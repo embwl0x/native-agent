@@ -375,14 +375,19 @@ and are rewritten only in the fresh public tree, avoiding a continuity break.
 
 The July 16 public-release audit confirms that the private development
 repository itself must never be exposed: its current files have no secret
-finding, but old history contains personal paths and identifiers. The eligible
-release surface is the fresh, one-commit generic export only. That export now
-checks its own rewritten architecture, resources, binary, metadata, identities,
-and secrets; clean-checkout tests no longer read private runtime state. Sparkle
-is pinned to 2.9.4 with 2.9.2 as the security floor. The intended public mirror
-remains private because GitHub still resolves one retired personal-identity
-commit by exact SHA; the publication verifier correctly refuses until GitHub
-returns an authoritative 404/410 and a current scrubbed snapshot is synced.
+finding, but old history contains personal paths and identifiers. Only a fresh
+generic export is eligible for the public mirror. That export checks its own
+rewritten architecture, resources, binary, metadata, identities, and secrets;
+clean-checkout tests no longer read private runtime state. Sparkle is pinned to
+2.9.4 with 2.9.2 as the security floor. On July 30, explicit owner approval was
+used to delete and recreate the stale private mirror. The retired
+personal-metadata Git object now returns authenticated `404`, the durable purge
+marker is cleared, and the recreated mirror contains only clean generic
+snapshot commits with approved noreply authorship. The canonical publisher
+regenerated, fully tested, pushed, independently cloned, and rescanned public
+snapshot `1b15a6fd743e0c9c56b3f82dbdb8405453df0c5b`. Visibility remains the
+explicit remaining owner action, followed by the source-matched notarized DMG,
+Sparkle/GitHub release, and fresh-VM proof.
 
 A clean VirtualBuddy install also caught a dry-run-only signing failure that
 the mounted artifact verifier could not reproduce: hardened-runtime ad-hoc
