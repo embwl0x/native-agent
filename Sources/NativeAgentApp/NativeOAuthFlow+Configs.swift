@@ -94,7 +94,7 @@ struct ProviderOAuthConfig: @unchecked Sendable {
         extraAuthParams: [
             "id_token_add_organizations": "true",
             "codex_cli_simplified_flow":  "true",
-            "originator":                 "nativeagent",
+            "originator":                 OpenAIOAuthDirectAdapter.codexBackendOriginator,
         ],
         tokenBodyFormat: .form,
         persistTokens: { tokens in

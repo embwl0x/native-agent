@@ -22,7 +22,7 @@ import PersistenceCore
 //   POST https://chatgpt.com/backend-api/codex/responses
 //   Authorization:    Bearer <access_token JWT>
 //   chatgpt-account-id: <chatgpt_account_id from JWT claim>
-//   originator:       nativeagent
+//   originator:       codex_cli_rs
 //   OpenAI-Beta:      responses=experimental
 //   Accept:           text/event-stream
 //   Content-Type:     application/json
@@ -119,6 +119,21 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
     public let providerId: String = "openai_oauth_direct"
 
     public static let productionSession: URLSession = makeProductionSession()
+    /// ChatGPT's Codex backend uses the official Codex client identity as a
+    /// routing contract, not merely analytics. A neutral NativeAgent
+    /// originator currently receives repeatable `server_is_overloaded`
+    /// failures for requests that succeed with this exact identity.
+    public static let codexBackendOriginator = "codex_cli_rs"
+    public static var codexBackendUserAgent: String {
+        let rawVersion =
+            (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String)
+            ?? "source"
+        let safeVersion = rawVersion.filter {
+            $0.isASCII && ($0.isLetter || $0.isNumber || ".-_".contains($0))
+        }
+        let nativeAgentVersion = safeVersion.isEmpty ? "source" : safeVersion
+        return "codex_cli_rs/0.145.0 NativeAgent/\(nativeAgentVersion)"
+    }
 
     private let session: URLSession
     private let endpoint: URL
@@ -238,11 +253,13 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         tools: [LLMToolSchema]?
     ) async throws -> String {
         let coercedModel = Self.coerceToGPTModel(model)
+        var forceTokenRefresh = false
         for attempt in 0...1 {
             try Task.checkCancellation()
             let access: String
             do {
-                access = try await ensureFreshAccessToken(forceRefresh: attempt == 1)
+                access = try await ensureFreshAccessToken(forceRefresh: forceTokenRefresh)
+                forceTokenRefresh = false
             } catch is CancellationError { throw CancellationError() }
             catch let err as LLMError { throw err }
             catch { throw LLMError.notConfigured(provider: "openai_oauth_direct") }
@@ -254,8 +271,8 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
             req.httpMethod = "POST"
             req.setValue("Bearer \(access)", forHTTPHeaderField: "Authorization")
             req.setValue(accountID, forHTTPHeaderField: "chatgpt-account-id")
-            req.setValue("nativeagent", forHTTPHeaderField: "originator")
-            req.setValue("NativeAgent (Darwin; arm64)", forHTTPHeaderField: "User-Agent")
+            req.setValue(Self.codexBackendOriginator, forHTTPHeaderField: "originator")
+            req.setValue(Self.codexBackendUserAgent, forHTTPHeaderField: "User-Agent")
             req.setValue("responses=experimental", forHTTPHeaderField: "OpenAI-Beta")
             req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -279,7 +296,10 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
             }
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             if status == 401 {
-                if attempt == 0 { continue }
+                if attempt == 0 {
+                    forceTokenRefresh = true
+                    continue
+                }
                 throw LLMError.authRejected(
                     provider: "openai_oauth_direct",
                     detail: OpenAIOAuthDirectExhaustedMarker
@@ -311,7 +331,12 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                     durationMs: durationMs
                 )
                 return s
-            case .providerError(let m): throw LLMError.providerError(message: m)
+            case .providerError(let message):
+                let error = Self.classifiedBackendError(message)
+                if attempt == 0, Self.isSafePreOutputRetry(error) {
+                    continue
+                }
+                throw error
             }
         }
         throw LLMError.notConfigured(provider: "openai_oauth_direct")
@@ -328,12 +353,15 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         let coercedModel = Self.coerceToGPTModel(model)
         return AsyncThrowingStream { continuation in
             let task = Task {
+                var forceTokenRefresh = false
                 for attempt in 0...1 {
+                    var emittedProviderOutput = false
                     do {
                         try Task.checkCancellation()
                         let access: String
                         do {
-                            access = try await ensureFreshAccessToken(forceRefresh: attempt == 1)
+                            access = try await ensureFreshAccessToken(forceRefresh: forceTokenRefresh)
+                            forceTokenRefresh = false
                         } catch is CancellationError { throw CancellationError() }
                         catch let err as LLMError { throw err }
                         catch { throw LLMError.notConfigured(provider: "openai_oauth_direct") }
@@ -345,8 +373,8 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                         req.httpMethod = "POST"
                         req.setValue("Bearer \(access)", forHTTPHeaderField: "Authorization")
                         req.setValue(accountID, forHTTPHeaderField: "chatgpt-account-id")
-                        req.setValue("nativeagent", forHTTPHeaderField: "originator")
-                        req.setValue("NativeAgent (Darwin; arm64)", forHTTPHeaderField: "User-Agent")
+                        req.setValue(Self.codexBackendOriginator, forHTTPHeaderField: "originator")
+                        req.setValue(Self.codexBackendUserAgent, forHTTPHeaderField: "User-Agent")
                         req.setValue("responses=experimental", forHTTPHeaderField: "OpenAI-Beta")
                         req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
                         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -370,7 +398,10 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                         }
                         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                         if status == 401 {
-                            if attempt == 0 { continue }
+                            if attempt == 0 {
+                                forceTokenRefresh = true
+                                continue
+                            }
                             throw LLMError.authRejected(
                     provider: "openai_oauth_direct",
                     detail: OpenAIOAuthDirectExhaustedMarker
@@ -410,6 +441,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                         var ttftMs: Int?
 
                         func stampTTFT() {
+                            emittedProviderOutput = true
                             if ttftMs == nil {
                                 ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
                             }
@@ -489,12 +521,21 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                                 }
                                 return true
                             } else if etype == "response.failed" {
-                                let errObj = ((event["response"] as? [String: Any])?["error"] as? [String: Any]) ?? [:]
-                                let msg = (errObj["message"] as? String) ?? "response failed"
-                                throw LLMError.providerError(message: "chatgpt-backend response failed: \(msg)")
+                                let detail = Self.backendErrorDescription(
+                                    from: event,
+                                    fallback: "response failed"
+                                )
+                                throw Self.classifiedBackendError(
+                                    "chatgpt-backend response failed: \(detail)"
+                                )
                             } else if etype == "error" {
-                                let msg = (event["message"] as? String) ?? "unknown"
-                                throw LLMError.providerError(message: "chatgpt-backend error: \(msg)")
+                                let detail = Self.backendErrorDescription(
+                                    from: event,
+                                    fallback: "unknown backend error"
+                                )
+                                throw Self.classifiedBackendError(
+                                    "chatgpt-backend error: \(detail)"
+                                )
                             } else if etype.hasPrefix("response.reasoning") {
                                 // Liveness: extended-reasoning frames
                                 // (response.reasoning_text.delta /
@@ -571,6 +612,21 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                             durationMs: durationMs
                         )
                         continuation.finish()
+                        return
+                    } catch let error as LLMError {
+                        // A capacity failure can arrive inside an HTTP 200
+                        // stream before any model output. Replaying that
+                        // provider request once is safe: no assistant delta or
+                        // tool call has crossed the stream, so the tool loop
+                        // has not dispatched an effect. Keep this independent
+                        // from OAuth refresh so a capacity retry never rotates
+                        // a healthy refresh token.
+                        if attempt == 0,
+                           !emittedProviderOutput,
+                           Self.isSafePreOutputRetry(error) {
+                            continue
+                        }
+                        continuation.finish(throwing: error)
                         return
                     } catch {
                         continuation.finish(throwing: error)
@@ -722,11 +778,13 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         // backend routes by model id and rejects unknown ids — `openai/...`
         // namespace prefixes need stripping (gpt-5.5 review NON-BLOCKING).
         let coercedModel = Self.coerceToGPTModel(model)
+        var forceTokenRefresh = false
         for attempt in 0...1 {
             try Task.checkCancellation()
             let access: String
             do {
-                access = try await ensureFreshAccessToken(forceRefresh: attempt == 1)
+                access = try await ensureFreshAccessToken(forceRefresh: forceTokenRefresh)
+                forceTokenRefresh = false
             } catch is CancellationError {
                 throw CancellationError()
             } catch let err as LLMError {
@@ -744,8 +802,8 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
             req.httpMethod = "POST"
             req.setValue("Bearer \(access)", forHTTPHeaderField: "Authorization")
             req.setValue(accountID, forHTTPHeaderField: "chatgpt-account-id")
-            req.setValue("nativeagent", forHTTPHeaderField: "originator")
-            req.setValue("NativeAgent (Darwin; arm64)", forHTTPHeaderField: "User-Agent")
+            req.setValue(Self.codexBackendOriginator, forHTTPHeaderField: "originator")
+            req.setValue(Self.codexBackendUserAgent, forHTTPHeaderField: "User-Agent")
             req.setValue("responses=experimental", forHTTPHeaderField: "OpenAI-Beta")
             req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -779,6 +837,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                     // Do NOT refresh inline here. Just loop — the next
                     // iteration's `ensureFreshAccessToken(forceRefresh: true)`
                     // does the single refresh, exactly once per call.
+                    forceTokenRefresh = true
                     continue
                 }
                 // Exhausted — Python raises a structured RuntimeError carrying
@@ -822,8 +881,12 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                     durationMs: durationMs
                 )
                 return s
-            case .providerError(let m):
-                throw LLMError.providerError(message: m)
+            case .providerError(let message):
+                let error = Self.classifiedBackendError(message)
+                if attempt == 0, Self.isSafePreOutputRetry(error) {
+                    continue
+                }
+                throw error
             }
         }
         // Unreachable — the loop body always either returns or throws.
@@ -886,6 +949,78 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         var text = String(decoding: collected, as: UTF8.self)
         if truncated { text += "\n...(truncated)" }
         return text
+    }
+
+    /// ChatGPT currently emits both a legacy top-level `message` and a newer
+    /// nested `error` object. `response.failed` places that same object under
+    /// `response.error`. Keep one decoder for buffered, streaming, plain, and
+    /// structured lanes so one backend envelope change cannot degrade only one
+    /// chat surface to an unhelpful "unknown" error.
+    static func backendErrorDescription(
+        from event: [String: Any],
+        fallback: String
+    ) -> String {
+        let nested = event["error"] as? [String: Any]
+        let responseNested =
+            ((event["response"] as? [String: Any])?["error"] as? [String: Any])
+        let object = nested ?? responseNested
+        let rawMessage = (object?["message"] as? String)
+            ?? (event["message"] as? String)
+            ?? fallback
+        let rawCode = (object?["code"] as? String)
+            ?? (object?["type"] as? String)
+            ?? (event["code"] as? String)
+        let message = boundedProviderErrorField(rawMessage, fallback: fallback)
+        guard let rawCode else { return message }
+        let code = boundedProviderErrorField(rawCode, fallback: "")
+        return code.isEmpty ? message : "\(message) [code=\(code)]"
+    }
+
+    /// HTTP 200 does not mean the ChatGPT Responses stream succeeded. Preserve
+    /// hard auth and rate-limit semantics while classifying explicit capacity
+    /// and availability failures as transient so existing surface retry policy
+    /// can handle them truthfully.
+    static func classifiedBackendError(_ description: String) -> LLMError {
+        let lower = description.lowercased()
+        if lower.contains("rate_limit")
+            || lower.contains("rate limit")
+            || lower.contains("too many requests") {
+            return .rateLimited(message: description, retryAfterSeconds: nil)
+        }
+        if lower.contains("invalid_api_key")
+            || lower.contains("invalid authentication")
+            || lower.contains("authentication_error")
+            || lower.contains("unauthorized") {
+            return .authRejected(provider: "openai_oauth_direct", detail: description)
+        }
+        if lower.contains("server_is_overloaded")
+            || lower.contains("overloaded_error")
+            || lower.contains("service_unavailable")
+            || lower.contains("server_error")
+            || lower.contains("currently overloaded")
+            || lower.contains("temporarily unavailable")
+            || lower.contains("try again later") {
+            return .transient(message: description)
+        }
+        return .providerError(message: description)
+    }
+
+    static func isSafePreOutputRetry(_ error: LLMError) -> Bool {
+        if case .transient = error { return true }
+        return false
+    }
+
+    private static func boundedProviderErrorField(
+        _ raw: String,
+        fallback: String,
+        maximumCharacters: Int = 1_024
+    ) -> String {
+        let cleaned = raw
+            .replacingOccurrences(of: "\0", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let value = cleaned.isEmpty ? fallback : cleaned
+        guard value.count > maximumCharacters else { return value }
+        return String(value.prefix(maximumCharacters)) + "…"
     }
 
     /// Coerce a model id to a GPT id for the chatgpt.com backend. Mirrors
@@ -1047,18 +1182,22 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                 }
                 return true
             } else if etype == "response.failed" {
-                // Mirrors Python L1058-L1061: extract response.error.message.
-                let errObj = ((event["response"] as? [String: Any])?["error"] as? [String: Any]) ?? [:]
-                let msg = (errObj["message"] as? String) ?? "response failed"
+                let detail = backendErrorDescription(
+                    from: event,
+                    fallback: "response failed"
+                )
                 failure = SSEParsed(
-                    result: .providerError("chatgpt-backend response failed: \(msg)"),
+                    result: .providerError("chatgpt-backend response failed: \(detail)"),
                     usage: nil
                 )
                 return true
             } else if etype == "error" {
-                let msg = (event["message"] as? String) ?? "unknown"
+                let detail = backendErrorDescription(
+                    from: event,
+                    fallback: "unknown backend error"
+                )
                 failure = SSEParsed(
-                    result: .providerError("chatgpt-backend error: \(msg)"),
+                    result: .providerError("chatgpt-backend error: \(detail)"),
                     usage: nil
                 )
                 return true

@@ -415,7 +415,14 @@ private func stubSession() -> URLSession {
         #expect(req.url?.absoluteString == "https://chatgpt.com/backend-api/codex/responses")
         #expect(req.value(forHTTPHeaderField: "Authorization") == "Bearer \(token)")
         #expect(req.value(forHTTPHeaderField: "chatgpt-account-id") == "acct_abc")
-        #expect(req.value(forHTTPHeaderField: "originator") == "nativeagent")
+        #expect(
+            req.value(forHTTPHeaderField: "originator")
+                == OpenAIOAuthDirectAdapter.codexBackendOriginator
+        )
+        #expect(
+            req.value(forHTTPHeaderField: "User-Agent")
+                == OpenAIOAuthDirectAdapter.codexBackendUserAgent
+        )
         #expect(req.value(forHTTPHeaderField: "OpenAI-Beta") == "responses=experimental")
         #expect(req.value(forHTTPHeaderField: "Accept") == "text/event-stream")
 
@@ -1296,6 +1303,155 @@ private func stubSession() -> URLSession {
         } else {
             Issue.record("expected .providerError, got: \(result)")
         }
+    }
+
+    @Test func sse_parser_surfaces_current_nested_error_message_and_code() throws {
+        let sse = """
+        data: {"type":"error","error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later.","param":null}}
+
+        """
+        let result = OpenAIOAuthDirectAdapter.parseResponsesSSE(
+            from: Data(sse.utf8)
+        )
+        if case .providerError(let message) = result {
+            #expect(message.contains("currently overloaded"))
+            #expect(message.contains("code=server_is_overloaded"))
+            #expect(!message.contains("unknown"))
+        } else {
+            Issue.record("expected .providerError, got: \(result)")
+        }
+    }
+
+    @Test func current_nested_overload_classifies_transient_but_unknown_error_stays_terminal() throws {
+        let event: [String: Any] = [
+            "type": "error",
+            "error": [
+                "type": "service_unavailable_error",
+                "code": "server_is_overloaded",
+                "message": "Our servers are currently overloaded. Please try again later.",
+            ],
+        ]
+        let description = OpenAIOAuthDirectAdapter.backendErrorDescription(
+            from: event,
+            fallback: "unknown backend error"
+        )
+        if case .transient(let message) =
+            OpenAIOAuthDirectAdapter.classifiedBackendError(description) {
+            #expect(message.contains("server_is_overloaded"))
+        } else {
+            Issue.record("current overload envelope must classify transient")
+        }
+        #expect(
+            OpenAIOAuthDirectAdapter.classifiedBackendError("schema rejected")
+                == .providerError(message: "schema rejected")
+        )
+    }
+
+    @Test func streamMessages_retries_current_nested_overload_without_refreshing_token() async throws {
+        OAuthStubURLProtocol.reset()
+        let overload = """
+        data: {"type":"error","error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}
+
+        data: {"type":"response.failed","response":{"error":{"code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}}
+
+        """
+        let success = """
+        data: {"type":"response.output_text.delta","delta":"OK"}
+
+        data: {"type":"response.completed","response":{"status":"completed"}}
+
+        """
+        OAuthStubURLProtocol.responder = { _ in
+            let body = OAuthStubURLProtocol.allRequests.count == 1 ? overload : success
+            return .init(
+                status: 200,
+                body: Data(body.utf8),
+                headers: ["Content-Type": "text/event-stream"]
+            )
+        }
+        let token = makeAccessJWT()
+        let path = writeAuthJSON([
+            "tokens": [
+                "access_token": token,
+                "refresh_token": "healthy-refresh-token",
+                "account_id": "acct_123",
+            ],
+        ])
+        let adapter = OpenAIOAuthDirectAdapter(
+            session: stubSession(),
+            authPathOverride: path
+        )
+
+        var text = ""
+        for try await event in adapter.streamMessages(
+            messages: [.user("Reply with exactly OK.")],
+            system: "You are helpful.",
+            model: nativeAgentPrimaryModel,
+            tools: [LLMToolSchema(
+                name: "time_now",
+                description: "Read the current time.",
+                parametersJSON: Data(#"{"type":"object","properties":{}}"#.utf8)
+            )]
+        ) {
+            if case .textDelta(let delta) = event { text += delta }
+        }
+
+        #expect(text == "OK")
+        #expect(OAuthStubURLProtocol.allRequests.count == 2)
+        #expect(OAuthStubURLProtocol.allRequests.allSatisfy {
+            $0.url?.absoluteString.contains("/backend-api/codex/responses") == true
+        }, "capacity retry must not rotate a healthy OAuth refresh token")
+    }
+
+    @Test func streamMessages_doesNotRetry_overloadAfterVisibleOutput() async throws {
+        OAuthStubURLProtocol.reset()
+        let partialThenOverload = """
+        data: {"type":"response.output_text.delta","delta":"partial"}
+
+        data: {"type":"error","error":{"code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}
+
+        """
+        OAuthStubURLProtocol.responder = { _ in
+            .init(
+                status: 200,
+                body: Data(partialThenOverload.utf8),
+                headers: ["Content-Type": "text/event-stream"]
+            )
+        }
+        let path = writeAuthJSON([
+            "tokens": [
+                "access_token": makeAccessJWT(),
+                "refresh_token": "healthy-refresh-token",
+                "account_id": "acct_123",
+            ],
+        ])
+        let adapter = OpenAIOAuthDirectAdapter(
+            session: stubSession(),
+            authPathOverride: path
+        )
+
+        var text = ""
+        do {
+            for try await event in adapter.streamMessages(
+                messages: [.user("hello")],
+                system: "You are helpful.",
+                model: nativeAgentPrimaryModel,
+                tools: nil
+            ) {
+                if case .textDelta(let delta) = event { text += delta }
+            }
+            Issue.record("expected the post-output overload to surface")
+        } catch let error as LLMError {
+            if case .transient(let message) = error {
+                #expect(message.contains("server_is_overloaded"))
+            } else {
+                Issue.record("expected transient overload, got \(error)")
+            }
+        }
+
+        #expect(text == "partial")
+        #expect(OAuthStubURLProtocol.allRequests.count == 1,
+                "a failure after visible output must never replay the provider request")
     }
 
     @Test func complete_throws_providerError_on_response_failed_frame() async throws {

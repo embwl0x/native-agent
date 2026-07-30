@@ -181,7 +181,14 @@ struct ImageGenerationToolTests {
         #expect(ImageGenerationStubURLProtocol.capturedMethod == "POST")
         #expect(capturedHeader("Authorization") == "Bearer \(token)")
         #expect(capturedHeader("chatgpt-account-id") == "acct_image_123")
-        #expect(capturedHeader("originator") == "nativeagent")
+        #expect(
+            capturedHeader("originator")
+                == OpenAIOAuthDirectAdapter.codexBackendOriginator
+        )
+        #expect(
+            capturedHeader("User-Agent")
+                == OpenAIOAuthDirectAdapter.codexBackendUserAgent
+        )
         #expect(capturedHeader("Accept") == "text/event-stream")
         #expect(capturedHeader("Content-Type") == "application/json")
         #expect(ImageGenerationStubURLProtocol.capturedBody["model"] as? String == nativeAgentPrimaryModel)
@@ -222,6 +229,37 @@ struct ImageGenerationToolTests {
             ))
         }
         #expect(ImageGenerationStubURLProtocol.capturedURL == nil)
+    }
+
+    @Test func codexOAuthImageClientSurfacesCurrentNestedBackendError() async throws {
+        ImageGenerationStubURLProtocol.reset()
+        let root = try await makeImageRoot(imageAllowed: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (authPath, _) = try writeCodexAuthJSON(root: root)
+        ImageGenerationStubURLProtocol.responseData = Data("""
+        data: {"type":"error","error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}
+
+        data: [DONE]
+
+        """.utf8)
+        let client = SwiftCodexOAuthImageGenerationClient(
+            session: imageStubSession(),
+            authPathOverride: authPath,
+            dataRoot: root
+        )
+
+        await #expect(throws: ImageGenerationToolError.invalidResponse(
+            "Our servers are currently overloaded. Please try again later. [code=server_is_overloaded]"
+        )) {
+            _ = try await client.generate(CodexImageGenerationRequest(
+                prompt: "small moon watercolor",
+                size: nil,
+                quality: nil,
+                outputFormat: "png",
+                count: 1,
+                timeoutSeconds: 60
+            ))
+        }
     }
 
     @Test func codexImageClientUsesImagegenAndCollectsArtifact() async throws {

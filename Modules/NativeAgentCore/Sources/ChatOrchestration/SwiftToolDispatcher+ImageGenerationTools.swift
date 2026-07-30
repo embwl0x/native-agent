@@ -497,8 +497,14 @@ final class SwiftCodexOAuthImageGenerationClient: @unchecked Sendable {
             urlRequest.timeoutInterval = TimeInterval(timeoutSeconds)
             urlRequest.setValue("Bearer \(context.accessToken)", forHTTPHeaderField: "Authorization")
             urlRequest.setValue(context.accountID, forHTTPHeaderField: "chatgpt-account-id")
-            urlRequest.setValue("nativeagent", forHTTPHeaderField: "originator")
-            urlRequest.setValue("NativeAgent (Darwin; arm64)", forHTTPHeaderField: "User-Agent")
+            urlRequest.setValue(
+                OpenAIOAuthDirectAdapter.codexBackendOriginator,
+                forHTTPHeaderField: "originator"
+            )
+            urlRequest.setValue(
+                OpenAIOAuthDirectAdapter.codexBackendUserAgent,
+                forHTTPHeaderField: "User-Agent"
+            )
             urlRequest.setValue("responses=experimental", forHTTPHeaderField: "OpenAI-Beta")
             urlRequest.setValue("text/event-stream", forHTTPHeaderField: "Accept")
             urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -613,7 +619,16 @@ final class SwiftCodexOAuthImageGenerationClient: @unchecked Sendable {
                 let error = ((payload["response"] as? [String: Any])?["error"] as? [String: Any]) ?? [:]
                 errorMessage = (error["message"] as? String) ?? "Codex image generation failed"
             } else if type == "error" {
-                errorMessage = (payload["message"] as? String) ?? "Codex image generation error"
+                let error = payload["error"] as? [String: Any]
+                let message = (error?["message"] as? String)
+                    ?? (payload["message"] as? String)
+                    ?? "Codex image generation error"
+                if let code = (error?["code"] as? String) ?? (error?["type"] as? String),
+                   !code.isEmpty {
+                    errorMessage = "\(message) [code=\(code)]"
+                } else {
+                    errorMessage = message
+                }
             }
             if let found = extractImageBase64(from: payload) {
                 imageBase64 = found
