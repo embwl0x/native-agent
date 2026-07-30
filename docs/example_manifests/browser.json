@@ -1,0 +1,147 @@
+{
+  "schemaVersion": 1,
+  "name": "browser",
+  "version": "1.0.0",
+  "type": "connector",
+  "transport": "ipc",
+  "description": "Control a visible WKWebView browser window from agent context: navigate, screenshot, click, fill, and read page content.",
+  "author": {
+    "name": "Your Name",
+    "email": "you@example.com",
+    "url": "https://github.com/your-username"
+  },
+  "ipc": {
+    "host": "127.0.0.1",
+    "port": 8766,
+    "authTokenFile": "~/Library/Application Support/NativeAgent/browser_ipc_token",
+    "authScheme": "bearer"
+  },
+  "tools": [
+    {
+      "name": "browser.navigate",
+      "description": "Navigate the browser to a URL. Returns the resolved URL and page title.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "The http/https URL to load."
+          }
+        },
+        "required": ["url"]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "url": {"type": "string"},
+          "title": {"type": "string"},
+          "httpStatus": {"type": "integer"}
+        }
+      }
+    },
+    {
+      "name": "browser.screenshot",
+      "description": "Capture a PNG screenshot of the current browser viewport.",
+      "inputSchema": {"type": "object", "properties": {}},
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "png_base64": {"type": "string", "description": "Base64-encoded PNG bytes."}
+        }
+      }
+    },
+    {
+      "name": "browser.click",
+      "description": "Click a DOM element identified by a CSS selector.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "selector": {"type": "string", "description": "CSS selector for the element to click."}
+        },
+        "required": ["selector"]
+      },
+      "outputSchema": {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+    },
+    {
+      "name": "browser.fill",
+      "description": "Set the value of an input element and dispatch input/change events.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "selector": {"type": "string"},
+          "text": {"type": "string"}
+        },
+        "required": ["selector", "text"]
+      },
+      "outputSchema": {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+    },
+    {
+      "name": "browser.read_text",
+      "description": "Return document.body.innerText of the current page.",
+      "inputSchema": {"type": "object", "properties": {}},
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "text": {"type": "string"}
+        }
+      }
+    },
+    {
+      "name": "browser.read_links",
+      "description": "Return all anchor links (href + text) from the current page, up to 200.",
+      "inputSchema": {"type": "object", "properties": {}},
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "links": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "url": {"type": "string"},
+                "text": {"type": "string"}
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "browser.show",
+      "description": "Make the browser window visible.",
+      "inputSchema": {"type": "object", "properties": {}},
+      "outputSchema": {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+    },
+    {
+      "name": "browser.hide",
+      "description": "Hide the browser window.",
+      "inputSchema": {"type": "object", "properties": {}},
+      "outputSchema": {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+    },
+    {
+      "name": "browser.status",
+      "description": "Return current browser state: visible, currentUrl, ready.",
+      "inputSchema": {"type": "object", "properties": {}},
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "visible": {"type": "boolean"},
+          "currentUrl": {"type": "string"},
+          "ready": {"type": "boolean"}
+        }
+      }
+    }
+  ],
+  "permissions": [
+    "network.localhost",
+    "browser_ipc"
+  ],
+  "domainConsent": {
+    "required": true,
+    "policy": "trust_center",
+    "note": "Navigation is gated by the Trust Center approved-domains list unless developerMode or wide_open is set."
+  },
+  "tags": ["browser", "web", "screenshot", "native"],
+  "homepage": "https://github.com/your-username/NativeAgent",
+  "license": "MIT"
+}

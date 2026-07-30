@@ -1,0 +1,471 @@
+import Foundation
+import Darwin
+import NativeAgentCore
+import BackgroundLoops
+import ChatOrchestration
+import DoctorChecks
+import MemoryV2
+import PersistenceCore
+import ProviderRouting
+import DreamREMCycle
+import TelegramBot
+import ApprovalInbox
+import WorkshopExecution
+import TrustCenter
+import MacControl
+import SelfImprovement
+
+// MARK: - Maintenance Loops
+
+extension BackgroundLoopsAssembly {
+    // Maintenance factories remain independently testable; the app-owned
+    // production manifest decides which ones have real ingress and consumers.
+    static func makeAutoDoctorLoop(
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        intervalSeconds: TimeInterval? = nil
+    ) -> some LoopRunner {
+        let config = NativeClient.readAutoDoctorConfig(dataRoot: dataRoot)
+        let configuredInterval = config.intervalSeconds
+            .map(TimeInterval.init)
+            .flatMap { $0.isFinite && $0 >= 3600 ? $0 : nil }
+        let interval = intervalSeconds ?? configuredInterval ?? (7 * 24 * 60 * 60)
+        return ConfiguredDoctorAutoRunLoop(
+            enabled: config.enabled ?? true,
+            doctor: DoctorAutoRunLoop(
+                interval: interval,
+                doctorChecks: SwiftNativeDoctorChecks()
+            )
+        )
+    }
+
+    static func makeFullMacExpiryLoop(
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        intervalSeconds: TimeInterval = 24 * 60 * 60
+    ) -> some LoopRunner {
+        FullMacExpiryRunner(
+            interval: intervalSeconds,
+            dataRoot: dataRoot
+        )
+    }
+
+    /// M7 (2026-07-09): `turn_traces/` grew one file plus one orphaned `.lock`
+    /// per day, forever — `ChatSessionRetention` only ever covered
+    /// `chat/sessions.json`. Six-hourly is ample for a day-granularity sweep.
+    static func makeTurnTraceRetentionLoop(
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        intervalSeconds: TimeInterval = 6 * 60 * 60
+    ) -> some LoopRunner {
+        TurnTraceRetentionRunner(
+            interval: intervalSeconds,
+            dataRoot: dataRoot
+        )
+    }
+
+    /// Weekly, app-owned self-improvement analyzer (replaces the dead janitor
+    /// sweep). Reads a week of real usage, asks the app's own LLM what to
+    /// improve, and stages runtime-class findings as one-tap-approvable items
+    /// via the approval inbox. Gated on the `enableAutonomy` trust switch.
+    static func makeWeeklySelfImprovementLoop(
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        llm: any LLMClient
+    ) -> WeeklySelfImprovementLoop {
+        let inbox = SwiftNativeApprovalInbox(root: dataRoot)
+        return WeeklySelfImprovementLoop(
+            llm: llm,
+            dataRoot: dataRoot,
+            isEnabled: { UserDefaults.standard.bool(forKey: "selfImprovementEnabled") },
+            stageProposal: { proposal in
+                let body: JSONValue = .object([
+                    "title": .string(proposal.title),
+                    "action": .string("self_improvement.apply"),
+                    "payload": .object([
+                        "kind": .string("self_improvement"),
+                        "evidence": .string(proposal.evidence),
+                        "proposedChange": .string(proposal.proposedChange),
+                        "apply": .object([
+                            "op": .string(proposal.applyOp ?? ""),
+                            "target": .string(proposal.applyTarget ?? ""),
+                        ]),
+                    ]),
+                    // Surface the exact op + target so the approval card shows
+                    // WHAT one tap will do (e.g. "[disable_skill: foo] ...").
+                    "payloadPreview": .string(
+                        "[" + (proposal.applyOp ?? "")
+                        + (proposal.applyTarget.map { ": \($0)" } ?? "")
+                        + "] " + String(proposal.proposedChange.prefix(180))
+                    ),
+                ])
+                do {
+                    _ = try await inbox.create(body)
+                } catch {
+                    // FIX 3 (A4.5): rethrow so the loop rolls back its weekly
+                    // marker (retry next tick) and returns .failed — a swallowed
+                    // create() silently dropped the proposal while the pass still
+                    // reported "weekly proposals staged".
+                    FileHandle.standardError.write(Data(
+                        "WeeklySelfImprovement: stage failed for \(proposal.title): \(error)\n".utf8))
+                    throw error
+                }
+            },
+            // U2b wave 2: code-class findings stop dying in the digest —
+            // they file into the evolution proposal store as `needs_diff`
+            // (prose, no patch yet; the diff lane is a deliberate act by
+            // Agent/Claude/the user, plan A4). Filed proposals carry the engine's
+            // pinned risk=critical + autoApprove=false; nothing here stages
+            // an approval card — only a GREEN candidate ever reaches
+            // stageEvolutionApprovals.
+            fileCodeFinding: { finding in
+                let store = EvolutionProposalStore(dataRoot: dataRoot)
+                do {
+                    _ = try await store.propose(
+                        source: .weekly,
+                        title: finding.title,
+                        evidence: finding.evidence
+                            + "\n\nproposed change: " + finding.proposedChange)
+                } catch {
+                    // FIX 3 (A4.5): rethrow — a swallowed propose() dropped the
+                    // code finding silently while the pass reported success.
+                    FileHandle.standardError.write(Data(
+                        "WeeklySelfImprovement: evolution filing failed for \(finding.title): \(error)\n".utf8))
+                    throw error
+                }
+            },
+            // MEASURE leg (north-star, 2026-06-15): feed the real week-over-week
+            // mission-outcome trend into the weekly analysis so the improvement
+            // brain sees whether Agent is actually completing more jobs in fewer
+            // steps — not just chat/error/doctor proxies. Read-only runner bound
+            // to the same dataRoot (the scoreboard only scans mission.json; the
+            // planner/executor are unused, hence the bare default construction).
+            workshopOutcomes: {
+                let runner = SwiftNativeWorkshopRunner(root: dataRoot)
+                return WorkshopOutcomeScoreboard.formatForPrompt(await runner.weeklyOutcomeStats())
+            }
+        )
+    }
+
+    /// Weekly retention sweep for the evolution proposal store (tightness round
+    /// 2 P-M2). `EvolutionProposalStore.sweep()` drops TERMINAL proposals older
+    /// than 30 days; it had zero production callers, so `proposals.json` only ever
+    /// grew. Dependency-clean: the prune is an injected closure so BackgroundLoops
+    /// gains no SelfImprovement dependency.
+    static func makeEvolutionProposalRetentionLoop(
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) -> EvolutionProposalRetentionLoop {
+        EvolutionProposalRetentionLoop(
+            sweep: {
+                try await EvolutionProposalStore(dataRoot: dataRoot).sweep()
+            }
+        )
+    }
+
+    /// Daily disk-hygiene watchdog (tightness round 2, item 6 — User: "make sure
+    /// we dont pile up logs like that again burning tons of hard disk" after a
+    /// 194MB dead-daemon log was found). Walks `dataRoot` once per day and, when a
+    /// single file exceeds 64MB or the tree exceeds 2GB, files ONE notification
+    /// card listing the offenders. NEVER deletes anything. Dependency-clean: the
+    /// inbox write is an injected closure wired to the same `notifications/inbox.jsonl`
+    /// upsert path HeartbeatLoop uses.
+    static func makeDataRootDiskHygieneLoop(
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) -> DataRootDiskHygieneCheck {
+        DataRootDiskHygieneCheck(
+            // A4.8 ride-along: the scheduler sleeps `interval` BEFORE the first
+            // tick, so a bare 24h interval starves under frequent deploys (the
+            // restart resets the sleep — disk_hygiene_last_run sat 3 days stale
+            // by 2026-07-24). Hourly tick + the existing once-per-day
+            // reservation = runs once a day, robust to restarts.
+            interval: 60 * 60,
+            dataRoot: dataRoot,
+            fileNotice: { report in
+                await fileDiskHygieneNotice(dataRoot: dataRoot, report: report)
+            }
+        )
+    }
+
+    /// A5.5: daily stale-artifact sweep — the delete-side sibling of the
+    /// detect-never-delete disk-hygiene watchdog above. Reaps orphaned
+    /// `context/<runId>.json` receipts left by the retired Python daemon and
+    /// archives `*.bak*` backups older than 30 days.
+    ///
+    /// REPORT-ONLY unless `staleArtifactSweepEnabled` is set. The key is unset on
+    /// a fresh install, so `UserDefaults.bool` returns false and every tick plans,
+    /// files ONE `sweep_pass` receipt describing what it WOULD remove, and removes
+    /// nothing. Same gate shape as `makeGoldenEvalLoop` — a step with an
+    /// irreversible side effect does not run unasked.
+    ///
+    /// Dependency-clean: the receipt append is an injected closure routed through
+    /// the shared `appendJSONLCapped`, so the sweep's own ledger cannot become
+    /// the next unbounded feed the disk-hygiene watchdog has to flag.
+    static func makeStaleArtifactSweepLoop(
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) -> StaleArtifactSweepLoop {
+        StaleArtifactSweepLoop(
+            // Same restart-starvation fix as the disk-hygiene loop above: the
+            // sweep's own day reservation dedups to once per UTC day; the
+            // hourly interval just guarantees the first tick actually lands
+            // within an hour of launch instead of 24h (which daily deploys
+            // kept resetting — the first sweep_pass report never filed).
+            interval: 60 * 60,
+            dataRoot: dataRoot,
+            isEnabled: { UserDefaults.standard.bool(forKey: "staleArtifactSweepEnabled") },
+            appendReceipt: { line in
+                let path = dataRoot
+                    .appendingPathComponent("logs", isDirectory: true)
+                    .appendingPathComponent("maintenance_sweep.jsonl")
+                do {
+                    try await appendJSONLCapped(
+                        line,
+                        to: path,
+                        using: SwiftNativePersistenceCore(),
+                        maxLines: JSONLLineCaps.maintenanceSweep,
+                        logLabel: "stale_artifact_sweep"
+                    )
+                    return true
+                } catch {
+                    // A false return aborts the pass before anything is removed
+                    // and rolls the day back, so the next tick retries.
+                    FileHandle.standardError.write(Data(
+                        "stale_artifact_sweep: receipt append failed: \(error)\n".utf8))
+                    return false
+                }
+            }
+        )
+    }
+
+    // MARK: - MEASURE v2: golden-eval loop
+
+    /// Weekly golden-eval submission for a CONTROLLED scoreboard cohort
+    /// (north-star MEASURE v2). OFF by default — `goldenEvalEnabled` is unset on
+    /// a fresh install, so `UserDefaults.bool` returns false and the loop is a
+    /// silent no-op (golden jobs EXECUTE and cost tokens; never run unasked).
+    /// When enabled, submits the fixed `GoldenEvalJobs.jobs` through a read-only
+    /// runner; the scoreboard segments them via
+    /// `weeklyOutcomeStats(onlyTriggerSource: GoldenEvalJobs.triggerSource)`.
+    static func makeGoldenEvalLoop(
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) -> GoldenEvalLoop {
+        return GoldenEvalLoop(
+            dataRoot: dataRoot,
+            isEnabled: { UserDefaults.standard.bool(forKey: "goldenEvalEnabled") },
+            submitGoldenJobs: { now in
+                // Use the REAL planner (SwiftNativeWorkshopPlannerLLM) — same as
+                // production makeMissionExecutor. The bare init defaults to
+                // StubWorkshopPlannerLLM, which would give golden missions the
+                // deterministic 2-step STUB plan instead of exercising the real
+                // planner — a golden eval that measures the stub is worthless
+                // (gpt-5.5 review BLOCKING, 2026-06-15).
+                // Pin the runner clock to the loop's `now` so each mission's
+                // createdAt keys to the SAME ISO-week bucket the loop's marker
+                // used (gpt-5.5 re-review HIGH — shared timestamp source).
+                let runner = SwiftNativeWorkshopRunner(
+                    root: dataRoot,
+                    planner: SwiftNativeWorkshopPlannerLLM(
+                        connectorActionsProvider: makeWorkshopPlannerConnectorActionsProvider(dataRoot: dataRoot),
+                        lifecycleObserver: dataRoot == PersistenceCore.defaultDataRoot()
+                            ? NativeCognitionRuntime.shared
+                            : nil,
+                        // Ledger rows follow the runner's root (gpt-5.5 review
+                        // BLOCKING, 2026-07-02).
+                        runLedgerDataRoot: dataRoot),
+                    now: { now })
+                var submitted = 0
+                for spec in GoldenEvalJobs.jobs {
+                    if (try? await runner.submit(spec: spec)) != nil { submitted += 1 }
+                }
+                return submitted
+            }
+        )
+    }
+
+
+    // The weekly self-improvement loop's on/off gate is the
+    // "selfImprovementEnabled" UserDefaults flag, owned by the Self-Improvement
+    // tab's switch (SelfImprovementView). Read inline in makeWeeklySelfImprovementLoop.
+
+    // MARK: - Disk-hygiene notification
+
+    /// Upsert ONE stable disk-hygiene card to `notifications/inbox.jsonl`, keyed
+    /// by a fixed id so the daily re-check updates one card instead of stacking
+    /// duplicates. Mirrors `upsertHeartbeatNoticeCard`. NEVER deletes anything —
+    /// the card just lists the offenders and their sizes for a human to act on.
+    private static func fileDiskHygieneNotice(dataRoot: URL, report: DiskHygieneReport) async -> Bool {
+        let inboxPath = dataRoot
+            .appendingPathComponent("notifications", isDirectory: true)
+            .appendingPathComponent("inbox.jsonl")
+        let cardId = "disk-hygiene"
+        let now = ISO8601DateFormatter().string(from: Date())
+        var lines: [String] = []
+        if report.totalOverBudget {
+            lines.append("data/ total is \(DataRootDiskHygiene.humanSize(report.totalBytes)) "
+                + "(over the 2GB budget).")
+        }
+        for offender in report.largeFiles.prefix(20) {
+            lines.append("• \(offender.relativePath) — \(DataRootDiskHygiene.humanSize(offender.sizeBytes))")
+        }
+        if report.truncated {
+            lines.append("(scan hit its file budget — totals may undercount; largest offenders shown)")
+        }
+        let detail = ("Large files under the app data directory (nothing was deleted):\n"
+            + lines.joined(separator: "\n"))
+        let summary = report.totalOverBudget
+            ? "data/ is \(DataRootDiskHygiene.humanSize(report.totalBytes)); "
+                + "\(report.largeFiles.count) large file(s)"
+            : "\(report.largeFiles.count) large file(s) in data/"
+        let card: JSONValue = .object([
+            "id": .string(cardId),
+            "created_at": .string(now),
+            "source": .string("disk_hygiene"),
+            "severity": .string("actionable"),
+            "title": .string("Disk usage is piling up"),
+            "summary": .string(String(summary.prefix(500))),
+            "detail": .string(detail),
+            "related_mission_id": .null,
+            "related_approval_id": .null,
+            "related_paths": .array([]),
+            "related_groups": .array([]),
+            "actions": .array([
+                .object(["id": .string("archive"), "label": .string("Archive"),
+                         "description": .string("Archive this card")]),
+                .object(["id": .string("dismiss"), "label": .string("Dismiss"),
+                         "description": .string("Dismiss this card")]),
+            ]),
+            "status": .string("unread"),
+            "read_at": .null,
+        ])
+        let persistence = SwiftNativePersistenceCore()
+        do {
+            let inserted = try await persistence.withFileLock(inboxPath) { () async throws -> Bool in
+                let rows = try await persistence.tailJSONL(inboxPath, limit: Int.max, maxBytes: nil)
+                var mutated: [JSONValue] = []
+                mutated.reserveCapacity(rows.count + 1)
+                var found = false
+                for row in rows {
+                    guard case .object(let obj) = row,
+                          case .string(let id)? = obj["id"],
+                          id == cardId else {
+                        mutated.append(row)
+                        continue
+                    }
+                    mutated.append(card)
+                    found = true
+                }
+                if !found { mutated.append(card) }
+                let serialized = try mutated.map { try $0.serialize(pretty: false) }
+                try FileManager.default.createDirectory(
+                    at: inboxPath.deletingLastPathComponent(), withIntermediateDirectories: true)
+                let payload = Data((serialized.joined(separator: "\n")
+                    + (serialized.isEmpty ? "" : "\n")).utf8)
+                try payload.write(to: inboxPath, options: [.atomic])
+                _ = chmod(inboxPath.path, 0o600)
+                return !found
+            }
+            if inserted {
+                await InboxPushNotifier.notifyIfAttentionWorthy(
+                    dataRoot: dataRoot,
+                    itemId: cardId,
+                    title: "Disk usage is piling up",
+                    summary: String(summary.prefix(500)),
+                    source: "disk_hygiene",
+                    severity: "actionable"
+                )
+            }
+            return true
+        } catch {
+            // A failed upsert must report false so the loop rolls back the
+            // daily reservation and retries delivery on the next tick.
+            FileHandle.standardError.write(Data(
+                "DataRootDiskHygieneCheck: notice upsert failed: \(error)\n".utf8))
+            return false
+        }
+    }
+}
+
+/// Auto Doctor wrapper that honors the persisted toggle. The scheduler still
+/// sees the canonical `doctor_auto_run` id, but disabled means the tick is a
+/// no-op instead of running diagnostics.
+private struct ConfiguredDoctorAutoRunLoop: LoopRunner {
+    let enabled: Bool
+    let doctor: DoctorAutoRunLoop
+
+    var loopId: String { doctor.loopId }
+    var interval: TimeInterval { doctor.interval }
+    var tickTimeoutOverride: TimeInterval? { doctor.tickTimeoutOverride }
+
+    func tick() async {
+        _ = await tickOutcome()
+    }
+
+    func tickOutcome() async -> LoopTickOutcome {
+        guard enabled else { return .skipped(reason: "auto doctor disabled") }
+        return await doctor.tickOutcome()
+    }
+}
+
+/// Cheap Full Mac expiry check split out from Auto Doctor. It stages at most
+/// one "expiring soon" card and one "expired" card per expiry cycle, without
+/// forcing a full Doctor run every five minutes.
+private struct FullMacExpiryRunner: EventDeadlineLoopRunner {
+    let interval: TimeInterval
+    let dataRoot: URL
+
+    var loopId: String { "full_mac_expiry" }
+    var tickTimeoutOverride: TimeInterval? { 30 }
+
+    func physiologyEvents() -> AsyncStream<Void> {
+        EventDeadlinePhysiology.storeAndFileEvents(paths: [
+            BackgroundLoopsAssembly.trustPolicyPath(dataRoot: dataRoot),
+        ])
+    }
+
+    func nextMeaningfulDeadline(after now: Date) async -> Date? {
+        let policy = await SwiftNativeTrustCenter(dataRoot: dataRoot).loadTrustPolicy()
+        let macPolicy = MacControlPolicy.fromTrustPolicyObject(policy)
+        guard case .active(let expiresAt) = FullMacExpiry.state(
+            macPolicy.trustPolicy ?? MacControlTrustPolicy(),
+            now: now
+        ) else { return nil }
+        let warning = expiresAt.addingTimeInterval(-FullMacExpiry.warningWindow)
+        if warning > now { return warning }
+        return expiresAt > now ? expiresAt : nil
+    }
+
+    func tick() async {
+        _ = await tickOutcome()
+    }
+
+    func tickOutcome() async -> LoopTickOutcome {
+        switch await FullMacExpiryNotifier(dataRoot: dataRoot).runOnce() {
+        case .completed(let detail): return .completed(result: detail)
+        case .skipped(let reason): return .skipped(reason: reason)
+        case .failed(let error): return .failed(error: error)
+        }
+    }
+}
+
+/// M7: prunes `turn_traces/` to the newest ~14 days, taking each day's orphaned
+/// `.lock` sidecar with it. Never silent — a sweep that removes anything says so.
+private struct TurnTraceRetentionRunner: LoopRunner {
+    let interval: TimeInterval
+    let dataRoot: URL
+
+    var loopId: String { "turn_trace_retention" }
+    var tickTimeoutOverride: TimeInterval? { 60 }
+
+    func tick() async {
+        _ = await tickOutcome()
+    }
+
+    func tickOutcome() async -> LoopTickOutcome {
+        do {
+            let report = try TurnTraceRetention.enforce(dataRoot: dataRoot, now: Date())
+            if report.removedDays > 0 || report.removedLocks > 0 {
+                NSLog("turn_trace_retention: removed %d day file(s) and %d lock(s), kept %d day(s)",
+                      report.removedDays, report.removedLocks, report.keptDays)
+            }
+            return .completed(result: "turn-trace retention completed")
+        } catch {
+            NSLog("turn_trace_retention: sweep failed: %@", String(describing: error))
+            return .failed(error: String(describing: error))
+        }
+    }
+}

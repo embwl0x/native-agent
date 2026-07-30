@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    Maintainer template for the Developer ID + production CloudKit release.
+    Permanent public Developer ID + production CloudKit entitlement template.
+    Signing still requires the matching local provisioning profile.
+  -->
+  <key>com.apple.developer.aps-environment</key>
+  <string>production</string>
+  <key>com.apple.developer.icloud-container-environment</key>
+  <string>Production</string>
+  <key>com.apple.developer.icloud-container-identifiers</key>
+  <array>
+    <string>iCloud.io.github.embwl0x.nativeagent</string>
+  </array>
+  <key>com.apple.developer.icloud-services</key>
+  <array>
+    <string>CloudKit</string>
+  </array>
+  <key>com.apple.security.app-sandbox</key>
+  <false/>
+  <key>com.apple.security.automation.apple-events</key>
+  <true/>
+  <key>com.apple.security.device.audio-input</key>
+  <true/>
+  <key>com.apple.security.files.user-selected.read-write</key>
+  <true/>
+  <key>com.apple.security.network.client</key>
+  <true/>
+  <key>com.apple.security.network.server</key>
+  <true/>
+  <key>com.apple.security.personal-information.calendars</key>
+  <true/>
+</dict>
+</plist>

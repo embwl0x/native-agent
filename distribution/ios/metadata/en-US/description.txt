@@ -1,0 +1,9 @@
+NativeAgent is the iPhone and iPad companion for your NativeAgent on Mac.
+
+Continue conversations, review activity, manage approvals, inspect memories,
+use Workshop, and stay connected to your agent away from the Mac. Communication
+between the companion and its paired Mac uses authenticated Apple iCloud
+transport, while the Mac remains the authority for tools, trust, and actions.
+
+NativeAgent requires a compatible NativeAgent installation on a Mac signed in
+to the same iCloud account.

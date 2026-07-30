@@ -1,0 +1,8 @@
+// Permanent public NativeAgent distribution identity.
+// Bundle identifiers cannot be changed after an App Store build is uploaded.
+NATIVEAGENT_IOS_BUNDLE_PREFIX = io.github.embwl0x.nativeagent
+NATIVEAGENT_IOS_BUNDLE_ID = $(NATIVEAGENT_IOS_BUNDLE_PREFIX).ios
+NATIVEAGENT_IOS_TEST_BUNDLE_ID = $(NATIVEAGENT_IOS_BUNDLE_PREFIX).ios.tests
+NATIVEAGENT_ICLOUD_CONTAINER_ID = iCloud.io.github.embwl0x.nativeagent
+NATIVEAGENT_IOS_KVSTORE_ID_SUFFIX = io.github.embwl0x.nativeagent
+NATIVEAGENT_MOBILE_SOURCE_KEY = mobile_app

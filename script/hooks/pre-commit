@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# NativeAgent pre-commit secret + personal-data guard.
+#
+# Runs gitleaks against STAGED changes only, using the repo's .gitleaks.toml
+# (secret rules + owner personal-data rules). Blocks the commit if anything
+# matches. Bypass for a known-safe commit with:  git commit --no-verify
+#
+# Install (once):  ./script/hooks/install.sh
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "[pre-commit] gitleaks not installed — 'brew install gitleaks'. Skipping scan." >&2
+  echo "[pre-commit] (install it: the repo relies on this guard before public release.)" >&2
+  exit 0
+fi
+
+if ! gitleaks git --staged --no-banner --redact -c "$ROOT/.gitleaks.toml"; then
+  echo "" >&2
+  echo "[pre-commit] BLOCKED: gitleaks found a secret or personal-data leak in staged changes." >&2
+  echo "[pre-commit] Fix it, or if it is a verified false positive: git commit --no-verify" >&2
+  exit 1
+fi

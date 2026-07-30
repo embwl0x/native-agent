@@ -1,0 +1,88 @@
+DEFINE SCHEMA
+
+    RECORD TYPE NAChatMessage (
+        "___createTime"     TIMESTAMP,
+        "___createdBy"      REFERENCE,
+        "___etag"           STRING,
+        "___modTime"        TIMESTAMP QUERYABLE SORTABLE,
+        "___modifiedBy"     REFERENCE,
+        "___recordID"       REFERENCE QUERYABLE,
+        createdAt           STRING QUERYABLE SORTABLE,
+        direction           STRING QUERYABLE,
+        kind                STRING QUERYABLE,
+        notificationEventId STRING,
+        notificationScreen  STRING,
+        notificationTitle   STRING,
+        payloadJSON         STRING,
+        senderDevice        STRING,
+        sessionId           STRING,
+        text                STRING,
+        GRANT WRITE TO "_creator",
+        GRANT CREATE TO "_icloud",
+        GRANT READ TO "_world"
+    );
+
+    RECORD TYPE NANotification (
+        "___createTime"     TIMESTAMP,
+        "___createdBy"      REFERENCE,
+        "___etag"           STRING,
+        "___modTime"        TIMESTAMP QUERYABLE SORTABLE,
+        "___modifiedBy"     REFERENCE,
+        "___recordID"       REFERENCE QUERYABLE,
+        createdAt           STRING QUERYABLE SORTABLE,
+        direction           STRING QUERYABLE,
+        kind                STRING,
+        notificationEventId STRING,
+        notificationScreen  STRING,
+        notificationTitle   STRING,
+        payloadJSON         STRING,
+        senderDevice        STRING,
+        sessionId           STRING,
+        text                STRING,
+        GRANT WRITE TO "_creator",
+        GRANT CREATE TO "_icloud",
+        GRANT READ TO "_world"
+    );
+
+    RECORD TYPE NAPairingDevice (
+        "___createTime" TIMESTAMP,
+        "___createdBy"  REFERENCE,
+        "___etag"       STRING,
+        "___modTime"    TIMESTAMP,
+        "___modifiedBy" REFERENCE,
+        "___recordID"   REFERENCE QUERYABLE,
+        publishedAt     STRING,
+        role            STRING,
+        secretHex       STRING,
+        GRANT WRITE TO "_creator",
+        GRANT CREATE TO "_icloud",
+        GRANT READ TO "_world"
+    );
+
+    RECORD TYPE NAStatus (
+        "___createTime" TIMESTAMP,
+        "___createdBy"  REFERENCE,
+        "___etag"       STRING,
+        "___modTime"    TIMESTAMP,
+        "___modifiedBy" REFERENCE,
+        "___recordID"   REFERENCE QUERYABLE,
+        key             STRING,
+        role            STRING,
+        updatedAt       STRING,
+        value           STRING,
+        GRANT WRITE TO "_creator",
+        GRANT CREATE TO "_icloud",
+        GRANT READ TO "_world"
+    );
+
+    RECORD TYPE Users (
+        "___createTime" TIMESTAMP,
+        "___createdBy"  REFERENCE,
+        "___etag"       STRING,
+        "___modTime"    TIMESTAMP,
+        "___modifiedBy" REFERENCE,
+        "___recordID"   REFERENCE,
+        roles           LIST<INT64>,
+        GRANT WRITE TO "_creator",
+        GRANT READ TO "_world"
+    );

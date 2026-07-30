@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  PUBLIC production entitlements — Developer ID (direct download) distribution.
+
+  This is NativeAgent.entitlements MINUS every iCloud / ubiquity / background-
+  task key. Rationale (2026-07-04): a Developer-ID-signed app that declares
+  iCloud entitlements but ships without a matching provisioning profile is
+  KILLED by macOS at launch (the same trap install_app.sh documents). The
+  public downloadable build has no per-user iCloud pairing anyway — the
+  iCloud/iPhone-companion feature is a separate track — so it ships with no
+  iCloud entitlements and launches cleanly on any Mac.
+
+  The Developer ID release keeps only capabilities the public runtime uses.
+  Sparkle's nested code is signed by the same Developer ID identity, so the
+  ad-hoc-only library-validation exception does not belong here.
+-->
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.app-sandbox</key>
+  <false/>
+
+  <!-- TCC rejects Calendar prompts from hardened-runtime builds without this. -->
+  <key>com.apple.security.personal-information.calendars</key>
+  <true/>
+
+  <key>com.apple.security.network.client</key>
+  <true/>
+
+  <key>com.apple.security.network.server</key>
+  <true/>
+
+  <key>com.apple.security.files.user-selected.read-write</key>
+  <true/>
+
+  <key>com.apple.security.automation.apple-events</key>
+  <true/>
+
+  <key>com.apple.security.device.audio-input</key>
+  <true/>
+</dict>
+</plist>

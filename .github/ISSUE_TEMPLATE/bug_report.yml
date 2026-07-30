@@ -1,0 +1,59 @@
+name: Bug report
+description: Report a reproducible NativeAgent problem without sharing private data.
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve NativeAgent. Remove API keys, OAuth tokens,
+        pairing keys, private prompts, personal files, and unredacted support
+        archives before submitting.
+  - type: input
+    id: version
+    attributes:
+      label: NativeAgent version
+      description: Include the Mac version and iOS/iPadOS build when relevant.
+      placeholder: "0.3.0 (10)"
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: "macOS 26.6 on Apple silicon; iOS 26.5.2"
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the visible behavior and the result you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Open …
+        2. Select …
+        3. Observe …
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Include only the smallest relevant, secret-free receipt or error.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety checks
+      options:
+        - label: I removed credentials, pairing material, private prompts, and personal data.
+          required: true
+        - label: I searched existing issues for the same problem.
+          required: true

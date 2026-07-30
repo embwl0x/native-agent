@@ -1,0 +1,6 @@
+# Contributor secret guard. `bash script/hooks/install.sh` arms the pre-commit
+# hook that runs `gitleaks git --staged` against this config.
+title = "NativeAgent gitleaks config"
+
+[extend]
+useDefault = true

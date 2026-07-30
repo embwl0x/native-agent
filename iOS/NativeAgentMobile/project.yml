@@ -1,0 +1,147 @@
+name: NativeAgentMobile
+# PATCH-2026-05-06: ios-companion xcodegen spec for iOS companion app
+# Generate: xcodegen --spec iOS/NativeAgentMobile/project.yml
+# from repo root (NativeAgent/).
+
+options:
+  bundleIdPrefix: io.github.embwl0x.nativeagent
+  deploymentTarget:
+    iOS: "17.0"
+  xcodeVersion: "15.0"
+  createIntermediateGroups: true
+
+settings:
+  SWIFT_VERSION: "5.9"
+  # U4 (2026-07-09) stage 1: warnings-only strict concurrency. The Mac side is
+  # already Swift 6; iOS stays on the 5.9 language mode so data-race violations
+  # surface as WARNINGS rather than hard errors while the remaining call sites
+  # are worked through. Stage 2 bumps SWIFT_VERSION to 6 (turning these into
+  # errors) once the `// concurrency-stage2` markers are cleared.
+  SWIFT_STRICT_CONCURRENCY: complete
+  TARGETED_DEVICE_FAMILY: "1,2"  # iPhone + iPad
+  SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+  MARKETING_VERSION: "0.3.0"
+  CURRENT_PROJECT_VERSION: "10"
+  # Set DEVELOPMENT_TEAM locally in Xcode or on the xcodebuild command line
+  # for device builds. Do not commit a personal Apple Developer Team ID.
+  CODE_SIGN_STYLE: "Automatic"
+  # Debug uses Config/Public.xcconfig plus an optional ignored Local.xcconfig
+  # for the current development profile. Release uses Release.xcconfig, which
+  # accepts local account/URL material but reasserts the permanent public IDs
+  # from CanonicalIdentifiers.xcconfig afterward. Do NOT re-declare them here:
+  # project-level settings override configFiles and can silently split Mac/iOS
+  # pairing across different iCloud stores.
+
+configFiles:
+  Debug: Config/Public.xcconfig
+  Release: Config/Release.xcconfig
+
+packages:
+  NativeAgentShared:
+    path: ../../Modules/NativeAgentShared
+
+targets:
+  # 2026-06-11: first iOS unit-test target (ChatStore merge semantics; the
+  # chat-smoothness campaign will grow it). Hosted in the app for @testable.
+  NativeAgentMobileTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests
+    dependencies:
+      - target: NativeAgentMobile
+    settings:
+      GENERATE_INFOPLIST_FILE: YES
+      PRODUCT_BUNDLE_IDENTIFIER: $(NATIVEAGENT_IOS_TEST_BUNDLE_ID)
+  NativeAgentMobile:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      - path: Resources
+    dependencies:
+      - package: NativeAgentShared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(NATIVEAGENT_IOS_BUNDLE_ID)
+        INFOPLIST_FILE: Sources/Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # iOS remote control uses signed iCloud KVS/Drive messages only.
+      configs:
+        Debug:
+          NATIVEAGENT_APS_ENVIRONMENT: development
+          NATIVEAGENT_ICLOUD_ENVIRONMENT: Development
+        Release:
+          NATIVEAGENT_APS_ENVIRONMENT: production
+          NATIVEAGENT_ICLOUD_ENVIRONMENT: Production
+    # PATCH-2026-05-07: icloud-bridge iOS entitlements for iCloud Drive + KVS
+    entitlements:
+      path: Sources/NativeAgentMobile.entitlements
+      properties:
+        # Release archives must request production APNS/CloudKit. Keeping the
+        # environment in configuration-specific build settings prevents a
+        # development entitlement from surviving into an App Store archive.
+        aps-environment: $(NATIVEAGENT_APS_ENVIRONMENT)
+        com.apple.developer.icloud-container-environment: $(NATIVEAGENT_ICLOUD_ENVIRONMENT)
+        # 2026-07-04: required for APNS interruption-level "time-sensitive" to
+        # take effect — without it iOS silently downgrades the level and
+        # overnight pushes (dream/REM cards) stay silenced by Sleep Focus.
+        # NOTE: xcodegen REGENERATES the .entitlements file from this block;
+        # edits made directly to the plist are wiped on the next regen.
+        com.apple.developer.usernotifications.time-sensitive: true
+        com.apple.developer.icloud-container-identifiers:
+          - $(NATIVEAGENT_ICLOUD_CONTAINER_ID)
+        com.apple.developer.icloud-services:
+          # CK-1 (2026-07-05): additive. CloudDocuments keeps live KVS/Drive
+          # sync; CloudKit is the device-sync foundation. Keep both.
+          - CloudDocuments
+          - CloudKit
+        com.apple.developer.ubiquity-container-identifiers:
+          - $(NATIVEAGENT_ICLOUD_CONTAINER_ID)
+        com.apple.developer.ubiquity-kvstore-identifier: $(TeamIdentifierPrefix)$(NATIVEAGENT_IOS_KVSTORE_ID_SUFFIX)
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: "NativeAgent"
+        # NativeAgent uses CryptoKit only for authentication/integrity and Apple
+        # platform transport; it does not ship custom or non-exempt encryption.
+        ITSAppUsesNonExemptEncryption: false
+        NSMicrophoneUsageDescription: "Listen to push-to-talk so you can dictate messages to your agent."
+        NSPhotoLibraryUsageDescription: "NativeAgentMobile lets you attach photos from your library so your agent can see them in chat."
+        NSSpeechRecognitionUsageDescription: "Convert your voice to text so your agent can read what you said."
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        # Read by ICloudBridgeConstants + DoctorChecks — must live HERE, not
+        # hand-added to Info.plist, or the next xcodegen regen drops them.
+        NativeAgentICloudContainerID: "$(NATIVEAGENT_ICLOUD_CONTAINER_ID)"
+        NativeAgentMobileSourceKey: "$(NATIVEAGENT_MOBILE_SOURCE_KEY)"
+        NativeAgentPrivacyPolicyURL: "$(NATIVEAGENT_PRIVACY_POLICY_URL)"
+        NativeAgentSupportURL: "$(NATIVEAGENT_SUPPORT_URL)"
+        # CK-4: baked device-sync transport selector. iOS can't read a per-process
+        # env var on a standalone install, so DeviceSyncTransportResolver reads
+        # this Info.plist key (env var still overrides on macOS/tests). "cloudkit"
+        # routes the companion through CloudKit; "kvs" (or removing this) reverts.
+        NativeAgentDeviceSync: "cloudkit"
+        UILaunchScreen: {}
+        UIBackgroundModes: [remote-notification]
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+        UISupportedInterfaceOrientations~ipad: [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: false
+# CK-4: explicit shared scheme so command-line xcodebuild can resolve the
+# NativeAgentShared SPM package + sign for device (a plain -target build can't
+# resolve package deps; xcodegen wasn't emitting an app scheme on regen).
+schemes:
+  NativeAgentMobile:
+    build:
+      targets:
+        NativeAgentMobile: all
+        NativeAgentMobileTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - NativeAgentMobileTests
+    archive:
+      config: Release

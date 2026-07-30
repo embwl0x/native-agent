@@ -1,0 +1,58 @@
+{
+  "schemaVersion": 1,
+  "panel": {
+    "id": "workout-tracker",
+    "title": "Workouts",
+    "icon": "figure.run",
+    "tint": "#FF6B35",
+    "sections": [
+      {
+        "id": "header",
+        "kind": "header",
+        "title": "This week",
+        "subtitle": "{{stats.week_summary}}"
+      },
+      {
+        "id": "stats",
+        "kind": "stat_grid",
+        "items": [
+          {"label": "Workouts", "value": "{{stats.count}}"},
+          {"label": "Streak",   "value": "{{stats.streak}}"}
+        ]
+      },
+      {
+        "id": "recent",
+        "kind": "list",
+        "title": "Recent",
+        "data_source": "skill.workout-tracker.list_recent",
+        "row_template": {
+          "title": "{{item.name}}",
+          "subtitle": "{{item.date}} • {{item.duration}}",
+          "trailing_action": {"label": "View", "action": "open_detail"}
+        }
+      },
+      {
+        "id": "log-form",
+        "kind": "form",
+        "title": "Log a workout",
+        "fields": [
+          {"id": "name",     "label": "Name",     "type": "text",   "required": true},
+          {"id": "duration", "label": "Duration", "type": "number", "unit": "min"}
+        ],
+        "submit": {
+          "label": "Log",
+          "action": "skill.workout-tracker.log",
+          "on_success": {"refresh_section": "recent"}
+        }
+      },
+      {
+        "id": "actions",
+        "kind": "actions",
+        "items": [
+          {"label": "Set goal",  "action": "skill.workout-tracker.set_goal", "icon": "target"},
+          {"label": "Settings", "action": "open_settings"}
+        ]
+      }
+    ]
+  }
+}

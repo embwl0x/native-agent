@@ -1,0 +1,147 @@
+# Build artifacts
+.build/
+.swiftpm/
+**/build/
+DerivedData/
+*.xcresult/
+dist/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+*.token
+# Defense-in-depth: secrets currently rely on the blanket data/ ignore below,
+# but a future re-include (!data/...) or a move out of data/ could otherwise
+# commit credentials. These patterns block them regardless of location.
+*secrets*.json
+*secret*.json
+*credentials*.json
+*.p12
+*.pfx
+*.provisionprofile
+*.mobileprovision
+*.jks
+*.keystore
+.netrc
+.npmrc
+.pypirc
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+data/secrets/
+secrets/
+.secrets/
+
+# Local-only signing, release, and privacy inputs.
+local/
+*.local.xcconfig
+iOS/NativeAgentMobile/Config/Local.xcconfig
+*.local.entitlements
+privacy_denylist.*
+
+# Local runtime state
+.runtime/
+*.log
+daemon/*.bak.*
+
+# IDE
+.idea/
+.vscode/
+
+# Phase 11: persona — keep personal identity private, ship clean templates
+persona/SOUL.md
+persona/SOUL.md.*.bak
+persona/USER.md
+persona/USER.md.*.bak
+persona/VOICE.md
+persona/VOICE.md.*.bak
+persona/GROWTH.md
+persona/GROWTH.md.*.bak
+persona/*.lock
+# Phase 14: AGENTS.md is personal (template is committed; personal copy is gitignored)
+persona/AGENTS.md
+persona/AGENTS.md.*.bak
+persona/notes.jsonl
+persona/*/notes.jsonl
+persona/*.bak
+# PATCH-2026-05-30: catch backups with the .bak.<suffix> naming pattern too
+# (e.g. GROWTH.md.bak.pre-feedback-cleanup-2026-05-28). The existing
+# persona/*.bak and persona/SOUL.md.*.bak patterns only match files where
+# .bak is the literal suffix; this catches the other shape that cleanup
+# scripts produce, which was leaving the repo perpetually dirty and
+# pausing self-improvement.
+persona/*.bak.*
+# Per-persona local backups / private Agent vault digests stay local
+persona/*/*.bak
+persona/*/*.bak.*
+persona/*/workspace/
+# Agent-specific skill bodies are personal persona content, NOT generic
+# shippable capabilities. Blanket-ignore every agent-*.md body so a new one
+# can never leak by being missed off an explicit list (2026-07-04: agent-
+# soul-original.md + agent-taste.md had slipped past the enumerated form).
+persona/skills/bodies/agent-*.md
+# PATCH-2026-05-30: multi-agent inbox state. Per docs/agent_inbox/REPORTING.md,
+# each agent (Claude, Codex, etc.) appends standups to its own inbox file
+# before ending a session. These are persistent local state, never meant to
+# be committed — and like the persona backups, they were leaving the repo
+# perpetually dirty and pausing the self-improvement gate.
+docs/agent_inbox/
+# N13 fix (R16): per-persona identity files under persona/<name>/ must also be gitignored.
+# Without these, a second persona's SOUL.md/USER.md/VOICE.md/GROWTH.md would be committed.
+persona/*/SOUL.md
+persona/*/USER.md
+persona/*/VOICE.md
+persona/*/GROWTH.md
+persona/*/AGENTS.md
+persona/*/*.lock
+persona/*/SOUL.md.*.bak
+persona/*/USER.md.*.bak
+persona/*/VOICE.md.*.bak
+persona/*/GROWTH.md.*.bak
+persona/*/AGENTS.md.*.bak
+
+# Phase 11: runtime state stays local — entire data/ is gitignored except .gitkeep
+data/
+!data/.gitkeep
+
+# Phase 11b: Workspace — Agent's work product (drafts, scratch, generated files)
+# Contents are gitignored; .gitkeep preserves the directory in the repo.
+# Use workspace/* (not workspace/) so specific files below can be
+# re-included — git cannot un-ignore a file whose parent DIR is excluded.
+workspace/*
+!workspace/.gitkeep
+# Self-improvement E2E harness is the canonical regression test for the
+# snapshot/promote/pending lifecycle — track it despite the workspace/ ignore.
+!workspace/test_selfimprove_loop_e2e.py
+
+# Skill bodies are committed — they are built-in capabilities useful to everyone
+# (no ignore entry needed; persona/skills/bodies/ is not excluded above)
+.claude/
+iOS/NativeAgentMobile/NativeAgentMobile.xcodeproj/xcuserdata/
+iOS/NativeAgentMobile/NativeAgentMobile.xcodeproj/project.xcworkspace/xcuserdata/
+iOS/NativeAgentMobile/build/
+
+# Ad-hoc working backups created by Agent during ops (registry/inbox edits)
+.backups/
+data.backup.*/
+
+# Local Hermes builder coordination state is generated per worktree.
+.hermes-builder/
+
+# Hermes/codex agent job workspaces parked in the repo root (foreign embedded repos)
+.hermes-*/

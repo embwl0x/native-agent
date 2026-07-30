@@ -1,0 +1,90 @@
+{
+  "schemaVersion": 1,
+  "name": "slack",
+  "version": "1.0.0",
+  "type": "connector",
+  "description": "List channels, search messages, and post (with approval) to Slack via OAuth bot token.",
+  "author": {
+    "name": "Your Name",
+    "email": "you@example.com",
+    "url": "https://github.com/your-username"
+  },
+  "oauth": {
+    "provider": "slack",
+    "flow": "authorization_code",
+    "deviceFlow": false,
+    "scopes": [
+      "chat:write",
+      "channels:read",
+      "groups:read",
+      "im:read",
+      "mpim:read",
+      "search:read"
+    ],
+    "envVars": {
+      "clientId": "NATIVEAGENT_SLACK_CLIENT_ID",
+      "clientSecret": "NATIVEAGENT_SLACK_CLIENT_SECRET"
+    },
+    "redirectUri": "nativeagent://oauth/slack",
+    "setup": "Create a Slack App at https://api.slack.com/apps, add OAuth & Permissions scopes, set NATIVEAGENT_SLACK_CLIENT_ID and NATIVEAGENT_SLACK_CLIENT_SECRET. Add the redirect URI to the app's OAuth redirect URLs."
+  },
+  "endpoints": {
+    "baseUrl": "https://slack.com/api",
+    "authHeader": "Bearer {token}"
+  },
+  "tools": [
+    {
+      "name": "slack.list_channels",
+      "description": "List Slack channels (public and private) accessible to the bot.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "limit": { "type": "integer", "description": "Max channels to return (default 100)." }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "slack.search_messages",
+      "description": "Search Slack messages using a query string.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string", "description": "Slack search query, e.g. 'in:#general deploy'." },
+          "count": { "type": "integer", "description": "Max results (default 20)." }
+        },
+        "required": ["query"]
+      }
+    },
+    {
+      "name": "slack.post_message",
+      "description": "Post a message to a Slack channel. Requires explicit user approval.",
+      "requiresApproval": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "channel": { "type": "string", "description": "Channel ID or name (e.g. '#general' or 'C01234ABC')." },
+          "text": { "type": "string" }
+        },
+        "required": ["channel", "text"]
+      }
+    },
+    {
+      "name": "slack.list_unreads",
+      "description": "List Slack channels with unread messages.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    }
+  ],
+  "permissions": [
+    "network.slack",
+    "keychain_read",
+    "keychain_write"
+  ],
+  "tags": ["slack", "messaging", "channels", "productivity"],
+  "homepage": "https://github.com/your-username/NativeAgent",
+  "license": "MIT"
+}

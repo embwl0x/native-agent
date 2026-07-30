@@ -1,0 +1,41 @@
+name: Feature request
+description: Propose a focused improvement that preserves NativeAgent's architecture.
+title: "[Feature] "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What user problem should this solve?
+      description: Describe the normal-use outcome, not only a proposed subsystem.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Explain how it should work across the relevant Mac, iOS, and messaging surfaces.
+    validations:
+      required: true
+  - type: textarea
+    id: architecture
+    attributes:
+      label: Architectural fit
+      description: |
+        Note the existing owner this should extend. NativeAgent avoids duplicate
+        memory, policy, scheduling, orchestration, and agent owners.
+  - type: textarea
+    id: proof
+    attributes:
+      label: How could it be verified?
+      description: Describe the observable behavior or trust boundary a test should prove.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and documentation for this capability.
+          required: true
+        - label: This request does not depend on publishing private credentials or personal data.
+          required: true

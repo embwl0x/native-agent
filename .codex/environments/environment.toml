@@ -1,0 +1,11 @@
+[actions.Run]
+command = "./script/build_and_run.sh"
+description = "Build and launch the Swift-native NativeAgent app"
+
+[actions.Verify]
+command = "./script/build_and_run.sh --verify"
+description = "Build, launch, and verify the Swift-native NativeAgent app"
+
+[actions.Test]
+command = "./script/test.sh"
+description = "Run the canonical NativeAgent repository test gate"

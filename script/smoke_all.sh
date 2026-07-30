@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+export CLANG_MODULE_CACHE_PATH="$ROOT/.runtime/clang-module-cache"
+export SWIFT_MODULE_CACHE_PATH="$ROOT/.runtime/swift-module-cache"
+mkdir -p "$CLANG_MODULE_CACHE_PATH" "$SWIFT_MODULE_CACHE_PATH"
+
+echo "[smoke] architecture blueprint drift"
+"$ROOT/script/check_architecture_blueprint.swift" --repo "$ROOT"
+
+echo "[smoke] production timer/deadline ownership"
+"$ROOT/script/check_timer_inventory.swift" --repo "$ROOT"
+
+echo "[smoke] persona hygiene"
+"$ROOT/script/check_persona_skill_hygiene.swift" --repo "$ROOT"
+
+echo "[smoke] Swift build"
+swift build --package-path "$ROOT"
+
+echo "[smoke] Native tool dispatch: get_persona_doc"
+swift run --package-path "$ROOT/Modules/NativeAgentCore" chat-drive \
+  dispatch get_persona_doc '{"doc":"SOUL"}'
+
+echo "[smoke] Native tool dispatch: list_skills"
+swift run --package-path "$ROOT/Modules/NativeAgentCore" chat-drive \
+  dispatch list_skills '{}'
+
+echo "[smoke] Native memory recall"
+swift run --package-path "$ROOT/Modules/NativeAgentCore" chat-drive \
+  dispatch recall_memory '{"query":"the user","limit":3}'
+
+echo "[smoke] Swift-native smoke passed"

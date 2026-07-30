@@ -1,0 +1,161 @@
+{
+  "schemaVersion": 1,
+  "name": "github",
+  "version": "1.0.0",
+  "type": "connector",
+  "description": "Create issues, list repos, and search GitHub from chat.",
+  "author": {
+    "name": "Your Name",
+    "email": "you@example.com",
+    "url": "https://github.com/your-username"
+  },
+  "oauth": {
+    "provider": "github",
+    "scopes": ["repo", "issues:write"],
+    "deviceFlow": true
+  },
+  "endpoints": {
+    "baseUrl": "https://api.github.com",
+    "authHeader": "Bearer {token}"
+  },
+  "tools": [
+    {
+      "name": "gh.create_issue",
+      "description": "Create a new GitHub issue in a repository.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "owner": {
+            "type": "string",
+            "description": "Repository owner (username or org name)."
+          },
+          "repo": {
+            "type": "string",
+            "description": "Repository name."
+          },
+          "title": {
+            "type": "string",
+            "description": "Issue title."
+          },
+          "body": {
+            "type": "string",
+            "description": "Issue body in Markdown. Optional."
+          },
+          "labels": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Labels to apply. Optional."
+          }
+        },
+        "required": ["owner", "repo", "title"]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "issueNumber": {
+            "type": "integer",
+            "description": "The newly created issue number."
+          },
+          "url": {
+            "type": "string",
+            "description": "HTML URL of the created issue."
+          }
+        },
+        "required": ["issueNumber", "url"]
+      }
+    },
+    {
+      "name": "gh.list_repos",
+      "description": "List repositories visible to the authenticated user.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "affiliation": {
+            "type": "string",
+            "enum": ["owner", "collaborator", "organization_member"],
+            "description": "Filter by affiliation. Defaults to owner."
+          },
+          "sort": {
+            "type": "string",
+            "enum": ["created", "updated", "pushed", "full_name"],
+            "description": "Sort order. Defaults to updated."
+          },
+          "perPage": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "description": "Results per page. Defaults to 30."
+          }
+        },
+        "required": []
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "repos": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "fullName": {"type": "string"},
+                "description": {"type": "string"},
+                "private": {"type": "boolean"},
+                "updatedAt": {"type": "string"}
+              }
+            }
+          },
+          "total": {"type": "integer"}
+        },
+        "required": ["repos", "total"]
+      }
+    },
+    {
+      "name": "gh.search_issues",
+      "description": "Search GitHub issues and pull requests using a query string.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "GitHub search query, e.g. 'repo:owner/repo is:open label:bug'."
+          },
+          "perPage": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "description": "Results per page. Defaults to 20."
+          }
+        },
+        "required": ["query"]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "totalCount": {"type": "integer"},
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "number": {"type": "integer"},
+                "title": {"type": "string"},
+                "state": {"type": "string"},
+                "url": {"type": "string"},
+                "createdAt": {"type": "string"}
+              }
+            }
+          }
+        },
+        "required": ["totalCount", "items"]
+      }
+    }
+  ],
+  "permissions": [
+    "network.public",
+    "keychain_read",
+    "keychain_write"
+  ],
+  "tags": ["github", "dev", "issues"],
+  "homepage": "https://github.com/your-username/NativeAgent",
+  "license": "MIT"
+}

@@ -1,0 +1,102 @@
+{
+  "schemaVersion": 1,
+  "name": "gmail",
+  "version": "1.0.0",
+  "type": "connector",
+  "description": "Read inbox, draft, and send Gmail messages from chat. Requires Google OAuth (installed-app flow).",
+  "author": {
+    "name": "Your Name",
+    "email": "you@example.com",
+    "url": "https://github.com/your-username"
+  },
+  "oauth": {
+    "provider": "email",
+    "flow": "authorization_code",
+    "deviceFlow": false,
+    "scopes": [
+      "https://www.googleapis.com/auth/gmail.readonly",
+      "https://www.googleapis.com/auth/gmail.compose",
+      "https://www.googleapis.com/auth/gmail.send"
+    ],
+    "envVars": {
+      "clientId": "NATIVEAGENT_GMAIL_CLIENT_ID",
+      "clientSecret": "NATIVEAGENT_GMAIL_CLIENT_SECRET"
+    },
+    "redirectUri": "nativeagent://oauth/gmail",
+    "setup": "Register an OAuth 2.0 Desktop/Installed App at https://console.cloud.google.com/, enable Gmail API, set NATIVEAGENT_GMAIL_CLIENT_ID and NATIVEAGENT_GMAIL_CLIENT_SECRET."
+  },
+  "endpoints": {
+    "baseUrl": "https://gmail.googleapis.com/gmail/v1/users/me",
+    "authHeader": "Bearer {token}"
+  },
+  "tools": [
+    {
+      "name": "gmail.list_inbox",
+      "description": "List recent inbox messages, optionally filtered by a Gmail search query.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string", "description": "Gmail search query, e.g. 'is:unread from:boss@example.com'." },
+          "max": { "type": "integer", "description": "Max results (default 10)." }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "gmail.read",
+      "description": "Read a full Gmail message by its ID.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "description": "Gmail message ID." }
+        },
+        "required": ["id"]
+      }
+    },
+    {
+      "name": "gmail.draft",
+      "description": "Create a Gmail draft.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "to": { "type": "string", "description": "Recipient email address." },
+          "subject": { "type": "string" },
+          "body": { "type": "string" }
+        },
+        "required": ["to"]
+      }
+    },
+    {
+      "name": "gmail.send",
+      "description": "Send a previously created draft. Requires explicit user approval.",
+      "requiresApproval": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "draftId": { "type": "string", "description": "Draft ID returned by gmail.draft." }
+        },
+        "required": ["draftId"]
+      }
+    },
+    {
+      "name": "gmail.search",
+      "description": "Search Gmail messages by query.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string" },
+          "max": { "type": "integer" }
+        },
+        "required": ["query"]
+      }
+    }
+  ],
+  "permissions": [
+    "network.google",
+    "keychain_read",
+    "keychain_write"
+  ],
+  "tags": ["email", "gmail", "google", "productivity"],
+  "homepage": "https://github.com/your-username/NativeAgent",
+  "license": "MIT"
+}

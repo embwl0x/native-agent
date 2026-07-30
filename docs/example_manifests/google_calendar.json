@@ -1,0 +1,94 @@
+{
+  "schemaVersion": 1,
+  "name": "google_calendar",
+  "version": "1.0.0",
+  "type": "connector",
+  "description": "List events, check availability, create and cancel calendar events via Google Calendar OAuth.",
+  "author": {
+    "name": "Your Name",
+    "email": "you@example.com",
+    "url": "https://github.com/your-username"
+  },
+  "oauth": {
+    "provider": "calendar",
+    "flow": "authorization_code",
+    "deviceFlow": false,
+    "scopes": [
+      "https://www.googleapis.com/auth/calendar"
+    ],
+    "envVars": {
+      "clientId": "NATIVEAGENT_GCAL_CLIENT_ID",
+      "clientSecret": "NATIVEAGENT_GCAL_CLIENT_SECRET"
+    },
+    "redirectUri": "nativeagent://oauth/calendar",
+    "setup": "Register an OAuth 2.0 Desktop/Installed App at https://console.cloud.google.com/, enable Google Calendar API, set NATIVEAGENT_GCAL_CLIENT_ID and NATIVEAGENT_GCAL_CLIENT_SECRET."
+  },
+  "endpoints": {
+    "baseUrl": "https://www.googleapis.com/calendar/v3",
+    "authHeader": "Bearer {token}"
+  },
+  "tools": [
+    {
+      "name": "calendar.list_events",
+      "description": "List calendar events in a time range.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "start": { "type": "string", "description": "RFC3339 start datetime, e.g. '2026-05-06T09:00:00Z'." },
+          "end": { "type": "string", "description": "RFC3339 end datetime." },
+          "max": { "type": "integer", "description": "Max results (default 20)." }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "calendar.create_event",
+      "description": "Create a calendar event. Requires explicit user approval.",
+      "requiresApproval": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "title": { "type": "string" },
+          "start": { "type": "string", "description": "RFC3339 datetime." },
+          "end": { "type": "string", "description": "RFC3339 datetime." },
+          "attendees": { "type": "array", "items": { "type": "string" }, "description": "Email addresses." },
+          "description": { "type": "string" },
+          "timeZone": { "type": "string", "description": "IANA timezone (default UTC)." }
+        },
+        "required": ["title", "start", "end"]
+      }
+    },
+    {
+      "name": "calendar.find_availability",
+      "description": "Find free time slots for a meeting of given duration.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "duration_min": { "type": "integer", "description": "Required duration in minutes." },
+          "window_days": { "type": "integer", "description": "Days to look ahead (default 7)." }
+        },
+        "required": ["duration_min"]
+      }
+    },
+    {
+      "name": "calendar.cancel_event",
+      "description": "Cancel (delete) a calendar event. Requires explicit user approval.",
+      "requiresApproval": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "eventId": { "type": "string", "description": "Google Calendar event ID." }
+        },
+        "required": ["eventId"]
+      }
+    }
+  ],
+  "permissions": [
+    "network.google",
+    "keychain_read",
+    "keychain_write"
+  ],
+  "tags": ["calendar", "google", "scheduling", "productivity"],
+  "homepage": "https://github.com/your-username/NativeAgent",
+  "license": "MIT"
+}

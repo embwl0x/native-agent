@@ -1,0 +1,5 @@
+// Keep local account material such as DEVELOPMENT_TEAM and hosted URLs, but
+// reassert canonical distribution identifiers afterward so an old development
+// profile cannot silently stamp a Release archive with legacy IDs.
+#include? "Local.xcconfig"
+#include "CanonicalIdentifiers.xcconfig"

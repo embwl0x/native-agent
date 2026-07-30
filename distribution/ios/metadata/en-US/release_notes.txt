@@ -1,0 +1,1 @@
+Initial App Store release of the NativeAgent companion for Mac.
