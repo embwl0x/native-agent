@@ -15,8 +15,8 @@ trust, transcript, and receipt rules converge on the same orchestration path.
 
 > NativeAgent is an advanced single-operator project. The source, tests,
 > personal install flow, public-export gate, Developer ID/notarization pipeline,
-> and signed-update machinery are real. The public GitHub release has not yet
-> been published, and connector depth varies; see
+> and signed-update machinery are real. The public source repository is live;
+> a notarized binary GitHub Release is still pending, and connector depth varies; see
 > [Project Status](PROJECT_STATUS.md) for the honest capability ledger.
 
 ## What exists today
@@ -33,9 +33,9 @@ trust, transcript, and receipt rules converge on the same orchestration path.
 | Surfaces | Mac chat, detached chat windows, iPhone/iPad, Telegram, Slack, local Codex/Claude Code bridges, and background work share the same agent factory and policy boundaries. |
 | Providers | ChatGPT OAuth, Codex CLI, OpenAI API, Anthropic OAuth/API, xAI OAuth, Moonshot API, and OpenRouter have distinct model/capability contracts. Current verified catalogs include GPT-5.6 variants, Claude 5/Fable/Opus, Grok 4.5, and Kimi K3. Moonshot keys stay Mac-local and refresh the account-visible Kimi model list. Swarms default to the provider/model selected for the Swarms surface; the agent may choose explicit worker models when useful. |
 | Connectors | Telegram, Slack, GitHub, X, Gmail, Google Calendar, Notion, local workspaces, Mac apps, and the visible browser have explicit setup and proof boundaries. Gmail, Calendar, and Notion reads are bounded and lazy-loaded; public users provide their own OAuth app or integration token locally. |
+| Trust | TrustCenter, SecurityCenter, Full Mac gates, connector proof, approval replay, exact receipts, signed iOS actions, and fail-closed persistence boundaries remain authoritative. |
 
 Local bridge clients should read `~/.config/claude-bridge/bridge.json`. NativeAgent prefers port 8771, advances when it is occupied, and publishes the actual loopback URL and bearer token together rather than requiring clients to assume a fixed port.
-| Trust | TrustCenter, SecurityCenter, Full Mac gates, connector proof, approval replay, exact receipts, signed iOS actions, and fail-closed persistence boundaries remain authoritative. |
 
 The detailed, evidence-backed inventory lives in
 [docs/CAPABILITIES.md](docs/CAPABILITIES.md).
