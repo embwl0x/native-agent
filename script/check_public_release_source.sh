@@ -20,4 +20,15 @@ fail() {
 git -C "$ROOT" ls-files --error-unmatch -- ".nativeagent-public-source" >/dev/null 2>&1 \
   || fail "public export marker must be tracked by the release commit"
 
-echo "[public-source] verified tracked scrubbed-export marker"
+REQUIRED_TRACKED_RESOURCES=(
+  "Modules/NativeAgentCore/Sources/MemoryV2/Resources/minilm_vocab.txt"
+  "Modules/NativeAgentCore/Sources/MemoryV2/Resources/minilm.mlpackage/Manifest.json"
+  "Modules/NativeAgentCore/Sources/MemoryV2/Resources/minilm.mlpackage/Data/com.apple.CoreML/model.mlmodel"
+  "Modules/NativeAgentCore/Sources/MemoryV2/Resources/minilm.mlpackage/Data/com.apple.CoreML/weights/weight.bin"
+)
+for resource in "${REQUIRED_TRACKED_RESOURCES[@]}"; do
+  git -C "$ROOT" ls-files --error-unmatch -- "$resource" >/dev/null 2>&1 \
+    || fail "public release requires tracked MiniLM resource: $resource"
+done
+
+echo "[public-source] verified tracked scrubbed-export marker and MiniLM resources"
