@@ -16,7 +16,7 @@ trust, transcript, and receipt rules converge on the same orchestration path.
 > NativeAgent is an advanced single-operator project. The source, tests,
 > personal install flow, public-export gate, Developer ID/notarization pipeline,
 > and signed-update machinery are real. The public source repository is live;
-> a notarized binary GitHub Release is still pending, and connector depth varies; see
+> a notarized binary GitHub Release is live, and connector depth varies; see
 > [Project Status](PROJECT_STATUS.md) for the honest capability ledger.
 
 ## What exists today
