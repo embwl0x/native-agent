@@ -1,10 +1,17 @@
 # NativeAgent Project Status
 
-Last updated: 2026-07-29
+Last updated: 2026-07-31
 
 ## Summary
 
 NativeAgent is a Swift-native macOS + iOS personal agent runtime. The macOS app owns the runtime in-process; the iOS app is a first-class remote cockpit over iCloud/APNS. Runtime state, persona files, credentials, local signing material, and work products are local-only and ignored by git.
+
+The public repository now uses the teal Living Core product icon consistently
+across its README, checked-in Mac iconset, packaged Mac icon, and iOS/App Store
+identity. `docs/USER_GUIDE.md` is the compact user-and-agent operating map for
+setup, every visible surface, Subconscious/Organism activation, Fluid Context,
+trust, tools/skills, Workshop, connectors, mobile continuity, verification,
+and diagnostics; `docs/CAPABILITIES.md` remains the deeper capability tour.
 
 The public notification path no longer depends on a NativeAgent-hosted APNS
 provider. Explicit alerts use a dedicated `NANotification` CloudKit private
@@ -136,15 +143,16 @@ identity, Developer ID profile, and App Store profile are registered and
 installed. A real local App Store export verifies the exact production
 APNS/CloudKit entitlements and distribution signature. The permanent App Store
 Connect record is Apple ID `6795542051`; version `0.3.0` has its public
-metadata, URLs, categories, and manual-release policy. TestFlight
+metadata, screenshots, URLs, categories, free worldwide availability, and
+manual-release policy. App Privacy is published as `Data Not Collected`, the
+content-rights and `13+` age-rating declarations are complete, and build `10`
+is submitted with App Store Connect status `Waiting for Review`. TestFlight
 `0.3.0 (10)` is processed, installed, and physically verified against the
 production bundle/container while the separate personal development app
 remains isolated. Key-free pairing, chat replies, provider/model projection,
 skills/tools sync, and a 3/3 iCloud-only locked-screen notification run are
-proven. Fresh ordinary-account coverage, final screenshots, copyright holder,
-review contact/instructions, compliance declarations, and Apple's 4.2.3
-companion-app review decision remain account-owner submission work—not
-conditions the source or runtime may fake.
+proven. Apple review and its companion-app policy decision are now the remaining
+external gates; the release stays manual after approval.
 
 The iOS companion now offers root-owned System/Light/Dark appearance, honors
 Reduce Motion for shared decorative effects, and uses 44-point primary chat

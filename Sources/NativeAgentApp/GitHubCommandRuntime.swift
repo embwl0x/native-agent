@@ -169,7 +169,9 @@ actor GitHubCommandRuntime {
         codexStatus: String,
         summary: String,
         threadId: String?,
-        turnId: String?
+        turnId: String?,
+        errorMessage: String? = nil,
+        noWorkObserved: Bool? = nil
     ) async {
         do {
             let items = try await store.recordCallback(
@@ -177,7 +179,9 @@ actor GitHubCommandRuntime {
                 codexStatus: codexStatus,
                 summary: summary,
                 threadId: threadId,
-                turnId: turnId
+                turnId: turnId,
+                errorMessage: errorMessage,
+                noWorkObserved: noWorkObserved
             )
             await observeOutcomes(items)
             var observations: [GitHubCommandObservation] = []

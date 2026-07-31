@@ -293,7 +293,7 @@ final class iCloudBridge: ObservableObject {
                 return
             }
             available = false
-            syncStatus = "iCloud unavailable — sign into iCloud in Settings → [Your Name]"
+            syncStatus = "iCloud unavailable — sign into iCloud in Settings → Apple Account"
             isSetUp = false  // allow retry
             return
         }

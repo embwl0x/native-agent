@@ -12,6 +12,8 @@ installation.
 - Privacy policy: **https://nativeagent.app/privacy**
 - Source repository: **https://github.com/embwl0x/native-agent**
 - Release notes: **https://github.com/embwl0x/native-agent/releases**
+- User and agent guide:
+  **https://github.com/embwl0x/native-agent/blob/main/docs/USER_GUIDE.md**
 
 ## Requirements
 

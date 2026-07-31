@@ -222,7 +222,7 @@ test("completed-without-reply never starts another thread or exec fallback", asy
   assert.equal(execution.turnResult.status, "completed_without_reply");
 });
 
-test("reply wait timeouts remain pending until exact terminal evidence", async () => {
+test("reply wait timeouts remain pending while the rollout keeps moving", async () => {
   const results = [
     { status: "timeout", waitSource: "exact_timeout" },
     { status: "timeout", waitSource: "exact_timeout" },
@@ -230,6 +230,8 @@ test("reply wait timeouts remain pending until exact terminal evidence", async (
   ];
   let timeouts = 0;
   let waits = 0;
+  let snapshots = 0;
+  let probeCalls = 0;
   const execution = await wakeup.waitForDurableTerminalExecution({
     threadId: "thread-pending",
     turnId: "turn-pending",
@@ -238,11 +240,163 @@ test("reply wait timeouts remain pending until exact terminal evidence", async (
       waits += 1;
       return results.shift();
     },
+    // A growing session file is legitimate long work: the stall count must
+    // reset every window and the liveness probe must never fire.
+    rolloutStallSnapshot: () => {
+      snapshots += 1;
+      return { path: "/tmp/rollout.jsonl", ino: 1, size: snapshots, mtimeMs: snapshots };
+    },
+    probeTurnLiveness: async () => {
+      probeCalls += 1;
+      return { serverReachable: false, turnFound: false, turnClaimsInProgress: false };
+    },
   });
 
   assert.equal(waits, 3);
   assert.equal(timeouts, 2);
+  assert.equal(probeCalls, 0);
   assert.equal(execution.turnResult.status, "completed");
+});
+
+// ------------------------------------------- stalled turns (task #46, 2026-07-30)
+
+test("a dead app-server with a stagnant rollout stalls after one full window", async () => {
+  let timeouts = 0;
+  let waits = 0;
+  const job = { threadId: "thread-stall", turnId: "turn-stall" };
+  const execution = await wakeup.waitForDurableTerminalExecution(job, {}, async () => { timeouts += 1; }, {
+    waitForTurnResult: async () => {
+      waits += 1;
+      return { status: "timeout", waitSource: "exact_timeout" };
+    },
+    rolloutStallSnapshot: () => ({ path: "/tmp/rollout.jsonl", ino: 7, size: 100, mtimeMs: 5 }),
+    probeTurnLiveness: async () => ({ serverReachable: false, turnFound: false, turnClaimsInProgress: false }),
+  });
+
+  // Window 1 establishes the baseline; window 2 proves stagnation and the
+  // dead probe converts it to a terminal stalled verdict.
+  assert.equal(waits, 2);
+  assert.equal(timeouts, 1);
+  assert.equal(execution.turnResult.status, "stalled");
+  assert.equal(execution.turnResult.stallEvidence.serverReachable, false);
+  assert.equal(execution.turnResult.stallEvidence.stagnantWindows, 1);
+  // No rollout content was scanned (path is fake), so work state is unknown.
+  assert.equal(execution.turnResult.noWorkObserved, null);
+});
+
+test("an inProgress-claiming turn gets one extra stagnant window before stalling", async () => {
+  let waits = 0;
+  let probeCalls = 0;
+  const job = { threadId: "thread-wedged", turnId: "turn-wedged" };
+  const execution = await wakeup.waitForDurableTerminalExecution(job, {}, async () => {}, {
+    waitForTurnResult: async () => {
+      waits += 1;
+      return { status: "timeout", waitSource: "exact_timeout" };
+    },
+    rolloutStallSnapshot: () => ({ path: "/tmp/rollout.jsonl", ino: 7, size: 100, mtimeMs: 5 }),
+    probeTurnLiveness: async () => {
+      probeCalls += 1;
+      return { serverReachable: true, turnFound: true, turnClaimsInProgress: true };
+    },
+  });
+
+  // baseline, stagnant=1 (probe says inProgress -> benefit of the doubt),
+  // stagnant=2 -> wedged verdict.
+  assert.equal(waits, 3);
+  assert.equal(probeCalls, 2);
+  assert.equal(execution.turnResult.status, "stalled");
+  assert.equal(execution.turnResult.stallEvidence.turnClaimsInProgress, true);
+  assert.equal(execution.turnResult.stallEvidence.stagnantWindows, 2);
+});
+
+test("a flaky thread/read (reachable-but-unconfirmed) never stalls in one window", async () => {
+  // The probe's catch shape for a reachable server whose thread/read failed:
+  // found + inProgress. One stagnant window must keep waiting; only the
+  // two-window wedged path may conclude. Regression for the gpt-5.5 review
+  // BLOCKING where turnFound:false here fed the one-window dead-liveness arm.
+  const flakyProbeShape = { serverReachable: true, turnFound: true, turnClaimsInProgress: true };
+  const results = [
+    { status: "timeout", waitSource: "exact_timeout" },
+    { status: "timeout", waitSource: "exact_timeout" },
+    { status: "completed", message: "done late but done" },
+  ];
+  let probeCalls = 0;
+  const execution = await wakeup.waitForDurableTerminalExecution(
+    { threadId: "thread-flaky", turnId: "turn-flaky" }, {}, async () => {}, {
+      waitForTurnResult: async () => results.shift(),
+      rolloutStallSnapshot: () => ({ path: "/tmp/rollout.jsonl", ino: 9, size: 10, mtimeMs: 1 }),
+      probeTurnLiveness: async () => {
+        probeCalls += 1;
+        return flakyProbeShape;
+      },
+    });
+
+  // baseline window, then ONE stagnant window probed as unconfirmed -> keep
+  // waiting -> the turn completes on the next wait.
+  assert.equal(probeCalls, 1);
+  assert.equal(execution.turnResult.status, "completed");
+});
+
+test("a stalled verdict reads observed activity from the real rollout for resend guidance", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-stall-activity-"));
+  const rollout = path.join(dir, "rollout.jsonl");
+  fs.writeFileSync(rollout, [
+    JSON.stringify({ type: "event_msg", payload: { type: "task_started", turn_id: "turn-act" } }),
+    JSON.stringify({ type: "response_item", payload: { type: "function_call", name: "shell" } }),
+  ].join("\n") + "\n");
+  const execution = await wakeup.waitForDurableTerminalExecution(
+    { threadId: "thread-act", turnId: "turn-act" }, {}, async () => {}, {
+      waitForTurnResult: async () => ({ status: "timeout", waitSource: "exact_timeout" }),
+      rolloutStallSnapshot: () => ({ path: rollout, ino: 1, size: 2, mtimeMs: 3 }),
+      probeTurnLiveness: async () => ({ serverReachable: true, turnFound: false, turnClaimsInProgress: false }),
+    });
+
+  assert.equal(execution.turnResult.status, "stalled");
+  assert.equal(execution.turnResult.noWorkObserved, false);
+  assert.equal(execution.turnResult.toolActivityCount, 1);
+
+  const noWork = path.join(dir, "rollout-nowork.jsonl");
+  fs.writeFileSync(noWork, JSON.stringify(
+    { type: "event_msg", payload: { type: "task_started", turn_id: "turn-idle" } }
+  ) + "\n");
+  const idle = await wakeup.waitForDurableTerminalExecution(
+    { threadId: "thread-idle", turnId: "turn-idle" }, {}, async () => {}, {
+      waitForTurnResult: async () => ({ status: "timeout", waitSource: "exact_timeout" }),
+      rolloutStallSnapshot: () => ({ path: noWork, ino: 1, size: 1, mtimeMs: 1 }),
+      probeTurnLiveness: async () => ({ serverReachable: false, turnFound: false, turnClaimsInProgress: false }),
+    });
+  assert.equal(idle.turnResult.status, "stalled");
+  assert.equal(idle.turnResult.noWorkObserved, true);
+});
+
+test("extractTurnResultFromRollout stays null without the includeNonTerminal flag", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-inflight-"));
+  const rollout = path.join(dir, "rollout.jsonl");
+  fs.writeFileSync(rollout, JSON.stringify(
+    { type: "event_msg", payload: { type: "task_started", turn_id: "turn-open" } }
+  ) + "\n");
+  assert.equal(wakeup.extractTurnResultFromRollout(rollout, "turn-open"), null);
+  const scanned = wakeup.extractTurnResultFromRollout(rollout, "turn-open", { includeNonTerminal: true });
+  assert.equal(scanned.status, "in_flight");
+  assert.equal(scanned.sawTurnStart, true);
+  assert.equal(scanned.toolActivityCount, 0);
+});
+
+test("the stalled bridge message names the cause and the resend safety", () => {
+  const text = wakeup.formatCodexReplyForNativeAgent({
+    entries: [entry({ messageId: "m-stall", text: "long refactor", topic: "repo" })],
+    turnId: "turn-stall",
+  }, {
+    status: "stalled",
+    completedAt: "2026-07-30T22:00:00Z",
+    noWorkObserved: true,
+    stallEvidence: { serverReachable: false, turnFound: false, turnClaimsInProgress: false, stagnantWindows: 1 },
+  });
+  assert.match(text, /Codex turn stalled\./);
+  assert.match(text, /will not complete on its own/);
+  assert.match(text, /app-server is no longer reachable/);
+  assert.match(text, /never executed, so resending it cannot stomp partial work/);
+  assert.match(text, /retry only after an explicit decision/);
 });
 
 test("inbox consumption waits until the reply job is durable", async () => {

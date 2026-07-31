@@ -75,7 +75,7 @@ struct PairingView: View {
                             .disabled(!pairingStore.isICloudSigned)
                         }
                     } else {
-                        Text("Sign into iCloud in Settings → [Your Name] to enable pairing.")
+                        Text("Sign into iCloud in Settings → Apple Account to enable pairing.")
                             .font(.callout)
                             .foregroundStyle(.orange)
                             .multilineTextAlignment(.center)

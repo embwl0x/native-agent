@@ -121,6 +121,16 @@ public protocol MemoryRecalling: Sendable {
         persona: String?,
         surface: String?
     ) async throws -> [MemoryRecallHit]
+    /// Bump use_count/last_used_at for memory records served into a turn by
+    /// Fluid Context (task #42). On active ContextFlow turns the legacy recall
+    /// lane — whose recordRecallHits call is the only other access-bump path —
+    /// is skipped entirely, so packet-served memories otherwise read as
+    /// "unused" to hygiene/eviction, starving exactly the hot rows. Must be a
+    /// protocol REQUIREMENT (not extension-only) so existential dispatch
+    /// reaches the production adapter (same trap as `matchesTombstone`).
+    /// Non-throwing: implementations log failures; a dropped bump self-heals
+    /// on any later serve.
+    func recordServedContextHits(ids: [String]) async
 }
 
 public extension MemoryRecalling {
@@ -136,6 +146,10 @@ public extension MemoryRecalling {
     ) async throws -> [MemoryRecallHit] {
         try await recall(query, k: k)
     }
+
+    /// Default no-op: legacy recallers and test fixtures track no access
+    /// signals. The production V2 adapter overrides this with a real bump.
+    func recordServedContextHits(ids: [String]) async {}
 }
 
 extension SwiftNativeMemoryRecaller: MemoryRecalling {}
@@ -828,6 +842,17 @@ public actor SwiftNativeTurnEngine {
                 if $1.pointer.kind == .memory || $1.pointer.kind == .correction { $0 += 1 }
             }
             trace.setMemoryRecallOutcome(.contextFlow(hitCount: memoryAtomCount))
+            // Task #42: these records are being SERVED into the live turn, and
+            // the legacy recall lane (the only other use_count bump) is skipped
+            // on this branch. Fire-and-forget after the outcome is traced —
+            // zero read latency, mirroring the recall lane's own bump. Only
+            // reachable in .active mode inside a real turn: shadow prepares
+            // detached and discards, and the frozen/eval lane never runs this
+            // engine, so neither can pollute access signals.
+            let servedIds = preparedContextTurn.selectedMemoryRecordIDs
+            if !servedIds.isEmpty, let memory {
+                Task { await memory.recordServedContextHits(ids: servedIds) }
+            }
         } else if let memory {
             let recallQuery = recallQueryOverride?
                 .trimmingCharacters(in: .whitespacesAndNewlines)

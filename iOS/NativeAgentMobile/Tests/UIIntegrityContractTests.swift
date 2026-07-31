@@ -56,6 +56,16 @@ final class UIIntegrityContractTests: XCTestCase {
         XCTAssertTrue(actions.contains("requireSuccessfulActionResponse"))
     }
 
+    func testPublicPairingCopyContainsNoTemplatePlaceholder() throws {
+        let pairing = try Self.source("PairingView.swift")
+        let bridge = try Self.source("iCloudBridge.swift")
+
+        XCTAssertFalse(pairing.contains("[Your Name]"))
+        XCTAssertFalse(bridge.contains("[Your Name]"))
+        XCTAssertTrue(pairing.contains("Settings → Apple Account"))
+        XCTAssertTrue(bridge.contains("Settings → Apple Account"))
+    }
+
     func testAppearanceIsOwnedAtTheAppRootAndExposedInSettings() throws {
         let design = try Self.source("NativeAgentDesign.swift")
         let app = try Self.source("NativeAgentMobileApp.swift")

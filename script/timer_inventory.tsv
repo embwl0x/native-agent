@@ -10,7 +10,6 @@ Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+AgentBridg
 Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+SubprocessSupport.swift	*	3	timeout_retry_deadline	ToolSubprocessOwner
 Modules/NativeAgentCore/Sources/Context/ContextSourceMonitoring.swift	*	1	event_deadline	ContextSourceDebouncer
 Modules/NativeAgentCore/Sources/Dispatcher/Actions/FileSystemActions.swift	*	2	timeout_retry_deadline	FileSystemProcessOwner
-Modules/NativeAgentCore/Sources/DoctorChecks/DoctorChecks.swift	*	1	timeout_retry_deadline	RetiredDaemonProcessCheck.boundedWaitUntilExit
 Modules/NativeAgentCore/Sources/MCPDispatcher/MCPHTTPTransport.swift	*	1	timeout_retry_deadline	MCPHTTPRetryBackoff
 Modules/NativeAgentCore/Sources/MCPDispatcher/MCPSubprocess+Pool.swift	*	1	event_deadline	MCPSubprocessPool.idleDeadline
 Modules/NativeAgentCore/Sources/MCPDispatcher/MCPSubprocess+Process.swift	*	1	timeout_retry_deadline	MCPSubprocessProcess

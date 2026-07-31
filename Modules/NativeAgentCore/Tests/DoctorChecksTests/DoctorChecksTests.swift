@@ -29,16 +29,6 @@ private func waitUntilExit(_ process: Process, timeout: TimeInterval) -> Bool {
     return !process.isRunning
 }
 
-private func terminateAndWaitBounded(_ process: Process) {
-    guard process.isRunning else { return }
-    process.terminate()
-    if waitUntilExit(process, timeout: 2.0) { return }
-    if process.isRunning {
-        _ = Darwin.kill(process.processIdentifier, SIGKILL)
-        _ = waitUntilExit(process, timeout: 1.0)
-    }
-}
-
 private struct StubCheck: DoctorCheck {
     let id: String
     let title: String
@@ -501,74 +491,6 @@ private struct InternallyFailingCheck: DoctorCheck {
     #expect(result.repair != nil)
 }
 
-@Test func installedAppZeroPythonCheck_detects_retired_artifact() async throws {
-    let root = tempDir()
-    defer { try? FileManager.default.removeItem(at: root) }
-    let app = root.appendingPathComponent("NativeAgent.app", isDirectory: true)
-    let exe = app.appendingPathComponent("Contents/MacOS/NativeAgentApp")
-    let resources = app.appendingPathComponent("Contents/Resources", isDirectory: true)
-    try FileManager.default.createDirectory(at: exe.deletingLastPathComponent(), withIntermediateDirectories: true)
-    try FileManager.default.createDirectory(at: resources, withIntermediateDirectories: true)
-    try Data().write(to: exe)
-    try Data("legacy".utf8).write(to: resources.appendingPathComponent("native_agentd.py"))
-    let result = await InstalledAppZeroPythonCheck(appURL: app).run()
-    #expect(result.status == "fail")
-    #expect(result.detail.contains("native_agentd.py"))
-}
-
-// MARK: - RetiredDaemonProcessCheck pid matching
-
-@Test func retiredDaemon_argv_classifier_accepts_real_daemon_invocations() {
-    #expect(RetiredDaemonProcessCheck.argvIsPythonRunningDaemon(
-        "/usr/bin/python3 /Users/example/Projects/NativeAgent/daemon/native_agentd.py"))
-    #expect(RetiredDaemonProcessCheck.argvIsPythonRunningDaemon(
-        "python3.11 daemon/native_agentd.py --port 8765"))
-    #expect(RetiredDaemonProcessCheck.argvIsPythonRunningDaemon(
-        "/opt/homebrew/bin/python3 -u native_agentd.py"))
-}
-
-@Test func retiredDaemon_argv_classifier_rejects_bystanders() {
-    // Audit fix 2026-06-10: the old bare `pgrep -f native_agentd.py`
-    // substring-matched ANY argv mentioning the file and repair SIGTERMed
-    // every match — editors, greps, audit sessions.
-    #expect(!RetiredDaemonProcessCheck.argvIsPythonRunningDaemon(
-        "vim daemon/native_agentd.py"))
-    #expect(!RetiredDaemonProcessCheck.argvIsPythonRunningDaemon(
-        "grep -rn python3 native_agentd.py"))
-    #expect(!RetiredDaemonProcessCheck.argvIsPythonRunningDaemon(
-        "bash -c sleep 5 # python3 native_agentd.py"))
-    // Similar-suffix script must not match (token equality / "/"-suffix rule).
-    #expect(!RetiredDaemonProcessCheck.argvIsPythonRunningDaemon(
-        "python3 not_native_agentd.py"))
-    #expect(!RetiredDaemonProcessCheck.argvIsPythonRunningDaemon(""))
-}
-
-@Test func retiredDaemon_pgrep_excludes_non_python_decoy_process() async throws {
-    // Empirical regression: spawn a live decoy whose argv CONTAINS
-    // "python3 ... native_agentd.py" but whose executable is bash. The old
-    // detection listed it (and repair would have SIGTERMed it); the tightened
-    // pgrep + per-pid argv verification must exclude it.
-    let decoy = Process()
-    decoy.executableURL = URL(fileURLWithPath: "/bin/bash")
-    // Give the exec'd sleep a deliberately misleading argv[0]. It remains one
-    // direct Process child (no orphan holding Swift Testing's event pipe), while
-    // pgrep still sees the python/script-shaped text and the argv classifier
-    // must reject it because the first token is bash.
-    decoy.arguments = [
-        "-c",
-        "exec -a 'bash python3 daemon/native_agentd.py' sleep 15",
-    ]
-    try decoy.run()
-    defer {
-        terminateAndWaitBounded(decoy)
-    }
-    // Give pgrep a beat to see the process table entry.
-    try await Task.sleep(nanoseconds: 200_000_000)
-    let pids = RetiredDaemonProcessCheck.pgrepNativeAgentDaemon()
-    #expect(!pids.contains(decoy.processIdentifier))
-    #expect(decoy.isRunning)
-}
-
 // MARK: - SwiftNativeDoctorChecks
 
 @Test func swiftNative_runAll_default_includes_core_runtime_checks() async throws {
@@ -583,9 +505,7 @@ private struct InternallyFailingCheck: DoctorCheck {
     #expect(ids.contains("memory_store"))
     #expect(ids.contains("coreml_embedder"))
     #expect(ids.contains("icloud_bridge_state"))
-    #expect(ids.contains("installed_app_zero_python"))
-    #expect(ids.contains("retired_python_daemon"))
-    #expect(results.count == 10)
+    #expect(results.count == 8)
 }
 
 @Test func swiftNative_runAll_repair_dispatches_to_repairable_checks() async throws {
@@ -663,35 +583,3 @@ private struct InternallyFailingCheck: DoctorCheck {
     #expect(decoded.repair == nil)
 }
 
-// MARK: - boundedWaitUntilExit regression (audit fix 2026-07-21)
-//
-// The pgrep/ps probes ran bare waitUntilExit() with no timeout/escalation —
-// one hung probe wedged the whole sequential doctor run.
-
-@Test func retiredDaemon_boundedWait_fastProbeSucceeds() throws {
-    let proc = Process()
-    proc.executableURL = URL(fileURLWithPath: "/usr/bin/true")
-    try proc.run()
-    #expect(RetiredDaemonProcessCheck.boundedWaitUntilExit(proc, timeout: 10))
-    #expect(!proc.isRunning)
-}
-
-@Test func retiredDaemon_boundedWait_escalatesHungProbe() async throws {
-    // Child IGNORES SIGTERM — the bounded wait must escalate to SIGKILL and
-    // report failure rather than hang the doctor run.
-    let proc = Process()
-    proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-    // `exec` is essential: killing a resident shell would orphan `sleep`, which
-    // inherits Swift Testing's event pipe and makes `swift test` wait forever
-    // after the helper exits.
-    proc.arguments = ["-c", "trap '' TERM; exec sleep 120"]
-    try proc.run()
-    let start = Date()
-    let ok = RetiredDaemonProcessCheck.boundedWaitUntilExit(proc, timeout: 0.5)
-    let elapsed = Date().timeIntervalSince(start)
-    #expect(!ok)
-    #expect(!proc.isRunning)
-    // timeout(0.5s) + TERM grace(1s) + KILL grace(≤1s) ≈ 2.5s; 15s is the
-    // structural tripwire proving escalation ran, not a perf assertion.
-    #expect(elapsed < 15)
-}

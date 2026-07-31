@@ -74,6 +74,7 @@ private actor FluidContextStub: ContextTurnPreparing {
 
 private actor FluidMemoryStub: MemoryRecalling {
     private(set) var recallCount = 0
+    private(set) var servedHits: [[String]] = []
 
     func recall(_ query: String, k: Int) async throws -> [MemoryRecallHit] {
         recallCount += 1
@@ -86,6 +87,10 @@ private actor FluidMemoryStub: MemoryRecalling {
             content: "legacy recall must not run",
             source: "test"
         )]
+    }
+
+    func recordServedContextHits(ids: [String]) async {
+        servedHits.append(ids)
     }
 }
 
@@ -225,6 +230,59 @@ private func fluidEngine(
 
     #expect(context.recalled.isEmpty)
     #expect(await memory.recallCount == 0)
+}
+
+@Test func activeFluidContextBumpsUseCountForPacketServedMemories() async throws {
+    let prepared = try fluidPreparedTurn()
+    prepared.attachMemoryRecordProvenance(["rec-b", "rec-a"])
+    let flow = FluidContextStub(mode: .active, prepared: prepared)
+    let memory = FluidMemoryStub()
+    _ = try await fluidEngine(
+        persona: FluidPersonaStub(throwsOnRead: true),
+        flow: flow,
+        memory: memory
+    ).buildTurnContext(
+        surface: "chat",
+        userMessage: "hello",
+        personaOverride: nil,
+        imageBlocks: [],
+        includeClockContext: false
+    )
+
+    // The serve bump is fire-and-forget off the turn path — poll under a
+    // deadline instead of sleeping blind (hangproof convention).
+    var hits: [[String]] = []
+    let deadline = Date().addingTimeInterval(2)
+    while Date() < deadline {
+        hits = await memory.servedHits
+        if !hits.isEmpty { break }
+        try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    #expect(hits.count == 1)
+    // attachMemoryRecordProvenance dedupes and sorts; the bump serves that set.
+    #expect(hits.first == ["rec-a", "rec-b"])
+    #expect(await memory.recallCount == 0)
+}
+
+@Test func fluidTurnWithoutProvenanceNeverBumps() async throws {
+    let prepared = try fluidPreparedTurn()
+    let flow = FluidContextStub(mode: .active, prepared: prepared)
+    let memory = FluidMemoryStub()
+    _ = try await fluidEngine(
+        persona: FluidPersonaStub(throwsOnRead: true),
+        flow: flow,
+        memory: memory
+    ).buildTurnContext(
+        surface: "chat",
+        userMessage: "hello",
+        personaOverride: nil,
+        imageBlocks: [],
+        includeClockContext: false
+    )
+    // Bounded settle window: the no-bump claim needs the fire-and-forget lane
+    // a beat to (not) run before asserting emptiness.
+    try await Task.sleep(nanoseconds: 100_000_000)
+    #expect(await memory.servedHits.isEmpty)
 }
 
 @Test func activeFluidContextUsesRAMKernelWithoutReadingPersona() async throws {

@@ -379,6 +379,13 @@ public struct GitHubCommandItem: Codable, Sendable, Equatable {
     public var blocker: GitHubCommandBlocker?
     public var finalReceipt: String?
     public var lastCallbackStatus: String?
+    // Failure detail from the codex completion callback (task #45): the
+    // provider/runtime error text and the three-state resend-safety signal
+    // (true = no work observed before the failure, false = partial work may
+    // exist, nil = unknown). Inline defaults keep the memberwise init and any
+    // cached snapshot decode-compatible.
+    public var lastCallbackErrorMessage: String? = nil
+    public var lastCallbackNoWorkObserved: Bool? = nil
     // The eventKey that last settled through verification into waiting_upstream.
     // An identical re-observation of an already-settled event must not bounce
     // back into attention; only a NEW actionable event may re-route.
@@ -448,6 +455,9 @@ private struct GitHubCommandCallback: Codable, Sendable, Equatable {
     let summary: String
     let threadId: String?
     let turnId: String?
+    // Optional so historical op-log rows without these fields keep decoding.
+    var errorMessage: String? = nil
+    var noWorkObserved: Bool? = nil
 }
 
 private enum GitHubCommandOpBody: Codable, Sendable, Equatable {
@@ -1019,7 +1029,9 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
         codexStatus: String,
         summary: String,
         threadId: String? = nil,
-        turnId: String? = nil
+        turnId: String? = nil,
+        errorMessage: String? = nil,
+        noWorkObserved: Bool? = nil
     ) async throws -> [GitHubCommandItem] {
         let ids = Set(messageIds.filter { !$0.isEmpty })
         guard !ids.isEmpty else { return [] }
@@ -1040,7 +1052,9 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
                     codexStatus: codexStatus,
                     summary: Self.bounded(summary, limit: 4_000),
                     threadId: threadId,
-                    turnId: turnId
+                    turnId: turnId,
+                    errorMessage: errorMessage.map { Self.bounded($0, limit: 1_000) },
+                    noWorkObserved: noWorkObserved
                 )
                 let op = GitHubCommandOp(id: UUID().uuidString.lowercased(), at: DeskClock.nowISO(), body: .callbackReceived(itemId: item.itemId, callback: callback))
                 try Self.validate(op.body, state: state)
@@ -1473,6 +1487,8 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
                 }
                 item.state = .verifying
                 item.lastCallbackStatus = callback.codexStatus
+                item.lastCallbackErrorMessage = callback.errorMessage
+                item.lastCallbackNoWorkObserved = callback.noWorkObserved
                 item.blocker = nil
                 item.updatedAt = op.at
                 Self.appendWorkLog(&item, GitHubCommandWorkLogEntry(
@@ -1633,7 +1649,9 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
                         ? "Codex returned, but live GitHub still shows the same actionable event."
                         : item.lastCallbackStatus == "completed_without_reply"
                             ? "Codex ended without a final result; NativeAgent did not replay an outcome-unknown turn."
-                            : "Codex did not complete the dispatched GitHub event.",
+                            : item.lastCallbackStatus == "stalled"
+                                ? "Codex stopped making progress and its runtime no longer confirms the turn; NativeAgent did not replay it."
+                                : "Codex did not complete the dispatched GitHub event.",
                     owner: callbackSucceeded ? "Codex" : "NativeAgent Codex bridge"
                 )
                 return

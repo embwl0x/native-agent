@@ -436,6 +436,24 @@ struct DeskView: View {
                 }
             }
             .padding(.leading, 2)
+            // Failure detail from the codex completion callback (task #45).
+            // Only failed-ish callbacks carry it; a healthy row stays two lines.
+            if ["failed", "stalled"].contains(item.lastCallbackStatus ?? ""),
+               item.lastCallbackErrorMessage != nil || item.lastCallbackNoWorkObserved != nil {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    if let error = item.lastCallbackErrorMessage, !error.isEmpty {
+                        Text(error)
+                            .font(.caption).foregroundStyle(.red)
+                            .lineLimit(2).truncationMode(.tail)
+                    }
+                    if let noWork = item.lastCallbackNoWorkObserved {
+                        Text(noWork ? "no work ran — resend safe" : "partial work possible")
+                            .font(.caption2)
+                            .foregroundStyle(noWork ? Color.secondary : Color.orange)
+                    }
+                }
+                .padding(.leading, 2)
+            }
         }
         .padding(.vertical, 8).padding(.horizontal, 10)
         .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
@@ -452,7 +470,8 @@ struct DeskView: View {
                 return ("waiting · \(kind.rawValue.replacingOccurrences(of: "_", with: " "))", .gray)
             case .attention(let reason):
                 switch reason {
-                case .codexFailed: return ("codex no result", .red)
+                case .codexFailed:
+                    return (item.lastCallbackStatus == "stalled" ? "codex stalled" : "codex no result", .red)
                 case .verificationFailed: return ("GitHub still actionable", .red)
                 case .callbackOverdue: return ("codex stalled", .red)
                 case .codexBusy: return ("legacy codex retry", .red)

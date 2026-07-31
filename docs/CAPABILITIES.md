@@ -1,6 +1,6 @@
 # NativeAgent capabilities
 
-*Verified against the repository and installed runtime baseline on 2026-07-11.*
+*Verified against the repository and release baseline on 2026-07-31.*
 
 This document is the readable product map. It describes what NativeAgent
 currently does without requiring a tour through every Swift target. Exact
@@ -77,7 +77,7 @@ but they do not own the agent.
 
 ### Local agent bridges
 
-- Authenticated, loopback-only Codex and Claude bridges.
+- Authenticated, loopback-only Codex and Claude Code bridges.
 - Full shared chat turns or narrowly gated tool calls.
 - Async handoffs preserve the originating Mac, Telegram, Slack, or iOS route
   and return Agent's completion assessment to that route.
@@ -261,12 +261,14 @@ defense-in-depth, not a containment boundary. Read
 
 ## Honest limits
 
-- The Organism Kernel and CognitiveSubstrate are experimental/default-off.
+- The Organism Kernel and CognitiveSubstrate are experimental and default-off;
+  **Settings → Advanced → Subconscious** enables their shared master path.
 - Connector depth varies; a configured OAuth flow is not automatically a
   complete integration.
-- Public direct-download release work has real signing/notarization/export
-  gates but remains `Partial+` until a complete owner-run release is published
-  and fresh-machine verified.
+- The public Mac release is notarized, Sparkle-updatable, and published through
+  GitHub Releases. NativeAgent Mobile `0.3.0 (10)` is submitted to Apple and is
+  currently waiting for App Review; TestFlight remains the verified mobile
+  distribution until Apple approves the public listing.
 - iCloud/CloudKit/APNS require correct Apple signing, containers, entitlements,
   and provisioning; the repository cannot supply those credentials.
 - NativeAgent is optimized for one operator and does not claim multi-tenant

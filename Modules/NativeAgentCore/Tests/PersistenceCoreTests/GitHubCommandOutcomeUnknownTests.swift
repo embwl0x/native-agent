@@ -88,6 +88,58 @@ struct GitHubCommandOutcomeUnknownTests {
         #expect(try await store.prepareDispatch(itemId: item.itemId) == nil)
     }
 
+    @Test("callback failure detail projects into the item for the desk")
+    func callbackFailureDetailProjectsIntoItem() async throws {
+        let root = try root(); defer { try? FileManager.default.removeItem(at: root) }
+        let store = GitHubCommandStore(dataRoot: root)
+        let item = try await store.observe(observation())
+        let intent = try #require(try await store.prepareDispatch(itemId: item.itemId))
+        let receipt = GitHubCommandDispatchReceipt(
+            eventKey: intent.eventKey,
+            dispatchId: intent.dispatchId,
+            messageId: intent.dispatchId,
+            queuedAt: DeskClock.nowISO()
+        )
+        _ = try await store.recordDispatchSuccess(itemId: item.itemId, receipt: receipt)
+        let updated = try await store.recordCallback(
+            messageIds: [receipt.messageId],
+            codexStatus: "failed",
+            summary: "Codex turn failed.",
+            errorMessage: "OpenAI is experiencing high demand (503)",
+            noWorkObserved: true
+        )
+        let projected = try #require(updated.first)
+        #expect(projected.lastCallbackStatus == "failed")
+        #expect(projected.lastCallbackErrorMessage == "OpenAI is experiencing high demand (503)")
+        #expect(projected.lastCallbackNoWorkObserved == true)
+    }
+
+    @Test("stalled callback parks with the stalled blocker and no replay")
+    func stalledCallbackParksWithStalledBlocker() async throws {
+        let root = try root(); defer { try? FileManager.default.removeItem(at: root) }
+        let store = GitHubCommandStore(dataRoot: root)
+        let item = try await store.observe(observation())
+        let intent = try #require(try await store.prepareDispatch(itemId: item.itemId))
+        let receipt = GitHubCommandDispatchReceipt(
+            eventKey: intent.eventKey,
+            dispatchId: intent.dispatchId,
+            messageId: intent.dispatchId,
+            queuedAt: DeskClock.nowISO()
+        )
+        _ = try await store.recordDispatchSuccess(itemId: item.itemId, receipt: receipt)
+        _ = try await store.recordCallback(
+            messageIds: [receipt.messageId],
+            codexStatus: "stalled",
+            summary: "Codex turn stalled.",
+            noWorkObserved: false
+        )
+        let parked = try await store.observe(observation())
+        #expect(parked.state == .attention(.codexFailed))
+        #expect(parked.blocker?.detail.contains("stopped making progress") == true)
+        #expect(parked.lastCallbackNoWorkObserved == false)
+        #expect(try await store.prepareDispatch(itemId: item.itemId) == nil)
+    }
+
     @Test("legacy codex_busy snapshot state is decodable but not dispatchable")
     func legacyBusyStateDoesNotDispatch() async throws {
         let encoded = Data(#"{"name":"attention","reason":"codex_busy"}"#.utf8)

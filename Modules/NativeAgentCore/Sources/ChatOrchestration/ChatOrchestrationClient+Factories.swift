@@ -334,6 +334,21 @@ private struct SwiftNativeMemoryV2RecallingAdapter: MemoryRecalling {
             surface: surface
         )
     }
+
+    /// Fluid-context serve bump (task #42): same use_count/last_used_at write
+    /// the legacy recall lane fires, reached from the packet-served path.
+    /// Errors are logged, never thrown — a dropped bump self-heals on any
+    /// later serve, matching the recall lane's proportionate response.
+    func recordServedContextHits(ids: [String]) async {
+        guard !ids.isEmpty else { return }
+        do {
+            try await memory.recordRecallHits(ids: ids)
+        } catch {
+            FileHandle.standardError.write(
+                Data("MemoryV2: context-serve bump failed for \(ids.count) ids: \(error)\n".utf8)
+            )
+        }
+    }
 }
 
 /// Construct the memory read owner for one chat factory root.

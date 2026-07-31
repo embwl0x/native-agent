@@ -1178,7 +1178,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
             writeJSON(conn, status: 400, obj: ["error": "codex_completion_digest_failed"])
             return
         }
-        let githubCommandCompletion: (messageIds: [String], status: String, threadId: String?, turnId: String?)? = {
+        let githubCommandCompletion: (messageIds: [String], status: String, threadId: String?, turnId: String?, errorMessage: String?, noWorkObserved: Bool?)? = {
             guard defaultSender == "codex", let completion = json["completion"] as? [String: Any] else { return nil }
             let messageIds = (completion["messageIds"] as? [Any])?.compactMap { $0 as? String } ?? []
             guard !messageIds.isEmpty else { return nil }
@@ -1186,7 +1186,11 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                 messageIds,
                 completion["codexStatus"] as? String ?? "unknown",
                 completion["threadId"] as? String,
-                completion["turnId"] as? String
+                completion["turnId"] as? String,
+                // JSON null decodes as NSNull, which fails both casts to nil —
+                // exactly the "unknown" reading the three-state field wants.
+                completion["errorMessage"] as? String,
+                completion["noWorkObserved"] as? Bool
             )
         }()
         let completionRoute: AgentBridgeCompletionRoute? = {
@@ -1286,7 +1290,9 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                                 codexStatus: completion.status,
                                 summary: rawText,
                                 threadId: completion.threadId,
-                                turnId: completion.turnId
+                                turnId: completion.turnId,
+                                errorMessage: completion.errorMessage,
+                                noWorkObserved: completion.noWorkObserved
                             )
                         }
                         let generated = try await ChatPersistenceContext
@@ -1353,7 +1359,9 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                             codexStatus: completion.status,
                             summary: rawText,
                             threadId: completion.threadId,
-                            turnId: completion.turnId
+                            turnId: completion.turnId,
+                            errorMessage: completion.errorMessage,
+                            noWorkObserved: completion.noWorkObserved
                         )
                     }
                     resp = try await client.chat(

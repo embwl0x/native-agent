@@ -1861,7 +1861,7 @@ async function attachConsumeAndReplyDelivery(result, entries, config, options = 
   return result;
 }
 
-function extractTurnResultFromRollout(rolloutPath, turnId) {
+function extractTurnResultFromRollout(rolloutPath, turnId, options = {}) {
   let text;
   try {
     text = fs.readFileSync(rolloutPath, "utf8");
@@ -1967,7 +1967,21 @@ function extractTurnResultFromRollout(rolloutPath, turnId) {
     }
   }
 
-  if (!completed) return null;
+  if (!completed) {
+    // Stall probing needs the turn's observed activity even without a
+    // terminal row. Opt-in only: every existing caller treats null as "no
+    // result yet", and an in_flight object leaking into those paths would
+    // read as a terminal outcome.
+    if (options.includeNonTerminal) {
+      return {
+        status: "in_flight",
+        sawTurnStart,
+        toolActivityCount,
+        hasMessage: Boolean((finalAgentMessage || assistantMessage || "").trim()),
+      };
+    }
+    return null;
+  }
   const message = (completed.lastAgentMessage || finalAgentMessage || assistantMessage || "").trim();
   if (completed.status === "failed") {
     // Three-state: true = we watched the whole turn and saw nothing execute
@@ -2524,10 +2538,135 @@ async function waitForTurnResultWithEmptyRetry(job, config, options = {}) {
   return { threadId, turnId, turnResult, attempts: [{ threadId, turnId, turnResult }] };
 }
 
+/// One wait-window's stall evidence. A "window" is a full replyWaitTimeoutMs
+/// interval (default 1h) that ended in exact_timeout — i.e. no terminal row
+/// became visible the entire time.
+function rolloutStallSnapshot(threadId, config) {
+  const rolloutPath = findThreadRolloutPath(threadId, config, { forceRefresh: true });
+  if (!rolloutPath) return null;
+  const stat = safeFileStat(rolloutPath);
+  if (!stat) return null;
+  return { path: rolloutPath, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs };
+}
+
+function stallSnapshotsEqual(a, b) {
+  if (!a && !b) return true; // no rollout discoverable across the window is itself stagnation
+  if (!a || !b) return false;
+  return a.path === b.path && a.ino === b.ino && a.size === b.size && a.mtimeMs === b.mtimeMs;
+}
+
+/// Ask the app-server whether it still claims this turn is running. Distinct
+/// outcomes matter: an unreachable server or a turn missing from its thread
+/// can never produce a terminal row, while a claimed-inProgress turn gets the
+/// benefit of the doubt for one extra window.
+async function probeTurnLiveness(threadId, turnId, config) {
+  const probeTimeoutMs = numberSetting(
+    config,
+    "stallProbeRpcTimeoutMs",
+    "NATIVE_AGENT_CODEX_STALL_PROBE_RPC_TIMEOUT_MS",
+    5000
+  );
+  let client = null;
+  try {
+    client = await connectRpc(probeTimeoutMs);
+  } catch {
+    return { serverReachable: false, turnFound: false, turnClaimsInProgress: false };
+  }
+  try {
+    const result = await client.request("thread/read", { threadId, includeTurns: true });
+    const turns = result && result.thread && Array.isArray(result.thread.turns)
+      ? result.thread.turns
+      : [];
+    const turn = turns.find((candidate) => candidate && candidate.id === turnId);
+    return {
+      serverReachable: true,
+      turnFound: Boolean(turn),
+      turnClaimsInProgress: Boolean(turn && turn.status === "inProgress"),
+    };
+  } catch {
+    // Reachable socket but a failed read proves nothing either way. Report
+    // the turn as found-and-inProgress so a flaky thread/read can never
+    // manufacture a one-window stall (gpt-5.5 review BLOCKING, 2026-07-30:
+    // turnFound:false here fed the !turnFound dead-liveness arm). The
+    // wedged-inProgress path still bounds a persistently unreadable turn at
+    // two stagnant windows.
+    return { serverReachable: true, turnFound: true, turnClaimsInProgress: true };
+  } finally {
+    client.close();
+  }
+}
+
 async function waitForDurableTerminalExecution(job, config, onTimeout, options = {}) {
+  const snapshotFn = options.rolloutStallSnapshot || rolloutStallSnapshot;
+  const probeFn = options.probeTurnLiveness || probeTurnLiveness;
   while (true) {
     const observed = await waitForTurnResultWithEmptyRetry(job, config, options);
     if (observed.turnResult.status !== "timeout") return observed;
+
+    // Stalled-turn detection (2026-07-30): a turn whose runtime died without
+    // writing task_complete/turn_aborted used to cycle timeout->rewait
+    // forever, indistinguishable from legitimate long work. Evidence, judged
+    // at each window boundary:
+    //   - rollout stagnation: the session file did not change (ino+size+mtime)
+    //     across one full wait window, or stayed undiscoverable;
+    //   - liveness: the app-server is unreachable, or reachable but no longer
+    //     lists this turn.
+    // Stagnant + dead liveness => stalled after ONE window. A server still
+    // claiming inProgress gets one extra stagnant window before the same
+    // verdict (an inProgress turn that writes nothing for two full windows is
+    // wedged, not thinking). Rollout movement resets the count.
+    const currentSnapshot = snapshotFn(observed.threadId, config);
+    const prior = job.stallProbe || null;
+    let effectiveStagnant;
+    if (!prior) {
+      // First window has no baseline to compare against — it only establishes
+      // one. Exception: a rollout that is still undiscoverable after a full
+      // wait window is already stagnation.
+      effectiveStagnant = currentSnapshot === null ? 1 : 0;
+    } else if (stallSnapshotsEqual(prior.rolloutSnapshot, currentSnapshot)) {
+      effectiveStagnant = (prior.stagnantWindows || 0) + 1;
+    } else {
+      effectiveStagnant = 0;
+    }
+    let liveness = null;
+    if (effectiveStagnant >= 1) {
+      liveness = await probeFn(observed.threadId, observed.turnId, config);
+      const deadLiveness = !liveness.serverReachable || !liveness.turnFound;
+      const wedgedInProgress = liveness.turnClaimsInProgress && effectiveStagnant >= 2;
+      if (deadLiveness || wedgedInProgress) {
+        const rolloutPath = currentSnapshot ? currentSnapshot.path : null;
+        const activity = rolloutPath
+          ? extractTurnResultFromRollout(rolloutPath, observed.turnId, { includeNonTerminal: true })
+          : null;
+        const inFlight = activity && activity.status === "in_flight" ? activity : null;
+        const noWorkObserved = !inFlight || !inFlight.sawTurnStart
+          ? null
+          : (inFlight.toolActivityCount === 0 && !inFlight.hasMessage);
+        return {
+          ...observed,
+          turnResult: {
+            ...observed.turnResult,
+            status: "stalled",
+            noWorkObserved,
+            toolActivityCount: inFlight ? inFlight.toolActivityCount : null,
+            stallEvidence: {
+              stagnantWindows: effectiveStagnant,
+              rolloutPath,
+              serverReachable: liveness.serverReachable,
+              turnFound: liveness.turnFound,
+              turnClaimsInProgress: liveness.turnClaimsInProgress,
+              detectedAt: nowISO(),
+            },
+          },
+        };
+      }
+    }
+    job.stallProbe = {
+      rolloutSnapshot: currentSnapshot,
+      stagnantWindows: effectiveStagnant,
+      lastProbe: liveness,
+      observedAt: nowISO(),
+    };
     await onTimeout(observed);
   }
 }
@@ -2543,9 +2682,13 @@ function formatCodexReplyForNativeAgent(job, turnResult) {
       ? (entries.length > 1
         ? `Codex wakeup failed for ${entries.length} queued messages.`
         : "Codex wakeup failed.")
-      : (entries.length > 1
-        ? `Codex wakeup produced no reply for ${entries.length} queued messages.`
-        : "Codex wakeup produced no reply.");
+      : turnResult.status === "stalled"
+        ? (entries.length > 1
+          ? `Codex turn stalled for ${entries.length} queued messages.`
+          : "Codex turn stalled.")
+        : (entries.length > 1
+          ? `Codex wakeup produced no reply for ${entries.length} queued messages.`
+          : "Codex wakeup produced no reply.");
   const lines = [
     title,
     "",
@@ -2574,6 +2717,22 @@ function formatCodexReplyForNativeAgent(job, turnResult) {
     lines.push("NativeAgent did not automatically replay the request because the first turn may already have produced effects. Report the bridge failure to User; retry only after an explicit decision.");
   } else if (turnResult.status === "aborted") {
     lines.push("Codex turn was aborted before a final reply landed.");
+  } else if (turnResult.status === "stalled") {
+    const ev = turnResult.stallEvidence || {};
+    const cause = !ev.serverReachable
+      ? "the Codex app-server is no longer reachable"
+      : !ev.turnFound
+        ? "the Codex app-server no longer lists this turn"
+        : "the turn still claims to be running but wrote nothing for two full wait windows";
+    lines.push(`Codex stopped making progress: no terminal row landed, the session file stayed unchanged across ${ev.stagnantWindows || 1}+ wait window(s), and ${cause}. This turn will not complete on its own.`);
+    if (turnResult.noWorkObserved === true) {
+      lines.push("No tool or shell activity was recorded before the stall: the request never executed, so resending it cannot stomp partial work.");
+    } else if (turnResult.noWorkObserved === false) {
+      lines.push("Tool activity was recorded before the stall, so partial work may exist on disk. Verify external state before resending.");
+    } else {
+      lines.push("The local record does not show whether any work executed before the stall. Treat partial work as possible: verify external state before resending.");
+    }
+    lines.push("NativeAgent did not automatically replay the request. Report the stall to User; retry only after an explicit decision.");
   } else if (turnResult.status === "failed") {
     lines.push("Codex's turn failed before a final reply landed.");
     const failureDetail = turnResult.errorMessage
@@ -2756,6 +2915,7 @@ async function deliverReplyJobUnlocked(jobPath, config) {
   if (!job.completedExecution) {
     job.completedExecution = execution;
     delete job.lastWait;
+    delete job.stallProbe;
     writeJSONAtomic(jobPath, job);
   }
   const turnResult = execution.turnResult;
@@ -2785,6 +2945,7 @@ async function deliverReplyJobUnlocked(jobPath, config) {
       errorMessage: turnResult.errorMessage || null,
       codexErrorInfo: turnResult.codexErrorInfo || null,
       noWorkObserved: turnResult.noWorkObserved ?? null,
+      stallEvidence: turnResult.stallEvidence || null,
     },
   });
   const receipt = {
@@ -2814,6 +2975,7 @@ async function deliverReplyJobUnlocked(jobPath, config) {
       errorMessage: turnResult.errorMessage || null,
       codexErrorInfo: turnResult.codexErrorInfo || null,
       noWorkObserved: turnResult.noWorkObserved ?? null,
+      stallEvidence: turnResult.stallEvidence || null,
       brain: turnResult.brain || null,
       messagePreview: (turnResult.message || "").slice(0, 1000),
     },

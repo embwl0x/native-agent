@@ -316,6 +316,15 @@ public extension HybridMemoryStorageProtocol {
 
 extension SwiftNativeMemoryV2 {
 
+    /// Access-signal bump for records served OUTSIDE the recall lane (the
+    /// fluid-context serve path, task #42). Same storage write as recall's
+    /// fire-and-forget bump; unwired actors fail closed like every other
+    /// storage-backed method.
+    public func recordRecallHits(ids: [String]) async throws {
+        guard let storage else { throw MemoryV2Error.storageUnavailable }
+        try await storage.recordRecallHits(ids: ids)
+    }
+
     /// Embed the query via the wired `EmbeddingProvider` (MiniLM on the Neural
     /// Engine in production), then ask `MemoryStorage` for the top-K nearest
     /// records by cosine. Hits are sorted by score descending; `total` reflects

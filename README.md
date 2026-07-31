@@ -15,8 +15,8 @@ trust, transcript, and receipt rules converge on the same orchestration path.
 
 > NativeAgent is an advanced single-operator project. The source, tests,
 > personal install flow, public-export gate, Developer ID/notarization pipeline,
-> and signed-update machinery are real. The public source repository is live;
-> a notarized binary GitHub Release is live, and connector depth varies; see
+> and signed-update machinery are real. The public source repository and a
+> notarized binary GitHub Release are live; connector depth varies, so see
 > [Project Status](PROJECT_STATUS.md) for the honest capability ledger.
 
 ## What exists today
@@ -33,12 +33,15 @@ trust, transcript, and receipt rules converge on the same orchestration path.
 | Surfaces | Mac chat, detached chat windows, iPhone/iPad, Telegram, Slack, local Codex/Claude Code bridges, and background work share the same agent factory and policy boundaries. |
 | Providers | ChatGPT OAuth, Codex CLI, OpenAI API, Anthropic OAuth/API, xAI OAuth, Moonshot API, and OpenRouter have distinct model/capability contracts. Current verified catalogs include GPT-5.6 variants, Claude 5/Fable/Opus, Grok 4.5, and Kimi K3. Moonshot keys stay Mac-local and refresh the account-visible Kimi model list. Swarms default to the provider/model selected for the Swarms surface; the agent may choose explicit worker models when useful. |
 | Connectors | Telegram, Slack, GitHub, X, Gmail, Google Calendar, Notion, local workspaces, Mac apps, and the visible browser have explicit setup and proof boundaries. Gmail, Calendar, and Notion reads are bounded and lazy-loaded; public users provide their own OAuth app or integration token locally. |
-| Trust | TrustCenter, SecurityCenter, Full Mac gates, connector proof, approval replay, exact receipts, signed iOS actions, and fail-closed persistence boundaries remain authoritative. |
 
 Local bridge clients should read `~/.config/claude-bridge/bridge.json`. NativeAgent prefers port 8771, advances when it is occupied, and publishes the actual loopback URL and bearer token together rather than requiring clients to assume a fixed port.
+| Trust | TrustCenter, SecurityCenter, Full Mac gates, connector proof, approval replay, exact receipts, signed iOS actions, and fail-closed persistence boundaries remain authoritative. |
 
 The detailed, evidence-backed inventory lives in
 [docs/CAPABILITIES.md](docs/CAPABILITIES.md).
+For a compact operational map—including every main page, trust modes, mobile
+pairing, connectors, lazy skills/tools, and how to enable the Subconscious and
+Organism—read the [User and Agent Guide](docs/USER_GUIDE.md).
 
 ## One runtime, one mind
 
@@ -132,11 +135,10 @@ After launch:
 4. Start the conversation yourself. Development and personal installs never
    synthesize startup greetings. A blank-slate public-release install may send
    one post-onboarding welcome after a provider is connected.
-5. Optional: Settings → Subconscious is the single user-facing master for the
-   cognitive substrate and organism. Its Fluid Context picker controls whether
-   resident selection is active, observe-only, or off. The Cognition
-   Observatory keeps granular research controls and reports the effective
-   runtime state.
+5. Optional: **Settings → Advanced → Subconscious** is the single user-facing
+   master for the cognitive substrate and organism. Its Fluid Context picker controls whether resident
+   selection is active, observe-only, or off. The Cognition Observatory keeps
+   granular research controls and reports the effective runtime state.
 
 The personal installer is not the public distribution pipeline. Signed and
 notarized DMG work is documented in
@@ -263,6 +265,7 @@ script/                           build, test, install, evaluation, and release 
 
 ## Documentation
 
+- [User and Agent Guide](docs/USER_GUIDE.md) — compact setup and complete operating map
 - [Capabilities](docs/CAPABILITIES.md) — readable current system tour
 - [North Star](docs/NORTHSTAR.md) — one mind, no theater, fluid digital processes
 - [Project Status](PROJECT_STATUS.md) — honest shipped/partial/experimental ledger
