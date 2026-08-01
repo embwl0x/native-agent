@@ -418,6 +418,96 @@ struct DeskOpsCompactionTests {
         }
     }
 
+    /// LATENT STORE-BRICK REGRESSION. The base's round-trip gate used to demand
+    /// BYTE IDENTITY between the decoded state's re-encoding and the tree on
+    /// disk — but the store's own migration vocabulary rewrites values on
+    /// decode: the retired private origin raw value maps to `.agent` and
+    /// re-encodes as "agent". A base carrying one therefore failed the gate,
+    /// `DeskCompactionBase.fromJSON` returned nil, and `readFeedUnlocked` threw
+    /// `compactionBaseCorrupt` — every desk read AND write dead on launch, with
+    /// no degradation path. Normalization is not corruption: the base must load
+    /// with the origin normalized forward.
+    @Test("a base carrying the retired origin value loads, normalized — never bricks the desk")
+    func retiredOriginValueInBaseIsMigratedNotCorrupt() async throws {
+        let root = try root(); defer { try? FileManager.default.removeItem(at: root) }
+        let s = store(root, threshold: 4)
+        let subject = try await s.createItem(kind: .project, project: "p", title: "migrated-origin")
+        for n in 1...5 {
+            _ = try await s.createItem(kind: .watch, project: "p", title: "churn-\(n)")
+        }
+        #expect(FileManager.default.fileExists(atPath: s.basePath.path))
+
+        // Rewrite the subject row's origin to the retired persisted value —
+        // exactly what a pre-rename feed carries. Never spelled literally.
+        let retiredOriginValue = ["ay", "ala"].joined()
+        var baseJSON = try JSONValue.parse(Data(contentsOf: s.basePath))
+        guard case .object(var baseObj) = baseJSON,
+              case .object(var stateObj)? = baseObj["state"],
+              case .array(var rows)? = stateObj["items"] else {
+            Issue.record("base file shape unexpected"); return
+        }
+        var stamped = false
+        for (i, row) in rows.enumerated() {
+            guard case .object(var itemObj) = row,
+                  case .string(subject.handle)? = itemObj["handle"] else { continue }
+            itemObj["origin"] = .string(retiredOriginValue)
+            rows[i] = .object(itemObj)
+            stamped = true
+            break
+        }
+        #expect(stamped, "test setup must actually find the subject row in the base")
+        stateObj["items"] = .array(rows)
+        let mangledStateVal = JSONValue.object(stateObj)
+        baseObj["state"] = mangledStateVal
+        baseJSON = .object(baseObj)
+        try baseJSON.serializedData(pretty: true).write(to: s.basePath)
+
+        // The OLD gate: byte identity. Prove it would have condemned this base.
+        let decoded = try #require(DeskState.fromJSON(mangledStateVal))
+        #expect(decoded.toJSON() != mangledStateVal,
+                "premise: the retired origin re-encodes as 'agent', so byte identity fails")
+        // The NEW gate: decode-stability + shape preservation. Faithful.
+        #expect(deskBaseRoundTripIsFaithful(decoded: decoded, onDisk: mangledStateVal))
+
+        // And the store loads, with the origin migrated forward.
+        let live = try await s.liveState()
+        let row = try #require(live.items.first { $0.handle == subject.handle })
+        #expect(row.origin == .agent)
+        #expect(row.title == "migrated-origin")
+        #expect(live.items.count == 6)
+    }
+
+    /// The migration tolerance must NOT become a hole: a key the decoder cannot
+    /// represent still changes the SHAPE of the re-encoding, and still fails
+    /// loud. (Under a naive decode-stability-only gate this base would load.)
+    @Test("an unknown extra field in a base item still fails loud")
+    func unknownExtraFieldInBaseStillFailsLoud() async throws {
+        let root = try root(); defer { try? FileManager.default.removeItem(at: root) }
+        let s = store(root, threshold: 4)
+        for n in 1...5 {
+            _ = try await s.createItem(kind: .watch, project: "p", title: "item-\(n)")
+        }
+        var baseJSON = try JSONValue.parse(Data(contentsOf: s.basePath))
+        guard case .object(var baseObj) = baseJSON,
+              case .object(var stateObj)? = baseObj["state"],
+              case .array(var rows)? = stateObj["items"],
+              case .object(var itemObj) = rows[0] else {
+            Issue.record("base file shape unexpected"); return
+        }
+        itemObj["futureFieldFromANewerBuild"] = .string("payload")
+        rows[0] = .object(itemObj)
+        stateObj["items"] = .array(rows)
+        baseObj["state"] = .object(stateObj)
+        baseJSON = .object(baseObj)
+        try baseJSON.serializedData(pretty: true).write(to: s.basePath)
+        do {
+            _ = try await s.liveState()
+            Issue.record("an unrepresentable extra field in the base must still throw")
+        } catch let error as DeskError {
+            guard case .compactionBaseCorrupt = error else { throw error }
+        }
+    }
+
     @Test("commit-stamp Lamport floor includes the base once the tail is empty")
     func maxCommittedTsFloorsOnBase() async throws {
         let root = try root(); defer { try? FileManager.default.removeItem(at: root) }

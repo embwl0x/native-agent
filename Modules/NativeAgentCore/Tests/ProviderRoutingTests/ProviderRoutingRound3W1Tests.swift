@@ -76,7 +76,7 @@ struct NativeLaneKeepAliveTests {
     /// so a healthy long-thinking kimi-code turn survives the idle window.
     @Test func heartbeat_keeps_guard_alive_through_slow_blocking_call() async throws {
         DelayingStubURLProtocol.reset()
-        DelayingStubURLProtocol.delaySeconds = 0.30
+        DelayingStubURLProtocol.delaySeconds = 3.0
         DelayingStubURLProtocol.body = Data(#"""
         {"content":[{"type":"tool_use","id":"tool_slow","name":"git_status","input":{}}],
          "stop_reason":"tool_use"}
@@ -84,18 +84,21 @@ struct NativeLaneKeepAliveTests {
         let root = try w1TempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
 
-        // Heartbeat every 20ms; guard idle window 100ms. The response does not
-        // arrive for 300ms — WITHOUT the heartbeat the guard kills it at 100ms.
+        // Heartbeat every 100ms; guard idle window 1.0s. The response does not
+        // arrive for 3.0s — WITHOUT the heartbeat the guard kills it at 1.0s.
+        // The 10:1 interval-to-idle-window ratio (was 5:1 at 20ms/100ms) gives
+        // the heartbeat room to slip repeatedly under full-suite CPU contention
+        // before the idle clock could ever trip. wallTimeout stays 10s > 3.0s.
         let adapter = AnthropicAdapter.kimiCode(
             session: delayingSession(),
             apiKeyOverride: "kc",
             dataRootOverride: root,
             telemetryDataRootOverride: root,
-            nativeToolKeepAliveInterval: 0.02
+            nativeToolKeepAliveInterval: 0.10
         )
         let guarded = ProviderStreamGuard.wrap(
             adapter.streamMessages(messages: [.user("go")], system: nil, model: "k3", tools: [w1Schema]),
-            config: ProviderStreamGuardConfig(idleTimeout: 0.10, wallTimeout: 10, checkInterval: 0.01),
+            config: ProviderStreamGuardConfig(idleTimeout: 1.0, wallTimeout: 10, checkInterval: 0.05),
             providerLabel: "kimi-code"
         )
 

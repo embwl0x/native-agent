@@ -64,9 +64,18 @@ struct MCPResultEvidenceTests {
             projection: projection
         )
 
+        // A real, writable directory: appendJSONLCapped now takes the file
+        // lock for EVERY conformer (wave 4), so a nonexistent parent dir
+        // fails at lock-open before the shim's own error can surface. The
+        // failure under test is the shim's append denial, not a missing dir.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MCPResultEvidenceTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
         let outcome = await MCPResultEvidence.persist(
             receipt,
-            to: URL(fileURLWithPath: "/unwritten/activity.jsonl"),
+            to: root.appendingPathComponent("activity.jsonl"),
             using: FailingMCPReceiptPersistence()
         )
 

@@ -57,6 +57,21 @@ private struct TimeoutStubLoop: LoopRunner {
     }
 }
 
+/// A loop with a short tick budget whose body ignores cooperative
+/// cancellation — the exact shape that used to wedge the single-flight gate
+/// forever after one timeout.
+private struct WedgedTimeoutStubLoop: LoopRunner {
+    let loopId = "wedged_timeout"
+    let interval: TimeInterval = 86_400
+    var tickTimeoutOverride: TimeInterval? { 0.05 }
+    let onTick: @Sendable () async -> Void
+
+    func tickOutcome() async -> LoopTickOutcome {
+        await onTick()
+        return .completed(result: nil)
+    }
+}
+
 private final class PhysiologyEventSource: @unchecked Sendable {
     let stream: AsyncStream<Void>
     private let continuation: AsyncStream<Void>.Continuation
@@ -267,6 +282,52 @@ struct BackgroundLoopsManagerTests {
         await probe.release()
         await periodic.value
         #expect(await probe.value == 1)
+        await manager.stop()
+    }
+
+    @Test("a timed-out uncancellable tick force-releases the gate so the next tick runs")
+    func timedOutWedgedTickDoesNotWedgeTheGate() async throws {
+        // Pre-fix: ManagedLoopRunner awaited `underlying.tickOutcome()`
+        // directly, so when the manager's timeout cancelled the tick task and
+        // the loop body ignored cancellation, `gate.finish` never ran. The
+        // gate stayed active forever and EVERY later tick coalesced into a
+        // skip — a permanently dead loop behind a single timeout receipt.
+        let probe = SuspendedTickProbe()
+        let loop = WedgedTimeoutStubLoop { await probe.tick() }
+        let manager = BackgroundLoopsManager()
+        await manager.start(loops: [loop])
+
+        let first = await manager.runTickOnce(loopId: loop.loopId)
+        guard case .failed(let firstError) = first else {
+            Issue.record("expected the wedged first tick to time out, got \(first)")
+            await probe.release()
+            await manager.stop()
+            return
+        }
+        #expect(firstError.hasPrefix("timeout after"))
+
+        // A subsequent request must RUN the underlying loop rather than
+        // coalesce. Entry count is the only honest verdict here: a coalesced
+        // joiner is itself cancelled by the same tick timeout, so the returned
+        // outcome is `.failed(timeout…)` either way and cannot discriminate.
+        // The force-release also lands one actor hop after the timeout throws,
+        // so a single follow-up may legitimately still join — but a join waits
+        // for idle, so a bounded retry converges. Pre-fix, entries stayed at 1
+        // forever no matter how many attempts were made.
+        var entries = await probe.value
+        attempts: for _ in 0..<3 {
+            _ = await manager.runTickOnce(loopId: loop.loopId)
+            // The wedged body is entered from an unstructured child, so observe
+            // the entry by bounded polling rather than a bare sleep.
+            for _ in 0..<20 {
+                entries = await probe.value
+                if entries >= 2 { break attempts }
+                try await Task.sleep(nanoseconds: 50_000_000)
+            }
+        }
+        #expect(entries >= 2, "gate stayed wedged — underlying loop never ran again (entries=\(entries))")
+
+        await probe.release()
         await manager.stop()
     }
 

@@ -109,11 +109,12 @@ extension SwiftNativeResearchClient {
             let capped = Array(existing.prefix(100))
             try await self.persistence.writeJSON(.array(capped), to: labRunsPath)
         }
-        if let p = persistence as? SwiftNativePersistenceCore {
-            try await p.withFileLock(labRunsPath, writeBack)
-        } else {
-            try await writeBack()
-        }
+        // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+        // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+        // every conformer already has it. The old downcast to
+        // SwiftNativePersistenceCore only had the effect of running this critical
+        // section UNLOCKED for any other conformer.
+        try await persistence.withFileLock(labRunsPath, writeBack)
 
         // Emit activity and trace side effects so the Mac activity feed and
         // trace ledger stay complete for in-process research runs.

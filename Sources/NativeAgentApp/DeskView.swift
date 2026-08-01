@@ -289,7 +289,9 @@ struct DeskView: View {
     // Absent entirely when nothing is tracked — an empty lane is noise.
 
     private enum GHBucket: String, CaseIterable {
-        case needsCodex = "Needs Codex"
+        // Display bucket only — persisted state is GitHubCommandItem.state;
+        // renamed from "Needs Codex" 2026-08-01 (User-approved taste item).
+        case needsCodex = "Waiting on Codex"
         case codexWorking = "Codex working"
         case needsUser = "Needs you"
         case waiting = "Waiting upstream"
@@ -462,7 +464,7 @@ struct DeskView: View {
     private func ghStatePill(_ item: GitHubCommandItem) -> some View {
         let (label, color): (String, Color) = {
             switch item.state {
-            case .detected, .needsCodex: return ("needs codex", .gray)
+            case .detected, .needsCodex: return ("waiting on codex", .gray)
             case .codexWorking: return ("codex working", .blue)
             case .verifying: return ("verifying", .teal)
             case .needsUser: return ("needs you", .orange)

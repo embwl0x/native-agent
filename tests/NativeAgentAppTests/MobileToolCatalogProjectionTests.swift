@@ -29,7 +29,6 @@ struct MobileToolCatalogProjectionTests {
             currentlyLoaded: ["time_now"],
             builderAvailable: [],
             builderPolicyLocked: [],
-            builderNotImplemented: [],
             macAppAvailable: [],
             macAppPolicyLocked: [],
             fullMacActive: false,

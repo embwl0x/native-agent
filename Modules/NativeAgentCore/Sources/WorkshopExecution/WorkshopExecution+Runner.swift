@@ -513,20 +513,24 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         // latency must not serialize the queue); only count+create is
         // critical. The executor's claim path takes its own flock — this
         // lock is admission-only.
-        if let p = persistence as? SwiftNativePersistenceCore {
-            let admissionLock = executionRecordsRoot.appendingPathComponent(".admission")
-            try await p.withFileLock(admissionLock) { [self] in
-                try await assertSlotAvailable()
-                // COUNTED reservation (delta review: an empty dir is invisible
-                // to the slot count, so racers serializing through this lock
-                // each saw the same count). `.reserved` occupies a slot until
-                // mission.json lands; removed on success, dir deleted on
-                // failure, age-out guards a crash between the two.
-                try FileManager.default.createDirectory(
-                    at: workshopExecutionDir(id), withIntermediateDirectories: true)
-                try Data("reserved \(nowStr)".utf8)
-                    .write(to: workshopExecutionDir(id).appendingPathComponent(".reserved"))
-            }
+        // Uniform locking (L7, 2026-08-01): admission used to run ONLY when
+        // `persistence` downcast to SwiftNativePersistenceCore — every other
+        // conformer skipped the slot-cap re-check and the counted reservation
+        // outright, so the cap was silently unenforced. `withFileLock` is a
+        // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4),
+        // so the downcast was gratuitous; admission now always runs, locked.
+        let admissionLock = executionRecordsRoot.appendingPathComponent(".admission")
+        try await persistence.withFileLock(admissionLock) { [self] in
+            try await assertSlotAvailable()
+            // COUNTED reservation (delta review: an empty dir is invisible
+            // to the slot count, so racers serializing through this lock
+            // each saw the same count). `.reserved` occupies a slot until
+            // mission.json lands; removed on success, dir deleted on
+            // failure, age-out guards a crash between the two.
+            try FileManager.default.createDirectory(
+                at: workshopExecutionDir(id), withIntermediateDirectories: true)
+            try Data("reserved \(nowStr)".utf8)
+                .write(to: workshopExecutionDir(id).appendingPathComponent(".reserved"))
         }
 
         // Ensure mission dir + receipts/ exist (daemon does this in
@@ -634,11 +638,12 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
             try await persistence.writeJSON(record.toJSON(), to: executionRecordJSON)
         }
         do {
-            if let p = persistence as? SwiftNativePersistenceCore {
-                try await p.withFileLock(executionRecordJSON, work)
-            } else {
-                try await work()
-            }
+            // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+            // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+            // every conformer already has it. The old downcast to
+            // SwiftNativePersistenceCore only had the effect of running this critical
+            // section UNLOCKED for any other conformer.
+            try await persistence.withFileLock(executionRecordJSON, work)
         } catch {
             throw WorkshopExecutionError.persistenceFailure("mission.json write failed: \(error)")
         }
@@ -744,11 +749,12 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
 
         let (record, didCancel): (WorkshopExecutionRecord, Bool)
         do {
-            if let p = persistence as? SwiftNativePersistenceCore {
-                (record, didCancel) = try await p.withFileLock(executionRecordJSON, work)
-            } else {
-                (record, didCancel) = try await work()
-            }
+            // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+            // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+            // every conformer already has it. The old downcast to
+            // SwiftNativePersistenceCore only had the effect of running this critical
+            // section UNLOCKED for any other conformer.
+            (record, didCancel) = try await persistence.withFileLock(executionRecordJSON, work)
         } catch let e as WorkshopExecutionError {
             throw e
         } catch {
@@ -903,11 +909,12 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
 
         let outcome: (record: WorkshopExecutionRecord, changed: Bool)?
         do {
-            if let p = persistence as? SwiftNativePersistenceCore {
-                outcome = try await p.withFileLock(executionRecordJSON, work)
-            } else {
-                outcome = try await work()
-            }
+            // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+            // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+            // every conformer already has it. The old downcast to
+            // SwiftNativePersistenceCore only had the effect of running this critical
+            // section UNLOCKED for any other conformer.
+            outcome = try await persistence.withFileLock(executionRecordJSON, work)
         } catch let e as WorkshopExecutionError {
             throw e
         } catch {
@@ -962,15 +969,18 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     // The lock is on timeline.jsonl's OWN `.lock` sibling — distinct from
     // mission.json's lock — so it never nests inside or contends with the
     // read-mutate-write critical section that submit()/cancel()/updateMission()
-    // hold on mission.json. For mock persistence there is no cross-process
-    // writer to race, so a plain append is correct.
+    // hold on mission.json. Uniform locking (2026-08-01): EVERY persistence
+    // conformer takes this lock — mock persistence included — pinned by
+    // UniformFileLockTests; do not restore an unlocked mock path.
     private func appendTimelineLocked(_ event: JSONValue, to timeline: URL) async throws {
-        if let p = persistence as? SwiftNativePersistenceCore {
-            try await p.withFileLock(timeline) {
-                try await p.appendJSONL(event, to: timeline)
-            }
-        } else {
-            try await persistence.appendJSONL(event, to: timeline)
+        // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+        // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+        // every conformer already has it. The old downcast to
+        // SwiftNativePersistenceCore only had the effect of running this critical
+        // section UNLOCKED for any other conformer.
+        let core = persistence
+        try await core.withFileLock(timeline) {
+            try await core.appendJSONL(event, to: timeline)
         }
     }
 

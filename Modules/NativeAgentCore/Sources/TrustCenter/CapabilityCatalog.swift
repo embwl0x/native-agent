@@ -292,10 +292,12 @@ private func resolvePackSigningKey(
         return secret
     }
 
-    if let nativePersistence = persistence as? SwiftNativePersistenceCore {
-        return try await nativePersistence.withFileLock(keyPath, work)
-    }
-    return try await work()
+    // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+    // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+    // every conformer already has it. The old downcast to
+    // SwiftNativePersistenceCore only had the effect of running this critical
+    // section UNLOCKED for any other conformer.
+    return try await persistence.withFileLock(keyPath, work)
 }
 
 /// SHA-256 hex of `s` (UTF-8 bytes), truncated to the first 32 chars —
@@ -681,10 +683,12 @@ public actor SwiftNativeCatalogWrites {
     private func withSourcesLock<T: Sendable>(
         _ work: @Sendable @escaping () async throws -> T
     ) async throws -> T {
-        if let p = persistence as? SwiftNativePersistenceCore {
-            return try await p.withFileLock(sourcesPath, work)
-        }
-        return try await work()
+        // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+        // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+        // every conformer already has it. The old downcast to
+        // SwiftNativePersistenceCore only had the effect of running this critical
+        // section UNLOCKED for any other conformer.
+        return try await persistence.withFileLock(sourcesPath, work)
     }
 
     /// Port of `upsert_catalog_source()`. Builds the
@@ -921,10 +925,11 @@ public actor SwiftNativeCatalogWrites {
         let work: @Sendable () async throws -> Void = {
             try await persistenceLocal.appendJSONL(event, to: tracesURL)
         }
-        if let p = persistence as? SwiftNativePersistenceCore {
-            try await p.withFileLock(tracesURL, work)
-        } else {
-            try await work()
-        }
+        // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+        // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+        // every conformer already has it. The old downcast to
+        // SwiftNativePersistenceCore only had the effect of running this critical
+        // section UNLOCKED for any other conformer.
+        try await persistence.withFileLock(tracesURL, work)
     }
 }

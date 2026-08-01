@@ -3394,7 +3394,7 @@ func canonicalAssistantRegenerationReplacesOneRowInsideTheTranscriptLock() async
                 $0.kind == "turn.reaction"
             }
         }
-        if reaction == nil { try await Task.sleep(for: .milliseconds(10)) }
+        if reaction == nil { try await Task.sleep(for: .milliseconds(100)) }
     }
     let exactReaction = try #require(reaction)
     #expect(exactReaction.turnId == "turn-retry")
@@ -4248,7 +4248,7 @@ func chatClient_streaming_claude_models_use_text_streaming_compatibility_path() 
         let events = try await TurnTraceRecentReader(dataRootOverride: root).read().events
         terminal = events.last { $0.kind == "turn.terminal" }
         if terminal != nil { break }
-        try await Task.sleep(for: .milliseconds(10))
+        try await Task.sleep(for: .milliseconds(100))
     }
     let terminalEvent = try #require(terminal)
     guard case .object(let payload) = terminalEvent.payload else {
@@ -4936,12 +4936,17 @@ func chatClient_streaming_structured_tool_call_dispatches_without_marker_delta()
     #expect(toolUseCount == 1)
     #expect(deltas.joined() == "Checking tools.I can see the tool catalog now.")
     #expect(!deltas.joined().contains("<tool_use"))
-    #expect(finalText == "I can see the tool catalog now.")
+    // Transcript fidelity (2026-07-31): the persisted assistant row is the
+    // SAME bytes the surface rendered — pre-tool narration included. These two
+    // assertions used to read "I can see the tool catalog now.", which pinned
+    // the defect: "Checking tools." was streamed, then dropped on reload.
+    #expect(finalText == "Checking tools.I can see the tool catalog now.")
+    #expect(finalText == deltas.joined())
 
     let lines = readJSONL(root, sessionId: "s-stream-tool-events")
     #expect(lines.count == 3)
     #expect(lines[1]["role"] as? String == "tool")
-    #expect(lines[2]["content"] as? String == "I can see the tool catalog now.")
+    #expect(lines[2]["content"] as? String == "Checking tools.I can see the tool catalog now.")
 }
 
 @Test
@@ -5590,7 +5595,7 @@ func alternateRootChatTraceBusPersistsOnlyUnderInjectedRoot() async throws {
     for _ in 0..<100 {
         let text = (try? String(contentsOf: injectedPath, encoding: .utf8)) ?? ""
         if text.contains(turnID) { break }
-        try await Task.sleep(for: .milliseconds(10))
+        try await Task.sleep(for: .milliseconds(100))
     }
 
     #expect((try? String(contentsOf: injectedPath, encoding: .utf8))?.contains(turnID) == true)
@@ -5651,7 +5656,7 @@ func chatClient_terminalTraceCarriesAuthoritativeMetacognitiveObservations() asy
         let events = try await TurnTraceRecentReader(dataRootOverride: root).read().events
         terminal = events.last { $0.kind == "turn.terminal" }
         if terminal != nil { break }
-        try await Task.sleep(for: .milliseconds(10))
+        try await Task.sleep(for: .milliseconds(100))
     }
     let event = try #require(terminal)
     guard case .object(let payload) = event.payload else {

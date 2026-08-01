@@ -970,24 +970,17 @@ extension NativeClient {
 
     private static func embeddingModeDetail(_ runtime: EmbeddingRuntimeSnapshot, requestedCoreML: Bool) -> String {
         guard requestedCoreML else {
-            return "Semantic CoreML embeddings are off; recall uses deterministic mock vectors plus KG fallback."
+            return EmbeddingPlainCopy.headline(.turnedOff)
         }
         // Env-mock opt-in path: user wanted CoreML, set the env var, runtime
         // returns mock vectors. Say so honestly.
         if runtime.effectiveBackend == ManagedEmbeddingProvider.mockBackend {
-            return "Bundled CoreML MiniLM is overridden by NATIVE_AGENT_EMBEDDING_MOCK; semantic recall uses deterministic mock vectors."
+            return EmbeddingPlainCopy.headline(.testVectors)
         }
         if runtime.effectiveBackend == ManagedEmbeddingProvider.failClosedBackend {
-            return "Bundled CoreML MiniLM resources are unavailable; semantic recall is fail-closed until the MiniLM bundle is installed."
+            return EmbeddingPlainCopy.headline(.modelMissing)
         }
-        switch runtime.mode {
-        case "performance":
-            return "CoreML MiniLM stays warm for fastest semantic recall."
-        case "low_memory":
-            return "CoreML MiniLM unloads after 45 seconds of idle time to reduce memory pressure."
-        default:
-            return "CoreML MiniLM lazy-loads on recall and unloads after 5 minutes idle."
-        }
+        return EmbeddingPlainCopy.modeLine(mode: runtime.mode)
     }
 
     private static func embeddingCurrentStep(_ runtime: EmbeddingRuntimeSnapshot, requestedCoreML: Bool) -> String {
@@ -1003,19 +996,22 @@ extension NativeClient {
         return "Semantic embedder fail-closed (CoreML resources missing or load failed)"
     }
 
+    // This value lands in the SECONDARY line under a plain headline
+    // (SlimSettingsView.modelUnavailableRow), so it is where the identifiers
+    // are allowed to live — the headline above it never carries them.
     private static func embeddingStatusDetail(_ runtime: EmbeddingRuntimeSnapshot, requestedCoreML: Bool) -> String? {
-        if !requestedCoreML { return "Turn embeddings back on to use bundled CoreML MiniLM for semantic recall." }
+        if !requestedCoreML { return EmbeddingPlainCopy.technicalDetail(.turnedOff) }
         if runtime.effectiveBackend == ManagedEmbeddingProvider.mockBackend {
-            return "NATIVE_AGENT_EMBEDDING_MOCK is set — semantic recall is using deterministic mock vectors instead of the bundled CoreML MiniLM."
+            return EmbeddingPlainCopy.technicalDetail(.testVectors)
         }
         if let error = runtime.lastLoadError {
-            return "CoreML load failed; semantic recall is fail-closed (embed() throws). \(error)"
+            return EmbeddingPlainCopy.technicalDetail(.modelFailed, error: error)
         }
         if runtime.coreMLLoaded { return nil }
         if runtime.effectiveBackend == ManagedEmbeddingProvider.failClosedBackend {
-            return "CoreML MiniLM resources are not on disk; semantic recall is fail-closed until the model bundle is installed."
+            return EmbeddingPlainCopy.technicalDetail(.modelMissing)
         }
-        return "CoreML MiniLM is not resident right now; it will load on the next semantic recall."
+        return EmbeddingPlainCopy.notLoadedYetLine
     }
 
     // DAEMON-DEAD PORT (2026-06-03): configure the Swift embedding runtime.
@@ -1173,4 +1169,82 @@ extension NativeClient {
         ]
     }
 
+}
+
+// MARK: - Plain-English semantic search copy
+//
+// UI-6 (2026-08-01, public era): every user-visible sentence about the memory
+// search model. Same rule as DoctorPlainCopy / MemoryStatusPlainCopy — the
+// headline says what a person lost and what it means for them, and the
+// identifiers (Core ML, MiniLM, the env override, the raw load error) survive
+// in a secondary technical line instead of being deleted. Pure values in,
+// Strings out, so the wording is unit-testable without a UI harness.
+enum EmbeddingPlainCopy {
+
+    /// What the embedding runtime is actually doing for search right now.
+    enum SearchState: Equatable {
+        /// The on-device model is serving real vectors.
+        case byMeaning
+        /// The user opted out of semantic embeddings in settings.
+        case turnedOff
+        /// NATIVE_AGENT_EMBEDDING_MOCK opt-in: deterministic test vectors.
+        case testVectors
+        /// Model resources are not on disk.
+        case modelMissing
+        /// Model resources exist but failed to load.
+        case modelFailed
+    }
+
+    /// Leads with the user's loss, never with a backend name.
+    static func headline(_ state: SearchState) -> String {
+        switch state {
+        case .byMeaning:
+            return "Memory search finds results by meaning."
+        case .turnedOff:
+            return "Memory search by meaning is turned off. Searches match words instead."
+        case .testVectors:
+            return "Memory search is running on test data, so results will not match meaning."
+        case .modelMissing:
+            return "Memory search by meaning is off because a required model is not installed. Searches match words instead."
+        case .modelFailed:
+            return "Memory search by meaning is off because the search model could not load. Searches match words instead."
+        }
+    }
+
+    /// The secondary line. Nil when there is nothing technical worth naming.
+    static func technicalDetail(_ state: SearchState, error: String? = nil) -> String? {
+        switch state {
+        case .byMeaning:
+            return nil
+        case .turnedOff:
+            return "Semantic embeddings are off in settings. Turn them on to use the bundled Core ML MiniLM model."
+        case .testVectors:
+            return "NATIVE_AGENT_EMBEDDING_MOCK is set, so search uses deterministic test vectors instead of the bundled Core ML MiniLM model."
+        case .modelMissing:
+            return "Search model: Core ML MiniLM. The bundled resources are not on disk."
+        case .modelFailed:
+            let trimmed = error?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if trimmed.isEmpty {
+                return "Search model: Core ML MiniLM. Load failed."
+            }
+            return "Search model: Core ML MiniLM. Load failed: \(trimmed)"
+        }
+    }
+
+    /// Idle-retention mode, described by what the user feels rather than by
+    /// which model unloads when.
+    static func modeLine(mode: String) -> String {
+        switch mode {
+        case "performance":
+            return "The search model stays loaded, so searches return as fast as possible."
+        case "low_memory":
+            return "The search model unloads after 45 seconds of no use, to keep memory free."
+        default:
+            return "The search model loads when you search and unloads after 5 minutes of no use."
+        }
+    }
+
+    /// Transient: the model is fine, just not resident this second.
+    static let notLoadedYetLine =
+        "The search model is not loaded right now. It loads on your next search."
 }

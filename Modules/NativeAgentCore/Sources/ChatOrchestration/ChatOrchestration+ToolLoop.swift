@@ -1890,6 +1890,17 @@ extension SwiftNativeTurnEngine {
         // tool markers) — carried across a mid-stream throw so the partial isn't
         // lost. Used only on the failure path.
         var visibleText = ""
+        // Transcript-loss fix (2026-07-31): interstitial narration from every
+        // NON-final iteration (prose → tool → prose → tool → prose). Those bytes
+        // were streamed to the surface but the success return built `reply` from
+        // the LAST iteration's `iterAccumulated` only, so a reload showed one
+        // paragraph where the user watched three render. The failure path already
+        // persisted the whole accumulated `visibleText`; success now matches it —
+        // raw concatenation, no injected separator, exactly the bytes emitted via
+        // progress?(.delta(...)). Bounced iterations (violation / empty-reply /
+        // announce) `continue` before the append, so rejected narration is
+        // discarded here the same way those paths reset `visibleText`.
+        var turnInterstitialProse = ""
         var lastProviderHadToolCalls = false
         var lastProtocolViolation: ToolCallProtocolViolation?
         // 2026-07-21 audit fix: bound the violation bounce — a
@@ -1920,6 +1931,10 @@ extension SwiftNativeTurnEngine {
         for _ in 0..<iterationLimit {
             providerCallCount += 1
             var iterAccumulated = ""
+            // Bytes this iteration actually handed to the surface (marker-safe
+            // slices only). Folded into `turnInterstitialProse` when the
+            // iteration ends in a tool dispatch.
+            var iterEmittedProse = ""
             var streamedCalls: [ParsedToolCall] = []
             var pendingProtocolDelta = ""
             // U1 step 4: thread the session id task-locally so the OpenAI
@@ -1990,6 +2005,7 @@ extension SwiftNativeTurnEngine {
                             let safe = String(pendingProtocolDelta[..<marker.lowerBound])
                             pendingProtocolDelta = String(pendingProtocolDelta[marker.lowerBound...])
                             if !safe.isEmpty {
+                                iterEmittedProse += safe
                                 await progress?(.delta(safe))
                             }
                         } else if pendingProtocolDelta.count > 16 {
@@ -2003,6 +2019,7 @@ extension SwiftNativeTurnEngine {
                             let safe = String(pendingProtocolDelta[..<split])
                             pendingProtocolDelta = String(pendingProtocolDelta[split...])
                             if !safe.isEmpty {
+                                iterEmittedProse += safe
                                 await progress?(.delta(safe))
                             }
                         }
@@ -2170,8 +2187,14 @@ extension SwiftNativeTurnEngine {
                 // Shared completed-turn finish (C2). Streaming passes the
                 // accumulated lastRawResponse as rawLLMResponse (vs the
                 // non-streaming iteration `raw`).
+                //
+                // The PERSISTED reply is every visible byte of the turn — the
+                // narration streamed before each tool round plus this final
+                // iteration's text — not just the last iteration. Single-round
+                // turns leave `turnInterstitialProse` empty, so they persist
+                // exactly `reply` as before.
                 return await finishCompletedTurn(
-                    reply: reply,
+                    reply: turnInterstitialProse + reply,
                     ctx: ctx,
                     dispatches: dispatches,
                     startNs: startNs,
@@ -2185,9 +2208,24 @@ extension SwiftNativeTurnEngine {
 
             let pendingProse = ToolCallParser.stripToolUseMarkers(pendingProtocolDelta)
             if !pendingProse.isEmpty {
+                iterEmittedProse += pendingProse
                 await progress?(.delta(pendingProse))
             }
             pendingProtocolDelta.removeAll(keepingCapacity: true)
+            // This iteration is committed (it dispatches tools, so it can never
+            // be rewound by a bounce): keep its narration for the persisted
+            // reply.
+            //
+            // ONLY when the provider streamed STRUCTURED tool calls. If the
+            // calls were instead recovered by parsing the iteration's TEXT, that
+            // text IS the call encoding — an XML <tool_use> marker or a raw
+            // {"tool_calls":[…]} payload depending on dialect — and must never
+            // land in the transcript as prose. stripToolUseMarkers only knows
+            // the XML dialect, so text-parsed iterations contribute nothing at
+            // all, exactly as before this fix.
+            if !streamedCalls.isEmpty {
+                turnInterstitialProse += ToolCallParser.stripToolUseMarkers(iterEmittedProse)
+            }
             // Shared post-dispatch round (C2): identical to the non-streaming
             // loop — assistant blocks → shared dispatch core → no-progress guard
             // → paired tool_result append → schema refresh + compat-only sweep.

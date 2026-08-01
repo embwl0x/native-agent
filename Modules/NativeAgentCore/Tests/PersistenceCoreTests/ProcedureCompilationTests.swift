@@ -514,6 +514,76 @@ struct ProcedureCompilationTests {
         #expect(FileManager.default.fileExists(atPath: corruptPath.path))
     }
 
+    /// L1 (2026-08-01 audit): `install()` wraps its write in
+    /// `withFileLock(artifactPath)`, which O_CREATs `<id>.json.lock` — and
+    /// nothing ever removed it. Deleting the artifact left the sidecar behind
+    /// forever, so the artifacts directory accumulated one dead lock per swept
+    /// or hand-deleted artifact. `loadInstalledArtifacts` filters on
+    /// `pathExtension == "json"`, so the orphans never surfaced anywhere; they
+    /// just grew.
+    ///
+    /// NEGATIVE CONTROL: drop the `reapOrphanArtifactLocks` call from
+    /// `sweepUnreferencedArtifacts` and both lock-absence expectations fail.
+    @Test("retention sweep reaps the lock sidecar of a removed artifact (L1)")
+    func retentionSweepReapsOrphanLockSidecars() async throws {
+        let (artifact, _) = try eligibleArtifact()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("procedure-lock-orphan-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ProcedureArtifactStore(dataRoot: root)
+        let path = try await store.install(artifact)
+
+        // install() takes the artifact-path flock, so the sidecar exists.
+        let lock = URL(fileURLWithPath: path.path + ".lock")
+        #expect(
+            FileManager.default.fileExists(atPath: lock.path),
+            "install must have created the lock sidecar for this test to mean anything"
+        )
+
+        // A LIVE artifact's lock is never reaped, aged or not.
+        let aged = Date().addingTimeInterval(-ProcedureArtifactStore.artifactRetentionAge - 3600)
+        try FileManager.default.setAttributes(
+            [.modificationDate: aged], ofItemAtPath: lock.path
+        )
+        #expect(await store.sweepUnreferencedArtifacts() == 0)
+        #expect(
+            FileManager.default.fileExists(atPath: lock.path),
+            "a lock whose artifact still exists is live bookkeeping"
+        )
+
+        // Age the artifact out: the sweep collects it AND its sidecar together.
+        try FileManager.default.setAttributes(
+            [.modificationDate: aged], ofItemAtPath: path.path
+        )
+        #expect(await store.sweepUnreferencedArtifacts() == 1)
+        #expect(!FileManager.default.fileExists(atPath: path.path))
+        #expect(
+            !FileManager.default.fileExists(atPath: lock.path),
+            "the swept artifact's lock sidecar must not outlive it"
+        )
+
+        // Second pass: a lock left by an earlier partial sweep (or a lock taken
+        // for an artifact that was never written) is reaped once aged — but a
+        // FRESH orphan lock is left alone, because an in-flight install owns it.
+        let stray = root.appendingPathComponent(
+            "living_fabric/procedures/artifacts/\(opaque("stray-lock")).json.lock"
+        )
+        try Data().write(to: stray)
+        #expect(await store.sweepUnreferencedArtifacts() == 0)
+        #expect(
+            FileManager.default.fileExists(atPath: stray.path),
+            "a recent orphan lock may belong to a live install — never reap it"
+        )
+        try FileManager.default.setAttributes(
+            [.modificationDate: aged], ofItemAtPath: stray.path
+        )
+        #expect(await store.sweepUnreferencedArtifacts() == 0)
+        #expect(
+            !FileManager.default.fileExists(atPath: stray.path),
+            "an aged orphan lock with no artifact must be reaped"
+        )
+    }
+
     @Test("retention sweep keeps an artifact with a recent invocation receipt (F3-M2)")
     func retentionSweepProtectsRecentlyInvoked() async throws {
         let (artifact, _) = try eligibleArtifact()
@@ -626,6 +696,127 @@ struct ProcedureCompilationTests {
         )
         #expect(await recentStore.sweepUnreferencedArtifacts() == 0)
         #expect(try await recentStore.loadInstalledArtifacts() == [artifact])
+    }
+
+    @Test("one undecodable receipt line cannot disable the retention sweep")
+    func retentionSweepSkipsUndecodableReceiptLine() async throws {
+        // A `return 0` on the first unparseable ledger line permanently turned
+        // the GC off for that store — which walks it into the 1024-artifact cap
+        // and fails installs closed. The sweep must skip the bad line instead.
+        let (artifact, _) = try eligibleArtifact()
+        let aged = Date().addingTimeInterval(-ProcedureArtifactStore.artifactRetentionAge - 3600)
+
+        func poisonLedger(at root: URL) throws {
+            let ledger = root.appendingPathComponent(
+                "living_fabric/procedures/invocations.jsonl"
+            )
+            // Torn/garbage line FIRST, so it is hit before any good receipt.
+            var poisoned = Data("{\"schema\":\"procedure.invocation\",\n".utf8)
+            poisoned.append(try Data(contentsOf: ledger))
+            try poisoned.write(to: ledger)
+        }
+
+        // Store A — receipts are STALE, so nothing protects the aged artifact.
+        // Buggy code returns 0 (bailed on the bad line); fixed code deletes it.
+        let staleRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("procedure-badline-stale-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: staleRoot) }
+        let stalePast = Date().addingTimeInterval(-ProcedureArtifactStore.artifactRetentionAge - 7200)
+        let staleStore = ProcedureArtifactStore(dataRoot: staleRoot, clock: { stalePast })
+        let stalePath = try await staleStore.install(artifact)
+        _ = try await staleStore.invokeManual(
+            artifactID: artifact.id,
+            opaqueInputReference: opaque("badline-stale-input"),
+            context: dryContext(artifact: artifact),
+            executor: RecordingProcedureExecutor()
+        )
+        try poisonLedger(at: staleRoot)
+        try FileManager.default.setAttributes(
+            [.modificationDate: aged], ofItemAtPath: stalePath.path
+        )
+        #expect(await staleStore.sweepUnreferencedArtifacts() == 1)
+        #expect(try await staleStore.loadInstalledArtifacts().isEmpty)
+
+        // Store B — the GOOD receipt after the bad line is still read, so the
+        // recently-invoked artifact stays protected. Skipping must not degrade
+        // into "protects nothing".
+        let recentRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("procedure-badline-recent-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: recentRoot) }
+        let recentStore = ProcedureArtifactStore(dataRoot: recentRoot)
+        let recentPath = try await recentStore.install(artifact)
+        _ = try await recentStore.invokeManual(
+            artifactID: artifact.id,
+            opaqueInputReference: opaque("badline-recent-input"),
+            context: dryContext(artifact: artifact),
+            executor: RecordingProcedureExecutor()
+        )
+        try poisonLedger(at: recentRoot)
+        try FileManager.default.setAttributes(
+            [.modificationDate: aged], ofItemAtPath: recentPath.path
+        )
+        #expect(await recentStore.sweepUnreferencedArtifacts() == 0)
+        #expect(try await recentStore.loadInstalledArtifacts() == [artifact])
+    }
+
+    @Test("invocation ledger caps at 10_000 rows well below any byte trigger")
+    func invocationLedgerCapsAtRowCountNotBytes() async throws {
+        // The cap used to carry `trimWhenBytesExceed: 8 MiB`. A receipt row is
+        // a few hundred bytes, so 10_000 rows never reaches 8 MiB — the cap
+        // could not fire, and `loadInvocationReceipts` throws
+        // `corruptInvocationLedger` the moment the ledger passes 10_000 rows.
+        // The store bricked itself before the trim was ever evaluated.
+        let (artifact, _) = try eligibleArtifact()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("procedure-rowcap-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ProcedureArtifactStore(dataRoot: root)
+        _ = try await store.install(artifact)
+        _ = try await store.invokeManual(
+            artifactID: artifact.id,
+            opaqueInputReference: opaque("rowcap-seed-input"),
+            context: dryContext(artifact: artifact),
+            executor: RecordingProcedureExecutor()
+        )
+
+        let ledger = root.appendingPathComponent(
+            "living_fabric/procedures/invocations.jsonl"
+        )
+        let seed = try Data(contentsOf: ledger)
+        // Sit exactly AT the row cap — the store is still healthy here, and the
+        // very next append is the one that must be trimmed back down.
+        var padded = Data()
+        for _ in 0..<10_000 { padded.append(seed) }
+        try padded.write(to: ledger)
+        let preSize = try #require(
+            (try FileManager.default.attributesOfItem(atPath: ledger.path)[.size]) as? NSNumber
+        ).intValue
+        // Under the old 8 MiB trigger, so the trim would have been skipped —
+        // and under the ledger's own 8 MiB read guard, so the reads below are
+        // gated on the ROW count alone.
+        #expect(preSize < 8 * 1_024 * 1_024)
+
+        _ = try await store.invokeManual(
+            artifactID: artifact.id,
+            opaqueInputReference: opaque("rowcap-trigger-input"),
+            context: dryContext(artifact: artifact),
+            executor: RecordingProcedureExecutor()
+        )
+
+        let after = try String(contentsOf: ledger, encoding: .utf8)
+            .split(separator: "\n", omittingEmptySubsequences: true)
+        #expect(after.count == 10_000)
+        #expect(try await store.loadInvocationReceipts().count == 10_000)
+        // The decisive half: with the byte trigger the ledger would now hold
+        // 10_001 rows and every later invocation would throw
+        // `corruptInvocationLedger` from `existingReceipt` — permanently.
+        _ = try await store.invokeManual(
+            artifactID: artifact.id,
+            opaqueInputReference: opaque("rowcap-followup-input"),
+            context: dryContext(artifact: artifact),
+            executor: RecordingProcedureExecutor()
+        )
+        #expect(try await store.loadInvocationReceipts().count == 10_000)
     }
 
     @Test("retention sweep never removes a pointer-referenced artifact")

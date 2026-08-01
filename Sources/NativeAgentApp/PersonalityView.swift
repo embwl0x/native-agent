@@ -230,7 +230,7 @@ struct PersonalityView: View {
                 minHeight: 320,
                 isReadOnly: selectedPersonalityDocIsMemoryOwnedUser
             )
-            .help(selectedPersonalityDocIsMemoryOwnedUser ? "USER.md is generated from MemoryV2. Save durable user facts through memory." : "")
+            .help(selectedPersonalityDocIsMemoryOwnedUser ? PersonalityDocHelpCopy.memoryOwnedDocument : "")
 
             HStack {
                 Button("Save Document", systemImage: "checkmark.circle") {
@@ -300,4 +300,14 @@ struct PersonalityView: View {
         }
         personalityDocDraft = selectedPersonalityDoc?.content ?? ""
     }
+}
+
+// MARK: - Plain-English personality document help copy
+//
+// UI-6 (2026-08-01, public era): the tooltip named both the file and the
+// memory backend. A user needs one thing from it — why this document is
+// read-only and where to change it instead.
+enum PersonalityDocHelpCopy {
+    static let memoryOwnedDocument =
+        "This document is written for you from your long-term memory profile, so it cannot be edited here. To change what it says, edit your memories on the Memory page."
 }

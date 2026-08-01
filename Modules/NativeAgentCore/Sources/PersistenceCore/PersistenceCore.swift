@@ -853,9 +853,9 @@ public func enforceJSONLByteCap(
 /// can grow the feed unbounded again (PersonaEngine doc-save emit, Skills,
 /// Missions, SchedulerDueJobRunner).
 ///
-/// Locking: when `takeLock` is true (default) and `persistence` is the
-/// SwiftNative impl, the append+cap runs under `withFileLock(path)` so the
-/// cap's read-trim-replace cannot race a concurrent capped writer. Callers
+/// Locking: when `takeLock` is true (default) the append+cap runs under
+/// `withFileLock(path)` — for EVERY conformer, not just the SwiftNative impl —
+/// so the cap's read-trim-replace cannot race a concurrent capped writer. Callers
 /// that already hold the events-feed flock pass `takeLock: false` to avoid
 /// double-acquiring it.
 public func appendJSONLCapped(
@@ -896,13 +896,19 @@ public func appendJSONLCapped(
         }
     }
     if takeLock {
-        if let p = persistence as? SwiftNativePersistenceCore {
-            try await p.withFileLock(path, work)
-        } else {
-            // No flock available (tests / HTTP-backed persistence): the cap's
-            // read-trim-replace must not run unlocked — append unrotated.
-            try await persistence.appendJSONL(event, to: path)
-        }
+        // L7 (2026-08-01 audit): this used to downcast to
+        // `SwiftNativePersistenceCore` and, on failure, append UNROTATED with no
+        // log — a silent fallback that quietly disabled every line/byte cap for
+        // any other conformer, letting the feed grow without bound while the
+        // call still reported success. The downcast was also gratuitous:
+        // `withFileLock` is a PersistenceCoreProtocol EXTENSION
+        // (PersistenceCore+FileLock.swift:4), so every conformer already has it,
+        // and it locks a local `<path>.lock` sidecar with flock independent of
+        // the append backend. The `takeLock: false` branch below has always run
+        // the cap for arbitrary conformers, so refusing to run it here was
+        // internally inconsistent too. Now uniform: lock, append, cap — and a
+        // lock-acquire failure THROWS rather than degrading in silence.
+        try await persistence.withFileLock(path, work)
     } else {
         // Caller already holds the events-feed flock.
         try await work()
@@ -965,11 +971,13 @@ public func appendUniqueById(
         if recent.contains(where: { id($0) == targetId }) { return }
         try await persistence.appendJSONL(record, to: path)
     }
-    if let p = persistence as? SwiftNativePersistenceCore {
-        try await p.withFileLock(path, work)
-    } else {
-        try await work()
-    }
+    // Same L7 correction as `appendJSONLCapped`: `withFileLock` is a
+    // PersistenceCoreProtocol extension, so the downcast that used to guard this
+    // only had the effect of silently running the tail-then-append read-modify
+    // -write UNLOCKED for every non-SwiftNative conformer — two racing callers
+    // both see no match and both append, defeating the idempotency this function
+    // exists to provide. Lock uniformly.
+    try await persistence.withFileLock(path, work)
 }
 
 // MARK: - Data root resolution (single source of truth — Subsystem #1 owns this)

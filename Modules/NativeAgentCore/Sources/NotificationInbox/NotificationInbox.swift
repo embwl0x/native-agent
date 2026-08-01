@@ -202,16 +202,23 @@ public struct NotificationInboxItem: Sendable, Equatable {
 
 // MARK: - NotificationInboxStore (read + status overlay)
 
-/// Pure file-backed view over the daemon's inbox directory. Read methods are
-/// deterministic functions of the on-disk `items.jsonl` + `index.json`; the
-/// status-transition methods mutate ONLY `index.json` (the overlay), never the
-/// append-only log — exactly as `Inbox._update_status` does in the daemon.
+/// RETIRED SILO — **not the production write path, and not a production read
+/// path either.** This is a pure file-backed view over `<dataRoot>/inbox/`
+/// (`items.jsonl` + `index.json`), the storage the decommissioned Python daemon
+/// owned. That store is frozen: as of the 2026-08-01 sweep, no code outside
+/// this module and its tests constructs a `NotificationInboxStore` or a
+/// `SwiftNativeNotificationInbox` (only the `nowISO()` static is borrowed).
 ///
-/// This struct does NOT take a process-wide lock by itself. The daemon wraps
-/// every overlay write in `file_lock(self._items_path)` (a cross-process flock
-/// keyed on items.jsonl). The factory below leaves status writes returning the
-/// HTTP-fallback signal until the Swift side wires the SAME flock target (see
-/// CUTOVER_PLAN.md §6.55). Read methods are always safe.
+/// THE LIVE INBOX IS `<dataRoot>/notifications/inbox.jsonl` — the append-only
+/// event log the macOS/iOS UI reads, written by
+/// `TriggerNotifierBinding.mirrorCardIntoRealInbox`,
+/// `NativeCognitionRuntime+ProviderVitals`, and friends, with status writes via
+/// `NativeClient.updateVisibleNotificationInboxStatus`. Send new work there.
+///
+/// Kept, not deleted, because the parity port + its tests are the record of the
+/// daemon's exact `Inbox` semantics. Read methods remain safe; the status-write
+/// surface is deliberately narrowed (see `updateStatus` below) so nobody
+/// re-wires a store whose backing file nothing else maintains.
 public struct NotificationInboxStore: Sendable {
     /// `<dataRoot>/inbox` directory.
     public let inboxDir: URL
@@ -355,14 +362,14 @@ public struct NotificationInboxStore: Sendable {
     /// `read_at == nil` means "leave read_at untouched" (Python only sets it
     /// `if read_at is not None`); pass a value to set it.
     ///
-    /// NOTE: this UNLOCKED variant performs the index.json read-modify-write with
-    /// no cross-process flock. It is retained for the direct-call / test surface
-    /// where no daemon is co-running. The PRODUCTION write path used by the
-    /// reader goes through `updateStatusLocked` (below), which wraps the SAME
-    /// read-modify-write in `withFileLock(itemsPath)` so it cannot tear against
-    /// the daemon's concurrent `_update_status` (which locks the same target).
+    /// RETIRED — NOT a production path (see the type doc above). This UNLOCKED
+    /// variant performs the index.json read-modify-write with no cross-process
+    /// flock; it is INTERNAL, kept only for the in-module / `@testable` surface
+    /// that exercises the parity port. Nothing outside this module may call it,
+    /// so no caller can re-wire a broken store by reaching for the unlocked
+    /// twin of `updateStatusLocked` (2026-08-01 dead-code-hazard sweep).
     @discardableResult
-    public func updateStatus(_ itemId: String, status: InboxItemStatus, readAt: String? = nil) -> Bool {
+    func updateStatus(_ itemId: String, status: InboxItemStatus, readAt: String? = nil) -> Bool {
         writeIndex(applyStatus(loadIndex(), itemId: itemId, status: status, readAt: readAt))
     }
 
@@ -392,7 +399,7 @@ public struct NotificationInboxStore: Sendable {
         return index
     }
 
-    /// CROSS-PROCESS-SAFE status write. Mirrors `Inbox._update_status`
+    /// CROSS-PROCESS-SAFE status write over the RETIRED silo. Mirrors `Inbox._update_status`
     /// INCLUDING its `file_lock(self._items_path)`
     /// wrap: the daemon locks on items.jsonl while mutating index.json, so the
     /// Swift side MUST take the SAME lock target (`<inboxDir>/items.jsonl.lock`,
@@ -404,6 +411,10 @@ public struct NotificationInboxStore: Sendable {
     /// Returns FALSE iff the write failed (same contract as `updateStatus`), so
     /// the reader can decline to acknowledge a write that never hit disk and fall
     /// back to HTTP (gpt-5.5 wave-31 review finding #12).
+    ///
+    /// RETIRED: no production caller reaches this. The live inbox status write
+    /// is `NativeClient.updateVisibleNotificationInboxStatus` over
+    /// `<dataRoot>/notifications/inbox.jsonl`.
     @discardableResult
     public func updateStatusLocked(
         _ itemId: String,
@@ -424,21 +435,24 @@ public struct NotificationInboxStore: Sendable {
         return await work()
     }
 
+    // The three unlocked convenience wrappers below are INTERNAL for the same
+    // reason `updateStatus` is: they write the retired silo without the flock.
+
     /// Mirror `Inbox.mark_read` (L208-209): status=read, read_at=now-iso.
     @discardableResult
-    public func markRead(_ itemId: String, now: String = NotificationInboxStore.nowISO()) -> Bool {
+    func markRead(_ itemId: String, now: String = NotificationInboxStore.nowISO()) -> Bool {
         updateStatus(itemId, status: .read, readAt: now)
     }
 
     /// Mirror `Inbox.mark_archived` (L211-212): status=archived (no read_at).
     @discardableResult
-    public func markArchived(_ itemId: String) -> Bool {
+    func markArchived(_ itemId: String) -> Bool {
         updateStatus(itemId, status: .archived)
     }
 
     /// Mirror `Inbox.dismiss` (L214-215): status=dismissed (no read_at).
     @discardableResult
-    public func dismiss(_ itemId: String) -> Bool {
+    func dismiss(_ itemId: String) -> Bool {
         updateStatus(itemId, status: .dismissed)
     }
 

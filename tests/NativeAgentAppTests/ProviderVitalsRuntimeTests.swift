@@ -89,6 +89,36 @@ private func vitalsRows(root: URL) throws -> [(kind: String, provider: String)] 
     #expect(try vitalsRows(root: root).map(\.kind) == ["degraded", "recovered", "degraded"])
 }
 
+// 2026-08-01 concurrency fix: the idempotency check used to read the inbox
+// OUTSIDE any lock, so two overlapping sweeps could both see "not degraded" and
+// both append — and the recovery gate, which only ever closes the LATEST row,
+// could never clear the stale one. Check + append now share one file lock.
+@Test func concurrentStagingStagesExactlyOneDegradedNotice() async throws {
+    let root = try tempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    // Separate runtime instances so actor re-entrancy is not the only
+    // interleaving surface — this is the cross-process shape the flock owns.
+    let runtimes = (0..<8).map { _ in makeRuntime(root: root) }
+    await withTaskGroup(of: Void.self) { group in
+        for runtime in runtimes {
+            group.addTask {
+                await runtime.stageProviderVitalsNotice(
+                    providerId: "kimi-code", transition: degradedTransition("kimi-code")
+                )
+            }
+        }
+    }
+
+    #expect(try vitalsRows(root: root).map(\.kind) == ["degraded"],
+            "overlapping sweeps double-carded the provider")
+
+    // And the single recovery closes the episode completely — no stale row left
+    // behind for the latest-row gate to miss.
+    await runtimes[0].postProviderVitalsRecoveryNotice(providerId: "kimi-code")
+    #expect(try vitalsRows(root: root).map(\.kind) == ["degraded", "recovered"])
+}
+
 @Test func recoveryWithoutOpenDegradationIsSilent() async throws {
     let root = try tempRoot()
     defer { try? FileManager.default.removeItem(at: root) }

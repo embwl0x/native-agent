@@ -120,9 +120,10 @@ the Swift Testing event pipe after the helper exits. The matching public Mac
 milestone DMG was notarized, stapled, mounted-artifact verified, and exercised
 on the test VM with its existing Application Support state preserved.
 Authenticated live state reports chat ready, pinned-session/transcript groups,
-the trust-aware tool catalog, and the rebuildable snapshot cache. A new
-source-matched DMG must still be cut and fresh-installed after the final public
-source commit; older staged DMGs are not release candidates.
+the trust-aware tool catalog, and the rebuildable snapshot cache. The public
+source repository is live, and notarized source-matched DMGs `0.3.0` and
+`0.3.1` are published as GitHub Releases with a live Sparkle appcast; `0.3.1`
+is the current public binary and its DMG digest matches the release asset.
 
 The versioned CloudKit schema is validated, imported to development, deployed
 to the permanent public container's Production environment, and independently

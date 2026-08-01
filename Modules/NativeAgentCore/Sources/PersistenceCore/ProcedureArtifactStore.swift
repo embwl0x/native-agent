@@ -199,7 +199,7 @@ public actor ProcedureArtifactStore {
         }
         // Best-effort GC after the install lands: retention must never fail
         // the install that triggered it.
-        _ = sweepUnreferencedArtifacts()
+        _ = await sweepUnreferencedArtifacts()
         return path
     }
 
@@ -230,7 +230,7 @@ public actor ProcedureArtifactStore {
         }
         // Best-effort GC BEFORE the ceiling check so an over-ceiling store
         // self-heals instead of fail-closing forever (audit 2026-07-21).
-        _ = sweepUnreferencedArtifacts()
+        _ = await sweepUnreferencedArtifacts()
         let artifactsDirectory = root.appendingPathComponent("artifacts", isDirectory: true)
         guard FileManager.default.fileExists(atPath: artifactsDirectory.path) else { return [] }
         let urls: [URL]
@@ -537,14 +537,21 @@ public actor ProcedureArtifactStore {
                 procedureID: selection.procedureID,
                 selectionMode: selection.mode
             )
+            // No `trimWhenBytesExceed` soft trigger here: a receipt row is well
+            // under 1KiB, so 10_000 rows is ~6-7MB — an 8MiB trigger would
+            // short-circuit the cap on every append, while `loadInvocationReceipts`
+            // throws `corruptInvocationLedger` the moment the ledger passes 10_000
+            // rows. The byte trigger made the cap unreachable and bricked the store
+            // instead. The exact newest-10_000 invariant must hold after EVERY
+            // append; `enforceJSONLLineCap`'s `size < maxLines` lower bound still
+            // keeps small ledgers O(1).
             try await appendJSONLCapped(
                 try JSONValue.parse(JSONEncoder().encode(receipt)),
                 to: invocationPath,
                 using: persistence,
                 maxLines: 10_000,
                 logLabel: "ProcedureArtifactStore",
-                takeLock: false,
-                trimWhenBytesExceed: 8 * 1_024 * 1_024
+                takeLock: false
             )
             return receipt
         }
@@ -574,7 +581,7 @@ public actor ProcedureArtifactStore {
     /// pointer — a recent receipt we cannot parse might name an artifact we are
     /// about to delete.
     @discardableResult
-    public func sweepUnreferencedArtifacts(now: Date = Date()) -> Int {
+    public func sweepUnreferencedArtifacts(now: Date = Date()) async -> Int {
         let fm = FileManager.default
         let artifactsDirectory = root.appendingPathComponent("artifacts", isDirectory: true)
         guard let urls = try? fm.contentsOfDirectory(
@@ -631,9 +638,14 @@ public actor ProcedureArtifactStore {
             }
             let decoder = JSONDecoder()
             for line in data.split(separator: UInt8(ascii: "\n")) where !line.isEmpty {
+                // Skip an undecodable receipt line rather than abandoning the
+                // whole sweep: bailing here let ONE bad line permanently disable
+                // the GC, which walks the store into the 1024-artifact cap and
+                // fails installs closed. A line we cannot read simply protects
+                // no artifact; every readable line still does.
                 guard let receipt = try? decoder.decode(
                     ProcedureInvocationReceipt.self, from: Data(line)
-                ) else { return 0 }
+                ) else { continue }
                 if let requested = Self.parsedTimestamp(receipt.requestedAt),
                    requested >= cutoff {
                     referenced.insert(receipt.artifactID)
@@ -679,7 +691,76 @@ public actor ProcedureArtifactStore {
         if removed > 0 {
             NSLog("ProcedureArtifactStore: retention sweep removed %d unreferenced artifact(s)", removed)
         }
+        let reapedLocks = await reapOrphanArtifactLocks(in: artifactsDirectory, cutoff: cutoff)
+        if reapedLocks > 0 {
+            NSLog("ProcedureArtifactStore: retention sweep removed %d orphan lock sidecar(s)", reapedLocks)
+        }
         return removed
+    }
+
+    /// Remove `<artifacts>/<id>.json.lock` sidecars whose `<id>.json` is gone
+    /// (L1, 2026-08-01 audit). `install()` wraps its write in
+    /// `persistence.withFileLock(artifactPath)`, which O_CREATs that sidecar —
+    /// and NOTHING ever removed it, so the directory accumulated one dead lock
+    /// per swept or hand-deleted artifact forever. `loadInstalledArtifacts`
+    /// filters on `pathExtension == "json"`, so the orphans never tripped the
+    /// capacity ceiling; they just grew, invisibly, which is exactly the shape
+    /// `TurnTraceRetention` already fixed for the turn-trace feed. This is that
+    /// second pass, keyed on the artifact instead of the date.
+    ///
+    /// Unlinking a lock file is only sound under TWO protections:
+    /// 1. The unlink happens while HOLDING `withFileLock(artifact)` — i.e. an
+    ///    exclusive flock on that very sidecar. An in-flight `install()` for
+    ///    the same id either finishes first (then the artifact exists and the
+    ///    re-check skips) or waits for us; it can never be mid-critical-section
+    ///    while we unlink. Without this, a sweep could unlink the lock an
+    ///    active install re-opened, splitting mutual exclusion across two
+    ///    inodes (gpt-5.5 review BLOCKING — the mtime gate alone fails for an
+    ///    old orphan a NEW install just re-opened: mtime is old, install live).
+    /// 2. `withFileLock` validates its fd's inode against whatever is at
+    ///    `lockPath` AFTER flock succeeds and retries on a mismatch
+    ///    (PersistenceCore+FileLock.swift:19-74, added 2026-07-25 for exactly
+    ///    this sweep) — so a waiter that lost its lock file to us re-opens the
+    ///    fresh one instead of proceeding on a deleted inode.
+    /// The aged-mtime pre-filter remains as a cheap candidate gate; both gates
+    /// are re-checked inside the lock before the unlink.
+    private func reapOrphanArtifactLocks(in directory: URL, cutoff: Date) async -> Int {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey, .isSymbolicLinkKey],
+            options: [.skipsHiddenFiles]
+        ) else { return 0 }
+        var reaped = 0
+        for entry in entries where entry.lastPathComponent.hasSuffix(".json.lock") {
+            let artifact = entry.deletingPathExtension()   // drop ".lock"
+            // Cheap pre-filter outside the lock; both gates re-checked inside.
+            guard !fm.fileExists(atPath: artifact.path) else { continue }
+            guard Self.lockSidecarIsAgedOrphan(entry, cutoff: cutoff) else { continue }
+            let didReap = (try? await persistence.withFileLock(artifact) { () -> Bool in
+                // Holding the sidecar's flock: no install is mid-write for
+                // this id. Re-check both gates — the world may have moved
+                // while we waited for the lock.
+                guard !FileManager.default.fileExists(atPath: artifact.path) else { return false }
+                guard Self.lockSidecarIsAgedOrphan(entry, cutoff: cutoff) else { return false }
+                return (try? FileManager.default.removeItem(at: entry)) != nil
+            }) ?? false
+            if didReap { reaped += 1 }
+        }
+        return reaped
+    }
+
+    private static func lockSidecarIsAgedOrphan(_ entry: URL, cutoff: Date) -> Bool {
+        // Fresh URL so the stat can never be satisfied from cached resource
+        // values — the in-lock re-check must see the current file.
+        let fresh = URL(fileURLWithPath: entry.path)
+        guard let values = try? fresh.resourceValues(
+                  forKeys: [.contentModificationDateKey, .isRegularFileKey, .isSymbolicLinkKey]
+              ),
+              values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              let modified = values.contentModificationDate else { return false }
+        return modified < cutoff
     }
 
     private func artifactPath(_ id: String) -> URL {

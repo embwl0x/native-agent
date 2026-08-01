@@ -463,11 +463,12 @@ extension SwiftNativeBrowserClient: BrowserOperationCommanding {
                 maxLines: maxLines, logLabel: label, takeLock: false
             )
         }
-        if let disk = persistenceCore as? SwiftNativePersistenceCore {
-            try await disk.withFileLock(path, work)
-        } else {
-            try await work()
-        }
+        // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+        // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+        // every conformer already has it. The old downcast to
+        // SwiftNativePersistenceCore only had the effect of running this critical
+        // section UNLOCKED for any other conformer.
+        try await persistenceCore.withFileLock(path, work)
     }
 
     private func readCanonicalRuns() async throws -> [JSONValue] {
@@ -482,10 +483,12 @@ extension SwiftNativeBrowserClient: BrowserOperationCommanding {
     private func withCanonicalRunsLock<T: Sendable>(
         _ operation: @Sendable () async throws -> T
     ) async throws -> T {
-        if let disk = persistenceCore as? SwiftNativePersistenceCore {
-            return try await disk.withFileLock(runsPath, operation)
-        }
-        return try await operation()
+        // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+        // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+        // every conformer already has it. The old downcast to
+        // SwiftNativePersistenceCore only had the effect of running this critical
+        // section UNLOCKED for any other conformer.
+        return try await persistenceCore.withFileLock(runsPath, operation)
     }
 
     private static let terminalStatuses: Set<String> = [

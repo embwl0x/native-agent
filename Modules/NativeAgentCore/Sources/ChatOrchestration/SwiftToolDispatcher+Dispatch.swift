@@ -19,6 +19,13 @@ import ToolExecution
 import Skills
 
 extension SwiftToolDispatcher {
+    /// Test seam (2026-07-31) for the lazy-load gate's catalog enumeration.
+    /// `listAvailableTools()` on the concrete dispatcher has no natural throw
+    /// path, so the fail-closed `catalog_unavailable` branch below is
+    /// unreachable from a real dataRoot. Task-local (not a global var) so
+    /// parallel test execution can't race it; always nil in production.
+    @TaskLocal static var lazyGateCatalogOverrideForTests: (@Sendable () async throws -> [String])?
+
     public func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         if ToolCallParser.isIgnorableToolName(tool) {
             return .object([
@@ -56,11 +63,29 @@ extension SwiftToolDispatcher {
             if !sessionId.isEmpty {
                 // Build the "exists in catalog" set from listAvailableTools()
                 // (the FULL accessible catalog, including Full-Mac additions).
+                // 2026-07-31 fail-closed fix: this used to be
+                // `if let names = try? await listAvailableTools() { ... } else
+                // { allAvailable = [] }`. Because gate enforcement lives
+                // INSIDE `allAvailable.contains(tool)`, an empty substitute set
+                // made every catalogued tool skip the not_loaded gate — a
+                // thrown enumeration silently opened the whole lazy-load gate.
+                // Enumeration failure now fails the CALL, not the gate.
                 let allAvailable: Set<String>
-                if let names = try? await listAvailableTools() {
-                    allAvailable = Set(names)
-                } else {
-                    allAvailable = []
+                do {
+                    if let override = Self.lazyGateCatalogOverrideForTests {
+                        allAvailable = Set(try await override())
+                    } else {
+                        allAvailable = Set(try await listAvailableTools())
+                    }
+                } catch {
+                    return .object([
+                        "status": .string("failed"),
+                        "reason": .string("catalog_unavailable"),
+                        "tool": .string(tool),
+                        "session_id": .string(sessionId),
+                        "detail": .string(String(describing: error)),
+                        "fix": .string("The tool catalog could not be enumerated, so the lazy-load gate cannot verify '\(tool)'. Retry; if it persists, check data/tools/registry.json and the MCP server config."),
+                    ])
                 }
                 if allAvailable.contains(tool) {
                     let persisted = await activeToolsStore.load(sessionId: sessionId).activeTools

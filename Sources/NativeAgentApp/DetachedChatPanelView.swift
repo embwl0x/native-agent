@@ -255,13 +255,28 @@ struct DetachedChatPanelView: View {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.system(size: 28))
                     .foregroundStyle(.yellow)
-                Text("Conversation unavailable")
+                // Public-era honesty copy (2026-08-01): the headline used to be
+                // a list of internal endpoint names. Plain sentence first, what
+                // to try second, endpoint names last in a smaller line that
+                // also carries the full list as a tooltip.
+                Text("This conversation could not be loaded")
                     .font(NativeAgentFont.section)
-                Text("Could not load \(loadStatus?.failedEndpoints.joined(separator: " and ") ?? "conversation history"). Existing messages were preserved.")
+                Text(DetachedChatLoadFailureCopy.message)
                     .font(NativeAgentFont.tag)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 24)
+                if let technical = DetachedChatLoadFailureCopy.technicalDetail(
+                    failedEndpoints: loadStatus?.failedEndpoints ?? []
+                ) {
+                    Text(technical)
+                        .font(NativeAgentFont.tag)
+                        .foregroundStyle(.tertiary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 24)
+                        .textSelection(.enabled)
+                        .help(technical)
+                }
             }
         } else if loadPresentation == .loading {
             VStack(spacing: 8) {
@@ -608,6 +623,20 @@ struct DetachedChatPanelView: View {
 }
 
 private let detachedBottomAnchor = "detached-chat-bottom-anchor"
+
+// Plain-English copy for the detached panel's load-failure state. Pure strings
+// so the wording is unit-testable; the view only decides where to put them.
+enum DetachedChatLoadFailureCopy {
+    static let message = "Your messages are safe. Check your connection, then close this window and open the chat again."
+
+    /// The internal endpoint names, formatted as a secondary line. Nil when
+    /// there is nothing specific to name.
+    static func technicalDetail(failedEndpoints: [String]) -> String? {
+        let named = failedEndpoints.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        guard !named.isEmpty else { return nil }
+        return "Did not respond: " + named.joined(separator: ", ")
+    }
+}
 
 // Scopes the scroll anchor to the initial offset on macOS 15+ so content-size
 // changes (hover timestamp, live resize reflow) never re-anchor the viewport.

@@ -527,11 +527,7 @@ struct ChatSessionAutocompactor: Sendable {
         var total = 0
         for row in rows {
             guard case .object(let obj) = row else { continue }
-            if case .string(let content)? = obj["content"] {
-                total += content.count
-            } else if let content = obj["content"] {
-                total += ((try? content.serialize(pretty: false)) ?? "").count
-            }
+            total += ChatCompactionRowRendering.characterCount(obj)
         }
         return total
     }
@@ -566,17 +562,84 @@ struct ChatSessionAutocompactor: Sendable {
                 if case .string(let s)? = obj["role"] { return s }
                 return "message"
             }()
-            let content: String = {
-                if case .string(let s)? = obj["content"] { return s }
-                return ""
-            }()
-            let normalized = content
-                .replacingOccurrences(of: "\n", with: " ")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !normalized.isEmpty else { continue }
-            lines.append("\(role): \(String(normalized.prefix(500)))")
+            guard let body = ChatCompactionRowRendering.summaryBody(
+                obj,
+                collapseNewlines: true
+            ) else { continue }
+            lines.append("\(role): \(String(body.prefix(500)))")
             if lines.joined(separator: "\n").count > 12_000 { break }
         }
         return String(lines.joined(separator: "\n").prefix(12_000))
+    }
+}
+
+/// The one place that knows how to READ a tool row during compaction.
+///
+/// Tool rows persist with `content: ""` and their whole payload under
+/// `metadata` (see `ChatOrchestrationClient+MessagePersistence.swift`). Both
+/// compaction paths used to look only at `content`, which produced a matched
+/// pair of defects: a tool-heavy transcript measured as ~zero characters and so
+/// never reached the token threshold (the session died on a provider
+/// context-length error instead of compacting), and — once it did compact —
+/// every record of which tools ran was dropped from the summary and from the
+/// distiller prompt.
+enum ChatCompactionRowRendering {
+    /// Characters this row contributes to the transcript size estimate. When
+    /// `content` is empty the payload lives in `metadata`, so the serialized
+    /// metadata length stands in for it.
+    static func characterCount(_ obj: [String: JSONValue]) -> Int {
+        if let content = obj["content"] {
+            if case .string(let text) = content {
+                if !text.isEmpty { return text.count }
+            } else {
+                return ((try? content.serialize(pretty: false)) ?? "").count
+            }
+        }
+        guard let metadata = obj["metadata"] else { return 0 }
+        return ((try? metadata.serialize(pretty: false)) ?? "").count
+    }
+
+    /// The transcript line body for a row, or nil when the row carries nothing
+    /// worth preserving. Falls back to a compact `toolName + resultSummary`
+    /// when `content` is empty so post-compaction continuity keeps a record of
+    /// the tool activity.
+    static func summaryBody(_ obj: [String: JSONValue], collapseNewlines: Bool) -> String? {
+        let content: String = {
+            if case .string(let text)? = obj["content"] { return text }
+            if let value = obj["content"] { return (try? value.serialize(pretty: false)) ?? "" }
+            return ""
+        }()
+        let normalized = normalize(content, collapseNewlines: collapseNewlines)
+        if !normalized.isEmpty { return normalized }
+        return toolFallbackLine(obj)
+    }
+
+    /// `toolName (ok): result summary` — nil when the row has no tool metadata.
+    static func toolFallbackLine(_ obj: [String: JSONValue]) -> String? {
+        guard case .object(let metadata)? = obj["metadata"] else { return nil }
+        guard case .string(let toolName)? = metadata["toolName"],
+              !toolName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        var line = toolName
+        if case .bool(let ok)? = metadata["ok"] {
+            line += ok ? " (ok)" : " (failed)"
+        }
+        if case .string(let summary)? = metadata["resultSummary"] {
+            let normalized = normalize(summary, collapseNewlines: true)
+            if !normalized.isEmpty {
+                line += ": \(String(normalized.prefix(toolResultSummaryMaximumCharacters)))"
+            }
+        }
+        return line
+    }
+
+    /// A tool receipt is context, not content — keep it short enough that a
+    /// long run of tool calls cannot crowd the conversation out of the summary.
+    static let toolResultSummaryMaximumCharacters = 200
+
+    private static func normalize(_ text: String, collapseNewlines: Bool) -> String {
+        let flattened = collapseNewlines
+            ? text.replacingOccurrences(of: "\n", with: " ")
+            : text
+        return flattened.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

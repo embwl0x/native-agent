@@ -615,6 +615,57 @@ private func fagThrows(mode: String, tool: String) async -> Bool {
     #expect(readThrew == false, "FAG read_only read_file expected to PASS (reach inner), but it threw")
 }
 
+/// 2026-07-31 audit fix — the six Full-Mac file/git READ tools
+/// (SwiftToolDispatcher.fullMacFileToolNames minus write_file, plus the git
+/// group) matched neither blockedExact nor any blockedPrefix, so
+/// fileAccess=none let real filesystem/repo readers through.
+/// .none must block them; .readOnly must keep PERMITTING them (they are
+/// reads — that is what read_only is for).
+private let fagFullMacReadTools = [
+    "file_excerpt", "grep",
+    "git_status", "git_diff", "git_log", "repo_dirty_summary",
+]
+
+@Test func AutonomyGuardCharacterization_FAG_none_blocks_fullMac_read_tools() async throws {
+    for tool in fagFullMacReadTools {
+        let threw = await fagThrows(mode: "none", tool: tool)
+        #expect(threw, "FAG none \(tool) expected throw (blocked), but it passed")
+    }
+    // The catalog surface must agree with the dispatch gate.
+    let gated = FileAccessGatedDispatcher(inner: FagCatalogStub(), fileAccess: "none")
+    let listed = try await gated.listAvailableTools()
+    for tool in fagFullMacReadTools {
+        #expect(listed.contains(tool) == false,
+                "FAG none listAvailableTools must not advertise \(tool)")
+    }
+}
+
+@Test func AutonomyGuardCharacterization_FAG_readOnly_still_permits_fullMac_read_tools() async throws {
+    for tool in fagFullMacReadTools {
+        let threw = await fagThrows(mode: "read_only", tool: tool)
+        #expect(threw == false,
+                "FAG read_only \(tool) is a READ and must reach inner, but it threw")
+    }
+    let gated = FileAccessGatedDispatcher(inner: FagCatalogStub(), fileAccess: "read_only")
+    let listed = try await gated.listAvailableTools()
+    for tool in fagFullMacReadTools {
+        #expect(listed.contains(tool), "FAG read_only must still advertise \(tool)")
+    }
+}
+
+/// Inner stub that reports the Full-Mac read tools so the per-mode catalog
+/// filtering is observable.
+private final class FagCatalogStub: ToolDispatchClient, @unchecked Sendable {
+    func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        .object(["status": .string("reached_inner")])
+    }
+    func listAvailableTools() async throws -> [String] {
+        ["file_excerpt", "grep", "git_status", "git_diff", "git_log",
+         "repo_dirty_summary", "read_file", "write_file"]
+    }
+    func listAvailableToolSchemas() async throws -> [LLMToolSchema] { [] }
+}
+
 @Test func AutonomyGuardCharacterization_FAG_permissive_passes_all() async throws {
     // The PERMISSIVE modes are "workspace"/"auto"/"full" — these never block.
     // 2026-07-21 audit: "" was REMOVED from the permissive set — an unset/

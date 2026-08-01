@@ -2611,28 +2611,41 @@ async function waitForDurableTerminalExecution(job, config, onTimeout, options =
     //     across one full wait window, or stayed undiscoverable;
     //   - liveness: the app-server is unreachable, or reachable but no longer
     //     lists this turn.
-    // Stagnant + dead liveness => stalled after ONE window. A server still
-    // claiming inProgress gets one extra stagnant window before the same
-    // verdict (an inProgress turn that writes nothing for two full windows is
-    // wedged, not thinking). Rollout movement resets the count.
+    // Stagnant + dead liveness => stalled after one stagnant window ON TOP of
+    // the baseline window (earliest possible verdict: end of window 2). A
+    // server still claiming inProgress needs `stallWedgedWindows` stagnant
+    // windows (default 4): rollout stagnation measures BYTES WRITTEN, and a
+    // single long tool call — a multi-hour build under the github-command
+    // profile — legitimately writes nothing until the call returns
+    // (2026-07-31 audit). Rollout movement resets the count.
     const currentSnapshot = snapshotFn(observed.threadId, config);
     const prior = job.stallProbe || null;
     let effectiveStagnant;
     if (!prior) {
-      // First window has no baseline to compare against — it only establishes
-      // one. Exception: a rollout that is still undiscoverable after a full
-      // wait window is already stagnation.
-      effectiveStagnant = currentSnapshot === null ? 1 : 0;
+      // First window ONLY establishes a baseline — even when the rollout is
+      // undiscoverable. "I can't find the subject" must never read as "the
+      // subject is dead" (2026-07-31 audit: a rotated rolloutPath or
+      // CODEX_HOME mismatch plus one transient RPC failure manufactured a
+      // one-window terminal stall on a healthy turn). A persistently
+      // undiscoverable rollout still converges: the next window compares
+      // null==null as stagnant and probes with a real baseline behind it.
+      effectiveStagnant = 0;
     } else if (stallSnapshotsEqual(prior.rolloutSnapshot, currentSnapshot)) {
       effectiveStagnant = (prior.stagnantWindows || 0) + 1;
     } else {
       effectiveStagnant = 0;
     }
+    const wedgedWindows = Math.max(2, numberSetting(
+      config,
+      "stallWedgedWindows",
+      "NATIVE_AGENT_CODEX_STALL_WEDGED_WINDOWS",
+      4
+    ));
     let liveness = null;
     if (effectiveStagnant >= 1) {
       liveness = await probeFn(observed.threadId, observed.turnId, config);
       const deadLiveness = !liveness.serverReachable || !liveness.turnFound;
-      const wedgedInProgress = liveness.turnClaimsInProgress && effectiveStagnant >= 2;
+      const wedgedInProgress = liveness.turnClaimsInProgress && effectiveStagnant >= wedgedWindows;
       if (deadLiveness || wedgedInProgress) {
         const rolloutPath = currentSnapshot ? currentSnapshot.path : null;
         const activity = rolloutPath
@@ -2723,8 +2736,8 @@ function formatCodexReplyForNativeAgent(job, turnResult) {
       ? "the Codex app-server is no longer reachable"
       : !ev.turnFound
         ? "the Codex app-server no longer lists this turn"
-        : "the turn still claims to be running but wrote nothing for two full wait windows";
-    lines.push(`Codex stopped making progress: no terminal row landed, the session file stayed unchanged across ${ev.stagnantWindows || 1}+ wait window(s), and ${cause}. This turn will not complete on its own.`);
+        : `the turn still claims to be running but wrote nothing across ${ev.stagnantWindows} full wait windows`;
+    lines.push(`Codex stopped making progress: no terminal row landed, the session file stayed unchanged across ${ev.stagnantWindows} consecutive wait window(s) after a baseline observation, and ${cause}. This turn will not complete on its own.`);
     if (turnResult.noWorkObserved === true) {
       lines.push("No tool or shell activity was recorded before the stall: the request never executed, so resending it cannot stomp partial work.");
     } else if (turnResult.noWorkObserved === false) {
@@ -2784,7 +2797,12 @@ function postBridgeMessage(text, sessionId, config, metadata = {}) {
 
   const host = stringSetting(config, "bridgeHost", "NATIVE_AGENT_CODEX_BRIDGE_HOST", "127.0.0.1");
   const port = numberSetting(config, "bridgePort", "NATIVE_AGENT_CODEX_BRIDGE_PORT", 8771);
-  const timeoutMs = numberSetting(config, "bridgeReplyTimeoutMs", "NATIVE_AGENT_CODEX_BRIDGE_REPLY_TIMEOUT_MS", 10 * 60 * 1000);
+  // 11 min, deliberately ABOVE the app's 600s messageWorkDeadlineSeconds so
+  // the two deadlines can never fire in the same second with an undefined
+  // winner (2026-07-31 audit: identical 600s/600s produced a socket-destroy vs
+  // work-cancel race that stranded completed replies). Same staggering rule as
+  // the +8s helper-deadline pair in SwiftToolDispatcher+AgentBridgeTools.
+  const timeoutMs = numberSetting(config, "bridgeReplyTimeoutMs", "NATIVE_AGENT_CODEX_BRIDGE_REPLY_TIMEOUT_MS", 11 * 60 * 1000);
   const body = JSON.stringify({
     text,
     sender: "codex",
@@ -2931,7 +2949,7 @@ async function deliverReplyJobUnlocked(jobPath, config) {
     turnId: execution.turnId,
     attemptCount: execution.attempts.length,
   }, turnResult);
-  const bridge = await postBridgeMessage(text, sessionId || "", config, {
+  const completionMetadata = {
     deliveryId: job.id,
     origin,
     completion: {
@@ -2947,7 +2965,24 @@ async function deliverReplyJobUnlocked(jobPath, config) {
       noWorkObserved: turnResult.noWorkObserved ?? null,
       stallEvidence: turnResult.stallEvidence || null,
     },
-  });
+  };
+  const bridge = await postBridgeMessageWithRetry(
+    () => postBridgeMessage(text, sessionId || "", config, completionMetadata),
+    {
+      maxAttempts: numberSetting(
+        config, "bridgeDeliveryMaxAttempts",
+        "NATIVE_AGENT_CODEX_BRIDGE_DELIVERY_MAX_ATTEMPTS", 4
+      ),
+      baseMs: numberSetting(
+        config, "bridgeDeliveryRetryBaseMs",
+        "NATIVE_AGENT_CODEX_BRIDGE_DELIVERY_RETRY_BASE_MS", 500
+      ),
+      capMs: numberSetting(
+        config, "bridgeDeliveryRetryCapMs",
+        "NATIVE_AGENT_CODEX_BRIDGE_DELIVERY_RETRY_CAP_MS", 8000
+      ),
+    }
+  );
   const receipt = {
     id: crypto.randomUUID(),
     createdAt: nowISO(),
@@ -2983,10 +3018,9 @@ async function deliverReplyJobUnlocked(jobPath, config) {
   };
   await appendReplyDeliveryReceipt(receipt);
   const terminalBridgeReply = isTerminalBridgeReply(bridge);
-  if (bridge.status === "delivered" || bridge.status === "dry_run" || terminalBridgeReply) {
-    try { fs.unlinkSync(jobPath); } catch {}
-  }
+  const jobFile = finalizeReplyJobFile(jobPath, bridge);
   return {
+    jobFile,
     status: terminalBridgeReply
       ? bridge.replyStatus
       : (bridge.status === "delivered" || bridge.status === "dry_run" ? "delivered" : "failed"),
@@ -3032,6 +3066,161 @@ function quarantineReplyJob(jobPath, error) {
       error: redactDiagnosticText(String(quarantineError && quarantineError.message || quarantineError)).slice(0, 500),
     };
   }
+}
+
+// Transport-level (not semantic) failures of the delivery POST. These say
+// nothing about whether the app processed the completion — the request never
+// reached a handler, or reached one that never claimed the delivery — so
+// resending the SAME deliveryId is exactly-once-safe: CodexCompletionLifecycle
+// .claim() is keyed on (deliveryId, requestDigest) and answers .cached /
+// .inProgress / .outcomeUnknown for anything already started.
+//
+// Deliberately NOT retryable:
+//   - 409 (outcome_unknown / conflict): terminal in the lifecycle. Once a state
+//     file reaches .outcomeUnknown, claim() returns .outcomeUnknown forever
+//     (CodexCompletionLifecycle.swift:198-199) and nothing transitions out of
+//     it. Retrying can only burn attempts.
+//   - 504 work_timeout: the app is mid-turn under its own 600s work deadline.
+//     A resend inside a short backoff window can only draw 202/409.
+//   - missing/empty bridge token: a config fault, not a transient one.
+function bridgeDeliveryRetryable(bridge) {
+  if (!bridge || bridge.status !== "failed") return false;
+  const httpStatus = Number(bridge.httpStatus);
+  if (Number.isFinite(httpStatus) && httpStatus > 0) {
+    if (httpStatus === 504) return false;
+    return httpStatus === 408 || httpStatus === 429 || httpStatus >= 500;
+  }
+  // No HTTP status at all: either a socket-level error or a local precondition.
+  const reason = String(bridge.reason || "");
+  if (reason === "bridge_token_missing" || reason === "bridge_token_empty") return false;
+  // An 11-minute request timeout means the app owns the turn; the durable job
+  // file outlives us and the launch-time recovery scan re-delivers.
+  if (reason === "bridge_message_timeout") return false;
+  return true;
+}
+
+// Full-jitter exponential backoff: delay_n ∈ [0, min(cap, base * 2^n)).
+function bridgeDeliveryBackoffMs(attemptIndex, options = {}) {
+  const baseMs = Number(options.baseMs) > 0 ? Number(options.baseMs) : 500;
+  const capMs = Number(options.capMs) > 0 ? Number(options.capMs) : 8000;
+  const random = typeof options.random === "function" ? options.random : Math.random;
+  const ceiling = Math.min(capMs, baseMs * Math.pow(2, Math.max(0, attemptIndex)));
+  return Math.floor(random() * ceiling);
+}
+
+// BRIDGES-4: a refused/reset delivery POST used to strand a completed Codex
+// reply in reply-jobs/ until the next app launch ran --recover-reply-jobs
+// (ClaudeBridge.swift:328). Retry a bounded, jittered handful of times first;
+// the app is usually mid-launch, not gone. Exhaustion is NOT a data loss path:
+// job.completedExecution is already persisted before the POST, and an
+// exhausted delivery leaves the job file in place for the recovery scan.
+async function postBridgeMessageWithRetry(post, options = {}) {
+  const maxAttempts = Math.max(1, Math.min(8, Number(options.maxAttempts) || 4));
+  const wait = typeof options.sleep === "function" ? options.sleep : sleep;
+  const attempts = [];
+  let bridge = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    bridge = await post(attempt);
+    if (!bridgeDeliveryRetryable(bridge)) break;
+    attempts.push({
+      attempt,
+      reason: bridge && bridge.reason ? String(bridge.reason).slice(0, 200) : null,
+      httpStatus: bridge && bridge.httpStatus != null ? bridge.httpStatus : null,
+    });
+    if (attempt === maxAttempts) break;
+    await wait(bridgeDeliveryBackoffMs(attempt - 1, options));
+  }
+  if (attempts.length && bridge && typeof bridge === "object") {
+    bridge = {
+      ...bridge,
+      deliveryAttempts: attempts.length + (bridgeDeliveryRetryable(bridge) ? 0 : 1),
+      retriedFailures: attempts,
+      retriesExhausted: bridgeDeliveryRetryable(bridge),
+    };
+  }
+  return bridge;
+}
+
+// What to do with the durable job file once the POST has settled.
+//
+//   "unlink"   — the app owns the completion now (delivered) or has definitively
+//                consumed/refused it; replaying would double-book.
+//   "preserve" — the app's outcome is AMBIGUOUS (409). Deleting here is what
+//                lost the reply: the receipt keeps only a 1000-char preview.
+//                Move the job aside so the full text survives for a human/agent,
+//                without leaving it in the scan path to relaunch forever.
+//   "retain"   — retryable/unknown failure; leave it for the recovery scan.
+function replyJobDisposition(bridge) {
+  if (!bridge) return "retain";
+  if (bridge.status === "delivered" || bridge.status === "dry_run") return "unlink";
+  if (!isTerminalBridgeReply(bridge)) return "retain";
+  return bridge.replyStatus === "outcome_unknown" || bridge.replyStatus === "conflict"
+    ? "preserve"
+    : "unlink";
+}
+
+// Preserve out of the *.json scan path: recoverReplyJobs only reads files
+// directly in jobsDir (see readdirSync + isFile filter), so a subdirectory is
+// never rescanned and can never relaunch a turn.
+// Newest-first bound on preserved replies. Preserved jobs hold full reply
+// text and nothing else ever deletes them, so the store must bound itself
+// (gpt-5.5 review MED): a stuck lifecycle 409-ing distinct completions for
+// days would otherwise grow this directory forever.
+const UNDELIVERED_REPLY_JOBS_CAP = 200;
+
+function pruneUndeliveredReplyJobs(undeliveredDir, cap = UNDELIVERED_REPLY_JOBS_CAP) {
+  let entries;
+  try {
+    entries = fs.readdirSync(undeliveredDir).filter((name) => name.endsWith(".json"));
+  } catch {
+    return;
+  }
+  if (entries.length <= cap) return;
+  const stamped = entries.map((name) => {
+    let mtimeMs = 0;
+    try { mtimeMs = fs.statSync(path.join(undeliveredDir, name)).mtimeMs; } catch {}
+    return { name, mtimeMs };
+  });
+  stamped.sort((a, b) => a.mtimeMs - b.mtimeMs);
+  for (const victim of stamped.slice(0, stamped.length - cap)) {
+    try { fs.unlinkSync(path.join(undeliveredDir, victim.name)); } catch {}
+  }
+}
+
+function preserveUndeliverableReplyJob(jobPath, bridge) {
+  const undeliveredDir = path.join(path.dirname(jobPath), "undelivered");
+  try {
+    fs.mkdirSync(undeliveredDir, { recursive: true, mode: 0o700 });
+    const target = path.join(
+      undeliveredDir,
+      `${path.basename(jobPath, ".json")}.${Date.now()}.${bridge && bridge.replyStatus || "unknown"}.json`
+    );
+    fs.renameSync(jobPath, target);
+    // rename keeps the source file's mode; a legacy 0644 job must not land
+    // world-readable with full reply text (gpt-5.5 review MED).
+    try { fs.chmodSync(target, 0o600); } catch {}
+    pruneUndeliveredReplyJobs(undeliveredDir);
+    fsyncDirectorySync(path.dirname(jobPath));
+    fsyncDirectorySync(undeliveredDir);
+    return { preserved: true, undeliveredPath: target };
+  } catch (error) {
+    return {
+      preserved: false,
+      error: redactDiagnosticText(String(error && error.message || error)).slice(0, 300),
+    };
+  }
+}
+
+function finalizeReplyJobFile(jobPath, bridge) {
+  const disposition = replyJobDisposition(bridge);
+  if (disposition === "unlink") {
+    try { fs.unlinkSync(jobPath); } catch {}
+    return { disposition };
+  }
+  if (disposition === "preserve") {
+    return { disposition, ...preserveUndeliverableReplyJob(jobPath, bridge) };
+  }
+  return { disposition };
 }
 
 function isTerminalBridgeReply(bridge) {
@@ -3549,6 +3738,12 @@ module.exports = {
   postBridgeMessage,
   processStartIdentity,
   isTerminalBridgeReply,
+  bridgeDeliveryRetryable,
+  bridgeDeliveryBackoffMs,
+  postBridgeMessageWithRetry,
+  replyJobDisposition,
+  finalizeReplyJobFile,
+  pruneUndeliveredReplyJobs,
   quarantineReplyJob,
   readCanonicalTurnResult,
   redactDiagnosticText,

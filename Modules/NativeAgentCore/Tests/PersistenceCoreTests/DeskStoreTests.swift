@@ -956,4 +956,190 @@ final class DeskStoreTests: XCTestCase {
         XCTAssertEqual(DeskClock.nowISO(parsed), stamp)
         XCTAssertEqual(TaskLedgerClock.nowISO(parsed), stamp)
     }
+
+    // MARK: - Terminal lifecycle: canceled rows are swept and capped
+
+    /// A CANCELED top-level item is sweep-eligible on the same grace clock as a
+    /// done one. Pre-fix (`guard item.status == .done`) canceled rows were never
+    /// returned, so they sat in live state forever.
+    func test_archive_sweep_includes_canceled_items() async throws {
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SwiftNativeDeskStore(dataRoot: root)
+
+        let canceled = try await store.createItem(kind: .plan, project: "na", title: "abandoned")
+        _ = try await store.setStatus(canceled.handle, status: .canceled)
+        let done = try await store.createItem(kind: .plan, project: "na", title: "shipped")
+        _ = try await store.closeItem(done.handle, outcomeSummary: "done")
+        let open = try await store.createItem(kind: .plan, project: "na", title: "still open")
+
+        // Terminal via setStatus stamps closedAt, so the grace clock applies.
+        let rows = try await store.liveState().items
+        let row = try XCTUnwrap(rows.first { $0.handle == canceled.handle })
+        XCTAssertEqual(row.status, .canceled)
+        XCTAssertNotNil(row.closedAt)
+
+        let insideGrace = try await store.archiveSweep(now: Date())
+        XCTAssertTrue(insideGrace.isEmpty)
+        let eligible = try await store.archiveSweep(now: Date().addingTimeInterval(72 * 3600))
+        XCTAssertEqual(Set(eligible), Set([canceled.handle, done.handle]))
+        XCTAssertFalse(eligible.contains(open.handle))
+    }
+
+    /// A canceled item archives through the same path and records a CANCELED
+    /// final status — proving the sweep hands archiveItem work it accepts.
+    func test_canceled_item_archives_with_canceled_final_status() async throws {
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SwiftNativeDeskStore(dataRoot: root)
+
+        let it = try await store.createItem(kind: .plan, project: "na", title: "abandoned")
+        _ = try await store.setStatus(it.handle, status: .canceled)
+        let eligible = try await store.archiveSweep(now: Date().addingTimeInterval(72 * 3600))
+        XCTAssertEqual(eligible, [it.handle])
+
+        let record = try await store.archiveItem(it.handle)
+        XCTAssertEqual(record.finalStatus, .canceled)
+        let live = try await store.liveState()
+        XCTAssertFalse(live.items.contains { $0.handle == it.handle })
+    }
+
+    /// Projection: 25 canceled top-level rows must NOT eat the 25-item cap and
+    /// push live work off the desk. Pre-fix the cap counted only `.done`, so the
+    /// canceled rows (lowest aliases) filled prefix(25) and the live items
+    /// vanished.
+    func test_projection_canceled_items_do_not_dominate_top_level_cap() {
+        let opened = "2026-07-01T10:00:00.000000+00:00"
+        func mk(_ n: Int, status: DeskStatus, title: String, closedAt: String?) -> DeskItem {
+            var item = DeskItem(handle: "h\(n)", alias: "\(n)", parent: nil, kind: .plan, status: status,
+                                project: "na", title: title, openedAt: opened, updatedAt: opened)
+            item.closedAt = closedAt
+            return item
+        }
+        var items: [DeskItem] = []
+        for n in 1...25 {
+            // Ascending closedAt so the newest-3 are deterministic (23, 24, 25).
+            items.append(mk(n, status: .canceled, title: "dead \(n)",
+                            closedAt: "2026-07-01T10:00:\(String(format: "%02d", n)).000000+00:00"))
+        }
+        for n in 26...30 {
+            items.append(mk(n, status: .now, title: "live \(n)", closedAt: nil))
+        }
+
+        let kept = DeskProjection.cappedTopLevel(DeskState(items: items, generatedTs: opened))
+        let keptCanceled = kept.filter { $0.status == .canceled }
+        XCTAssertEqual(keptCanceled.count, DeskProjection.doneCap)
+        XCTAssertEqual(Set(keptCanceled.map(\.handle)), Set(["h23", "h24", "h25"]))
+        // Every live item survives.
+        for n in 26...30 {
+            XCTAssertTrue(kept.contains { $0.handle == "h\(n)" }, "live item h\(n) fell off the desk")
+        }
+
+        let rendered = DeskProjection.render(DeskState(items: items, generatedTs: opened))
+        XCTAssertTrue(rendered.contains("live 30"), rendered)
+    }
+
+    // MARK: - Per-item history caps
+
+    /// Notes are capped to the newest `notesCap`; the tail readers care about
+    /// (`notes.last`) is preserved. Pre-fix the list grew unbounded and the whole
+    /// tree was re-serialized on every op.
+    func test_notes_are_capped_to_newest_window() async throws {
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SwiftNativeDeskStore(dataRoot: root)
+
+        let it = try await store.createItem(kind: .plan, project: "na", title: "chatty")
+        let total = SwiftNativeDeskStore.notesCap + 50
+        for i in 1...total {
+            _ = try await store.appendNote(it.handle, text: "note \(i)")
+        }
+
+        let items = try await store.liveState().items
+        let row = try XCTUnwrap(items.first { $0.handle == it.handle })
+        XCTAssertEqual(row.notes.count, SwiftNativeDeskStore.notesCap)
+        XCTAssertEqual(row.notes.last?.text, "note \(total)")
+        XCTAssertEqual(row.notes.first?.text, "note \(total - SwiftNativeDeskStore.notesCap + 1)")
+        XCTAssertFalse(row.notes.contains { $0.text == "note 1" })
+    }
+
+    /// The cap survives a compaction round-trip: the base is written from the
+    /// capped fold, so a rebuild from base + tail stays capped (this is the
+    /// O(n²) the fix exists to prevent).
+    func test_notes_cap_survives_compaction() async throws {
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        // Low threshold so compaction certainly fires mid-run and the capped
+        // fold is baked into the base, then more notes land in the tail.
+        let store = SwiftNativeDeskStore(dataRoot: root, opsCompactionThreshold: 64)
+
+        let it = try await store.createItem(kind: .plan, project: "na", title: "chatty")
+        for i in 1...(SwiftNativeDeskStore.notesCap + 25) {
+            _ = try await store.appendNote(it.handle, text: "note \(i)")
+        }
+        for i in 1...25 {
+            _ = try await store.appendNote(it.handle, text: "post \(i)")
+        }
+
+        let items = try await store.liveState().items
+        let row = try XCTUnwrap(items.first { $0.handle == it.handle })
+        XCTAssertEqual(row.notes.count, SwiftNativeDeskStore.notesCap)
+        XCTAssertEqual(row.notes.last?.text, "post 25")
+    }
+
+    /// Refs are capped by IMPORTANCE, not recency: a gh identity ref (priority 0)
+    /// must outlive a flood of low-priority note refs, because
+    /// GitHubProjectTracking matches and retires desk rows by it.
+    func test_refs_cap_evicts_least_important_and_keeps_gh_identity() async throws {
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SwiftNativeDeskStore(dataRoot: root)
+
+        let it = try await store.createItem(kind: .gh, project: "na", title: "tracked pr")
+        _ = try await store.addRef(it.handle, ref: DeskRef(kind: .ghPr(
+            repo: "o/r", number: 42, title: "pr", status: "open", checks: nil)))
+        for i in 1...(SwiftNativeDeskStore.refsCap + 40) {
+            _ = try await store.addRef(it.handle, ref: DeskRef(kind: .note(text: "n\(i)")))
+        }
+
+        let items = try await store.liveState().items
+        let row = try XCTUnwrap(items.first { $0.handle == it.handle })
+        XCTAssertEqual(row.refs.count, SwiftNativeDeskStore.refsCap)
+        XCTAssertTrue(row.refs.contains { ref in
+            if case .ghPr(_, let number, _, _, _) = ref.kind { return number == 42 }
+            return false
+        }, "gh identity ref was evicted — tracker rows would orphan")
+        // Among equal-priority note refs the OLDEST go first.
+        XCTAssertFalse(row.refs.contains { ref in
+            if case .note(let text) = ref.kind { return text == "n1" }
+            return false
+        })
+    }
+
+    // gpt-5.5 wave-2 review: the ORIGINAL tracking ref must survive even a
+    // flood of newer EQUAL-priority gh refs (the case the note-only flood
+    // above could not catch — equal priority evicts oldest-first, which is
+    // the tracking identity). Tracking refs are never eviction victims.
+    func test_refs_cap_protects_gh_identity_under_equal_priority_flood() async throws {
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SwiftNativeDeskStore(dataRoot: root)
+
+        let it = try await store.createItem(kind: .gh, project: "na", title: "tracked pr")
+        // The tracking identity, added at creation (oldest gh_pr).
+        _ = try await store.addRef(it.handle, ref: DeskRef(kind: .ghPr(
+            repo: "o/r", number: 42, title: "pr", status: "open", checks: nil)))
+        // A flood of newer, same-priority gh_pr refs on the same row.
+        for n in 100...(100 + SwiftNativeDeskStore.refsCap + 40) {
+            _ = try await store.addRef(it.handle, ref: DeskRef(kind: .ghPr(
+                repo: "o/r", number: n, title: nil, status: "open", checks: nil)))
+        }
+
+        let items = try await store.liveState().items
+        let row = try XCTUnwrap(items.first { $0.handle == it.handle })
+        XCTAssertTrue(row.refs.contains { ref in
+            if case .ghPr(_, let number, _, _, _) = ref.kind { return number == 42 }
+            return false
+        }, "the original gh tracking ref was evicted under an equal-priority gh flood — the tracker row would orphan")
+    }
 }

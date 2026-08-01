@@ -676,6 +676,10 @@ extension BackgroundLoopsAssembly {
         do {
             let inserted = try await persistence.withFileLock(inboxPath) { () async throws -> Bool in
                 let rows = try await persistence.tailJSONL(inboxPath, limit: Int.max, maxBytes: nil)
+                guard InboxRewriteGuard.rewriteIsSafe(rows: rows, path: inboxPath) else {
+                    InboxRewriteGuard.refuse("HeartbeatLoop", path: inboxPath)
+                    return false
+                }
                 var mutated: [JSONValue] = []
                 mutated.reserveCapacity(rows.count + 1)
                 var found = false
@@ -1028,5 +1032,38 @@ extension BackgroundLoopsAssembly {
                 severity: "actionable"
             )
         }
+    }
+}
+
+// MARK: - Inbox whole-file rewrite guard
+//
+// The notification inbox upserts read the whole file with `tailJSONL` and then
+// rewrite it in place. That read is LOSSY by design: it decodes non-UTF8 bytes
+// with replacement and `compactMap`s away every line it cannot parse. So a torn
+// or corrupted inbox comes back as `[]`, and rewriting from that silently wipes
+// every pending card the user had not seen yet.
+//
+// Zero rows is only legitimate when the file genuinely holds nothing on disk —
+// which must still allow the very first card to be appended.
+enum InboxRewriteGuard {
+    /// True when it is safe to rewrite `path` from `rows`.
+    static func rewriteIsSafe(rows: [JSONValue], path: URL) -> Bool {
+        if !rows.isEmpty { return true }
+        guard FileManager.default.fileExists(atPath: path.path) else { return true }
+        guard let size = (try? FileManager.default.attributesOfItem(
+            atPath: path.path
+        )[.size]) as? NSNumber else {
+            // Present but unstattable: assume it holds cards and refuse.
+            return false
+        }
+        return size.intValue == 0
+    }
+
+    /// Logs the refusal on the way out so a skipped upsert is never silent.
+    static func refuse(_ label: String, path: URL) {
+        FileHandle.standardError.write(Data(
+            ("\(label): inbox read returned no rows for a non-empty file at "
+             + "\(path.path) — skipping whole-file rewrite to avoid wiping "
+             + "pending cards\n").utf8))
     }
 }

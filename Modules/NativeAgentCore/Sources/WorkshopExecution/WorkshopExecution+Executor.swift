@@ -616,16 +616,18 @@ public actor WorkshopExecutorLoop {
     /// Returns nil when the mission was not claimable (already claimed, not
     /// queued, or no slot free).
     private func claim(_ executionId: String) async throws -> WorkshopExecutionRecord? {
-        if let p = persistence as? SwiftNativePersistenceCore {
-            // The queue root may not exist yet on a fresh data root; the
-            // lock-file open needs its parent directory.
-            try? FileManager.default.createDirectory(
-                at: executionRecordsRoot, withIntermediateDirectories: true)
-            return try await p.withFileLock(queueClaimLockTarget) {
-                try await self.claimUnderQueueLock(executionId)
-            }
+        // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+        // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+        // every conformer already has it. The old downcast to
+        // SwiftNativePersistenceCore only had the effect of running this critical
+        // section UNLOCKED for any other conformer.
+        // The queue root may not exist yet on a fresh data root; the
+        // lock-file open needs its parent directory.
+        try? FileManager.default.createDirectory(
+            at: executionRecordsRoot, withIntermediateDirectories: true)
+        return try await persistence.withFileLock(queueClaimLockTarget) {
+            try await self.claimUnderQueueLock(executionId)
         }
-        return try await claimUnderQueueLock(executionId)
     }
 
     /// The scan + per-Workshop execution RMW half of claim(). MUST only be called while
@@ -654,10 +656,12 @@ public actor WorkshopExecutorLoop {
             try await persistence.writeJSON(record.toJSON(), to: executionRecordJSON)
             return record
         }
-        if let p = persistence as? SwiftNativePersistenceCore {
-            return try await p.withFileLock(executionRecordJSON, work)
-        }
-        return try await work()
+        // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+        // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+        // every conformer already has it. The old downcast to
+        // SwiftNativePersistenceCore only had the effect of running this critical
+        // section UNLOCKED for any other conformer.
+        return try await persistence.withFileLock(executionRecordJSON, work)
     }
 
     // MARK: mission run loop (port of _run_mission_locked, the retired daemon)
@@ -1796,10 +1800,12 @@ public actor WorkshopExecutorLoop {
             return (record, true)
         }
         do {
-            if let p = persistence as? SwiftNativePersistenceCore {
-                return try await p.withFileLock(executionRecordJSON, work)
-            }
-            return try await work()
+            // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+            // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+            // every conformer already has it. The old downcast to
+            // SwiftNativePersistenceCore only had the effect of running this critical
+            // section UNLOCKED for any other conformer.
+            return try await persistence.withFileLock(executionRecordJSON, work)
         } catch let e as WorkshopExecutionError {
             throw e
         } catch {
@@ -1820,22 +1826,26 @@ public actor WorkshopExecutorLoop {
             }
             return SwiftNativeWorkshopRunner.recordFromJSON(obj)
         }
-        if let p = persistence as? SwiftNativePersistenceCore {
-            return try await p.withFileLock(executionRecordJSON, work)
-        }
-        return try await work()
+        // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+        // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+        // every conformer already has it. The old downcast to
+        // SwiftNativePersistenceCore only had the effect of running this critical
+        // section UNLOCKED for any other conformer.
+        return try await persistence.withFileLock(executionRecordJSON, work)
     }
 
     /// Same cross-process `<timeline>.lock` flock the runner + daemon take
     /// on every timeline append (SwiftNativeWorkshopRunner.appendTimelineLocked).
     private func appendTimelineLocked(_ event: JSONValue, executionId: String) async throws {
         let timeline = timelinePath(executionId)
-        if let p = persistence as? SwiftNativePersistenceCore {
-            try await p.withFileLock(timeline) {
-                try await p.appendJSONL(event, to: timeline)
-            }
-        } else {
-            try await persistence.appendJSONL(event, to: timeline)
+        // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+        // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+        // every conformer already has it. The old downcast to
+        // SwiftNativePersistenceCore only had the effect of running this critical
+        // section UNLOCKED for any other conformer.
+        let core = persistence
+        try await core.withFileLock(timeline) {
+            try await core.appendJSONL(event, to: timeline)
         }
     }
 

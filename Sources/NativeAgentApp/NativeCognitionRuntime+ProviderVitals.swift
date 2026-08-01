@@ -90,9 +90,23 @@ extension NativeCognitionRuntime {
 
     /// The provider's latest vitals inbox row, if any ("degraded" or
     /// "recovered" — event-log semantics; the LATEST row is the live state).
-    func latestProviderVitalsNoticeKind(providerId: String) async -> String? {
-        let persistence = SwiftNativePersistenceCore()
-        let rows = (try? await persistence.readJSONL(providerVitalsInboxPath)) ?? []
+    ///
+    /// 2026-08-01 concurrency fix: takes NO lock of its own and THROWS on read
+    /// failure. Callers run it INSIDE `withFileLock(providerVitalsInboxPath)`
+    /// so the idempotency check and the append are one critical section —
+    /// previously two overlapping sweeps could both read "not degraded" and
+    /// both append, leaving a stale `degraded` card the recovery gate (which
+    /// only ever closes the LATEST row) can never clear. Swallowing a read
+    /// error into `[]` had the same effect on its own, so the error now aborts
+    /// the sweep rather than manufacturing a duplicate.
+    /// Mirrors the check-then-append-under-one-lock shape
+    /// `TriggerNotifierBinding.mirrorCardIntoRealInbox` uses.
+    private static func latestProviderVitalsNoticeKindLocked(
+        providerId: String,
+        inboxPath: URL,
+        persistence: SwiftNativePersistenceCore
+    ) async throws -> String? {
+        let rows = try await persistence.readJSONL(inboxPath)
         for row in rows.reversed() {
             guard case .object(let obj) = row,
                   case .string(let source)? = obj["source"], source == "provider_vitals",
@@ -110,39 +124,43 @@ extension NativeCognitionRuntime {
     ) async {
         // Disk-derived idempotency: if the latest vitals row for this provider
         // is already an unrecovered degradation notice — this run or any prior
-        // run — nothing to do.
-        if await latestProviderVitalsNoticeKind(providerId: providerId) == "degraded" {
-            return
-        }
+        // run — nothing to do. The check runs INSIDE the inbox lock together
+        // with the append (see `appendProviderVitalsNotice`).
         await appendProviderVitalsNotice(
             providerId: providerId,
             kind: "degraded",
             severity: "important",
             title: providerVitalsCardTitle(providerId: providerId, transition: transition),
-            message: providerVitalsCardEvidence(providerId: providerId, transition: transition)
+            message: providerVitalsCardEvidence(providerId: providerId, transition: transition),
+            gateOnLatestKind: { $0 != "degraded" }
         )
     }
 
     func postProviderVitalsRecoveryNotice(providerId: String) async {
-        // Only meaningful when the latest row is an open degradation notice.
-        guard await latestProviderVitalsNoticeKind(providerId: providerId) == "degraded" else {
-            return
-        }
+        // Only meaningful when the latest row is an open degradation notice —
+        // checked under the same lock as the append.
         await appendProviderVitalsNotice(
             providerId: providerId,
             kind: "recovered",
             severity: "info",
             title: "\(providerId) recovered",
-            message: "\(providerId) is back to normal speed — no action needed."
+            message: "\(providerId) is back to normal speed — no action needed.",
+            gateOnLatestKind: { $0 == "degraded" }
         )
     }
 
+    /// Append one vitals notice iff `gateOnLatestKind` accepts the provider's
+    /// latest on-disk vitals row. Read-gate and append run under ONE
+    /// `withFileLock(providerVitalsInboxPath)` (append with `takeLock: false`),
+    /// so overlapping sweeps serialize and a read failure aborts the write
+    /// instead of being read as "no prior notice".
     private func appendProviderVitalsNotice(
         providerId: String,
         kind: String,
         severity: String,
         title: String,
-        message: String
+        message: String,
+        gateOnLatestKind: @escaping @Sendable (String?) -> Bool
     ) async {
         let stamp = ISO8601DateFormatter().string(from: now())
         let row: JSONValue = .object([
@@ -164,15 +182,25 @@ extension NativeCognitionRuntime {
             "providerVitalsKind": .string(kind),
         ])
         let persistence = SwiftNativePersistenceCore()
+        let inboxPath = providerVitalsInboxPath
         do {
-            try await appendJSONLCapped(
-                row, to: providerVitalsInboxPath, using: persistence,
-                maxLines: JSONLLineCaps.notificationInbox,
-                logLabel: "ProviderVitals.inbox"
-            )
+            try await persistence.withFileLock(inboxPath) { () async throws -> Void in
+                let latest = try await Self.latestProviderVitalsNoticeKindLocked(
+                    providerId: providerId, inboxPath: inboxPath, persistence: persistence
+                )
+                guard gateOnLatestKind(latest) else { return }
+                try await appendJSONLCapped(
+                    row, to: inboxPath, using: persistence,
+                    maxLines: JSONLLineCaps.notificationInbox,
+                    logLabel: "ProviderVitals.inbox",
+                    takeLock: false
+                )
+            }
         } catch {
+            // A read/lock/write failure ABORTS the notice — no card is better
+            // than a duplicate `degraded` card the recovery gate can't clear.
             FileHandle.standardError.write(
-                Data("ProviderVitals: inbox notice append failed for \(providerId): \(error)\n".utf8)
+                Data("ProviderVitals: inbox notice (\(kind)) failed for \(providerId): \(error)\n".utf8)
             )
         }
     }

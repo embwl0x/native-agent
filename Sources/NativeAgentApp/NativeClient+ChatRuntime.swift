@@ -163,7 +163,6 @@ extension NativeClient {
                         suppressUserAppend: suppressUserAppend
                     )
                 }
-                var accumulatedSwift = ""
                 // Slow-turn advisory (2026-06-14): if no token arrives within
                 // ~10s, post a non-cancelling "still working" notice on the live
                 // turn-notice bus. This NEVER interrupts the stream — a slow-but-
@@ -211,7 +210,6 @@ extension NativeClient {
                                 firstToken.mark()
                                 slowWatch.cancel()
                             }
-                            accumulatedSwift += s
                             continuation.yield(s)
                         case .toolUse, .toolResult:
                             // Keep the slow-turn advisory ALIVE during tool runs:

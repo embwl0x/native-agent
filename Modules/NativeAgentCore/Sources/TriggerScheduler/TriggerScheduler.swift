@@ -485,10 +485,12 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
                     persistence: persistence
                 )
             }
-            if let p = persistence as? SwiftNativePersistenceCore {
-                return try await p.withFileLock(inboxPath, work)
-            }
-            return try await work()
+            // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+            // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+            // every conformer already has it. The old downcast to
+            // SwiftNativePersistenceCore only had the effect of running this critical
+            // section UNLOCKED for any other conformer.
+            return try await persistence.withFileLock(inboxPath, work)
         }
     }
 
@@ -513,10 +515,12 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
                     persistence: persistence
                 )
             }
-            if let p = persistence as? SwiftNativePersistenceCore {
-                return try await p.withFileLock(workshopExecutionsPath, work)
-            }
-            return try await work()
+            // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+            // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+            // every conformer already has it. The old downcast to
+            // SwiftNativePersistenceCore only had the effect of running this critical
+            // section UNLOCKED for any other conformer.
+            return try await persistence.withFileLock(workshopExecutionsPath, work)
         }
     }
 
@@ -609,10 +613,12 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
                 }
                 return TriggerStatus(name: name, enabled: nil, status: "updated", config: .object(newCfg))
             }
-            if let p = persistence as? SwiftNativePersistenceCore {
-                return try await p.withFileLock(inboxPath, work)
-            }
-            return try await work()
+            // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+            // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+            // every conformer already has it. The old downcast to
+            // SwiftNativePersistenceCore only had the effect of running this critical
+            // section UNLOCKED for any other conformer.
+            return try await persistence.withFileLock(inboxPath, work)
         }
     }
 
@@ -1405,10 +1411,12 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
             return true
         }
         do {
-            if let p = persistence as? SwiftNativePersistenceCore {
-                return try await p.withFileLock(statePath, work)
-            }
-            return try await work()
+            // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+            // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+            // every conformer already has it. The old downcast to
+            // SwiftNativePersistenceCore only had the effect of running this critical
+            // section UNLOCKED for any other conformer.
+            return try await persistence.withFileLock(statePath, work)
         } catch {
             Self.logger.error("claim RMW failed for trigger '\(name, privacy: .public)': \(String(describing: error), privacy: .public) — treated as not-claimed (no fire this tick)")
             return false

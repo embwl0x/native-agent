@@ -196,21 +196,6 @@ public actor ActiveToolsStore {
         }
     }
 
-    public func save(_ state: ChatSessionActiveTools) async throws {
-        let trimmed = state.sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard NativeAgentChatSessionID.isSafePathComponent(trimmed) else {
-            throw NSError(
-                domain: "ActiveToolsStore",
-                code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "invalid sessionId"]
-            )
-        }
-        let path = pathFor(sessionId: trimmed)
-        try await persistence.withFileLock(path) {
-            try await self.saveLocked(state, path: path)
-        }
-    }
-
     @discardableResult
     public func addLoaded(sessionId: String, names: Set<String>) async throws -> ChatSessionActiveTools {
         let trimmed = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -325,10 +310,20 @@ public actor ActiveToolsStore {
     }
 
     private func saveLocked(_ state: ChatSessionActiveTools, path: URL) async throws {
-        guard !state.activeTools.isEmpty || !state.loadedAt.isEmpty else {
-            try? FileManager.default.removeItem(at: path)
-            return
-        }
+        // An EMPTY loadout is persisted, not deleted (2026-08-01). This used to
+        // `removeItem` the `<id>.json` whenever both sets went empty — which is
+        // reachable on a fully LIVE session via `removeLoaded(all: true)` or the
+        // in-file TTL prune. The lock-sidecar reaper above treats "sibling .json
+        // absent" as proof that no live session owns the id, and nothing ever
+        // refreshes the lock's mtime, so a >24h session that unloaded all its
+        // tools had its IN-USE `<id>.json.lock` reaped out from under it.
+        // Mutual exclusion survived (withFileLock revalidates the inode), but
+        // the repeated reap/retry race hits that helper's `attempts >= 8` throw,
+        // which load()'s catch swallows into an EMPTY loadout — session tool
+        // amnesia. Keeping the sibling makes the reaper's liveness premise true.
+        // load() reads an empty-state file identically to an absent one (empty
+        // sets, prune no-ops), and the json half of the sweep still reaps this
+        // file on mtime once it really is 24h cold.
         let body: JSONValue = .object([
             "sessionId": .string(state.sessionId),
             "activeTools": .array(state.activeTools.sorted().map { .string($0) }),

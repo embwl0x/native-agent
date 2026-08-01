@@ -61,7 +61,9 @@ struct MemoryView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                TextField("Search memory (semantic recall)", text: $query)
+                // UI-5: "semantic recall" is a backend word. The search box is
+                // the first thing on the page, so it says what it does.
+                TextField("Search your memories", text: $query)
                     .textFieldStyle(.roundedBorder)
                 Menu {
                     Button("Consolidate memory", systemImage: "arrow.triangle.merge") {
@@ -342,7 +344,10 @@ private struct MemoryProposalReviewPanel: View {
     var body: some View {
         NativePanel(title: "Memory Proposals", systemImage: "brain.head.profile") {
             VStack(alignment: .leading, spacing: 10) {
-                Text("Review durable user facts the agent wants to keep in USER.md. One-off project state is compressed into the graph instead of asking for approval.")
+                // UI-5: "USER.md" and "the graph" are file and backend names.
+                // The filename still ships, inside Advanced Diagnostics on the
+                // memory status panel.
+                Text("Review the lasting facts the agent wants to keep in your long-term memory profile. Short-lived project details are stored automatically without asking.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 ScrollView {
@@ -735,6 +740,73 @@ struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
     }
 }
 
+// MARK: - Plain-English memory status copy
+//
+// UI-5 (2026-08-01, public era): pure string helpers so the honesty copy is
+// unit-testable without a UI snapshot harness. Values in, Strings out.
+enum MemoryStatusPlainCopy {
+    /// Prefer the v2 status counts when the app has them; fall back to the
+    /// direct SQLite probe on a fresh install where status has not loaded yet.
+    static func savedCount(active: Int?, sqliteRecordCount: Int) -> Int {
+        if let active, active > 0 { return active }
+        return sqliteRecordCount
+    }
+
+    /// Vocabulary understood by NativeAgentTheme.statusColor / StatusBadge.
+    static func statusText(health: MemoryV2NativeStackSnapshot.EmbedderHealth) -> String {
+        switch health {
+        case .working: return "ok"
+        case .ready: return "warn"
+        case .broken, .missing: return "failed"
+        }
+    }
+
+    static func headline(savedCount: Int, health: MemoryV2NativeStackSnapshot.EmbedderHealth) -> String {
+        if health.needsAttention {
+            return "Memories are being saved, but smart search is not working."
+        }
+        if savedCount == 0 {
+            return "No memories saved yet."
+        }
+        return "Memory is working."
+    }
+
+    static func countsLine(savedCount: Int, pinned: Int, pendingProposals: Int) -> String {
+        guard savedCount > 0 || pendingProposals > 0 else {
+            return "Memories appear here as the agent learns from your conversations."
+        }
+        var parts = [savedCount == 1 ? "1 memory saved" : "\(savedCount) memories saved"]
+        if pinned > 0 { parts.append("\(pinned) pinned") }
+        if pendingProposals > 0 {
+            parts.append(pendingProposals == 1
+                ? "1 waiting for your approval"
+                : "\(pendingProposals) waiting for your approval")
+        }
+        return parts.joined(separator: ". ") + "."
+    }
+
+    /// Non-nil only when the user should know something is off. The technical
+    /// reason string stays in Advanced Diagnostics.
+    static func attentionDetail(health: MemoryV2NativeStackSnapshot.EmbedderHealth) -> String? {
+        switch health {
+        case .working:
+            return nil
+        case .ready:
+            return "Smart search starts the first time you search."
+        case .broken:
+            return "Smart search could not start. Searches fall back to matching words. Open Advanced Diagnostics for the reason."
+        case .missing:
+            return "The on-device search model is not installed. Searches fall back to matching words."
+        }
+    }
+
+    static func searchQualityLine(realSemanticAvailable: Bool) -> String {
+        realSemanticAvailable
+            ? "Search finds memories by meaning, not just matching words."
+            : "Search matches words for now. Meaning-based search turns on once the on-device model is ready."
+    }
+}
+
 private struct MemoryV2NativeStackPanel: View {
     let snapshot: MemoryV2NativeStackSnapshot
     let cloudKitStatus: String
@@ -745,19 +817,91 @@ private struct MemoryV2NativeStackPanel: View {
     var latestHygiene: MemoryHygieneReport? = nil
     let isReindexing: Bool
     let onReindex: () -> Void
+    // Collapsed by default; mirrors the Advanced disclosures in TrustCenterView
+    // and MacControlPermissionsView.
+    @State private var showAdvancedDiagnostics = false
+
+    // UI-5 (public-user honesty, 2026-08-01): the panel used to open on SQLite,
+    // Core ML, CoreSpotlight, CloudKit and a data-root path. A person who did
+    // not build this app has no way to read that. Plain status leads; every
+    // backend row still ships inside Advanced Diagnostics.
+    private var healthTint: Color {
+        switch snapshot.embedderHealth {
+        case .working: return .green
+        case .ready: return .orange
+        case .broken, .missing: return .red
+        }
+    }
 
     var body: some View {
-        NativePanel(title: "Apple-Native Memory Stack", systemImage: "memorychip", tint: .blue) {
+        NativePanel(title: "Memory Status", systemImage: "brain.head.profile", tint: healthTint) {
             VStack(alignment: .leading, spacing: 8) {
-                MemoryV2SummaryBar(status: summaryStatus, latest: latestHygiene)
-                HStack(spacing: 12) {
-                    stackRow(
-                        icon: "cylinder.split.1x2",
-                        title: "SQLite",
-                        value: "\(snapshot.sqliteRecordCount) records",
-                        detail: snapshot.migrated ? "migrated" : "fresh",
-                        tint: snapshot.sqliteRecordCount > 0 ? .green : .secondary
-                    )
+                HStack(alignment: .firstTextBaseline) {
+                    InlineStatusDot(status: MemoryStatusPlainCopy.statusText(health: snapshot.embedderHealth))
+                    Text(MemoryStatusPlainCopy.headline(
+                        savedCount: MemoryStatusPlainCopy.savedCount(
+                            active: summaryStatus?.counts?.active,
+                            sqliteRecordCount: snapshot.sqliteRecordCount
+                        ),
+                        health: snapshot.embedderHealth
+                    ))
+                    .font(NativeAgentFont.section)
+                    Spacer()
+                }
+                Text(MemoryStatusPlainCopy.countsLine(
+                    savedCount: MemoryStatusPlainCopy.savedCount(
+                        active: summaryStatus?.counts?.active,
+                        sqliteRecordCount: snapshot.sqliteRecordCount
+                    ),
+                    pinned: summaryStatus?.counts?.pinned ?? 0,
+                    pendingProposals: summaryStatus?.counts?.pendingProposals ?? snapshot.sqliteProposalCount
+                ))
+                .font(NativeAgentFont.body)
+                .foregroundStyle(.secondary)
+                if let attention = MemoryStatusPlainCopy.attentionDetail(health: snapshot.embedderHealth) {
+                    Text(attention)
+                        .font(.caption)
+                        .foregroundStyle(snapshot.embedderHealth.needsAttention ? .red : .orange)
+                }
+                Text(MemoryStatusPlainCopy.searchQualityLine(
+                    realSemanticAvailable: summaryStatus?.embedding?.realSemanticAvailable == true
+                ))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                DisclosureGroup(isExpanded: $showAdvancedDiagnostics) {
+                    advancedDiagnostics
+                        .padding(.top, 10)
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "slider.horizontal.3")
+                            .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Advanced Diagnostics")
+                                .font(NativeAgentFont.section)
+                            Text("Storage, on-device search model, Spotlight, iCloud, and file locations.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var advancedDiagnostics: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            MemoryV2SummaryBar(status: summaryStatus, latest: latestHygiene)
+            HStack(spacing: 12) {
+                stackRow(
+                    icon: "cylinder.split.1x2",
+                    title: "SQLite",
+                    value: "\(snapshot.sqliteRecordCount) records",
+                    detail: snapshot.migrated ? "migrated" : "fresh",
+                    tint: snapshot.sqliteRecordCount > 0 ? .green : .secondary
+                )
                     // 2026-06-07: at-a-glance embedder health. the user asked
                     // for a clear "tell me if it's not working" indicator.
                     //   green  = inference running, N successful loads
@@ -782,35 +926,48 @@ private struct MemoryV2NativeStackPanel: View {
                         }()
                     )
                 }
-                HStack(spacing: 12) {
-                    stackRow(
-                        icon: "magnifyingglass.circle",
-                        title: "CoreSpotlight",
-                        value: snapshot.spotlightReindexed
+            HStack(spacing: 12) {
+                stackRow(
+                    icon: "magnifyingglass.circle",
+                    title: "CoreSpotlight",
+                    value: isReindexing
+                        ? "reindexing…"
+                        : (snapshot.spotlightReindexed
                             ? "\(snapshot.spotlightIndexedCount) indexed"
-                            : "not indexed",
-                        detail: snapshot.spotlightReindexed ? "reindex sentinel present" : "tap Spotlight to index",
-                        tint: snapshot.spotlightReindexed ? .green : .secondary
-                    )
-                    stackRow(
-                        icon: "icloud",
-                        title: "CloudKit",
-                        value: cloudKitStatus,
-                        detail: snapshot.cloudKitAccountStatus == cloudKitStatus
-                            ? "account check"
-                            : "account: \(snapshot.cloudKitAccountStatus)",
-                        tint: cloudKitStatus == "available" ? .green : .secondary
-                    )
-                }
-                if !snapshot.dataRootPath.isEmpty {
-                    Text("data root: \(snapshot.dataRootPath)")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                        .textSelection(.enabled)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
+                            : "not indexed"),
+                    detail: snapshot.spotlightReindexed ? "reindex sentinel present" : "tap Spotlight to index",
+                    tint: snapshot.spotlightReindexed ? .green : .secondary
+                )
+                stackRow(
+                    icon: "icloud",
+                    title: "CloudKit",
+                    value: cloudKitStatus,
+                    detail: snapshot.cloudKitAccountStatus == cloudKitStatus
+                        ? "account check"
+                        : "account: \(snapshot.cloudKitAccountStatus)",
+                    tint: cloudKitStatus == "available" ? .green : .secondary
+                )
             }
+            // UI-5: the long-term memory profile's real filename lives here,
+            // inside Advanced Diagnostics, and nowhere else in the UI.
+            Text("long-term memory profile file: USER.md")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .textSelection(.enabled)
+            if !snapshot.dataRootPath.isEmpty {
+                Text("data root: \(snapshot.dataRootPath)")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .textSelection(.enabled)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Button(isReindexing ? "Reindexing Spotlight…" : "Reindex Spotlight", systemImage: "magnifyingglass") {
+                onReindex()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(isReindexing)
         }
     }
 

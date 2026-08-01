@@ -184,10 +184,16 @@ public struct TriggerContentBuilder: Sendable {
     /// `<root>/desk/desk_ops.jsonl` → live materialized state. Non-terminal
     /// statuses only (`done` / `canceled` are not "open").
     func deskSection() async -> DeskSection {
-        let store = SwiftNativeDeskStore(
-            dataRoot: root,
-            persistence: (persistence as? SwiftNativePersistenceCore) ?? SwiftNativePersistenceCore()
-        )
+        // SwiftNativeDeskStore requires the concrete persistence type. The old
+        // `?? SwiftNativePersistenceCore()` fallback silently substituted a
+        // FRESH persistence when the injected one wasn't SwiftNative — reading
+        // the real filesystem behind a test's mock (uniform-locking sweep
+        // follow-up, 2026-08-01). A non-SwiftNative persistence cannot drive
+        // the desk store, so the section is honestly unavailable instead.
+        guard let native = persistence as? SwiftNativePersistenceCore else {
+            return DeskSection(openCount: 0, body: nil)
+        }
+        let store = SwiftNativeDeskStore(dataRoot: root, persistence: native)
         guard let state = try? await store.liveState(), !state.items.isEmpty else {
             return DeskSection(openCount: 0, body: nil)
         }

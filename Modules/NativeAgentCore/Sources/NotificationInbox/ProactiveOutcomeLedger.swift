@@ -218,24 +218,19 @@ public struct ProactiveOutcomeLedger: Sendable {
         // U5 W-G: the activity feed is now capped via a read-replace under the
         // activity flock (Connectors/Research). An unlocked append here can land
         // between that cap's read and replace and be lost — take the same lock.
-        if let p = persistence as? SwiftNativePersistenceCore {
-            try? await p.withFileLock(activityPath) { [persistence, activityPath] in
-                try await appendJSONLCapped(
-                    event,
-                    to: activityPath,
-                    using: persistence,
-                    maxLines: JSONLLineCaps.activityEvents,
-                    logLabel: "ProactiveOutcomeLedger.activity",
-                    takeLock: false
-                )
-            }
-        } else {
-            try? await appendJSONLCapped(
+        // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+        // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+        // every conformer already has it. The old downcast to
+        // SwiftNativePersistenceCore only had the effect of running this critical
+        // section UNLOCKED for any other conformer.
+        try? await persistence.withFileLock(activityPath) { [persistence, activityPath] in
+            try await appendJSONLCapped(
                 event,
                 to: activityPath,
                 using: persistence,
                 maxLines: JSONLLineCaps.activityEvents,
-                logLabel: "ProactiveOutcomeLedger.activity"
+                logLabel: "ProactiveOutcomeLedger.activity",
+                takeLock: false
             )
         }
         return record
@@ -282,6 +277,11 @@ public struct ProactiveOutcomeLedger: Sendable {
         // Mirror tail_jsonl(path, 1000) — default max_bytes=1 MiB, last `limit`
         // physical lines, malformed skipped. SwiftNativePersistenceCore.tailJSONL
         // reproduces that contract (see PersistenceCore.swift).
+        //
+        // NOT the lock-degrade shape (L7 sweep, 2026-08-01): this downcast
+        // selects a byte-bounded TAIL read, not `withFileLock`. Nothing here
+        // loses mutual exclusion — the two branches differ only in how much of
+        // the file they read. Deliberately left as-is.
         if let p = persistence as? SwiftNativePersistenceCore {
             return (try? await p.tailJSONL(outcomesPath, limit: limit, maxBytes: 1_048_576)) ?? []
         }

@@ -25,7 +25,8 @@ import Foundation
 //   • one optional note line renders only for a high-signal item (status blocked
 //     or flag) with a latest note: `  note: <text>`.
 //
-// CAPS: ≤25 top-level live items; among `done` show ≤3 most-recent; refs
+// CAPS: ≤25 top-level live items; among TERMINAL (done + canceled) show ≤3
+// most-recent; refs
 // summarized as `refs:N` (the optional inline form is not rendered — priority
 // ordering is exposed via DeskItem.liveRefs for consumers); per-item live render
 // ≤3 refs in priority order.
@@ -66,19 +67,26 @@ public enum DeskProjection {
 
     // MARK: - Top-level selection + caps
 
-    /// Top-level items in alias order, with the done-cap and 25-item cap applied.
+    /// Top-level items in alias order, with the terminal-cap and 25-item cap
+    /// applied.
+    ///
+    /// The recency cap counts TERMINAL items (done AND canceled), not `.done`
+    /// alone. Canceled rows are closed work with the same zero live signal as
+    /// done rows; when only `.done` was capped, canceled top-level items were
+    /// unbounded here, sat at the lowest aliases, and `prefix(topLevelCap)`
+    /// filled with them until live work fell off the desk entirely.
     static func cappedTopLevel(_ state: DeskState) -> [DeskItem] {
         let top = state.topLevel  // already in alias order from compact
-        // Keep all non-done; among done keep the ≤3 most-recent (by closedAt).
-        let done = top.filter { $0.status == .done }
-        let keepDone: Set<String>
-        if done.count > doneCap {
-            let recent = done.sorted { ($0.closedAt ?? $0.updatedAt) > ($1.closedAt ?? $1.updatedAt) }.prefix(doneCap)
-            keepDone = Set(recent.map { $0.handle })
+        // Keep all non-terminal; among terminal keep the ≤3 most-recent (by closedAt).
+        let terminal = top.filter { $0.status.isTerminal }
+        let keepTerminal: Set<String>
+        if terminal.count > doneCap {
+            let recent = terminal.sorted { ($0.closedAt ?? $0.updatedAt) > ($1.closedAt ?? $1.updatedAt) }.prefix(doneCap)
+            keepTerminal = Set(recent.map { $0.handle })
         } else {
-            keepDone = Set(done.map { $0.handle })
+            keepTerminal = Set(terminal.map { $0.handle })
         }
-        let filtered = top.filter { $0.status != .done || keepDone.contains($0.handle) }
+        let filtered = top.filter { !$0.status.isTerminal || keepTerminal.contains($0.handle) }
         return Array(filtered.prefix(topLevelCap))
     }
 
@@ -114,7 +122,9 @@ public enum DeskProjection {
         if let stale = staleSegment(item, now: now) {
             segs.append(stale)
         }
-        if item.status == .done, let archives = archiveCountdown(item, now: now, archiveGrace: archiveGrace) {
+        // Terminal, not `.done` alone — canceled rows are swept on the same
+        // grace clock (archiveSweep), so they get the same countdown.
+        if item.status.isTerminal, let archives = archiveCountdown(item, now: now, archiveGrace: archiveGrace) {
             segs.append(archives)
         }
         if item.cadence.mode == .event {

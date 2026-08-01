@@ -416,7 +416,7 @@ struct LivingMemoryPermissionsView: View {
                         }
                     )
                 )
-                .help("Nightly pass: clusters recurring session memories and proposes facts for USER.md.")
+                .help(MemoryPolicyHelpCopy.nightlyConsolidation)
                 EffectTimingTag(timing: .nextRun)
                 Spacer()
             }
@@ -435,7 +435,7 @@ struct LivingMemoryPermissionsView: View {
                     )
                 )
                 .disabled(!draftPolicy.consolidation_enabled)
-                .help("When on and promotion engine enabled, consolidated facts are written to USER.md automatically.")
+                .help(MemoryPolicyHelpCopy.autoPromoteConsolidated)
                 EffectTimingTag(timing: .nextRun)
                 Spacer()
             }
@@ -578,4 +578,18 @@ struct TrustBoundaryRow: View {
         }
         .textSelection(.enabled)
     }
+}
+
+// MARK: - Plain-English memory policy help copy
+//
+// UI-6 (2026-08-01, public era): these tooltips named USER.md, a file a public
+// user never opens and has no reason to know about. They describe the same
+// thing the Memory page calls a long-term memory profile. Pure values so the
+// wording is pinnable in PublicHonestyCopyTests.
+enum MemoryPolicyHelpCopy {
+    static let nightlyConsolidation =
+        "Once a night, the agent looks for things that keep coming up in your conversations and suggests them for your long-term memory profile."
+
+    static let autoPromoteConsolidated =
+        "Adds those suggestions to your long-term memory profile automatically, instead of waiting for you to approve each one."
 }

@@ -1458,11 +1458,41 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                 // work task — a cancel is NOT a chat failure. The cancelled
                 // partial already persisted via streamCancelled; writing a
                 // chat_failed/message_failed row after it double-books the
-                // turn. Reply 499-style (no failure row, no lifecycle flip).
-                self.writeJSON(conn, status: 200, obj: [
+                // turn. Reply 499-style (no failure row).
+                //
+                // 2026-07-31: the claim still has to be RELEASED. A cancel here
+                // means the 600s work deadline fired mid-turn; without the same
+                // outcome receipt the generic catch writes, the lifecycle stays
+                // .claimed under THIS ownerInstanceId, claim() answers
+                // .inProgress for us forever (reconcileInterruptedClaims only
+                // sweeps other instance ids), and every node-side retry gets
+                // 202 completion_in_progress until relaunch. Ambiguous, not
+                // failed — markOutcomeUnknown is exactly that receipt.
+                var cancelObject: [String: Any] = [
                     "status": "cancelled",
                     "reply": "(turn cancelled)",
-                ])
+                ]
+                if lifecycleClaimed, !responseCached,
+                   let deliveryId, let completionRequestDigest {
+                    do {
+                        try await CodexCompletionLifecycle.shared.markOutcomeUnknown(
+                            deliveryId: deliveryId,
+                            requestDigest: completionRequestDigest,
+                            detail: "work_deadline_cancelled:\(Self.messageWorkDeadlineSeconds)s"
+                        )
+                    } catch {
+                        cancelObject["detail"] =
+                            "outcome receipt failed: \(String(describing: error))"
+                    }
+                }
+                // The outcome receipt above always runs — lifecycle truth is
+                // unconditional. The RESPONSE is not: the 600s deadline handler
+                // that cancelled us claims the latch before answering 504, so
+                // writing here without claiming would put a second HTTP
+                // response on the same connection (gpt-5.5 wave review,
+                // 2026-07-31). Loser of the race stays silent.
+                guard workLatch.claim() else { return }
+                self.writeJSON(conn, status: 200, obj: cancelObject)
             } catch {
                 var failureStatus = "chat_failed"
                 var failureDetail = String(describing: error)

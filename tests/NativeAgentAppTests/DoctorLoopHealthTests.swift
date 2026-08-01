@@ -13,14 +13,16 @@ private func observation(
     loopId: String = "github_tracking",
     lastRun: Date?,
     interval: TimeInterval = 300,
-    lastError: String?
+    lastError: String?,
+    nextRun: Date? = nil,
+    running: Bool = true
 ) -> LoopHealthObservation {
     LoopHealthObservation(
         loopId: loopId,
         lastRun: lastRun,
-        nextRun: lastRun?.addingTimeInterval(interval),
+        nextRun: nextRun ?? lastRun?.addingTimeInterval(interval),
         lastError: lastError,
-        running: true
+        running: running
     )
 }
 
@@ -62,12 +64,91 @@ private func observation(
     #expect(verdicts[0].level == .ok)
 }
 
-@Test func never_ticked_loop_is_ok_with_no_ticks_detail() {
+// LOOPS-3: "no error recorded" is not the same as "healthy". A loop that has
+// never ticked is only OK while its first tick is still genuinely PENDING —
+// running, and scheduled for a time that has not passed yet.
+
+@Test func never_ticked_but_scheduled_ahead_is_ok_with_no_ticks_detail() {
     let now = Date(timeIntervalSince1970: 1_784_200_000)
-    let obs = observation(lastRun: nil, lastError: nil)
+    let obs = observation(lastRun: nil, lastError: nil, nextRun: now.addingTimeInterval(300))
     let verdicts = DoctorLoopHealth.evaluate(observations: [obs], recentFailureDates: [:], now: now)
     #expect(verdicts[0].level == .ok)
-    #expect(verdicts[0].detail == "No ticks yet.")
+    #expect(verdicts[0].detail.hasPrefix("No ticks yet"))
+}
+
+@Test func never_ticked_and_overdue_is_fail_not_ok() {
+    // The LOOPS-4 starvation signature seen from Doctor's side: a weekly loop
+    // whose scheduled first tick came and went days ago. lastError is nil
+    // precisely BECAUSE it never ran — the old rule reported this green.
+    let now = Date(timeIntervalSince1970: 1_784_200_000)
+    let obs = observation(
+        loopId: "weekly_self_improvement",
+        lastRun: nil,
+        lastError: nil,
+        nextRun: now.addingTimeInterval(-3 * 86_400)
+    )
+    let verdicts = DoctorLoopHealth.evaluate(observations: [obs], recentFailureDates: [:], now: now)
+    #expect(verdicts[0].level == .fail)
+    #expect(verdicts[0].detail.contains("Never ticked and overdue"))
+}
+
+@Test func not_running_loop_is_fail_even_with_no_error() {
+    let now = Date(timeIntervalSince1970: 1_784_200_000)
+    let obs = observation(
+        lastRun: now.addingTimeInterval(-30),
+        lastError: nil,
+        running: false
+    )
+    let verdicts = DoctorLoopHealth.evaluate(observations: [obs], recentFailureDates: [:], now: now)
+    #expect(verdicts[0].level == .fail)
+    #expect(verdicts[0].detail.contains("Not running"))
+}
+
+@Test func running_but_unscheduled_loop_is_fail() {
+    // Registered, running, but no next tick planned — it can never fire.
+    let now = Date(timeIntervalSince1970: 1_784_200_000)
+    let obs = observation(lastRun: nil, lastError: nil, nextRun: nil)
+    let verdicts = DoctorLoopHealth.evaluate(observations: [obs], recentFailureDates: [:], now: now)
+    #expect(verdicts[0].level == .fail)
+    #expect(verdicts[0].detail.contains("Not scheduled"))
+}
+
+@Test func mildly_overdue_loop_that_has_ticked_before_is_warn_not_fail() {
+    let now = Date(timeIntervalSince1970: 1_784_200_000)
+    // 5-min loop, next tick was due 5 min ago: past the 150s slack but well
+    // inside the 30-min grace window — it may still land.
+    let obs = observation(
+        lastRun: now.addingTimeInterval(-600),
+        lastError: nil,
+        nextRun: now.addingTimeInterval(-300)
+    )
+    let verdicts = DoctorLoopHealth.evaluate(observations: [obs], recentFailureDates: [:], now: now)
+    #expect(verdicts[0].level == .warn)
+    #expect(verdicts[0].detail.contains("Overdue by"))
+}
+
+@Test func severely_overdue_loop_escalates_to_fail() {
+    let now = Date(timeIntervalSince1970: 1_784_200_000)
+    // 5-min loop whose next tick was due 4 hours ago — far beyond grace.
+    let obs = observation(
+        lastRun: now.addingTimeInterval(-4 * 3600 - 300),
+        lastError: nil,
+        nextRun: now.addingTimeInterval(-4 * 3600)
+    )
+    let verdicts = DoctorLoopHealth.evaluate(observations: [obs], recentFailureDates: [:], now: now)
+    #expect(verdicts[0].level == .fail)
+}
+
+@Test func tick_jitter_within_slack_stays_ok() {
+    // A tick 30s late must not flap the verdict.
+    let now = Date(timeIntervalSince1970: 1_784_200_000)
+    let obs = observation(
+        lastRun: now.addingTimeInterval(-330),
+        lastError: nil,
+        nextRun: now.addingTimeInterval(-30)
+    )
+    let verdicts = DoctorLoopHealth.evaluate(observations: [obs], recentFailureDates: [:], now: now)
+    #expect(verdicts[0].level == .ok)
 }
 
 @Test func long_interval_loop_gets_proportional_grace() {

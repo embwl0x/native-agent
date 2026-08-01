@@ -81,89 +81,28 @@ extension NativeClient {
         var flipHandlers: [String: ConnectorActionHandler] = [:]
         var flipSideEffecting: Set<String> = []
         var flipTrivialVerify: Set<String> = []
-        if true {
-            let reg = LocalConnectorActions.personaReadOnly
+        // The action flips (persona_read, workspace_list, time_now,
+        // persona_list_skills, read_file, file_excerpt, system_info) were once
+        // each gated behind their own rollout flag. All seven shipped ON and the
+        // flags were retired, so the registries now merge unconditionally. The
+        // merge is a union: every registry is disjoint from the others, so
+        // ordering is immaterial and nothing clobbers. `system_info` consumes no
+        // file_access sandbox state (no path input, no allowedRoots check),
+        // unlike the read_file / file_excerpt flips.
+        func mergeFlipRegistry(_ reg: LocalConnectorActions) {
             for name in reg.toolNames {
                 flipHandlers[name] = { input, ctx in reg.run(name, input: input, ctx: ctx) ?? .null }
                 if reg.isSideEffecting(name) { flipSideEffecting.insert(name) }
                 if reg.isTrivialVerify(name) { flipTrivialVerify.insert(name) }
             }
         }
-        if true {
-            let reg = LocalConnectorActions.workspaceListReadOnly
-            for name in reg.toolNames {
-                flipHandlers[name] = { input, ctx in reg.run(name, input: input, ctx: ctx) ?? .null }
-                if reg.isSideEffecting(name) { flipSideEffecting.insert(name) }
-                if reg.isTrivialVerify(name) { flipTrivialVerify.insert(name) }
-            }
-        }
-        // WAVE 38 W07 (§6.180) — THIRD action flip: `time_now`, gated on its OWN
-        // `.dispatchTimeNow` flag. Same union-by-flag merge: added ONLY when the
-        // flag is ON, disjoint from the persona_read / workspace_list registries,
-        // so no clobber and the one-flag-per-action leash holds.
-        if true {
-            let reg = LocalConnectorActions.timeNowReadOnly
-            for name in reg.toolNames {
-                flipHandlers[name] = { input, ctx in reg.run(name, input: input, ctx: ctx) ?? .null }
-                if reg.isSideEffecting(name) { flipSideEffecting.insert(name) }
-                if reg.isTrivialVerify(name) { flipTrivialVerify.insert(name) }
-            }
-        }
-        // WAVE 39 W08 (§6.201) — FOURTH action flip: `persona_list_skills`, gated
-        // on its OWN `.dispatchPersonaListSkills` flag. Same union-by-flag merge:
-        // added ONLY when the flag is ON, disjoint from the persona_read /
-        // workspace_list / time_now registries, so no clobber and the
-        // one-flag-per-action leash holds.
-        if true {
-            let reg = LocalConnectorActions.personaListSkillsReadOnly
-            for name in reg.toolNames {
-                flipHandlers[name] = { input, ctx in reg.run(name, input: input, ctx: ctx) ?? .null }
-                if reg.isSideEffecting(name) { flipSideEffecting.insert(name) }
-                if reg.isTrivialVerify(name) { flipTrivialVerify.insert(name) }
-            }
-        }
-        // WAVE 40 W14 (§6.220) — FIFTH action flip: `read_file`, gated on its OWN
-        // `.dispatchReadFile` flag. Same union-by-flag merge: added ONLY when the
-        // flag is ON, disjoint from the persona_read / workspace_list / time_now /
-        // persona_list_skills registries, so no clobber and the one-flag-per-action
-        // leash holds. The native handler reuses the EXACT FileSystemActions
-        // sandbox the already-LIVE persona_read flip shares.
-        if true {
-            let reg = LocalConnectorActions.readFileReadOnly
-            for name in reg.toolNames {
-                flipHandlers[name] = { input, ctx in reg.run(name, input: input, ctx: ctx) ?? .null }
-                if reg.isSideEffecting(name) { flipSideEffecting.insert(name) }
-                if reg.isTrivialVerify(name) { flipTrivialVerify.insert(name) }
-            }
-        }
-        // WAVE 40 W14 (§6.220) — SIXTH action flip: `file_excerpt`, gated on its OWN
-        // `.dispatchFileExcerpt` flag. Same union-by-flag merge: added ONLY when the
-        // flag is ON, disjoint from every prior scoped registry, so no clobber and
-        // the one-flag-per-action leash holds.
-        if true {
-            let reg = LocalConnectorActions.fileExcerptReadOnly
-            for name in reg.toolNames {
-                flipHandlers[name] = { input, ctx in reg.run(name, input: input, ctx: ctx) ?? .null }
-                if reg.isSideEffecting(name) { flipSideEffecting.insert(name) }
-                if reg.isTrivialVerify(name) { flipTrivialVerify.insert(name) }
-            }
-        }
-        // WAVE 41 W14 (§6.240) — SEVENTH action flip: `system_info`, gated on its
-        // OWN `.dispatchSystemInfo` flag. Same union-by-flag merge: added ONLY when
-        // the flag is ON, disjoint from every prior scoped registry, so no clobber
-        // and the one-flag-per-action leash holds. UNLIKE the read_file/file_excerpt
-        // flips this action consumes NO file_access sandbox state (no path input, no
-        // allowedRoots check), so it is unaffected by the §6.220 round-2
-        // empty-repoRoot/empty-allowedRoots `DispatchContext.defaultForSurface` gap
-        // the W02 cluster is fixing.
-        if true {
-            let reg = LocalConnectorActions.systemInfoReadOnly
-            for name in reg.toolNames {
-                flipHandlers[name] = { input, ctx in reg.run(name, input: input, ctx: ctx) ?? .null }
-                if reg.isSideEffecting(name) { flipSideEffecting.insert(name) }
-                if reg.isTrivialVerify(name) { flipTrivialVerify.insert(name) }
-            }
-        }
+        mergeFlipRegistry(LocalConnectorActions.personaReadOnly)
+        mergeFlipRegistry(LocalConnectorActions.workspaceListReadOnly)
+        mergeFlipRegistry(LocalConnectorActions.timeNowReadOnly)
+        mergeFlipRegistry(LocalConnectorActions.personaListSkillsReadOnly)
+        mergeFlipRegistry(LocalConnectorActions.readFileReadOnly)
+        mergeFlipRegistry(LocalConnectorActions.fileExcerptReadOnly)
+        mergeFlipRegistry(LocalConnectorActions.systemInfoReadOnly)
         let localActions: LocalConnectorActions? = flipHandlers.isEmpty
             ? nil
             : LocalConnectorActions(

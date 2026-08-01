@@ -56,14 +56,19 @@ private actor LoopExecutionGate {
     private var idleWaiters: [IdleWait] = []
     private var joinCount = 0
     private var joinWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Bumped on every successful acquire. `finish` only acts when its token
+    /// matches, so a wedged tick that force-released and then completed LATE
+    /// can never close a gate a newer tick already owns.
+    private var generation: UInt64 = 0
 
-    /// Returns true to the request that owns this execution. Coalesced callers
-    /// wait for that owner and receive false.
-    func acquireOrJoin() async -> Bool {
+    /// Returns the ownership token to the request that owns this execution.
+    /// Coalesced callers wait for that owner and receive nil.
+    func acquireOrJoin() async -> UInt64? {
         guard active else {
             active = true
             runCount += 1
-            return true
+            generation &+= 1
+            return generation
         }
         joinCount += 1
         let observers = joinWaiters
@@ -72,11 +77,15 @@ private actor LoopExecutionGate {
             observer.resume()
         }
         await waitForIdle()
-        return false
+        return nil
     }
 
-    func finish(at date: Date) {
-        lastRun = date
+    /// Releases the gate for exactly one acquire. `date` is nil for a forced
+    /// release (the owner was cancelled/timed out while the underlying tick was
+    /// still running) so a wedged tick never advertises a completed run.
+    func finish(at date: Date?, token: UInt64) {
+        guard active, token == generation else { return }
+        if let date { lastRun = date }
         active = false
         let waiters = idleWaiters
         idleWaiters.removeAll()
@@ -131,6 +140,38 @@ private actor LoopExecutionGate {
     }
 }
 
+/// One-shot latch resolving the race between "the underlying tick returned"
+/// and "our own Task was cancelled". Exactly one resolution wins; a LATE
+/// completion from a wedged tick is dropped as stale.
+private actor ManagedTickRace {
+    enum Result: Sendable {
+        case finished(LoopTickOutcome)
+        case cancelled
+    }
+
+    private var result: Result?
+    private var waiters: [CheckedContinuation<Result, Never>] = []
+
+    func resolve(_ value: Result) {
+        guard result == nil else { return }
+        result = value
+        let parked = waiters
+        waiters.removeAll()
+        for waiter in parked { waiter.resume(returning: value) }
+    }
+
+    func wait() async -> Result {
+        if let result { return result }
+        return await withCheckedContinuation { continuation in
+            if let result {
+                continuation.resume(returning: result)
+            } else {
+                waiters.append(continuation)
+            }
+        }
+    }
+}
+
 private struct ManagedLoopRunner: LoopRunner {
     let underlying: any LoopRunner
     let gate: LoopExecutionGate
@@ -141,14 +182,43 @@ private struct ManagedLoopRunner: LoopRunner {
     var interval: TimeInterval { underlying.interval }
     var tickTimeoutOverride: TimeInterval? { underlying.tickTimeoutOverride }
 
+    /// Single-release discipline: exactly one `finish` per `acquireOrJoin`,
+    /// carrying the acquire's token. The underlying tick runs in an
+    /// unstructured child so cancellation of THIS task (the manager's tick
+    /// timeout cancels it) releases the gate immediately even when the loop
+    /// body ignores cooperative cancellation — otherwise the gate stayed
+    /// active forever and every later tick coalesced into a skip, permanently
+    /// wedging the loop behind a one-time timeout.
     func tickOutcome() async -> LoopTickOutcome {
-        guard await gate.acquireOrJoin() else {
+        guard let token = await gate.acquireOrJoin() else {
             return .skipped(reason: LoopTickOutcome.coalescedSkipReason)
         }
-        let outcome = await underlying.tickOutcome()
-        await gate.finish(at: clock())
-        await onFinished()
-        return outcome
+        let race = ManagedTickRace()
+        let loop = underlying
+        let child = Task {
+            let outcome = await loop.tickOutcome()
+            await race.resolve(.finished(outcome))
+        }
+        let result = await withTaskCancellationHandler {
+            await race.wait()
+        } onCancel: {
+            child.cancel()
+            Task { await race.resolve(.cancelled) }
+        }
+
+        switch result {
+        case .finished(let outcome):
+            await gate.finish(at: clock(), token: token)
+            await onFinished()
+            return outcome
+        case .cancelled:
+            // Forced release: the child may still be running. It can only
+            // resolve an already-latched race and its token is stale, so it
+            // cannot double-finish or close a newer tick's gate.
+            await gate.finish(at: nil, token: token)
+            await onFinished()
+            return .failed(error: "cancelled before tick completed")
+        }
     }
 }
 

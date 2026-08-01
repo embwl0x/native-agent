@@ -105,6 +105,7 @@ public enum ChatSessionRetention {
         var kept: [[String: JSONValue]] = []
         kept.reserveCapacity(rows.count - reasons.count)
         var report = ChatSessionRetentionReport()
+        var staleEmptyAborts = 0
         for (index, row) in rows.enumerated() {
             guard let reason = reasons[index] else {
                 kept.append(row)
@@ -119,7 +120,42 @@ public enum ChatSessionRetention {
                     report.archivedEmptySessions += 1
                 }
             } else {
+                if reason == .staleEmpty { staleEmptyAborts += 1 }
                 kept.append(row)
+            }
+        }
+
+        // Wave-2 deferral closed (wave 5): stale-empty candidates were
+        // excluded from active-cap planning on the assumption they leave.
+        // An ABORTED stale-empty archive (transcript grew non-empty under
+        // the lock) re-enters the active population with no planned reason,
+        // so the count can exceed the cap until some later sweep. One
+        // bounded re-plan over the kept rows closes that window — aborted
+        // rows are non-empty now and participate as ordinary active
+        // sessions. Second pass executes activeCap only, so it terminates.
+        if staleEmptyAborts > 0 {
+            let secondReasons = plannedArchiveReasons(
+                rows: kept,
+                now: now,
+                policy: policy,
+                protectedSessionIds: protectedSessionIds
+            )
+            if secondReasons.contains(where: { $0.value == .activeCap }) {
+                var secondKept: [[String: JSONValue]] = []
+                secondKept.reserveCapacity(kept.count)
+                for (index, row) in kept.enumerated() {
+                    guard secondReasons[index] == .activeCap else {
+                        secondKept.append(row)
+                        continue
+                    }
+                    if try archive(row: row, reason: .activeCap, dataRoot: dataRoot, now: now) {
+                        report.archivedSessions += 1
+                        report.archivedForCap += 1
+                    } else {
+                        secondKept.append(row)
+                    }
+                }
+                kept = secondKept
             }
         }
 
@@ -270,6 +306,18 @@ public enum ChatSessionRetention {
         baseArchivedRow["retentionReason"] = .string(reason.rawValue)
 
         let archived = try withBoundedTranscriptLock(messagesPath) { () throws -> Bool in
+            // Re-validate the staleEmpty PREMISE under the lock (2026-08-01).
+            // The decision came from the pre-lock `sessions.json` snapshot; a
+            // writer can append the session's first message and release the
+            // transcript lock between that snapshot and here. The existence
+            // check below only chose whether to COPY — it never aborted — so a
+            // now-non-empty transcript was copied to the archive and the hot
+            // file deleted, losing a live session's first message from the hot
+            // tier. `.activeCap` archival is a size decision, not an emptiness
+            // one, so it is deliberately left unchanged.
+            if reason == .staleEmpty, transcriptIsNonEmpty(messagesPath) {
+                return false
+            }
             // Check existence only after locking: a writer may be creating the
             // first row while retention is selecting this session.
             var archivedMessagesPath: URL?
@@ -319,6 +367,19 @@ public enum ChatSessionRetention {
             return true
         }
         return archived ?? false
+    }
+
+    /// True when the transcript at `path` holds at least one non-blank JSONL
+    /// line. Must be called while holding that transcript's lock. An unreadable
+    /// file reads as EMPTY: a session with no transcript on disk is the normal
+    /// stale-empty case, and failing closed there would park every such session
+    /// hot forever.
+    private static func transcriptIsNonEmpty(_ path: URL) -> Bool {
+        guard let data = try? Data(contentsOf: path), !data.isEmpty else { return false }
+        guard let text = String(data: data, encoding: .utf8) else { return true }
+        return text.split(separator: "\n").contains {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
     }
 
     /// Synchronous, bounded counterpart to `PersistenceCoreProtocol.withFileLock`.

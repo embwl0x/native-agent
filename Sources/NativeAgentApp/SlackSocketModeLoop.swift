@@ -254,6 +254,28 @@ struct SlackSocketModeLoop: LoopRunner {
     private let deduper = SlackEventDeduper()
     private let historyPollState = SlackHistoryPollState()
     private let conversationCache = SlackConversationCache()
+    // LOOPS-2: every spawned handling task is registered here so loop stop can
+    // cancel + await it instead of leaking detached work past the tick.
+    private let inFlight = SlackInFlightHandlers()
+    // LOOPS-5: shared socket-liveness signal that gates history polling.
+    private let socketHealth = SlackSocketHealth()
+    private let outbound: SlackSocketModeOutbound
+
+    /// A socket that has said `hello` and has produced a frame or a successful
+    /// ping inside this window counts as healthy. Pings run every 25s, so 90s
+    /// is three missed heartbeats.
+    static let socketHealthGrace: TimeInterval = 90
+    /// How often the history-poll task re-evaluates its trigger while idle.
+    static let historyPollCheckInterval: TimeInterval = 10
+
+    /// LOOPS-5: conservative backstop poll that still runs while the socket
+    /// looks healthy. Pings can keep succeeding while Slack silently stops
+    /// delivering events, and that failure mode is invisible to the socket, so
+    /// polling is throttled rather than removed. Default 15 min (vs the old
+    /// every-60s poll) — a ~15x reduction in redundant API traffic.
+    var historySafetyPollInterval: TimeInterval {
+        max(config.historyPollInterval * 10, 900)
+    }
 
     init(
         config: SlackSocketModeConfig,
@@ -261,6 +283,7 @@ struct SlackSocketModeLoop: LoopRunner {
         interval: TimeInterval = 2,
         sessionRecycleInterval: TimeInterval = 3_600,
         session: URLSession = .shared,
+        outbound: SlackSocketModeOutbound = .live,
         chatHandler: @escaping SlackSocketModeChatHandler
     ) {
         self.config = config
@@ -268,6 +291,7 @@ struct SlackSocketModeLoop: LoopRunner {
         self.interval = interval
         self.sessionRecycleInterval = sessionRecycleInterval
         self.session = session
+        self.outbound = outbound
         self.chatHandler = chatHandler
     }
 
@@ -336,6 +360,33 @@ struct SlackSocketModeLoop: LoopRunner {
                 "receiveLoopErroredAt": .string(Self.nowString()),
             ])
             await recordError(context: "socket_mode", error: error)
+            // History polling lives inside receiveLoop, so a session that
+            // dies BEFORE the loop starts (openSocketURL throw: Slack API
+            // down, bad token) used to leave the fallback transport stone
+            // dead — no gap-fill until a socket finally opened. One
+            // best-effort poll here keeps messages flowing during exactly
+            // the outages the fallback exists for. Failure is already the
+            // tick's outcome; the poll's own error is recorded, not thrown.
+            if config.historyPollEnabled {
+                do {
+                    try await pollSlackHistoryOnce()
+                    await writeState([
+                        "lastHistoryPollAt": .string(Self.nowString()),
+                        "lastHistoryPollTrigger": .string("socket_open_failed"),
+                        "lastHistoryPollError": .null,
+                    ])
+                } catch is CancellationError {
+                    // Loop is being stopped mid-fallback: report the
+                    // cancellation, not a false loop failure (gpt-5.5 MED).
+                    await writeState([
+                        "connected": .bool(false),
+                        "cancelledAt": .string(Self.nowString()),
+                    ])
+                    return .skipped(reason: "Slack socket mode canceled")
+                } catch {
+                    await recordError(context: "history_poll", error: error)
+                }
+            }
             return .failed(error: Self.redact(String(describing: error)))
         }
     }
@@ -371,10 +422,33 @@ struct SlackSocketModeLoop: LoopRunner {
         let historyPollTask = Task {
             await historyPollUntilCancelled()
         }
-        defer {
-            pingTask.cancel()
-            historyPollTask.cancel()
+        // LOOPS-2: handling used to be spawned into detached `Task {}` blocks
+        // that outlived the tick — nothing cancelled them, nothing awaited
+        // them, and their outcome never reached the loop's health accounting.
+        // Every exit path (return, throw, cancellation) now drains the child
+        // tasks AND the tracked handling set before the tick reports.
+        do {
+            try await receiveLoopBody(socket: socket)
+        } catch {
+            await drainSessionWork(pingTask: pingTask, historyPollTask: historyPollTask)
+            throw error
         }
+        await drainSessionWork(pingTask: pingTask, historyPollTask: historyPollTask)
+    }
+
+    private func drainSessionWork(
+        pingTask: Task<Void, Never>,
+        historyPollTask: Task<Void, Never>
+    ) async {
+        pingTask.cancel()
+        historyPollTask.cancel()
+        await socketHealth.markDisconnected()
+        await historyPollTask.value
+        await pingTask.value
+        await inFlight.cancelAndWaitAll()
+    }
+
+    private func receiveLoopBody(socket: URLSessionWebSocketTask) async throws {
         while !Task.isCancelled {
             let message = try await socket.receive()
             let json: JSONValue
@@ -389,18 +463,22 @@ struct SlackSocketModeLoop: LoopRunner {
             }
             guard case .object(let obj) = json else { continue }
             let type = Self.string(obj["type"]) ?? ""
+            // LOOPS-5: any received frame proves the socket is alive.
+            await socketHealth.markAlive()
             await writeState([
                 "lastWebSocketMessageAt": .string(Self.nowString()),
                 "lastWebSocketMessageType": .string(type.isEmpty ? "unknown" : type),
             ])
             switch type {
             case "hello":
+                await socketHealth.markConnected()
                 await writeState([
                     "connected": .bool(true),
                     "connectedAt": .string(Self.nowString()),
                     "lastError": .null,
                 ])
             case "disconnect":
+                await socketHealth.markDisconnected()
                 await writeState([
                     "connected": .bool(false),
                     "disconnectedAt": .string(Self.nowString()),
@@ -419,11 +497,37 @@ struct SlackSocketModeLoop: LoopRunner {
                 }
                 let shouldProcess = await deduper.markIfNew(inbound.eventId)
                 guard shouldProcess else { continue }
-                Task {
-                    await handleInbound(inbound)
-                }
+                // Socket handling stays concurrent (the receive loop must keep
+                // acking envelopes), but it is tracked — see spawnInboundHandling.
+                await spawnInboundHandling(inbound)
             }
         }
+    }
+
+    /// LOOPS-2: spawn handling into the tracked set, and unmark the deduper if
+    /// delivery failed so the message is retryable instead of permanently
+    /// swallowed by a "seen" entry that never produced a reply.
+    func spawnInboundHandling(_ inbound: SlackInboundMessage) async {
+        let id = UUID()
+        let task = Task {
+            let delivered = await handleInbound(inbound)
+            if delivered {
+                await deduper.confirmDelivered(inbound.eventId)
+            } else {
+                await deduper.unmark(inbound.eventId)
+            }
+            await inFlight.finish(id)
+        }
+        await inFlight.register(task, id: id)
+    }
+
+    /// Test/lifecycle seam: cancel and await everything the loop spawned.
+    func cancelAndWaitInFlightHandling() async {
+        await inFlight.cancelAndWaitAll()
+    }
+
+    var inFlightHandlingCount: Int {
+        get async { await inFlight.count }
     }
 
     private func historyPollUntilCancelled() async {
@@ -434,19 +538,45 @@ struct SlackSocketModeLoop: LoopRunner {
             ])
             return
         }
+        await writeState([
+            "historyPollEnabled": .bool(true),
+            "historyPollInterval": .double(config.historyPollInterval),
+            "historyPollMode": .string("event_driven"),
+            "historySafetyPollInterval": .double(historySafetyPollInterval),
+        ])
+        // LOOPS-5: this task is created fresh per socket session, so
+        // `lastPollAt == nil` means "just (re)connected" and produces the
+        // gap-fill poll. After that the socket's own health decides.
+        var lastPollAt: Date?
         while !Task.isCancelled {
+            let now = Date()
+            guard let trigger = Self.historyPollTrigger(
+                now: now,
+                socketHealthy: await socketHealth.isHealthy(now: now),
+                lastPollAt: lastPollAt,
+                pollInterval: config.historyPollInterval,
+                safetyInterval: historySafetyPollInterval
+            ) else {
+                do {
+                    try await Task.sleep(
+                        nanoseconds: UInt64(Self.historyPollCheckInterval * 1_000_000_000))
+                } catch {
+                    return
+                }
+                continue
+            }
             do {
                 try await pollSlackHistoryOnce()
+                lastPollAt = Date()
                 await writeState([
-                    "historyPollEnabled": .bool(true),
-                    "historyPollInterval": .double(config.historyPollInterval),
                     "lastHistoryPollAt": .string(Self.nowString()),
+                    "lastHistoryPollTrigger": .string(trigger.rawValue),
                     "lastHistoryPollError": .null,
                 ])
-                try await Task.sleep(nanoseconds: UInt64(config.historyPollInterval * 1_000_000_000))
             } catch is CancellationError {
                 return
             } catch {
+                lastPollAt = Date()
                 await writeState([
                     "lastHistoryPollAt": .string(Self.nowString()),
                     "lastHistoryPollError": .string(Self.redact(String(describing: error))),
@@ -459,6 +589,32 @@ struct SlackSocketModeLoop: LoopRunner {
                 }
             }
         }
+    }
+
+    /// LOOPS-5: pure decision for "should history poll run right now?".
+    ///
+    /// Old behavior polled every `pollInterval` unconditionally, even while the
+    /// socket was connected and delivering the same messages. Now:
+    ///   - no poll yet this socket session -> gap-fill (covers reconnects and
+    ///     anything missed while the socket was down),
+    ///   - socket unhealthy -> keep polling at `pollInterval` (this is the
+    ///     fallback transport),
+    ///   - socket healthy -> only the infrequent `safetyInterval` backstop,
+    ///     because a socket can keep answering pings while Slack silently
+    ///     stops delivering events.
+    static func historyPollTrigger(
+        now: Date,
+        socketHealthy: Bool,
+        lastPollAt: Date?,
+        pollInterval: TimeInterval,
+        safetyInterval: TimeInterval
+    ) -> SlackHistoryPollTrigger? {
+        guard let lastPollAt else { return .gapFill }
+        let elapsed = now.timeIntervalSince(lastPollAt)
+        if !socketHealthy {
+            return elapsed >= pollInterval ? .socketUnhealthy : nil
+        }
+        return elapsed >= safetyInterval ? .safetyInterval : nil
     }
 
     private func pollSlackHistoryOnce() async throws {
@@ -559,23 +715,62 @@ struct SlackSocketModeLoop: LoopRunner {
                 Self.string($1["ts"]) ?? "0"
             )
         }
+        // LOOPS-2: history delivery is awaited inline (structured) instead of
+        // fired into a detached Task, so the poll task owns its lifecycle and
+        // cancellation reaches it. It also lets the channel cursor advance only
+        // past messages that actually got delivered: a failed delivery unmarks
+        // the deduper AND stops the watermark, so the next poll re-fetches and
+        // retries it rather than losing it forever.
+        var watermark: String?
+        var stalledOnFailure = false
         for message in ordered {
+            if Task.isCancelled { throw CancellationError() }
             guard let inbound = inboundMessage(fromHistoryMessage: message, conversation: conversation) else {
+                // Nothing to deliver (bot / subtype / empty) — safe to skip past.
+                if let ts = Self.string(message["ts"]) { watermark = Self.laterTs(watermark, ts) }
                 continue
             }
             let shouldProcess = await deduper.markIfNew(inbound.eventId)
-            guard shouldProcess else { continue }
-            await historyPollState.markSeen(channelId: conversation.id, ts: inbound.ts)
+            guard shouldProcess else {
+                // Dedupe hit. Only a CONFIRMED delivery justifies moving the
+                // watermark past this message — an in-flight socket delivery
+                // can still fail and unmark, and a watermark already past it
+                // would skip the message forever (gpt-5.5 review BLOCKING).
+                // In-flight: stop here and let the next poll re-check; by then
+                // the mark has either been confirmed or released.
+                if await deduper.isDelivered(inbound.eventId) {
+                    watermark = Self.laterTs(watermark, inbound.ts)
+                    continue
+                }
+                stalledOnFailure = true
+                break
+            }
             await writeState([
                 "lastHistoryPollMessageAt": .string(Self.nowString()),
                 "lastHistoryPollChannelId": .string(conversation.id),
                 "lastHistoryPollMessageTs": .string(inbound.ts),
             ])
-            Task {
-                await handleInbound(inbound)
+            let delivered = await handleInbound(inbound)
+            if delivered {
+                await deduper.confirmDelivered(inbound.eventId)
+                watermark = Self.laterTs(watermark, inbound.ts)
+            } else {
+                await deduper.unmark(inbound.eventId)
+                stalledOnFailure = true
+                break
             }
         }
-        await historyPollState.markSeen(channelId: conversation.id, ts: newest)
+        if !stalledOnFailure {
+            watermark = Self.laterTs(watermark, newest)
+        }
+        if let watermark {
+            await historyPollState.markSeen(channelId: conversation.id, ts: watermark)
+        }
+    }
+
+    private static func laterTs(_ lhs: String?, _ rhs: String) -> String {
+        guard let lhs else { return rhs }
+        return slackTimestampLessThan(lhs, rhs) ? rhs : lhs
     }
 
     private func inboundMessage(
@@ -613,6 +808,7 @@ struct SlackSocketModeLoop: LoopRunner {
             do {
                 try await Task.sleep(nanoseconds: 25_000_000_000)
                 try await sendPing(socket: socket)
+                await socketHealth.markAlive()
                 await writeState([
                     "lastPingAt": .string(Self.nowString()),
                     "lastPingError": .null,
@@ -620,6 +816,7 @@ struct SlackSocketModeLoop: LoopRunner {
             } catch is CancellationError {
                 return
             } catch {
+                await socketHealth.markDisconnected()
                 await writeState([
                     "connected": .bool(false),
                     "lastPingErrorAt": .string(Self.nowString()),
@@ -755,19 +952,23 @@ struct SlackSocketModeLoop: LoopRunner {
         return channelId.hasPrefix("D") || channelId.hasPrefix("C") || channelId.hasPrefix("G")
     }
 
-    private func handleInbound(_ inbound: SlackInboundMessage) async {
+    /// Returns `true` only when the reply actually reached Slack. Callers use
+    /// that to decide whether the deduper mark and the history watermark may
+    /// stand (LOOPS-2: a `false` here must leave the message retryable).
+    @discardableResult
+    func handleInbound(_ inbound: SlackInboundMessage) async -> Bool {
         await writeState([
             "lastEventAt": .string(Self.nowString()),
             "lastEventId": .string(inbound.eventId),
             "lastChannelId": .string(inbound.channelId),
         ])
         do {
-            let outbound = try await chatHandler(inbound)
-            let reply = outbound.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            let imageAttachments = Self.uploadableImageAttachments(outbound.attachments)
+            let chatReply = try await chatHandler(inbound)
+            let reply = chatReply.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let imageAttachments = Self.uploadableImageAttachments(chatReply.attachments)
             guard !reply.isEmpty || !imageAttachments.isEmpty else {
                 await recordError(context: "empty_reply", error: SlackSocketModeError.api("chat returned empty reply"), inbound: inbound)
-                return
+                return false
             }
             var postedAny = false
             if !reply.isEmpty {
@@ -779,7 +980,7 @@ struct SlackSocketModeLoop: LoopRunner {
                     input["thread_ts"] = .string(threadTs)
                 }
                 do {
-                    let posted = try await SlackConnectorActions.postMessage(input: input)
+                    let posted = try await outbound.postMessage(input)
                     if Self.envelopeOK(posted) {
                         postedAny = true
                     } else {
@@ -795,7 +996,7 @@ struct SlackSocketModeLoop: LoopRunner {
                     if reply.isEmpty {
                         input["initial_comment"] = .string(attachment.name ?? "Generated image")
                     }
-                    let uploaded = try await SlackConnectorActions.uploadFile(input: input)
+                    let uploaded = try await outbound.uploadFile(input)
                     if Self.envelopeOK(uploaded) {
                         postedAny = true
                     } else {
@@ -807,9 +1008,10 @@ struct SlackSocketModeLoop: LoopRunner {
             }
             if postedAny {
                 await recordReceipt(kind: "reply", inbound: inbound, reply: reply.isEmpty ? "[image]" : reply)
-            } else {
-                await recordError(context: "post_reply", error: SlackSocketModeError.api("no Slack reply artifact posted"), inbound: inbound)
+                return true
             }
+            await recordError(context: "post_reply", error: SlackSocketModeError.api("no Slack reply artifact posted"), inbound: inbound)
+            return false
         } catch {
             await recordError(context: "chat_handler", error: error, inbound: inbound)
             let notice = "(internal error while drafting a Slack reply)"
@@ -820,7 +1022,8 @@ struct SlackSocketModeLoop: LoopRunner {
             if let threadTs = inbound.replyThreadTs, !threadTs.isEmpty {
                 input["thread_ts"] = .string(threadTs)
             }
-            _ = try? await SlackConnectorActions.postMessage(input: input)
+            _ = try? await outbound.postMessage(input)
+            return false
         }
     }
 
@@ -1316,6 +1519,7 @@ actor SlackHistoryPollState {
 actor SlackEventDeduper {
     private var seen: [String] = []
     private var seenSet: Set<String> = []
+    private var deliveredSet: Set<String> = []
     private let cap: Int
 
     init(cap: Int = 500) {
@@ -1330,9 +1534,142 @@ actor SlackEventDeduper {
         while seen.count > cap {
             let removed = seen.removeFirst()
             seenSet.remove(removed)
+            deliveredSet.remove(removed)
         }
         return true
     }
+
+    /// A mark alone means "delivery in flight — or failed and about to be
+    /// unmarked." Only a confirmed delivery may let the history poller advance
+    /// its watermark past the message: a dedupe hit on an IN-FLIGHT mark can
+    /// still fail and unmark afterwards, and a watermark that already moved
+    /// past it would skip the message forever (gpt-5.5 review BLOCKING).
+    func confirmDelivered(_ id: String) {
+        guard !id.isEmpty, seenSet.contains(id) else { return }
+        deliveredSet.insert(id)
+    }
+
+    /// LOOPS-2: release a mark whose delivery failed. Without this the mark is
+    /// a permanent tombstone — the message counts as "seen" forever while
+    /// never having been delivered, so no retry path can ever reach it.
+    func unmark(_ id: String) {
+        guard !id.isEmpty, seenSet.contains(id) else { return }
+        seenSet.remove(id)
+        deliveredSet.remove(id)
+        if let index = seen.lastIndex(of: id) {
+            seen.remove(at: index)
+        }
+    }
+
+    func hasSeen(_ id: String) -> Bool {
+        seenSet.contains(id)
+    }
+
+    func isDelivered(_ id: String) -> Bool {
+        deliveredSet.contains(id)
+    }
+}
+
+/// LOOPS-5: which condition released the history poll. Persisted to state.json
+/// so an operator can tell a gap-fill from the safety backstop.
+enum SlackHistoryPollTrigger: String, Sendable, Equatable {
+    /// First poll of a socket session — covers the reconnect gap.
+    case gapFill = "gap_fill"
+    /// The socket is not delivering; history is the fallback transport.
+    case socketUnhealthy = "socket_unhealthy"
+    /// Infrequent backstop against a socket that pings fine but delivers nothing.
+    case safetyInterval = "safety_interval"
+}
+
+/// LOOPS-5: socket liveness shared between the receive loop, the ping task and
+/// the history poller.
+actor SlackSocketHealth {
+    private var connected = false
+    private var lastAliveAt: Date?
+
+    func markConnected(now: Date = Date()) {
+        connected = true
+        lastAliveAt = now
+    }
+
+    /// A frame arrived or a ping round-tripped — either proves the transport
+    /// works, even if `hello` has not been seen yet.
+    func markAlive(now: Date = Date()) {
+        connected = true
+        lastAliveAt = now
+    }
+
+    func markDisconnected() {
+        connected = false
+        lastAliveAt = nil
+    }
+
+    func isHealthy(now: Date = Date(), grace: TimeInterval = SlackSocketModeLoop.socketHealthGrace) -> Bool {
+        guard connected, let lastAliveAt else { return false }
+        return now.timeIntervalSince(lastAliveAt) <= grace
+    }
+}
+
+/// LOOPS-2: registry of handling tasks spawned by the loop, so loop stop can
+/// cancel and await them instead of letting detached work escape the tick.
+actor SlackInFlightHandlers {
+    private var tasks: [UUID: Task<Void, Never>] = [:]
+    private var finished: Set<UUID> = []
+
+    var count: Int { tasks.count }
+
+    func register(_ task: Task<Void, Never>, id: UUID) {
+        // The task may already have completed before we got here; don't
+        // resurrect a finished entry (that would leak a handle forever).
+        if finished.remove(id) != nil { return }
+        tasks[id] = task
+    }
+
+    func finish(_ id: UUID) {
+        if tasks.removeValue(forKey: id) == nil {
+            finished.insert(id)
+        }
+    }
+
+    /// Bounded: a handler that ignores cooperative cancellation must not
+    /// deadlock loop stop or socket recycle (gpt-5.5 review MEDIUM). After
+    /// `timeout` the remaining tasks are abandoned — they are already
+    /// cancelled, and shutdown cannot hang on a wedged provider call.
+    /// Returns how many tasks were abandoned (0 = clean drain).
+    ///
+    /// Deliberately POLLS the registry instead of `await task.value`: awaiting
+    /// the value of a non-throwing task does not respond to cancellation, so
+    /// any structure that awaits it (including a task group, which must drain
+    /// its children before returning) inherits the wedge — the first cut of
+    /// this fix deadlocked exactly that way. `finish(id)` empties the registry
+    /// as each handler completes; a handler that never finishes is what the
+    /// deadline is for.
+    @discardableResult
+    func cancelAndWaitAll(timeout: TimeInterval = 10) async -> Int {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !tasks.isEmpty, Date() < deadline {
+            // Re-cancel each round: a handler registered after entry (receive
+            // loop racing shutdown) must still get the cancellation signal.
+            for (_, task) in tasks { task.cancel() }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let abandoned = tasks.count
+        tasks.removeAll()
+        finished.removeAll()
+        return abandoned
+    }
+}
+
+/// Injection seam for the two Slack write calls the loop makes. Production uses
+/// `.live`; tests substitute a recorder so no test can post to a real workspace.
+struct SlackSocketModeOutbound: Sendable {
+    var postMessage: @Sendable (_ input: [String: JSONValue]) async throws -> JSONValue
+    var uploadFile: @Sendable (_ input: [String: JSONValue]) async throws -> JSONValue
+
+    static let live = SlackSocketModeOutbound(
+        postMessage: { try await SlackConnectorActions.postMessage(input: $0) },
+        uploadFile: { try await SlackConnectorActions.uploadFile(input: $0) }
+    )
 }
 
 enum SlackSocketModeError: Error, CustomStringConvertible {

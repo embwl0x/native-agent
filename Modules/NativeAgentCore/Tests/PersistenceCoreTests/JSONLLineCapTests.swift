@@ -174,6 +174,45 @@ struct JSONLLineCapTests {
         #expect((perms & 0o777) == 0o600)
     }
 
+    /// L7 (2026-08-01 audit): `appendJSONLCapped(takeLock: true)` used to
+    /// downcast to `SwiftNativePersistenceCore` and, when that failed, append
+    /// UNROTATED with no log and no throw — a silent fallback that disabled the
+    /// cap entirely for every other conformer. `withFileLock` is a protocol
+    /// EXTENSION, so the shim below has it too; the cap must run for it.
+    ///
+    /// NEGATIVE CONTROL: restore the downcast and this test observes 30
+    /// unrotated lines instead of 10.
+    @Test func cappedAppend_rotatesForNonSwiftNativeConformers() async throws {
+        let path = tmpFile()
+        defer { try? FileManager.default.removeItem(at: path.deletingLastPathComponent()) }
+        let persistence = PassthroughPersistenceShim()
+
+        for id in 0..<30 {
+            try await appendJSONLCapped(
+                .object(["id": .int(Int64(id))]),
+                to: path,
+                using: persistence,
+                maxLines: 10,
+                logLabel: "JSONLLineCapTests.nonSwiftNative"
+            )
+        }
+
+        let lines = try String(contentsOf: path, encoding: .utf8)
+            .split(separator: "\n")
+        #expect(
+            lines.count == 10,
+            "a non-SwiftNative conformer must be capped, not silently appended unrotated"
+        )
+        let newest = try JSONValue.parse(Data(lines[lines.count - 1].utf8))
+        guard case .object(let object) = newest else {
+            Issue.record("newest row was not an object")
+            return
+        }
+        #expect(object["id"] == .int(29), "the cap must keep the NEWEST rows")
+        // The lock sidecar the protocol extension now takes for this conformer.
+        #expect(FileManager.default.fileExists(atPath: path.path + ".lock"))
+    }
+
     /// These two historically bypassed the shared activity owner and performed
     /// a full-file line count after every append. Keep the ownership boundary
     /// explicit so a future parity edit cannot silently restore O(file) work.
@@ -197,5 +236,47 @@ struct JSONLLineCapTests {
                 "\(relativePath) must not perform an exact full-feed scan per append"
             )
         }
+    }
+}
+
+/// A PersistenceCoreProtocol conformer that is NOT `SwiftNativePersistenceCore`
+/// but writes to the same local paths — the shape of every test double and of
+/// any future alternate backend. It inherits `withFileLock` from the protocol
+/// extension exactly like the real impl does.
+private struct PassthroughPersistenceShim: PersistenceCoreProtocol {
+    func readJSON(_ path: URL, defaultValue: JSONValue) async -> JSONValue {
+        guard let data = try? Data(contentsOf: path),
+              let parsed = try? JSONValue.parse(data) else { return defaultValue }
+        return parsed
+    }
+
+    func writeJSON(_ value: JSONValue, to path: URL) async throws {
+        try FileManager.default.createDirectory(
+            at: path.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try Data(try value.serialize(pretty: false).utf8).write(to: path, options: .atomic)
+    }
+
+    func appendJSONL(_ record: JSONValue, to path: URL) async throws {
+        try FileManager.default.createDirectory(
+            at: path.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let line = Data((try record.serialize(pretty: false) + "\n").utf8)
+        if let handle = try? FileHandle(forWritingTo: path) {
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: line)
+        } else {
+            try line.write(to: path, options: .atomic)
+        }
+    }
+
+    func tailJSONL(_ path: URL, limit: Int, maxBytes: Int?) async throws -> [JSONValue] {
+        Array(try await readJSONL(path).suffix(limit))
+    }
+
+    func readJSONL(_ path: URL) async throws -> [JSONValue] {
+        guard let text = try? String(contentsOf: path, encoding: .utf8) else { return [] }
+        return try text.split(separator: "\n").map { try JSONValue.parse(Data($0.utf8)) }
     }
 }

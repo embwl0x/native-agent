@@ -68,7 +68,6 @@ struct ChatToolCatalogSnapshot: Codable, Hashable, Sendable {
     var currentlyLoaded: Set<String>
     var builderAvailable: [String]
     var builderPolicyLocked: [String]
-    var builderNotImplemented: [String]
     var macAppAvailable: [String]
     var macAppPolicyLocked: [String]
     var fullMacActive: Bool
@@ -142,7 +141,6 @@ struct ChatToolCatalogSnapshot: Codable, Hashable, Sendable {
             currentlyLoaded: Set(stringArray("currently_loaded")),
             builderAvailable: stringArray("builder_available_tools"),
             builderPolicyLocked: stringArray("builder_policy_locked_tools"),
-            builderNotImplemented: stringArray("builder_not_implemented_tools"),
             macAppAvailable: stringArray("mac_app_available_tools"),
             macAppPolicyLocked: stringArray("mac_app_policy_locked_tools"),
             fullMacActive: boolVal("full_mac_active"),

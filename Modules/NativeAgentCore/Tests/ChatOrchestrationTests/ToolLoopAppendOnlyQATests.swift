@@ -546,10 +546,85 @@ func appendOnlyQA_S5_streamingLoop_equivalent_across_lever() async throws {
         tools: freshTools(), userMessage: "stream it", grownPromptCompat: true
     )
     expectEquivalent(new, old, scenario: "S5")
-    #expect(new.reply == "streamed final")
+    // Transcript-fidelity fix (2026-07-31): the persisted reply carries EVERY
+    // visible byte of the turn, including the "checking " narration streamed
+    // before iteration 1's tool call. This assertion previously read
+    // "streamed final" — that pinned the defect where the success path built
+    // the reply from the last iteration only, so a reload dropped narration
+    // the user had already watched render. See S8 below.
+    #expect(new.reply == "checking streamed final")
     #expect(new.dispatchNames == ["read_file", "search_kg"])
     #expect(new.messagesByCall.count == 3)
     expectAppendOnly(new.messagesByCall)
+}
+
+// MARK: - S8: streamed bytes == persisted reply across tool rounds
+
+/// Collects the TEXT payload of every `.delta` event, so a test can assert the
+/// bytes the surface rendered are byte-identical to the bytes persisted.
+private actor DeltaTextCapture {
+    private var text = ""
+    func append(_ event: TurnStreamEvent) {
+        if case .delta(let chunk) = event { text += chunk }
+    }
+    func snapshot() -> String { text }
+}
+
+@Test
+func appendOnlyQA_S8_streamingInterstitialProse_persistsInOrder() async throws {
+    // prose → tool → prose → tool → prose. All three prose segments were
+    // streamed to the surface; all three must survive into the persisted
+    // reply, in order. Before the 2026-07-31 fix the success return built the
+    // reply from the LAST iteration's accumulator only, so the transcript kept
+    // segment 3 and silently dropped 1 and 2 — the user watched three
+    // paragraphs render and a reload showed one.
+    let first = "First I will read the file. "
+    let second = "Now I will search the graph. "
+    let third = "Both came back clean."
+    let events: [[LLMMessageStreamEvent]] = [
+        [
+            .textDelta(first),
+            .toolCall(LLMStreamToolCall(id: "p1", name: "read_file", inputJSON: Data(#"{"path":"x"}"#.utf8))),
+        ],
+        [
+            .textDelta(second),
+            .toolCall(LLMStreamToolCall(id: "p2", name: "search_kg", inputJSON: Data("{}".utf8))),
+        ],
+        [.textDelta(third)],
+    ]
+    let tools = MockToolDispatchClient(scripted: [
+        "read_file": .string("file-body"),
+        "search_kg": .string("kg-body"),
+    ])
+    let dir = try makeTempDir("s8")
+    let persona = SwiftNativePersonaEngine(root: dir)
+    let llm = StreamingMessagesCapturingLLM(scriptedEvents: events)
+    let engine = makeEngine(persona: persona, llm: llm, tools: tools)
+    let deltas = DeltaTextCapture()
+    let result = try await engine.executeTurnWithStreamingToolLoop(
+        userMessage: "read then search",
+        llm: llm,
+        tools: tools,
+        progress: { event in await deltas.append(event) }
+    )
+
+    #expect(result.toolDispatches.map(\.name) == ["read_file", "search_kg"])
+    #expect(llm.messagesByCall.count == 3)
+
+    // All three segments present…
+    #expect(result.reply.contains(first))
+    #expect(result.reply.contains(second))
+    #expect(result.reply.contains(third))
+    // …and in order.
+    let i1 = try #require(result.reply.range(of: first))
+    let i2 = try #require(result.reply.range(of: second))
+    let i3 = try #require(result.reply.range(of: third))
+    #expect(i1.upperBound <= i2.lowerBound)
+    #expect(i2.upperBound <= i3.lowerBound)
+    // The core contract: what the user SAW is what gets PERSISTED.
+    let streamed = await deltas.snapshot()
+    #expect(streamed == result.reply)
+    #expect(result.reply == first + second + third)
 }
 
 // MARK: - S6: legacy id-less markers (synthesized ids)

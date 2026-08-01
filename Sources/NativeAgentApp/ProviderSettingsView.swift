@@ -825,6 +825,81 @@ struct ProviderRowView: View {
 
 // MARK: - Configure Sheet
 
+// FIRSTRUN-2 (2026-08-01): Save writes a key to disk and used to report a flat
+// "Saved." Readiness everywhere downstream is inferred from file presence
+// (NativeClient+Providers.swift synthesizes `hasToken` from the file), so a
+// typo'd or revoked key read as a working provider until the first chat failed.
+//
+// Writing a key is not proof the key works. Save now moves the sheet into
+// `savedUnverified` and the copy says exactly that; only a passing Test
+// Connection promotes it to `verified`. Validation is never auto-fired on save
+// — the user presses Test Connection.
+enum ProviderCredentialVerification: Equatable {
+    /// Nothing written or tested in this sheet session.
+    case idle
+    /// Credential written to disk, never checked against the service.
+    case savedUnverified
+    /// Credential written, and this provider has no live probe to check it
+    /// with (`tested:false` from testProvider — e.g. Anthropic has no free
+    /// probe endpoint). NOT a failure: without this state a working key could
+    /// never leave "test failed" (gpt-5.5 review BLOCKING).
+    case savedNoProbe
+    /// Test Connection came back OK.
+    case verified
+    /// Test Connection ran and did not come back OK.
+    case verificationFailed
+
+    /// Save only ever means "written to disk".
+    static func afterSave() -> ProviderCredentialVerification { .savedUnverified }
+
+    /// Test Connection is the only transition that can claim the key works —
+    /// and only a probe that actually RAN can claim it failed.
+    static func afterTest(_ result: ProviderTestResult) -> ProviderCredentialVerification {
+        if result.tested {
+            return result.status == "ok" ? .verified : .verificationFailed
+        }
+        // No live probe ran. "error" means the attempt itself found something
+        // wrong before probing (no key on disk) — a real failure. Anything
+        // else means the provider is untestable, which must not read as failed.
+        return result.status == "error" ? .verificationFailed : .savedNoProbe
+    }
+
+    /// Clearing credentials drops any earlier claim.
+    static func afterClear() -> ProviderCredentialVerification { .idle }
+
+    /// Short plain-English line shown under the panels. `providerNote` is an
+    /// optional provider-specific addendum; it must never claim the key works.
+    func statusText(providerNote: String? = nil) -> String {
+        let base: String
+        switch self {
+        case .idle:
+            base = ""
+        case .savedUnverified:
+            base = "Saved to this Mac. Not checked yet — press Test Connection to confirm it works."
+        case .savedNoProbe:
+            base = "Saved to this Mac. This provider has no connection test — the key is checked on your first real request."
+        case .verified:
+            base = "Saved and tested. This provider is working."
+        case .verificationFailed:
+            base = "Saved, but the test failed. Check the key, then test again."
+        }
+        guard let note = providerNote, !note.isEmpty else { return base }
+        return base.isEmpty ? note : "\(base) \(note)"
+    }
+
+    /// Header badge override, or `nil` to keep the provider's own auth status.
+    /// A file-presence "ready" badge must not sit above an untested key.
+    var badge: (text: String, status: String)? {
+        switch self {
+        case .idle: return nil
+        case .savedUnverified: return ("saved · not tested", "warn")
+        case .savedNoProbe: return ("saved · no test available", "ok")
+        case .verified: return ("tested · working", "ok")
+        case .verificationFailed: return ("test failed", "error")
+        }
+    }
+}
+
 struct ProviderConfigSheet: View {
     let provider: ProviderInfo
     let onDone: () -> Void
@@ -839,6 +914,10 @@ struct ProviderConfigSheet: View {
     @State private var isSaving = false
     @State private var statusText = ""
     @State private var showRemoveCredentialsConfirm = false
+    /// FIRSTRUN-2: tracks whether the credential in this sheet has actually
+    /// been proven against the service, independent of the file-presence
+    /// readiness the provider row reports.
+    @State private var verification: ProviderCredentialVerification = .idle
 
     init(provider: ProviderInfo, onDone: @escaping () -> Void) {
         self.provider = provider
@@ -860,10 +939,16 @@ struct ProviderConfigSheet: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(provider.display_name)
                         .font(.title2).bold()
-                    StatusBadge(
-                        text: provider.auth_status.state,
-                        status: provider.auth_status.state == "ready" ? "ok" : "warn"
-                    )
+                    // FIRSTRUN-2: an unverified save must not inherit the
+                    // file-presence "ready" badge.
+                    if let badge = verification.badge {
+                        StatusBadge(text: badge.text, status: badge.status)
+                    } else {
+                        StatusBadge(
+                            text: provider.auth_status.state,
+                            status: provider.auth_status.state == "ready" ? "ok" : "warn"
+                        )
+                    }
                 }
                 Spacer()
                 Button("Done") { onDone() }
@@ -1038,16 +1123,20 @@ struct ProviderConfigSheet: View {
                 }
             }
             await appModel.loadProvidersForChat()
-            statusText = {
+            // FIRSTRUN-2: the key is on disk, nothing more. Any earlier
+            // "verified" claim is stale now that the credential changed.
+            verification = .afterSave()
+            testResult = nil
+            statusText = verification.statusText(providerNote: {
                 switch provider.provider_id {
                 case "moonshot":
-                    return "Saved. Moonshot model choices are ready; use Test Connection to verify the key."
+                    return "Moonshot model choices are ready."
                 case "kimi-code":
-                    return "Saved. Kimi Code model choices are ready; the server accepts the tiers your subscription allows."
+                    return "Kimi Code model choices are ready; the server accepts the tiers your subscription allows."
                 default:
-                    return "Saved."
+                    return nil
                 }
-            }()
+            }())
         } catch {
             statusText = "Save failed: \(error.localizedDescription)"
         }
@@ -1058,8 +1147,14 @@ struct ProviderConfigSheet: View {
         isTesting = true
         testResult = nil
         do {
-            testResult = try await appModel.testProvider(provider.provider_id)
+            let result = try await appModel.testProvider(provider.provider_id)
+            testResult = result
+            // FIRSTRUN-2: Test Connection is the only thing that can clear the
+            // saved-but-unverified state.
+            verification = .afterTest(result)
+            statusText = verification.statusText()
         } catch {
+            verification = .verificationFailed
             statusText = "Test error: \(error.localizedDescription)"
         }
         isTesting = false
@@ -1069,6 +1164,8 @@ struct ProviderConfigSheet: View {
         do {
             _ = try await appModel.clearProvider(provider.provider_id)
             apiKey = ""
+            verification = .afterClear()
+            testResult = nil
             statusText = "Credentials removed."
             // S.5: propagate cleared credentials to the provider list so the
             // parent ProviderSettingsView and the chat brain bar reflect the

@@ -241,14 +241,13 @@ struct ChatCompactionDistiller: Sendable {
                 if case .string(let s)? = obj["role"] { return s }
                 return "message"
             }()
-            let content: String = {
-                if case .string(let s)? = obj["content"] { return s }
-                if let c = obj["content"] { return (try? c.serialize(pretty: false)) ?? "" }
-                return ""
-            }()
-            let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { continue }
-            lines.append("\(role): \(trimmed)")
+            // Tool rows carry empty content and a metadata payload; without the
+            // fallback the distilled recollection loses every trace of what ran.
+            guard let body = ChatCompactionRowRendering.summaryBody(
+                obj,
+                collapseNewlines: false
+            ) else { continue }
+            lines.append("\(role): \(body)")
         }
         var rendered: [String] = []
         var dropped = 0

@@ -645,6 +645,21 @@ public actor SwiftNativeLoopScheduler {
     private let persistence = SwiftNativePersistenceCore()
     private var running: Bool = false
 
+    // LOOPS-4: the tick task used to sleep a FULL interval before its first
+    // tick and the scheduler kept run history only in memory. A weekly loop
+    // therefore never ran on a machine restarted more often than weekly — each
+    // launch restarted the 7-day sleep from zero. Per-loop last-run is now
+    // durable, and the FIRST sleep after launch is the REMAINDER of the period
+    // (or a short startup stagger when the period already elapsed).
+    private let loopStatePath: URL?
+    private let startupStagger: TimeInterval
+    private var persistedLastRun: [String: Date] = [:]
+    private var persistedStateLoaded = false
+    private var persistedStateLoad: Task<[String: Date], Never>?
+    /// Slot counter used to fan overdue startup ticks out instead of firing
+    /// every starved loop in the same instant. Reset on each `start()`.
+    private var overdueStartupSlots = 0
+
     // A4.2: loop failures are receipt-strong but push-silent (the github_tracking
     // 633-receipts-unseen incident). Fire ONE push when a loop ENTERS a failure
     // streak — never per-failure (the streak check below suppresses the
@@ -669,14 +684,45 @@ public actor SwiftNativeLoopScheduler {
     // already spans 5 minutes.
     private let failurePushMinStreakDuration: TimeInterval = 120
 
+    /// `loopStatePath` holds the durable per-loop last-run map. When nil it is
+    /// derived as a sibling of `failureReceiptsPath` — durable run state lives
+    /// beside the durable failure receipts, so the process-wide scheduler
+    /// (which already injects a receipts path) gets persistence automatically
+    /// while a bare in-test scheduler stays entirely in memory.
     public init(
         clock: @escaping @Sendable () -> Date = { Date() },
         tickTimeout: TimeInterval = 300,
-        failureReceiptsPath: URL? = nil
+        failureReceiptsPath: URL? = nil,
+        loopStatePath: URL? = nil,
+        startupStagger: TimeInterval = 5
     ) {
         self.clock = clock
         self.tickTimeout = tickTimeout
         self.failureReceiptsPath = failureReceiptsPath
+        self.loopStatePath = loopStatePath ?? failureReceiptsPath?
+            .deletingLastPathComponent()
+            .appendingPathComponent("background_loop_state.json")
+        self.startupStagger = max(0, startupStagger)
+    }
+
+    /// First-sleep rule after (re)start. Pure so it can be pinned directly.
+    ///
+    /// - no persisted last-run → sleep the full period (the loop's clock
+    ///   starts now; the seed written at spawn makes the NEXT launch honor it)
+    /// - period already elapsed → tick after `stagger` (bounded by the period)
+    /// - otherwise → sleep only the remainder, clamped to the period so a
+    ///   backwards clock jump cannot stretch the wait past one interval
+    public static func firstTickDelay(
+        interval: TimeInterval,
+        lastRun: Date?,
+        now: Date,
+        stagger: TimeInterval
+    ) -> TimeInterval {
+        let period = max(0, interval)
+        guard let lastRun else { return period }
+        let remaining = period - now.timeIntervalSince(lastRun)
+        guard remaining > 0 else { return min(max(0, stagger), period) }
+        return min(remaining, period)
     }
 
     /// Inject the app-side failure-transition push. Called once at startup after
@@ -690,6 +736,17 @@ public actor SwiftNativeLoopScheduler {
 
     public func register(_ loop: any LoopRunner) async {
         let id = loop.loopId
+        // Load durable last-run BEFORE any spawn so the first sleep can be the
+        // remainder of the period rather than a fresh full interval.
+        await loadPersistedStateIfNeeded()
+        // First time we have ever seen this loop: start its durable clock now.
+        // Written synchronously (not fire-and-forget) so a process that exits
+        // shortly after launch still leaves the stamp behind — otherwise a
+        // weekly loop's clock resets on every restart, which is the starvation
+        // bug itself.
+        if persistedLastRun[id] == nil {
+            await recordDurableRun(loopId: id, at: clock())
+        }
         // If this loopId is already registered, cancel the old task before
         // installing the new registration. The old task's generation token
         // is stale; without cancelling it, spawnTaskIfNeeded() would refuse
@@ -724,7 +781,9 @@ public actor SwiftNativeLoopScheduler {
     }
 
     public func start() async {
+        await loadPersistedStateIfNeeded()
         running = true
+        overdueStartupSlots = 0
         for (_, reg) in loops {
             spawnTaskIfNeeded(for: reg)
         }
@@ -754,12 +813,31 @@ public actor SwiftNativeLoopScheduler {
         let interval = reg.loop.interval
         let capturedLoop = reg.loop
         let capturedRegId = reg.registrationId
+        let now = clock()
+
+        // A loop whose persisted period already elapsed gets a stagger slot so
+        // N starved loops do not all fire in the same instant on launch.
+        let persisted = persistedLastRun[id]
+        let elapsed = persisted.map { now.timeIntervalSince($0) >= max(0, interval) } ?? false
+        let stagger: TimeInterval
+        if elapsed {
+            overdueStartupSlots += 1
+            stagger = startupStagger * Double(overdueStartupSlots)
+        } else {
+            stagger = startupStagger
+        }
+        let firstDelay = Self.firstTickDelay(
+            interval: interval,
+            lastRun: persisted,
+            now: now,
+            stagger: stagger
+        )
         let task = Task<Void, Never> { [weak self] in
             guard let self else { return }
+            var delay = firstDelay
             while !Task.isCancelled {
-                let nanos = UInt64(max(0, interval) * 1_000_000_000)
                 do {
-                    try await Task.sleep(nanoseconds: nanos)
+                    try await Task.sleep(nanoseconds: timeoutNanoseconds(delay))
                 } catch {
                     return
                 }
@@ -769,14 +847,87 @@ public actor SwiftNativeLoopScheduler {
                 // returns — a tick that suspended a long time may have been
                 // raced by stop(); exit the loop before sleeping again.
                 if Task.isCancelled { return }
+                delay = interval
             }
         }
         tasks[id] = task
         // Seed nextTickAt so consumers see a forward-looking time even
-        // before the first tick lands.
+        // before the first tick lands. It must reflect the ACTUAL first
+        // delay, or Doctor's overdue check would disagree with the scheduler.
         var st = states[id] ?? LoopState(loopId: id)
-        st.nextTickAt = clock().addingTimeInterval(interval)
+        st.nextTickAt = now.addingTimeInterval(firstDelay)
         states[id] = st
+    }
+
+    // MARK: durable per-loop run state (LOOPS-4)
+
+    /// Reads the durable map at most once. `register` and `start` both suspend
+    /// here, so the in-flight read is memoized as a Task and later callers AWAIT
+    /// it — a plain `loaded = true` flag would let a second concurrent
+    /// `register` spawn against a still-empty map and sleep a full interval.
+    private func loadPersistedStateIfNeeded() async {
+        if persistedStateLoaded { return }
+        let load: Task<[String: Date], Never>
+        if let inFlight = persistedStateLoad {
+            load = inFlight
+        } else {
+            let path = loopStatePath
+            load = Task { await Self.readLoopState(path) }
+            persistedStateLoad = load
+        }
+        let loaded = await load.value
+        guard !persistedStateLoaded else { return }
+        persistedStateLoaded = true
+        persistedStateLoad = nil
+        // Never clobber a stamp recorded while the read was in flight — that
+        // one is newer than anything on disk.
+        for (id, date) in loaded where persistedLastRun[id] == nil {
+            persistedLastRun[id] = date
+        }
+    }
+
+    /// A missing/corrupt file simply yields no persisted history, which
+    /// degrades to the pre-LOOPS-4 behavior rather than blocking startup.
+    private static func readLoopState(_ path: URL?) async -> [String: Date] {
+        guard let path else { return [:] }
+        let value = await SwiftNativePersistenceCore().readJSON(path, defaultValue: .object([:]))
+        guard case .object(let root) = value,
+              case .object(let loops)? = root["loops"]
+        else { return [:] }
+        let iso = ISO8601DateFormatter()
+        var result: [String: Date] = [:]
+        for (id, raw) in loops {
+            guard case .string(let stamp) = raw, let date = iso.date(from: stamp) else { continue }
+            result[id] = date
+        }
+        return result
+    }
+
+    /// Serializes the whole (small — one entry per loop id ever registered)
+    /// map. Entries deliberately OUTLIVE `unregister`: a hot-reload via
+    /// `restartLoop` must not reset a weekly loop's due clock back to zero.
+    private func flushLoopState() async {
+        guard let loopStatePath else { return }
+        let iso = ISO8601DateFormatter()
+        var loops: [String: JSONValue] = [:]
+        for (id, date) in persistedLastRun {
+            loops[id] = .string(iso.string(from: date))
+        }
+        do {
+            try await persistence.writeJSON(
+                .object(["version": .string("1"), "loops": .object(loops)]),
+                to: loopStatePath
+            )
+        } catch {
+            FileHandle.standardError.write(Data(
+                "BackgroundLoops: failed to persist loop run state: \(error)\n".utf8
+            ))
+        }
+    }
+
+    private func recordDurableRun(loopId: String, at date: Date) async {
+        persistedLastRun[loopId] = date
+        await flushLoopState()
     }
 
     private func runOneTick(loop: any LoopRunner, registrationId: UUID) async {
@@ -801,6 +952,7 @@ public actor SwiftNativeLoopScheduler {
             st.lastResult = "failed"
             st.tickCount += 1
             states[id] = st
+            await recordDurableRun(loopId: id, at: now)
             let err = st.lastError ?? "timeout"
             await appendFailureReceipt(loopId: id, error: err)
             await maybePushFailureStreak(loopId: id, error: err, now: now)
@@ -816,6 +968,7 @@ public actor SwiftNativeLoopScheduler {
             st.lastResult = "failed"
             st.tickCount += 1
             states[id] = st
+            await recordDurableRun(loopId: id, at: now)
             let err = st.lastError ?? "unknown error"
             await appendFailureReceipt(loopId: id, error: err)
             await maybePushFailureStreak(loopId: id, error: err, now: now)
@@ -842,6 +995,12 @@ public actor SwiftNativeLoopScheduler {
             st.lastError = error
         }
         states[id] = st
+        // A coalesced skip did not actually execute the loop body, so it must
+        // not advance the durable due clock — otherwise overlapping wake
+        // traffic could keep pushing a starved loop's next due time forward.
+        if outcome != .skipped(reason: LoopTickOutcome.coalescedSkipReason) {
+            await recordDurableRun(loopId: id, at: now)
+        }
         switch outcome {
         case .failed(let error):
             await appendFailureReceipt(loopId: id, error: error)
@@ -996,17 +1155,38 @@ public actor SwiftNativeLoopScheduler {
         st.tickCount += 1
         st.lastResult = "failed"
         states[loopId] = st
+        await recordDurableRun(loopId: loopId, at: now)
         await appendFailureReceipt(loopId: loopId, error: error)
         await maybePushFailureStreak(loopId: loopId, error: error, now: now)
     }
 
     public func recordResult(loopId: String, result: String) async {
         var st = states[loopId] ?? LoopState(loopId: loopId)
+        let now = clock()
         st.lastResult = result
         st.lastError = nil
+        // A manual/event-driven run is a real tick for LIVE health too, not
+        // just the durable clock: without these stamps Doctor keeps reading
+        // the old overdue nextTickAt until the periodic task happens to fire
+        // (gpt-5.5 review MEDIUM). If the periodic task is scheduled sooner
+        // than now+interval it will fire and re-stamp — a forward claim here
+        // can only make Doctor less alarmist, never hide a missed tick.
+        st.lastTickAt = now
+        if let reg = loops[loopId] {
+            st.nextTickAt = now.addingTimeInterval(reg.loop.interval)
+        }
         states[loopId] = st
+        // An out-of-band execution (manager.runTickOnce) is still a real run:
+        // it must advance the durable due clock or a manual/event-driven tick
+        // would leave the loop looking permanently overdue across restarts.
+        await recordDurableRun(loopId: loopId, at: now)
         consecutiveFailures[loopId] = 0
         failureStreakStartedAt[loopId] = nil
+    }
+
+    /// Test seam: the durable last-run stamp the scheduler would restart from.
+    internal func _testPersistedLastRun(loopId: String) -> Date? {
+        persistedLastRun[loopId]
     }
 }
 

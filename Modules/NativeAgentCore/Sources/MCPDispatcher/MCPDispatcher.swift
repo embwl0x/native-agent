@@ -781,10 +781,12 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
             try await persistence.writeJSON(.array(out), to: ledgerPath)
             return record
         }
-        if let p = persistence as? SwiftNativePersistenceCore {
-            return try await p.withFileLock(ledgerPath, work)
-        }
-        return try await work()
+        // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+        // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+        // every conformer already has it. The old downcast to
+        // SwiftNativePersistenceCore only had the effect of running this critical
+        // section UNLOCKED for any other conformer.
+        return try await persistence.withFileLock(ledgerPath, work)
     }
 
     public func revokeConsent(serverId: String, toolName: String) async throws {
@@ -843,11 +845,12 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
             try await persistence.appendJSONL(event, to: tracesURL)
         }
         do {
-            if let p = persistence as? SwiftNativePersistenceCore {
-                try await p.withFileLock(tracesURL, work)
-            } else {
-                try await work()
-            }
+            // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+            // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+            // every conformer already has it. The old downcast to
+            // SwiftNativePersistenceCore only had the effect of running this critical
+            // section UNLOCKED for any other conformer.
+            try await persistence.withFileLock(tracesURL, work)
         } catch {
             // Swallow — trace emission is best-effort, parity-only.
         }
@@ -887,11 +890,12 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
             }
             try await persistence.writeJSON(.array(mutated), to: ledgerPath)
         }
-        if let p = persistence as? SwiftNativePersistenceCore {
-            try await p.withFileLock(ledgerPath, work)
-            return
-        }
-        try await work()
+        // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+        // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+        // every conformer already has it. The old downcast to
+        // SwiftNativePersistenceCore only had the effect of running this critical
+        // section UNLOCKED for any other conformer.
+        try await persistence.withFileLock(ledgerPath, work)
     }
 
     /// Checked authority-store read. General persistence reads intentionally

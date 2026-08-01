@@ -212,14 +212,17 @@ func recordPanelRefresh_cleanRefresh_isNotStaleAndHasNoNotice() {
 
 @MainActor
 @Test
-func recordPanelRefresh_failedEndpoints_produceANoticeNamingThem() {
+func recordPanelRefresh_failedEndpoints_produceAPlainNotice() {
     let model = AppModel()
     model.recordPanelRefresh(.chat, failedEndpoints: ["trust policy", "model catalog"])
 
     #expect(model.isPanelStale(.chat) == true)
     let notice = try? #require(model.panelStaleNotice(for: .chat))
-    #expect(notice?.contains("trust policy") == true)
-    #expect(notice?.contains("model catalog") == true)
+    // Public-user honesty (wave 4): endpoint names are internal vocabulary
+    // and must NOT appear in the user-facing sentence. Inverted from the
+    // pre-wave test that required them.
+    #expect(notice?.contains("trust policy") == false)
+    #expect(notice?.contains("model catalog") == false)
     // Never had a clean refresh this run — say so rather than invent an age.
     #expect(notice?.contains("Nothing has loaded yet") == true)
 }
@@ -239,7 +242,8 @@ func recordPanelRefresh_failureAfterSuccess_keepsTheLastSuccessTimestamp() {
     #expect(model.isPanelStale(.legacyWorkshop) == true)
     let notice = try? #require(model.panelStaleNotice(for: .legacyWorkshop))
     #expect(notice?.contains("Showing data from") == true)
-    #expect(notice?.contains("missions") == true)
+    // Wave-4 honesty: internal endpoint ids stay out of the sentence.
+    #expect(notice?.contains("missions") == false)
 }
 
 @MainActor

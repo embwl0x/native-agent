@@ -73,11 +73,6 @@ extension SwiftToolDispatcher {
         let lockedBuilderTools = swiftBuilderTools.filter { !names.contains($0) }
         let availableAppTools = Self.fullMacAppToolNames.sorted().filter { names.contains($0) }
         let lockedAppTools = Self.fullMacAppToolNames.sorted().filter { !names.contains($0) }
-        // 2026-06-08 agent-builder-tools: shell/bash/git/apply_patch/run_tests
-        // plus fixed-argv swift_build/swift_test are implemented in
-        // ChatOrchestrationClient. Catalog should no longer label them
-        // not-implemented.
-        let unsupportedBuilderTools: [String] = []
         let groupIndex = ToolPreloadHeuristics.groupIndex(
             availableToolNames: Set(names)
         )
@@ -111,7 +106,6 @@ extension SwiftToolDispatcher {
             "available_tools": .array(names.map { .string($0) }),
             "builder_available_tools": .array(availableBuilderTools.map { .string($0) }),
             "builder_policy_locked_tools": .array(lockedBuilderTools.map { .string($0) }),
-            "builder_not_implemented_tools": .array(unsupportedBuilderTools.map { .string($0) }),
             "tools": .array(rows),
         ])
     }

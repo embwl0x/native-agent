@@ -115,11 +115,12 @@ extension SwiftNativeResearchClient {
             obj["searxng_base_url"] = .string(base)
             try await persistence.writeJSON(.object(obj), to: configPath)
         }
-        if let p = persistence as? SwiftNativePersistenceCore {
-            try await p.withFileLock(configPath, work)
-        } else {
-            try await work()
-        }
+        // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+        // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+        // every conformer already has it. The old downcast to
+        // SwiftNativePersistenceCore only had the effect of running this critical
+        // section UNLOCKED for any other conformer.
+        try await persistence.withFileLock(configPath, work)
     }
 
 }

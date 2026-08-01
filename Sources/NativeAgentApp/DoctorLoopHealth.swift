@@ -71,19 +71,26 @@ enum DoctorLoopHealth {
     /// floor holds up to 6 ticks, so 3 = half the window solidly failing.
     static let persistentFailureThreshold = 3
 
-    /// Grace window = max(3 × estimated interval, 30 min). The scheduler sets
-    /// nextTickAt = lastTickAt + interval on every recorded tick, so the
-    /// spread is a faithful interval estimate; loops that have not ticked yet
-    /// fall back to the 5-minute manager default.
-    static func graceWindow(for observation: LoopHealthObservation) -> TimeInterval {
-        let fallback: TimeInterval = 300
-        let estimated: TimeInterval
+    /// The scheduler sets nextTickAt = lastTickAt + interval on every recorded
+    /// tick, so the spread is a faithful interval estimate; loops that have not
+    /// ticked yet fall back to the 5-minute manager default.
+    static func estimatedInterval(for observation: LoopHealthObservation) -> TimeInterval {
         if let last = observation.lastRun, let next = observation.nextRun, next > last {
-            estimated = next.timeIntervalSince(last)
-        } else {
-            estimated = fallback
+            return next.timeIntervalSince(last)
         }
-        return max(3 * estimated, 30 * 60)
+        return 300
+    }
+
+    /// Grace window = max(3 × estimated interval, 30 min).
+    static func graceWindow(for observation: LoopHealthObservation) -> TimeInterval {
+        max(3 * estimatedInterval(for: observation), 30 * 60)
+    }
+
+    /// How far past `nextRun` a loop may drift before Doctor calls it overdue.
+    /// Half an estimated interval, floored at 60s, so ordinary tick jitter and
+    /// a tick body that legitimately runs long never flap the verdict.
+    static func overdueTolerance(for observation: LoopHealthObservation) -> TimeInterval {
+        max(estimatedInterval(for: observation) / 2, 60)
     }
 
     /// Pure health rule. `recentFailureDates` maps loopId → receipt timestamps
@@ -96,11 +103,12 @@ enum DoctorLoopHealth {
     ) -> [LoopHealthVerdict] {
         observations.map { observation in
             guard let lastError = observation.lastError else {
-                return LoopHealthVerdict(
-                    loopId: observation.loopId,
-                    level: .ok,
-                    detail: observation.lastRun == nil ? "No ticks yet." : "Healthy."
-                )
+                // LOOPS-3: "no error recorded" is NOT the same as "healthy".
+                // A loop whose scheduler task is not active, or that is
+                // scheduled for a time long past, has produced no error
+                // precisely because it never ran. Those are the states this
+                // rule used to report green.
+                return scheduleVerdict(for: observation, now: now)
             }
             let window = graceWindow(for: observation)
             let cutoff = now.addingTimeInterval(-window)
@@ -125,6 +133,52 @@ enum DoctorLoopHealth {
             if lhs.level != rhs.level { return rank(lhs.level) < rank(rhs.level) }
             return lhs.loopId < rhs.loopId
         }
+    }
+
+    /// Verdict for a loop with no recorded error: judge whether it is actually
+    /// SCHEDULED and RUNNING rather than assuming silence means health.
+    ///
+    /// - not running          → fail (a registered loop with no active
+    ///                          scheduler task cannot tick; nothing self-clears)
+    /// - running, no nextRun  → fail (registered but never scheduled)
+    /// - never ticked, overdue→ fail (the starvation signature: the first tick
+    ///                          never fired)
+    /// - overdue past grace   → fail
+    /// - overdue past slack   → warn (may still land)
+    /// - otherwise            → ok
+    static func scheduleVerdict(
+        for observation: LoopHealthObservation,
+        now: Date
+    ) -> LoopHealthVerdict {
+        func verdict(_ level: LoopHealthLevel, _ detail: String) -> LoopHealthVerdict {
+            LoopHealthVerdict(loopId: observation.loopId, level: level, detail: detail)
+        }
+        let lastTickPhrase = observation.lastRun
+            .map { "Last tick \(describeAge(now.timeIntervalSince($0))) ago." }
+            ?? "It has never ticked."
+
+        guard observation.running else {
+            return verdict(.fail, "Not running: registered, but no scheduler task is active. \(lastTickPhrase)")
+        }
+        guard let nextRun = observation.nextRun else {
+            return verdict(.fail, "Not scheduled: running, but no next tick is planned. \(lastTickPhrase)")
+        }
+
+        let overdueBy = now.timeIntervalSince(nextRun)
+        guard overdueBy > overdueTolerance(for: observation) else {
+            if observation.lastRun == nil {
+                return verdict(.ok, "No ticks yet; first tick due in \(describeAge(-overdueBy)).")
+            }
+            return verdict(.ok, "Healthy.")
+        }
+        if observation.lastRun == nil {
+            return verdict(.fail, "Never ticked and overdue by \(describeAge(overdueBy)): the first tick has not fired.")
+        }
+        let grace = graceWindow(for: observation)
+        if overdueBy > grace {
+            return verdict(.fail, "Overdue by \(describeAge(overdueBy)) (beyond \(describeAge(grace)) grace). \(lastTickPhrase)")
+        }
+        return verdict(.warn, "Overdue by \(describeAge(overdueBy)). \(lastTickPhrase)")
     }
 
     private static func rank(_ level: LoopHealthLevel) -> Int {

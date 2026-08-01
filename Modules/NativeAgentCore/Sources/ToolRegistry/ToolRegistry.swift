@@ -356,12 +356,13 @@ public actor SwiftNativeToolRegistry: ToolRegistryProtocol {
             // wrap, the Swift promote would be the one-sided mutator.
             // Order: process-local serialize (runSerialized) FIRST, then
             // cross-process flock INSIDE — mirrors the Wave 6 JSONLEmbeddingStore
-            // pattern. Non-Swift persistence implementations fall through
-            // unlocked.
-            if let p = persistence as? SwiftNativePersistenceCore {
-                return try await p.withFileLock(registryPath, work)
-            }
-            return try await work()
+            // pattern. EVERY conformer takes the flock — see below.
+            // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+            // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+            // every conformer already has it. The old downcast to
+            // SwiftNativePersistenceCore only had the effect of running this critical
+            // section UNLOCKED for any other conformer.
+            return try await persistence.withFileLock(registryPath, work)
         }
     }
 
@@ -543,11 +544,13 @@ public actor SwiftNativeToolRegistry: ToolRegistryProtocol {
         }
 
         // Cross-process flock around the R-M-W of registry.json + the file
-        // move. Non-Swift persistence implementations fall through unlocked.
-        if let p = persistence as? SwiftNativePersistenceCore {
-            return try await p.withFileLock(registryPath, work)
-        }
-        return try await work()
+        // move. EVERY conformer takes the flock — see below.
+        // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+        // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+        // every conformer already has it. The old downcast to
+        // SwiftNativePersistenceCore only had the effect of running this critical
+        // section UNLOCKED for any other conformer.
+        return try await persistence.withFileLock(registryPath, work)
     }
 
     /// Mirror of daemon.native_agentd.NativeAgentRuntime.tool_dir_for_record

@@ -251,8 +251,12 @@ private func fluidEngine(
 
     // The serve bump is fire-and-forget off the turn path — poll under a
     // deadline instead of sleeping blind (hangproof convention).
+    // The deadline is generous (10s) because under full-suite parallelism the
+    // detached bump Task can starve for seconds behind other suites' work; the
+    // claim under test is that the bump EVENTUALLY lands, not that it lands
+    // fast. Still bounded, so a bump that never fires fails instead of hanging.
     var hits: [[String]] = []
-    let deadline = Date().addingTimeInterval(2)
+    let deadline = Date().addingTimeInterval(10)
     while Date() < deadline {
         hits = await memory.servedHits
         if !hits.isEmpty { break }

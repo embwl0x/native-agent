@@ -233,11 +233,12 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
                     throw TriggerSchedulerError.persistenceFailure(String(describing: error))
                 }
             }
-            if let p = persistence as? SwiftNativePersistenceCore {
-                try await p.withFileLock(jobsPath, work)
-            } else {
-                try await work()
-            }
+            // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+            // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+            // every conformer already has it. The old downcast to
+            // SwiftNativePersistenceCore only had the effect of running this critical
+            // section UNLOCKED for any other conformer.
+            try await persistence.withFileLock(jobsPath, work)
 
             // record_activity("scheduler", "Scheduled job created", ...) →
             // activity/events.jsonl. Swift-owned append (mirror Connectors W20):
@@ -272,11 +273,12 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
                     takeLock: false
                 )
             }
-            if let p = persistence as? SwiftNativePersistenceCore {
-                try await p.withFileLock(activityPath, activityWork)
-            } else {
-                try await activityWork()
-            }
+            // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+            // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+            // every conformer already has it. The old downcast to
+            // SwiftNativePersistenceCore only had the effect of running this critical
+            // section UNLOCKED for any other conformer.
+            try await persistence.withFileLock(activityPath, activityWork)
             return 0
         }
 
@@ -355,11 +357,12 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
                 }
                 return target
             }
-            if let p = persistence as? SwiftNativePersistenceCore {
-                return try await p.withFileLock(jobsPath, work)
-            } else {
-                return try await work()
-            }
+            // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+            // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+            // every conformer already has it. The old downcast to
+            // SwiftNativePersistenceCore only had the effect of running this critical
+            // section UNLOCKED for any other conformer.
+            return try await persistence.withFileLock(jobsPath, work)
         }
 
         // record_activity("scheduler", "Scheduled job cancelled",
@@ -393,11 +396,12 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
                     takeLock: false
                 )
             }
-            if let p = persistence as? SwiftNativePersistenceCore {
-                try await p.withFileLock(activityPath, activityWork)
-            } else {
-                try await activityWork()
-            }
+            // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+            // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+            // every conformer already has it. The old downcast to
+            // SwiftNativePersistenceCore only had the effect of running this critical
+            // section UNLOCKED for any other conformer.
+            try await persistence.withFileLock(activityPath, activityWork)
             return 0
         }
 
@@ -437,11 +441,12 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
                 guard case .array(let jobs) = raw else { return [] }
                 return jobs.map { SchedulerJobNormalizer.decorateNextRunAt($0) }
             }
-            if let p = persistence as? SwiftNativePersistenceCore {
-                return try await p.withFileLock(jobsPath, work)
-            } else {
-                return try await work()
-            }
+            // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+            // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+            // every conformer already has it. The old downcast to
+            // SwiftNativePersistenceCore only had the effect of running this critical
+            // section UNLOCKED for any other conformer.
+            return try await persistence.withFileLock(jobsPath, work)
         }
     }
 

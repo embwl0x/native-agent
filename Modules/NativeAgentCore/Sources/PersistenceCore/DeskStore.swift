@@ -59,6 +59,12 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
     /// the tail alone would silently blank every compacted item, so reads FAIL
     /// LOUD instead (fail-loud over fail-over).
     case compactionBaseCorrupt(path: String)
+    /// The compaction base exists but its BYTES could not be read (transient IO:
+    /// EMFILE burst, a not-yet-materialized iCloud dataless file). Distinct from
+    /// compactionBaseCorrupt so a retryable IO error is never laundered into a
+    /// permanent corruption verdict that bricks every read AND write
+    /// (2026-07-31 sweep wave 2; same fix landed in TaskLedger/GitHubCommand).
+    case compactionBaseUnreadable(path: String)
 
     public var errorDescription: String? {
         switch self {
@@ -98,6 +104,8 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
             return "desk: reservation \(reservationId) on \(handle) is already complete; a slot completes once"
         case .compactionBaseCorrupt(let path):
             return "desk: compaction base at \(path) exists but does not decode — refusing to replay from the tail alone (that would silently drop every compacted item)"
+        case .compactionBaseUnreadable(let path):
+            return "desk: compaction base at \(path) exists but its bytes could not be read (transient IO) — retry rather than treating the desk as corrupt"
         }
     }
 }
@@ -166,18 +174,36 @@ struct DeskCompactionBase: Sendable {
     static func fromJSON(_ value: JSONValue) -> DeskCompactionBase? {
         guard case .object(let obj) = value,
               let stateVal = obj["state"], let state = DeskState.fromJSON(stateVal),
-              // ROUND-TRIP GATE: the decoded state must re-encode to exactly
-              // the tree on disk. The shared decoders are deliberately
-              // tolerant (unknown ref kinds skipped, wrong-typed string
-              // arrays → []), which is right for forward-compat readers but
-              // wrong for the base — after the truncate this snapshot is the
-              // ONLY copy, so any tolerated-then-normalized deviation (a
-              // shrunken notify.on, a dropped citation date list, a future
-              // version's extra field) means the decode did NOT faithfully
-              // reproduce the snapshot → corrupt, fail loud. An uncorrupted
-              // base always passes: it was written by toJSON, and decode∘encode
-              // is identity on canonical output (the M10 round-trip contract).
-              state.toJSON() == stateVal,
+              // ROUND-TRIP GATE. The shared decoders are deliberately tolerant
+              // (unknown ref kinds skipped, wrong-typed string arrays → []),
+              // which is right for forward-compat readers but wrong for the
+              // base — after the truncate this snapshot is the ONLY copy, so a
+              // tolerated-then-DROPPED field (a shrunken notify.on, a lost
+              // citation list, a future version's extra key) means the decode
+              // did NOT faithfully reproduce the snapshot → corrupt, fail loud.
+              //
+              // The gate is DECODE-STABILITY + SHAPE-PRESERVATION, not byte
+              // identity. Byte identity was wrong: the store's own MIGRATION
+              // vocabulary legitimately rewrites values on decode — the retired
+              // private origin raw value maps to `.agent` (DeskOrigin
+              // .decodePersisted) and re-encodes as "agent", and Pursuit's
+              // init clamps maxSessions/maxDays into range. A base carrying
+              // either failed the identity check, so fromJSON returned nil and
+              // readFeedUnlocked threw compactionBaseCorrupt — bricking EVERY
+              // desk read and write on launch with no degradation path.
+              // Normalization is not corruption; DROPPED DATA is. So:
+              //   1. re-encode, decode again, re-encode — the two encodings must
+              //      match, i.e. normalization applied once is a FIXED POINT
+              //      (a decoder that keeps changing its mind is not trustworthy
+              //      as the sole surviving copy);
+              //   2. the encoding must have the SAME SHAPE as the tree on disk
+              //      — same object key sets, same array counts, recursively.
+              // (2) is what preserves the fail-loud contract: a value the
+              // decoder normalizes in place (origin, a clamped bound) keeps the
+              // key and passes; anything the decoder cannot represent —
+              // an unknown extra field, a dropped ref, a collapsed notify.on —
+              // changes the shape and still fails loud.
+              deskBaseRoundTripIsFaithful(decoded: state, onDisk: stateVal),
               case .string(let lastCompactedOpId)? = obj["lastCompactedOpId"],
               !lastCompactedOpId.isEmpty,
               case .string(let compactedAt)? = obj["compactedAt"],
@@ -203,6 +229,59 @@ struct DeskCompactionBase: Sendable {
             compactedAt: compactedAt,
             compactedOpCount: compactedOpCount
         )
+    }
+}
+
+/// The compaction base's round-trip gate (see `DeskCompactionBase.fromJSON`).
+/// True when re-encoding the decoded state is FAITHFUL to the tree on disk:
+///
+///   1. DECODE-STABILITY — decoding the re-encoded tree and encoding it again
+///      reproduces the same tree. Normalization applied once must be a fixed
+///      point, so whatever the decoder rewrote it has now finished rewriting.
+///   2. SHAPE-PRESERVATION — the re-encoded tree has the same object key sets,
+///      the same array counts, and the same scalar JSON kinds as the tree on
+///      disk, recursively. Only scalar VALUES may differ.
+///
+/// (2) is the fail-loud half. The store's migration vocabulary rewrites scalars
+/// in place (the retired origin raw value → "agent"; a Pursuit bound clamped
+/// into range) and that is a faithful read of an intact snapshot. Everything
+/// the decoder cannot represent — an unknown extra key, a skipped ref, a
+/// wrong-typed `notify.on` that collapses to [] and drops the key, a scalar
+/// whose TYPE the decoder had to coerce — changes the shape and is refused.
+func deskBaseRoundTripIsFaithful(decoded state: DeskState, onDisk: JSONValue) -> Bool {
+    let encoded = state.toJSON()
+    guard let restable = DeskState.fromJSON(encoded), restable.toJSON() == encoded else { return false }
+    return deskJSONShapeMatches(encoded, onDisk)
+}
+
+/// Recursive shape equality: same object key sets, same array counts, same
+/// scalar kinds. Scalar payloads are compared EXCEPT under the named migration
+/// keys — the only places the decoder legitimately rewrites a value in place
+/// (retired origin raw value → "agent"; Pursuit bounds clamped into range).
+/// Everything else must round-trip byte-faithful: without this allowlist, any
+/// unknown enum token that decodes to a default (a future notify.level, a
+/// future cadence.mode) would be silently rewritten in the only surviving
+/// base snapshot (gpt-5.5 wave review, 2026-07-31).
+private let deskScalarMigrationKeys: Set<String> = ["origin", "maxSessions", "maxDays"]
+
+private func deskJSONShapeMatches(_ a: JSONValue, _ b: JSONValue, key: String? = nil) -> Bool {
+    switch (a, b) {
+    case let (.object(ao), .object(bo)):
+        guard Set(ao.keys) == Set(bo.keys) else { return false }
+        for (k, av) in ao {
+            guard let bv = bo[k], deskJSONShapeMatches(av, bv, key: k) else { return false }
+        }
+        return true
+    case let (.array(aa), .array(ba)):
+        guard aa.count == ba.count else { return false }
+        return zip(aa, ba).allSatisfy { deskJSONShapeMatches($0, $1, key: key) }
+    case (.null, .null):
+        return true
+    case (.bool, .bool), (.int, .int), (.double, .double), (.string, .string):
+        if a == b { return true }
+        return key.map { deskScalarMigrationKeys.contains($0) } ?? false
+    default:
+        return false
     }
 }
 
@@ -364,8 +443,15 @@ public struct SwiftNativeDeskStore: Sendable {
         guard FileManager.default.fileExists(atPath: basePath.path) else {
             return DeskFeed(base: nil, ops: ops, fileOpCount: fileOpCount)
         }
-        let raw = await persistence.readJSON(basePath, defaultValue: .null)
-        guard raw != .null, let base = DeskCompactionBase.fromJSON(raw) else {
+        // Read the bytes directly so a transient IO failure (EMFILE, a dataless
+        // iCloud file) throws a RETRYABLE error instead of collapsing to the
+        // readJSON default that then reads as permanent corruption (2026-07-31
+        // sweep wave 2). Only a genuine parse/decode failure is corruption.
+        guard let baseData = try? Data(contentsOf: basePath) else {
+            throw DeskError.compactionBaseUnreadable(path: basePath.path)
+        }
+        guard let raw = try? JSONValue.parse(baseData), raw != .null,
+              let base = DeskCompactionBase.fromJSON(raw) else {
             throw DeskError.compactionBaseCorrupt(path: basePath.path)
         }
         // Prefix-drop via the shared snapshot+tail engine (byte-identical to the
@@ -902,15 +988,25 @@ public struct SwiftNativeDeskStore: Sendable {
         }
     }
 
-    /// archiveSweep — RETURN the handles eligible for archival (done, not
-    /// pinned, past the grace window, terminal children only, not standing). Does
-    /// NOT mutate anything; a background loop decides whether to call
-    /// archiveItem on each. Pure query (state read + deterministic predicate).
+    /// archiveSweep — RETURN the handles eligible for archival (TERMINAL — done
+    /// OR canceled — not pinned, past the grace window, terminal children only,
+    /// not standing). Does NOT mutate anything; a background loop decides whether
+    /// to call archiveItem on each. Pure query (state read + deterministic
+    /// predicate).
+    ///
+    /// The guard is `status.isTerminal`, matching archiveItem (which accepts any
+    /// terminal item) and makeArchiveRecord (which maps `.canceled` to a canceled
+    /// final record). A `.done`-only guard stranded every canceled top-level item
+    /// in live state forever — never swept, and (before the matching projection
+    /// fix) never capped, so canceled rows accumulated at the lowest aliases and
+    /// pushed live work off the 25-item desk. Both terminal paths stamp closedAt
+    /// (close_item always; set_status when `status.isTerminal`), so the grace
+    /// window below is well-defined for canceled rows too.
     public func archiveSweep(now: Date = Date(), grace: TimeInterval = SwiftNativeDeskStore.defaultArchiveGrace) async throws -> [String] {
         let state = try await liveState()
         return state.items.compactMap { item -> String? in
             guard item.parent == nil else { return nil }       // only sweep top-level
-            guard item.status == .done, !item.pinned else { return nil }
+            guard item.status.isTerminal, !item.pinned else { return nil }
             guard item.kind != .standing else { return nil }
             guard let closedAt = item.closedAt, let closed = DeskClock.parseISO(closedAt) else { return nil }
             guard now.timeIntervalSince(closed) >= grace else { return nil }
@@ -1162,6 +1258,67 @@ public struct SwiftNativeDeskStore: Sendable {
 
     /// Build the final archive record for an item (the shared shape used by both
     /// single-item archive and subtree cascade).
+    // MARK: - Per-item history caps (notes / refs)
+
+    /// Newest N notes retained per item. Notes are an append-only per-item log
+    /// (append_note, plus a receipt per completed work session / work_log), and
+    /// the WHOLE item tree is re-serialized + fsynced on every desk op AND baked
+    /// into the compaction base — so an uncapped note list makes the feed O(n²)
+    /// over its life, defeating the exact cost compaction exists to bound.
+    /// Readers only ever want the recent tail: the projection and DeskView read
+    /// `notes.last`, the Workshop panel reads them newest-first.
+    public static let notesCap = 200
+
+    /// Max refs retained per item. Same write-amplification argument as notes.
+    public static let refsCap = 64
+
+    /// Append a note, evicting the OLDEST beyond `notesCap`.
+    static func appendNoteCapped(_ item: inout DeskItem, _ note: DeskNote) {
+        item.notes.append(note)
+        if item.notes.count > notesCap {
+            item.notes.removeFirst(item.notes.count - notesCap)
+        }
+    }
+
+    /// Append a ref, evicting the LEAST IMPORTANT beyond `refsCap` — by the
+    /// model's own `DeskRefKind.priority` ranking (the same one liveRefs sorts
+    /// by), oldest-first among equals. Deliberately NOT a plain `suffix`: gh
+    /// pr/issue refs (priority 0/1) are an item's tracking IDENTITY —
+    /// GitHubProjectTracking matches and retires desk rows by them — so a
+    /// newest-N cap would silently orphan a tracked row behind a flood of
+    /// low-priority note/trace refs. Survivors keep insertion order.
+    static func appendRefCapped(_ item: inout DeskItem, _ ref: DeskRef) {
+        item.refs.append(ref)
+        guard item.refs.count > refsCap else { return }
+        let overflow = item.refs.count - refsCap
+        // gh_pr / gh_issue refs are the row's TRACKING IDENTITY —
+        // GitHubProjectTracking matches and retires a desk row by the exact
+        // presence of that ref. Evicting one (even under a flood of newer,
+        // equal-priority gh refs) orphans the tracked row and duplicates it on
+        // the next observation (gpt-5.5 wave-2 review). So they are NEVER
+        // eviction victims: overflow is drawn only from the non-tracking kinds,
+        // and if tracking refs alone exceed the cap the array is allowed to
+        // exceed it rather than lose an identity.
+        func isTrackingRef(_ r: DeskRef) -> Bool {
+            switch r.kind {
+            case .ghPr, .ghIssue: return true
+            default: return false
+            }
+        }
+        let victims = Set(
+            item.refs.enumerated()
+                .filter { !isTrackingRef($0.element) }
+                .sorted { a, b in
+                    a.element.priority == b.element.priority
+                        ? a.offset < b.offset
+                        : a.element.priority > b.element.priority
+                }
+                .prefix(overflow)
+                .map(\.offset)
+        )
+        item.refs = item.refs.enumerated().filter { !victims.contains($0.offset) }.map(\.element)
+    }
+
     static func makeArchiveRecord(_ item: DeskItem, now: String) -> ArchiveRecord {
         ArchiveRecord(
             handle: item.handle,
@@ -1291,7 +1448,7 @@ public struct SwiftNativeDeskStore: Sendable {
                 byHandle[op.handle] = item
             case let .addRef(ref):
                 guard var item = byHandle[op.handle] else { continue }
-                item.refs.append(ref)
+                Self.appendRefCapped(&item, ref)
                 item.updatedAt = op.ts
                 byHandle[op.handle] = item
             case let .updateRef(refId, cachedFields):
@@ -1303,7 +1460,7 @@ public struct SwiftNativeDeskStore: Sendable {
                 byHandle[op.handle] = item
             case let .appendNote(text):
                 guard var item = byHandle[op.handle] else { continue }
-                item.notes.append(DeskNote(ts: op.ts, text: text))
+                Self.appendNoteCapped(&item, DeskNote(ts: op.ts, text: text))
                 item.updatedAt = op.ts
                 byHandle[op.handle] = item
             case let .setCadence(cadence):
@@ -1350,7 +1507,7 @@ public struct SwiftNativeDeskStore: Sendable {
                     p.reservations[idx].receipt = receipt
                     p.reservations[idx].completedAt = op.ts
                 }
-                item.notes.append(DeskNote(ts: op.ts, text: receipt))
+                Self.appendNoteCapped(&item, DeskNote(ts: op.ts, text: receipt))
                 p.lastWorkedAt = op.ts
                 Self.recomputePursuitCounters(&p)
                 item.pursuit = p
@@ -1358,7 +1515,7 @@ public struct SwiftNativeDeskStore: Sendable {
                 byHandle[op.handle] = item
             case let .workLog(receipt):
                 guard var item = byHandle[op.handle], var p = item.pursuit else { continue }
-                item.notes.append(DeskNote(ts: op.ts, text: receipt))
+                Self.appendNoteCapped(&item, DeskNote(ts: op.ts, text: receipt))
                 p.lastWorkedAt = op.ts
                 item.pursuit = p
                 item.updatedAt = op.ts

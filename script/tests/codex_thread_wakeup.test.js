@@ -284,29 +284,75 @@ test("a dead app-server with a stagnant rollout stalls after one full window", a
   assert.equal(execution.turnResult.noWorkObserved, null);
 });
 
-test("an inProgress-claiming turn gets one extra stagnant window before stalling", async () => {
+test("an inProgress-claiming turn needs stallWedgedWindows stagnant windows (configurable)", async () => {
   let waits = 0;
   let probeCalls = 0;
   const job = { threadId: "thread-wedged", turnId: "turn-wedged" };
-  const execution = await wakeup.waitForDurableTerminalExecution(job, {}, async () => {}, {
-    waitForTurnResult: async () => {
-      waits += 1;
-      return { status: "timeout", waitSource: "exact_timeout" };
-    },
-    rolloutStallSnapshot: () => ({ path: "/tmp/rollout.jsonl", ino: 7, size: 100, mtimeMs: 5 }),
-    probeTurnLiveness: async () => {
-      probeCalls += 1;
-      return { serverReachable: true, turnFound: true, turnClaimsInProgress: true };
-    },
-  });
+  const execution = await wakeup.waitForDurableTerminalExecution(
+    job, { stallWedgedWindows: 2 }, async () => {}, {
+      waitForTurnResult: async () => {
+        waits += 1;
+        return { status: "timeout", waitSource: "exact_timeout" };
+      },
+      rolloutStallSnapshot: () => ({ path: "/tmp/rollout.jsonl", ino: 7, size: 100, mtimeMs: 5 }),
+      probeTurnLiveness: async () => {
+        probeCalls += 1;
+        return { serverReachable: true, turnFound: true, turnClaimsInProgress: true };
+      },
+    });
 
-  // baseline, stagnant=1 (probe says inProgress -> benefit of the doubt),
-  // stagnant=2 -> wedged verdict.
+  // baseline, stagnant=1 (inProgress -> benefit of the doubt), stagnant=2 ->
+  // wedged verdict at the configured floor.
   assert.equal(waits, 3);
   assert.equal(probeCalls, 2);
   assert.equal(execution.turnResult.status, "stalled");
   assert.equal(execution.turnResult.stallEvidence.turnClaimsInProgress, true);
   assert.equal(execution.turnResult.stallEvidence.stagnantWindows, 2);
+});
+
+test("the default wedged threshold tolerates a long silent single-tool call", async () => {
+  // A multi-hour build writes zero rollout bytes while the server honestly
+  // reports inProgress. With the default threshold (4), two stagnant windows
+  // must NOT produce a stall; the turn completes when the tool returns.
+  const results = [
+    { status: "timeout", waitSource: "exact_timeout" },
+    { status: "timeout", waitSource: "exact_timeout" },
+    { status: "timeout", waitSource: "exact_timeout" },
+    { status: "completed", message: "build done" },
+  ];
+  const execution = await wakeup.waitForDurableTerminalExecution(
+    { threadId: "thread-build", turnId: "turn-build" }, {}, async () => {}, {
+      waitForTurnResult: async () => results.shift(),
+      rolloutStallSnapshot: () => ({ path: "/tmp/rollout.jsonl", ino: 7, size: 100, mtimeMs: 5 }),
+      probeTurnLiveness: async () => ({ serverReachable: true, turnFound: true, turnClaimsInProgress: true }),
+    });
+  assert.equal(execution.turnResult.status, "completed");
+});
+
+test("an undiscoverable rollout never stalls on the first window", async () => {
+  // Pin-the-subject regression (2026-07-31 audit): "can't find the rollout"
+  // is not "the turn is dead". Window 1 with a null snapshot only sets the
+  // baseline even when the liveness probe reports the server unreachable;
+  // window 2 (null==null stagnation) may then reach the verdict.
+  let waits = 0;
+  let probeCalls = 0;
+  const execution = await wakeup.waitForDurableTerminalExecution(
+    { threadId: "thread-lost", turnId: "turn-lost" }, {}, async () => {}, {
+      waitForTurnResult: async () => {
+        waits += 1;
+        return { status: "timeout", waitSource: "exact_timeout" };
+      },
+      rolloutStallSnapshot: () => null,
+      probeTurnLiveness: async () => {
+        probeCalls += 1;
+        return { serverReachable: false, turnFound: false, turnClaimsInProgress: false };
+      },
+    });
+  assert.equal(execution.turnResult.status, "stalled");
+  assert.equal(waits, 2);
+  assert.equal(probeCalls, 1);
+  assert.equal(execution.turnResult.stallEvidence.stagnantWindows, 1);
+  assert.equal(execution.turnResult.stallEvidence.rolloutPath, null);
 });
 
 test("a flaky thread/read (reachable-but-unconfirmed) never stalls in one window", async () => {
@@ -1446,4 +1492,276 @@ test("canonical read re-finds a late-appearing rollout before accepting ambiguou
   assert.equal(result.status, "failed");
   assert.match(result.errorMessage, /503/);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// --- BRIDGES-4 / 409 delivery retry -----------------------------------------
+
+test("transport failures are retryable; lifecycle-terminal 409s are not", () => {
+  // Retryable: the request never reached a handler that claimed the delivery.
+  assert.equal(wakeup.bridgeDeliveryRetryable({
+    status: "failed", reason: "connect ECONNREFUSED 127.0.0.1:8771",
+  }), true);
+  assert.equal(wakeup.bridgeDeliveryRetryable({
+    status: "failed", reason: "socket hang up",
+  }), true);
+  assert.equal(wakeup.bridgeDeliveryRetryable({
+    status: "failed", reason: "http_503", httpStatus: 503,
+  }), true);
+  assert.equal(wakeup.bridgeDeliveryRetryable({
+    status: "failed", reason: "http_429", httpStatus: 429,
+  }), true);
+
+  // NOT retryable: 409 outcome_unknown is terminal in CodexCompletionLifecycle
+  // (claim() returns .outcomeUnknown forever once the state file reaches it),
+  // so a resend can only burn attempts.
+  assert.equal(wakeup.bridgeDeliveryRetryable({
+    status: "failed", reason: "http_409", httpStatus: 409, replyStatus: "outcome_unknown",
+  }), false);
+  assert.equal(wakeup.bridgeDeliveryRetryable({
+    status: "failed", reason: "http_409", httpStatus: 409, replyStatus: "conflict",
+  }), false);
+  // NOT retryable: the app owns the turn under its own 600s work deadline.
+  assert.equal(wakeup.bridgeDeliveryRetryable({
+    status: "failed", reason: "http_504", httpStatus: 504,
+  }), false);
+  assert.equal(wakeup.bridgeDeliveryRetryable({
+    status: "failed", reason: "bridge_message_timeout",
+  }), false);
+  // NOT retryable: config faults, not transient ones.
+  assert.equal(wakeup.bridgeDeliveryRetryable({
+    status: "failed", reason: "bridge_token_missing",
+  }), false);
+  // Success is never retried.
+  assert.equal(wakeup.bridgeDeliveryRetryable({ status: "delivered" }), false);
+});
+
+test("delivery backoff is bounded, jittered, and capped", () => {
+  // Full jitter: delay ∈ [0, min(cap, base * 2^n)).
+  assert.equal(wakeup.bridgeDeliveryBackoffMs(0, { baseMs: 500, capMs: 8000, random: () => 0 }), 0);
+  assert.equal(
+    wakeup.bridgeDeliveryBackoffMs(0, { baseMs: 500, capMs: 8000, random: () => 0.999 }),
+    Math.floor(0.999 * 500)
+  );
+  assert.equal(
+    wakeup.bridgeDeliveryBackoffMs(2, { baseMs: 500, capMs: 8000, random: () => 0.5 }),
+    1000
+  );
+  // Cap holds no matter how many attempts.
+  for (const attempt of [5, 10, 40]) {
+    assert.ok(
+      wakeup.bridgeDeliveryBackoffMs(attempt, { baseMs: 500, capMs: 8000, random: () => 0.999 }) < 8000
+    );
+  }
+  // Jitter actually varies the delay.
+  const values = new Set();
+  for (let i = 0; i < 50; i += 1) values.add(wakeup.bridgeDeliveryBackoffMs(3, { baseMs: 500 }));
+  assert.ok(values.size > 1);
+});
+
+test("delivery POST retries a refused connection and succeeds on attempt 2", async () => {
+  const seen = [];
+  const slept = [];
+  const bridge = await wakeup.postBridgeMessageWithRetry(
+    async (attempt) => {
+      seen.push(attempt);
+      return attempt === 1
+        ? { status: "failed", reason: "connect ECONNREFUSED 127.0.0.1:8771" }
+        : { status: "delivered", replyStatus: "ok" };
+    },
+    { maxAttempts: 4, baseMs: 500, sleep: async (ms) => { slept.push(ms); } }
+  );
+  assert.deepEqual(seen, [1, 2]);
+  assert.equal(bridge.status, "delivered");
+  assert.equal(bridge.deliveryAttempts, 2);
+  assert.equal(bridge.retriesExhausted, false);
+  assert.equal(slept.length, 1);
+  assert.ok(slept[0] >= 0 && slept[0] < 500);
+});
+
+test("delivery POST exhausts its bounded attempts and terminates cleanly", async () => {
+  const seen = [];
+  const slept = [];
+  const bridge = await wakeup.postBridgeMessageWithRetry(
+    async (attempt) => {
+      seen.push(attempt);
+      return { status: "failed", reason: "connect ECONNREFUSED 127.0.0.1:8771" };
+    },
+    { maxAttempts: 4, baseMs: 500, sleep: async (ms) => { slept.push(ms); } }
+  );
+  // Bounded: exactly maxAttempts posts, exactly maxAttempts-1 sleeps. No loop.
+  assert.deepEqual(seen, [1, 2, 3, 4]);
+  assert.equal(slept.length, 3);
+  assert.equal(bridge.status, "failed");
+  assert.equal(bridge.retriesExhausted, true);
+  assert.equal(bridge.retriedFailures.length, 4);
+});
+
+test("a 409 outcome_unknown is posted exactly once — never resent", async () => {
+  const seen = [];
+  const bridge = await wakeup.postBridgeMessageWithRetry(
+    async (attempt) => {
+      seen.push(attempt);
+      return {
+        status: "failed", reason: "http_409", httpStatus: 409, replyStatus: "outcome_unknown",
+      };
+    },
+    { maxAttempts: 4, baseMs: 1, sleep: async () => {} }
+  );
+  assert.deepEqual(seen, [1]);
+  assert.equal(bridge.replyStatus, "outcome_unknown");
+  assert.equal(bridge.retriedFailures, undefined);
+});
+
+test("job file disposition: unlink on delivery, retain on transport failure", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-codex-job-disposition-"));
+  try {
+    const delivered = path.join(dir, "delivered.json");
+    fs.writeFileSync(delivered, JSON.stringify({ id: "a" }));
+    assert.equal(wakeup.finalizeReplyJobFile(delivered, { status: "delivered", replyStatus: "ok" }).disposition, "unlink");
+    assert.equal(fs.existsSync(delivered), false);
+
+    // BRIDGES-4: an exhausted transport failure must LEAVE the durable job in
+    // the scan path — that is the state the recovery scan already picks up.
+    const retained = path.join(dir, "retained.json");
+    fs.writeFileSync(retained, JSON.stringify({ id: "b" }));
+    const result = wakeup.finalizeReplyJobFile(retained, {
+      status: "failed", reason: "connect ECONNREFUSED 127.0.0.1:8771", retriesExhausted: true,
+    });
+    assert.equal(result.disposition, "retain");
+    assert.equal(fs.existsSync(retained), true);
+
+    // A consumed-but-empty reply is still the app's to own; don't relaunch it.
+    const noReply = path.join(dir, "noreply.json");
+    fs.writeFileSync(noReply, JSON.stringify({ id: "c" }));
+    assert.equal(wakeup.finalizeReplyJobFile(noReply, { status: "failed", replyStatus: "no_reply" }).disposition, "unlink");
+    assert.equal(fs.existsSync(noReply), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an ambiguous 409 preserves the full reply instead of deleting it", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-codex-job-preserve-"));
+  const jobsDir = path.join(dir, "reply-jobs");
+  fs.mkdirSync(jobsDir);
+  try {
+    const jobPath = path.join(jobsDir, "job-1.json");
+    const job = { id: "job-1", threadId: "t", turnId: "u", completedExecution: { turnResult: { message: "the full codex reply" } } };
+    fs.writeFileSync(jobPath, JSON.stringify(job));
+
+    const result = wakeup.finalizeReplyJobFile(jobPath, {
+      status: "failed", httpStatus: 409, replyStatus: "outcome_unknown",
+    });
+    assert.equal(result.disposition, "preserve");
+    assert.equal(result.preserved, true);
+    assert.equal(fs.existsSync(jobPath), false);
+    // The full text survives — the receipt only ever kept a 1000-char preview.
+    assert.deepEqual(JSON.parse(fs.readFileSync(result.undeliveredPath, "utf8")), job);
+
+    // ...and it is OUT of the recovery scan path, so it can never relaunch a turn.
+    const scanned = [];
+    const recovery = await wakeup.recoverReplyJobs({}, {
+      jobsDir,
+      recoveryLockDir: path.join(dir, ".recovery.lock"),
+      worker: async (p) => { scanned.push(p); return { status: "delivered" }; },
+    });
+    assert.equal(recovery.scanned, 0);
+    assert.deepEqual(scanned, []);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("preserved replies are 0600 and the undelivered store is capped", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-codex-job-preserve-hygiene-"));
+  const jobsDir = path.join(dir, "reply-jobs");
+  fs.mkdirSync(jobsDir);
+  try {
+    // gpt-5.5 review MED: rename keeps the source mode — a 0644 legacy job
+    // must not land world-readable with full reply text.
+    const loosePath = path.join(jobsDir, "loose.json");
+    fs.writeFileSync(loosePath, JSON.stringify({ id: "loose" }), { mode: 0o644 });
+    const preserved = wakeup.finalizeReplyJobFile(loosePath, {
+      status: "failed", httpStatus: 409, replyStatus: "outcome_unknown",
+    });
+    assert.equal(preserved.preserved, true);
+    assert.equal(fs.statSync(preserved.undeliveredPath).mode & 0o777, 0o600);
+
+    // gpt-5.5 review MED: nothing else ever deletes preserved jobs, so the
+    // store bounds itself — oldest evicted past the cap, newest kept.
+    const undeliveredDir = path.join(jobsDir, "undelivered");
+    for (let i = 0; i < 210; i += 1) {
+      const p = path.join(undeliveredDir, `old-${String(i).padStart(3, "0")}.json`);
+      fs.writeFileSync(p, "{}", { mode: 0o600 });
+      fs.utimesSync(p, new Date(1000000 + i), new Date(1000000 + i));
+    }
+    wakeup.pruneUndeliveredReplyJobs(undeliveredDir);
+    const left = fs.readdirSync(undeliveredDir).filter((n) => n.endsWith(".json"));
+    assert.equal(left.length, 200);
+    assert.equal(left.includes("old-000.json"), false, "oldest evicted first");
+    assert.equal(left.includes("old-209.json"), true, "newest kept");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a retained job is re-delivered by the existing recovery scan", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-codex-job-retain-scan-"));
+  const jobsDir = path.join(dir, "reply-jobs");
+  fs.mkdirSync(jobsDir);
+  try {
+    const jobPath = path.join(jobsDir, "job-2.json");
+    // completedExecution is persisted BEFORE the POST, so the retained file
+    // already carries everything a later delivery needs. No new state.
+    fs.writeFileSync(jobPath, JSON.stringify({
+      id: "job-2", threadId: "t", turnId: "u",
+      completedExecution: { threadId: "t", turnId: "u", attempts: [], turnResult: { status: "completed", message: "reply" } },
+    }));
+    wakeup.finalizeReplyJobFile(jobPath, { status: "failed", reason: "connect ECONNREFUSED", retriesExhausted: true });
+
+    const redelivered = [];
+    const recovery = await wakeup.recoverReplyJobs({}, {
+      jobsDir,
+      recoveryLockDir: path.join(dir, ".recovery.lock"),
+      worker: async (p) => {
+        const loaded = JSON.parse(fs.readFileSync(p, "utf8"));
+        redelivered.push(loaded.completedExecution.turnResult.message);
+        return { status: "delivered", jobPath: p };
+      },
+    });
+    assert.equal(recovery.scanned, 1);
+    assert.deepEqual(redelivered, ["reply"]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- BRIDGES-5 source conformance guard -------------------------------------
+
+test("shipped helper arms pipe drains before process.run and writes stdin async", () => {
+  const swiftPath = path.join(
+    __dirname, "..", "..",
+    "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+AgentBridgeTools.swift"
+  );
+  const source = fs.readFileSync(swiftPath, "utf8");
+  const helperStart = source.indexOf("private static func runCodexWakeupHelper");
+  assert.ok(helperStart > 0, "runCodexWakeupHelper not found");
+  const helper = source.slice(helperStart, helperStart + 6000);
+
+  const attachOut = helper.indexOf("outDrain.attach(to: stdout.fileHandleForReading)");
+  const attachErr = helper.indexOf("errDrain.attach(to: stderr.fileHandleForReading)");
+  const run = helper.indexOf("try process.run()");
+  assert.ok(attachOut > 0 && attachErr > 0, "both pipes must have a drain attached");
+  // BRIDGES-5: a drain attached AFTER run() still leaves a window where a fast
+  // helper can fill 64KB and wedge. Order is the fix.
+  assert.ok(attachOut < run, "stdout drain must be attached before process.run()");
+  assert.ok(attachErr < run, "stderr drain must be attached before process.run()");
+
+  // The pre-fix read-after-wait calls must be gone from this helper.
+  assert.equal(helper.includes("stdout.fileHandleForReading.readDataToEndOfFile()"), false);
+  assert.equal(helper.includes("stderr.fileHandleForReading.readDataToEndOfFile()"), false);
+
+  // stdin must not be written synchronously on the polling thread.
+  assert.ok(/DispatchQueue\.global\([^)]*\)\.async \{[\s\S]{0,200}stdin\.fileHandleForWriting/.test(helper),
+    "stdin must be written off-thread");
 });

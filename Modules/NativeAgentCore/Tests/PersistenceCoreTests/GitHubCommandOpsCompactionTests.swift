@@ -140,6 +140,28 @@ struct GitHubCommandOpsCompactionTests {
         }
     }
 
+    @Test("an unreadable-but-present base is transient IO, not permanent corruption")
+    func unreadableBaseIsNotReportedAsCorrupt() async throws {
+        let root = try root(); defer { try? FileManager.default.removeItem(at: root) }
+        let store = GitHubCommandStore(dataRoot: root, changeBus: StoreChangeBus(), opsCompactionThreshold: 8)
+        try await drive(store)
+        #expect(FileManager.default.fileExists(atPath: store.basePath.path))
+
+        // A path that EXISTS but whose bytes cannot be read at all — the shape
+        // `readJSON(_:defaultValue:)` used to collapse into its `.null` default
+        // (fd exhaustion under a dispatch storm, an iCloud dataless
+        // placeholder, a mid-read EIO). Classifying that as the permanent
+        // "ops_base.json exists but is unreadable" invariant bricked every
+        // read AND write on a blip that would have cleared on retry.
+        try FileManager.default.removeItem(at: store.basePath)
+        try FileManager.default.createDirectory(at: store.basePath, withIntermediateDirectories: true)
+
+        var thrown: (any Error)?
+        do { _ = try await store.liveState() } catch { thrown = error }
+        #expect(thrown as? GitHubCommandStoreError == .baseUnreadable(store.basePath.path),
+                "transient IO reported as permanent corruption: \(String(describing: thrown))")
+    }
+
     @Test("a writer holding the flock fails loud on a corrupt pairing instead of wedging")
     func writerCorruptPairingFailsLoudNotWedged() async throws {
         let root = try root(); defer { try? FileManager.default.removeItem(at: root) }

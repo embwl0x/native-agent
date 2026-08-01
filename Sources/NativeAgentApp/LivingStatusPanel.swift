@@ -296,9 +296,15 @@ struct LivingStatusPanel: View {
                     livingRow("Dream", snapshot.lastDreamSummary, icon: "moon.stars")
                 }
                 if refreshPresentation == .stale {
-                    Label("Today could not refresh \(refreshStatus?.failedEndpoints.joined(separator: " and ") ?? "its sources"); showing last known state.", systemImage: "exclamationmark.triangle.fill")
+                    // Endpoint names are internal vocabulary — plain headline,
+                    // technical detail demoted to a tooltip (same pattern as
+                    // DetachedChatLoadFailureCopy).
+                    Label("Some of this couldn't refresh — showing the last known state.", systemImage: "exclamationmark.triangle.fill")
                         .font(.caption2)
                         .foregroundStyle(.yellow)
+                        .help((refreshStatus?.failedEndpoints.isEmpty == false)
+                            ? "Did not respond: " + (refreshStatus?.failedEndpoints.joined(separator: ", ") ?? "")
+                            : "The status sources did not respond.")
                 }
             } else if refreshPresentation == .unavailable {
                 Label("\(appModel.agentDisplayName)'s current state is unavailable; no calm or needs-nothing state was inferred.", systemImage: "exclamationmark.triangle.fill")

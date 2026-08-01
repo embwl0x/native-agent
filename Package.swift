@@ -123,8 +123,7 @@ let package = Package(
                 // MultimodalTTS owns POST /v1/multimodal/tts.
                 // VoiceOutputController.speakOpenAI calls SwiftOpenAITTSClient
                 // (direct URLSession POST to
-                // OpenAI's /v1/audio/speech, key via LLMCredentialResolver)
-                // instead of NativeClient.synthesizeSpeech.
+                // OpenAI's /v1/audio/speech, key via LLMCredentialResolver).
                 .product(name: "MultimodalTTS", package: "NativeAgentCore"),
                 // CapabilityFoundry owns the live GET
                 // /v1/capability-foundry route (Mac ContentView.capabilityFoundry

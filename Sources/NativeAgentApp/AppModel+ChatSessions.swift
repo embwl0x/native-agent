@@ -496,12 +496,13 @@ extension AppModel {
     @MainActor
     func panelStaleNotice(for item: SidebarItem) -> String? {
         guard let status = panelRefreshStatus[item], status.isStale else { return nil }
-        let endpoints = status.failedEndpoints.joined(separator: ", ")
+        // Endpoint names are internal vocabulary; the user-facing sentence
+        // stays plain (same rule as DetachedChatLoadFailureCopy).
         guard let lastSuccess = status.lastSuccessAt else {
-            return "Couldn't reach \(endpoints). Nothing has loaded yet this session."
+            return "Nothing has loaded yet this session. Check your connection."
         }
         let age = Self.approximateAgeDescription(since: lastSuccess, now: status.lastAttemptAt)
-        return "Showing data from \(age) — couldn't reach \(endpoints)."
+        return "Showing data from \(age) — some information couldn't be refreshed."
     }
 
     /// Coarse, dependency-free relative age. Deliberately vague: the point is

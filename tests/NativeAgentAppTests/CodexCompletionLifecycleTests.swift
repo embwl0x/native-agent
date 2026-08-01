@@ -380,6 +380,40 @@ struct CodexCompletionLifecycleTests {
       != ClaudeBridge.codexCompletionRequestDigest(changed))
   }
 
+  /// A work-deadline cancel inside the SAME app instance used to wedge the
+  /// delivery: the claim stayed `.claimed` under the live ownerInstanceId, so
+  /// claim() answered `.inProgress` to every node-side retry (202
+  /// completion_in_progress) until relaunch — reconcileInterruptedClaims only
+  /// sweeps OTHER instance ids. The cancel path now writes the same outcome
+  /// receipt the generic failure path does, which unwedges the retry.
+  @Test
+  func sameOwnerOutcomeReceiptUnwedgesRetriesWithoutRelaunch() async throws {
+    let fixture = try Fixture()
+    defer { fixture.cleanup() }
+    let lifecycle = fixture.lifecycle(owner: "process-a")
+
+    #expect(try await lifecycle.claim(
+      deliveryId: "delivery-1",
+      requestDigest: "digest-1"
+    ) == .start)
+    // Without the receipt, the owning instance answers itself .inProgress.
+    #expect(try await lifecycle.claim(
+      deliveryId: "delivery-1",
+      requestDigest: "digest-1"
+    ) == .inProgress)
+
+    try await lifecycle.markOutcomeUnknown(
+      deliveryId: "delivery-1",
+      requestDigest: "digest-1",
+      detail: "work_deadline_cancelled:600s"
+    )
+
+    #expect(try await lifecycle.claim(
+      deliveryId: "delivery-1",
+      requestDigest: "digest-1"
+    ) == .outcomeUnknown)
+  }
+
   private func prepareCachedResponse(_ lifecycle: CodexCompletionLifecycle) async throws {
     #expect(try await lifecycle.claim(
       deliveryId: "delivery-1",

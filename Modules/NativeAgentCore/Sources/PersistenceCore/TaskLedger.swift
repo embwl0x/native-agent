@@ -266,6 +266,17 @@ public enum TaskLedgerClock {
     }
 }
 
+/// The base file EXISTS but its bytes could not be read at all (fd exhaustion,
+/// an iCloud dataless placeholder, a transient IO error). Distinct from
+/// `TaskLedgerBaseCorrupt` on purpose: this one is TRANSIENT and retryable, so
+/// it must never be reported as — or acted on like — permanent corruption.
+public struct TaskLedgerBaseUnreadable: Error, LocalizedError, Sendable {
+    public let path: String
+    public var errorDescription: String? {
+        "task ledger: compaction base at \(path) exists but its bytes could not be read (transient IO — fd exhaustion or a dataless file); retry rather than treating the ledger as corrupt"
+    }
+}
+
 public struct TaskLedgerClaimConflict: Error, LocalizedError, Sendable {
     public let taskId: String
     public let owner: TaskLedgerActor
@@ -311,6 +322,10 @@ public struct SwiftNativeTaskLedger: Sendable {
     /// the base — and the derived task_ledger_state.json — kept every taskId
     /// ever written.
     static let terminalTaskRetention: TimeInterval = 30 * 24 * 60 * 60
+    /// Per-task cap on the derived `refs` union. Without it a long-lived task
+    /// that attaches a ref per event grows the derived state — and the
+    /// compaction base it is baked into — without bound. Newest-wins.
+    static let maxRefsPerTask = 64
 
     public let dataRoot: URL
     public let persistence: SwiftNativePersistenceCore
@@ -427,8 +442,19 @@ public struct SwiftNativeTaskLedger: Sendable {
         let prefix = Array(feed.events.dropLast(keepTail))
         let tail = Array(feed.events.suffix(keepTail))
         guard let lastPrefix = prefix.last else { return }
-        let baseTasks = Self.compact(base: feed.base, prefix)
-            .filter { Self.retainInCompactionBase($0, now: Date()) }
+        // "Now" for the retention fold is the FEED'S OWN newest stamp, never
+        // wall-clock (mirrors GitHubCommandStore's terminal retirement, which
+        // anchors to `updatedAt`): the same feed must fold to the same base on
+        // every machine and at every replay, otherwise two writers compacting
+        // the identical feed minutes apart produce different bases and the
+        // eviction boundary drifts with whoever happened to run the append.
+        // No parseable stamp anywhere in the feed → evict nothing (eviction
+        // must never lose a row just because the clock is unreadable).
+        let folded = Self.compact(base: feed.base, prefix)
+        let feedNow = feed.events.compactMap { TaskLedgerClock.parseISO($0.ts) }.max()
+        let baseTasks = feedNow.map { now in
+            folded.filter { Self.retainInCompactionBase($0, now: now) }
+        } ?? folded
         let newBase = TaskLedgerCompactionBase(
             tasks: baseTasks,
             lastCompactedOpId: lastPrefix.id,
@@ -476,8 +502,19 @@ public struct SwiftNativeTaskLedger: Sendable {
         guard FileManager.default.fileExists(atPath: basePath.path) else {
             return TaskLedgerFeed(base: nil, events: events, fileEventCount: fileEventCount)
         }
-        let raw = await persistence.readJSON(basePath, defaultValue: .null)
-        guard raw != .null, let base = TaskLedgerCompactionBase.fromJSON(raw) else {
+        // Read the base bytes DIRECTLY — `persistence.readJSON` collapses every
+        // failure mode into its default (EMFILE burst, an iCloud dataless
+        // placeholder, a mid-read EIO all look identical to a parse failure),
+        // and the corruption invariant below is PERMANENT: it bricks reads AND
+        // writes. Separating "could not read the bytes" (transient → throw a
+        // distinct, retryable error) from "read the bytes, they are not a base"
+        // (genuine corruption → fail loud) keeps the fail-loud contract without
+        // laundering a transient IO blip into permanent corruption.
+        guard let data = try? Data(contentsOf: basePath) else {
+            throw TaskLedgerBaseUnreadable(path: basePath.path)
+        }
+        guard let raw = try? JSONValue.parse(data),
+              let base = TaskLedgerCompactionBase.fromJSON(raw) else {
             throw TaskLedgerBaseCorrupt(path: basePath.path)
         }
         let tail = SnapshotTailOpLog.dropCompactedPrefix(
@@ -489,8 +526,26 @@ public struct SwiftNativeTaskLedger: Sendable {
     /// List the derived compacted task states, newest-updated first. Reads the
     /// events feed directly (always current) rather than the cached state file,
     /// so a list right after a CLI append reflects it without a recompaction.
+    ///
+    /// UNDER THE EVENTS FLOCK (2026-08-01). `readFeedUnlocked` reads events
+    /// FIRST and the base SECOND, and unlike GitHubCommandStore the ledger's
+    /// base carries no `tailFirstOpId` torn-read proof — so a lock-free reader
+    /// that suspends at the `await` before the base read can pair a
+    /// PRE-compaction events snapshot with a POST-compaction base. That feed
+    /// still holds e1..eN, the new base already folded them, and
+    /// `dropCompactedPrefix` finds no `lastCompactedOpId` in the old snapshot →
+    /// returns the events UNCHANGED → the fold double-applies them on top of a
+    /// base that already contains them. A `done` task reappears as `claimed`,
+    /// and `staleClaims` then fires on a closed task. The flock makes the two
+    /// reads one atomic pairing. `staleClaims` funnels through here rather than
+    /// taking the lock itself — `withFileLock` is NOT reentrant (a fresh fd
+    /// spins EWOULDBLOCK against our own held lock), so nesting would deadlock.
+    /// For the same reason `claim` / `appendAndRecompactUnlocked` call
+    /// `readFeedUnlocked` directly: they already hold this lock.
     public func listTasks(includeTerminal: Bool = true) async throws -> [TaskLedgerTaskState] {
-        let feed = try await readFeedUnlocked()
+        let feed = try await persistence.withFileLock(eventsPath) {
+            try await readFeedUnlocked()
+        }
         var states = Self.compact(base: feed.base, feed.events)
         if !includeTerminal {
             states = states.filter { $0.status != .done && $0.status != .cancelled }
@@ -500,7 +555,9 @@ public struct SwiftNativeTaskLedger: Sendable {
 
     /// Tasks with an active CLAIM older than `staleAfter` and no update since.
     /// "Active claim" = current status is `claimed` (a later update/done/etc.
-    /// clears the stale signal). Returns newest-claimed first.
+    /// clears the stale signal). Returns newest-claimed first. Reads through
+    /// `listTasks`, which takes the events flock — do NOT add a second
+    /// `withFileLock` here; it is not reentrant and would deadlock.
     public func staleClaims(
         staleAfter: TimeInterval = 24 * 60 * 60,
         now: Date = Date()
@@ -545,6 +602,12 @@ public struct SwiftNativeTaskLedger: Sendable {
                 s.updatedTs = e.ts
                 if let n = e.note, !n.isEmpty { s.lastNote = n }
                 for r in e.refs where !s.refs.contains(r) { s.refs.append(r) }
+                // Bound the union: refs were the one unbounded field in the
+                // derived state — a long-lived task accumulating a ref per
+                // event grew task_ledger_state.json AND the compaction base
+                // forever. Newest-wins (suffix), matching every other tail cap
+                // in the store.
+                if s.refs.count > Self.maxRefsPerTask { s.refs = Array(s.refs.suffix(Self.maxRefsPerTask)) }
                 byTask[e.taskId] = s
             } else {
                 order.append(e.taskId)
@@ -556,7 +619,7 @@ public struct SwiftNativeTaskLedger: Sendable {
                     createdTs: e.ts,
                     updatedTs: e.ts,
                     lastNote: e.note,
-                    refs: e.refs
+                    refs: Array(e.refs.suffix(Self.maxRefsPerTask))
                 )
             }
         }

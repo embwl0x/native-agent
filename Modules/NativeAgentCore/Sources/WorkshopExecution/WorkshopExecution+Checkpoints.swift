@@ -236,19 +236,16 @@ public actor SwiftNativeWorkshopCheckpointStore {
         try await readCheckpoints(executionId: executionId).last
     }
 
-    /// Internal flock'd writer. Mirrors `SwiftNativeWorkshopRunner.appendTimelineLocked`:
-    /// downcast to `SwiftNativePersistenceCore` and take `withFileLock(target)`;
-    /// run unlocked when the injected persistence is a mock (tests that pass
-    /// a non-SwiftNative impl).
+    /// Internal flock'd writer. Mirrors `SwiftNativeWorkshopRunner.appendTimelineLocked`.
+    /// `withFileLock` is a PersistenceCoreProtocol EXTENSION
+    /// (PersistenceCore+FileLock.swift:4), so this locks for EVERY conformer —
+    /// the old downcast to `SwiftNativePersistenceCore` silently ran the write
+    /// unlocked for any other impl (L7, 2026-08-01).
     private func withLockedWrite(
         path: URL,
         _ body: @escaping @Sendable () async throws -> Void
     ) async throws {
-        if let p = persistence as? SwiftNativePersistenceCore {
-            try await p.withFileLock(path) {
-                try await body()
-            }
-        } else {
+        try await persistence.withFileLock(path) {
             try await body()
         }
     }
@@ -438,16 +435,13 @@ public actor SwiftNativeWorkshopEscalator {
         return try readFailClosedJSONL(path)
     }
 
-    /// Same flock helper shape as the checkpoint store.
+    /// Same flock helper shape as the checkpoint store — uniform for every
+    /// conformer, not just SwiftNative (L7, 2026-08-01).
     private func withLockedWrite(
         path: URL,
         _ body: @escaping @Sendable () async throws -> Void
     ) async throws {
-        if let p = persistence as? SwiftNativePersistenceCore {
-            try await p.withFileLock(path) {
-                try await body()
-            }
-        } else {
+        try await persistence.withFileLock(path) {
             try await body()
         }
     }

@@ -1067,7 +1067,10 @@ extension NativeCognitionRuntime {
         let keyVars = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "XAI_API_KEY"]
         if keyVars.contains(where: { env[$0]?.isEmpty == false }) { return true }
 
-        return SwiftCodexDeviceLoginManager.codexIsResolvable()
+        // A resolvable codex binary with no auth token cannot serve a turn;
+        // counting it here made the organism report providers it cannot use
+        // (same defect as the first-run readiness copy, fixed in lockstep).
+        return false
     }
 
     nonisolated static func hasReadableContent(_ url: URL) -> Bool {  // internal for actor extensions (move-only Wave C)

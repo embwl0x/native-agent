@@ -75,6 +75,14 @@ final class FileAccessGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         // install card; even the read-only status tool stays denied here so
         // fileAccess=none keeps the whole evolution surface unreachable.
         "evolution_propose", "evolution_status", "self_install",
+        // 2026-07-31 audit fix: the Full-Mac file/git read tools
+        // (SwiftToolDispatcher.fullMacFileToolNames + the git group) matched
+        // neither blockedExact nor any blockedPrefix, so fileAccess=none was
+        // letting six real filesystem/repo readers through. `write_file` was
+        // already covered by prefix. These stay PERMITTED under .readOnly —
+        // they are reads, and read_only exists to allow exactly this.
+        "file_excerpt", "grep",
+        "git_status", "git_diff", "git_log", "repo_dirty_summary",
     ]
     private static let readOnlyBlockedPrefixes: [String] = [
         "write.", "write_", "shell.", "shell_", "bash.", "bash_", "exec.", "exec_",

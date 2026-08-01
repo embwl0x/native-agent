@@ -566,19 +566,19 @@ extension SwiftNativeSelfImprovement {
         trainingPromotionDataRoot().appendingPathComponent("memory", isDirectory: true)
     }
 
-    /// Run `body` under the cross-process `withFileLock(path)` when the injected
-    /// persistence is the concrete `SwiftNativePersistenceCore` (the production
-    /// path), or bare when it is a mock/alternate impl that has no lock. Same
-    /// downcast-or-fallback pattern as Research.swift (L474) and MacControl —
-    /// `withFileLock` is declared only on the concrete type, not the protocol.
+    /// Run `body` under the cross-process `withFileLock(path)`.
+    ///
+    /// L7 (2026-08-01): this used to downcast to `SwiftNativePersistenceCore` and
+    /// run `body` BARE otherwise — the stale comment claimed `withFileLock` was
+    /// "declared only on the concrete type". It is a PersistenceCoreProtocol
+    /// EXTENSION (PersistenceCore+FileLock.swift:4); every conformer has it, and
+    /// it locks a local `<path>.lock` sidecar independent of the write backend.
+    /// So the downcast only ever cost mutual exclusion. Lock uniformly.
     private func withTrainingFileLock<T: Sendable>(
         _ path: URL,
         _ body: @Sendable @escaping () async throws -> T
     ) async throws -> T {
-        if let p = trainingPromotionPersistence() as? SwiftNativePersistenceCore {
-            return try await p.withFileLock(path, body)
-        }
-        return try await body()
+        return try await trainingPromotionPersistence().withFileLock(path, body)
     }
 
     /// Find the proposal file whose `proposal_id` field equals `proposalId`,

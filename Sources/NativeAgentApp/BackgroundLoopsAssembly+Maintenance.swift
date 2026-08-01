@@ -336,6 +336,10 @@ extension BackgroundLoopsAssembly {
         do {
             let inserted = try await persistence.withFileLock(inboxPath) { () async throws -> Bool in
                 let rows = try await persistence.tailJSONL(inboxPath, limit: Int.max, maxBytes: nil)
+                guard InboxRewriteGuard.rewriteIsSafe(rows: rows, path: inboxPath) else {
+                    InboxRewriteGuard.refuse("DiskHygieneLoop", path: inboxPath)
+                    return false
+                }
                 var mutated: [JSONValue] = []
                 mutated.reserveCapacity(rows.count + 1)
                 var found = false

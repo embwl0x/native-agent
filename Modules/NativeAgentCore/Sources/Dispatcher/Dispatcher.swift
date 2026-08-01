@@ -436,8 +436,9 @@ public actor DispatchLedger {
 
     public var path: URL { ledgerPath }
 
-    /// Append one dispatch entry. The Swift runtime wraps the append in a file
-    /// lock when available; injected test persistence can fall through unlocked.
+    /// Append one dispatch entry. Routed through the shared capped append,
+    /// which takes the file lock for EVERY persistence conformer (uniform
+    /// locking sweep, 2026-08-01) — injected test persistence included.
     public func append(_ entry: DispatchLedgerEntry) async throws {
         let dir = ledgerPath.deletingLastPathComponent()
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

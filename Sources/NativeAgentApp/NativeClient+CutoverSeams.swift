@@ -40,9 +40,12 @@ import Browser
 import CapabilityFoundry
 
 // W-H Band (U5 decomposition, move-only): Wave-3 runtime seam wrappers
-// (mobile pairing, TTS, MacControl run, KG/inbox/connector URLSession
-// consolidation). Relocated verbatim with its two companion structs
-// (TTSAudioResponse, MacControlRunResult — used only by this cluster).
+// (mobile pairing, MacControl run, inbox/connector URLSession
+// consolidation). Relocated verbatim with its companion struct
+// (MacControlRunResult — used only by this cluster). The TTS
+// (synthesizeSpeech / TTSAudioResponse) and KG-forget
+// (forgetKGEntityViaClient) seams were removed once their last callers
+// moved to SwiftOpenAITTSClient and the canonical KG forget client.
 // Two documented fileprivate→internal lifts in the root (the connector
 // registry helpers readConnectorRegistryEntry / mutateConnectorRegistryEntry
 // stay in the root file) and one in this file (macControlPolicyProvider,
@@ -54,10 +57,6 @@ import CapabilityFoundry
 // and ConnectorWizardView behind NativeClient so each subsystem has one
 // app-owned Swift entry point.
 
-struct TTSAudioResponse: Decodable {
-    let audio_base64: String?
-}
-
 struct MacControlRunResult {
     let statusCode: Int
     let json: [String: Any]?
@@ -65,26 +64,6 @@ struct MacControlRunResult {
 }
 
 extension NativeClient {
-    // --- TTS ----------------------------------------------------------------
-    func synthesizeSpeech(text: String, voice: String = "alloy", format: String = "mp3") async throws -> Data {
-        try await SwiftOpenAITTSClient().synthesize(text: text, voice: voice, format: format)
-    }
-
-    // --- Knowledge graph ----------------------------------------------------
-    /// POST /v1/knowledge_graph/forget. Returns the raw response dictionary.
-    /// This replaces the URLSession-based variant in the KnowledgeGraphView
-    /// extension so all KG-mutation paths flow through the central helpers.
-    // Delegate to the canonical KG forget client. memory.sqlite is the live
-    // owner; JSON remains a pre-SQLite compatibility path only.
-    func forgetKGEntityViaClient(id: String, reason: String) async throws -> [String: Any] {
-        let impl = makeKnowledgeGraphForgetClient(
-            graphPath: SwiftNativeKnowledgeGraphReader.defaultPath()
-        )
-        let result = try await impl.forgetEntity(entityId: id, reason: reason)
-        let data = try result.serializedData(pretty: false)
-        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
-    }
-
     // --- Raw snapshot passthrough ------------------------------------------
     /// GET an arbitrary `/v1/...` route and return the raw response body bytes.
     /// Used by MacSyncEngine for snapshot endpoints whose typed Codable decode

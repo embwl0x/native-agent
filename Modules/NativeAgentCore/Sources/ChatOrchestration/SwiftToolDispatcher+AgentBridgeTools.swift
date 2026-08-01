@@ -906,6 +906,80 @@ extension SwiftToolDispatcher {
         return nil
     }
 
+    /// Concurrent accumulator for one child pipe.
+    ///
+    /// BRIDGES-5: the helper's stdout/stderr must be drained WHILE the child
+    /// runs. A macOS pipe holds ~64KB; a helper that emits more (a large
+    /// `--recover-reply-jobs` report, a node stack trace) blocks in `write(2)`
+    /// forever if the parent only reads after `waitUntilExit`. The old code
+    /// read at line 953 — after the poll loop — so any >64KB helper wedged,
+    /// hit the deadline, and got reported as `helper_timeout`: a lie, because
+    /// the helper was alive and blocked on us.
+    private final class HelperPipeDrain: @unchecked Sendable {
+        private let lock = NSLock()
+        private let finished = DispatchSemaphore(value: 0)
+        private let byteCap: Int
+        private var buffer = Data()
+        private var truncatedBytes = 0
+        private var didFinish = false
+
+        init(byteCap: Int = 8 * 1024 * 1024) {
+            self.byteCap = byteCap
+        }
+
+        /// Installs the reader. MUST be called before `process.run()`.
+        func attach(to handle: FileHandle) {
+            handle.readabilityHandler = { [weak self] readHandle in
+                guard let self else { return }
+                let chunk = readHandle.availableData
+                if chunk.isEmpty {
+                    readHandle.readabilityHandler = nil
+                    self.finish()
+                    return
+                }
+                self.lock.lock()
+                // Always CONSUME, even past the cap — dropping bytes we already
+                // read keeps memory bounded without ever re-wedging the pipe.
+                let room = self.byteCap - self.buffer.count
+                if room > 0 {
+                    self.buffer.append(chunk.prefix(room))
+                    self.truncatedBytes += max(0, chunk.count - room)
+                } else {
+                    self.truncatedBytes += chunk.count
+                }
+                self.lock.unlock()
+            }
+        }
+
+        private func finish() {
+            lock.lock()
+            let alreadyFinished = didFinish
+            didFinish = true
+            lock.unlock()
+            if !alreadyFinished { finished.signal() }
+        }
+
+        /// Bounded wait for EOF, then detach. Never blocks indefinitely: a
+        /// killed child can leave a pipe held open by a grandchild.
+        func waitForEOF(timeout: TimeInterval, handle: FileHandle) {
+            _ = finished.wait(timeout: .now() + timeout)
+            handle.readabilityHandler = nil
+            finish()
+        }
+
+        var data: Data {
+            lock.lock()
+            defer { lock.unlock() }
+            return buffer
+        }
+
+        var truncated: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return truncatedBytes > 0
+        }
+    }
+
     private static func runCodexWakeupHelper(helper: URL, inputData: Data, cwd: URL) -> JSONValue {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
@@ -919,9 +993,18 @@ extension SwiftToolDispatcher {
         process.standardOutput = stdout
         process.standardError = stderr
 
+        // Readers armed BEFORE run(): from the child's first byte there is a
+        // consumer on both pipes, so neither can fill.
+        let outDrain = HelperPipeDrain()
+        let errDrain = HelperPipeDrain()
+        outDrain.attach(to: stdout.fileHandleForReading)
+        errDrain.attach(to: stderr.fileHandleForReading)
+
         do {
             try process.run()
         } catch {
+            stdout.fileHandleForReading.readabilityHandler = nil
+            stderr.fileHandleForReading.readabilityHandler = nil
             return .object([
                 "status": .string("failed"),
                 "reason": .string("helper_spawn_failed"),
@@ -930,8 +1013,14 @@ extension SwiftToolDispatcher {
             ])
         }
 
-        stdin.fileHandleForWriting.write(inputData)
-        try? stdin.fileHandleForWriting.close()
+        // Same hazard in the other direction: a payload larger than the pipe
+        // buffer blocks this thread if the helper hasn't started reading yet.
+        // Write off-thread and let the deadline loop below stay responsive.
+        DispatchQueue.global(qos: .utility).async {
+            let handle = stdin.fileHandleForWriting
+            try? handle.write(contentsOf: inputData)
+            try? handle.close()
+        }
 
         let deadline = Date().addingTimeInterval(Self.codexWakeupHelperTimeoutSeconds())
         while process.isRunning, Date() < deadline {
@@ -943,15 +1032,38 @@ extension SwiftToolDispatcher {
             if process.isRunning {
                 kill(process.processIdentifier, SIGKILL)
             }
-            return .object([
+            // Whatever the helper managed to say before the deadline is real
+            // diagnostic evidence — a timeout is no longer a blind report.
+            outDrain.waitForEOF(timeout: 1.0, handle: stdout.fileHandleForReading)
+            errDrain.waitForEOF(timeout: 1.0, handle: stderr.fileHandleForReading)
+            let partialErr = String(data: errDrain.data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            var timeoutObject: [String: JSONValue] = [
                 "status": .string("failed"),
                 "reason": .string("helper_timeout"),
                 "helper": .string(helper.path),
-            ])
+            ]
+            if !partialErr.isEmpty {
+                timeoutObject["stderrPreview"] = .string(String(partialErr.prefix(500)))
+            }
+            return .object(timeoutObject)
         }
 
-        let outData = stdout.fileHandleForReading.readDataToEndOfFile()
-        let errData = stderr.fileHandleForReading.readDataToEndOfFile()
+        // The child exited; drain to EOF before parsing so a large final flush
+        // is never truncated mid-JSON. Waits run CONCURRENTLY and stay short:
+        // serial 5s+5s could stretch the helper timeout contract by 10s when a
+        // grandchild holds a pipe open (gpt-5.5 review MED) — the normal case
+        // (writers closed at exit) returns immediately either way.
+        let eofGroup = DispatchGroup()
+        eofGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            outDrain.waitForEOF(timeout: 2.0, handle: stdout.fileHandleForReading)
+            eofGroup.leave()
+        }
+        errDrain.waitForEOF(timeout: 2.0, handle: stderr.fileHandleForReading)
+        eofGroup.wait()
+        let outData = outDrain.data
+        let errData = errDrain.data
         let stdoutText = String(data: outData, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let stderrText = String(data: errData, encoding: .utf8)?
@@ -971,9 +1083,11 @@ extension SwiftToolDispatcher {
             return parsed
         }
 
+        // A capped drain that dropped bytes explains a failed parse honestly:
+        // "no JSON" on a >8MiB report is truncation, not a silent helper.
         return .object([
             "status": .string(process.terminationStatus == 0 ? "completed" : "failed"),
-            "reason": .string("helper_returned_no_json"),
+            "reason": .string(outDrain.truncated ? "helper_output_truncated" : "helper_returned_no_json"),
             "helper": .string(helper.path),
             "exitCode": .int(Int64(process.terminationStatus)),
             "stderrPreview": .string(String(stderrText.prefix(500))),

@@ -437,6 +437,11 @@ public enum GitHubCommandStoreError: Error, LocalizedError, Equatable {
     case invalidTransition(String)
     case malformedOperation
     case invariantViolation(String)
+    /// ops_base.json EXISTS but its bytes could not be read (fd exhaustion, an
+    /// iCloud dataless placeholder, a transient IO error). Deliberately NOT an
+    /// `invariantViolation`: that one is permanent corruption and wedges every
+    /// reader and writer, this one is transient and the caller may retry.
+    case baseUnreadable(String)
 
     public var errorDescription: String? {
         switch self {
@@ -445,6 +450,7 @@ public enum GitHubCommandStoreError: Error, LocalizedError, Equatable {
         case .invalidTransition(let detail): return "Invalid GitHub Command transition: \(detail)"
         case .malformedOperation: return "GitHub Command operation feed contains an unreadable row."
         case .invariantViolation(let detail): return "GitHub Command invariant failed: \(detail)"
+        case .baseUnreadable(let path): return "GitHub Command compaction base at \(path) exists but its bytes could not be read (transient IO); retry rather than treating the feed as corrupt."
         }
     }
 }
@@ -1247,8 +1253,18 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
         // would present a near-empty replay as valid state — data loss
         // dressed as health (review round 2, F1 finding 3). atomicWrite
         // (temp + rename) means readers never see a partial base.
-        let raw = await persistence.readJSON(basePath, defaultValue: .null)
-        guard raw != .null, let base: GitHubCommandCompactionBase = try? Self.decode(raw) else {
+        // Read the bytes DIRECTLY rather than through `readJSON`, whose
+        // default-on-ANY-failure contract cannot distinguish "the file does not
+        // parse" from "the file could not be read at all" (EMFILE burst under
+        // a dispatch storm, an iCloud dataless placeholder, a transient EIO).
+        // The invariant below is PERMANENT and wedges every reader AND writer,
+        // so a transient IO blip must not reach it — it throws a distinct,
+        // retryable error instead. Genuine corruption still fails loud.
+        guard let data = try? Data(contentsOf: basePath) else {
+            throw GitHubCommandStoreError.baseUnreadable(basePath.path)
+        }
+        guard let raw = try? JSONValue.parse(data),
+              let base: GitHubCommandCompactionBase = try? Self.decode(raw) else {
             throw GitHubCommandStoreError.invariantViolation(
                 "ops_base.json exists but is unreadable — refusing to replay a truncated feed from empty"
             )

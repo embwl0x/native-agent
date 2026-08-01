@@ -600,7 +600,10 @@ private struct EmbeddingsSettingsSection: View {
             //                   NATIVE_AGENT_EMBEDDING_MOCK opt-in)
             //   otherwise     → Off (catch-all for runtime-not-wired)
             if s.effectiveBackend == "unavailable" {
-                Label("Fail-closed", systemImage: "exclamationmark.triangle.fill")
+                // UI-6 (2026-08-01): "Fail-closed" is an internal term for the
+                // same thing the install-failure branch above already calls
+                // "Unavailable". One word, and it is the plain one.
+                Label("Unavailable", systemImage: "exclamationmark.triangle.fill")
                     .labelStyle(.titleAndIcon).foregroundStyle(.orange).font(.caption)
             } else if reindexState == "running" {
                 Label("Indexing…", systemImage: "arrow.triangle.2.circlepath")
@@ -622,8 +625,11 @@ private struct EmbeddingsSettingsSection: View {
         VStack(alignment: .leading, spacing: 6) {
             // gpt-5.5 review-2 follow-up: the runtime fails closed when the
             // CoreML resources aren't on disk — embed() throws rather than
-            // returning mock vectors. UI string updated to match.
-            Text("CoreML semantic model is unavailable; semantic recall is fail-closed until the MiniLM bundle is installed.")
+            // returning mock vectors. UI string matches that behavior.
+            // UI-6 (2026-08-01): the headline says what the user lost; the
+            // model identifiers moved down into the secondary line below,
+            // which NativeClient fills from EmbeddingPlainCopy.technicalDetail.
+            Text(EmbeddingPlainCopy.headline(.modelMissing))
                 .font(.caption).foregroundStyle(.secondary)
             if let detail = s.reindexState?.detail, !detail.isEmpty {
                 Text(detail)
@@ -691,14 +697,23 @@ private struct EmbeddingsSettingsSection: View {
             // final 'local' branch is explicit so an unknown future backend
             // value falls into a safe 'status unknown' string instead of
             // silently asserting "CoreML is running."
+            // UI-6 (2026-08-01): plain headline per state. The Core ML /
+            // MiniLM / env-var identifiers still ship — one line down, in the
+            // technical caption, and in the model name row above.
             if s.effectiveBackend == "unavailable" {
-                Text("CoreML model file isn't loadable; semantic recall is fail-closed.")
+                Text(EmbeddingPlainCopy.headline(.modelFailed))
                     .font(.caption).foregroundStyle(.orange)
+                if let detail = EmbeddingPlainCopy.technicalDetail(.modelFailed) {
+                    Text(detail).font(.caption2).foregroundStyle(.secondary)
+                }
             } else if s.effectiveBackend == "hash" {
-                Text("Semantic recall is using mock vectors (config opt-out or NATIVE_AGENT_EMBEDDING_MOCK).")
-                    .font(.caption2).foregroundStyle(.secondary)
+                Text(EmbeddingPlainCopy.headline(.testVectors))
+                    .font(.caption).foregroundStyle(.secondary)
+                if let detail = EmbeddingPlainCopy.technicalDetail(.testVectors) {
+                    Text(detail).font(.caption2).foregroundStyle(.secondary)
+                }
             } else if s.effectiveBackend == "local" {
-                Text("Semantic recall is running through the bundled Apple-native model.")
+                Text(EmbeddingPlainCopy.headline(.byMeaning))
                     .font(.caption2).foregroundStyle(.secondary)
             } else {
                 Text("Embedding backend status unknown (\(s.effectiveBackend)).")

@@ -139,11 +139,12 @@ private struct ChatToolCatalogSection: View {
         // hardcoded sets are still used as overrides for the most-specific
         // categorization (shell tools, system_info), but builder-set names
         // not in those overrides now flow to File Ops via the envelope's
-        // builderAvailable + builderPolicyLocked + builderNotImplemented
-        // sets — so new builder tools added to the dispatcher get
-        // bucketed correctly without UI code changes.
+        // builderAvailable + builderPolicyLocked sets — so new builder tools
+        // added to the dispatcher get bucketed correctly without UI code
+        // changes. (builderNotImplemented retired 2026-08-01: the list had
+        // been permanently empty since the builder cutover completed.)
         let builderSet = Set(
-            catalog.builderAvailable + catalog.builderPolicyLocked + catalog.builderNotImplemented
+            catalog.builderAvailable + catalog.builderPolicyLocked
         )
         let macAppSet = Set(catalog.macAppAvailable + catalog.macAppPolicyLocked)
         var mcp: [ChatCatalogTool] = []
@@ -343,14 +344,9 @@ private struct ChatToolCatalogSection: View {
     private func statusBadge(for tool: ChatCatalogTool) -> some View {
         let isLocked = catalog.builderPolicyLocked.contains(tool.name)
             || catalog.macAppPolicyLocked.contains(tool.name)
-        let isUnimplemented = catalog.builderNotImplemented.contains(tool.name)
         let isActive = tool.loadState == "loaded" || catalog.currentlyLoaded.contains(tool.name)
 
-        if isUnimplemented {
-            Label("not-implemented", systemImage: "circle.dashed")
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.secondary)
-        } else if isLocked {
+        if isLocked {
             Label("policy-locked", systemImage: "lock")
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(.orange)

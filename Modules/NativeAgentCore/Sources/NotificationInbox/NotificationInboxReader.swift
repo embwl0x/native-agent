@@ -1,4 +1,18 @@
-// Reader protocol + factory for the proactive NOTIFICATION inbox surface.
+// RETIRED — reader protocol + factory for the DECOMMISSIONED daemon inbox silo
+// at <dataRoot>/inbox/ (items.jsonl + index.json).
+//
+// THIS IS NOT THE PRODUCTION READ OR WRITE PATH. The live inbox is
+// <dataRoot>/notifications/inbox.jsonl — the append-only event log the macOS
+// and iOS UIs read; status changes go through
+// `NativeClient.updateVisibleNotificationInboxStatus`, and cards are appended
+// by `TriggerNotifierBinding.mirrorCardIntoRealInbox` and the provider-vitals
+// notice lane. Verified 2026-08-01: no code outside this module and its tests
+// constructs `SwiftNativeNotificationInbox` or calls `makeNotificationInbox`.
+// The module is kept — not deleted — because the parity port and its tests are
+// the record of the retired daemon's exact `Inbox` semantics. Do not wire new
+// callers here; point them at notifications/inbox.jsonl.
+//
+// Everything below describes the daemon-parity contract as it was.
 //
 // Mirrors the wave-pattern of KnowledgeGraph / MacAssistantStatus:
 //   - a `NotificationInboxReader` protocol with the READ + safe-status-write calls,
@@ -21,13 +35,12 @@
 // returns nil so the caller can surface unsupported instead of serving an
 // under-enriched payload. The enrichment port remains open.
 //
-// STATUS WRITES (read/archive/dismiss) — gated behind a cross-process lock
-// prereq. The daemon's `_update_status` wraps the write in
-// `file_lock(self._items_path)`. Until the Swift side takes the SAME flock
-// target (PersistenceCore+FileLock against <dataRoot>/inbox/items.jsonl), a
-// native overlay write could race older writers. The factory accepts a
-// `statusWritesEnabled` flag for tests and targeted local disablement; when
-// false, status-mutation methods return nil instead of using any fallback.
+// STATUS WRITES (read/archive/dismiss) — route through
+// `NotificationInboxStore.updateStatusLocked`, which takes the SAME flock
+// target the daemon's `_update_status` did (<dataRoot>/inbox/items.jsonl.lock).
+// The `statusWritesEnabled` flag can disable them entirely (methods return
+// nil). Retired-silo caveat: these writes land in frozen storage nothing else
+// maintains — they are exercised by tests only.
 
 import Foundation
 import NativeAgentCore
@@ -73,20 +86,20 @@ public struct SwiftNativeNotificationInbox: NotificationInboxReader {
     /// Persistence used for the cross-process flock + the ledger appends.
     public let persistence: any PersistenceCoreProtocol
     /// Whether status-mutation writes (read/archive/dismiss) are allowed to run
-    /// natively.
+    /// natively against the RETIRED silo.
     ///
-    /// Wave 32 W16: now DEFAULTS TRUE. The cross-process flock prereq that gated
-    /// this in wave 31 W10 is closed — `NotificationInboxStore.updateStatusLocked`
-    /// wraps the index.json read-modify-write in `withFileLock(itemsPath)`, the
-    /// SAME lock target the daemon's `_update_status` takes. Reads were already
-    /// native; the status writes are now safe to serve natively too.
+    /// Wave 32 W16 made this default TRUE once
+    /// `NotificationInboxStore.updateStatusLocked` wrapped the index.json
+    /// read-modify-write in `withFileLock(itemsPath)`. That is now moot in
+    /// production: nothing constructs this reader outside tests, so the flag
+    /// only affects the parity-test surface.
     public let statusWritesEnabled: Bool
     /// Whether the proactive-outcome ledger side-effect is wired in Swift.
     ///
-    /// Wave 32 W16: now DEFAULTS TRUE. `ProactiveOutcomeLedger` ports
+    /// Wave 32 W16: defaults TRUE. `ProactiveOutcomeLedger` ports
     /// `maybe_record_proactive_inbox_outcome` + `record_proactive_outcome`, so
-    /// archive/dismiss can fire the ledger BEFORE the status write exactly as the
-    /// daemon route did.
+    /// archive/dismiss fire the ledger BEFORE the status write exactly as the
+    /// retired daemon route did. Also test-surface-only today.
     public let proactiveOutcomeWired: Bool
 
     public init(

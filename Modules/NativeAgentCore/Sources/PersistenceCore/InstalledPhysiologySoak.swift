@@ -777,6 +777,11 @@ public actor InstalledPhysiologySoakStore {
             let path = rows.key
             let values = try rows.value.map { try JSONValue.parse(encoder.encode($0)) }
             try await persistence.withFileLock(path) {
+                // Verified NOT the lock-degrade shape (uniform-locking sweep,
+                // 2026-08-01): the lock is already held for every conformer
+                // above; this downcast only selects the SwiftNative BATCH
+                // append API vs per-row appends. Do not "fix" into a nested
+                // withFileLock — it is non-reentrant.
                 if let native = persistence as? SwiftNativePersistenceCore {
                     try await native.appendJSONL(values, to: path)
                 } else {
