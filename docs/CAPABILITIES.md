@@ -79,10 +79,21 @@ but they do not own the agent.
 
 - Authenticated, loopback-only Codex and Claude Code bridges.
 - Full shared chat turns or narrowly gated tool calls.
+- Repository-scale handoffs wake real coding sessions rather than raw
+  one-shot model calls: Codex starts a persisted app-server thread, while
+  Claude Code creates or resumes a topic-scoped CLI session in the same working
+  directory. Both retain their native coding tools and session context.
 - Async handoffs preserve the originating Mac, Telegram, Slack, or iOS route
   and return Agent's completion assessment to that route.
 - External MCP tools are denied on human-out-of-loop bridge calls; normal trust
   and approval rules remain in force.
+
+NativeAgent remains the persistent mind and verification owner. Builder
+sessions receive a bounded work order and project context—not an unrestricted
+memory dump or inherited safety authority—and their claimed result must still
+be proven by tests, receipts, git state, or the canonical external domain. See
+the [User and Agent Guide](USER_GUIDE.md#codex-and-claude-code-as-specialist-builders)
+for the complete operating contract.
 
 ## Fluid Context
 

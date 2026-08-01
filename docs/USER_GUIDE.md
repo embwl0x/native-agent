@@ -176,6 +176,48 @@ available to run provider turns and tools. See
   descriptor at `~/.config/claude-bridge/bridge.json`; never assume port 8771
   is free or bypass the published bearer token.
 
+### Codex and Claude Code as specialist builders
+
+NativeAgent has native file, shell, git, patch, test, and build tools and can
+complete ordinary development work itself. For a difficult repository-scale
+task, however, Codex and Claude Code are purpose-built coding environments:
+they are usually better at sustained multi-file implementation, debugging,
+large test runs, review, and repair. The bridge lets the configured agent hand
+that work to a stronger temporary builder without turning the builder into a
+second memory, personality, scheduler, or authority owner.
+
+These are real coding sessions, not one stateless model call with a copied
+prompt:
+
+- **Codex:** `codex_message` normally starts a persisted, non-ephemeral Codex
+  app-server thread in the selected project directory. The thread receives the
+  chosen model and reasoning controls, Codex's normal repository tools, a
+  bounded execution policy, durable turn identity, and a tracked final reply.
+  A specifically configured pinned thread can be resumed, but the safe public
+  default is a fresh full thread for each independent handoff; it does not
+  silently hijack whichever Codex task the user currently has open.
+- **Claude Code:** `claude_message` starts the real Claude Code CLI with a
+  durable session id. NativeAgent keeps one session pointer per topic and
+  working directory, so a follow-up on the same topic resumes the prior Claude
+  Code conversation, project context, and tool history instead of starting an
+  unaware one-shot process.
+
+NativeAgent sends a bounded work order and the correct working directory; the
+builder then inspects the repository itself. It does **not** receive an
+unbounded dump of private memories, and it does not inherit permission to
+bypass TrustCenter, approvals, connector proof, or effect-time checks.
+Human-out-of-loop bridge turns cannot stop for invisible interactive approval;
+if required authority is unavailable, the builder must return the blocker.
+
+When the builder finishes, NativeAgent records the completion, returns it to
+the originating Mac, Telegram, Slack, or iOS session, and assesses the result
+as success, partial, or failure. A builder's statement is still not proof:
+tests, receipts, git state, and the domain that owns the external effect must
+verify the outcome before the persistent agent treats it as settled. This is
+the intended division of labor: NativeAgent remains the continuous mind;
+Codex or Claude Code temporarily supplies deeper engineering cognition, and
+the verified result returns to that same mind.
+
 ## What the configured agent should do
 
 1. Treat persona and MemoryV2 as identity/fact authority; use `commit_memory`

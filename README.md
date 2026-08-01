@@ -33,9 +33,15 @@ trust, transcript, and receipt rules converge on the same orchestration path.
 | Surfaces | Mac chat, detached chat windows, iPhone/iPad, Telegram, Slack, local Codex/Claude Code bridges, and background work share the same agent factory and policy boundaries. |
 | Providers | ChatGPT OAuth, Codex CLI, OpenAI API, Anthropic OAuth/API, xAI OAuth, Moonshot API, and OpenRouter have distinct model/capability contracts. Current verified catalogs include GPT-5.6 variants, Claude 5/Fable/Opus, Grok 4.5, and Kimi K3. Moonshot keys stay Mac-local and refresh the account-visible Kimi model list. Swarms default to the provider/model selected for the Swarms surface; the agent may choose explicit worker models when useful. |
 | Connectors | Telegram, Slack, GitHub, X, Gmail, Google Calendar, Notion, local workspaces, Mac apps, and the visible browser have explicit setup and proof boundaries. Gmail, Calendar, and Notion reads are bounded and lazy-loaded; public users provide their own OAuth app or integration token locally. |
+| Trust | TrustCenter, SecurityCenter, Full Mac gates, connector proof, approval replay, exact receipts, signed iOS actions, and fail-closed persistence boundaries remain authoritative. |
 
 Local bridge clients should read `~/.config/claude-bridge/bridge.json`. NativeAgent prefers port 8771, advances when it is occupied, and publishes the actual loopback URL and bearer token together rather than requiring clients to assume a fixed port.
-| Trust | TrustCenter, SecurityCenter, Full Mac gates, connector proof, approval replay, exact receipts, signed iOS actions, and fail-closed persistence boundaries remain authoritative. |
+
+For serious repository work, the Codex and Claude Code bridges wake real,
+context-bearing coding sessions—not raw one-shot model calls—then return the
+builder's result to the originating NativeAgent session for canonical
+verification. The [builder bridge guide](docs/USER_GUIDE.md#codex-and-claude-code-as-specialist-builders)
+explains the division of labor, session continuity, permissions, and receipts.
 
 The detailed, evidence-backed inventory lives in
 [docs/CAPABILITIES.md](docs/CAPABILITIES.md).
