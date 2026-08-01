@@ -4,6 +4,32 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ---
 
+## 0.3.2 — reliability sweep and plain-language pass (2026-08-01)
+
+Five audit waves swept the whole app ahead of the public baseline, fixing
+roughly 45 confirmed defects. Persistence now takes the shared file lock at
+every conformer call site (35 sites across 13 files), retiring the pattern
+where a failed downcast silently degraded to unlocked writes; new concurrency
+probes with negative controls guard the invariant. The Slack socket loop only
+advances its history-poll watermark after confirmed delivery, cancels
+background work with a bounded wait that reports abandoned tasks, and
+gap-fills history on reconnect instead of polling on a fixed timer.
+
+User-facing surfaces got an honesty and plain-language pass: provider keys
+without a connection test now read "saved · no test available" instead of
+implying a passed check, and Doctor, Memory, settings, and status copy drop
+internal jargon (file paths, database names, endpoint identifiers) from
+headlines — with regression tests banning it from coming back. Chat session
+retention gained a second planning pass so stale empty sessions can no longer
+starve the active-session cap.
+
+## 0.3.1 — OAuth transport repair and export hardening (2026-07-30)
+
+Repaired the direct ChatGPT OAuth transport. Hardened the public-source
+export pipeline: exact tracked-identity scanning, compilation of rewritten
+tests, purge proofs for retired Git objects, and tracked MiniLM release
+resources for reproducible public builds.
+
 ## 0.3.0 release candidate — public Mac/iPhone continuity (2026-07-29)
 
 NativeAgent's public distribution now uses one production CloudKit identity
