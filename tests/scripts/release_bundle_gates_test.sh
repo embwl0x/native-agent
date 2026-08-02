@@ -56,6 +56,17 @@ if [[ "$personal_hits" != *'/Lookalike.bundle/minilm_vocab.txt' ]]; then
 fi
 rm -rf "$BUNDLE/Contents/Resources/Lookalike.bundle"
 
+# Signature metadata is generated after the pre-signing scan and is opaque to
+# the app. The mounted-artifact verifier uses this same helper and must not
+# interpret signature bytes as app-owned text.
+mkdir -p "$BUNDLE/Contents/_CodeSignature"
+printf '%s\n' 'private_fixture_identity' > "$BUNDLE/Contents/_CodeSignature/CodeResources"
+if [[ -n "$(release_personal_identity_hit_files "$BUNDLE" 'private_fixture_identity')" ]]; then
+  echo "FAIL: signature metadata was not exempted" >&2
+  exit 1
+fi
+rm -rf "$BUNDLE/Contents/_CodeSignature"
+
 printf '%s\n' 'private_fixture_identity' >> "$BIN"
 if NATIVEAGENT_PRIVACY_DENYLIST_FILE="$DENYLIST" \
   release_assert_no_identity_strings "$BUNDLE" >/dev/null 2>&1; then

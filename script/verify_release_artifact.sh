@@ -11,6 +11,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/script/lib/plist_types.sh"
 # shellcheck source=lib/provisioning_profile_contract.sh
 source "$ROOT/script/lib/provisioning_profile_contract.sh"
+# shellcheck source=lib/release_bundle_gates.sh
+source "$ROOT/script/lib/release_bundle_gates.sh"
 APP_NAME="NativeAgent"
 PRODUCT="NativeAgentApp"
 REQUIRE_NOTARIZED=false
@@ -515,12 +517,7 @@ if [[ -f "$PRIVACY_DENYLIST_FILE" ]]; then
 fi
 raw_personal_hits=""
 if [[ -n "$PERSONAL_RE" ]]; then
-  raw_personal_hits="$(
-    find "$BUNDLE" \
-      -path '*/_CodeSignature' -prune -o \
-      -type f -print0 2>/dev/null \
-    | xargs -0 grep -IlE "$PERSONAL_RE" 2>/dev/null || true
-  )"
+  raw_personal_hits="$(release_personal_identity_hit_files "$BUNDLE" "$PERSONAL_RE")"
 fi
 for hit in $raw_personal_hits; do
   fail "configured personal identifier found in release artifact: $hit"

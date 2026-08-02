@@ -68,7 +68,8 @@ release_personal_identity_hit_files() {
   [[ -n "$regex" ]] || return 0
 
   find "$bundle" \
-    \( -path '*/NativeAgentCore_MemoryV2.bundle/minilm_vocab.txt' \
+    \( -path '*/_CodeSignature' \
+       -o -path '*/NativeAgentCore_MemoryV2.bundle/minilm_vocab.txt' \
        -o -path '*/NativeAgentCore_MemoryV2.bundle/minilm.mlpackage/*' \) -prune -o \
     -type f -print0 2>/dev/null \
   | xargs -0 grep -IlE "$regex" 2>/dev/null \
