@@ -188,6 +188,14 @@ extension CognitiveSubstrate {
             !isSelfEvidence($0)
                 && "\($0.subjectReference.type):\($0.subjectReference.id)" == subjectKey
         } ? 1.0 : 0.0
+        // D-1 note (2026-08-02): this term stays BOOLEAN on purpose. The +0.10
+        // view hit is a pinned, documented R2-A behaviour
+        // (StandingViewsTests.unmatchedOrNeutralTextIsByteIdenticalToNoViews),
+        // and regrading it would move a relevance constant for marginal gain.
+        // What D-1 changes here is WHICH concerns can produce the hit: her
+        // active views now contribute lived concerns of their own, so an event
+        // touching her own settled words registers where it previously could
+        // only register through one of the shipped six.
         let activeViewHit = activeStandingViewTagHit(in: event.summary) ? 1.0 : 0.0
         a.goalRelevance = clamp(0.45 * event.importance + 0.30 * kindBase
             + 0.20 * continuity + 0.10 * activeViewHit)
@@ -287,16 +295,28 @@ extension CognitiveSubstrate {
     /// Deterministic keyword read over view title+body — no LLM. Views are sparse
     /// in the wild today (the R2-C eviction fix just let them start surviving), so
     /// this returning false is the norm until Wave E yield builds up.
+    ///
+    /// D-1 (2026-08-02): the concern set is now DERIVED from her (see
+    /// `+AppraisalConcerns`) and is derived ONCE outside the view loop — it
+    /// depends on the views themselves, so deriving it per view would be
+    /// O(views²·terms) on the ingest hot path. Because each active view also
+    /// contributes a LIVED concern made of its own distinctive words, an event
+    /// touching what she actually settled now registers here, where before it
+    /// could only register through one of the shipped six.
     func activeStandingViewTagHit(in text: String) -> Bool {
         let lower = text.lowercased()
         guard !lower.isEmpty else { return false }
+        // Both loops below iterate ACTIVE views, so with none there is nothing to
+        // hit and the concern derivation is pure cost on the ingest hot path.
+        // (Zero active views is still the wild norm.)
+        guard standingViews.values.contains(where: { $0.status == .active }) else { return false }
+        let concerns = appraisalConcerns()
         for view in standingViews.values where view.status == .active {
             let viewText = "\(view.title) \(view.body)".lowercased()
-            for concern in appraisalConcernLexicon() {
-                if concern.keywords.contains(where: { viewText.contains($0) }),
-                   concern.keywords.contains(where: { lower.contains($0) }) {
-                    return true
-                }
+            for concern in concerns
+            where Self.concernMatches(concern, in: viewText)
+                && Self.concernMatches(concern, in: lower) {
+                return true
             }
         }
         return false
@@ -352,20 +372,32 @@ extension CognitiveSubstrate {
                                 "your judgment", "your reading"].contains { probe.contains($0) }
             guard youDirected || workDirected else { return 0 }
         }
+        // D-1: derive the concern set ONCE outside the view loop. It now depends
+        // on the views themselves, so deriving it per view would be quadratic on
+        // the ingest hot path — and with no active views there is nothing to
+        // match, so skip the derivation entirely.
+        guard standingViews.values.contains(where: { $0.status == .active }) else { return 0 }
+        let concerns = appraisalConcerns()
         var aggregate = 0.0
         var matched = 0
         for view in standingViews.values where view.status == .active {
             let viewText = "\(view.title) \(view.body)".lowercased()
-            var hit = false
-            for concern in appraisalConcernLexicon() {
-                if concern.keywords.contains(where: { viewText.contains($0) }),
-                   concern.keywords.contains(where: { lower.contains($0) }) {
-                    hit = true
-                    break
-                }
+            var hitWeight = 0.0
+            for concern in concerns
+            where Self.concernMatches(concern, in: viewText)
+                && Self.concernMatches(concern, in: lower) {
+                hitWeight = max(hitWeight, concern.weight)
             }
-            guard hit else { continue }
-            let conviction = min(1.0, 0.5 + 0.1 * Double(view.evidenceNodeIds.count))
+            guard hitWeight > 0 else { continue }
+            // Conviction: what the view settled on, LIFTED by how much the
+            // matched concern is hers rather than shipped (D-1). Still capped at
+            // 1 per view, so the aggregate stays inside −1…1 and the welfare
+            // bounds downstream are untouched.
+            let conviction = min(
+                1.0,
+                (0.5 + 0.1 * Double(view.evidenceNodeIds.count))
+                    * (hitWeight / Self.appraisalLivedConcernMaximumWeight + 0.5)
+            )
             aggregate += (textValence > 0 ? conviction : -conviction)
             matched += 1
         }
@@ -373,23 +405,4 @@ extension CognitiveSubstrate {
         return Self.clampSigned(aggregate / Double(matched))
     }
 
-    struct AppraisalConcern {
-        let name: String
-        let keywords: [String]
-    }
-
-    func appraisalConcernLexicon() -> [AppraisalConcern] {
-        let configuredUserName = userAddress.lowercased()
-        let relationshipKeywords = (configuredUserName == "you" ? [] : [configuredUserName])
-            + ["together", "trust", "warm", "with you"]
-
-        return [
-            AppraisalConcern(name: "relationship", keywords: relationshipKeywords),
-            AppraisalConcern(name: "truth", keywords: ["honest", "verify", "accurate", "truth", "instrument"]),
-            AppraisalConcern(name: "followThrough", keywords: ["finish", "follow through", "commit", "promised", "deliver"]),
-            AppraisalConcern(name: "repair", keywords: ["fix", "repair", "broke", "recover", "debug"]),
-            AppraisalConcern(name: "learning", keywords: ["learn", "understand", "curious", "figure out", "why"]),
-            AppraisalConcern(name: "userCare", keywords: ["care", "help", "support", "there for", "look after"]),
-        ]
-    }
 }

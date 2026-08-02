@@ -832,6 +832,16 @@ public struct DeskItem: Sendable, Equatable {
     public var pinned: Bool
     public var blockedReason: String?
     public var waitingOn: String?
+    /// Stable handles of the items that block this one. The SEQUENCING edge set
+    /// (Agent's #1): prose in `blockedReason` rots, an edge self-clears when the
+    /// blocker closes. Blockedness itself is DERIVED on every read
+    /// (`DeskSequencing`) — never stored — so a blocker closing auto-unblocks
+    /// its dependents with no writer running and no op to fire.
+    public var blockedOn: [String]
+    /// `yyyy-MM-dd` day or full ISO stamp this item is deliberately parked
+    /// until. A deferred item is not ready AND is never flagged stale
+    /// (Agent's #3 — half her "stale" items are parked on purpose).
+    public var deferUntil: String?
     public var origin: DeskOrigin       // immutable after create; default .owner
     public var pursuit: Pursuit?        // present only for origin=agent, kind=project
 
@@ -875,7 +885,9 @@ public struct DeskItem: Sendable, Equatable {
         blockedReason: String? = nil,
         waitingOn: String? = nil,
         origin: DeskOrigin = .owner,
-        pursuit: Pursuit? = nil
+        pursuit: Pursuit? = nil,
+        blockedOn: [String] = [],
+        deferUntil: String? = nil
     ) {
         self.handle = handle
         self.alias = alias
@@ -897,6 +909,8 @@ public struct DeskItem: Sendable, Equatable {
         self.waitingOn = waitingOn
         self.origin = origin
         self.pursuit = pursuit
+        self.blockedOn = blockedOn
+        self.deferUntil = deferUntil
     }
 
     /// Live refs in render priority order (gh_pr > gh_issue > … > note), capped.
@@ -925,6 +939,11 @@ public struct DeskItem: Sendable, Equatable {
         if let closedAt, !closedAt.isEmpty { obj["closedAt"] = .string(closedAt) }
         if let blockedReason, !blockedReason.isEmpty { obj["blockedReason"] = .string(blockedReason) }
         if let waitingOn, !waitingOn.isEmpty { obj["waitingOn"] = .string(waitingOn) }
+        // M10 again: both sequencing fields are OMITTED at their default, so a
+        // pre-wave row round-trips BYTE-IDENTICAL and the compaction base's
+        // shape gate (deskJSONShapeMatches) sees no new keys.
+        if !blockedOn.isEmpty { obj["blockedOn"] = .array(blockedOn.map { .string($0) }) }
+        if let deferUntil, !deferUntil.isEmpty { obj["deferUntil"] = .string(deferUntil) }
         // origin OMITTED when the neutral default — a pre-origin state.json row
         // round-trips byte-identical (M10). pursuit emitted only when present.
         if origin != .owner { obj["origin"] = .string(origin.rawValue) }
@@ -963,6 +982,17 @@ public struct DeskItem: Sendable, Equatable {
         } else if strictCollections, obj["notes"] != nil {
             return nil   // present but not an array — corrupt, never "empty"
         }
+        // blockedOn: same strict rule as refs/notes/reservations. In the
+        // compaction base this snapshot is the ONLY copy — a silently-dropped
+        // blocker edge would vanish a dependency FOREVER, and the item would
+        // read as ready when it is not.
+        var blockedOn: [String] = []
+        if case .array(let arr)? = obj["blockedOn"] {
+            blockedOn = arr.compactMap { if case .string(let s) = $0 { return s } else { return nil } }
+            if strictCollections, blockedOn.count != arr.count { return nil }
+        } else if strictCollections, obj["blockedOn"] != nil {
+            return nil   // present but not an array — corrupt, never "empty"
+        }
         if strictCollections, let pursuitValue = obj["pursuit"] {
             // A present pursuit must be an OBJECT, and every nested ledger
             // collection that is present must be a fully-decodable array —
@@ -995,7 +1025,9 @@ public struct DeskItem: Sendable, Equatable {
             waitingOn: jsonString(obj, "waitingOn"),
             // M10: origin decodes OPTIONAL defaulting .owner; pursuit optional.
             origin: jsonString(obj, "origin").flatMap(DeskOrigin.decodePersisted) ?? .owner,
-            pursuit: obj["pursuit"].map { Pursuit.fromJSON($0) }
+            pursuit: obj["pursuit"].map { Pursuit.fromJSON($0) },
+            blockedOn: blockedOn,
+            deferUntil: jsonString(obj, "deferUntil")
         )
     }
 }
@@ -1100,6 +1132,10 @@ public enum DeskOpBody: Sendable, Equatable {
     case reserveWorkSession(reservationId: String, day: String, slot: String)
     case completeWorkSession(reservationId: String, receipt: String)
     case workLog(receipt: String)   // desk_work_log — a plain work receipt note
+    // Sequencing seam. Both REPLACE (never merge) so the op is the whole truth
+    // of the field at that point in the feed.
+    case setBlockedOn(handles: [String])   // replaces the WHOLE blocker set
+    case setDeferUntil(until: String?)     // nil / "" CLEARS the parked date
 
     public var token: String {
         switch self {
@@ -1118,6 +1154,8 @@ public enum DeskOpBody: Sendable, Equatable {
         case .reserveWorkSession: return "reserve_work_session"
         case .completeWorkSession: return "complete_work_session"
         case .workLog: return "work_log"
+        case .setBlockedOn: return "set_blocked_on"
+        case .setDeferUntil: return "set_defer_until"
         }
     }
 }
@@ -1199,6 +1237,15 @@ public struct DeskOp: Sendable, Equatable {
             obj["receipt"] = .string(receipt)
         case let .workLog(receipt):
             obj["receipt"] = .string(receipt)
+        case let .setBlockedOn(handles):
+            // ALWAYS emitted, even EMPTY — an empty set is a CLEAR, and the
+            // omit-empty `put` helper above would drop it and silently lose the
+            // clear on replay (the exact shape of the update_title empty-summary
+            // bug this file already carries a scar from).
+            obj["blockedOn"] = .array(handles.map { .string($0) })
+        case let .setDeferUntil(until):
+            // Same reason: "" IS the clear and must survive the round-trip.
+            obj["until"] = .string(until ?? "")
         }
         return .object(obj)
     }
@@ -1273,6 +1320,13 @@ public struct DeskOp: Sendable, Equatable {
         case "work_log":
             guard let receipt = jsonString(obj, "receipt") else { return nil }
             body = .workLog(receipt: receipt)
+        case "set_blocked_on":
+            // Absent / wrong-typed → [] , which is the CLEAR. The op is a
+            // whole-set replace, so there is nothing to preserve on a partial read.
+            body = .setBlockedOn(handles: jsonStringArray(obj, "blockedOn"))
+        case "set_defer_until":
+            let raw = jsonString(obj, "until") ?? ""
+            body = .setDeferUntil(until: raw.isEmpty ? nil : raw)
         default:
             return nil // tolerant: unknown op tokens skipped
         }

@@ -4,6 +4,30 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ---
 
+## Unreleased — weak-spot campaign round 3 (2026-08-02)
+
+Cognition took its first roadmap step in a month: appraisal now derives what
+matters to the agent from her own approved standing views (the shipped
+defaults become a floor), and a felt resolution only registers when something
+actually at stake resolves — a provider call succeeding no longer manufactures
+a feeling. System-vs-user turns are classified by who originated them instead
+of by keyword-matching the user's words, so ordinary prose ("remind me about
+the doctor") is no longer dropped from the felt layer.
+
+A shared set of lifecycle primitives (scoped acquire/release handles and a
+bounded await) closes the repo's most common bug shape — an acquire whose
+release misses an exit path — with five confirmed leaks retrofitted, including
+an exec-slot leak that could permanently wedge the Mac-control bridge and an
+unbounded wait held under a cross-process lock. The five-site tool-registration
+invariant is now enforced by a test rather than remembered.
+
+The public-release path is hardened: the identity scrub is now the only route
+to a public DMG, with a byte-level leak gate, and the two loopback bridges no
+longer bind a port or mint a token on public installs. Completed Workshop runs
+now leave a memory the agent can recall — 56 executions that previously left no
+trace. Onboarding is reachable on a genuinely blank machine again, and several
+silent provider/tool failures now fail loud. ~5,300 core + 870 app tests green.
+
 ## 0.3.2 — reliability sweep and plain-language pass (2026-08-01)
 
 Five audit waves swept the whole app ahead of the public baseline, fixing

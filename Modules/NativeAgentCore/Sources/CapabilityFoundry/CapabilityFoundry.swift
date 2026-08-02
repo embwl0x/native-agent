@@ -247,12 +247,14 @@ public struct SwiftNativeCapabilityFoundryClient: CapabilityFoundryClient {
         //   tool     → <root>/tools/registry.json       (status=="active")
         //   workflow → <root>/workflows/registry.json   (definition count)
         //   mcp      → <root>/mcp/servers.json          (entry count)
-        // Lanes with no native source (panel/plugin/catalog) keep count 0,
-        // and the envelope says so honestly: top-level status is "partial"
-        // (renders as a neutral badge via NativeAgentTheme.statusColor's
-        // default branch) with a `detail` naming what is and isn't wired.
-        // The review queues + the side-effecting backlog tick remain
-        // unported (see file header).
+        // 2026-08-02 (E-1): lanes with no native source (panel/plugin/catalog)
+        // are GONE rather than reported as zero — the Mac panel renders one
+        // card per lane, so a permanently-zero lane is a rendered claim about a
+        // system that does not exist. Top-level status stays "partial" (a
+        // neutral badge via NativeAgentTheme.statusColor's default branch) with
+        // a `detail` naming exactly what is and isn't wired. The review queues +
+        // the side-effecting backlog tick remain unported (see file header);
+        // their envelope fields stay empty and nothing renders them.
         let skillEntries = InstalledSkillInventory.list(dataRoot: root)
         let toolEntries = Self.arrayEntries(at: root.appendingPathComponent("tools/registry.json"))
         let workflowEntries = Self.arrayEntries(at: root.appendingPathComponent("workflows/registry.json"))
@@ -307,15 +309,14 @@ public struct SwiftNativeCapabilityFoundryClient: CapabilityFoundryClient {
             CapabilityFoundryLane(id: "tool", title: "Tools", status: "ready", count: toolEntries.count, reviewCount: 0, endpoint: "native:tools/registry.json", policyGate: "signed_manifest_and_validation", hotPath: "summary_only_until_matched"),
             CapabilityFoundryLane(id: "workflow", title: "Workflows", status: "ready", count: workflowCount, reviewCount: 0, endpoint: "native:workflows/registry.json", policyGate: "step_approval_gates", hotPath: "summary_only_until_routed"),
             CapabilityFoundryLane(id: "mcp", title: "MCP Servers", status: "ready", count: mcpCount, reviewCount: 0, endpoint: "native:mcp/servers.json", policyGate: "consent_ledger", hotPath: "server_manifest_only"),
-            // loop-C honesty fix (2026-06-13): panel/plugin/catalog lanes are
-            // NOT natively wired (the result-level `detail` already says so) —
-            // the panel data/action backends are throw-stubs and plugin/catalog
-            // have no native source. Stop badging them "ready"; "degraded"
-            // matches reality (static panels still render; dynamic data/actions
-            // and plugin/catalog do not).
-            CapabilityFoundryLane(id: "panel", title: "App Readouts", status: "degraded", count: 0, reviewCount: 0, endpoint: nil, policyGate: "skillBuilderPolicy.allow_ui_panels", hotPath: "json_schema_rendered_outside_chat"),
-            CapabilityFoundryLane(id: "plugin", title: "On-Demand Plugins", status: "degraded", count: 0, reviewCount: 0, endpoint: nil, policyGate: "build_or_install_only_when_task_justifies_it", hotPath: "plugin_manifest_only_never_preinstalled"),
-            CapabilityFoundryLane(id: "catalog", title: "Capability Packs", status: "degraded", count: 0, reviewCount: 0, endpoint: nil, policyGate: "signed_pack_validation", hotPath: "catalog_metadata_only"),
+            // REMOVED 2026-08-02 (E-1): the panel / plugin / catalog lanes.
+            // 2026-06-13 downgraded them from "ready" to "degraded" — honest
+            // about the code, still a lie on screen, because CapabilitiesView
+            // renders one card per lane and three cards reading
+            // "App Readouts — DEGRADED — 0" are furniture around systems that
+            // do not exist (no native source, no store, no backend). A lane
+            // appears here when it can count something real. The result-level
+            // `detail` below names what is and isn't wired.
         ]
         let readouts: [CapabilityFoundryReadout] = [
             CapabilityFoundryReadout(id: "capabilities", title: "Capabilities tab", status: "active", surface: "mac"),
@@ -325,7 +326,7 @@ public struct SwiftNativeCapabilityFoundryClient: CapabilityFoundryClient {
         ]
         return CapabilityFoundryResult(
             status: "partial",
-            detail: "Native counts for skills/tools/workflows/mcp; panel, plugin, and catalog lanes plus review queues are not yet wired natively.",
+            detail: "Native counts for skills/tools/workflows/mcp. No panel, plugin, or capability-pack lane exists; the review queue and the auto-implementation ledger are unported, so reviewQueue/recentArtifacts are always empty and summary.review/autoCreated are always 0.",
             principle: "Tiny core runtime; the agent can build plugin-shaped add-ons on demand through manifests, validation, approval, and lazy routing.",
             hotPathContract: hotPath,
             summary: summary,

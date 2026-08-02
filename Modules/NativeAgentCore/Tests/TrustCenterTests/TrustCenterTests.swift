@@ -841,6 +841,28 @@ private func bundle(default d: String, overrides: [String: JSONValue]) -> [Strin
     #expect(tc.autonomyForTool("foo", policy: b) == "send_approval")
 }
 
+// A1.4 (prerelease-upgrade-campaign): a bundle with NO `autonomyDefault` at
+// all must fail CLOSED. The literal used to be "auto" — a partial/rewritten
+// policy bundle silently bought unattended tool fire for every unlisted tool.
+// The normal loader backfills "supervised" (TrustCenter+PolicyLoading), so this
+// pins the defense-in-depth literal for callers that hand-build a bundle —
+// notably ChatOrchestration+AutonomyGate, which only sets `autonomyDefault`
+// when the policy carries a string value for it.
+@Test func autonomyForTool_absent_autonomyDefault_fails_closed_to_send_approval() async throws {
+    let tc = SwiftNativeTrustCenter()
+    // No `autonomyDefault` key whatsoever.
+    let noDefault: [String: JSONValue] = [
+        "autonomyOverrides": .object(["mac.shell": .string("blocked")]),
+    ]
+    #expect(tc.autonomyForTool("some.unlisted.tool", policy: noDefault) == "send_approval")
+    // Empty tool name takes the same fallback.
+    #expect(tc.autonomyForTool("", policy: noDefault) == "send_approval")
+    // Totally empty bundle too.
+    #expect(tc.autonomyForTool("anything", policy: [:]) == "send_approval")
+    // An explicit entry still wins over the fail-closed fallback.
+    #expect(tc.autonomyForTool("mac.shell", policy: noDefault) == "blocked")
+}
+
 @Test func defaultTrustPolicy_includes_swarmPolicy() async throws {
     let tc = SwiftNativeTrustCenter()
     let p = tc.defaultTrustPolicy()

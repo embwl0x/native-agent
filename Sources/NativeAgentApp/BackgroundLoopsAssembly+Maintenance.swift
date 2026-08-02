@@ -182,100 +182,16 @@ extension BackgroundLoopsAssembly {
         )
     }
 
-    /// A5.5: daily stale-artifact sweep — the delete-side sibling of the
-    /// detect-never-delete disk-hygiene watchdog above. Reaps orphaned
-    /// `context/<runId>.json` receipts left by the retired Python daemon and
-    /// archives `*.bak*` backups older than 30 days.
-    ///
-    /// REPORT-ONLY unless `staleArtifactSweepEnabled` is set. The key is unset on
-    /// a fresh install, so `UserDefaults.bool` returns false and every tick plans,
-    /// files ONE `sweep_pass` receipt describing what it WOULD remove, and removes
-    /// nothing. Same gate shape as `makeGoldenEvalLoop` — a step with an
-    /// irreversible side effect does not run unasked.
-    ///
-    /// Dependency-clean: the receipt append is an injected closure routed through
-    /// the shared `appendJSONLCapped`, so the sweep's own ledger cannot become
-    /// the next unbounded feed the disk-hygiene watchdog has to flag.
-    static func makeStaleArtifactSweepLoop(
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) -> StaleArtifactSweepLoop {
-        StaleArtifactSweepLoop(
-            // Same restart-starvation fix as the disk-hygiene loop above: the
-            // sweep's own day reservation dedups to once per UTC day; the
-            // hourly interval just guarantees the first tick actually lands
-            // within an hour of launch instead of 24h (which daily deploys
-            // kept resetting — the first sweep_pass report never filed).
-            interval: 60 * 60,
-            dataRoot: dataRoot,
-            isEnabled: { UserDefaults.standard.bool(forKey: "staleArtifactSweepEnabled") },
-            appendReceipt: { line in
-                let path = dataRoot
-                    .appendingPathComponent("logs", isDirectory: true)
-                    .appendingPathComponent("maintenance_sweep.jsonl")
-                do {
-                    try await appendJSONLCapped(
-                        line,
-                        to: path,
-                        using: SwiftNativePersistenceCore(),
-                        maxLines: JSONLLineCaps.maintenanceSweep,
-                        logLabel: "stale_artifact_sweep"
-                    )
-                    return true
-                } catch {
-                    // A false return aborts the pass before anything is removed
-                    // and rolls the day back, so the next tick retries.
-                    FileHandle.standardError.write(Data(
-                        "stale_artifact_sweep: receipt append failed: \(error)\n".utf8))
-                    return false
-                }
-            }
-        )
-    }
-
-    // MARK: - MEASURE v2: golden-eval loop
-
-    /// Weekly golden-eval submission for a CONTROLLED scoreboard cohort
-    /// (north-star MEASURE v2). OFF by default — `goldenEvalEnabled` is unset on
-    /// a fresh install, so `UserDefaults.bool` returns false and the loop is a
-    /// silent no-op (golden jobs EXECUTE and cost tokens; never run unasked).
-    /// When enabled, submits the fixed `GoldenEvalJobs.jobs` through a read-only
-    /// runner; the scoreboard segments them via
-    /// `weeklyOutcomeStats(onlyTriggerSource: GoldenEvalJobs.triggerSource)`.
-    static func makeGoldenEvalLoop(
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) -> GoldenEvalLoop {
-        return GoldenEvalLoop(
-            dataRoot: dataRoot,
-            isEnabled: { UserDefaults.standard.bool(forKey: "goldenEvalEnabled") },
-            submitGoldenJobs: { now in
-                // Use the REAL planner (SwiftNativeWorkshopPlannerLLM) — same as
-                // production makeMissionExecutor. The bare init defaults to
-                // StubWorkshopPlannerLLM, which would give golden missions the
-                // deterministic 2-step STUB plan instead of exercising the real
-                // planner — a golden eval that measures the stub is worthless
-                // (gpt-5.5 review BLOCKING, 2026-06-15).
-                // Pin the runner clock to the loop's `now` so each mission's
-                // createdAt keys to the SAME ISO-week bucket the loop's marker
-                // used (gpt-5.5 re-review HIGH — shared timestamp source).
-                let runner = SwiftNativeWorkshopRunner(
-                    root: dataRoot,
-                    planner: SwiftNativeWorkshopPlannerLLM(
-                        connectorActionsProvider: makeWorkshopPlannerConnectorActionsProvider(dataRoot: dataRoot),
-                        lifecycleObserver: dataRoot == PersistenceCore.defaultDataRoot()
-                            ? NativeCognitionRuntime.shared
-                            : nil,
-                        // Ledger rows follow the runner's root (gpt-5.5 review
-                        // BLOCKING, 2026-07-02).
-                        runLedgerDataRoot: dataRoot),
-                    now: { now })
-                var submitted = 0
-                for spec in GoldenEvalJobs.jobs {
-                    if (try? await runner.submit(spec: spec)) != nil { submitted += 1 }
-                }
-                return submitted
-            }
-        )
-    }
+    // NOT BUILT HERE (2026-08-02, silo-dissolution E-4): the stale-artifact
+    // sweep and the golden-eval loop. Both gated on UserDefaults keys
+    // (`staleArtifactSweepEnabled`, `goldenEvalEnabled`) that NOTHING in the
+    // repo ever writes — no @AppStorage, no Toggle, no set(forKey:). Registered,
+    // they woke forever and could never act, and the sweep additionally walked
+    // data/ daily to append a report nobody reads. Deleted rather than given a
+    // toggle: no theater, and neither lane was asked for. `StaleArtifactSweep`,
+    // `StaleArtifactSweepLoop`, `GoldenEvalLoop` and `GoldenEvalJobs` remain in
+    // BackgroundLoops with their tests, so rebuilding either is a factory + one
+    // line in `assembleAllLoops` — behind a real switch this time.
 
 
     // The weekly self-improvement loop's on/off gate is the

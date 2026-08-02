@@ -1,6 +1,37 @@
 import Foundation
 import PersistenceCore
 
+/// Process-wide "already warned about this server" set. `listMCPTools` runs on
+/// every chat turn, so the warning is deduped per server id — loud once, not
+/// once per turn.
+final class _MCPWarnedServerSet: @unchecked Sendable {
+    private let lock = NSLock()
+    private var seen: Set<String> = []
+    private var order: [String] = []
+
+    /// Returns true when this is the FIRST time we've seen `serverId`.
+    func insert(_ serverId: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard seen.insert(serverId).inserted else { return false }
+        order.append(serverId)
+        return true
+    }
+
+    var recorded: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return order
+    }
+
+    func reset() {
+        lock.lock()
+        seen.removeAll()
+        order.removeAll()
+        lock.unlock()
+    }
+}
+
 /// Descriptor surfaced to the LLM-side tool list. The bridged-tool name
 /// convention is `mcp__<serverId>__<toolName>` (matches the daemon's
 /// `mcp_dispatcher_bridge` shape so consent/risk lookup stays uniform).
@@ -81,7 +112,23 @@ public enum MCPToolBridge {
         var out: [MCPToolDescriptor] = []
         out.reserveCapacity(servers.count * 4)
         for (serverId, serverRisk) in servers {
-            guard let tools = toolsCache[serverId] else { continue }
+            guard let tools = toolsCache[serverId], !tools.isEmpty else {
+                // FAIL LOUD (NORTHSTAR clause 2). A server that servers.json
+                // says is usable but that contributes ZERO descriptors is a
+                // silent capability loss — the model is told it has no such
+                // tools and reports "I don't have access". Before F-B3 this
+                // was the state of EVERY stdio server, because nothing wrote
+                // `mcp/cache/tools.json` after the daemon was retired. The
+                // cure is `SwiftNativeMCPDispatcher.refreshAllToolsCaches()`;
+                // this line makes the disease visible either way.
+                warnEmptyServer(
+                    serverId: serverId,
+                    reason: toolsCache[serverId] == nil
+                        ? "no entry in mcp/cache/tools.json (never handshaked, or the cache was never stamped)"
+                        : "its cache entry lists zero tools"
+                )
+                continue
+            }
             for t in tools {
                 let bridged = "mcp__\(serverId)__\(t.name)"
                 out.append(
@@ -173,6 +220,27 @@ public enum MCPToolBridge {
         let consentRisk = normalizedRisk(consent.risk, fallback: "")
         let currentRisk = normalizedRisk(effectiveRiskClass, fallback: "")
         return !consentRisk.isEmpty && consentRisk == currentRisk
+    }
+
+    // MARK: - Silent-loss warnings
+
+    /// Servers already warned about, so the per-turn tool-list assembly logs
+    /// once per server rather than on every chat turn.
+    private static let warnedServers = _MCPWarnedServerSet()
+
+    /// Server ids warned about this process, in first-seen order. The
+    /// observable half of the loud failure — stderr is the human half.
+    public static var emptyServerWarnings: [String] { warnedServers.recorded }
+
+    /// Test seam — forget the warned set so a test can observe the warning.
+    public static func _resetEmptyServerWarnings() { warnedServers.reset() }
+
+    private static func warnEmptyServer(serverId: String, reason: String) {
+        guard warnedServers.insert(serverId) else { return }
+        let message = "MCPToolBridge: server '\(serverId)' is configured but contributes ZERO tool "
+            + "descriptors — \(reason). The model will not see any mcp__\(serverId)__* tools. Run "
+            + "SwiftNativeMCPDispatcher.refreshAllToolsCaches() to stamp the cache from a live handshake.\n"
+        FileHandle.standardError.write(Data(message.utf8))
     }
 
     // MARK: - File IO

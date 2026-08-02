@@ -7,10 +7,13 @@ import NativeAgentCore
 
 @Suite("U5 W-G — MemoryV2 misc")
 struct U5WGMiscTests {
+    /// Onboarded install — USER.md generation is gated on onboarding having
+    /// completed (fix-blank-install-onboarding, 2026-08-02).
     private func tmpRoot() -> URL {
         let url = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("u5wg-\(UUID().uuidString)", isDirectory: true)
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        try? Data("completed_at=test\n".utf8).write(to: url.appendingPathComponent(".onboarded"))
         return url
     }
 

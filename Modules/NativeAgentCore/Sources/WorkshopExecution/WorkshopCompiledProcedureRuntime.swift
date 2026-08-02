@@ -266,16 +266,43 @@ public struct WorkshopCompiledLocalFileCopyInvocation: Sendable {
         return outcome
     }
 
-    private static func executeOrAwaitCanonicalProcedure(
+    /// HARD deadline on the canonical terminal observation below.
+    ///
+    /// fix-locked-unbounded-wait (2026-08-02): this observation runs INSIDE
+    /// `ProcedureArtifactStore.invoke`'s `withFileLock(invocations.jsonl)` —
+    /// an untimed cross-process `LOCK_EX`. With three Workshop missions already
+    /// running, `claim` returns nil, `start` throws, and the wait below used to
+    /// be unbounded: the record stayed `queued`, nothing ever wrote it again,
+    /// and EVERY procedure invocation in EVERY process wedged behind the flock.
+    /// One hang became a system-wide wedge. The deadline converts that into one
+    /// typed, logged, per-caller failure.
+    /// Companion rule (design doc C-2): no unbounded wait under a file lock.
+    static var canonicalObservationTimeoutSeconds: TimeInterval {
+        BoundedWait.seconds(
+            fromEnv: "NATIVE_AGENT_WORKSHOP_CANONICAL_OBSERVATION_TIMEOUT_SECONDS",
+            fallback: 300
+        )
+    }
+
+    /// Internal (not private) so the bounded-observation test can drive it
+    /// directly: the whole point of the deadline is that this call RETURNS.
+    static func executeOrAwaitCanonicalProcedure(
         executionID: String,
         runner: SwiftNativeWorkshopRunner,
         loop: WorkshopExecutorLoop
     ) async throws -> WorkshopExecutionRecord {
         do {
             return try await loop.start(executionId: executionID)
-        } catch {
-            // The resident executor may have won the queued→running CAS. It is
-            // still the same canonical record caused by this invocation.
+        } catch let error as WorkshopExecutionError {
+            // NARROW on purpose: the ONLY tolerated failure is losing the
+            // queued→running CAS to the resident executor (a typed
+            // `invalidRequest` refusal) — it is still the same canonical record
+            // caused by this invocation, so we fall through and observe it.
+            // The old blanket `catch {}` also swallowed CancellationError and
+            // every real dispatch/IO failure, so a cancelled or broken start
+            // became an unbounded wait under the invocation flock instead of an
+            // error. Anything else rethrows.
+            guard case .invalidRequest = error else { throw error }
         }
         let terminal: Set<String> = [
             "completed", "done", "succeeded", "failed", "cancelled", "canceled",
@@ -284,20 +311,26 @@ public struct WorkshopCompiledLocalFileCopyInvocation: Sendable {
            terminal.contains(current.status.lowercased()) {
             return current
         }
-        let changes = FileChangeEvents(paths: [runner.executionRecordPath(executionID)])
-        defer { changes.cancel() }
-        // Close the registration race without a timer or poll.
-        if let current = await runner.getWorkshopExecution(executionID),
-           terminal.contains(current.status.lowercased()) {
-            return current
-        }
-        for await _ in changes.stream {
-            try Task.checkCancellation()
+        let timeout = canonicalObservationTimeoutSeconds
+        return try await BoundedWait.run(
+            seconds: timeout,
+            reason: "canonical Workshop terminal record \(executionID)"
+        ) {
+            let changes = FileChangeEvents(paths: [runner.executionRecordPath(executionID)])
+            defer { changes.cancel() }
+            // Close the registration race without a timer or poll.
             if let current = await runner.getWorkshopExecution(executionID),
                terminal.contains(current.status.lowercased()) {
                 return current
             }
+            for await _ in changes.stream {
+                try Task.checkCancellation()
+                if let current = await runner.getWorkshopExecution(executionID),
+                   terminal.contains(current.status.lowercased()) {
+                    return current
+                }
+            }
+            throw WorkshopCompiledProcedureRuntimeError.canonicalObservationEnded
         }
-        throw WorkshopCompiledProcedureRuntimeError.canonicalObservationEnded
     }
 }

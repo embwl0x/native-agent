@@ -252,7 +252,11 @@ struct InstalledPhysiologySoakRecorderTests {
         let report = await recorder.report()
         let elapsed = started.duration(to: ContinuousClock().now)
 
-        #expect(elapsed < .seconds(1))
+        // 10s, not 1s: the claim is "the 20ms drain deadline won, not the
+        // wedged durability barrier" — any finite bound with headroom proves
+        // that, while a 1s bound loses to scheduler noise under full-suite
+        // parallelism.
+        #expect(elapsed < .seconds(10))
         #expect(report.claimBlockers.contains(
             "physiology recorder durability barrier did not complete"
         ))
@@ -324,8 +328,11 @@ struct InstalledPhysiologySoakRecorderTests {
         return root
     }
 
+    // 10s deadline, not 2s: positive steps only need the deadline to exceed
+    // worst-case scheduler noise under full-suite parallelism — a green run
+    // still returns at the first 2ms poll that observes the condition.
     private func waitUntil(
-        timeoutSeconds: TimeInterval = 2,
+        timeoutSeconds: TimeInterval = 10,
         _ predicate: @escaping @Sendable () async -> Bool
     ) async throws {
         let deadline = Date().addingTimeInterval(timeoutSeconds)

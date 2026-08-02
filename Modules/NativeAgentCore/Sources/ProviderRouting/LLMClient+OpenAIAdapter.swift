@@ -50,6 +50,25 @@ public final class OpenAIAdapter: LLMAdapter {
     }
 
     public func complete(prompt: String, system: String?, model: String) async throws -> String {
+        try await complete(prompt: prompt, system: system, model: model, tools: nil)
+    }
+
+    /// F-B2 (2026-08-02): the api-key OpenAI lane used to inherit the protocol's
+    /// default tools-aware `complete`, which DROPS `tools` on the floor — the
+    /// request body carried only model+messages, no `.toolCall` was ever
+    /// emitted, and the agent silently believed it had zero tools. The Moonshot
+    /// and xAI adapters speak the identical Chat-Completions wire; this brings
+    /// OpenAI to parity (tools / tool_choice / parallel_tool_calls out,
+    /// tool_calls parsed back in on BOTH the streaming and non-streaming paths).
+    ///
+    /// BYTE-IDENTITY: `tools == nil || tools!.isEmpty` produces the exact body
+    /// this method sent before the change.
+    public func complete(
+        prompt: String,
+        system: String?,
+        model: String,
+        tools: [LLMToolSchema]?
+    ) async throws -> String {
         guard let key = apiKeyOverride
                 ?? LLMCredentialResolver.resolveAPIKey(
                     envVar: "OPENAI_API_KEY",
@@ -75,6 +94,7 @@ public final class OpenAIAdapter: LLMAdapter {
             "model": model,
             "messages": messages,
         ]
+        try Self.applyTools(to: &body, tools: tools)
         OpenAIExecutionControls.applyChatCompletionsControls(to: &body, model: model)
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
@@ -94,13 +114,10 @@ public final class OpenAIAdapter: LLMAdapter {
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         try throwIfChatCompletionsError(status: status, data: data, mapping: Self.statusMapping, response: response)
 
-        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let choices = obj["choices"] as? [[String: Any]],
-              let first = choices.first,
-              let message = first["message"] as? [String: Any],
-              let content = message["content"] as? String else {
+        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw LLMError.invalidResponse(status: status)
         }
+        let parsed = try Self.parseCompletion(obj, status: status)
         // U1 step 1: token/cache usage telemetry (non-fatal, numbers only).
         let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
         await telemetry.record(
@@ -111,7 +128,7 @@ public final class OpenAIAdapter: LLMAdapter {
             ttftMs: nil,
             durationMs: durationMs
         )
-        return content
+        return parsed
     }
 
     // MARK: - Structured messages (native vision)
@@ -134,7 +151,20 @@ public final class OpenAIAdapter: LLMAdapter {
         let hasImage = messages.contains { m in
             m.content.contains { if case .image = $0 { return true }; return false }
         }
-        guard hasImage else {
+        // F-B2: tool_use / tool_result blocks now demand the STRUCTURED body
+        // (assistant.tool_calls + role:"tool" messages). Flattening them into
+        // "[tool_use …]" text is what made the api-key OpenAI lane unable to
+        // run a second tool-loop turn. A plain text-only conversation still
+        // takes the byte-identical flatten path below.
+        let hasToolBlocks = messages.contains { m in
+            m.content.contains {
+                switch $0 {
+                case .toolUse, .toolResult: return true
+                default: return false
+                }
+            }
+        }
+        guard hasImage || hasToolBlocks else {
             // Text-only: reproduce the LLMAdapter default flatten EXACTLY.
             var parts: [String] = []
             for m in messages {
@@ -154,7 +184,7 @@ public final class OpenAIAdapter: LLMAdapter {
                 }
             }
             let combined = parts.joined(separator: "\n")
-            return try await complete(prompt: combined, system: system, model: model)
+            return try await complete(prompt: combined, system: system, model: model, tools: tools)
         }
 
         guard let key = apiKeyOverride
@@ -172,63 +202,11 @@ public final class OpenAIAdapter: LLMAdapter {
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        // Chat Completions multi-part content: image_url parts (data-URL
-        // object) FIRST, then a text part. text-only messages keep the plain
-        // string content form so non-image turns in a mixed conversation are
-        // unchanged.
-        var apiMessages: [[String: Any]] = []
-        if let sys = system, !sys.isEmpty {
-            apiMessages.append(["role": "system", "content": sys])
-        }
-        for m in messages {
-            let role = m.role == .user ? "user" : "assistant"
-            let hasImg = m.content.contains { if case .image = $0 { return true }; return false }
-            if hasImg {
-                var contentParts: [[String: Any]] = []
-                for block in m.content {
-                    switch block {
-                    case .image(let mediaType, let base64, _, _):
-                        contentParts.append([
-                            "type": "image_url",
-                            "image_url": ["url": "data:\(mediaType);base64,\(base64)"],
-                        ])
-                    case .text(let t):
-                        contentParts.append(["type": "text", "text": t])
-                    case .toolUse(_, let name, let inputJSON):
-                        let argsStr = String(data: inputJSON, encoding: .utf8) ?? "{}"
-                        contentParts.append(["type": "text", "text": "[tool_use \(name) \(argsStr)]"])
-                    case .toolResult(_, let content, _):
-                        contentParts.append(["type": "text", "text": "[tool_result] \(content)"])
-                    }
-                }
-                apiMessages.append(["role": role, "content": contentParts])
-            } else {
-                // Non-image message: flatten ALL blocks (text + tool blocks) to
-                // a single string content. Mirrors the api-key Anthropic adapter
-                // so a tool_use/tool_result message later in an image-bearing
-                // conversation is NOT silently dropped.
-                var parts: [String] = []
-                for block in m.content {
-                    switch block {
-                    case .text(let t):
-                        parts.append(t)
-                    case .toolUse(_, let name, let inputJSON):
-                        let argsStr = String(data: inputJSON, encoding: .utf8) ?? "{}"
-                        parts.append("[tool_use \(name) \(argsStr)]")
-                    case .toolResult(_, let content, _):
-                        parts.append("[tool_result] \(content)")
-                    case .image:
-                        break  // unreachable: this is the no-image branch
-                    }
-                }
-                apiMessages.append(["role": role, "content": parts.joined(separator: "\n")])
-            }
-        }
-
         var body: [String: Any] = [
             "model": model,
-            "messages": apiMessages,
+            "messages": Self.chatMessages(messages: messages, system: system),
         ]
+        try Self.applyTools(to: &body, tools: tools)
         OpenAIExecutionControls.applyChatCompletionsControls(to: &body, model: model)
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
@@ -242,13 +220,10 @@ public final class OpenAIAdapter: LLMAdapter {
         }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         try throwIfChatCompletionsError(status: status, data: data, mapping: Self.statusMapping, response: response)
-        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let choices = obj["choices"] as? [[String: Any]],
-              let first = choices.first,
-              let message = first["message"] as? [String: Any],
-              let content = message["content"] as? String else {
+        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw LLMError.invalidResponse(status: status)
         }
+        let parsed = try Self.parseCompletion(obj, status: status)
         let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
         await telemetry.record(
             provider: providerId,
@@ -258,7 +233,7 @@ public final class OpenAIAdapter: LLMAdapter {
             ttftMs: nil,
             durationMs: durationMs
         )
-        return content
+        return parsed
     }
 
     // MARK: - Streaming (SSE)
@@ -421,6 +396,242 @@ public final class OpenAIAdapter: LLMAdapter {
             }
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    // MARK: - Structured streaming (tool calls)
+
+    /// F-B2 (2026-08-02): the api-key OpenAI lane had NO `streamMessages`
+    /// override, so it fell through to the protocol default — one
+    /// `completeMessages` round-trip yielded as a single `.textDelta`, and a
+    /// `.toolCall` event was structurally impossible. Every tool the chat spine
+    /// offered vanished on this provider with no error and no log. This mirrors
+    /// `MoonshotAdapter.streamMessages` on the identical Chat-Completions wire.
+    public func streamMessages(
+        messages: [LLMMessage],
+        system: String?,
+        model: String,
+        tools: [LLMToolSchema]?
+    ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
+        let session = self.session
+        let endpoint = self.endpoint
+        let apiKeyOverride = self.apiKeyOverride
+        let credentialRoot = self.credentialRoot
+        let includesProcessEnvironmentCredentials = self.includesProcessEnvironmentCredentials
+        let telemetry = self.telemetry
+        let providerId = self.providerId
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    guard let key = apiKeyOverride
+                            ?? LLMCredentialResolver.resolveAPIKey(
+                                envVar: "OPENAI_API_KEY",
+                                providerConfigFile: "openai.json",
+                                dataRoot: credentialRoot,
+                                includeEnvironment: includesProcessEnvironmentCredentials),
+                          !key.isEmpty else {
+                        throw LLMError.notConfigured(provider: "openai")
+                    }
+
+                    var req = URLRequest(url: endpoint)
+                    req.httpMethod = "POST"
+                    req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+                    applyStreamingLLMHeaders(to: &req)
+                    var body: [String: Any] = [
+                        "model": model,
+                        "messages": Self.chatMessages(messages: messages, system: system),
+                        "stream": true,
+                        "stream_options": ["include_usage": true],
+                    ]
+                    try Self.applyTools(to: &body, tools: tools)
+                    OpenAIExecutionControls.applyChatCompletionsControls(to: &body, model: model)
+                    req.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+                    let requestStartNs = DispatchTime.now().uptimeNanoseconds
+                    let bytes: URLSession.AsyncBytes
+                    let response: URLResponse
+                    do {
+                        (bytes, response) = try await session.bytes(for: req)
+                    } catch {
+                        throw mapTransportError(error, fallback: .underlying(message: "connection refused: \(endpoint.host ?? "openai")"))
+                    }
+                    let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                    if !(200..<300).contains(status) {
+                        var errData = Data()
+                        do {
+                            for try await byte in bytes {
+                                errData.append(byte)
+                                if errData.count >= 4096 { break }
+                            }
+                        } catch {}
+                        try throwIfChatCompletionsError(
+                            status: status, data: errData,
+                            mapping: Self.statusMapping, response: response
+                        )
+                        throw LLMError.invalidResponse(status: status)
+                    }
+
+                    var ttftMs: Int?
+                    var sawContent = false
+                    var decoder = ChatCompletionsStreamDecoder(providerLabel: "OpenAI")
+                    for try await sse in SSEEventStream(bytes) {
+                        try Task.checkCancellation()
+                        let frame = try decoder.consume(payload: sse.data)
+                        if frame.isDone { break }
+                        // Liveness: reasoning frames and tool-argument deltas are
+                        // real model output but not reply text — keep the idle
+                        // clock in ProviderStreamGuard advancing during a long
+                        // thinking phase or a big argument accumulation.
+                        if frame.reasoning != nil { continuation.yield(.keepAlive) }
+                        if let content = frame.content {
+                            if ttftMs == nil {
+                                ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
+                            }
+                            sawContent = true
+                            continuation.yield(.textDelta(content))
+                        }
+                        for _ in 0..<frame.toolCallDeltaCount { continuation.yield(.keepAlive) }
+                    }
+                    guard decoder.sawDone else {
+                        throw LLMError.streamTruncated(message: "openai stream ended without [DONE]")
+                    }
+                    let completed = decoder.completedToolCalls(idPrefix: "openai")
+                    // A3.3 parity: `[DONE]` with zero content AND zero tool calls
+                    // is an empty-and-silent turn. A tool-only turn is NOT empty.
+                    if !sawContent && completed.isEmpty {
+                        throw LLMError.streamTruncated(
+                            message: "openai stream produced no content ([DONE], empty)"
+                        )
+                    }
+                    for call in completed {
+                        continuation.yield(.toolCall(.init(
+                            id: call.id,
+                            name: call.name,
+                            inputJSON: Data(call.arguments.utf8)
+                        )))
+                    }
+                    let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
+                    await telemetry.record(
+                        provider: providerId, model: model, streaming: true,
+                        usage: decoder.usage, ttftMs: ttftMs, durationMs: durationMs
+                    )
+                    continuation.finish()
+                } catch let err as LLMError {
+                    continuation.finish(throwing: err)
+                } catch is CancellationError {
+                    continuation.finish(throwing: CancellationError())
+                } catch {
+                    continuation.finish(throwing: mapTransportError(error, fallback: .underlying(message: "stream: \(error)")))
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    // MARK: - Shared body / response helpers
+
+    /// Emit `tools` / `tool_choice` / `parallel_tool_calls` exactly the way the
+    /// Moonshot and xAI adapters do on this same wire. No-op (byte-identical
+    /// body) when there are no tools.
+    static func applyTools(to body: inout [String: Any], tools: [LLMToolSchema]?) throws {
+        guard let tools, !tools.isEmpty else { return }
+        body["tools"] = try tools.map { schema in
+            [
+                "type": "function",
+                "function": [
+                    "name": schema.name,
+                    "description": schema.description,
+                    "parameters": try JSONSerialization.jsonObject(with: schema.parametersJSON),
+                ],
+            ]
+        }
+        body["tool_choice"] = "auto"
+        body["parallel_tool_calls"] = true
+    }
+
+    /// Structured Chat-Completions message array: images as `image_url` parts,
+    /// assistant tool calls as `tool_calls`, tool results as `role:"tool"` rows.
+    static func chatMessages(messages: [LLMMessage], system: String?) -> [[String: Any]] {
+        var out: [[String: Any]] = []
+        if let system, !system.isEmpty {
+            out.append(["role": "system", "content": system])
+        }
+        for message in messages {
+            let role = message.role == .user ? "user" : "assistant"
+            var textParts: [String] = []
+            var contentParts: [[String: Any]] = []
+            var toolCalls: [[String: Any]] = []
+            var toolResults: [[String: Any]] = []
+            var hasImage = false
+            for block in message.content {
+                switch block {
+                case .text(let text):
+                    textParts.append(text)
+                    contentParts.append(["type": "text", "text": text])
+                case .image(let mediaType, let base64, _, _):
+                    hasImage = true
+                    contentParts.append([
+                        "type": "image_url",
+                        "image_url": ["url": "data:\(mediaType);base64,\(base64)"],
+                    ])
+                case .toolUse(let id, let name, let inputJSON):
+                    toolCalls.append([
+                        "id": id,
+                        "type": "function",
+                        "function": [
+                            "name": name,
+                            "arguments": String(data: inputJSON, encoding: .utf8) ?? "{}",
+                        ],
+                    ])
+                case .toolResult(let toolUseID, let content, _):
+                    toolResults.append([
+                        "role": "tool", "tool_call_id": toolUseID, "content": content,
+                    ])
+                }
+            }
+            if !toolCalls.isEmpty {
+                out.append([
+                    "role": "assistant",
+                    "content": textParts.isEmpty ? NSNull() : textParts.joined(separator: "\n"),
+                    "tool_calls": toolCalls,
+                ])
+            } else if !contentParts.isEmpty {
+                out.append([
+                    "role": role,
+                    "content": hasImage ? contentParts : textParts.joined(separator: "\n"),
+                ])
+            }
+            out.append(contentsOf: toolResults)
+        }
+        return out
+    }
+
+    /// Non-streaming reply → text plus `<tool_use …>` markers, the same shape
+    /// the Anthropic / Moonshot / xAI adapters return for the tool loop.
+    /// A tool-ONLY reply carries `content: null` — that used to fail the
+    /// `content as? String` guard and throw `.invalidResponse`.
+    static func parseCompletion(_ obj: [String: Any], status: Int) throws -> String {
+        guard let choices = obj["choices"] as? [[String: Any]],
+              let message = choices.first?["message"] as? [String: Any] else {
+            throw LLMError.invalidResponse(status: status)
+        }
+        let content = (message["content"] as? String) ?? ""
+        let rawCalls = message["tool_calls"] as? [[String: Any]] ?? []
+        let markers: [String] = rawCalls.enumerated().compactMap { index, raw in
+            guard let function = raw["function"] as? [String: Any],
+                  let name = function["name"] as? String, !name.isEmpty else { return nil }
+            let id = (raw["id"] as? String) ?? "openai_tool_\(index)_\(name)"
+            let args = (function["arguments"] as? String) ?? "{}"
+            return "<tool_use id=\"\(id)\" name=\"\(name)\">\(args)</tool_use>"
+        }
+        if content.isEmpty && markers.isEmpty {
+            // Neither text nor a tool call: the reply is genuinely unusable.
+            // Keep the pre-change failure mode for that case.
+            if message["content"] is String { return "" }
+            throw LLMError.invalidResponse(status: status)
+        }
+        var pieces: [String] = content.isEmpty ? [] : [content]
+        pieces.append(contentsOf: markers)
+        return pieces.joined(separator: "\n")
     }
 
     /// R-M1: shared status→error mapping for the api-key OpenAI Chat Completions

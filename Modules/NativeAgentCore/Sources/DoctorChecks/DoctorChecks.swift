@@ -1037,6 +1037,96 @@ public struct CoreMLEmbedderCheck: RepairingDoctorCheck {
     }
 }
 
+// MARK: - OpLogHealthCheck
+
+/// Is any append-only op-log feed wedged or growing without bound?
+///
+/// WHY THIS CHECK EXISTS (gpt-5.5 review 2026-08-02, finding 3): the three
+/// snapshot+tail stores REFUSE to compact while any row is undecodable — right,
+/// because compacting would delete rows this build cannot read — but refusing
+/// costs liveness, and the only signal was a deduped stderr line plus a couple
+/// of APIs nothing called. In a GUI app stderr goes nowhere. One row written by
+/// a newer build can therefore wedge compaction for weeks while every append
+/// replays an ever-longer feed, and the first thing User would notice is the desk
+/// getting slow. Doctor is where "app-owned local state is in a bad way" already
+/// lives, so the surface goes here rather than in a new reporting lane.
+///
+/// STATUS SEMANTICS:
+///   • `fail` — a feed cannot be read at all, or holds rows this build cannot
+///     use. Compaction is blocked; the feed can only grow.
+///   • `warn` — every feed is decodable but one has grown past
+///     `growthWarnMultiple`× its own compaction threshold (i.e. compaction has
+///     not run in a long time), or a torn trailing line was seen.
+///   • `ok` — nothing skipped and every feed is inside its normal band. Missing
+///     feed files are a fresh install and count as ok.
+public struct OpLogHealthCheck: DoctorCheck {
+    public let id: String = "op_log_health"
+    public let title: String = "Op-Log Health"
+    private let root: URL
+
+    public init(root: URL = defaultDataRoot()) {
+        self.root = root
+    }
+
+    public func run() async -> CheckResult {
+        var lines: [String] = []
+        var failed = false
+        var warned = false
+
+        func record(_ health: SnapshotTailOpLog.OpLogHealth) {
+            lines.append(health.detailLine)
+            switch health.status {
+            case .blocked: failed = true
+            case .warn: warned = true
+            case .ok: break
+            }
+        }
+
+        // A store whose read THROWS is itself a finding — GitHubCommandStore
+        // fails loud on an undecodable op — so each feed is probed
+        // independently and a throw becomes this feed's fail line, never an
+        // abort of the other two.
+        do {
+            record(try await SwiftNativeDeskStore(dataRoot: root, changeBus: StoreChangeBus()).opLogHealth())
+        } catch {
+            failed = true
+            lines.append("DeskStore: unreadable — \(error)")
+        }
+        do {
+            record(try await SwiftNativeTaskLedger(dataRoot: root).feedHealth())
+        } catch {
+            failed = true
+            lines.append("TaskLedger: unreadable — \(error)")
+        }
+        do {
+            record(try await GitHubCommandStore(dataRoot: root, changeBus: StoreChangeBus()).opLogHealth())
+        } catch {
+            failed = true
+            lines.append("GitHubCommandStore: unreadable — \(error)")
+        }
+
+        let detail = lines.joined(separator: "; ")
+        if failed {
+            return CheckResult(
+                id: id, title: title, status: "fail",
+                detail: "Op-log compaction is blocked: \(detail)",
+                repair: "Run the newest build of the app AND of the task-ledger / desk-sweep CLIs — "
+                    + "the feed holds rows an older binary cannot decode, and compaction refuses to "
+                    + "delete them. The feed keeps growing until a build that understands them runs."
+            )
+        }
+        if warned {
+            return CheckResult(
+                id: id, title: title, status: "warn",
+                detail: "An op-log feed has grown well past its compaction threshold: \(detail)",
+                repair: "Usually self-healing — the next write past the threshold compacts. If it "
+                    + "persists, a writer is failing before it reaches the compaction step."
+            )
+        }
+        return CheckResult(id: id, title: title, status: "ok", detail: detail)
+    }
+}
+
 public actor SwiftNativeDoctorChecks: DoctorChecksProtocol {
     private let checks: [DoctorCheck]
 
@@ -1049,6 +1139,7 @@ public actor SwiftNativeDoctorChecks: DoctorChecksProtocol {
         MemoryStoreCheck(),
         CoreMLEmbedderCheck(),
         ICloudBridgeStateCheck(),
+        OpLogHealthCheck(),
     ]) {
         self.checks = checks
     }

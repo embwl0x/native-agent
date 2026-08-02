@@ -222,6 +222,15 @@ public actor WorkshopExecutorLoop {
     /// asking for approval is honored even under yolo).
     private let stepApprovalEnforced: @Sendable () async -> Bool
     private let terminalEventSink: WorkshopTerminalEventSink?
+    /// Resolves the mission→memory recorder LAZILY, on the first terminal event.
+    /// Lazy because the production writer touches `SwiftNativeMemoryV2.shared`,
+    /// which opens the SQLite store on first access — constructing an executor
+    /// must not have that side effect. See `defaultMissionMemoryProvider`.
+    private let missionMemoryProvider: @Sendable () -> WorkshopMissionMemoryRecorder?
+    /// The write queue, built on first terminal event from the resolved
+    /// recorder. Terminal transitions HAND OFF to this and return; they never
+    /// wait on the memory store. See ``WorkshopMissionMemoryQueue``.
+    private var missionMemoryQueue: WorkshopMissionMemoryQueue?
     private let now: @Sendable () -> Date
     /// One-shot startup orphan-reclaim, memoized as a Task so EVERY fresh-claim
     /// path (drainOnce, start, resumeAfterApproval) awaits the SAME reclaim to
@@ -241,11 +250,16 @@ public actor WorkshopExecutorLoop {
     /// `root.path` makes both instances share ONE reclaim: it runs exactly once
     /// per process per root, before any claim by any instance. Unique temp roots
     /// keep test isolation; production's single root shares one barrier.
-    private static let reconcileLock = NSLock()
-    // nonisolated(unsafe): access is hand-synchronized under reconcileLock
-    // (ensureOrphansReconciled) — the compiler can't see the lock, so we vouch
-    // for the safety. Never touch this dict outside the lock.
-    private nonisolated(unsafe) static var reconcileTasksByRoot: [String: Task<Void, Never>] = [:]
+    ///
+    /// fix-reconcile-memo-leak (2026-08-02): this used to be a hand-locked
+    /// `[String: Task]` with an insert and NO removal — every unique data root
+    /// permanently retained its reclaim `Task`, and a Task retains its closure
+    /// context, i.e. the executor instance that created it. `OnceByKey` keeps
+    /// the identical once-per-process-per-root guarantee but drops the Task
+    /// (and its captures) the moment the run completes, keeping only a
+    /// completion marker — plus a `reset()` seam so a temp-root-per-test suite
+    /// stops growing the table for the life of the test process.
+    static let orphanReclaimOnce = OnceByKey<String>(name: "workshop-orphan-reclaim")
     private static let logger = Logger(subsystem: "com.nativeagent.workshop", category: "executor")
 
     /// - Parameters:
@@ -279,6 +293,7 @@ public actor WorkshopExecutorLoop {
         approvalTimeoutInterval: TimeInterval? = nil,
         stepApprovalEnforced: @escaping @Sendable () async -> Bool = { true },
         terminalEventSink: WorkshopTerminalEventSink? = nil,
+        missionMemory: WorkshopMissionMemoryRecorder? = nil,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.root = root
@@ -321,7 +336,51 @@ public actor WorkshopExecutorLoop {
         self.approvalTimeoutNanos = UInt64(safeApprovalSecs * 1_000_000_000)
         self.stepApprovalEnforced = stepApprovalEnforced
         self.terminalEventSink = terminalEventSink
+        self.missionMemoryProvider = Self.missionMemoryProvider(
+            injected: missionMemory,
+            root: root
+        )
         self.now = now
+    }
+
+    /// Mission→memory wiring rule, in one place.
+    ///
+    /// An INJECTED recorder always wins (tests, and any future caller that wants
+    /// a different store). Otherwise the default writer is used ONLY when this
+    /// executor is running against the process's default data root — the same
+    /// root `SwiftNativeMemoryV2.shared` is rooted at. An executor on a temp root
+    /// (every test, every fixture) gets no recorder rather than silently writing
+    /// fixture missions into User's real memory store.
+    ///
+    /// This is why the plug needs no app-assembly wiring: production builds its
+    /// executor on the default root, so it is on by default, in-module, and any
+    /// future executor construction inherits it.
+    private static func missionMemoryProvider(
+        injected: WorkshopMissionMemoryRecorder?,
+        root: URL
+    ) -> @Sendable () -> WorkshopMissionMemoryRecorder? {
+        if let injected {
+            return { injected }
+        }
+        guard root.standardizedFileURL.path
+            == PersistenceCore.defaultDataRoot().standardizedFileURL.path else {
+            return { nil }
+        }
+        return {
+            WorkshopMissionMemoryRecorder(
+                writer: SwiftNativeWorkshopMissionMemoryWriter(),
+                log: { level, message in
+                    // A failed write must be findable (gpt-5.5 review A1): the
+                    // whole sink used to go through `.info`, which is exactly
+                    // where a "she can't remember this mission" line goes to
+                    // die at default log level.
+                    switch level {
+                    case .error: Self.logger.error("\(message, privacy: .public)")
+                    case .info: Self.logger.info("\(message, privacy: .public)")
+                    }
+                }
+            )
+        }
     }
 
     /// `NATIVE_AGENT_MAX_ACTIVE_MISSIONS` — the SAME env var the daemon's
@@ -439,25 +498,16 @@ public actor WorkshopExecutorLoop {
 
     /// Run the one-shot orphan reclaim to completion, memoized PER DATA-ROOT so
     /// concurrent claim paths — across ALL executor instances on that root —
-    /// share ONE reclaim and none claims before it finishes. The lookup-or-
-    /// create runs inside `reconcileLock` (a brief synchronous critical section,
-    /// no await held) so the Task is created exactly once per root even when two
-    /// instances race here; `await task.value` happens after the unlock. (Strong
-    /// self-capture in the Task is intentional and harmless: reconcileOrphaned-
-    /// Running only touches root-derived paths, so whichever instance first
-    /// creates the Task can run the reclaim correctly for any instance; the
-    /// retained instance lives for the process, same as before.)
+    /// share ONE reclaim and none claims before it finishes. `OnceByKey` is an
+    /// actor, so the lookup-or-create is atomic even when two instances race
+    /// here, and every caller awaits the same run to COMPLETION. (Strong
+    /// self-capture in the operation is intentional and harmless:
+    /// reconcileOrphanedRunning only touches root-derived paths, so whichever
+    /// instance first starts the reclaim runs it correctly for any instance —
+    /// and unlike the old memo table, the capture is released the moment the
+    /// run completes.)
     private func ensureOrphansReconciled() async {
-        let key = root.path
-        let task: Task<Void, Never> = {
-            Self.reconcileLock.lock()
-            defer { Self.reconcileLock.unlock() }
-            if let existing = Self.reconcileTasksByRoot[key] { return existing }
-            let created = Task { await self.reconcileOrphanedRunning() }
-            Self.reconcileTasksByRoot[key] = created
-            return created
-        }()
-        await task.value
+        await Self.orphanReclaimOnce.run(root.path) { await self.reconcileOrphanedRunning() }
     }
 
     /// One-time startup reconcile (crash/restart orphan recovery). A mission
@@ -1744,6 +1794,161 @@ public actor WorkshopExecutorLoop {
     private func emitTerminalEvent(_ record: WorkshopExecutionRecord?, reason: String?) async {
         guard let record, ["completed", "failed", "cancelled"].contains(record.status) else { return }
         await terminalEventSink?(record, reason)
+        // Receipts first, memory second — and the memory write is HANDED OFF,
+        // never awaited (gpt-5.5 review A1, BLOCKING). `recorder.record` embeds,
+        // inserts, then sweeps retention; awaiting it here meant a busy SQLite
+        // or a stalled embedder held the terminal path and the executor did not
+        // advance to the next queued mission. The queue preserves order, keeps
+        // the write, and logs its own failures at `.error`.
+        // `waitForMissionMemoryWrites()` is the seam for anyone who needs the
+        // tail (shutdown, tests).
+        await resolvedMissionMemoryQueue(building: true)?.enqueue(record, reason: reason)
+    }
+
+    /// Resolve — and on first use, build — the mission-memory queue.
+    /// `building: false` never constructs one, so the wait seam cannot create a
+    /// queue (and thus touch `SwiftNativeMemoryV2.shared`) as a side effect.
+    private func resolvedMissionMemoryQueue(building: Bool) -> WorkshopMissionMemoryQueue? {
+        if let missionMemoryQueue { return missionMemoryQueue }
+        guard building, let recorder = missionMemoryProvider() else { return nil }
+        let queue = WorkshopMissionMemoryQueue(recorder: recorder)
+        missionMemoryQueue = queue
+        return queue
+    }
+
+    /// Await every mission-memory write handed off so far. Nothing on the
+    /// execution path calls this — it exists so shutdown and tests can observe
+    /// a lane that is deliberately off the hot path.
+    ///
+    /// `timeout` is the SHUTDOWN CONTRACT (gpt-5.5 review, BLOCKING 1,
+    /// 2026-08-02). Production quit stops loops, MCP, context and cognition
+    /// under a 3s budget and never drained this queue, so a terminal mission
+    /// whose write was still in embed/SQLite left `mission.json` on disk with
+    /// no memory behind it — silently. Draining fixes that; draining
+    /// UNBOUNDED would trade a lost memory for a hung quit, so an unfinished
+    /// drain is ABANDONED at the deadline and says so at `.error`.
+    ///
+    /// Returns true when the tail actually drained. `nil` timeout = wait
+    /// forever (tests).
+    @discardableResult
+    public func waitForMissionMemoryWrites(timeout: TimeInterval? = nil) async -> Bool {
+        guard let queue = resolvedMissionMemoryQueue(building: false) else { return true }
+        guard let timeout, timeout.isFinite, timeout > 0 else {
+            await queue.drain()
+            return true
+        }
+        let gate = WorkshopMissionMemoryGate()
+        let drain = Task.detached(priority: .utility) {
+            await queue.drain()
+            gate.signal(true)
+        }
+        let timer = Task.detached(priority: .utility) {
+            try? await Task.sleep(nanoseconds: UInt64(min(timeout, 3600) * 1_000_000_000))
+            gate.signal(false)
+        }
+        let drained = await gate.wait()
+        // The drain task is deliberately NOT cancelled on timeout: the write may
+        // still land before the process actually exits, and cancelling it could
+        // only make the loss more certain.
+        timer.cancel()
+        if !drained {
+            let pending = await queue.pendingCount()
+            Self.logger.error(
+                """
+                [workshop-memory] shutdown drain ABANDONED after \(timeout, privacy: .public)s with \
+                \(pending, privacy: .public) mission-memory write(s) still pending — those missions are on \
+                disk and she will not remember them.
+                """
+            )
+        }
+        _ = drain
+        return drained
+    }
+
+    /// CRASH RECONCILIATION — the other half of BLOCKING 1.
+    ///
+    /// A bounded drain covers a clean quit. A crash (or a kill inside the
+    /// shutdown budget) still ends with a terminal `mission.json` and no memory
+    /// row, and nothing ever went back for it. This does, at launch.
+    ///
+    /// BOUNDED, TWICE, and here is the choice: only executions whose record was
+    /// last written inside `within` (default 7 days) are considered, and at most
+    /// `maxRecords` (default 100) of them, newest first. 7 days because the loss
+    /// window it repairs is "the last time this app was killed", not "all of
+    /// history", and because the store's own mission lane only keeps
+    /// `retentionCap` (200) rows anyway — rescanning a year of executions on
+    /// every launch would read hundreds of files to re-mint memories retention
+    /// is about to archive. The scan reads directory MODIFICATION DATES first
+    /// and only opens `mission.json` for the survivors, so the file reads are
+    /// bounded by `maxRecords`, not by the size of the history.
+    ///
+    /// Returns the number of missions handed to the write queue.
+    @discardableResult
+    public func reconcileMissedMissionMemories(
+        within: TimeInterval = 7 * 24 * 3600,
+        maxRecords: Int = 100
+    ) async -> Int {
+        guard maxRecords > 0 else { return 0 }
+        let cutoff = now().addingTimeInterval(-max(0, within))
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(
+            at: executionRecordsRoot,
+            includingPropertiesForKeys: [.isDirectoryKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return 0 }
+
+        // Cheap pass: dates only, no JSON reads.
+        let recent: [(url: URL, modified: Date)] = entries.compactMap { url in
+            guard let values = try? url.resourceValues(
+                forKeys: [.isDirectoryKey, .contentModificationDateKey]
+            ), values.isDirectory == true else { return nil }
+            guard let modified = values.contentModificationDate, modified >= cutoff else { return nil }
+            return (url, modified)
+        }
+        .sorted { $0.modified > $1.modified }
+        .prefix(maxRecords)
+        .map { $0 }
+        // Resolve the queue only once there is something to reconcile: on the
+        // production root, building it opens the MemoryV2 SQLite store, and a
+        // launch with no recent missions should not pay for that here.
+        guard !recent.isEmpty, let queue = resolvedMissionMemoryQueue(building: true) else { return 0 }
+
+        // KNOWN EDGE, deliberately accepted: `recordedSources` sees ACTIVE rows
+        // only, so a mission whose memory retention already ARCHIVED reads as
+        // missing and gets re-written. It costs one duplicate narrative at
+        // worst (`store()` collapses byte-identical content), and it only
+        // reaches a row that is both inside the 7-day window AND already past
+        // the 200-row cap — i.e. 200+ missions in a week. Widening the read to
+        // archived rows would trade that for re-reading retired history on
+        // every launch, which is the cost this window exists to avoid.
+        let known = await queue.recordedSources()
+        var reconciled = 0
+        for entry in recent {
+            let raw = await persistence.readJSON(
+                entry.url.appendingPathComponent("mission.json"), defaultValue: .null
+            )
+            guard case .object(let object) = raw,
+                  case .string(let id)? = object["id"], !id.isEmpty else { continue }
+            let record = SwiftNativeWorkshopRunner.recordFromJSON(object)
+            guard ["completed", "failed", "cancelled"].contains(record.status) else { continue }
+            guard case .remember = WorkshopMissionMemory.decide(record) else { continue }
+            guard !known.contains(WorkshopMissionMemory.source(for: record)) else { continue }
+            Self.logger.info(
+                """
+                [workshop-memory] reconcile: terminal mission \(id, privacy: .public) \
+                (status \(record.status, privacy: .public)) has no memory — re-queuing the write \
+                that a crash or a killed shutdown lost.
+                """
+            )
+            await queue.enqueue(record, reason: nil)
+            reconciled += 1
+        }
+        if reconciled > 0 {
+            Self.logger.info(
+                "[workshop-memory] reconcile: re-queued \(reconciled, privacy: .public) missed mission memories"
+            )
+        }
+        return reconciled
     }
 
     private func scanQueue() async -> [WorkshopExecutionRecord] {

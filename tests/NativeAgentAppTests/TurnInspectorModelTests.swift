@@ -252,8 +252,13 @@ struct TurnInspectorModelTests {
         // One final clean start then stop.
         await store.start()
         await store.stop()
-        // Let the detached defer-unsubscribes drain.
-        try await Task.sleep(nanoseconds: 400_000_000)
+        // Positive step (the detached defer-unsubscribes SHOULD drain) polls
+        // with a generous deadline — a fixed 400ms beat routinely loses to
+        // scheduler noise under full-suite parallelism.
+        let drainDeadline = Date().addingTimeInterval(10)
+        while await TurnTraceBus.shared.subscriberCount > baseline, Date() < drainDeadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
         let after = await TurnTraceBus.shared.subscriberCount
         #expect(after <= baseline, "no sink leaked after start/stop cycling (baseline \(baseline), after \(after))")
     }

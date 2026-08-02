@@ -328,14 +328,59 @@ extension AppModel {
         }
     }
 
+    /// What a Doctor run actually produced.
+    ///
+    /// gpt-5.5 review BLOCKING 2 (2026-08-02): `runDoctor` used to return a Bool
+    /// that meant "a report came back", and onboarding read it as "the repair
+    /// worked". A repair that ran to completion over a store it could NOT fix
+    /// returned `true`, so the wizard showed "<Agent> is ready" over a broken
+    /// scaffold. The two questions are now distinct on the type.
+    enum DoctorRunOutcome: Equatable {
+        /// No report: another run held the lock, or the run threw.
+        case unavailable(String)
+        /// A report came back. `failingChecks` are its `status == fail|error`
+        /// rows — the run completing says nothing about them.
+        case completed(status: String, failingChecks: [DoctorCheck])
+
+        /// True when the run produced a report at all. This is the old Bool's
+        /// meaning; callers that only wanted "did it run" keep using it.
+        var didRun: Bool {
+            if case .completed = self { return true }
+            return false
+        }
+
+        /// Failing rows outside the `live.*` namespace, which covers optional
+        /// user-configured subsystems (Telegram token, SearXNG URL). Those are
+        /// real Doctor findings but they are NOT the app-owned scaffold, and
+        /// blocking onboarding on them would strand a user who skipped setup.
+        var failingScaffoldChecks: [DoctorCheck] {
+            guard case .completed(_, let failing) = self else { return [] }
+            return failing.filter { !$0.id.hasPrefix("live.") }
+        }
+
+        /// One line naming what to fix, for a user-facing surface.
+        var failureDetail: String {
+            switch self {
+            case .unavailable(let reason):
+                return reason
+            case .completed:
+                let failing = failingScaffoldChecks
+                guard !failing.isEmpty else { return "Doctor reported a failure with no failing check." }
+                return failing.map { "\($0.title): \($0.detail)" }.joined(separator: " ")
+            }
+        }
+    }
+
     @MainActor
     @discardableResult
-    func runDoctor(repair: Bool) async -> Bool {
+    func runDoctor(repair: Bool) async -> DoctorRunOutcome {
         // PATCH-2026-05-30: surface in-flight state to the UI so the user
         // sees a spinner + "Running…" text instead of an apparent freeze.
         // Block concurrent invocations — clicking Run while a run is in
         // flight should be a no-op, not a queued duplicate.
-        guard !doctorRunning else { return false }
+        guard !doctorRunning else {
+            return .unavailable("A Doctor run is already in progress.")
+        }
         doctorRunning = true
         doctorRunStartedAt = Date()
         // gpt-5.5 review (B2 wave): invalidate the snapshot-reuse freshness
@@ -348,14 +393,18 @@ extension AppModel {
             doctorRunStartedAt = nil
         }
         do {
-            doctorReport = try await client.runDoctor(repair: repair)
+            let report = try await client.runDoctor(repair: repair)
+            doctorReport = report
             doctorReportCompletedAt = Date()
             statusText = repair ? "Doctor repair finished" : "Doctor check finished"
             await refreshAll()
-            return true
+            let failing = report.checks.filter {
+                ["fail", "error"].contains($0.status.lowercased())
+            }
+            return .completed(status: report.status, failingChecks: failing)
         } catch {
             statusText = "Doctor failed: \(error.localizedDescription)"
-            return false
+            return .unavailable(error.localizedDescription)
         }
     }
 

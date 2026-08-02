@@ -8,6 +8,19 @@
 #   ./script/release.sh --publish-appcast  — generate+sign AND publish the feed;
 #                                            only this mode lets the app claim that
 #                                            automatic updates work (A2.1)
+#   ./script/release.sh --self-test-gates dist/NativeAgent.app
+#                                          — run the A1.1 identity leak gate and the
+#                                            A1.5 bundle assertion against an existing
+#                                            .app and exit. Builds/signs nothing.
+#
+# PUBLIC LANE (A1.1-2026-08-02): any NATIVEAGENT_ICLOUD_BUILD other than
+# personal|1 is a PUBLIC release, and a public release is ALWAYS built from the
+# scrubbed export. Run it from the private tree as usual — this script produces
+# the export itself (script/make_public_export.sh) and re-runs inside it with
+# the private signing inputs, so scrubbed AND notarized is now one path instead
+# of two mutually exclusive ones.
+#   NATIVEAGENT_PUBLIC_EXPORT_DIR   — where to put the export (default: mktemp)
+#   NATIVEAGENT_REUSE_PUBLIC_EXPORT — 1 reuses an existing export; --dry-run only
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,6 +30,8 @@ source "$ROOT/script/lib/sparkle_tools.sh"
 source "$ROOT/script/lib/release_quarantine.sh"
 # shellcheck source=lib/provisioning_profile_contract.sh
 source "$ROOT/script/lib/provisioning_profile_contract.sh"
+# shellcheck source=lib/release_bundle_gates.sh
+source "$ROOT/script/lib/release_bundle_gates.sh"
 APP_NAME="NativeAgent"
 PRODUCT="NativeAgentApp"
 DRY_RUN=false
@@ -27,14 +42,47 @@ GENERATE_APPCAST=false
 PUBLISH_APPCAST=false
 
 # RELEASE-2026-05-06: parse flags
+SELF_TEST_GATES_TARGET=""
+_expect_self_test_target=false
 for arg in "$@"; do
+  if [[ "$_expect_self_test_target" == "true" ]]; then
+    SELF_TEST_GATES_TARGET="$arg"
+    _expect_self_test_target=false
+    continue
+  fi
   case "$arg" in
     --dry-run) DRY_RUN=true ;;
     --appcast) GENERATE_APPCAST=true ;;
     --publish-appcast) GENERATE_APPCAST=true; PUBLISH_APPCAST=true ;;
+    --self-test-gates) _expect_self_test_target=true ;;
+    --self-test-gates=*) SELF_TEST_GATES_TARGET="${arg#--self-test-gates=}" ;;
     *) echo "Unknown argument: $arg" >&2; exit 1 ;;
   esac
 done
+if [[ "$_expect_self_test_target" == "true" ]]; then
+  echo "ERROR: --self-test-gates requires a path to a .app bundle." >&2
+  exit 1
+fi
+
+# A1.1/A1.5: run the shipped bundle gates against an EXISTING .app and exit.
+# Builds nothing, signs nothing, notarizes nothing — this exists so the gates
+# can be proven to fire (and to keep firing) without a 20-minute release.
+if [[ -n "$SELF_TEST_GATES_TARGET" ]]; then
+  if [[ ! -d "$SELF_TEST_GATES_TARGET" ]]; then
+    echo "ERROR: --self-test-gates target is not a directory: $SELF_TEST_GATES_TARGET" >&2
+    exit 1
+  fi
+  echo "==> Self-testing release gates against $SELF_TEST_GATES_TARGET"
+  _self_test_rc=0
+  release_assert_no_identity_strings "$SELF_TEST_GATES_TARGET" || _self_test_rc=1
+  release_assert_no_user_state_in_bundle "$SELF_TEST_GATES_TARGET" || _self_test_rc=1
+  if [[ "$_self_test_rc" -eq 0 ]]; then
+    echo "==> Gate self-test: BOTH GATES PASS for this bundle."
+  else
+    echo "==> Gate self-test: at least one gate FAILED (a real release would abort here)." >&2
+  fi
+  exit "$_self_test_rc"
+fi
 
 # --dry-run exits before the DMG exists, so an appcast flag there would be
 # silently ignored — the exact "looks like it worked" shape this wave removes.
@@ -177,8 +225,37 @@ if [[ "$DRY_RUN" == "false" ]]; then
     exit 1
   fi
 fi
+# A1.1-2026-08-02: the scrub is the ONLY path to a public DMG.
+#
+# Before: this line hard-FAILED when a public build was started from the private
+# working tree, and the scrubbed export (which has the marker) has no local/
+# directory — local/ is gitignored, so the maintainer entitlements and the
+# provisioning profile never leave the private repo. The notarizable path and
+# the scrubbed path were therefore mutually exclusive in practice, and the way
+# anyone actually got a DMG out was to run this script unscrubbed. 44 Claude
+# refs compiled straight into the public binary.
+#
+# After: a public build started from the private tree is no longer a refusal,
+# it is a two-stage release. This process produces the scrubbed export, then
+# re-runs THIS script inside it with the private signing inputs handed over as
+# absolute paths. The child sees the marker, passes the check below, and does
+# the ordinary sign/notarize/staple/DMG flow on scrubbed source.
+#
+# Private/dev lane (NATIVEAGENT_ICLOUD_BUILD=1|personal, and script/build_and_run.sh)
+# is untouched: it never enters this branch.
+NATIVEAGENT_NEEDS_PUBLIC_SCRUB=false
 if [[ "$NATIVEAGENT_RELEASE_SYNC_MODE" != "personal" ]]; then
-  "$ROOT/script/check_public_release_source.sh" "$ROOT"
+  if [[ -f "$ROOT/.nativeagent-public-source" ]]; then
+    "$ROOT/script/check_public_release_source.sh" "$ROOT"
+  elif [[ "${NATIVEAGENT_PUBLIC_SCRUB_CHILD:-0}" == "1" ]]; then
+    # Recursion guard: a child must never re-enter the orchestrator. If it got
+    # here the export it was pointed at is not a valid scrubbed tree.
+    echo "ERROR: scrubbed-export child started in a tree with no public-source marker." >&2
+    echo "       Refusing to recurse; inspect the export at $ROOT." >&2
+    exit 1
+  else
+    NATIVEAGENT_NEEDS_PUBLIC_SCRUB=true
+  fi
 fi
 # Notarize via a stored keychain profile (xcrun notarytool store-credentials)
 # instead of an app-specific password in the environment — keeps the secret out
@@ -215,6 +292,122 @@ if [[ -z "$NATIVEAGENT_RELEASE_ENTITLEMENTS" ]]; then
   else
     NATIVEAGENT_RELEASE_ENTITLEMENTS="$ROOT/NativeAgent.public.entitlements"
   fi
+fi
+
+# A1.1-2026-08-02: stage 1 of the two-stage public release — produce the
+# scrubbed export and re-run this script inside it.
+#
+# Placed AFTER entitlements selection (so the child inherits the resolved,
+# private-tree file) and BEFORE entitlements validation / the Sparkle preflight
+# / the build (so nothing expensive or temp-file-generating has happened yet;
+# the child performs all of it exactly once, on scrubbed source).
+if [[ "$NATIVEAGENT_NEEDS_PUBLIC_SCRUB" == "true" ]]; then
+  _abs_release_path() {
+    # Absolutize a path from the private tree so it still resolves after the
+    # child chdir's into the export. Empty stays empty.
+    local p="$1"
+    [[ -n "$p" ]] || { printf '%s' ""; return 0; }
+    case "$p" in
+      /*) printf '%s' "$p" ;;
+      *) printf '%s' "$ROOT/$p" ;;
+    esac
+  }
+
+  [[ -x "$ROOT/script/make_public_export.sh" ]] \
+    || { echo "ERROR: script/make_public_export.sh missing or not executable; cannot cut a public release." >&2; exit 1; }
+
+  PUBLIC_EXPORT_DIR="${NATIVEAGENT_PUBLIC_EXPORT_DIR:-}"
+  if [[ -z "$PUBLIC_EXPORT_DIR" ]]; then
+    PUBLIC_EXPORT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/nativeagent-public-release.XXXXXX")/export"
+  fi
+
+  # Re-using an existing export skips the scrub, so it is allowed ONLY for
+  # --dry-run iteration. A notarized artifact always gets a fresh scrub.
+  _reuse_export=false
+  if [[ "${NATIVEAGENT_REUSE_PUBLIC_EXPORT:-0}" == "1" ]]; then
+    if [[ "$DRY_RUN" != "true" ]]; then
+      echo "ERROR: NATIVEAGENT_REUSE_PUBLIC_EXPORT=1 is only permitted with --dry-run." >&2
+      echo "       A notarized public DMG must be cut from a freshly scrubbed export." >&2
+      exit 1
+    fi
+    if [[ -f "$PUBLIC_EXPORT_DIR/.nativeagent-public-source" ]]; then
+      _reuse_export=true
+    fi
+  fi
+
+  echo "==> A1.1: public release requested (sync mode: $NATIVEAGENT_RELEASE_SYNC_MODE) from the private tree."
+  if [[ "$_reuse_export" == "true" ]]; then
+    echo "==> Re-using existing scrubbed export (dry-run only): $PUBLIC_EXPORT_DIR"
+  else
+    echo "==> Producing the scrubbed public export at: $PUBLIC_EXPORT_DIR"
+    echo "    (identity scrub + gitleaks + identity guard + build verification;"
+    echo "     this is the only source a public DMG is ever built from)"
+    "$ROOT/script/make_public_export.sh" "$PUBLIC_EXPORT_DIR"
+  fi
+  "$ROOT/script/check_public_release_source.sh" "$PUBLIC_EXPORT_DIR"
+
+  # The signing inputs live in the private tree (local/ is gitignored and is
+  # deliberately never exported). Handing them over as absolute paths is what
+  # makes the scrubbed source notarizable — the exact coupling whose absence
+  # made the two paths mutually exclusive.
+  CHILD_ENTITLEMENTS="$(_abs_release_path "$NATIVEAGENT_RELEASE_ENTITLEMENTS")"
+  CHILD_PROFILE="$(_abs_release_path "$NATIVEAGENT_PROVISIONING_PROFILE")"
+  CHILD_SPARKLE_KEY="$(_abs_release_path "$NATIVEAGENT_SPARKLE_ED_PRIV_KEY")"
+  # The denylist lives under the private local/ dir, which the export does not
+  # carry; point the child back at the private copy so its personal-data leak
+  # guard keeps the same rules instead of silently degrading to no rules.
+  CHILD_PRIVACY_DENYLIST="$(_abs_release_path "${NATIVEAGENT_PRIVACY_DENYLIST_FILE:-local/privacy_denylist.regex}")"
+  if [[ -n "$CHILD_ENTITLEMENTS" && ! -r "$CHILD_ENTITLEMENTS" ]]; then
+    echo "ERROR: release entitlements not readable from the private tree: $CHILD_ENTITLEMENTS" >&2
+    exit 1
+  fi
+
+  echo "==> A1.1: re-running release.sh inside the scrubbed export"
+  set +e
+  (
+    cd "$PUBLIC_EXPORT_DIR" || exit 1
+    NATIVEAGENT_PUBLIC_SCRUB_CHILD=1 \
+    NATIVEAGENT_RELEASE_ENTITLEMENTS="$CHILD_ENTITLEMENTS" \
+    NATIVEAGENT_PROVISIONING_PROFILE="$CHILD_PROFILE" \
+    NATIVEAGENT_SPARKLE_ED_PRIV_KEY="$CHILD_SPARKLE_KEY" \
+    NATIVEAGENT_PRIVACY_DENYLIST_FILE="$CHILD_PRIVACY_DENYLIST" \
+      "$PUBLIC_EXPORT_DIR/script/release.sh" "$@"
+  )
+  CHILD_RC=$?
+  set -e
+  if [[ "$CHILD_RC" -ne 0 ]]; then
+    echo "" >&2
+    echo "ERROR: the scrubbed public release failed (exit $CHILD_RC)." >&2
+    echo "       Export preserved for inspection: $PUBLIC_EXPORT_DIR" >&2
+    exit "$CHILD_RC"
+  fi
+
+  # Copy the finished public artifacts back into the private tree's dist/ so the
+  # maintainer picks them up where every other release lands. The export is left
+  # in place as the provenance record for the artifacts.
+  mkdir -p "$ROOT/dist"
+  _copied=()
+  for _artifact in "$APP_NAME.app" "$APP_NAME.app.zip" "$APP_NAME-$VERSION.dmg" "$APP_NAME-$VERSION.dmg.zip"; do
+    if [[ -e "$PUBLIC_EXPORT_DIR/dist/$_artifact" ]]; then
+      rm -rf "${ROOT:?}/dist/$_artifact"
+      cp -R "$PUBLIC_EXPORT_DIR/dist/$_artifact" "$ROOT/dist/$_artifact"
+      _copied+=("dist/$_artifact")
+    fi
+  done
+  if [[ -d "$PUBLIC_EXPORT_DIR/dist/appcast" ]]; then
+    rm -rf "$ROOT/dist/appcast"
+    cp -R "$PUBLIC_EXPORT_DIR/dist/appcast" "$ROOT/dist/appcast"
+    _copied+=("dist/appcast")
+  fi
+  echo ""
+  echo "==> Public release v$VERSION built from SCRUBBED source."
+  echo "    scrubbed export : $PUBLIC_EXPORT_DIR"
+  if [[ ${#_copied[@]} -gt 0 ]]; then
+    echo "    copied back     : ${_copied[*]}"
+  else
+    echo "    WARNING: no artifacts found under $PUBLIC_EXPORT_DIR/dist to copy back." >&2
+  fi
+  exit 0
 fi
 
 # Validate the chosen entitlements up front so a bad file fails BEFORE the slow
@@ -867,6 +1060,40 @@ if [[ -n "$_personal_hits" || -n "$_identity_text_hits" || -n "$_identity_binary
   exit 1
 fi
 echo "[release] leak guard passed — blank slate bundle: no configured personal data, credentials, OAuth/token files, live or derived ContextFlow state, or local identity defaults"
+
+# A1.1-2026-08-02 — COMPILED-BINARY LEAK GATE. The guard above only inspects the
+# executable's string table when NATIVEAGENT_LOCAL_IDENTITY_RE is exported, and
+# that variable defaults to EMPTY, so on a normal machine the binary was never
+# actually scanned for the private instance names. This gate is unconditional
+# and hard-coded (claude|agent). Measured on the current unscrubbed dev binary:
+# 68 canonical-casing hits — i.e. this is exactly what shipped.
+#
+# A1.5-2026-08-02 — BUNDLE ASSERTION. The state check above is scoped to
+# Contents/Resources and stops at the first hit; this one walks the WHOLE
+# bundle and names every data/ dir, trust/policy.json, providers/surfaces.json
+# or user store it finds.
+#
+# Both run after ALL staging and before codesign, so a failure aborts the
+# release with nothing signed. See script/lib/release_bundle_gates.sh.
+#
+# SCOPE: the identity gate is a PUBLIC-lane gate. A `personal` build is the
+# maintainer's own instance, where these names are the product, not a leak —
+# failing it there would break the private release lane. Everything reaching
+# this point in a public lane was built from the scrubbed export (enforced
+# above), so the gate is asserting that the scrub actually worked. The A1.5
+# bundle assertion applies to EVERY lane: no build of any kind should carry a
+# writable store inside its signed bundle.
+_gate_rc=0
+if [[ "$NATIVEAGENT_RELEASE_SYNC_MODE" != "personal" ]]; then
+  release_assert_no_identity_strings "$BUNDLE" || _gate_rc=1
+else
+  echo "[leak-gate] skipped — private 'personal' lane (public lanes always run it)."
+fi
+release_assert_no_user_state_in_bundle "$BUNDLE" || _gate_rc=1
+if [[ "$_gate_rc" -ne 0 ]]; then
+  echo "ERROR: release bundle failed the A1.1/A1.5 gates — REFUSING TO SHIP." >&2
+  exit 1
+fi
 
 # RELEASE-2026-05-06: step 5 — codesign
 echo "==> Codesigning..."

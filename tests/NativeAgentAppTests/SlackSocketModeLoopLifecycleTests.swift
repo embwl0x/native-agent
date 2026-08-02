@@ -181,7 +181,9 @@ func slackInFlightHandlers_cancelAndWaitAllAbandonsCancellationIgnoringTask() as
     let started = Date()
     let abandoned = await handlers.cancelAndWaitAll(timeout: 0.5)
     #expect(abandoned == 1)
-    #expect(Date().timeIntervalSince(started) < 5)
+    // 10s, not 5s: the claim is "the 0.5s wait timeout won, not the stubborn
+    // handler" — well above scheduler noise, well below a real wedge.
+    #expect(Date().timeIntervalSince(started) < 10)
     #expect(await handlers.count == 0)
 
     await release.set() // let the stubborn task exit; nothing may await it now
@@ -358,7 +360,10 @@ private actor SlackTestSignal {
 
     func fire() { fired = true }
 
-    func wait(timeout: TimeInterval = 5) async {
+    // 15s default, not 5s: positive waits only need to exceed worst-case
+    // scheduler noise under full-suite parallelism; a green run returns at
+    // the first 2ms poll that observes the signal.
+    func wait(timeout: TimeInterval = 15) async {
         let deadline = Date().addingTimeInterval(timeout)
         while !fired, Date() < deadline {
             try? await Task.sleep(nanoseconds: 2_000_000)

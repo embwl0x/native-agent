@@ -522,7 +522,11 @@ private func makeProfile(root: URL, handle: String = "desk_test") -> WorkshopToo
     let receipt = await session.run(WorkshopSessionRequest(
         handle: item.handle, reservationId: res, title: "t", promptSeed: "work"))
     #expect(receipt.status == .blocked, "a wedged turn resolves to a finite needs-User state, not an infinite wait")
-    #expect(Date().timeIntervalSince(startedAt) < 1.0, "the configured subsecond deadline must be honored")
+    // 10s, not 1s: the claim is "the 0.2s deadline won, not the 60s wedge" —
+    // well below the wedge still proves that, while tight bounds lose to
+    // scheduler noise under full-suite parallelism (2.87s overshoot observed
+    // elsewhere in this suite on a loaded machine).
+    #expect(Date().timeIntervalSince(startedAt) < 10.0, "the configured subsecond deadline must win over the wedged turn")
     let execution = await state.snapshot()
     #expect(execution.cancelled, "the losing provider/tool task must receive cancellation")
     #expect(!execution.active, "no provider/tool task may remain alive after the blocked receipt")

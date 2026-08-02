@@ -192,7 +192,13 @@ struct TelegramBackoffPollLoopTests {
         #expect(readRows(errorsURL).count == 1)
 
         // Window open → tick is a no-op: NO transport hit, NO new error row.
-        #expect(await loop.tickOutcome() == .skipped(reason: "Telegram poll backoff active"))
+        // The skip must be HEALTH-NEUTRAL — reported as an ordinary skip it
+        // reset the scheduler's consecutive-failure streak between every real
+        // failure, so the failure-streak push could never fire during an
+        // outage (audit 2026-08-02).
+        let backoffSkip = await loop.tickOutcome()
+        #expect(backoffSkip == .backingOff(reason: "Telegram poll backoff active"))
+        #expect(backoffSkip.isHealthNeutralSkip)
         await loop.tick()
         #expect(sw.count == 1)
         #expect(readRows(errorsURL).count == 1)

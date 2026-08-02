@@ -268,8 +268,11 @@ struct TrustBackupRestoreSafetyTests {
         return try entries.filter { try $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true }.count
     }
 
+    // 10s deadline, not 2s: positive steps only need the deadline to exceed
+    // worst-case scheduler noise under full-suite parallelism — a green run
+    // still returns at the first 10ms poll that observes the directory.
     private func waitForAdditionalBackupDirectory(under root: URL, initialCount: Int) async throws {
-        for _ in 0..<200 {
+        for _ in 0..<1000 {
             if try backupDirectoryCount(under: root) > initialCount {
                 return
             }

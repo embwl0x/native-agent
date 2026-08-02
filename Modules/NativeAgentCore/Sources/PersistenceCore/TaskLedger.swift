@@ -232,6 +232,19 @@ struct TaskLedgerFeed: Sendable {
     let base: TaskLedgerCompactionBase?
     var events: [TaskLedgerEvent]
     var fileEventCount: Int
+    /// What the raw feed scan could not use — malformed lines and events whose
+    /// `kind` token this build does not know. Compaction REFUSES while this is
+    /// non-clean: the truncate drops everything before the kept tail, so a
+    /// skipped row would be erased. Same policy as DeskStore; see
+    /// `SnapshotTailOpLog`.
+    var integrity: SnapshotTailOpLog.OpLogIntegrity = .clean
+
+    /// PHYSICAL rows in the events file — what the compaction threshold is
+    /// compared against (gpt-5.5 review 2026-08-02, finding 2). `fileEventCount`
+    /// counts events `TaskLedgerEvent.fromJSON` accepted, so a feed full of a
+    /// newer build's event kinds measured as near-zero and never reached the
+    /// threshold, the gate, or the refusal warning.
+    var compactionRowCount: Int { integrity.feedRowCount(decodedCount: fileEventCount) }
 }
 
 public struct TaskLedgerBaseCorrupt: Error, LocalizedError, Sendable {
@@ -419,7 +432,7 @@ public struct SwiftNativeTaskLedger: Sendable {
         // Append UNCAPPED — snapshot+tail compaction (B4) replaces the old naive
         // newest-N line cap, which dropped a quiet task's founding events
         // outright. The caller already holds the flock.
-        try await persistence.appendJSONL(event.toJSON(), to: eventsPath)
+        try await persistence.appendJSONLDurable(event.toJSON(), to: eventsPath)
         // Recompact derived state from base + tail (folds compacted tasks too).
         let feed = try await readFeedUnlocked()
         let state = Self.compact(base: feed.base, feed.events)
@@ -435,7 +448,13 @@ public struct SwiftNativeTaskLedger: Sendable {
     /// prefix-drop makes the in-between crash window safe (never lost, never
     /// double-applied). The caller holds the events flock.
     private func compactIfNeededUnlocked(feed: TaskLedgerFeed) async throws {
-        guard feed.fileEventCount >= compactionThreshold else { return }
+        // PHYSICAL rows, not decoded events — see `TaskLedgerFeed.compactionRowCount`.
+        guard feed.compactionRowCount >= compactionThreshold else { return }
+        // THE UNKNOWN-ROW GATE (audit 2026-08-02, finding 1) — identical policy
+        // to DeskStore, enforced from the same place. A newer writer's event
+        // kind read by a stale `task-ledger` binary would otherwise be folded
+        // away by a base that never saw it.
+        guard SnapshotTailOpLog.mayCompact(feed.integrity, feed: Self.logLabel, path: eventsPath) else { return }
         // `feed.events` is already base+tail (prefix-dropped). Fold everything
         // EXCEPT the kept tail into the (existing) base.
         guard feed.events.count > keepTail else { return }
@@ -485,8 +504,46 @@ public struct SwiftNativeTaskLedger: Sendable {
     /// callers reading raw events see the same recent slice they always did.
     /// Use `readFeedUnlocked` / `listTasks` for the base-folded authoritative view.
     public func readEventsUnlocked() async throws -> [TaskLedgerEvent] {
-        let raw = try await persistence.readJSONL(eventsPath)
-        return raw.compactMap { TaskLedgerEvent.fromJSON($0) }
+        try await readEventsWithIntegrityUnlocked().events
+    }
+
+    /// `readEventsUnlocked` plus the accounting of what the scan threw away.
+    /// `TaskLedgerEvent.fromJSON` returns nil for an unknown `kind` — tolerant
+    /// on read, but the count must reach `compactIfNeededUnlocked` so the fold
+    /// cannot delete rows it never folded.
+    func readEventsWithIntegrityUnlocked() async throws -> (events: [TaskLedgerEvent], integrity: SnapshotTailOpLog.OpLogIntegrity) {
+        let (raw, report) = try await persistence.readJSONLReporting(eventsPath)
+        let events = raw.compactMap { TaskLedgerEvent.fromJSON($0) }
+        let integrity = SnapshotTailOpLog.OpLogIntegrity(
+            malformedLineCount: report.malformedLineCount,
+            undecodableRowCount: raw.count - events.count,
+            trailingPartialLine: report.trailingPartialLine,
+            physicalRowCount: report.physicalLineCount
+        )
+        SnapshotTailOpLog.noteIntegrity(integrity, feed: Self.logLabel, path: eventsPath)
+        return (events, integrity)
+    }
+
+    /// The readable counter behind the log line: what the ledger's feed
+    /// currently cannot decode. Non-zero means compaction is (correctly)
+    /// refusing to run and the feed is growing.
+    public func feedIntegrity() async throws -> SnapshotTailOpLog.OpLogIntegrity {
+        try await readEventsWithIntegrityUnlocked().integrity
+    }
+
+    /// The ledger feed's health for the Doctor surface (gpt-5.5 review
+    /// 2026-08-02, finding 3): undecodable rows AND feed size, so a wedged
+    /// compaction is caught while it is still only growth.
+    public func feedHealth() async throws -> SnapshotTailOpLog.OpLogHealth {
+        let integrity = try await feedIntegrity()
+        return SnapshotTailOpLog.OpLogHealth(
+            feed: Self.logLabel,
+            path: eventsPath,
+            physicalRowCount: integrity.physicalRowCount,
+            byteCount: SnapshotTailOpLog.OpLogHealth.fileSize(eventsPath),
+            compactionThreshold: compactionThreshold,
+            integrity: integrity
+        )
     }
 
     /// Read the replayable feed: the compaction base (if any) + the events that
@@ -497,10 +554,10 @@ public struct SwiftNativeTaskLedger: Sendable {
     /// does not decode throws (folding the tail alone would blank compacted
     /// tasks). No base file → genesis: the whole feed folds from empty.
     func readFeedUnlocked() async throws -> TaskLedgerFeed {
-        let events = try await readEventsUnlocked()
+        let (events, integrity) = try await readEventsWithIntegrityUnlocked()
         let fileEventCount = events.count
         guard FileManager.default.fileExists(atPath: basePath.path) else {
-            return TaskLedgerFeed(base: nil, events: events, fileEventCount: fileEventCount)
+            return TaskLedgerFeed(base: nil, events: events, fileEventCount: fileEventCount, integrity: integrity)
         }
         // Read the base bytes DIRECTLY — `persistence.readJSON` collapses every
         // failure mode into its default (EMFILE burst, an iCloud dataless
@@ -520,7 +577,7 @@ public struct SwiftNativeTaskLedger: Sendable {
         let tail = SnapshotTailOpLog.dropCompactedPrefix(
             events, lastCompactedOpId: base.lastCompactedOpId, id: { $0.id }
         )
-        return TaskLedgerFeed(base: base, events: tail, fileEventCount: fileEventCount)
+        return TaskLedgerFeed(base: base, events: tail, fileEventCount: fileEventCount, integrity: integrity)
     }
 
     /// List the derived compacted task states, newest-updated first. Reads the

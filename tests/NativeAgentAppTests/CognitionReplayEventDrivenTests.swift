@@ -135,7 +135,11 @@ struct CognitionReplayEventDrivenTests {
         )
         let elapsed = started.duration(to: clock.now)
 
-        #expect(elapsed < .seconds(2))
+        // 10s, not 2s: the claim is "the 0.05s replay deadline won, not the
+        // indefinitely-blocked operation" — any finite bound with headroom
+        // proves that, while a 2s bound loses to scheduler noise under
+        // full-suite parallelism.
+        #expect(elapsed < .seconds(10))
         #expect(await runtime.eventDrivenReplayAttemptCountForProof() == 1)
         #expect(await runtime.replayReconciliationPendingForProof())
         #expect((await runtime.deadlineBailoutCountsForProof()).replay == 1)

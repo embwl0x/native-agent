@@ -246,7 +246,7 @@ public struct SessionDigestProvider: Sendable {
         headline += " ended \(Self.formatUTC(anchor))."
         lines.append(headline)
         if let preview = prior.lastMessagePreview, !preview.isEmpty {
-            lines.append("Last reply: \(clip(preview, 220))")
+            lines.append("Last reply: \(clip(Self.deGreetedPreview(preview), 220))")
         }
 
         var activity: [String] = []
@@ -532,6 +532,48 @@ public struct SessionDigestProvider: Sendable {
             .replacingOccurrences(of: "\r", with: " ")
             .replacingOccurrences(of: "\n", with: " ")
         return MemoryTextClip.sentenceClip(normalized, cap: cap)
+    }
+
+    /// The "Last reply" line is a BRIEFING about what the conversation was
+    /// about — not a voice sample. Quoting her greeting verbatim at every
+    /// session start re-seeded her own pet-name rut cross-session (the
+    /// "handsome" loop, 2026-08-01 — the capsule Sound echo was the other
+    /// carrier). When the preview OPENS with a short salutation clause
+    /// followed by real content, drop the salutation and brief the content.
+    /// Deliberately generic — a clause-length heuristic, never a word list:
+    /// it sheds "Morning, handsome. 💜", "Night, User.", and whatever she
+    /// coins next, while a short reply with no substance behind it stays
+    /// whole. SENTENCE punctuation only: an em-dash boundary would chop
+    /// substantive short leads ("Saved — memory 35810648…", "Verdict —
+    /// failed…"), live shapes in her data (gpt-5.5 review, 2026-08-02) —
+    /// dash-glued greetings that survive here are damped downstream by the
+    /// capsule echo's worn-word rule.
+    static let greetingClauseMaxCharacters = 45
+    static let greetingRemainderMinCharacters = 40
+
+    static func deGreetedPreview(_ preview: String) -> String {
+        let trimmed = preview.trimmingCharacters(in: .whitespacesAndNewlines)
+        var boundary: String.Index? = nil
+        for (offset, ch) in trimmed.enumerated() {
+            if ".!?".contains(ch) {
+                boundary = trimmed.index(trimmed.startIndex, offsetBy: offset)
+                break
+            }
+            if offset > greetingClauseMaxCharacters { break }
+        }
+        guard let boundary else { return trimmed }
+        let clause = trimmed[..<boundary]
+        guard clause.count <= greetingClauseMaxCharacters else { return trimmed }
+        var rest = String(trimmed[trimmed.index(after: boundary)...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // Shed a stranded leading emoji/symbol run left behind by the clause
+        // ("💜 Early one —" → "Early one —").
+        while let first = rest.first, !first.isLetter, !first.isNumber {
+            rest.removeFirst()
+        }
+        rest = rest.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard rest.count >= greetingRemainderMinCharacters else { return trimmed }
+        return rest
     }
 
     // MARK: - time helpers

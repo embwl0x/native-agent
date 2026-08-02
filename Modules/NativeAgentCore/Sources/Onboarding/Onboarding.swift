@@ -812,9 +812,33 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
             )
             let soulPath = targets["soul"]!
             let voicePath = targets["voice"]!
-            let userPath = targets["user"]!
             let growthPath = targets["growth"]!
-            let personaPaths = [soulPath, voicePath, userPath, growthPath]
+            // fix-blank-install-onboarding (2026-08-02, revised by gpt-5.5
+            // review): USER.md is NEVER proof that onboarding completed, in ANY
+            // gate. Two independent reasons:
+            //
+            //   1. It is a generator-owned file. `UserMDGenerator.regenerate`
+            //      replaces the whole document with its own autogen body, so
+            //      onboarding's template prose survives only until the first
+            //      regeneration. Content that a subsystem rewrites on a timer
+            //      cannot be durable evidence of an event.
+            //   2. Accepting its content is the circularity that hid the wizard
+            //      on blank installs. A blank machine wrote a header-only
+            //      USER.md, USER.md satisfied "already onboarded", and the
+            //      wizard never appeared. Any rule of the shape "USER.md's
+            //      content proves onboarding" can relatch the moment one write
+            //      escapes the producer gate.
+            //
+            // A genuinely completed install always carries SOUL.md (written
+            // first in the commit order and never touched by the generator) and,
+            // since the transaction landed, `.onboarded`. Those are the proofs.
+            // `MemoryV2.UserMDGenerator.onboardingHasCompleted` accepts exactly
+            // the same two — the three gates agree by EXCLUDING the ambiguous
+            // file rather than by each re-deriving a subtle predicate.
+            //
+            // USER.md still matters to `completeOnboarding`, but only as bytes
+            // that must not be destroyed silently — see `classifyUserDoc`.
+            let personaPaths = [soulPath, voicePath, growthPath]
             let onboardedSentinel = targets["sentinel"]!
             let pending = try Self.loadTransactionIfPresent(
                 at: transactionManifestPath,
@@ -825,7 +849,6 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
                 || personaPaths.contains { fm.fileExists(atPath: $0.path) }
                 || fm.fileExists(atPath: onboardedSentinel.path)
             let hasIdentityAnchor = fm.fileExists(atPath: soulPath.path)
-                || fm.fileExists(atPath: userPath.path)
                 || fm.fileExists(atPath: onboardedSentinel.path)
             let hasAuxiliaryOnly = !hasIdentityAnchor
                 && (fm.fileExists(atPath: voicePath.path) || fm.fileExists(atPath: growthPath.path))
@@ -891,13 +914,29 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
                 // Without a transaction manifest, any live persona/sentinel is
                 // unrelated pre-existing state and must never be adopted as if
                 // this call created it.
-                let preexisting = Self.expectedTargetURLs(
+                //
+                // fix-blank-install-onboarding (gpt-5.5 review BLOCKING 1): this
+                // gate used to be a raw `fileExists` sweep INCLUDING USER.md,
+                // which put it at odds with `startOnboarding`. A machine
+                // contaminated by the old launch bug carries a header-only
+                // USER.md: the start gate correctly opens the wizard, and this
+                // gate then refused Build with `persona_already_exists` — a dead
+                // end. The two gates now classify USER.md with the same
+                // predicate. A `.generatorProjection` is a reproducible view of
+                // the memory store, so it is overwritable (its exact bytes are
+                // pinned as the transaction's base hash below); `.authored`
+                // bytes still block, because reset must back them up first.
+                let allTargets = Self.expectedTargetURLs(
                     personaRoot: personaRoot,
                     profilePath: profileJSONPath,
                     dataRoot: dataRoot
                 )
-                .filter { $0.key != "profile" }
-                .contains { FileManager.default.fileExists(atPath: $0.value.path) }
+                let userPath = allTargets["user"]!
+                let userShape = Self.classifyUserDoc(at: userPath)
+                let preexisting = allTargets
+                    .filter { $0.key != "profile" && $0.key != "user" }
+                    .contains { FileManager.default.fileExists(atPath: $0.value.path) }
+                    || userShape == .authored
                 guard !preexisting else {
                     return OnboardingCompleteResult(
                         ok: false,
@@ -905,6 +944,14 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
                         detail: "Persona docs already exist. Use POST /v1/onboarding/reset first."
                     )
                 }
+                // An overwritable projection is still bytes on disk, so the
+                // transaction records the exact hash it intends to replace.
+                // `ensureCommitted` then refuses if anything else changed the
+                // file between manifest publication and commit — the same
+                // fail-closed contract profile.json already had.
+                let userBaseSHA256: String? = userShape == .generatorProjection
+                    ? (try? Data(contentsOf: userPath)).map { Self.sha256($0) }
+                    : nil
 
                 let docs: PersonaTemplates.Docs
                 do {
@@ -932,7 +979,7 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
                 let staged: [(String, String, String?)] = [
                     ("soul", docs.soul, nil),
                     ("voice", docs.voice, nil),
-                    ("user", docs.user, nil),
+                    ("user", docs.user, userBaseSHA256),
                     ("growth", docs.growth, nil),
                     ("profile", profilePlan.content, profilePlan.baseSHA256),
                     ("sentinel", sentinelBody, nil),
@@ -1269,6 +1316,56 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
             canonicalPath(profilePath),
         ]
         return sha256(Data(components.joined(separator: "\u{0}").utf8))
+    }
+
+    /// What a USER.md on disk actually is.
+    ///
+    /// USER.md has two writers with opposite meanings. Onboarding writes it
+    /// once from a persona template (prose about the user). `UserMDGenerator`
+    /// then OWNS it: every regeneration replaces the whole file with an
+    /// `<!-- USER_MD_AUTOGEN_START -->…END` body (a heading plus one bullet per
+    /// active memory), preserving only a `<!-- USER_PREAMBLE_START -->…END`
+    /// region if one is already there.
+    ///
+    /// So the only thing USER.md's content can prove is which of those two
+    /// wrote it last — never that onboarding completed. See the `startOnboarding`
+    /// comment for why no gate treats it as proof.
+    enum UserDocShape: Equatable {
+        /// No file, or unreadable bytes. Nothing to protect, nothing to prove.
+        case absent
+        /// Everything present is explicable as `UserMDGenerator` output: the
+        /// autogen body region, autogen/preamble markers, headings, blank
+        /// lines. Safe for onboarding to overwrite — it is a projection of the
+        /// memory store, reproducible from SQLite.
+        case generatorProjection
+        /// Carries bytes the generator cannot produce: prose or bullets OUTSIDE
+        /// the autogen body region, or human-edited preamble content. Never
+        /// overwritten silently; reset backs it up first.
+        case authored
+    }
+
+    /// Classify USER.md. Deliberately conservative: anything the generator
+    /// could plausibly have emitted classifies as `.generatorProjection`, so
+    /// the only files that block onboarding are ones with genuinely foreign
+    /// bytes in them.
+    static func classifyUserDoc(at path: URL) -> UserDocShape {
+        guard let text = try? String(contentsOf: path, encoding: .utf8) else { return .absent }
+        // Strip the generator's own body region wholesale. Its contents —
+        // heading, memory bullets, blank lines — are a projection of SQLite and
+        // say nothing about who onboarded.
+        var remainder = text
+        if let start = remainder.range(of: UserMDAutogenMarkers.bodyStart),
+           let end = remainder.range(of: UserMDAutogenMarkers.bodyEnd, range: start.upperBound..<remainder.endIndex) {
+            remainder.removeSubrange(start.lowerBound..<end.upperBound)
+        }
+        for rawLine in remainder.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty { continue }
+            if line.hasPrefix("#") { continue }           // markdown headings
+            if line.hasPrefix("<!--") { continue }        // autogen/preamble markers
+            return .authored
+        }
+        return .generatorProjection
     }
 
     private static func expectedTargetURLs(

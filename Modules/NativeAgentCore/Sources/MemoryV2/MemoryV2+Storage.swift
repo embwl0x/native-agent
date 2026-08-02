@@ -479,7 +479,10 @@ public struct MemoryEmbeddingEpochActivationReport: Sendable, Equatable {
 // MARK: - MemoryStorage actor
 
 public actor MemoryStorage {
-    private let dbPool: DatabasePool
+    // `internal`, not `private`, so same-module storage extensions in other
+    // files (e.g. `MemoryV2+LaneRetention`) can issue their own queries
+    // against the SAME pool rather than re-opening the database.
+    let dbPool: DatabasePool
     public let path: URL
     private let memoryLimit: Int
     private var startupBoundEvictions: [StoredMemory]

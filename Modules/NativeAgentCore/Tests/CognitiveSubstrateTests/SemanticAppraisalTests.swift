@@ -331,7 +331,9 @@ struct SemanticAppraisalTests {
             to: .empty
         )
         let reflex = try #require(reflexState.candidates["desk:blocked"])
-        let appraisalTerms = await substrate.appraisalConcernLexicon()
+        // D-1 renamed the one concern vocabulary to `appraisalConcerns()` — the
+        // shipped six are now only its floor (`appraisalConcernFloor()`).
+        let appraisalTerms = await substrate.appraisalConcerns()
         let relationshipTerms = try #require(appraisalTerms.first { $0.name == "relationship" })
         let generated = [
             bodyLine,

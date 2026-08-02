@@ -317,6 +317,12 @@ public actor CognitiveSubstrate {
     ) async -> Bool {
         await waitForMaintenanceTransition()
         guard configuration.enabled else { return false }
+        // D-2 (2026-08-02) — STAKES, not event class. A felt resolution about
+        // machinery she holds no concern for is not a feeling; it is her own
+        // plumbing reporting in. Rejected BEFORE any state is touched (no seen
+        // key consumed, no node, no affect, no attention publish), so the felt
+        // layer gets quieter instead of louder. Gates this one event class only.
+        guard feltResolutionIsAtStake(event) else { return false }
         // A duplicate CognitiveEvent is inert across the WHOLE cognition owner,
         // not merely ContinuityField structure. This await-free O(1) check keeps
         // affect, mood, relational-presence anchors, pending completion, revision,

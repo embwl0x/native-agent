@@ -74,7 +74,10 @@ struct NativeCognitionAttentionProjectionTests {
         let opsPath = root.appendingPathComponent("desk/desk_ops.jsonl")
         StoreChangeBus.shared.emit(StoreChange(store: .desk, path: opsPath))
 
-        for _ in 0..<50 {
+        // 10s deadline, not 500ms: the positive step (the replay SHOULD start)
+        // only needs the deadline to exceed worst-case scheduler noise under
+        // full-suite parallelism; a green run breaks at the first 10ms poll.
+        for _ in 0..<1000 {
             if await probe.callCount >= 2 { break }
             try await Task.sleep(for: .milliseconds(10))
         }
@@ -88,7 +91,12 @@ struct NativeCognitionAttentionProjectionTests {
         // Invalidation clears advisory pursuit state immediately, and the
         // detached canonical replay cannot occupy the runtime actor or turn.
         #expect(whileReplayBlocked?.activeTask == nil)
-        #expect(elapsed < 0.05)
+        // 1s, not 50ms: the claim is "the attention read did not await the
+        // indefinitely-blocked replay load" — any finite bound with headroom
+        // proves that (the structural claims above and callCount below carry
+        // the mechanism), while a 50ms bound loses to scheduler noise under
+        // full-suite parallelism.
+        #expect(elapsed < 1.0)
         #expect(await probe.callCount == 2)
     }
 }

@@ -125,18 +125,34 @@ public enum CognitiveTurnKind: String, Sendable, Equatable, CaseIterable {
             return .debug
         }
 
-        let systemMarkers = [
-            "observatory",
-            "reflection",
-            "background loop",
-            "background_loop",
-            "scheduler",
-            "doctor",
-        ]
-        if systemMarkers.contains(where: { haystack.contains($0) }) {
-            return .system
-        }
-
+        // H3 (Step 1 APPRAISAL, 2026-08-02) — there is deliberately NO system
+        // marker list here any more. `.system` is a statement about PROVENANCE
+        // (who originated the turn), and provenance is never recoverable from
+        // the words in the turn. The old list substring-matched bare nouns —
+        // "observatory", "reflection", "scheduler", "doctor", "background
+        // loop" — against a haystack that includes the USER'S OWN MESSAGE, so
+        // "remind me about the doctor" classified User's turn `.system` — and a
+        // `.system` node is excluded from mood (+Mood), the capsule
+        // (+Capsule) and attention (+AttentionSignals), and lands in the
+        // workspace at HALF weight under a system-item cap (+Workspace).
+        // (It is NOT excluded from affect: `.system.contributesToLivedState`
+        // is true, so felt chemistry still moves — downweighted, not deleted.
+        // Corrected 2026-08-02, gpt-5.5 review B2: this comment used to claim
+        // a blanket affect/workspace exclusion that the code never had.)
+        // Ordinary prose was being demoted out of her felt life by topic word.
+        //
+        // Provenance now comes from exactly two honest channels, both below in
+        // `CognitiveEvent.init`:
+        //   1. the originator states it (`turnKind:` argument or `turnKind`
+        //      metadata) — a background loop, motor lane, or scheduler that
+        //      mints a turn says so, the way `NativeCognitiveEventFactory
+        //      .motorAction` already passes `turnKind: .system`; and
+        //   2. failing that, the EVENT KIND, which is itself provenance —
+        //      tool/provider/lifecycle/felt-resolution events are machine-
+        //      originated, chat turns are person-originated.
+        // `.debug`/`.verification` above stay marker-driven: those markers are
+        // bridge PROVENANCE PREFIXES stamped onto the wire by the originating
+        // harness, not topic words a person would type.
         return .live
     }
 }

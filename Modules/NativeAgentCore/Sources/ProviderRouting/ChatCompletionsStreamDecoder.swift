@@ -41,6 +41,23 @@ public struct ChatCompletionsStreamDecoder {
     private struct Accum { var id = ""; var name = ""; var arguments = "" }
     private var toolAccum: [Int: Accum] = [:]
     private var toolOrder: [Int] = []
+    /// Slot most recently written to. Fallback anchor for an `index`-less
+    /// fragment whose frame position has no counterpart in `previousFrameSlots`
+    /// — see `slot(for:position:)`.
+    private var currentToolIndex: Int?
+    /// Slots touched by the PREVIOUS `tool_calls` frame, in that frame's array
+    /// order. An id-less fragment at array position `p` of the current frame
+    /// belongs to `previousFrameSlots[p]`: providers that omit `index` keep the
+    /// per-frame array order stable across continuation frames. Reset (rebuilt)
+    /// on every `tool_calls` frame, so it is a per-frame cursor and never a
+    /// decoder-global one.
+    private var previousFrameSlots: [Int] = []
+    /// True while the CURRENT frame's array still lines up with
+    /// `previousFrameSlots`. Cleared the moment an entry lands off-position (a
+    /// new call opening mid-array, a frame that grew), after which id-less
+    /// entries in that frame chain from the open call instead. Reset to true at
+    /// the top of every `tool_calls` frame.
+    private var frameAligned = true
 
     /// True once a `[DONE]` sentinel has been consumed. When the byte stream
     /// ends with this still false, the adapter throws `streamTruncated`.
@@ -123,12 +140,16 @@ public struct ChatCompletionsStreamDecoder {
         }
         if let calls = delta["tool_calls"] as? [[String: Any]] {
             frame.toolCallDeltaCount = calls.count
-            for raw in calls {
-                let index = (raw["index"] as? Int) ?? toolOrder.count
+            var touched: [Int] = []
+            frameAligned = true
+            for (position, raw) in calls.enumerated() {
+                let index = slot(for: raw, position: position)
                 if toolAccum[index] == nil {
                     toolAccum[index] = Accum()
                     toolOrder.append(index)
                 }
+                currentToolIndex = index
+                touched.append(index)
                 var call = toolAccum[index]!
                 if let id = raw["id"] as? String, !id.isEmpty { call.id = id }
                 if let function = raw["function"] as? [String: Any] {
@@ -137,8 +158,86 @@ public struct ChatCompletionsStreamDecoder {
                 }
                 toolAccum[index] = call
             }
+            previousFrameSlots = touched
         }
         return frame
+    }
+
+    /// Resolve which accumulator a `tool_calls[]` fragment belongs to.
+    ///
+    /// `index` is authoritative when the provider sends it. When it is ABSENT
+    /// the old rule keyed on `toolOrder.count`, which minted a NEW slot for
+    /// every fragment: a stream emitting `{id,name,arguments:"{\"q\""}` then
+    /// `{arguments:":\"x\"}"}` built two accumulators, and the second — having
+    /// no name — was dropped by `completedToolCalls`, so the call surfaced with
+    /// truncated arguments (or `{}` when the split fell before any argument
+    /// text). Pre-existing, but live since the OpenAI api-key adapter began
+    /// routing through this decoder (gpt-5.5 BLOCKING, 2026-08-02).
+    ///
+    /// The first fix keyed an id-less fragment to `currentToolIndex` — the
+    /// decoder-GLOBAL last-written slot. That still corrupts INTERLEAVED
+    /// multi-call streams (gpt-5.5 BLOCKING, 2026-08-02): frame 1 opens calls
+    /// `A` and `B`, leaving the cursor on `B`; frame 2 carries the id-less
+    /// fragments `[A_args, B_args]`, so BOTH landed on `B` — `A` surfaced
+    /// truncated and `B` got both halves of the JSON.
+    ///
+    /// The rule is now POSITIONAL and per-frame: an id-less fragment at array
+    /// position `p` belongs to the slot that position `p` addressed in the
+    /// previous `tool_calls` frame (`previousFrameSlots`, rebuilt every frame).
+    /// That is exactly the wire semantics `index` would have spelled out. A
+    /// position with no previous counterpart (e.g. an id-less continuation
+    /// riding behind a freshly-opened call in a mixed frame) falls back to the
+    /// currently-open slot. A fragment carrying a NEW `id` still starts a call,
+    /// a repeated `id` still rejoins its own, and an id-less fragment whose
+    /// `function.name` disagrees with the slot it resolved to opens a new call
+    /// rather than corrupting that one.
+    private mutating func slot(for raw: [String: Any], position: Int) -> Int {
+        if let explicit = raw["index"] as? Int {
+            noteAlignment(of: explicit, at: position)
+            return explicit
+        }
+        let id = (raw["id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        if let id, let known = toolOrder.first(where: { toolAccum[$0]?.id == id }) {
+            noteAlignment(of: known, at: position)
+            return known
+        }
+        if id == nil, frameAligned, position < previousFrameSlots.count {
+            let candidate = previousFrameSlots[position]
+            if continues(candidate, raw) { return candidate }
+        } else if id == nil, let open = currentToolIndex, continues(open, raw) {
+            // This frame's array no longer lines up with the previous one (an
+            // entry addressed by id/index landed off-position, or the frame
+            // grew): chain from the call this frame most recently opened or
+            // touched rather than trusting a stale position.
+            return open
+        }
+        // New id, a name that disagrees with the resolved slot, or the very
+        // first fragment of the stream: allocate a slot that cannot collide
+        // with an explicit index seen so far.
+        frameAligned = false
+        return (toolAccum.keys.max() ?? -1) + 1
+    }
+
+    /// An id- or index-addressed entry that does NOT land where the previous
+    /// frame's same position landed means this frame's array layout shifted, so
+    /// every LATER id-less entry in it must chain from the open call instead of
+    /// reading a stale position.
+    private mutating func noteAlignment(of slot: Int, at position: Int) {
+        guard position < previousFrameSlots.count, previousFrameSlots[position] == slot else {
+            frameAligned = false
+            return
+        }
+    }
+
+    /// True when `raw` can be a continuation of the call already in `slot`. Only
+    /// a fragment that names a DIFFERENT function is rejected — continuation
+    /// fragments carry no `name` at all, and providers that repeat the name on
+    /// every fragment repeat the same one.
+    private func continues(_ slot: Int, _ raw: [String: Any]) -> Bool {
+        guard let existing = toolAccum[slot]?.name, !existing.isEmpty else { return true }
+        guard let name = (raw["function"] as? [String: Any])?["name"] as? String,
+              !name.isEmpty else { return true }
+        return name == existing
     }
 
     /// Finalize the accumulated tool calls in first-seen order. Skips calls

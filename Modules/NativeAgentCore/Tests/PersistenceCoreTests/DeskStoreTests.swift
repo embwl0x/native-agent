@@ -273,17 +273,27 @@ final class DeskStoreTests: XCTestCase {
         let state = DeskState(items: [i1, i2, i2a, i2b, i2c, i3, i4, i4c, i5], generatedTs: gen)
         let rendered = DeskProjection.render(state, now: now)
 
+        // Sequencing wave: parents gain a DERIVED `<done>/<total> done` rollup
+        // (items 2 and 4 have children), and the desk gains the trailing
+        // `next up:` section — the "what's next" answer. Rows with no children,
+        // no blockers and no defer render exactly as before.
         let expected = """
         desk · owner · rev \(gen) · stale ok
         status: watch · flag · now · next · todo · done · blocked
         1 watch na · missions list refresh lag -> #50 · stale:42m
-        2 plan atrium · clean-rebuild cmd center · now session store -> GRDB · refs:3
+        2 plan atrium · clean-rebuild cmd center · now session store -> GRDB · 1/3 closed · refs:3
           2.1 done GRDB schema scaffold
           2.2 now session store -> GRDB
           2.3 next outbound dispatch queue
         3 watch standing · ping when Codex lands big diff -> Claude xreview · quiet/event
-        4 gh newproj · repo/name · 6 open issues · next read issues + draft plan · refs:6
+        4 gh newproj · repo/name · 6 open issues · next read issues + draft plan · 0/1 closed · refs:6
         5 done na · subconscious additive-warmth tuning · archives in 2d
+        next up:
+          2.2 now session store -> GRDB
+          4.1 next read issues + draft plan
+          2.3 next outbound dispatch queue
+          1 watch missions list refresh lag -> #50
+          2 watch clean-rebuild cmd center
         """
         XCTAssertEqual(rendered, expected)
     }
@@ -300,7 +310,7 @@ final class DeskStoreTests: XCTestCase {
                      project: "na", title: "t\($0)", openedAt: opened, updatedAt: opened)
         }
         let renderedMany = DeskProjection.render(DeskState(items: many, generatedTs: gen))
-        let topLines = renderedMany.split(separator: "\n").dropFirst(2).filter { !$0.hasPrefix("  ") }
+        let topLines = itemLines(renderedMany)
         XCTAssertEqual(topLines.count, 25)
 
         // 5 done items → at most 3 rendered (most-recent by closedAt).
@@ -310,8 +320,17 @@ final class DeskStoreTests: XCTestCase {
                      closedAt: "2026-06-29T1\(i):00:00.000000+00:00", pinned: true) // pinned → suppress countdown noise
         }
         let renderedDone = DeskProjection.render(DeskState(items: dones, generatedTs: gen))
-        let doneLines = renderedDone.split(separator: "\n").dropFirst(2).filter { !$0.hasPrefix("  ") }
-        XCTAssertEqual(doneLines.count, 3)
+        XCTAssertEqual(itemLines(renderedDone).count, 3)
+    }
+
+    /// The desk's ITEM region: everything after the 2 header lines and before the
+    /// trailing `next up:` section, top-level rows only (children are indented).
+    private func itemLines(_ rendered: String) -> [Substring] {
+        var lines = rendered.split(separator: "\n").dropFirst(2)
+        if let cut = lines.firstIndex(of: "next up:") {
+            lines = lines[..<cut]
+        }
+        return lines.filter { !$0.hasPrefix("  ") }
     }
 
     func test_projection_refs_summarized_when_three_or_more() {
@@ -801,8 +820,12 @@ final class DeskStoreTests: XCTestCase {
         let collapsed = DeskProjection.render(DeskState(
             items: [mk("2", status: .now, title: "parent2"),
                     mk("2.1", parent: "h_2", status: .next, title: "next child")], generatedTs: gen))
-        XCTAssertFalse(collapsed.contains("2.1 next next child"), collapsed)
-        XCTAssertTrue(collapsed.contains("· next next child"), collapsed)
+        // Scope to the ITEM region: the trailing `next up:` section legitimately
+        // lists the ready child by alias, which is not the duplicate-child-row
+        // regression this test guards.
+        let collapsedItems = collapsed.components(separatedBy: "\nnext up:")[0]
+        XCTAssertFalse(collapsedItems.contains("2.1 next next child"), collapsed)
+        XCTAssertTrue(collapsedItems.contains("· next next child"), collapsed)
     }
 
     // MARK: - Notify evaluator (desk-side push: idempotent, no cognition)
@@ -1141,5 +1164,417 @@ final class DeskStoreTests: XCTestCase {
             if case .ghPr(_, let number, _, _, _) = ref.kind { return number == 42 }
             return false
         }, "the original gh tracking ref was evicted under an equal-priority gh flood — the tracker row would orphan")
+    }
+
+    // MARK: - Sequencing: blocked-on edges, defer, auto-unblock, next-action
+    //
+    // The load-bearing property is that blockedness is DERIVED: closing a
+    // blocker unblocks its dependents with NO op written for the dependent.
+
+    /// Both sequencing ops survive append → rebuild-from-ops, and the rebuild
+    /// equals the in-memory fold.
+    func test_sequencing_ops_roundtrip_through_rebuild() async throws {
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SwiftNativeDeskStore(dataRoot: root)
+
+        let a = try await store.createItem(kind: .plan, project: "na", title: "A")
+        let b = try await store.createItem(kind: .plan, project: "na", title: "B")
+        _ = try await store.setBlockedOn(b.handle, blockers: [a.handle])
+        _ = try await store.setDeferUntil(b.handle, until: "2099-01-01")
+
+        let folded = try await store.liveState()
+        let row = try XCTUnwrap(folded.items.first { $0.handle == b.handle })
+        XCTAssertEqual(row.blockedOn, [a.handle])
+        XCTAssertEqual(row.deferUntil, "2099-01-01")
+
+        // Rebuild from the raw ops feed (no base yet) must equal the fold.
+        let rebuilt = SwiftNativeDeskStore.compact(try await store.readOpsUnlocked())
+        XCTAssertEqual(rebuilt.items, folded.items)
+    }
+
+    /// THE FEATURE: A blocks B. Closing A makes B ready with NO op written for B.
+    func test_auto_unblock_cascade_needs_no_op_on_the_dependent() async throws {
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SwiftNativeDeskStore(dataRoot: root)
+
+        let a = try await store.createItem(kind: .plan, project: "na", title: "A")
+        let b = try await store.createItem(kind: .plan, project: "na", title: "B")
+        _ = try await store.setStatus(b.handle, status: .now)
+        _ = try await store.setBlockedOn(b.handle, blockers: [a.handle])
+
+        let before = try await store.liveState()
+        let planBefore = DeskSequencing.compute(before)
+        XCTAssertEqual(planBefore.byHandle[b.handle]?.effectiveBlockers, [a.handle])
+        XCTAssertEqual(planBefore.byHandle[b.handle]?.isReady, false)
+        XCTAssertFalse(planBefore.nextUp.contains(b.handle), "a blocked item must never be next up")
+
+        let opsForBBefore = try await store.readOpsUnlocked().filter { $0.handle == b.handle }.count
+
+        // Close the BLOCKER. Nothing touches B.
+        _ = try await store.closeItem(a.handle, outcomeSummary: "done A")
+
+        let after = try await store.liveState()
+        let planAfter = DeskSequencing.compute(after)
+        XCTAssertEqual(planAfter.byHandle[b.handle]?.effectiveBlockers, [],
+                       "a terminal blocker must not block — this IS the cascade")
+        XCTAssertEqual(planAfter.byHandle[b.handle]?.isReady, true)
+        XCTAssertTrue(planAfter.nextUp.contains(b.handle))
+
+        // The stored edge is untouched, and NO op was written for B.
+        let rowB = try XCTUnwrap(after.items.first { $0.handle == b.handle })
+        XCTAssertEqual(rowB.blockedOn, [a.handle])
+        let opsForBAfter = try await store.readOpsUnlocked().filter { $0.handle == b.handle }.count
+        XCTAssertEqual(opsForBAfter, opsForBBefore,
+                       "unblocking must be DERIVED — no op may be written for the dependent")
+    }
+
+    /// A→B→C: closing A leaves C blocked by B; closing B frees C.
+    func test_cascade_depth_unblocks_one_level_at_a_time() async throws {
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SwiftNativeDeskStore(dataRoot: root)
+
+        let a = try await store.createItem(kind: .plan, project: "na", title: "A")
+        let b = try await store.createItem(kind: .plan, project: "na", title: "B")
+        let c = try await store.createItem(kind: .plan, project: "na", title: "C")
+        _ = try await store.setBlockedOn(b.handle, blockers: [a.handle])
+        _ = try await store.setBlockedOn(c.handle, blockers: [b.handle])
+
+        _ = try await store.closeItem(a.handle, outcomeSummary: "A done")
+        var plan = DeskSequencing.compute(try await store.liveState())
+        XCTAssertEqual(plan.byHandle[b.handle]?.isReady, true)
+        XCTAssertEqual(plan.byHandle[c.handle]?.effectiveBlockers, [b.handle])
+        XCTAssertEqual(plan.byHandle[c.handle]?.isReady, false)
+
+        _ = try await store.closeItem(b.handle, outcomeSummary: "B done")
+        plan = DeskSequencing.compute(try await store.liveState())
+        XCTAssertEqual(plan.byHandle[c.handle]?.effectiveBlockers, [])
+        XCTAssertEqual(plan.byHandle[c.handle]?.isReady, true)
+    }
+
+    /// An ARCHIVED blocker is gone from live state entirely — it must not block.
+    func test_archived_blocker_does_not_block() async throws {
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SwiftNativeDeskStore(dataRoot: root)
+
+        let a = try await store.createItem(kind: .plan, project: "na", title: "A")
+        let b = try await store.createItem(kind: .plan, project: "na", title: "B")
+        _ = try await store.setBlockedOn(b.handle, blockers: [a.handle])
+        _ = try await store.closeItem(a.handle, outcomeSummary: "A done")
+        _ = try await store.archiveItem(a.handle)
+
+        let state = try await store.liveState()
+        XCTAssertFalse(state.items.contains { $0.handle == a.handle })
+        let plan = DeskSequencing.compute(state)
+        XCTAssertEqual(plan.byHandle[b.handle]?.effectiveBlockers, [])
+        XCTAssertEqual(plan.byHandle[b.handle]?.isReady, true)
+    }
+
+    /// CLEARS must round-trip. The prior shipped bug in this file was an
+    /// empty-string clear silently dropped by the omit-empty encoder.
+    func test_sequencing_clears_survive_rebuild_from_ops() async throws {
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SwiftNativeDeskStore(dataRoot: root)
+
+        let a = try await store.createItem(kind: .plan, project: "na", title: "A")
+        let b = try await store.createItem(kind: .plan, project: "na", title: "B")
+        _ = try await store.setBlockedOn(b.handle, blockers: [a.handle])
+        _ = try await store.setDeferUntil(b.handle, until: "2099-01-01")
+
+        _ = try await store.setBlockedOn(b.handle, blockers: [])
+        _ = try await store.setDeferUntil(b.handle, until: nil)
+
+        // The clear ops themselves must be on the wire (not omitted).
+        let raw = try await SwiftNativePersistenceCore().readJSONL(store.opsPath)
+        let clearBlocked = raw.compactMap { DeskOp.fromJSON($0) }
+            .last { if case .setBlockedOn = $0.body { return true } else { return false } }
+        XCTAssertEqual(clearBlocked?.body, .setBlockedOn(handles: []))
+        let clearDefer = raw.compactMap { DeskOp.fromJSON($0) }
+            .last { if case .setDeferUntil = $0.body { return true } else { return false } }
+        XCTAssertEqual(clearDefer?.body, .setDeferUntil(until: nil))
+
+        // And the rebuild-from-ops sees the clears.
+        let rebuilt = SwiftNativeDeskStore.compact(try await store.readOpsUnlocked())
+        let row = try XCTUnwrap(rebuilt.items.first { $0.handle == b.handle })
+        XCTAssertEqual(row.blockedOn, [])
+        XCTAssertNil(row.deferUntil)
+    }
+
+    /// Write-time refusals: unknown blocker, self-block, cycle, bad defer date.
+    func test_blocked_on_write_time_refusals() async throws {
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SwiftNativeDeskStore(dataRoot: root)
+
+        let a = try await store.createItem(kind: .plan, project: "na", title: "A")
+        let b = try await store.createItem(kind: .plan, project: "na", title: "B")
+
+        // Unknown blocker.
+        do {
+            _ = try await store.setBlockedOn(a.handle, blockers: ["desk_nope"])
+            XCTFail("expected blockedOnUnknown")
+        } catch let e as DeskError {
+            guard case .blockedOnUnknown = e else { return XCTFail("wrong error \(e)") }
+        }
+        // Self block.
+        do {
+            _ = try await store.setBlockedOn(a.handle, blockers: [a.handle])
+            XCTFail("expected blockedOnSelf")
+        } catch let e as DeskError {
+            guard case .blockedOnSelf = e else { return XCTFail("wrong error \(e)") }
+        }
+        // Cycle: A blocked-on B, then B blocked-on A.
+        _ = try await store.setBlockedOn(a.handle, blockers: [b.handle])
+        do {
+            _ = try await store.setBlockedOn(b.handle, blockers: [a.handle])
+            XCTFail("expected blockedOnCycle")
+        } catch let e as DeskError {
+            guard case .blockedOnCycle = e else { return XCTFail("wrong error \(e)") }
+        }
+        // The refused edge left NOTHING behind.
+        let liveAfterRefusal = try await store.liveState()
+        let rowB = try XCTUnwrap(liveAfterRefusal.items.first { $0.handle == b.handle })
+        XCTAssertEqual(rowB.blockedOn, [])
+
+        // Unparseable defer.
+        do {
+            _ = try await store.setDeferUntil(b.handle, until: "next tuesday-ish")
+            XCTFail("expected deferUntilUnparseable")
+        } catch let e as DeskError {
+            guard case .deferUntilUnparseable = e else { return XCTFail("wrong error \(e)") }
+        }
+    }
+
+    /// A cycle written by a HAND-AUTHORED feed (bypassing the write gate) must
+    /// not hang compute, and both nodes are flagged. If this regresses the test
+    /// hangs rather than fails — which is exactly the failure mode being guarded
+    /// (a hang here freezes every desk_read).
+    func test_hand_authored_cycle_does_not_hang_and_is_flagged() async throws {
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SwiftNativeDeskStore(dataRoot: root)
+
+        let a = try await store.createItem(kind: .plan, project: "na", title: "A")
+        let b = try await store.createItem(kind: .plan, project: "na", title: "B")
+        // Straight to the feed — no validation, the way another process or a
+        // legacy/hand-edited file could leave it.
+        try await appendLegacyOp(DeskOp(handle: a.handle, body: .setBlockedOn(handles: [b.handle])), to: store)
+        try await appendLegacyOp(DeskOp(handle: b.handle, body: .setBlockedOn(handles: [a.handle])), to: store)
+
+        let state = try await store.liveState()
+        let plan = DeskSequencing.compute(state)
+        XCTAssertEqual(plan.byHandle[a.handle]?.blockedByCycle, true)
+        XCTAssertEqual(plan.byHandle[b.handle]?.blockedByCycle, true)
+        XCTAssertEqual(plan.byHandle[a.handle]?.isReady, false)
+        XCTAssertEqual(plan.byHandle[b.handle]?.isReady, false)
+        XCTAssertTrue(plan.nextUp.isEmpty)
+
+        // And it renders honestly rather than silently vanishing.
+        XCTAssertTrue(DeskProjection.render(state, plan: plan).contains("⚠ blocked-on cycle"))
+    }
+
+    /// blockedOn / deferUntil survive a snapshot+tail compaction.
+    func test_sequencing_fields_survive_compaction() async throws {
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SwiftNativeDeskStore(dataRoot: root, opsCompactionThreshold: 6)
+
+        let a = try await store.createItem(kind: .plan, project: "na", title: "A")
+        let b = try await store.createItem(kind: .plan, project: "na", title: "B")
+        _ = try await store.setBlockedOn(b.handle, blockers: [a.handle])
+        _ = try await store.setDeferUntil(b.handle, until: "2099-03-04")
+        // Push past the threshold so the base snapshot is written.
+        for i in 0..<8 { _ = try await store.appendNote(a.handle, text: "n\(i)") }
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: store.basePath.path),
+                      "expected a compaction base to have been written")
+        let state = try await store.liveState()
+        let row = try XCTUnwrap(state.items.first { $0.handle == b.handle })
+        XCTAssertEqual(row.blockedOn, [a.handle], "a blocker edge was lost across compaction")
+        XCTAssertEqual(row.deferUntil, "2099-03-04")
+    }
+
+    /// A base row with a malformed `blockedOn` FAILS the strict decode rather
+    /// than silently dropping the edges. In the base this snapshot is the only
+    /// copy — a dropped edge would vanish the dependency forever.
+    func test_malformed_blocked_on_fails_strict_decode() throws {
+        let opened = "2026-07-01T10:00:00.000000+00:00"
+        func row(_ blockedOn: JSONValue) -> JSONValue {
+            .object([
+                "handle": .string("desk_x"), "alias": .string("1"),
+                "kind": .string("plan"), "status": .string("todo"),
+                "project": .string("na"), "title": .string("t"),
+                "openedAt": .string(opened), "updatedAt": .string(opened),
+                "pinned": .bool(false),
+                "blockedOn": blockedOn,
+            ])
+        }
+        // Not an array at all.
+        XCTAssertNil(DeskItem.fromJSON(row(.string("desk_a")), strictCollections: true))
+        // An array with a non-string element.
+        XCTAssertNil(DeskItem.fromJSON(row(.array([.string("desk_a"), .int(7)])), strictCollections: true))
+        // Tolerant mode still decodes (forward-compat readers), dropping the junk.
+        let tolerant = try XCTUnwrap(DeskItem.fromJSON(row(.array([.string("desk_a"), .int(7)]))))
+        XCTAssertEqual(tolerant.blockedOn, ["desk_a"])
+        // A well-formed row decodes strictly.
+        let strict = try XCTUnwrap(DeskItem.fromJSON(row(.array([.string("desk_a")])), strictCollections: true))
+        XCTAssertEqual(strict.blockedOn, ["desk_a"])
+        // And a whole state carrying a malformed row fails loud.
+        XCTAssertNil(DeskState.fromJSON(.object([
+            "generatedTs": .string(opened),
+            "items": .array([row(.string("nope"))]),
+        ])))
+    }
+
+    /// A pre-wave row (no blockedOn / deferUntil) serializes with NO new keys —
+    /// byte-identical to before the wave, so the compaction base's shape gate
+    /// still passes on an existing snapshot.
+    func test_item_without_sequencing_fields_emits_no_new_keys() throws {
+        let opened = "2026-07-01T10:00:00.000000+00:00"
+        let item = DeskItem(handle: "desk_x", alias: "1", kind: .plan, status: .todo,
+                            project: "na", title: "t", openedAt: opened, updatedAt: opened)
+        guard case .object(let obj) = item.toJSON() else { return XCTFail("not an object") }
+        XCTAssertNil(obj["blockedOn"])
+        XCTAssertNil(obj["deferUntil"])
+        // Round-trip is stable (the base gate re-encodes and compares shape).
+        let back = try XCTUnwrap(DeskItem.fromJSON(item.toJSON(), strictCollections: true))
+        XCTAssertEqual(back.toJSON(), item.toJSON())
+        XCTAssertEqual(back, item)
+    }
+
+    // MARK: - Sequencing: ordering, rollup, defer rendering
+
+    private func seqItem(
+        _ alias: String, parent: String? = nil, status: DeskStatus = .todo,
+        title: String? = nil, openedAt: String = "2026-07-01T10:00:00.000000+00:00",
+        blockedOn: [String] = [], deferUntil: String? = nil,
+        cadence: Cadence = Cadence()
+    ) -> DeskItem {
+        DeskItem(handle: "h_\(alias)", alias: alias, parent: parent, kind: .plan, status: status,
+                 project: "na", title: title ?? "t\(alias)", cadence: cadence,
+                 openedAt: openedAt, updatedAt: openedAt,
+                 blockedOn: blockedOn, deferUntil: deferUntil)
+    }
+
+    /// nextUp respects status rank, then openedAt; a blocked item never appears.
+    func test_next_up_ordering_and_excludes_blocked() {
+        let early = "2026-07-01T09:00:00.000000+00:00"
+        let late = "2026-07-01T18:00:00.000000+00:00"
+        let items = [
+            seqItem("1", status: .todo, openedAt: late),
+            seqItem("2", status: .now, openedAt: late),
+            seqItem("3", status: .next, openedAt: late),
+            seqItem("4", status: .next, openedAt: early),   // same rank, opened EARLIER → first
+            seqItem("5", status: .now, blockedOn: ["h_2"]), // highest rank but BLOCKED
+            seqItem("6", status: .done, openedAt: early),   // terminal → never ready
+        ]
+        let plan = DeskSequencing.compute(DeskState(items: items, generatedTs: early))
+        XCTAssertEqual(plan.nextUp, ["h_2", "h_4", "h_3", "h_1"])
+        XCTAssertEqual(plan.byHandle["h_5"]?.isReady, false)
+        XCTAssertEqual(plan.byHandle["h_6"]?.isReady, false)
+    }
+
+    /// nextUp is capped at 5.
+    func test_next_up_capped_at_five() {
+        let opened = "2026-07-01T10:00:00.000000+00:00"
+        let items = (1...9).map { seqItem("\($0)", status: .todo, openedAt: opened) }
+        let plan = DeskSequencing.compute(DeskState(items: items, generatedTs: opened))
+        XCTAssertEqual(plan.nextUp.count, DeskSequencing.nextUpCap)
+    }
+
+    /// A deferred item renders `deferred until` and is NOT flagged stale even
+    /// when its cadence window has long elapsed (Agent's #3).
+    func test_deferred_item_shows_defer_and_suppresses_stale() {
+        let now = Date(timeIntervalSince1970: 1_780_000_000)
+        let gen = DeskClock.nowISO(now)
+        // Stale by any measure: refreshed 42m ago against a 30m window.
+        let staleCadence = Cadence(mode: .on_ask,
+                                   lastRefreshAt: DeskClock.nowISO(now.addingTimeInterval(-2520)),
+                                   staleAfter: "30m")
+        let parked = seqItem("1", title: "parked on purpose", deferUntil: "2099-05-06", cadence: staleCadence)
+        let notParked = seqItem("2", title: "genuinely neglected", cadence: staleCadence)
+        let state = DeskState(items: [parked, notParked], generatedTs: gen)
+        let plan = DeskSequencing.compute(state, now: now)
+
+        XCTAssertEqual(plan.byHandle["h_1"]?.isDeferred, true)
+        XCTAssertEqual(plan.byHandle["h_1"]?.isReady, false)
+        XCTAssertFalse(plan.nextUp.contains("h_1"))
+        XCTAssertNil(DeskProjection.staleSegment(parked, now: now),
+                     "a deliberately parked item must never be flagged stale")
+        XCTAssertNotNil(DeskProjection.staleSegment(notParked, now: now))
+
+        let rendered = DeskProjection.render(state, now: now, plan: plan)
+        let parkedLine = try? XCTUnwrap(rendered.split(separator: "\n").first { $0.contains("parked on purpose") })
+        XCTAssertTrue(parkedLine?.contains("deferred until 2099-05-06") == true, rendered)
+        XCTAssertFalse(parkedLine?.contains("stale:") == true, rendered)
+        // The un-parked sibling still gets its staleness marker.
+        XCTAssertTrue(rendered.contains("stale:42m"), rendered)
+
+        // An unparseable defer is NOT a park — never silently shelve an item.
+        let junk = seqItem("3", deferUntil: "soon-ish")
+        XCTAssertFalse(DeskSequencing.isDeferred(junk, now: now))
+        // A PAST defer has expired.
+        let expired = seqItem("4", deferUntil: "2020-01-01")
+        XCTAssertFalse(DeskSequencing.isDeferred(expired, now: now))
+    }
+
+    /// The parent rollup counts the WHOLE subtree, not just direct children.
+    func test_parent_rollup_counts_whole_subtree() {
+        let opened = "2026-07-01T10:00:00.000000+00:00"
+        let items = [
+            seqItem("1", status: .now),
+            seqItem("1.1", parent: "h_1", status: .done),
+            seqItem("1.2", parent: "h_1", status: .todo),
+            seqItem("1.2.1", parent: "h_1.2", status: .done),
+            seqItem("1.2.2", parent: "h_1.2", status: .canceled),   // terminal counts as done
+            seqItem("1.2.3", parent: "h_1.2", status: .todo),
+        ]
+        let state = DeskState(items: items, generatedTs: opened)
+        let plan = DeskSequencing.compute(state, now: Date(timeIntervalSince1970: 1_780_000_000))
+        // 5 descendants, 3 terminal — direct-children-only would say 1/2.
+        XCTAssertEqual(plan.byHandle["h_1"]?.doneCount, 3)
+        XCTAssertEqual(plan.byHandle["h_1"]?.totalCount, 5)
+        // Self excluded at every level.
+        XCTAssertEqual(plan.byHandle["h_1.2"]?.doneCount, 2)
+        XCTAssertEqual(plan.byHandle["h_1.2"]?.totalCount, 3)
+        XCTAssertEqual(plan.byHandle["h_1.1"]?.totalCount, 0)
+
+        let rendered = DeskProjection.render(state, now: Date(timeIntervalSince1970: 1_780_000_000), plan: plan)
+        XCTAssertTrue(rendered.contains("3/5 closed"), rendered)
+    }
+
+    /// A child of a blocked (or deferred) parent is not actionable.
+    func test_child_of_blocked_parent_is_not_ready() {
+        let opened = "2026-07-01T10:00:00.000000+00:00"
+        let items = [
+            seqItem("1", status: .todo),                                   // the blocker
+            seqItem("2", status: .todo, blockedOn: ["h_1"]),               // blocked parent
+            seqItem("2.1", parent: "h_2", status: .now),                   // its child
+            seqItem("3", status: .todo, deferUntil: "2099-01-01"),         // parked parent
+            seqItem("3.1", parent: "h_3", status: .now),                   // its child
+        ]
+        let plan = DeskSequencing.compute(DeskState(items: items, generatedTs: opened),
+                                          now: Date(timeIntervalSince1970: 1_780_000_000))
+        XCTAssertEqual(plan.byHandle["h_2.1"]?.isReady, false, "a child of a blocked parent is not actionable")
+        XCTAssertEqual(plan.byHandle["h_3.1"]?.isReady, false, "a child of a parked parent is not actionable")
+        // The child has no blockers of its OWN — the obstruction is inherited.
+        XCTAssertEqual(plan.byHandle["h_2.1"]?.effectiveBlockers, [])
+        XCTAssertEqual(plan.nextUp, ["h_1"])
+    }
+
+    /// blocked-on renders ALIASES (never handles), capped at 3 + `+N`.
+    func test_blocked_on_renders_aliases_capped() {
+        let opened = "2026-07-01T10:00:00.000000+00:00"
+        var items = (1...5).map { seqItem("\($0)", status: .todo) }
+        items.append(seqItem("9", status: .todo, blockedOn: ["h_1", "h_2", "h_3", "h_4", "h_5"]))
+        let state = DeskState(items: items, generatedTs: opened)
+        let rendered = DeskProjection.render(state, now: Date(timeIntervalSince1970: 1_780_000_000))
+        XCTAssertTrue(rendered.contains("blocked-on 1,2,3+2"), rendered)
+        XCTAssertFalse(rendered.contains("desk_"), "the projection must never render a raw handle")
+        XCTAssertFalse(rendered.contains("h_1 "), "the projection must never render a raw handle")
     }
 }

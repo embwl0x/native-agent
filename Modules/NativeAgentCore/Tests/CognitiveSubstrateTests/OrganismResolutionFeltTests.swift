@@ -160,15 +160,15 @@ struct OrganismResolutionFeltTests {
         let event = CognitiveEvent(
             id: UUID().uuidString,
             kind: .organismResolutionFelt,
-            subject: CognitiveSubjectReference(type: "organism_path", id: "tool:swift_build", label: "toolCompletion"),
+            subject: CognitiveSubjectReference(type: "organism_path", id: "desk:ship_the_release", label: "workflowAdvance"),
             sourceClass: .observed,
             occurredAt: t0,
-            summary: "Relief — the tool:swift_build path I was braced for landed fine.",
+            summary: "Relief — the desk:ship_the_release path I was braced for landed fine.",
             importance: 0.65,
             metadata: ["feltValence": .double(0.5), "feltArousal": .double(0.15)]
         )
         await substrate.ingest(event)
-        let node = await substrate.snapshot().nodes.first { $0.subjectReference.id.hasPrefix("tool:swift_build") }
+        let node = await substrate.snapshot().nodes.first { $0.subjectReference.id.hasPrefix("desk:ship_the_release") }
         #expect(node != nil, "the felt resolution must mint a node")
         #expect(abs((node?.emotionalValence ?? 0) - 0.5) < 0.0001, "the organism's measured valence lands as-is: \(String(describing: node?.emotionalValence))")
     }
@@ -184,16 +184,27 @@ struct OrganismResolutionFeltTests {
         )
     }
 
+    /// D-2 (2026-08-02): the fixture path is `workflowAdvance` — a COMMITMENT
+    /// resolving — not `toolCompletion`. These tests are about the substrate's
+    /// felt-resolution stamping and the A3 disposition pattern read, and both of
+    /// those mechanisms are unchanged. What changed is admission: a mechanical
+    /// tool/provider/phone resolution she holds no concern about no longer mints
+    /// a felt node at all (`feltResolutionIsAtStake`), so a `toolCompletion`
+    /// fixture would now be testing the gate instead of the mechanism it names.
+    /// The gate itself is pinned in `AppraisalStakesTests`.
     private func feltResolutionEvent(kind: String, valence: Double, path: String, at: Date) -> CognitiveEvent {
         CognitiveEvent(
             id: UUID().uuidString,
             kind: .organismResolutionFelt,
-            subject: CognitiveSubjectReference(type: "organism_path", id: "tool:swift_build#\(UUID().uuidString.prefix(8))", label: path),
+            subject: CognitiveSubjectReference(type: "organism_path", id: "desk:ship_the_release#\(UUID().uuidString.prefix(8))", label: path),
             sourceClass: .observed,
             occurredAt: at,
+            // Prose matches the fixture's path kind (`workflowAdvance`): this is
+            // a COMMITMENT resolving, not a tool call. (gpt-5.5 review B3,
+            // 2026-08-02 — the label was retargeted and the wording wasn't.)
             summary: kind == "relief"
-                ? "Relief — the tool path I was braced for landed fine."
-                : "Disappointment — the tool path I was counting on fell through.",
+                ? "Relief — the commitment I was braced for landed fine."
+                : "Disappointment — the commitment I was counting on fell through.",
             importance: 0.65,
             metadata: ["feltValence": .double(valence), "feltArousal": .double(0.3), "resolutionKind": .string(kind)]
         )
@@ -208,7 +219,7 @@ struct OrganismResolutionFeltTests {
         let s = makeFeltSubstrate(now: { t })
         for i in 0..<3 {
             await s.ingest(feltResolutionEvent(
-                kind: "disappointment", valence: -0.5, path: "toolCompletion",
+                kind: "disappointment", valence: -0.5, path: "workflowAdvance",
                 at: t.addingTimeInterval(Double(i - 3) * 600)
             ))
         }
@@ -220,7 +231,7 @@ struct OrganismResolutionFeltTests {
         let s2 = makeFeltSubstrate(now: { t2 })
         for i in 0..<3 {
             await s2.ingest(feltResolutionEvent(
-                kind: "relief", valence: 0.5, path: "toolCompletion",
+                kind: "relief", valence: 0.5, path: "workflowAdvance",
                 at: t2.addingTimeInterval(Double(i - 3) * 600)
             ))
         }
@@ -232,7 +243,7 @@ struct OrganismResolutionFeltTests {
         let s3 = makeFeltSubstrate(now: { t3 })
         for i in 0..<2 {
             await s3.ingest(feltResolutionEvent(
-                kind: "disappointment", valence: -0.5, path: "toolCompletion",
+                kind: "disappointment", valence: -0.5, path: "workflowAdvance",
                 at: t3.addingTimeInterval(Double(i - 2) * 600)
             ))
         }
@@ -258,7 +269,7 @@ struct OrganismResolutionFeltTests {
         let s = makeFeltSubstrate(now: { clock.now() })
         for i in 0..<3 {
             await s.ingest(feltResolutionEvent(
-                kind: "disappointment", valence: -0.5, path: "toolCompletion",
+                kind: "disappointment", valence: -0.5, path: "workflowAdvance",
                 at: clock.now().addingTimeInterval(Double(i - 3) * 600)
             ))
         }
@@ -285,7 +296,7 @@ struct OrganismResolutionFeltTests {
         let s = makeFeltSubstrate(now: { clock.now() })
         for i in 0..<3 {
             await s.ingest(feltResolutionEvent(
-                kind: "disappointment", valence: -0.5, path: "toolCompletion",
+                kind: "disappointment", valence: -0.5, path: "workflowAdvance",
                 at: clock.now().addingTimeInterval(Double(i) * 10)
             ))
         }
@@ -297,7 +308,7 @@ struct OrganismResolutionFeltTests {
         // the same day. Growth gate would pass; the DAY CLAIM must block it.
         clock.advance(20 * 3600 + 60)
         await s.ingest(feltResolutionEvent(
-            kind: "disappointment", valence: -0.5, path: "toolCompletion",
+            kind: "disappointment", valence: -0.5, path: "workflowAdvance",
             at: clock.now()
         ))
         await s.runMaintenance(reason: "a3-day-tick-2")
@@ -309,7 +320,7 @@ struct OrganismResolutionFeltTests {
         clock.advance(26 * 3600) // now in a later day bucket
         for _ in 0..<3 {
             await s.ingest(feltResolutionEvent(
-                kind: "disappointment", valence: -0.5, path: "toolCompletion",
+                kind: "disappointment", valence: -0.5, path: "workflowAdvance",
                 at: clock.now()
             ))
         }
@@ -328,7 +339,7 @@ struct OrganismResolutionFeltTests {
         let s = makeFeltSubstrate(now: { clock.now() })
         for _ in 0..<3 {
             await s.ingest(feltResolutionEvent(
-                kind: "disappointment", valence: -0.5, path: "toolCompletion",
+                kind: "disappointment", valence: -0.5, path: "workflowAdvance",
                 at: clock.now()
             ))
         }
@@ -341,7 +352,7 @@ struct OrganismResolutionFeltTests {
         // nudges again instead of being wrongly suppressed.
         for _ in 0..<3 {
             await s.ingest(feltResolutionEvent(
-                kind: "disappointment", valence: -0.5, path: "toolCompletion",
+                kind: "disappointment", valence: -0.5, path: "workflowAdvance",
                 at: clock.now()
             ))
         }
@@ -371,7 +382,7 @@ struct OrganismResolutionFeltTests {
         )
         for i in 0..<3 {
             await s.ingest(feltResolutionEvent(
-                kind: "disappointment", valence: -0.5, path: "toolCompletion",
+                kind: "disappointment", valence: -0.5, path: "workflowAdvance",
                 at: t.addingTimeInterval(Double(i - 3) * 600)
             ))
         }

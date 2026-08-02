@@ -426,7 +426,16 @@ public func makeBackgroundLoops() -> any BackgroundLoopsProtocol {
 /// `tickOutcome()` so the scheduler can preserve honest state and receipts.
 public enum LoopTickOutcome: Sendable, Equatable {
     case completed(result: String?)
-    case skipped(reason: String)
+    /// `healthNeutral: true` declares "this skip is NOT evidence the loop is
+    /// healthy". The canonical case is a loop that skips BECAUSE it is inside
+    /// its own failure-backoff window (TelegramPollLoop). Before this flag
+    /// existed the scheduler cleared the consecutive-failure streak on every
+    /// non-coalesced skip, so a self-backing-off loop on a 2s cadence reset
+    /// its own streak between every real failure and the failure-streak push
+    /// could NEVER fire — a revoked token or offline Mac stayed silent
+    /// forever. Defaults to `false` so an ordinary "nothing to do" skip
+    /// remains a genuine health signal.
+    case skipped(reason: String, healthNeutral: Bool = false)
     case failed(error: String)
 
     /// The manager's single-flight gate returns this reason when a tick
@@ -436,6 +445,70 @@ public enum LoopTickOutcome: Sendable, Equatable {
     /// health, and must not reset the consecutive-failure streak (gpt-5.5
     /// BLOCKING, A4.8 round).
     public static let coalescedSkipReason = "coalesced with active tick"
+
+    /// Constructor for "I am skipping because I am failing". Prefer this over
+    /// a bare `.skipped(reason:)` in any loop that gates itself behind its own
+    /// backoff/cooldown after an operational failure.
+    public static func backingOff(reason: String) -> LoopTickOutcome {
+        .skipped(reason: reason, healthNeutral: true)
+    }
+
+    /// True only for the manager's single-flight coalesce skip.
+    public var isCoalescedSkip: Bool {
+        if case .skipped(let reason, _) = self { return reason == Self.coalescedSkipReason }
+        return false
+    }
+
+    /// True when this outcome proves nothing about the loop's health and must
+    /// therefore leave the consecutive-failure streak untouched. Covers both
+    /// the coalesced skip and any loop-declared health-neutral skip.
+    public var isHealthNeutralSkip: Bool {
+        if case .skipped(let reason, let healthNeutral) = self {
+            return healthNeutral || reason == Self.coalescedSkipReason
+        }
+        return false
+    }
+}
+
+/// Exponential-with-jitter retry curve applied by the scheduler when a loop's
+/// tick FAILS. Same shape as `TelegramExponentialBackoff` (which stays as the
+/// Telegram poll loop's own intra-tick gate); this one lives at the scheduler
+/// so every loop gets failure backoff, not just the one that hand-rolled it.
+///
+/// Without it a 2s-interval loop re-hit a dead endpoint every 2 seconds
+/// forever (Slack socket mode against a revoked token).
+public struct LoopFailureBackoffPolicy: Sendable, Equatable {
+    public var baseDelay: TimeInterval
+    public var maxDelay: TimeInterval
+    public var multiplier: Double
+    public var jitterRange: ClosedRange<Double>
+
+    /// Defaults: 5s → 300s cap, doubling, ±20% jitter, reset on first success.
+    public init(
+        baseDelay: TimeInterval = 5,
+        maxDelay: TimeInterval = 300,
+        multiplier: Double = 2,
+        jitterRange: ClosedRange<Double> = 0.8...1.2
+    ) {
+        self.baseDelay = max(0, baseDelay)
+        self.maxDelay = max(0, maxDelay)
+        self.multiplier = max(1, multiplier)
+        self.jitterRange = jitterRange
+    }
+
+    public static let `default` = LoopFailureBackoffPolicy()
+
+    /// `base * multiplier^(n-1)`, capped at `maxDelay`, jittered, then
+    /// re-clamped so the documented cap is a hard ceiling.
+    public func delay(
+        forConsecutiveFailures failures: Int,
+        jitter: (ClosedRange<Double>) -> Double
+    ) -> TimeInterval {
+        guard failures > 0 else { return 0 }
+        let exponent = Double(min(failures - 1, 64))
+        let raw = min(maxDelay, baseDelay * pow(multiplier, exponent))
+        return min(maxDelay, max(0, raw * jitter(jitterRange)))
+    }
 }
 
 /// A single periodic worker the scheduler drives. Neither entry point may
@@ -465,6 +538,11 @@ public protocol LoopRunner: Sendable {
     /// trace (audit 2026-06-09). Requirement (not extension-only) so the
     /// override dispatches dynamically through `any LoopRunner`.
     var tickTimeoutOverride: TimeInterval? { get }
+    /// Per-loop override for the scheduler's failure-backoff curve. nil → the
+    /// scheduler's default policy. A requirement (not extension-only) so the
+    /// override dispatches dynamically through `any LoopRunner`, exactly like
+    /// `tickTimeoutOverride`.
+    var failureBackoffPolicy: LoopFailureBackoffPolicy? { get }
     /// The honest per-tick outcome. Required — there is no default, so every
     /// loop implements it and the scheduler always records a real outcome
     /// rather than a swallowed `.completed`.
@@ -476,6 +554,7 @@ public protocol LoopRunner: Sendable {
 
 public extension LoopRunner {
     var tickTimeoutOverride: TimeInterval? { nil }
+    var failureBackoffPolicy: LoopFailureBackoffPolicy? { nil }
 
     func tick() async {
         _ = await tickOutcome()
@@ -645,6 +724,21 @@ public actor SwiftNativeLoopScheduler {
     private let persistence = SwiftNativePersistenceCore()
     private var running: Bool = false
 
+    // Failure backoff (audit 2026-08-02, HIGH): before this, the next tick was
+    // scheduled `interval` out on the SUCCESS and the FAILURE path alike, so a
+    // 2s loop kept hammering a dead endpoint every 2s for as long as the
+    // outage lasted. The curve reuses the loop's existing consecutive-failure
+    // streak (already reset on the first real success), so backoff and the
+    // failure-streak push agree on what "still failing" means.
+    private let defaultFailureBackoff: LoopFailureBackoffPolicy
+    private let jitter: @Sendable (ClosedRange<Double>) -> Double
+    /// Floor for any computed next-tick delay. Start-relative scheduling can
+    /// produce a negative delay when a tick outruns its own interval (a 25s
+    /// Telegram long poll on a 2s cadence); this keeps that from becoming a
+    /// busy spin without stretching the cadence the way tick-END scheduling
+    /// did.
+    private let minimumTickSpacing: TimeInterval
+
     // LOOPS-4: the tick task used to sleep a FULL interval before its first
     // tick and the scheduler kept run history only in memory. A weekly loop
     // therefore never ran on a machine restarted more often than weekly — each
@@ -694,7 +788,10 @@ public actor SwiftNativeLoopScheduler {
         tickTimeout: TimeInterval = 300,
         failureReceiptsPath: URL? = nil,
         loopStatePath: URL? = nil,
-        startupStagger: TimeInterval = 5
+        startupStagger: TimeInterval = 5,
+        failureBackoff: LoopFailureBackoffPolicy = .default,
+        minimumTickSpacing: TimeInterval = 0.25,
+        jitter: @escaping @Sendable (ClosedRange<Double>) -> Double = { Double.random(in: $0) }
     ) {
         self.clock = clock
         self.tickTimeout = tickTimeout
@@ -703,6 +800,9 @@ public actor SwiftNativeLoopScheduler {
             .deletingLastPathComponent()
             .appendingPathComponent("background_loop_state.json")
         self.startupStagger = max(0, startupStagger)
+        self.defaultFailureBackoff = failureBackoff
+        self.minimumTickSpacing = max(0, minimumTickSpacing)
+        self.jitter = jitter
     }
 
     /// First-sleep rule after (re)start. Pure so it can be pinned directly.
@@ -842,12 +942,18 @@ public actor SwiftNativeLoopScheduler {
                     return
                 }
                 if Task.isCancelled { return }
+                let tickStartedAt = await self.currentClock()
                 await self.runOneTick(loop: capturedLoop, registrationId: capturedRegId)
                 // Cooperative cancellation check immediately after tick
                 // returns — a tick that suspended a long time may have been
                 // raced by stop(); exit the loop before sleeping again.
                 if Task.isCancelled { return }
-                delay = interval
+                // The next delay is computed on the actor because it depends on
+                // the loop's live failure streak AND on when THIS tick started
+                // (see nextDelay: `interval` measured from tick end is what
+                // turned a 6h loop with a 25-minute tick into a 6h25m loop,
+                // permanently, across restarts).
+                delay = await self.nextDelay(for: capturedLoop, tickStartedAt: tickStartedAt)
             }
         }
         tasks[id] = task
@@ -857,6 +963,56 @@ public actor SwiftNativeLoopScheduler {
         var st = states[id] ?? LoopState(loopId: id)
         st.nextTickAt = now.addingTimeInterval(firstDelay)
         states[id] = st
+    }
+
+    /// Actor-hopped read of the injected clock so the spawned tick task can
+    /// stamp a tick's START without capturing the closure itself.
+    private func currentClock() -> Date { clock() }
+
+    /// Delay before the NEXT tick of `loop`.
+    ///
+    /// Two rules, both fixes for shipped drift/hammering bugs:
+    ///
+    /// * FAILING (`consecutiveFailures > 0`): back off exponentially with
+    ///   jitter from the tick's END, floored at the loop's own interval and
+    ///   capped by the policy. Reset happens implicitly — the streak is
+    ///   cleared on the first real success/health-bearing skip, so the very
+    ///   next delay returns to the normal cadence.
+    /// * HEALTHY: the next tick is scheduled `interval` after the tick's
+    ///   START, not after it returned. Tick-end scheduling made every loop's
+    ///   effective period `interval + tickDuration` and that drift persisted
+    ///   across restarts through the durable last-run stamp.
+    ///
+    /// Both branches are floored at `minimumTickSpacing` so a tick that
+    /// outruns its own interval cannot become a busy spin.
+    private func nextDelay(for loop: any LoopRunner, tickStartedAt: Date) -> TimeInterval {
+        let id = loop.loopId
+        let interval = max(0, loop.interval)
+        let now = clock()
+        let streak = consecutiveFailures[id] ?? 0
+        let delay: TimeInterval
+        if streak > 0 {
+            let policy = loop.failureBackoffPolicy ?? defaultFailureBackoff
+            let backoff = policy.delay(forConsecutiveFailures: streak, jitter: jitter)
+            delay = max(minimumTickSpacing, max(interval, backoff))
+        } else {
+            let elapsed = max(0, now.timeIntervalSince(tickStartedAt))
+            delay = max(minimumTickSpacing, interval - elapsed)
+        }
+        // Keep the advertised next-tick time honest: Doctor's overdue check
+        // reads this, and after backoff/drift correction `now + interval` is
+        // simply wrong.
+        if var st = states[id] {
+            st.nextTickAt = now.addingTimeInterval(delay)
+            states[id] = st
+        }
+        return delay
+    }
+
+    /// Test seam: the delay the periodic task would sleep next.
+    internal func _testNextDelay(loopId: String, tickStartedAt: Date) -> TimeInterval? {
+        guard let reg = loops[loopId] else { return nil }
+        return nextDelay(for: reg.loop, tickStartedAt: tickStartedAt)
     }
 
     // MARK: durable per-loop run state (LOOPS-4)
@@ -952,7 +1108,12 @@ public actor SwiftNativeLoopScheduler {
             st.lastResult = "failed"
             st.tickCount += 1
             states[id] = st
-            await recordDurableRun(loopId: id, at: now)
+            // A TIMED-OUT tick did not complete its body, so — exactly like the
+            // coalesced skip below — it must NOT advance the durable due clock.
+            // It previously did, which meant a weekly loop that always times
+            // out booked a fresh durable stamp every attempt and therefore
+            // never read as overdue: the starvation was invisible to Doctor and
+            // to the startup catch-up path (audit 2026-08-02).
             let err = st.lastError ?? "timeout"
             await appendFailureReceipt(loopId: id, error: err)
             await maybePushFailureStreak(loopId: id, error: err, now: now)
@@ -987,30 +1148,45 @@ public actor SwiftNativeLoopScheduler {
         case .completed(let result):
             st.lastResult = result ?? "completed"
             st.lastError = nil
-        case .skipped(let reason):
+        case .skipped(let reason, _):
             st.lastResult = "skipped: \(reason)"
-            st.lastError = nil
+            // A HEALTH-NEUTRAL skip proves nothing about the loop's health, so
+            // it must not erase the standing failure. Clearing `lastError` on a
+            // `.backingOff` skip left `consecutiveFailures` nonzero while the
+            // error slot read nil, and Doctor's no-error path then reported the
+            // loop Healthy in the middle of its own failure-backoff window
+            // (gpt-5.5 NEEDS_FIX, audit 2026-08-02). Only a skip that IS
+            // evidence of health ("nothing due") clears it.
+            if !outcome.isHealthNeutralSkip { st.lastError = nil }
         case .failed(let error):
             st.lastResult = "failed"
             st.lastError = error
         }
         states[id] = st
-        // A coalesced skip did not actually execute the loop body, so it must
-        // not advance the durable due clock — otherwise overlapping wake
-        // traffic could keep pushing a starved loop's next due time forward.
-        if outcome != .skipped(reason: LoopTickOutcome.coalescedSkipReason) {
+        // A health-neutral skip did not actually execute the loop body, so it
+        // must not advance the durable due clock — otherwise overlapping wake
+        // traffic (coalesce) or a loop sitting in its own backoff window
+        // (.backingOff) would keep pushing a starved loop's next due time
+        // forward and the starvation would be invisible to restart catch-up.
+        if !outcome.isHealthNeutralSkip {
             await recordDurableRun(loopId: id, at: now)
         }
         switch outcome {
         case .failed(let error):
             await appendFailureReceipt(loopId: id, error: error)
             await maybePushFailureStreak(loopId: id, error: error, now: now)
-        case .skipped(let reason) where reason == LoopTickOutcome.coalescedSkipReason:
-            // A periodic tick that joined an active execution proves nothing
-            // about loop health — the active tick may be failing right now.
-            // Leave the streak alone (gpt-5.5 BLOCKING: resetting here could
-            // hold a genuinely failing loop below the push threshold under
-            // overlapping wake traffic).
+        case .skipped where outcome.isHealthNeutralSkip:
+            // Two shapes land here, neither of which is evidence of health:
+            //   * the coalesced skip — a periodic tick that joined an active
+            //     execution which may be failing right now (gpt-5.5 BLOCKING:
+            //     resetting here could hold a genuinely failing loop below the
+            //     push threshold under overlapping wake traffic);
+            //   * a loop-declared health-neutral skip — "I am backing off
+            //     BECAUSE I am failing" (TelegramPollLoop). Resetting on this
+            //     one meant the streak was cleared between every real failure
+            //     at the 0.25-2s tick cadence, so maybePushFailureStreak could
+            //     never reach its threshold and a revoked token / offline Mac
+            //     stayed silent forever (audit 2026-08-02, HIGH).
             break
         case .completed, .skipped:
             consecutiveFailures[id] = 0
@@ -1147,7 +1323,16 @@ public actor SwiftNativeLoopScheduler {
     /// by calling this from their tick body (via a SchedulerHandle pattern in
     /// a future iteration) — for Phase B we expose it on the actor so tests
     /// can verify the lastError slot wires correctly.
-    public func recordFailure(loopId: String, error: String) async {
+    ///
+    /// `advanceDurableRun: false` records the failure WITHOUT booking a fresh
+    /// durable last-run stamp. The out-of-band timeout path passes false so it
+    /// agrees with the periodic path (`runOneTick`'s TickTimeoutError catch): a
+    /// tick that never finished its body is not a run, and a weekly loop that
+    /// always times out must keep reading as overdue across restarts instead of
+    /// re-arming a week-long sleep every attempt (gpt-5.5 BLOCKING, 2026-08-02).
+    public func recordFailure(
+        loopId: String, error: String, advanceDurableRun: Bool = true
+    ) async {
         var st = states[loopId] ?? LoopState(loopId: loopId)
         let now = clock()
         st.lastError = error
@@ -1155,7 +1340,9 @@ public actor SwiftNativeLoopScheduler {
         st.tickCount += 1
         st.lastResult = "failed"
         states[loopId] = st
-        await recordDurableRun(loopId: loopId, at: now)
+        if advanceDurableRun {
+            await recordDurableRun(loopId: loopId, at: now)
+        }
         await appendFailureReceipt(loopId: loopId, error: error)
         await maybePushFailureStreak(loopId: loopId, error: error, now: now)
     }
@@ -1182,6 +1369,11 @@ public actor SwiftNativeLoopScheduler {
         await recordDurableRun(loopId: loopId, at: now)
         consecutiveFailures[loopId] = 0
         failureStreakStartedAt[loopId] = nil
+    }
+
+    /// Test seam: the loop's live consecutive-failure streak.
+    internal func _testConsecutiveFailures(loopId: String) -> Int {
+        consecutiveFailures[loopId] ?? 0
     }
 
     /// Test seam: the durable last-run stamp the scheduler would restart from.

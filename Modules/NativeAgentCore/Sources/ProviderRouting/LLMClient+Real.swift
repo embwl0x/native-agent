@@ -558,6 +558,17 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         if isMoonshotCatalogModel(lower) {
             return AdapterResolution(choice: .moonshot, model: model, providerId: "moonshot")
         }
+        // A namespaced `vendor/model` id is the OpenRouter form, and by here no
+        // first-party rule has claimed it. Resolve it to `.openRouter` EVEN IF
+        // OpenRouter is unconfigured, so the adapter guard throws
+        // `notConfigured(provider: "openrouter")` — the same fail-loud shape the
+        // pinned-provider path already produces. Previously this fell through to
+        // Codex, so a swarms worker asking for `anthropic/claude-3.5-sonnet`
+        // with OpenRouter unconfigured silently ran on the Codex CLI with a
+        // model string Codex has never heard of (gpt-5.5 BLOCKING, 2026-08-02).
+        if lower.contains("/") {
+            return AdapterResolution(choice: .openRouter, model: model, providerId: "openrouter")
+        }
         return AdapterResolution(choice: .codex, model: model, providerId: "codex")
     }
 
@@ -598,7 +609,13 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         case "openai": return .openAI
         case "xai": return .xai
         case "moonshot": return .moonshot
-        case "openrouter": return openRouter != nil ? .openRouter : .codex
+        // FAIL LOUD (NORTHSTAR clause 2): an explicit `openrouter` pin resolves
+        // to the OpenRouter adapter choice ALWAYS. It used to degrade to
+        // `.codex` when OpenRouter was unconfigured, which silently spent the
+        // ChatGPT subscription on a different model with no error and no log.
+        // Every other missing adapter in this switch surfaces `.notConfigured`
+        // at its dispatch site; OpenRouter now does the same.
+        case "openrouter": return .openRouter
         case "codex": return .codex
         default: return nil
         }
@@ -776,9 +793,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                 switch resolution.choice {
                 case .openRouter:
                     guard let or = openRouter else {
-                        return try await codex.complete(
-                            prompt: prompt, system: system, model: effectiveModel, tools: tools
-                        )
+                        throw LLMError.notConfigured(provider: "openrouter")
                     }
                     return try await or.complete(
                         prompt: prompt, system: system, model: effectiveModel, tools: tools
@@ -862,9 +877,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                 switch resolution.choice {
                 case .openRouter:
                     guard let or = openRouter else {
-                        return try await codex.completeMessages(
-                            messages: messages, system: system, model: effectiveModel, tools: tools
-                        )
+                        throw LLMError.notConfigured(provider: "openrouter")
                     }
                     return try await or.completeMessages(
                         messages: messages, system: system, model: effectiveModel, tools: tools
@@ -979,15 +992,12 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                     try await LLMCallContext.$serviceTier.withValue(controls.serviceTier) {
                     switch resolution.choice {
                     case .openRouter:
-                        if let or = openRouter {
-                            try await forward(or.streamMessages(
-                                messages: messages, system: system, model: effectiveModel, tools: tools
-                            ), providerLabel: "openrouter")
-                        } else {
-                            try await forward(codex.streamMessages(
-                                messages: messages, system: system, model: effectiveModel, tools: tools
-                            ), providerLabel: "codex")
+                        guard let or = openRouter else {
+                            throw LLMError.notConfigured(provider: "openrouter")
                         }
+                        try await forward(or.streamMessages(
+                            messages: messages, system: system, model: effectiveModel, tools: tools
+                        ), providerLabel: "openrouter")
                     case .anthropic:
                         // F1-M1: the native-tools GATE (usesNativeToolLane) and
                         // this resolver decide the provider independently; with
@@ -1139,13 +1149,13 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                 let providerLabel: String
                 switch resolution.choice {
                 case .openRouter:
-                    if let or = self.openRouter {
-                        stream = or.stream(prompt: prompt, system: system, model: effectiveModel)
-                        providerLabel = "openrouter"
-                    } else {
-                        stream = codex.stream(prompt: prompt, system: system, model: effectiveModel)
-                        providerLabel = "codex"
+                    guard let or = self.openRouter else {
+                        await self.providerLifecycleFinish(started, phase: .failed)
+                        continuation.finish(throwing: LLMError.notConfigured(provider: "openrouter"))
+                        return
                     }
+                    stream = or.stream(prompt: prompt, system: system, model: effectiveModel)
+                    providerLabel = "openrouter"
                 case .anthropic:
                     do {
                         let adapter = try self.anthropicAdapter(for: resolution.providerId)

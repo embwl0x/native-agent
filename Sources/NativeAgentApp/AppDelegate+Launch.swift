@@ -188,6 +188,20 @@ extension AppDelegate {
             await GitHubCommandRuntime.shared.replayResidentStateAtLaunch()
             let loops = BackgroundLoopsAssembly.assembleAllLoops()
             await BackgroundLoopsManager.shared.start(loops: loops)
+            // CRASH RECONCILIATION for the Workshop→memory lane (gpt-5.5
+            // review BLOCKING 1, 2026-08-02). Mission-memory writes are handed
+            // off to a detached queue, so a crash — or a kill inside the 3s
+            // termination budget — can leave a terminal `mission.json` on disk
+            // with no memory behind it. `applicationWillTerminate` drains the
+            // queue for a CLEAN quit; this repairs the unclean one, bounded to
+            // recent executions (see the method's own doc for the window).
+            //
+            // Sequenced INSIDE this task, after `start(loops:)`, because
+            // WorkshopExecutorRef is configured by the loop assembly — a
+            // sibling Task.detached would race it and find the ref nil.
+            if let executor = WorkshopExecutorRef.shared.current() {
+                _ = await executor.reconcileMissedMissionMemories()
+            }
         }
         Task.detached(priority: .utility) {
             // Reconcile historical Desk feeds written before parent/child
@@ -209,6 +223,14 @@ extension AppDelegate {
             // contention (e.g. another instance holding the GRDB pool) can't
             // stall the rest of bring-up.
             if let gen = UserMDGenerator.shared {
+                // Pre-onboarding this throws `onboardingIncomplete` and writes
+                // nothing (fix-blank-install-onboarding, 2026-08-02). It used
+                // to create the persona dir and an empty USER.md on a blank
+                // machine, which satisfied onboarding's own identity-anchor
+                // check and hid the wizard depending on who won the launch
+                // race. The gate lives in the generator, so EVERY caller —
+                // launch, memory-insert pokes, consolidation — is covered and
+                // the outcome no longer depends on task ordering.
                 _ = try? await gen.regenerate()
                 if let bridge = await SwiftNativeMemoryV2.shared.underlyingBridge() {
                     await bridge.underlyingStorage().attachUserMDGenerator(gen)
@@ -404,6 +426,22 @@ extension AppDelegate {
         group.enter()
         Task.detached {
             await BackgroundLoopsManager.shared.stop()
+            group.leave()
+        }
+        // Workshop mission memories are written OFF the terminal path by a
+        // detached queue, and `BackgroundLoopsManager.stop()` cancels loop
+        // tasks — it does not drain that queue (gpt-5.5 review BLOCKING 1,
+        // 2026-08-02). Without this, a mission that reached terminal moments
+        // before quit left `mission.json` on disk and no memory: she did the
+        // work and could not remember it. Bounded BELOW the 3s budget so a
+        // wedged SQLite/embedder can never hold up quit — an unfinished drain
+        // logs what it abandoned instead of blocking. The crash case (this
+        // never runs at all) is repaired at next launch by
+        // `reconcileMissedMissionMemories`.
+        group.enter()
+        Task.detached {
+            await WorkshopExecutorRef.shared.current()?
+                .waitForMissionMemoryWrites(timeout: 2.5)
             group.leave()
         }
         // MCP stdio children don't reliably exit on stdin EOF — stop the

@@ -337,6 +337,280 @@ extension SwiftToolDispatcher {
         return await deskConfirm(store, handle: handle, prefix: canceled ? "canceled" : "closed")
     }
 
+    // MARK: - desk_blocked_on
+
+    /// desk_blocked_on — point an item at the ITEMS blocking it (never prose).
+    /// `blocked_on` is a CSV of visible numbers or handles and REPLACES the whole
+    /// set; an EMPTY string clears it.
+    ///
+    /// Every blocker ref goes through `resolveDeskRef` (invariant 2): passing the
+    /// visible number must work for the blockers exactly as it does for the
+    /// target — the addressability gap Agent caught live.
+    func impl_desk_blocked_on(input: [String: JSONValue]) async throws -> JSONValue {
+        let handle = try await resolveDeskHandle(input)
+        // Absent `blocked_on` is the same as an explicit clear: the op replaces
+        // the whole set, so there is no "leave it alone" reading of a missing arg.
+        let refs = deskCSV(input, "blocked_on")
+        var blockers: [String] = []
+        for ref in refs {
+            blockers.append(try await resolveDeskRef(ref))
+        }
+        let store = deskStore()
+        do {
+            _ = try await store.setBlockedOn(handle, blockers: blockers)
+        } catch let e as DeskError {
+            return .object([
+                "status": .string("refused"),
+                "reason": .string(e.errorDescription ?? "\(e)"),
+            ])
+        }
+        // Name the resolved blockers by the ALIASES the operator sees.
+        let state = try? await store.liveState()
+        let aliases = blockers.compactMap { h in state?.items.first { $0.handle == h }?.alias }
+        let prefix = aliases.isEmpty
+            ? "blockers cleared"
+            : "blocked-on \(aliases.joined(separator: ","))"
+        return await deskConfirm(store, handle: handle, prefix: prefix)
+    }
+
+    // MARK: - desk_defer
+
+    /// desk_defer — park an item until a day (`yyyy-MM-dd`) or ISO stamp. An
+    /// empty `until` clears the park. A deferred item is not "next up" and is
+    /// never flagged stale.
+    func impl_desk_defer(input: [String: JSONValue]) async throws -> JSONValue {
+        let handle = try await resolveDeskHandle(input)
+        let raw = optionalString(input, "until")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let until: String? = (raw?.isEmpty == false) ? raw : nil
+        let store = deskStore()
+        do {
+            _ = try await store.setDeferUntil(handle, until: until)
+        } catch let e as DeskError {
+            return .object([
+                "status": .string("refused"),
+                "reason": .string(e.errorDescription ?? "\(e)"),
+            ])
+        }
+        return await deskConfirm(
+            store, handle: handle,
+            prefix: until.map { "deferred until \($0)" } ?? "defer cleared"
+        )
+    }
+
+    // MARK: - desk_breakdown
+
+    /// desk_breakdown — one call from a big idea to a numbered campaign: create
+    /// a parent (or graft onto an existing item via `parent`), create its
+    /// sub-items in order, wire blocked-on edges between them, and park any
+    /// child with a defer date.
+    ///
+    /// In a child's `blocked_on` CSV, a BARE INTEGER is the 1-based position of
+    /// a sibling in THIS call; anything else (a dotted number like "3.1" or a
+    /// desk_ handle) resolves against the live desk. Top-level items can't be
+    /// referenced by their bare number here — that would be ambiguous with
+    /// batch positions — so wire those afterward with desk_blocked_on.
+    ///
+    /// A mid-batch refusal reports status "partial" with everything already
+    /// created — never a silent half-campaign.
+    func impl_desk_breakdown(input: [String: JSONValue]) async throws -> JSONValue {
+        guard case .array(let rawChildren)? = input["children"], !rawChildren.isEmpty else {
+            throw AutonomyGateError.toolDenied(reason: "desk_breakdown: children must be a non-empty array")
+        }
+        struct ChildSpec {
+            var title: String
+            var summary: String?
+            var blockedOnCSV: String
+            var deferUntil: String?
+        }
+        var specs: [ChildSpec] = []
+        // An LLM inventing a plausible-but-wrong child field is the NORMAL
+        // failure mode, not an edge case — Agent's first live call passed
+        // `batch: 2` meaning ordering and got a silently flat campaign.
+        // Unknown keys are REFUSED loudly, never dropped.
+        let allowedChildKeys: Set<String> = ["title", "summary", "blocked_on", "defer_until"]
+        for (idx, raw) in rawChildren.enumerated() {
+            guard case .object(let obj) = raw,
+                  case .string(let title)? = obj["title"],
+                  !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw AutonomyGateError.toolDenied(reason: "desk_breakdown: child \(idx + 1) needs a non-empty title")
+            }
+            let unknown = obj.keys.filter { !allowedChildKeys.contains($0) }.sorted()
+            guard unknown.isEmpty else {
+                throw AutonomyGateError.toolDenied(
+                    reason: "desk_breakdown: child \(idx + 1) has unknown field(s) \(unknown.joined(separator: ", ")) — allowed: title, summary, blocked_on, defer_until. For ordering, put the blocking sibling positions in blocked_on (e.g. \"1,2\" or [1,2]).")
+            }
+            func str(_ k: String) -> String? {
+                if case .string(let s)? = obj[k] { return s.trimmingCharacters(in: .whitespacesAndNewlines) }
+                return nil
+            }
+            // blocked_on: CSV string OR an array of strings/ints — the array
+            // is the shape a model reaches for naturally; both are honest.
+            let blockedOnCSV: String
+            switch obj["blocked_on"] {
+            case .some(.string(let s)):
+                blockedOnCSV = s
+            case .some(.array(let arr)):
+                var tokens: [String] = []
+                for entry in arr {
+                    switch entry {
+                    case .string(let s): tokens.append(s)
+                    case .int(let i): tokens.append(String(i))
+                    // Wire JSON numbers decode as .double on some paths (the
+                    // bridge caught this live: literal `1` arrived as 1.0) —
+                    // an integral double is an integer position.
+                    case .double(let d) where d == d.rounded() && d.magnitude < 1_000_000:
+                        tokens.append(String(Int(d)))
+                    default:
+                        throw AutonomyGateError.toolDenied(
+                            reason: "desk_breakdown: child \(idx + 1) blocked_on array entries must be strings or integers")
+                    }
+                }
+                blockedOnCSV = tokens.joined(separator: ",")
+            case .none:
+                blockedOnCSV = ""
+            default:
+                throw AutonomyGateError.toolDenied(
+                    reason: "desk_breakdown: child \(idx + 1) blocked_on must be a CSV string or an array")
+            }
+            specs.append(ChildSpec(
+                title: title.trimmingCharacters(in: .whitespacesAndNewlines),
+                summary: (str("summary")?.isEmpty == false) ? str("summary") : nil,
+                blockedOnCSV: blockedOnCSV,
+                deferUntil: (str("defer_until")?.isEmpty == false) ? str("defer_until") : nil
+            ))
+        }
+        // Pre-validate every batch-position token BEFORE any write, so a bad
+        // position fails the whole call instead of leaving a half-campaign.
+        for (idx, spec) in specs.enumerated() {
+            for token in spec.blockedOnCSV.split(separator: ",")
+                .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) }).filter({ !$0.isEmpty }) {
+                if let pos = Int(token) {
+                    guard pos >= 1, pos <= specs.count else {
+                        throw AutonomyGateError.toolDenied(
+                            reason: "desk_breakdown: child \(idx + 1) blocked_on '\(pos)' is not a position in this batch (1–\(specs.count))")
+                    }
+                    guard pos != idx + 1 else {
+                        throw AutonomyGateError.toolDenied(reason: "desk_breakdown: child \(idx + 1) cannot block on itself")
+                    }
+                }
+            }
+        }
+
+        let store = deskStore()
+        let parentHandle: String
+        let project: String
+        let parentRaw = optionalString(input, "parent")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let parentRaw, !parentRaw.isEmpty {
+            // Graft mode: attach the new sub-items to an existing item.
+            parentHandle = try await resolveDeskRef(parentRaw)
+            let state = try await store.liveState()
+            guard let parentItem = state.items.first(where: { $0.handle == parentHandle }) else {
+                throw AutonomyGateError.toolDenied(reason: "desk_breakdown: parent '\(parentRaw)' is not live")
+            }
+            project = parentItem.project
+        } else {
+            let proj = try requireString(input, "project").trimmingCharacters(in: .whitespacesAndNewlines)
+            let title = try requireString(input, "title").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !proj.isEmpty, !title.isEmpty else {
+                throw AutonomyGateError.toolDenied(reason: "desk_breakdown: project and title must be non-empty")
+            }
+            let kindRaw = optionalString(input, "kind")?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let kind = (kindRaw?.isEmpty == false) ? DeskKind(rawValue: kindRaw!) : .plan
+            guard let kind else {
+                throw AutonomyGateError.toolDenied(
+                    reason: "desk_breakdown: unknown kind '\(kindRaw ?? "")' — one of \(DeskKind.allCases.map(\.rawValue).joined(separator: ", "))")
+            }
+            let summary = optionalString(input, "summary")?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let parentItem = try await store.createItem(
+                kind: kind, project: proj, title: title,
+                parent: nil, summary: (summary?.isEmpty == false) ? summary : nil
+            )
+            parentHandle = parentItem.handle
+            project = proj
+        }
+
+        // Create the children in order, then wire edges + defers. From here on
+        // a refusal reports PARTIAL state honestly instead of throwing away
+        // what already exists on the desk.
+        var createdHandles: [String] = []
+        var planLines: [String] = []
+        func partial(_ reason: String) async -> JSONValue {
+            let state = try? await store.liveState()
+            let parentAlias = state?.items.first { $0.handle == parentHandle }?.alias ?? parentHandle
+            return .object([
+                "status": .string("partial"),
+                "reason": .string(reason),
+                "parent": .string(parentAlias),
+                "created": .array(planLines.map { .string($0) }),
+            ])
+        }
+        for (idx, spec) in specs.enumerated() {
+            do {
+                let child = try await store.createItem(
+                    kind: .plan, project: project, title: spec.title,
+                    parent: parentHandle, summary: spec.summary
+                )
+                createdHandles.append(child.handle)
+                planLines.append("\(child.alias) \(spec.title)")
+            } catch {
+                return await partial("creating child \(idx + 1) '\(spec.title)': \(error.localizedDescription)")
+            }
+        }
+        for (idx, spec) in specs.enumerated() {
+            let tokens = spec.blockedOnCSV.split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+            if !tokens.isEmpty {
+                var blockers: [String] = []
+                do {
+                    for token in tokens {
+                        if let pos = Int(token) {
+                            blockers.append(createdHandles[pos - 1])
+                        } else {
+                            blockers.append(try await resolveDeskRef(token))
+                        }
+                    }
+                    _ = try await store.setBlockedOn(createdHandles[idx], blockers: blockers)
+                } catch let e as DeskError {
+                    return await partial("wiring child \(idx + 1) blockers: \(e.errorDescription ?? "\(e)")")
+                } catch {
+                    return await partial("wiring child \(idx + 1) blockers: \(error.localizedDescription)")
+                }
+            }
+            if let until = spec.deferUntil {
+                do {
+                    _ = try await store.setDeferUntil(createdHandles[idx], until: until)
+                } catch let e as DeskError {
+                    return await partial("deferring child \(idx + 1): \(e.errorDescription ?? "\(e)")")
+                } catch {
+                    return await partial("deferring child \(idx + 1): \(error.localizedDescription)")
+                }
+            }
+        }
+
+        // The numbered plan + what's actionable right now, aliases only.
+        let state = try await store.liveState()
+        let plan = DeskSequencing.compute(state)
+        let parentAlias = state.items.first { $0.handle == parentHandle }?.alias ?? parentHandle
+        let byHandle = Dictionary(uniqueKeysWithValues: state.items.map { ($0.handle, $0) })
+        var lines: [String] = []
+        for handle in createdHandles {
+            guard let item = byHandle[handle] else { continue }
+            var segs = ["\(item.alias) \(item.title)"]
+            segs.append(contentsOf: DeskProjection.sequencingSegments(item, in: state, plan: plan, includeRollup: false))
+            lines.append(segs.joined(separator: " · "))
+        }
+        let readyNow = createdHandles.filter { plan.byHandle[$0]?.isReady == true }
+            .compactMap { byHandle[$0]?.alias }
+        return .object([
+            "status": .string("ok"),
+            "parent": .string(parentAlias),
+            "handle": .string(parentHandle),
+            "plan": .array(lines.map { .string($0) }),
+            "ready_now": .array(readyNow.map { .string($0) }),
+            "confirmation": .string("campaign \(parentAlias) · \(createdHandles.count) sub-items · ready now: \(readyNow.isEmpty ? "none" : readyNow.joined(separator: ", "))"),
+        ])
+    }
+
     // MARK: - desk_archive
 
     func impl_desk_archive(input: [String: JSONValue]) async throws -> JSONValue {
@@ -405,5 +679,160 @@ extension SwiftToolDispatcher {
             )
         }
         return DeskRef(kind: kind)
+    }
+
+    // MARK: - desk_nag_control
+
+    /// desk_nag_control — User's nag switch, driven by DETERMINISTIC params.
+    ///
+    /// Agent parses the intent ("stay on me about the release track" / "go
+    /// quiet, I'm busy this week"); the TOOL takes explicit arguments and never
+    /// guesses. Actions: enable | disable | mute | unmute | status.
+    ///
+    /// `unmute` is the one that carries weight: it clears the mute, opens a new
+    /// attention window (re-arming every item's one nag), AND returns the drift
+    /// digest in the reply — muted must never mean blind, so the answer to
+    /// "what moved while I was quiet?" comes back in the same turn User asks for
+    /// the pressure back.
+    func impl_desk_nag_control(input: [String: JSONValue]) async throws -> JSONValue {
+        let action = try requireString(input, "action")
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let kindRaw = (optionalString(input, "scope_kind") ?? "global")
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard ["global", "project", "item"].contains(kindRaw) else {
+            throw AutonomyGateError.toolDenied(
+                reason: "desk_nag_control: unknown scope_kind '\(kindRaw)' (expected global|project|item)")
+        }
+        let scopeIdRaw = optionalString(input, "scope_id")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let untilRaw = optionalString(input, "until")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let configStore = DeskNagConfigStore(dataRoot: dataRoot)
+
+        switch action {
+        case "enable", "disable":
+            let on = (action == "enable")
+            switch kindRaw {
+            case "global":
+                let next = try await configStore.update { $0.settingGlobal(on) }
+                return .object([
+                    "status": .string("ok"),
+                    "confirmation": .string("nagging \(on ? "ON" : "OFF") globally (window \(next.windowId))"),
+                    "config": deskNagConfigJSON(next),
+                ])
+            case "project":
+                guard let scopeIdRaw, !scopeIdRaw.isEmpty else {
+                    throw AutonomyGateError.toolDenied(reason: "desk_nag_control: scope_kind 'project' needs scope_id (the project name)")
+                }
+                let next = try await configStore.update { $0.settingScope(kind: .project, id: scopeIdRaw, enabled: on) }
+                return .object([
+                    "status": .string("ok"),
+                    "confirmation": .string(deskNagScopeConfirmation(
+                        "project \(scopeIdRaw)", on: on, config: next)),
+                    "config": deskNagConfigJSON(next),
+                ])
+            default:
+                guard let scopeIdRaw, !scopeIdRaw.isEmpty else {
+                    throw AutonomyGateError.toolDenied(reason: "desk_nag_control: scope_kind 'item' needs scope_id (the desk number or handle)")
+                }
+                // Same addressability rule as every other desk mutation: the
+                // visible number works, and it is resolved to a stable handle
+                // BEFORE it is stored (aliases are display, handles identity).
+                let handle = try await resolveDeskRef(scopeIdRaw)
+                let next = try await configStore.update { $0.settingScope(kind: .item, id: handle, enabled: on) }
+                let alias = (try? await deskStore().liveState())?.items.first { $0.handle == handle }?.alias
+                return .object([
+                    "status": .string("ok"),
+                    "handle": .string(handle),
+                    "confirmation": .string(deskNagScopeConfirmation(
+                        "item \(alias ?? handle)", on: on, config: next)),
+                    "config": deskNagConfigJSON(next),
+                ])
+            }
+
+        case "mute":
+            // A bad date is REFUSED, not silently turned into "quiet forever" —
+            // the failure mode this lane must never have.
+            if let untilRaw, !untilRaw.isEmpty, !DeskClock.isParseableDate(untilRaw) {
+                return .object([
+                    "status": .string("refused"),
+                    "reason": .string("desk_nag_control: cannot mute until '\(untilRaw)' — expected a yyyy-MM-dd day or a full ISO timestamp (omit `until` to mute indefinitely)"),
+                ])
+            }
+            let next = try await configStore.update { $0.muted(until: untilRaw?.isEmpty == false ? untilRaw : nil) }
+            let phrase = (next.mutedUntil == DeskNagConfig.indefiniteMuteSentinel)
+                ? "indefinitely" : "until \(next.mutedUntil ?? "?")"
+            return .object([
+                "status": .string("ok"),
+                "confirmation": .string("nagging muted \(phrase) — still tracking, nothing will ping"),
+                "config": deskNagConfigJSON(next),
+            ])
+
+        case "unmute":
+            // Read the desk ONCE, then compute the digest and consume the drift
+            // against that same snapshot inside the config flock.
+            let state = try await deskStore().liveState()
+            let now = Date()
+            let plan = DeskSequencing.compute(state, now: now)
+            let (next, digest) = try await configStore.updating { current in
+                let lines = DeskNagEvaluator.digestOnUnmute(state: state, plan: plan, config: current, now: now)
+                // Consume BEFORE the window bump: what User just read in the
+                // digest must not come straight back as a nag on the next tick.
+                let consumed = DeskNagEvaluator.consumingDrift(state: state, plan: plan, config: current, now: now)
+                return (consumed.unmuted(), lines)
+            }
+            let summary = digest.isEmpty
+                ? "nagging back on (window \(next.windowId)) — nothing drifted while you were quiet"
+                : "nagging back on (window \(next.windowId)) — \(digest.count) item(s) moved while quiet"
+            return .object([
+                "status": .string("ok"),
+                "confirmation": .string(summary),
+                "drift": .array(digest.map { .string($0) }),
+                "config": deskNagConfigJSON(next),
+            ])
+
+        case "status":
+            let config = await configStore.load()
+            let muted = config.isMuted(now: Date())
+            var lines: [String] = ["nagging \(config.enabled ? "ON" : "OFF") globally · window \(config.windowId)"]
+            if muted {
+                lines.append(config.mutedUntil == DeskNagConfig.indefiniteMuteSentinel
+                    ? "muted indefinitely" : "muted until \(config.mutedUntil ?? "?")")
+            } else if config.mutedUntil != nil {
+                lines.append("mute has elapsed (\(config.mutedUntil ?? "")) — the next tick reports the drift")
+            }
+            if config.scopes.isEmpty {
+                lines.append("no scopes — nothing nags until you name a project or item")
+            } else {
+                for scope in config.scopes {
+                    lines.append("  \(scope.kind.rawValue) \(scope.id): \(scope.enabled ? "on" : "off")")
+                }
+            }
+            lines.append("\(config.ledger.count) item(s) already nagged in this window; \(config.observed.count) tracked")
+            return .object([
+                "status": .string("ok"),
+                "summary": .string(lines.joined(separator: "\n")),
+                "config": deskNagConfigJSON(config),
+            ])
+
+        default:
+            throw AutonomyGateError.toolDenied(
+                reason: "desk_nag_control: unknown action '\(action)' (expected enable|disable|mute|unmute|status)")
+        }
+    }
+
+    /// Honest confirmation for a scope flip: turning a scope on while the
+    /// GLOBAL switch is off changes nothing yet, and saying so beats letting
+    /// User believe the pressure is live.
+    private func deskNagScopeConfirmation(_ label: String, on: Bool, config: DeskNagConfig) -> String {
+        let base = "nagging \(on ? "ON" : "OFF") for \(label)"
+        if on && !config.enabled {
+            return base + " — but the GLOBAL nag switch is off, so nothing will ping until you enable it"
+        }
+        return base
+    }
+
+    /// The whole config, verbatim — `status` must be honest, not a summary that
+    /// hides the ledger.
+    private func deskNagConfigJSON(_ config: DeskNagConfig) -> JSONValue {
+        config.toJSON()
     }
 }

@@ -36,17 +36,25 @@ public enum DeskProjection {
     public static let topLevelCap = 25
     public static let doneCap = 3
 
+    /// Aliases shown inline on a `blocked-on` segment before collapsing to `+N`.
+    public static let blockedOnAliasCap = 3
+
     public static func render(
         _ state: DeskState,
         now: Date = Date(),
-        archiveGrace: TimeInterval = SwiftNativeDeskStore.defaultArchiveGrace
+        archiveGrace: TimeInterval = SwiftNativeDeskStore.defaultArchiveGrace,
+        plan injectedPlan: DeskSequencing.Plan? = nil
     ) -> String {
+        // The plan is DERIVED here so every existing call site keeps working and
+        // automatically gains the sequencing segments; it is injectable purely so
+        // tests can pin a plan without reconstructing state.
+        let plan = injectedPlan ?? DeskSequencing.compute(state, now: now)
         var lines: [String] = []
         lines.append("desk · owner · rev \(state.generatedTs) · stale ok")
         lines.append("status: watch · flag · now · next · todo · done · blocked")
 
         for item in cappedTopLevel(state) {
-            lines.append(renderTopLevel(item, in: state, now: now, archiveGrace: archiveGrace))
+            lines.append(renderTopLevel(item, in: state, now: now, archiveGrace: archiveGrace, plan: plan))
             if let note = noteLine(item) { lines.append(note) }
             // Children list only when the item has ≥2 children.
             // List children when there are ≥2, OR a lone child the parent line's
@@ -58,11 +66,63 @@ public enum DeskProjection {
             let listKids = kids.count >= 2 || (kids.count == 1 && childHighlight(item, in: state) == nil)
             if listKids {
                 for kid in kids.sorted(by: { SwiftNativeDeskStore.aliasSeq($0.alias) < SwiftNativeDeskStore.aliasSeq($1.alias) }) {
-                    lines.append("  \(kid.alias) \(kid.status.rawValue) \(kid.title)")
+                    var kidSegs = ["  \(kid.alias) \(kid.status.rawValue) \(kid.title)"]
+                    kidSegs.append(contentsOf: sequencingSegments(kid, in: state, plan: plan, includeRollup: false))
+                    lines.append(kidSegs.joined(separator: " · "))
                 }
             }
         }
+
+        // "what's next" — the answer this whole surface exists for. Rendered as
+        // ALIASES (invariant 2: the projection never shows a handle).
+        let nextUp = plan.nextUp.compactMap { h in state.items.first { $0.handle == h } }
+        if !nextUp.isEmpty {
+            lines.append("next up:")
+            for item in nextUp {
+                lines.append("  \(item.alias) \(item.status.rawValue) \(item.title)")
+            }
+        }
         return lines.joined(separator: "\n")
+    }
+
+    // MARK: - Sequencing segments (blocked-on / deferred / cycle / rollup)
+
+    /// The derived sequencing segments for one row, in render order. Blockers are
+    /// rendered as the ALIASES the operator sees, never the internal handles.
+    /// Public: desk_breakdown composes its numbered-plan reply from these same
+    /// segments so the tool reply and the projection can never disagree.
+    public static func sequencingSegments(
+        _ item: DeskItem,
+        in state: DeskState,
+        plan: DeskSequencing.Plan,
+        includeRollup: Bool
+    ) -> [String] {
+        guard let itemPlan = plan.byHandle[item.handle] else { return [] }
+        var segs: [String] = []
+        if includeRollup, itemPlan.totalCount > 0 {
+            // "closed", not "done": the numerator counts every TERMINAL
+            // descendant (done AND canceled) — it measures work remaining,
+            // and claiming a canceled child as "done" would be a false label.
+            segs.append("\(itemPlan.doneCount)/\(itemPlan.totalCount) closed")
+        }
+        if !itemPlan.effectiveBlockers.isEmpty {
+            let aliases = itemPlan.effectiveBlockers.compactMap { h in
+                state.items.first { $0.handle == h }?.alias
+            }
+            if !aliases.isEmpty {
+                let shown = aliases.prefix(blockedOnAliasCap).joined(separator: ",")
+                let overflow = aliases.count - min(aliases.count, blockedOnAliasCap)
+                segs.append("blocked-on \(shown)" + (overflow > 0 ? "+\(overflow)" : ""))
+            }
+        }
+        if itemPlan.blockedByCycle {
+            segs.append("⚠ blocked-on cycle")
+        }
+        if itemPlan.isDeferred, let raw = item.deferUntil,
+           let day = DeskSequencing.deferDisplayDay(raw) {
+            segs.append("deferred until \(day)")
+        }
+        return segs
     }
 
     // MARK: - Top-level selection + caps
@@ -92,7 +152,13 @@ public enum DeskProjection {
 
     // MARK: - One top-level line
 
-    static func renderTopLevel(_ item: DeskItem, in state: DeskState, now: Date, archiveGrace: TimeInterval) -> String {
+    static func renderTopLevel(
+        _ item: DeskItem,
+        in state: DeskState,
+        now: Date,
+        archiveGrace: TimeInterval,
+        plan: DeskSequencing.Plan
+    ) -> String {
         let token2 = (item.status == .watch) ? item.kind.rawValue : item.status.rawValue
         var segs: [String] = ["\(item.alias) \(token2) \(item.project)", item.title]
 
@@ -113,6 +179,9 @@ public enum DeskProjection {
         if let highlight = childHighlight(item, in: state) {
             segs.append(highlight)
         }
+        // Parent progress DERIVES from the subtree (Agent's #2 — never a field
+        // she hand-maintains), plus the blocked-on / cycle / deferred markers.
+        segs.append(contentsOf: sequencingSegments(item, in: state, plan: plan, includeRollup: true))
         // refs:N only when 3+ (0–2 stay off the compact line; the full set lives
         // in the store + tab). gpt-5.5 review: spec is ">= 3", was rendering
         // refs:1 / refs:2.
@@ -158,6 +227,11 @@ public enum DeskProjection {
     /// `stale:<dur>` when the item's cadence.lastRefreshAt is older than its
     /// staleAfter window. nil when no lastRefreshAt / staleAfter, or still fresh.
     static func staleSegment(_ item: DeskItem, now: Date) -> String? {
+        // A DEFERRED item is parked on purpose — it is not neglected, and
+        // flagging it stale is the exact noise the defer field exists to kill
+        // (Agent's #3). Checked from the item itself so the suppression holds
+        // for every caller of staleSegment, plan or no plan.
+        guard !DeskSequencing.isDeferred(item, now: now) else { return nil }
         guard let lastRaw = item.cadence.lastRefreshAt,
               let last = DeskClock.parseISO(lastRaw),
               let staleAfter = item.cadence.staleAfter,

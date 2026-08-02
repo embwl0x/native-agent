@@ -505,7 +505,10 @@ private struct InternallyFailingCheck: DoctorCheck {
     #expect(ids.contains("memory_store"))
     #expect(ids.contains("coreml_embedder"))
     #expect(ids.contains("icloud_bridge_state"))
-    #expect(results.count == 8)
+    // op_log_health: the append-only feeds' compaction-blocked / unbounded-growth
+    // surface (gpt-5.5 review 2026-08-02, finding 3).
+    #expect(ids.contains("op_log_health"))
+    #expect(results.count == 9)
 }
 
 @Test func swiftNative_runAll_repair_dispatches_to_repairable_checks() async throws {

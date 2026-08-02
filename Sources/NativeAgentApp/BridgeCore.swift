@@ -72,6 +72,24 @@ enum BridgeCore {
     /// MacControlBridge gains it.)
     static let headerByteCap = 65_536
 
+    // MARK: - Authority reads
+
+    /// STRICT boolean read out of a `JSONSerialization` object graph: true only
+    /// for a real JSON `true`, never for a number.
+    ///
+    /// `as? Bool` is not safe here. Foundation bridges `NSNumber(1)` to `Bool`
+    /// successfully, so `json["developerMode"] as? Bool == true` opens a start
+    /// gate on `{"developerMode": 1}` — the same trap that turned wire `1` into
+    /// `.bool(true)` in `anyToJSONValue` (fixed 2026-08-01, see the CFBoolean
+    /// branch there). For a value that decides whether a bridge binds a port
+    /// and mints a bearer token, the direction of error on damaged or tampered
+    /// policy bytes must be "stay down", so type drift reads as false.
+    static func strictBool(_ value: Any?) -> Bool {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) == CFBooleanGetTypeID() else { return false }
+        return number.boolValue
+    }
+
     // MARK: - Endpoint
 
     /// True for loopback peers (localhost / 127.0.0.1 / ::1). A non-hostPort

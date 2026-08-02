@@ -31,8 +31,11 @@ private func writeJSONObject(_ object: Any, to url: URL) throws {
     try data.write(to: url, options: .atomic)
 }
 
+// 10s deadline, not 3s: positive steps only need the deadline to exceed
+// worst-case scheduler noise under full-suite parallelism — a green run
+// still returns at the first 20ms poll that observes the condition.
 private func eventually(
-    timeout: Duration = .seconds(3),
+    timeout: Duration = .seconds(10),
     condition: @escaping @Sendable () async -> Bool
 ) async throws {
     let clock = ContinuousClock()

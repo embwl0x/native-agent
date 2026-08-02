@@ -618,6 +618,7 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
     /// feed grew unbounded with O(total-ops) replay per write (audit round 2,
     /// F1: 15.9k ops in 6 days). Injectable for tests.
     let opsCompactionThreshold: Int
+    public static let logLabel = "GitHubCommandStore"
     private let persistence = SwiftNativePersistenceCore()
     private let changeBus: StoreChangeBus
 
@@ -925,13 +926,16 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
             }
             let state = try replay(base: feed.base, feed.ops + newOps)
             try Self.validate(state)
-            try await persistence.appendJSONL(try newOps.map(Self.json), to: opsPath)
+            try await persistence.appendJSONLDurable(try newOps.map(Self.json), to: opsPath)
             changeBus.emit(StoreChange(store: .githubCommand, path: opsPath))
             try await persistence.writeJSON(try Self.json(state), to: statePath)
             try await compactIfNeededUnlocked(
                 base: feed.base,
                 rebasedOps: feed.ops + newOps,
-                fileOpCount: feed.fileOpCount + newOps.count
+                fileOpCount: feed.fileOpCount + newOps.count,
+                // The physical row count came from the PRE-append read; these
+                // ops are now in the file too, so carry them (finding 2).
+                integrity: feed.integrity.appendingRows(newOps.count)
             )
             return observations.compactMap { state.item($0.itemId) }
         }
@@ -1064,7 +1068,7 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
                 )
                 let op = GitHubCommandOp(id: UUID().uuidString.lowercased(), at: DeskClock.nowISO(), body: .callbackReceived(itemId: item.itemId, callback: callback))
                 try Self.validate(op.body, state: state)
-                try await persistence.appendJSONL(try Self.json(op), to: opsPath)
+                try await persistence.appendJSONLDurable(try Self.json(op), to: opsPath)
                 changeBus.emit(StoreChange(store: .githubCommand, path: opsPath))
                 ops.append(op)
                 appendedCount += 1
@@ -1077,7 +1081,8 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
             try await compactIfNeededUnlocked(
                 base: feed.base,
                 rebasedOps: ops,
-                fileOpCount: feed.fileOpCount + appendedCount
+                fileOpCount: feed.fileOpCount + appendedCount,
+                integrity: feed.integrity.appendingRows(appendedCount)
             )
             return updated
         }
@@ -1130,13 +1135,16 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
             for op in newOps { try Self.validate(op.body, state: prior) }
             let state = try replay(base: feed.base, feed.ops + newOps)
             try Self.validate(state)
-            try await persistence.appendJSONL(try newOps.map(Self.json), to: opsPath)
+            try await persistence.appendJSONLDurable(try newOps.map(Self.json), to: opsPath)
             changeBus.emit(StoreChange(store: .githubCommand, path: opsPath))
             try await persistence.writeJSON(try Self.json(state), to: statePath)
             try await compactIfNeededUnlocked(
                 base: feed.base,
                 rebasedOps: feed.ops + newOps,
-                fileOpCount: feed.fileOpCount + newOps.count
+                fileOpCount: feed.fileOpCount + newOps.count,
+                // The physical row count came from the PRE-append read; these
+                // ops are now in the file too, so carry them (finding 2).
+                integrity: feed.integrity.appendingRows(newOps.count)
             )
             return intents
         }
@@ -1171,12 +1179,12 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
     private func appendUnlocked(
         _ body: GitHubCommandOpBody,
         itemId: String,
-        feed: (base: GitHubCommandState?, ops: [GitHubCommandOp], fileOpCount: Int)
+        feed: (base: GitHubCommandState?, ops: [GitHubCommandOp], fileOpCount: Int, integrity: SnapshotTailOpLog.OpLogIntegrity)
     ) async throws -> GitHubCommandItem {
         let prior = try replay(base: feed.base, feed.ops)
         try Self.validate(body, state: prior)
         let op = GitHubCommandOp(id: UUID().uuidString.lowercased(), at: DeskClock.nowISO(), body: body)
-        try await persistence.appendJSONL(try Self.json(op), to: opsPath)
+        try await persistence.appendJSONLDurable(try Self.json(op), to: opsPath)
         changeBus.emit(StoreChange(store: .githubCommand, path: opsPath))
         let state = try replay(base: feed.base, feed.ops + [op])
         try Self.validate(state)
@@ -1184,20 +1192,64 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
         try await compactIfNeededUnlocked(
             base: feed.base,
             rebasedOps: feed.ops + [op],
-            fileOpCount: feed.fileOpCount + 1
+            fileOpCount: feed.fileOpCount + 1,
+            integrity: feed.integrity.appendingRows(1)
         )
         guard let item = state.item(itemId) else { throw GitHubCommandStoreError.unknownItem(itemId) }
         return item
     }
 
-    private func readOpsUnlocked() async throws -> [GitHubCommandOp] {
-        let rows = try await persistence.readJSONL(opsPath)
-        return try rows.map { row in
+    /// Ops plus the accounting of what the raw scan discarded.
+    ///
+    /// An UNDECODABLE row already fails LOUD here (`malformedOperation`) — this
+    /// store never had finding 1's silent-skip exposure, so `undecodableRowCount`
+    /// is structurally zero. What it DID share is finding 2: `readJSONL` drops an
+    /// unparseable LINE silently, and compaction would then rewrite the feed
+    /// without it. The gate in `compactIfNeededUnlocked` closes that.
+    private func readOpsWithIntegrityUnlocked() async throws -> (ops: [GitHubCommandOp], integrity: SnapshotTailOpLog.OpLogIntegrity) {
+        let (rows, report) = try await persistence.readJSONLReporting(opsPath)
+        let ops = try rows.map { row -> GitHubCommandOp in
             guard let op: GitHubCommandOp = try? Self.decode(row) else {
                 throw GitHubCommandStoreError.malformedOperation
             }
             return op
         }
+        let integrity = SnapshotTailOpLog.OpLogIntegrity(
+            malformedLineCount: report.malformedLineCount,
+            undecodableRowCount: 0,
+            trailingPartialLine: report.trailingPartialLine,
+            physicalRowCount: report.physicalLineCount
+        )
+        SnapshotTailOpLog.noteIntegrity(integrity, feed: Self.logLabel, path: opsPath)
+        return (ops, integrity)
+    }
+
+    private func readOpsUnlocked() async throws -> [GitHubCommandOp] {
+        try await readOpsWithIntegrityUnlocked().ops
+    }
+
+    /// The readable counter: what the GitHub-command feed currently cannot use.
+    public func opLogIntegrity() async throws -> SnapshotTailOpLog.OpLogIntegrity {
+        try await readOpsWithIntegrityUnlocked().integrity
+    }
+
+    /// The GitHub-command feed's health for the Doctor surface (gpt-5.5 review
+    /// 2026-08-02, finding 3): unusable rows AND feed size.
+    ///
+    /// This one reads through `readOpsWithIntegrityUnlocked`, which THROWS on an
+    /// undecodable op row (this store fails loud where Desk skips). The Doctor
+    /// check catches that and reports it — a feed that will not even parse is
+    /// exactly what a health surface is for.
+    public func opLogHealth() async throws -> SnapshotTailOpLog.OpLogHealth {
+        let integrity = try await opLogIntegrity()
+        return SnapshotTailOpLog.OpLogHealth(
+            feed: Self.logLabel,
+            path: opsPath,
+            physicalRowCount: integrity.physicalRowCount,
+            byteCount: SnapshotTailOpLog.OpLogHealth.fileSize(opsPath),
+            compactionThreshold: opsCompactionThreshold,
+            integrity: integrity
+        )
     }
 
     /// Reads the replayable feed: compaction base (if any) + the ops that
@@ -1217,7 +1269,7 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
     ///   - anything else is a torn read → retry; after 3 torn reads, one
     ///     pass under the flock is guaranteed consistent. Lock-free readers
     ///     ONLY — callers already holding the flock use readFeedLocked.
-    private func readFeedUnlocked() async throws -> (base: GitHubCommandState?, ops: [GitHubCommandOp], fileOpCount: Int) {
+    private func readFeedUnlocked() async throws -> (base: GitHubCommandState?, ops: [GitHubCommandOp], fileOpCount: Int, integrity: SnapshotTailOpLog.OpLogIntegrity) {
         for _ in 0..<3 {
             if let feed = try await readFeedAttempt() { return feed }
         }
@@ -1233,7 +1285,7 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
     /// writer exists, so a failed (base, tail) pairing is genuine on-disk
     /// corruption and must throw loud — not wedge this writer, and every
     /// writer queued behind it, forever.
-    private func readFeedLocked() async throws -> (base: GitHubCommandState?, ops: [GitHubCommandOp], fileOpCount: Int) {
+    private func readFeedLocked() async throws -> (base: GitHubCommandState?, ops: [GitHubCommandOp], fileOpCount: Int, integrity: SnapshotTailOpLog.OpLogIntegrity) {
         guard let feed = try await readFeedAttempt() else {
             throw GitHubCommandStoreError.invariantViolation(
                 "ops feed unreadable as a consistent (base, tail) pair even under the ops flock"
@@ -1242,11 +1294,13 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
         return feed
     }
 
-    private func readFeedAttempt() async throws -> (base: GitHubCommandState?, ops: [GitHubCommandOp], fileOpCount: Int)? {
-        var ops = try await readOpsUnlocked()
+    private func readFeedAttempt() async throws -> (base: GitHubCommandState?, ops: [GitHubCommandOp], fileOpCount: Int, integrity: SnapshotTailOpLog.OpLogIntegrity)? {
+        let read = try await readOpsWithIntegrityUnlocked()
+        var ops = read.ops
+        let integrity = read.integrity
         let fileOpCount = ops.count
         guard FileManager.default.fileExists(atPath: basePath.path) else {
-            return (nil, ops, fileOpCount)
+            return (nil, ops, fileOpCount, integrity)
         }
         // A base that EXISTS but will not decode must fail LOUD: after a
         // compaction has truncated the op-log, silently ignoring the base
@@ -1271,10 +1325,10 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
         }
         if let idx = ops.lastIndex(where: { $0.id == base.lastCompactedOpId }) {
             ops.removeFirst(idx + 1)
-            return (base.state, ops, fileOpCount)
+            return (base.state, ops, fileOpCount, integrity)
         }
         if ops.first?.id == base.tailFirstOpId {
-            return (base.state, ops, fileOpCount)
+            return (base.state, ops, fileOpCount, integrity)
         }
         return nil
     }
@@ -1293,9 +1347,20 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
     private func compactIfNeededUnlocked(
         base: GitHubCommandState?,
         rebasedOps: [GitHubCommandOp],
-        fileOpCount: Int
+        fileOpCount: Int,
+        integrity: SnapshotTailOpLog.OpLogIntegrity
     ) async throws {
-        guard fileOpCount >= opsCompactionThreshold else { return }
+        // PHYSICAL rows, not decoded ops (gpt-5.5 review 2026-08-02, finding 2).
+        // Undecodable ops throw upstream here, but a malformed LINE is dropped
+        // silently by the scan, so a feed padded with malformed lines measured
+        // smaller than it is — under the threshold, past the gate, never warned
+        // about, growing without bound.
+        guard integrity.feedRowCount(decodedCount: fileOpCount) >= opsCompactionThreshold else { return }
+        // THE UNKNOWN-ROW GATE (audit 2026-08-02, finding 1), same policy as
+        // DeskStore and TaskLedger. Undecodable ops already throw upstream here,
+        // so in practice this catches a malformed LINE that `readJSONL` dropped —
+        // rewriting the feed would delete it for good.
+        guard SnapshotTailOpLog.mayCompact(integrity, feed: Self.logLabel, path: opsPath) else { return }
         // keep >= 1: the rewritten log's head op is the lock-free reader's
         // consistency proof (tailFirstOpId), so the tail must never be empty.
         let keep = min(Self.compactionKeepTailOps, max(1, opsCompactionThreshold / 4))

@@ -5,10 +5,14 @@ import NativeAgentCore
 
 @Suite("UserMDGenerator")
 struct UserMDGenTests {
+    /// A data root for an install that has FINISHED onboarding — USER.md
+    /// generation is gated on that (fix-blank-install-onboarding, 2026-08-02;
+    /// see UserMDOnboardingGateTests for the blank-install side).
     private func tmpRoot() -> URL {
         let url = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("usermdgen-\(UUID().uuidString)", isDirectory: true)
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        try? Data("completed_at=test\n".utf8).write(to: url.appendingPathComponent(".onboarded"))
         return url
     }
 

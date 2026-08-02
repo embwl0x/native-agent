@@ -17,6 +17,132 @@ import WorkshopExecution
 // W2's fallback declaration was dropped at integration; this file now uses
 // the canonical type directly via the `import NativeAgentCore` above.
 
+// MARK: - MCP tools-cache warm (production trigger)
+
+/// Owns the ONE production caller of `SwiftNativeMCPDispatcher
+/// .refreshAllToolsCaches()`. `MCPToolBridge.listMCPTools` — the sole producer
+/// of `mcp__<server>__<tool>` descriptors for the model — reads
+/// `mcp/cache/tools.json` and never refreshes it, so after the daemon was
+/// retired the cache had no writer on any non-UI path: a perfectly healthy
+/// stdio server advertised zero tools and the capability was simply absent.
+///
+/// Two properties the chat path depends on:
+/// - **Non-blocking.** `kickDetached` schedules and returns; a slow or dead
+///   server can never delay a turn's tool-catalog build.
+/// - **Bounded.** One sweep at a time, hard-cancelled at `sweepDeadline`, and
+///   re-armed no more than once per `rearmInterval` — so a per-turn catalog
+///   build cannot fan out into a subprocess storm.
+actor MCPToolCatalogWarmer {
+    typealias Sweep = @Sendable (URL) async -> Void
+
+    static let shared = MCPToolCatalogWarmer()
+
+    /// Minimum gap between sweeps. A chat turn builds the catalog repeatedly;
+    /// only the first build in a window may spawn subprocesses.
+    static let rearmInterval: TimeInterval = 300
+    /// Hard ceiling on one sweep. A wedged server gets cancelled, not waited on.
+    static let sweepDeadline: TimeInterval = 30
+
+    private let sweep: Sweep
+    private let clock: @Sendable () -> Date
+    private let rearmInterval: TimeInterval
+    private let sweepDeadline: TimeInterval
+    private var lastStartedAt: Date?
+    private var inFlight = false
+    /// Test seam: sweeps that ran to completion (or were deadline-cancelled).
+    private(set) var finishedSweeps = 0
+
+    init(
+        sweep: @escaping Sweep = MCPToolCatalogWarmer.liveSweep,
+        clock: @escaping @Sendable () -> Date = { Date() },
+        rearmInterval: TimeInterval = MCPToolCatalogWarmer.rearmInterval,
+        sweepDeadline: TimeInterval = MCPToolCatalogWarmer.sweepDeadline
+    ) {
+        self.sweep = sweep
+        self.clock = clock
+        self.rearmInterval = rearmInterval
+        self.sweepDeadline = sweepDeadline
+    }
+
+    static let liveSweep: Sweep = { root in
+        _ = await SwiftNativeMCPDispatcher(root: root).refreshAllToolsCaches()
+    }
+
+    /// Synchronous, allocation-cheap entry point for the tool-catalog build.
+    /// Returns immediately; every decision happens on the actor.
+    nonisolated func kickDetached(dataRoot: URL) {
+        Task.detached(priority: .utility) { [self] in
+            await kickIfDue(dataRoot: dataRoot)
+        }
+    }
+
+    /// True when this call actually started a sweep. False when one is already
+    /// running or the re-arm window has not elapsed.
+    @discardableResult
+    func kickIfDue(dataRoot: URL) async -> Bool {
+        guard !inFlight else { return false }
+        let now = clock()
+        if let last = lastStartedAt, now.timeIntervalSince(last) < rearmInterval {
+            return false
+        }
+        lastStartedAt = now
+        inFlight = true
+        Task { await self.runBoundedSweep(dataRoot: dataRoot) }
+        return true
+    }
+
+    private func runBoundedSweep(dataRoot: URL) async {
+        let sweep = self.sweep
+        let deadline = self.sweepDeadline
+        // Deliberately NOT a task group: a group awaits every child before it
+        // returns, so a sweep that ignores cancellation (an MCP subprocess
+        // wedged inside a `tools/list` round-trip is exactly that) would pin
+        // `inFlight` forever and the warmer could never refresh again. The
+        // one-shot latch lets the DEADLINE release the slot whether or not the
+        // sweep ever notices it was cancelled.
+        let latch = OneShotLatch()
+        let work = Task.detached(priority: .utility) {
+            await sweep(dataRoot)
+            await latch.fire()
+        }
+        let timer = Task.detached(priority: .utility) {
+            try? await Task.sleep(nanoseconds: UInt64(deadline * 1_000_000_000))
+            await latch.fire()
+        }
+        await latch.wait()
+        work.cancel()
+        timer.cancel()
+        inFlight = false
+        finishedSweeps += 1
+    }
+
+    /// Test seam.
+    func _testState() -> (inFlight: Bool, finished: Int, lastStartedAt: Date?) {
+        (inFlight, finishedSweeps, lastStartedAt)
+    }
+}
+
+/// Resumes its single waiter on the FIRST `fire()` and ignores every later one.
+/// Used to race a bounded deadline against work that may never return.
+private actor OneShotLatch {
+    private var fired = false
+    private var waiter: CheckedContinuation<Void, Never>?
+
+    func fire() {
+        guard !fired else { return }
+        fired = true
+        waiter?.resume()
+        waiter = nil
+    }
+
+    func wait() async {
+        if fired { return }
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            if fired { c.resume() } else { waiter = c }
+        }
+    }
+}
+
 // MARK: - Schema builders
 
 extension SwiftToolDispatcher {
@@ -24,7 +150,16 @@ extension SwiftToolDispatcher {
     /// clients and the MCP UI, but advertising it back to NativeAgent's LLM
     /// duplicates native Swift tools and forces a needless self-protocol hop.
     func modelVisibleMCPTools() -> [MCPToolDescriptor] {
-        MCPToolBridge.listMCPTools(dataRoot: dataRoot).filter {
+        // PRODUCTION TRIGGER for the MCP tools-cache refresh. `listMCPTools`
+        // reads `mcp/cache/tools.json` and nothing else; before this, the only
+        // callers of `refreshAllToolsCaches` were manual/UI actions, so a
+        // configured stdio server with an empty cache contributed ZERO model
+        // -visible tools forever with no error (gpt-5.5 NEEDS_FIX, 2026-08-02).
+        // Fire-and-forget on purpose: the sweep spawns subprocesses, so it can
+        // never sit in front of a chat turn. This build serves whatever is on
+        // disk; the sweep stamps the cache for the next catalog build.
+        MCPToolCatalogWarmer.shared.kickDetached(dataRoot: dataRoot)
+        return MCPToolBridge.listMCPTools(dataRoot: dataRoot).filter {
             $0.serverId != "nativeagent-internal"
         }
     }
@@ -1660,6 +1795,56 @@ extension SwiftToolDispatcher {
                         ("handle", strSchema("The item's stable handle.")),
                     ],
                     required: ["handle"]
+                )
+            ),
+            requestedSchema(
+                name: "desk_blocked_on",
+                description: "Point a Desk item at the ITEMS blocking it. blocked_on is a comma-separated list of desk numbers (e.g. \"2,3.1\") or handles, and REPLACES the whole set; pass an empty string to clear it. Blockers are edges, not prose: when a blocker is closed, canceled, or archived, every item waiting on it becomes ready again automatically — no follow-up call. Refuses an unknown blocker, an item blocking itself, or an edge that would close a dependency cycle.",
+                parametersJSON: params(
+                    properties: [
+                        ("handle", strSchema("The item's desk number (e.g. 2 or 2.1) or its stable handle.")),
+                        ("blocked_on", strSchema("Comma-separated desk numbers/handles of the blockers. Empty string clears all blockers.")),
+                    ],
+                    required: ["handle", "blocked_on"]
+                )
+            ),
+            requestedSchema(
+                name: "desk_breakdown",
+                description: "Break a big idea into a numbered campaign in ONE call: creates a parent Desk item plus its sub-items in order, wires blocked-on edges between them, and can park children until a date. children is an array of objects {title, summary?, blocked_on?, defer_until?}. In a child's blocked_on CSV, a BARE INTEGER means the 1-based position of a sibling in THIS call (e.g. \"1,2\" = blocked on the first two sub-items); a dotted desk number (\"3.1\") or desk_ handle references an existing item — top-level items can't be referenced by bare number here (ambiguous with positions), wire those afterward with desk_blocked_on. Pass parent to GRAFT new sub-items onto an existing item instead of creating a new parent (project/title/kind are then ignored). Returns the numbered plan plus which sub-items are ready right now. A mid-batch refusal returns status \"partial\" listing what was created.",
+                parametersJSON: params(
+                    properties: [
+                        ("project", strSchema("Project bucket for a NEW campaign parent. Required unless parent is given.")),
+                        ("title", strSchema("Title for the NEW campaign parent. Required unless parent is given.")),
+                        ("kind", strSchema("Optional parent kind (default plan): watch|plan|project|gh|standing.")),
+                        ("summary", strSchema("Optional one-line parent summary.")),
+                        ("parent", strSchema("Graft mode: desk number or handle of an EXISTING item to attach the sub-items to.")),
+                        ("children", looseObjectArraySchema("Ordered sub-items. Each: {title (required), summary?, blocked_on? (CSV string or array: bare integers = positions of siblings in THIS call, dotted numbers/handles = existing items), defer_until? (yyyy-MM-dd or ISO)}. NO other fields — an unknown field is refused, not ignored.")),
+                    ],
+                    required: ["children"]
+                )
+            ),
+            requestedSchema(
+                name: "desk_defer",
+                description: "Park a Desk item until a date — it stays on the desk but is not \"next up\" and is never flagged stale until then. until is a yyyy-MM-dd day or a full ISO timestamp; an empty string clears the park.",
+                parametersJSON: params(
+                    properties: [
+                        ("handle", strSchema("The item's desk number (e.g. 2 or 2.1) or its stable handle.")),
+                        ("until", strSchema("yyyy-MM-dd day or full ISO timestamp. Empty string clears the deferral.")),
+                    ],
+                    required: ["handle", "until"]
+                )
+            ),
+            requestedSchema(
+                name: "desk_nag_control",
+                description: "Control how hard the Desk stays on User. NAGGING IS HIS SWITCH: it is default OFF and scoped — parse his intent (\"stay on me about the release track\" / \"go quiet, I'm busy this week\") and call this with explicit arguments. action=enable|disable turns the global switch or one scope on/off (a scope only nags while the global switch is ON); action=mute goes quiet without losing track (omit `until` for indefinite); action=unmute comes back, re-arms every item's one nag for a new window, and RETURNS in `drift` what moved while you were quiet; action=status reports the whole config honestly. A nag only ever fires on stale + a real change underneath (blocker cleared / defer elapsed / moved while stale), at most once per item per window, and only at digest level — never urgent.",
+                parametersJSON: params(
+                    properties: [
+                        ("action", strSchema("enable | disable | mute | unmute | status.")),
+                        ("scope_kind", strSchema("global (default) | project | item. Which switch enable/disable flips.")),
+                        ("scope_id", strSchema("Required for scope_kind=project (the project name) or item (the desk number, e.g. 2.1, or its stable handle).")),
+                        ("until", strSchema("mute only: yyyy-MM-dd day or full ISO timestamp. Omit to mute indefinitely.")),
+                    ],
+                    required: ["action"]
                 )
             ),
             requestedSchema(

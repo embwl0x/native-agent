@@ -357,6 +357,94 @@ public protocol PersistenceCoreProtocol: Sendable {
     func tailJSONL(_ path: URL, limit: Int, maxBytes: Int?) async throws -> [JSONValue]
     func readJSONL(_ path: URL) async throws -> [JSONValue]
     func replaceJSONL(_ records: [JSONValue], to path: URL) async throws
+    /// REQUIREMENTS, not just extension members: `SwiftNativeDeskStore` holds an
+    /// `any PersistenceCoreProtocol`, and a protocol-extension-only method on an
+    /// existential dispatches STATICALLY to the default — the real
+    /// implementation would never run and every desk read would report a clean
+    /// feed. Declaring them here makes the witness table carry them. Defaults
+    /// live in the extension below, so no existing conformer breaks.
+    func readJSONLReporting(_ path: URL) async throws -> (rows: [JSONValue], report: JSONLReadReport)
+    func appendJSONLDurable(_ record: JSONValue, to path: URL) async throws
+}
+
+/// What a raw JSONL scan had to throw away (audit 2026-08-02, finding 2).
+///
+/// `readJSONL` drops any line it cannot parse. Tolerating a TORN TRAILING line
+/// is right — an append that had not landed whole when we read will land, and
+/// the writer re-appends. Silently dropping a malformed line in the MIDDLE of a
+/// file is not: a desk that lost three ops looks byte-for-byte as healthy as one
+/// that lost none. This carries the count back out so a store can say so.
+public struct JSONLReadReport: Sendable, Equatable {
+    /// Unparseable lines that are NOT the tolerated trailing partial. Real
+    /// damage: bytes between two good lines that no longer decode.
+    public var malformedLineCount: Int
+    /// The file's last line was torn (no trailing newline). Tolerated, reported.
+    public var trailingPartialLine: Bool
+    /// PHYSICAL rows the scan walked — every non-empty line in the file,
+    /// whether or not it parsed and whether or not this build understood it.
+    ///
+    /// WHY IT EXISTS (gpt-5.5 review 2026-08-02, finding 2): every op-log store
+    /// thresholds compaction on how big the FEED is, and before this it counted
+    /// DECODED entries. A stale binary facing 100k rows it cannot decode plus 10
+    /// it can would compute a feed size of 10 — under every threshold — so the
+    /// compaction path (and with it the loud "REFUSING to compact" warning that
+    /// is the only product signal of the wedge) never ran at all, while the file
+    /// grew without bound. The threshold has to key on bytes-on-disk, and this
+    /// is the row-shaped proxy for them that the scan already computes.
+    public var physicalLineCount: Int
+
+    public init(
+        malformedLineCount: Int = 0,
+        trailingPartialLine: Bool = false,
+        physicalLineCount: Int = 0
+    ) {
+        self.malformedLineCount = malformedLineCount
+        self.trailingPartialLine = trailingPartialLine
+        self.physicalLineCount = physicalLineCount
+    }
+
+    public static let clean = JSONLReadReport()
+    public var isClean: Bool { malformedLineCount == 0 && !trailingPartialLine }
+}
+
+extension PersistenceCoreProtocol {
+    /// `readJSONL` plus what the scan discarded.
+    ///
+    /// THE DEFAULT NEVER CLAIMS A CLEAN SCAN IT HAS NOT PROVEN (gpt-5.5 review
+    /// 2026-08-02, finding 4). The previous default hard-coded `.clean`, which
+    /// is only true for a conformer with no file behind it. A file-backed
+    /// wrapper — a decorator that implements `readJSONL` by delegating to
+    /// `SwiftNativePersistenceCore` and simply never thinks about this method —
+    /// inherited "clean" for a feed that had malformed rows on disk, and the
+    /// compaction gate it feeds then rewrote the file and erased them. Nothing
+    /// about that conformance is visibly wrong at the call site, which is
+    /// exactly why the default has to be safe rather than convenient.
+    ///
+    /// So: if a real file exists at `path`, the report is derived from THOSE
+    /// BYTES via the canonical scanner — the same bytes compaction is about to
+    /// rewrite — and only a path with no file falls back to describing the rows
+    /// the conformer returned. A delegating wrapper therefore reports honestly
+    /// whether or not its author remembered this method; an in-memory shim
+    /// still reports clean, because for it that IS the truth. The cost is one
+    /// extra read for delegating conformers only; `SwiftNativePersistenceCore`
+    /// overrides this method outright and never pays it.
+    public func readJSONLReporting(_ path: URL) async throws -> (rows: [JSONValue], report: JSONLReadReport) {
+        let rows = try await readJSONL(path)
+        guard FileManager.default.fileExists(atPath: path.path) else {
+            return (rows, JSONLReadReport(physicalLineCount: rows.count))
+        }
+        let fileReport = try await SwiftNativePersistenceCore().readJSONLReporting(path).report
+        return (rows, fileReport)
+    }
+
+    /// Durable append: the bytes are on the platter before this returns.
+    ///
+    /// The default delegates to the plain `appendJSONL` — a shim with no real
+    /// file has nothing to flush. `SwiftNativePersistenceCore` overrides it with
+    /// an `F_FULLFSYNC` before the descriptor closes.
+    public func appendJSONLDurable(_ record: JSONValue, to path: URL) async throws {
+        try await appendJSONL(record, to: path)
+    }
 }
 
 extension PersistenceCoreProtocol {
@@ -427,6 +515,22 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
         _ = chmod(path.path, 0o600)
     }
 
+    /// Durable batch append — one write, one `F_FULLFSYNC`. Same contract as the
+    /// single-record `appendJSONLDurable`; used by the op-log stores that commit
+    /// a multi-op transaction under one flock.
+    public func appendJSONLDurable(_ records: [JSONValue], to path: URL) async throws {
+        guard !records.isEmpty else { return }
+        let dir = path.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var payload = Data()
+        for record in records {
+            payload.append(contentsOf: try record.serialize(pretty: false).utf8)
+            payload.append(0x0A)
+        }
+        try Self.appendBytes(payload, to: path, durable: true)
+        _ = chmod(path.path, 0o600)
+    }
+
     /// Atomically REPLACES a JSONL file's entire contents (single rename —
     /// no window where the file is partially written). An empty `records`
     /// truncates the feed. For op-log compaction; the caller is responsible
@@ -473,11 +577,68 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
     }
 
     public func readJSONL(_ path: URL) async throws -> [JSONValue] {
-        guard FileManager.default.fileExists(atPath: path.path) else { return [] }
+        try await readJSONLReporting(path).rows
+    }
+
+    /// The real scan behind `readJSONL`. Row-for-row IDENTICAL to what it always
+    /// returned — the only addition is the accounting of what got dropped.
+    ///
+    /// A parse failure on the LAST line of a file that does not end in `\n` is a
+    /// torn append still in flight: tolerated, flagged, not counted as damage.
+    /// Every other parse failure — including a zero-filled or blank line between
+    /// two good rows, which is what a crashed write leaves behind on APFS — is
+    /// counted, because the caller needs to know it is looking at a feed with
+    /// holes in it.
+    public func readJSONLReporting(_ path: URL) async throws -> (rows: [JSONValue], report: JSONLReadReport) {
+        guard FileManager.default.fileExists(atPath: path.path) else { return ([], .clean) }
         let data = try Data(contentsOf: path)
-        return Self.decodeLines(data, dropFirstPartial: false).compactMap { line in
-            try? JSONValue.parse(Data(line.utf8))
+        let lines = Self.decodeLines(data, dropFirstPartial: false)
+        let endsWithNewline = data.last == 0x0A
+        var rows: [JSONValue] = []
+        rows.reserveCapacity(lines.count)
+        var malformed = 0
+        var trailingPartial = false
+        for (index, line) in lines.enumerated() {
+            if let parsed = try? JSONValue.parse(Data(line.utf8)) {
+                rows.append(parsed)
+                continue
+            }
+            if index == lines.count - 1 && !endsWithNewline {
+                trailingPartial = true
+            } else {
+                malformed += 1
+            }
         }
+        return (rows, JSONLReadReport(
+            malformedLineCount: malformed,
+            trailingPartialLine: trailingPartial,
+            // Every physical line the file holds — decoded, malformed, or torn.
+            // The op-log threshold keys on this, never on `rows.count`.
+            physicalLineCount: lines.count
+        ))
+    }
+
+    /// `appendJSONL` that does not return until the bytes are DURABLE.
+    ///
+    /// WHY THIS IS A SEPARATE ENTRY POINT rather than a change to `appendJSONL`
+    /// (audit 2026-08-02, finding 2): `write(2)` returning success only means
+    /// the kernel has the page, so a power loss between the append and the next
+    /// flush loses an op that every caller was told had committed. The fix is
+    /// `F_FULLFSYNC` — but it costs a real drive-cache flush (tens of ms on
+    /// APFS), and `appendJSONL` is the shared write path for telemetry, turn
+    /// traces and scheduler chatter, where a lost tail line costs nothing and a
+    /// per-line barrier would be felt on every turn. So the canonical op-log
+    /// stores — the ones whose feed IS the state of record — call this, and the
+    /// advisory feeds keep the fast path. `appendAuditLine`/`appendAuditLineRaw`
+    /// are deliberately NOT durable for the same reason: they are an audit
+    /// trail, not a source of truth, and their loss window is one line.
+    public func appendJSONLDurable(_ record: JSONValue, to path: URL) async throws {
+        let dir = path.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var line = try record.serialize(pretty: false)
+        line += "\n"
+        try Self.appendBytes(Data(line.utf8), to: path, durable: true)
+        _ = chmod(path.path, 0o600)
     }
 
     public func tailJSONL(_ path: URL, limit: Int, maxBytes: Int?) async throws -> [JSONValue] {
@@ -529,12 +690,25 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
 
     /// Append bytes to a file, creating it if absent. Uses POSIX open(O_APPEND)
     /// so concurrent appenders interleave at line boundaries.
-    private static func appendBytes(_ data: Data, to path: URL, createMode: mode_t = 0o600) throws {
+    /// `durable: true` adds an `F_FULLFSYNC` before the descriptor closes —
+    /// the only macOS call that flushes the DRIVE's write cache (plain
+    /// `fsync(2)` returns once the data reaches that cache and is still lost on
+    /// power loss). Falls back to `fsync` where the filesystem rejects it
+    /// (ENOTSUP on some network/virtual filesystems), which is still strictly
+    /// better than nothing.
+    static func appendBytes(
+        _ data: Data,
+        to path: URL,
+        createMode: mode_t = 0o600,
+        durable: Bool = false,
+        syscalls: FlushSyscalls = .system
+    ) throws {
         let fd = open(path.path, O_WRONLY | O_CREAT | O_APPEND, createMode)
         if fd < 0 {
             throw PersistenceCoreError.ioFailure("open(append) failed: \(String(cString: strerror(errno)))")
         }
-        defer { close(fd) }
+        var handedOff = false
+        defer { if !handedOff { _ = syscalls.close(fd) } }
         try data.withUnsafeBytes { raw in
             var ptr = raw.baseAddress!
             var remaining = raw.count
@@ -548,6 +722,114 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
                 remaining -= n
             }
         }
+        // The write landed in the page cache. Everything that makes this append
+        // DURABLE happens below, BEFORE we return — never in a defer.
+        handedOff = true
+        try flushAndClose(fd: fd, path: path, durable: durable, syscalls: syscalls)
+    }
+
+    /// The three syscalls the durability tail depends on, behind a seam so a
+    /// test can make them FAIL. Each closure returns 0 on success or the errno
+    /// it failed with — the real ones read the global `errno` immediately, so
+    /// nothing downstream depends on a global that a later call may clobber.
+    struct FlushSyscalls: Sendable {
+        var fullFsync: @Sendable (Int32) -> Int32
+        var fsync: @Sendable (Int32) -> Int32
+        var close: @Sendable (Int32) -> Int32
+
+        static let system = FlushSyscalls(
+            fullFsync: { fd in Darwin.fcntl(fd, F_FULLFSYNC) == -1 ? errno : 0 },
+            fsync: { fd in Darwin.fsync(fd) == -1 ? errno : 0 },
+            close: { fd in Darwin.close(fd) == -1 ? errno : 0 }
+        )
+    }
+
+    /// errnos that mean "this filesystem does not implement `F_FULLFSYNC`",
+    /// the ONLY case in which degrading to plain `fsync` is legitimate. A
+    /// Set because `ENOTSUP` and `EOPNOTSUPP` are the same value on Darwin and
+    /// a `switch` over both would not compile.
+    private static let fullFsyncUnsupportedErrnos: Set<Int32> =
+        [ENOTSUP, EOPNOTSUPP, ENOTTY, EINVAL, ENOSYS, ENODEV]
+
+    /// Flush (when `durable`) and close, reporting every failure by THROWING.
+    ///
+    /// WHY THIS IS NOT A `defer` (gpt-5.5 review 2026-08-02, BLOCKING 1): the
+    /// old code ran the flush inside a non-throwing `defer` and discarded the
+    /// fallback `fsync`'s return value, so `appendJSONLDurable` returned
+    /// SUCCESS after a failed `F_FULLFSYNC` *and* a failed `fsync` — EIO on a
+    /// dying disk, ENOSPC on a full one. The caller then wrote derived state or
+    /// compacted the feed on the strength of an op that was never durable,
+    /// which is the exact class of loss the durable path exists to prevent. A
+    /// durable append that cannot prove durability must fail loudly instead.
+    ///
+    /// Rules: EINTR retries (a signal is not a durability failure); a genuine
+    /// "unsupported" errno degrades to `fsync` and only then; a failed fallback
+    /// throws; a failed close throws on the durable path, because on a
+    /// writeback filesystem close(2) is where a deferred write error surfaces.
+    /// Non-durable appends keep their historical best-effort close (reported on
+    /// stderr, not thrown) — they are telemetry and turn traces, whose contract
+    /// never promised the bytes were on the platter.
+    static func flushAndClose(
+        fd: Int32,
+        path: URL,
+        durable: Bool,
+        syscalls: FlushSyscalls = .system
+    ) throws {
+        var flushError: PersistenceCoreError?
+        if durable {
+            do {
+                try fullSync(fd: fd, path: path, syscalls: syscalls)
+            } catch let error as PersistenceCoreError {
+                flushError = error
+            }
+        }
+        // Close EXACTLY ONCE regardless — retrying close(2) on EINTR is a
+        // double-close on Darwin (the descriptor is already gone) and could
+        // close a descriptor another thread has since been handed.
+        let closeErrno = syscalls.close(fd)
+        if let flushError { throw flushError }
+        if closeErrno != 0 && closeErrno != EINTR {
+            let message = "close(append \(path.lastPathComponent)) failed: \(String(cString: strerror(closeErrno)))"
+            if durable { throw PersistenceCoreError.ioFailure(message) }
+            FileHandle.standardError.write(Data("PersistenceCore: \(message)\n".utf8))
+        }
+    }
+
+    /// `F_FULLFSYNC`, with the ONE legitimate fallback. Throws when the bytes
+    /// cannot be proven durable.
+    private static func fullSync(fd: Int32, path: URL, syscalls: FlushSyscalls) throws {
+        var lastErrno: Int32 = 0
+        for _ in 0..<8 {
+            lastErrno = syscalls.fullFsync(fd)
+            if lastErrno == 0 { return }
+            if lastErrno != EINTR { break }
+        }
+        if lastErrno == EINTR {
+            throw PersistenceCoreError.ioFailure(
+                "F_FULLFSYNC(\(path.lastPathComponent)) kept returning EINTR — durability unproven"
+            )
+        }
+        guard fullFsyncUnsupportedErrnos.contains(lastErrno) else {
+            // A REAL flush failure (EIO, ENOSPC, EDQUOT …). Falling back to
+            // fsync here would just ask the same broken device again and let a
+            // lost write masquerade as a commit.
+            throw PersistenceCoreError.ioFailure(
+                "F_FULLFSYNC(\(path.lastPathComponent)) failed: \(String(cString: strerror(lastErrno)))"
+            )
+        }
+        // The filesystem has no drive-cache flush (some network/virtual
+        // filesystems). Plain fsync is strictly better than nothing — but its
+        // result is now CHECKED.
+        var fsyncErrno: Int32 = 0
+        for _ in 0..<8 {
+            fsyncErrno = syscalls.fsync(fd)
+            if fsyncErrno == 0 { return }
+            if fsyncErrno != EINTR { break }
+        }
+        throw PersistenceCoreError.ioFailure(
+            "F_FULLFSYNC unsupported (\(String(cString: strerror(lastErrno)))) and "
+            + "fsync(\(path.lastPathComponent)) failed: \(String(cString: strerror(fsyncErrno)))"
+        )
     }
 
     /// Write `data` to `path` atomically via a side temp file + rename(2),

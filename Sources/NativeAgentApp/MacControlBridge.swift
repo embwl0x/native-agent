@@ -22,6 +22,7 @@
 import Foundation
 import Darwin
 import MacControl
+import NativeAgentCore
 import Network
 import PersistenceCore
 
@@ -111,7 +112,6 @@ final class MacControlBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
     }
     private final class ExecState: @unchecked Sendable {
         let lock = NSLock()
-        var activeCount = 0
         var activeProcesses: [String: Process] = [:]
         var cancelRequested: Set<String> = []
         var cancelSignalled: Set<String> = []
@@ -124,25 +124,26 @@ final class MacControlBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
     // seek to the same end offset and clobber/interleave each other's JSONL line.
     private static let auditAppendLock = NSLock()
 
-    private static func tryAcquireExecSlot() -> Bool {
-        execState.lock.lock()
-        defer { execState.lock.unlock() }
-        guard execState.activeCount < execLimit else { return false }
-        execState.activeCount += 1
-        return true
-    }
+    /// The exec concurrency gate. The count lives INSIDE `ScopedSlotCounter`
+    /// and is private to it, so there is no way to admit an exec without
+    /// holding a `ScopedSlot` handle, and no way to release except by letting
+    /// that handle die (`deinit` is the only release path).
+    ///
+    /// fix-exec-slot-leak (2026-08-02): the handler used to acquire a raw
+    /// counter increment and rely solely on the `defer` inside the background
+    /// dispatch block. Any throw between the acquire and that block (the
+    /// durable `.started` transition throws on flock contention or a full disk)
+    /// unwound straight to the request's outer catch WITHOUT entering the block,
+    /// leaking the slot permanently. `execLimit` is 2, so two such throws pinned
+    /// the count at the limit and every subsequent `/macctl/exec` returned 429
+    /// until the app was restarted — `stopAllProcesses` deliberately refuses to
+    /// zero the count, so emergency_stop could not recover it either.
+    /// With the handle idiom the throw unwinds THROUGH the handle, whose deinit
+    /// releases; the background block owns the release only because it captures
+    /// the handle explicitly.
+    static let execSlots = ScopedSlotCounter(name: "macctl-exec", limit: execLimit)
 
-    private static func releaseExecSlot() {
-        execState.lock.lock()
-        execState.activeCount = max(0, execState.activeCount - 1)
-        execState.lock.unlock()
-    }
-
-    private static func currentExecCount() -> Int {
-        execState.lock.lock()
-        defer { execState.lock.unlock() }
-        return execState.activeCount
-    }
+    private static func currentExecCount() -> Int { execSlots.activeCount }
 
     private static func registerProcess(_ proc: Process, operationId: String) {
         execState.lock.lock()
@@ -214,14 +215,13 @@ final class MacControlBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
             process.isRunning ? key : nil
         })
         execState.activeProcesses.removeAll()
-        // fix-emergency-stop-race: do NOT zero activeCount here. Every acquired
-        // slot has exactly one defer'd releaseExecSlot() still pending for the
-        // execs being killed; that defer decrements activeCount. Zeroing it as
-        // well double-counts each release (count is driven below the true number
-        // of live slots), which under-counts and lets the next burst over-admit
-        // past execLimit. Leaving activeCount alone lets the pending defers
-        // reconcile it accurately — and a slot newly acquired AFTER this point is
-        // already reflected, so it can't be wrongly dropped.
+        // fix-emergency-stop-race: do NOT try to zero the exec slot count here.
+        // Every admitted exec still holds a live `ScopedSlot` handle whose
+        // deinit releases it when the background block unwinds. Forcing the
+        // count to zero on top of that would double-count each release, driving
+        // it below the true number of live slots and letting the next burst
+        // over-admit past execLimit. `ScopedSlotCounter` keeps the count private
+        // precisely so this shortcut is not expressible.
         execState.lock.unlock()
         final class ProcessSnapshot: @unchecked Sendable {
             let processes: [String: Process]
@@ -286,7 +286,60 @@ final class MacControlBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
 
     // MARK: - Lifecycle
 
+    /// A1.3 (prerelease-upgrade-campaign): don't bind 8770 or mint a bearer
+    /// token until Mac Control is actually switched on. Reads the SAME live
+    /// policy file + key `bridgePolicyAllows` already uses
+    /// (`<dataRoot>/trust/policy.json` → `macControlPolicy.enabled`), so there
+    /// is one policy source for this bridge, not two. Absent/unparseable file
+    /// or absent key ⇒ false ⇒ no listener.
+    ///
+    /// Verified safe to gate (consumer sweep 2026-08-02): the 8770 listener has
+    /// ZERO in-repo clients — the in-app Mac Control tool lane runs in-process
+    /// through `MacControlGate` + `SystemProcessAdapter`, and iOS remote Mac
+    /// actions go over iCloud sync / `NativeClient /v1/mac_control/*`, never
+    /// this socket. And with `enabled == false` every `/macctl/exec` was
+    /// already rejected 403 `exec_blocked` by `bridgePolicyAllows`, so the bind
+    /// produced nothing but an occupied port and an on-disk descriptor
+    /// advertising a live token.
+    nonisolated static func startGateAllows() -> Bool {
+        let policyURL = NativeAgentPaths.dataRoot
+            .appendingPathComponent("trust")
+            .appendingPathComponent("policy.json")
+        let json: [String: Any]? = {
+            guard let data = try? Data(contentsOf: policyURL) else { return nil }
+            return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        }()
+        return startGateAllows(policyJSON: json)
+    }
+
+    /// Pure decision seam for `startGateAllows()` — same semantics, no I/O.
+    /// `policyJSON == nil` models a missing/unparseable policy file.
+    nonisolated static func startGateAllows(policyJSON: [String: Any]?) -> Bool {
+        guard let macPolicy = policyJSON?["macControlPolicy"] as? [String: Any] else {
+            return false
+        }
+        // STRICT — see BridgeCore.strictBool: a numeric `1` must NOT open a
+        // gate that binds a port and mints a bearer token.
+        return BridgeCore.strictBool(macPolicy["enabled"])
+    }
+
     func start() {
+        // Gate BEFORE the startup-state latch, the operation-recovery Task, and
+        // `BridgeCore.generateToken()` — a gated-off launch must leave no
+        // listener, no in-memory token, and no descriptor on disk.
+        guard Self.startGateAllows() else {
+            NSLog(
+                "NativeAgent MacControlBridge not starting: macControlPolicy.enabled is false "
+                + "— no port bound, no token minted"
+            )
+            // Sweep a descriptor left by a crashed or pre-gate run: it still
+            // advertises a bearer token for a port nothing is listening on
+            // (gpt-5.5 review, NEEDS_FIX). Unconditional here — unlike
+            // ClaudeBridge's shared ~/.config path, this descriptor lives
+            // under THIS instance's dataRoot, so it can only be our own.
+            removeDescriptor()
+            return
+        }
         stateLock.lock()
         guard let generation = startupState.begin(listenerExists: bridgeListener.isActive) else {
             stateLock.unlock()
@@ -1053,7 +1106,18 @@ final class MacControlBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                     ])
                     return
                 }
-                guard Self.tryAcquireExecSlot() else {
+                // fix-exec-slot-leak (2026-08-02): the slot is a `ScopedSlot`
+                // handle. Every exit from here — including a throw out of the
+                // `.started` transition below — unwinds through `execSlot`,
+                // whose deinit is the ONLY release path. Previously the only
+                // release was the background block's `defer`; a throwing
+                // transition (flock contention, disk full) unwound to the outer
+                // catch without ever entering that block, permanently burning a
+                // slot. Two of them pinned the active count at execLimit forever
+                // — every /macctl/exec returned 429 and emergency_stop
+                // deliberately refuses to zero the count, so only an app restart
+                // recovered it.
+                guard let execSlot = Self.execSlots.acquire() else {
                     _ = try await Self.operationStore.transition(
                         operationId: operationId,
                         to: .blocked,
@@ -1073,71 +1137,82 @@ final class MacControlBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                     ])
                     return
                 }
-                _ = try await Self.operationStore.transition(
-                    operationId: operationId,
-                    to: .started,
-                    verification: .pending,
-                    expectedNextEvidence: "Process exit and bounded output"
-                )
-
-                // Process.waitUntilExit is intentionally kept off Swift's
-                // cooperative executor. The completion returns to a Task only
-                // after the child and process group are gone.
-                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                    defer { Self.releaseExecSlot() }
-                    let resultBox = ExecResultBox(Self.runProcess(
-                        argv: argv,
-                        stdin: stdinStr,
-                        timeout: timeout,
-                        operationId: operationId
-                    ))
-                    let result = resultBox.value
-                    let cancellation = Self.consumeCancellation(operationId: operationId)
-                    let timedOut = result["timed_out"] as? Bool ?? false
-                    let exit = result["exit"] as? Int ?? -1
-                    // A request racing with natural exit is not an
-                    // acknowledgement, and a real exit-0 remains completed
-                    // even if a cancellation signal was attempted too late to
-                    // prevent the successful terminal result.
-                    let terminal = Self.execTerminalState(
-                        exit: exit,
-                        timedOut: timedOut,
-                        cancellationSignalled: cancellation.signalled
+                do {
+                    _ = try await Self.operationStore.transition(
+                        operationId: operationId,
+                        to: .started,
+                        verification: .pending,
+                        expectedNextEvidence: "Process exit and bounded output"
                     )
-                    let cancellationAcknowledged = terminal == .cancelAcknowledged
-                    let verification: MotorVerificationState = terminal == .completed ? .unverified : .failed
-                    Task { [weak self] in
-                        guard let self else { return }
-                        do {
-                            let record = try await Self.operationStore.transition(
-                                operationId: operationId,
-                                to: terminal,
-                                verification: verification,
-                                expectedNextEvidence: terminal == .completed ? "Separate observation of intended effect" : nil,
-                                outcomeCode: cancellationAcknowledged
-                                    ? "cancelled_after_process_exit"
-                                    : (timedOut ? "timeout" : "exit_\(exit)")
-                            )
-                            resultBox.value["protocolVersion"] = protocolVersion
-                            resultBox.value["operationId"] = operationId
-                            resultBox.value["operationState"] = record.state.rawValue
-                            resultBox.value["verification"] = record.verification.rawValue
-                            resultBox.value["cancelAcknowledged"] = record.state == .cancelAcknowledged
-                            Self.appendExecAudit(
-                                argv: argv,
-                                status: record.state.rawValue,
-                                reason: "exit_\(exit)",
-                                operationId: operationId
-                            )
-                            self.writeJSON(conn, status: 200, obj: resultBox.value)
-                        } catch {
-                            self.writeJSON(conn, status: 500, obj: [
-                                "error": "terminal_transition_failed",
-                                "detail": error.localizedDescription,
-                                "operationId": operationId,
-                            ])
+
+                    // Process.waitUntilExit is intentionally kept off Swift's
+                    // cooperative executor. The completion returns to a Task only
+                    // after the child and process group are gone.
+                    // `[execSlot]`: capturing the handle IS the ownership
+                    // transfer — the slot stays held until this block's context
+                    // is torn down, i.e. after the child and its process group
+                    // are gone. No `defer` to forget.
+                    DispatchQueue.global(qos: .userInitiated).async { [weak self, execSlot] in
+                        // Holding the handle IS the release contract: it dies
+                        // with this block's context, exactly once.
+                        defer { withExtendedLifetime(execSlot) {} }
+                        let resultBox = ExecResultBox(Self.runProcess(
+                            argv: argv,
+                            stdin: stdinStr,
+                            timeout: timeout,
+                            operationId: operationId
+                        ))
+                        let result = resultBox.value
+                        let cancellation = Self.consumeCancellation(operationId: operationId)
+                        let timedOut = result["timed_out"] as? Bool ?? false
+                        let exit = result["exit"] as? Int ?? -1
+                        // A request racing with natural exit is not an
+                        // acknowledgement, and a real exit-0 remains completed
+                        // even if a cancellation signal was attempted too late to
+                        // prevent the successful terminal result.
+                        let terminal = Self.execTerminalState(
+                            exit: exit,
+                            timedOut: timedOut,
+                            cancellationSignalled: cancellation.signalled
+                        )
+                        let cancellationAcknowledged = terminal == .cancelAcknowledged
+                        let verification: MotorVerificationState = terminal == .completed ? .unverified : .failed
+                        Task { [weak self] in
+                            guard let self else { return }
+                            do {
+                                let record = try await Self.operationStore.transition(
+                                    operationId: operationId,
+                                    to: terminal,
+                                    verification: verification,
+                                    expectedNextEvidence: terminal == .completed ? "Separate observation of intended effect" : nil,
+                                    outcomeCode: cancellationAcknowledged
+                                        ? "cancelled_after_process_exit"
+                                        : (timedOut ? "timeout" : "exit_\(exit)")
+                                )
+                                resultBox.value["protocolVersion"] = protocolVersion
+                                resultBox.value["operationId"] = operationId
+                                resultBox.value["operationState"] = record.state.rawValue
+                                resultBox.value["verification"] = record.verification.rawValue
+                                resultBox.value["cancelAcknowledged"] = record.state == .cancelAcknowledged
+                                Self.appendExecAudit(
+                                    argv: argv,
+                                    status: record.state.rawValue,
+                                    reason: "exit_\(exit)",
+                                    operationId: operationId
+                                )
+                                self.writeJSON(conn, status: 200, obj: resultBox.value)
+                            } catch {
+                                self.writeJSON(conn, status: 500, obj: [
+                                    "error": "terminal_transition_failed",
+                                    "detail": error.localizedDescription,
+                                    "operationId": operationId,
+                                ])
+                            }
                         }
                     }
+                    // The background block owns the release from here on: it
+                    // captured the handle, so the slot is freed exactly once,
+                    // after the child process and its process group are gone.
                 }
             } catch {
                 self.writeJSON(conn, status: 409, obj: [

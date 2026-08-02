@@ -19,7 +19,12 @@ extension SwiftNativeTrustCenter {
         let tool = toolName.trimmingCharacters(in: .whitespaces)
         let fallback: String = {
             if case .string(let s)? = policy["autonomyDefault"] { return s }
-            return "auto"
+            // A1.4 (prerelease-upgrade-campaign): fail CLOSED. A policy bundle
+            // with no `autonomyDefault` used to resolve every unlisted tool to
+            // "auto" — a missing/rewritten/partial policy file silently bought
+            // unattended tool fire. "send_approval" is the safe literal: the
+            // tool still runs, but only behind an approval card.
+            return "send_approval"
         }()
         if tool.isEmpty { return fallback }
         var overrides: [String: JSONValue] = [:]

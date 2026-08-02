@@ -19,11 +19,346 @@ import WorkshopExecution
 //   4. The board         — User/system items, family-grouped as before
 //   5. Recently finished — terminal items + recent terminal executions
 
+/// A lane's read outcome — the honesty primitive this surface borrows from
+/// `WorkshopReceiptsState` (WorkshopObservatoryPanel.swift:237). `.rows([])`
+/// means the lane is genuinely empty; `.unavailable(reason)` means the read
+/// failed or the store is corrupt. A failure must NEVER render as emptiness:
+/// "Quiet right now", "No tracked GitHub work…" and "The bench is clear" are
+/// read as facts about the bench, not as facts about the reader.
+enum DeskLaneState<Row: Sendable>: Sendable {
+    case unavailable(String)
+    case rows([Row])
+
+    static var maxReasonChars: Int { 240 }
+
+    var items: [Row] {
+        if case .rows(let rows) = self { return rows }
+        return []
+    }
+
+    var unavailableReason: String? {
+        if case .unavailable(let reason) = self { return reason }
+        return nil
+    }
+
+    /// A throwing read: the error text IS the reason, bounded.
+    static func failed(_ error: any Error) -> DeskLaneState {
+        .unavailable(String("\(error)".prefix(maxReasonChars)))
+    }
+
+    /// Silent-zero cross-check, for readers that CANNOT throw.
+    /// `SwiftNativeWorkshopRunner.listAll()` swallows an unreadable execution
+    /// root and returns `[]`, so the only honest signal available to this
+    /// surface is the disk cross-check. The probe is TRI-state on purpose: a
+    /// bare count conflated "the root isn't there" (honest zero) with "the root
+    /// wouldn't open" (the corrupt-store case this whole check exists to
+    /// expose), because both produced 0.
+    static func classify(rows: [Row], probe: DeskRecordProbe, noun: String) -> DeskLaneState {
+        switch probe {
+        case .empty:
+            // No store yet — a genuinely empty lane, rows or not.
+            return .rows(rows)
+        case .unreadable(let detail):
+            // The reader could not even enumerate the store. `rows` is [] by
+            // construction in that case; saying "empty" here is the exact lie
+            // this primitive exists to prevent.
+            return .unavailable(
+                String("Couldn't read the \(noun) store — \(detail)".prefix(maxReasonChars)))
+        case .records(let recordsOnDisk):
+            if rows.isEmpty && recordsOnDisk > 0 {
+                return .unavailable("\(recordsOnDisk) \(noun) on disk, none could be read")
+            }
+            return .rows(rows)
+        }
+    }
+}
+
+/// What a store's record root looked like on disk, for readers that swallow
+/// their own failures. Three states, because the count alone cannot tell an
+/// absent store from an unopenable one — and only one of those is empty.
+enum DeskRecordProbe: Sendable, Equatable {
+    /// The root does not exist. Nothing has been written yet: an honest zero.
+    case empty
+    /// The root exists but could not be enumerated (permissions, corruption,
+    /// not-a-directory). NOT zero — unknown.
+    case unreadable(String)
+    /// The root was enumerated: this many directories actually hold a record
+    /// (or are malformed record dirs). Reservation/cancellation leftovers that
+    /// legitimately carry no record are NOT counted — counting them turned a
+    /// healthy empty bench into a bogus "unavailable" banner.
+    case records(Int)
+}
+
+/// One rendered line in the "Waiting on you" strip.
+struct DeskAttentionLine: Identifiable, Equatable, Sendable {
+    enum Shape: Equatable, Sendable {
+        /// A full line with its own icon — one item User has to deal with.
+        case primary
+        /// The GitHub-blocked roll-up header. Carries a count, not an item.
+        case groupHeader
+        /// An indented bullet under the roll-up.
+        case groupChild
+    }
+    let id: String
+    let icon: String
+    let text: String
+    let shape: Shape
+    /// True when USER is the one holding this up — an approval, or a GitHub item
+    /// routed to him. Everything else in this strip is blocked on someone or
+    /// something else, and rendering all of it at one weight made the section
+    /// title a lie: the eye has to land on the rows only he can clear.
+    let needsUserDirectly: Bool
+}
+
+/// Builds and BOUNDS the "Waiting on you" strip.
+///
+/// The strip is fed by four op-log-sourced collections (approval-blocked
+/// executions, needs-you GitHub items, blocked/flagged desk items, GitHub-blocked
+/// desk items). All four grow with the op log, and the enclosing `LazyVStack`
+/// only virtualizes its DIRECT children — a nested `VStack` builds every row
+/// eagerly on every render regardless of viewport. So the four sources flatten
+/// into ONE priority-ordered list that is capped as a whole; capping each source
+/// separately would still let the strip grow with the number of sources.
+///
+/// Nothing is hidden silently — this is the strip that says what is blocked, and
+/// a blocked item scrolled out of existence is worse than a long list. The
+/// section header carries the honest total, the roll-up header carries its own
+/// count even when its children are cut, and everything past the cap is reachable
+/// through an explicit reveal — the same contract `finishedSection` already keeps.
+enum DeskAttentionStrip {
+    /// Rows rendered before the reveal takes over. Matches the finished
+    /// section's cap so the two bounded surfaces feel like one rule.
+    static let visibleLineCap = 8
+
+    /// The stamped reason GitHubProjectTracking writes on every checks/review-
+    /// blocked item; matched verbatim so hand-written reasons that merely
+    /// mention GitHub keep their own inline text.
+    static let githubStampedBlockedReason =
+        "GitHub checks or review state are blocking progress."
+
+    static func isGitHubStampedBlock(_ item: DeskItem) -> Bool {
+        item.status == .blocked && item.blockedReason == githubStampedBlockedReason
+    }
+
+    // MARK: deterministic bucket order
+    //
+    // Each sort ends on a unique key (id / itemId / handle) so the comparator is
+    // a TOTAL order — `sorted(by:)` is not stable in Swift, so "equal" elements
+    // are free to swap between reloads unless the last key separates them.
+
+    static func sortedApprovals(
+        _ approvals: [WorkshopExecution.WorkshopExecutionRecord]
+    ) -> [WorkshopExecution.WorkshopExecutionRecord] {
+        approvals.sorted { l, r in
+            if l.createdAt != r.createdAt { return l.createdAt > r.createdAt }
+            if l.updatedAt != r.updatedAt { return l.updatedAt > r.updatedAt }
+            return l.id < r.id
+        }
+    }
+
+    static func sortedGitHubItems(_ items: [GitHubCommandItem]) -> [GitHubCommandItem] {
+        items.sorted { l, r in
+            if l.updatedAt != r.updatedAt { return l.updatedAt > r.updatedAt }
+            if l.createdAt != r.createdAt { return l.createdAt > r.createdAt }
+            return l.itemId < r.itemId
+        }
+    }
+
+    static func sortedDeskItems(_ items: [DeskItem]) -> [DeskItem] {
+        items.sorted { l, r in
+            if l.updatedAt != r.updatedAt { return l.updatedAt > r.updatedAt }
+            if l.openedAt != r.openedAt { return l.openedAt > r.openedAt }
+            return l.handle < r.handle
+        }
+    }
+
+    /// Priority order = who is actually being waited on. Approvals first (a
+    /// paused execution is the most expensive thing to leave sitting), then the
+    /// GitHub items that need User's call, then every other blocked/flagged item
+    /// with its own reason, and last the GitHub-blocked roll-up — those are
+    /// waiting on GitHub, not on User.
+    ///
+    /// Every bucket is sorted with a TOTAL order before the cap is applied.
+    /// `listAll()` sorts on `createdAt` alone and the desk lanes inherit
+    /// directory-enumeration order, so equal timestamps had no tie-breaker: nine
+    /// approvals created in the same bucket meant a different one became the
+    /// hidden ninth on each reload, with no state change behind it. The strip
+    /// must be a function of the data, not of the file system's mood.
+    ///
+    /// `limit` bounds CONSTRUCTION, not just rendering: past the cap the lines
+    /// were still being built (and re-built on every SwiftUI diff) only to be
+    /// dropped. Truncating here is exactly `Array(lines().prefix(limit))` —
+    /// buckets are emitted in priority order, so a prefix of the built list is
+    /// a prefix of the full one.
+    static func lines(
+        approvals: [WorkshopExecution.WorkshopExecutionRecord],
+        githubNeedsYou: [GitHubCommandItem],
+        otherAttention: [DeskItem],
+        githubBlocked: [DeskItem],
+        limit: Int? = nil
+    ) -> [DeskAttentionLine] {
+        let cap = limit ?? Int.max
+        guard cap > 0 else { return [] }
+        var out: [DeskAttentionLine] = []
+        out.reserveCapacity(
+            min(cap, approvals.count + githubNeedsYou.count
+                + otherAttention.count + githubBlocked.count + 1))
+        for exec in sortedApprovals(approvals) {
+            if out.count >= cap { return out }
+            out.append(DeskAttentionLine(
+                id: "approval:\(exec.id)",
+                icon: "checkmark.shield",
+                text: "\u{201C}\(exec.title)\u{201D} needs an approval to continue",
+                shape: .primary,
+                needsUserDirectly: true))
+        }
+        // One-pointer rule (contract): a needs-User GitHub item gets ONE pointer
+        // here; the canonical card lives in GitHub Command below.
+        for item in sortedGitHubItems(githubNeedsYou) {
+            if out.count >= cap { return out }
+            out.append(DeskAttentionLine(
+                id: "gh:\(item.itemId)",
+                icon: "arrow.triangle.pull",
+                text: "\(item.repository) #\(item.number) needs your call — see GitHub Command",
+                shape: .primary,
+                needsUserDirectly: true))
+        }
+        for item in sortedDeskItems(otherAttention) {
+            if out.count >= cap { return out }
+            out.append(DeskAttentionLine(
+                id: "item:\(item.handle)",
+                icon: item.status == .blocked ? "stop.circle" : "flag",
+                text: item.status == .blocked
+                    ? "\(item.title)\(item.blockedReason.map { " — \($0)" } ?? "")"
+                    : "\(item.title)\(item.waitingOn.map { " — waiting on \($0)" } ?? "")",
+                shape: .primary,
+                needsUserDirectly: false))
+        }
+        // Taste pass 2026-07-24: GitHub-blocked items all carry the same stamped
+        // blockedReason — repeated per row it turned the strip into wallpaper.
+        // The header carries the count, so it stays honest even when the cap
+        // cuts its children away.
+        if !githubBlocked.isEmpty {
+            if out.count >= cap { return out }
+            out.append(DeskAttentionLine(
+                id: "ghblocked:header",
+                icon: "stop.circle",
+                text: "Blocked on GitHub checks or review · \(githubBlocked.count) — these move when GitHub does",
+                shape: .groupHeader,
+                needsUserDirectly: false))
+            for item in sortedDeskItems(githubBlocked) {
+                if out.count >= cap { return out }
+                out.append(DeskAttentionLine(
+                    id: "ghblocked:\(item.handle)",
+                    icon: "circle.fill",
+                    text: item.title,
+                    shape: .groupChild,
+                    needsUserDirectly: false))
+            }
+        }
+        return out
+    }
+
+    static func visible(_ lines: [DeskAttentionLine], showingAll: Bool) -> [DeskAttentionLine] {
+        showingAll ? lines : Array(lines.prefix(visibleLineCap))
+    }
+
+    /// The honest total for the header: things User is waiting on, NOT rendered
+    /// rows — the roll-up header is chrome, not an item.
+    static func itemCount(_ lines: [DeskAttentionLine]) -> Int {
+        lines.filter { $0.shape != .groupHeader }.count
+    }
+
+    /// How many ITEMS the cap is currently hiding (0 when everything shows).
+    static func hiddenItemCount(_ lines: [DeskAttentionLine], showingAll: Bool) -> Int {
+        itemCount(lines) - itemCount(visible(lines, showingAll: showingAll))
+    }
+
+    /// Of what's hidden, how much is User personally blocking. Priority order
+    /// means this is normally zero — the cap eats the tail, and the tail is the
+    /// stuff waiting on someone else. When it ISN'T zero (more than a capful of
+    /// approvals), the reveal has to say so out loud instead of reading like a
+    /// generic "and some more".
+    static func hiddenNeedsUserCount(_ lines: [DeskAttentionLine], showingAll: Bool) -> Int {
+        let shownIds = Set(visible(lines, showingAll: showingAll).map(\.id))
+        return lines.filter { $0.needsUserDirectly && !shownIds.contains($0.id) }.count
+    }
+
+    /// The reveal's exact words. Built here, not in the view, so the honesty of
+    /// the collapsed state is a tested property rather than a string literal.
+    static func revealLabel(_ lines: [DeskAttentionLine], showingAll: Bool) -> String {
+        revealText(
+            hiddenItems: hiddenItemCount(lines, showingAll: showingAll),
+            totalItems: itemCount(lines),
+            hiddenNeedsUser: hiddenNeedsUserCount(lines, showingAll: showingAll),
+            showingAll: showingAll)
+    }
+
+    static func revealText(
+        hiddenItems: Int, totalItems: Int, hiddenNeedsUser: Int, showingAll: Bool
+    ) -> String {
+        if showingAll { return "Show fewer" }
+        let base = "\(hiddenItems) more waiting — show all \(totalItems)"
+        return hiddenNeedsUser > 0 ? "\(base) · \(hiddenNeedsUser) need your call" : base
+    }
+
+    /// What the view actually needs: the lines it will render, plus the honest
+    /// totals for the header and the reveal. Only the VISIBLE lines are built —
+    /// the counts are arithmetic on the bucket sizes, so a strip with 400
+    /// blocked items constructs 8 strings per render, not 400.
+    struct Plan: Equatable, Sendable {
+        let visible: [DeskAttentionLine]
+        /// Every waiting item, hidden or not. Roll-up header is chrome, excluded.
+        let totalItems: Int
+        let hiddenItems: Int
+        let hiddenNeedsUser: Int
+
+        var isEmpty: Bool { visible.isEmpty }
+        func revealLabel(showingAll: Bool) -> String {
+            DeskAttentionStrip.revealText(
+                hiddenItems: hiddenItems, totalItems: totalItems,
+                hiddenNeedsUser: hiddenNeedsUser, showingAll: showingAll)
+        }
+    }
+
+    static func plan(
+        approvals: [WorkshopExecution.WorkshopExecutionRecord],
+        githubNeedsYou: [GitHubCommandItem],
+        otherAttention: [DeskItem],
+        githubBlocked: [DeskItem],
+        showingAll: Bool
+    ) -> Plan {
+        let visible = lines(
+            approvals: approvals,
+            githubNeedsYou: githubNeedsYou,
+            otherAttention: otherAttention,
+            githubBlocked: githubBlocked,
+            limit: showingAll ? nil : visibleLineCap)
+        let totalItems = approvals.count + githubNeedsYou.count
+            + otherAttention.count + githubBlocked.count
+        let needsUserTotal = approvals.count + githubNeedsYou.count
+        return Plan(
+            visible: visible,
+            totalItems: totalItems,
+            hiddenItems: totalItems - itemCount(visible),
+            hiddenNeedsUser: needsUserTotal - visible.filter(\.needsUserDirectly).count)
+    }
+}
+
 private struct DeskViewSnapshot: Sendable {
     let deskState: DeskState?
     let deskError: String?
-    let executions: [WorkshopExecution.WorkshopExecutionRecord]
-    let githubItems: [GitHubCommandItem]
+    let executions: DeskLaneState<WorkshopExecution.WorkshopExecutionRecord>
+    let githubItems: DeskLaneState<GitHubCommandItem>
+    /// ONE DeskSequencing.compute() per load — never per row. The derivation
+    /// walks the whole blocked-on graph plus every parent chain, so calling it
+    /// from a row builder would re-run that walk on every SwiftUI diff pass.
+    /// It's pure and Sendable, so it rides along in the background snapshot.
+    let plan: DeskSequencing.Plan
+    /// handle → alias, built from the SAME state the plan came from. The UI
+    /// shows operator aliases ("2.1") and never internal handles — same
+    /// invariant DeskProjection holds.
+    let aliasByHandle: [String: String]
 }
 
 struct DeskView: View {
@@ -34,11 +369,31 @@ struct DeskView: View {
     // listHistory whitelists would make an unknown/corrupt status (e.g. a
     // future "retrying") vanish from BOTH sections. Nothing on this surface
     // may disappear: unknown statuses render on the bench with their raw pill.
-    @State private var allExecutions: [WorkshopExecution.WorkshopExecutionRecord] = []
+    @State private var executionsLane: DeskLaneState<WorkshopExecution.WorkshopExecutionRecord> = .rows([])
     @State private var loadError: String?
     @State private var expandedRoots: Set<String> = []
+    @State private var showAllFinished = false
+    @State private var showAllAttention = false
+    /// M12: only the NEWEST load may publish. Two loads race constantly here —
+    /// the toolbar refresh, the op-log reloader and the scene-phase change all
+    /// call load(), and a slow one landing after a fast one would stomp fresh
+    /// items with stale ones. The token is taken on the main actor before the
+    /// detached read and checked on the main actor after it.
+    @State private var loadGate = LatestAsyncRequestGate()
+    // Derived sequencing for the CURRENT items, recomputed only in load().
+    @State private var plan: DeskSequencing.Plan = DeskSequencing.Plan()
+    @State private var aliasByHandle: [String: String] = [:]
     // W2b: the GitHub Command operational lane (workshop-github-command.md).
-    @State private var githubItems: [GitHubCommandItem] = []
+    @State private var githubLane: DeskLaneState<GitHubCommandItem> = .rows([])
+
+    // Lane unwrapping happens in ONE place: every slice below reads rows, and
+    // the sections read the reason. A lane that failed contributes zero rows AND
+    // renders its own unavailable notice — it never contributes silent emptiness.
+    private var allExecutions: [WorkshopExecution.WorkshopExecutionRecord] { executionsLane.items }
+    private var githubItems: [GitHubCommandItem] { githubLane.items }
+    private var laneUnavailable: Bool {
+        executionsLane.unavailableReason != nil || githubLane.unavailableReason != nil
+    }
 
     private var dataRoot: URL { PersistenceCore.defaultDataRoot() }
 
@@ -80,22 +435,24 @@ struct DeskView: View {
         activeItems.filter { $0.status == .blocked || $0.status == .flag }
     }
 
-    // The stamped reason GitHubProjectTracking writes on every checks/review-
-    // blocked item; matched verbatim so hand-written reasons that merely
-    // mention GitHub keep their own inline text.
-    private static let githubStampedBlockedReason =
-        "GitHub checks or review state are blocking progress."
-
     private var githubBlockedAttentionItems: [DeskItem] {
-        attentionItems.filter {
-            $0.status == .blocked && $0.blockedReason == Self.githubStampedBlockedReason
-        }
+        attentionItems.filter(DeskAttentionStrip.isGitHubStampedBlock)
     }
 
     private var nonGitHubAttentionItems: [DeskItem] {
-        attentionItems.filter {
-            !($0.status == .blocked && $0.blockedReason == Self.githubStampedBlockedReason)
-        }
+        attentionItems.filter { !DeskAttentionStrip.isGitHubStampedBlock($0) }
+    }
+
+    /// The strip, flattened + priority-ordered + BOUNDED in one pass. Only the
+    /// lines that will actually render are built; the header/reveal counts come
+    /// back as arithmetic, so hidden rows cost nothing per SwiftUI diff.
+    private var attentionPlan: DeskAttentionStrip.Plan {
+        DeskAttentionStrip.plan(
+            approvals: approvalExecutions,
+            githubNeedsYou: needsUserGitHubItems,
+            otherAttention: nonGitHubAttentionItems,
+            githubBlocked: githubBlockedAttentionItems,
+            showingAll: showAllAttention)
     }
 
     private static let terminalExecutionStatuses: Set<String> = ["completed", "failed", "cancelled"]
@@ -119,7 +476,9 @@ struct DeskView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
+            // Lazy: the board's history sections can hold hundreds of rows;
+            // only what scrolls into view is built (NEEDS_FIX 4).
+            LazyVStack(alignment: .leading, spacing: 18) {
                 headerRow
 
                 if let loadError {
@@ -130,7 +489,11 @@ struct DeskView: View {
                         .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
                 }
 
-                if items.isEmpty && allExecutions.isEmpty && githubItems.isEmpty && loadError == nil {
+                // "The bench is clear" is a claim about the bench. It may only
+                // render when every lane actually reported — a failed read is
+                // not a clear bench (NORTHSTAR clause 2, no theater).
+                if items.isEmpty && allExecutions.isEmpty && githubItems.isEmpty
+                    && loadError == nil && !laneUnavailable {
                     emptyState
                 } else {
                     attentionSection
@@ -203,6 +566,27 @@ struct DeskView: View {
         .padding(.top, 4)
     }
 
+    /// The one shape a failed lane renders as. Deliberately NOT styled like the
+    /// quiet-lane placeholder: a broken reader has to look different from a
+    /// quiet bench at a glance, or the whole distinction is decorative.
+    private func laneUnavailableNotice(title: String, detail: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "questionmark.circle")
+                .font(.callout).foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.callout.weight(.semibold)).foregroundStyle(.orange)
+                Text(detail)
+                    .font(.caption).foregroundStyle(.secondary)
+                    .lineLimit(3).truncationMode(.tail)
+                Text("This is a read failure, not an empty lane — the work may still be there.")
+                    .font(.caption2).foregroundStyle(.tertiary)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(10)
+        .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+    }
+
     // MARK: empty state
 
     private var emptyState: some View {
@@ -223,50 +607,25 @@ struct DeskView: View {
 
     @ViewBuilder
     private var attentionSection: some View {
-        if !attentionItems.isEmpty || !approvalExecutions.isEmpty || !needsUserGitHubItems.isEmpty {
-            sectionHeader("Waiting on you", systemImage: "hand.raised")
+        let strip = attentionPlan
+        if !strip.isEmpty {
+            // The count is on the header, always — so the strip states how much
+            // is waiting even in the frame where most of it is collapsed.
+            sectionHeader("Waiting on you", count: strip.totalItems, systemImage: "hand.raised")
             VStack(alignment: .leading, spacing: 6) {
-                ForEach(approvalExecutions, id: \.id) { exec in
-                    attentionLine(
-                        icon: "checkmark.shield",
-                        text: "\u{201C}\(exec.title)\u{201D} needs an approval to continue"
-                    )
+                ForEach(strip.visible) { line in
+                    attentionRow(line)
                 }
-                // One-pointer rule (contract): a needs-User GitHub item gets ONE
-                // pointer here; the canonical card lives in GitHub Command below.
-                ForEach(needsUserGitHubItems, id: \.itemId) { item in
-                    attentionLine(
-                        icon: "arrow.triangle.pull",
-                        text: "\(item.repository) #\(item.number) needs your call — see GitHub Command"
-                    )
-                }
-                // Taste pass 2026-07-24: GitHub-blocked items all carry the
-                // same stamped blockedReason ("GitHub checks or review state
-                // are blocking progress.") — repeated per row it turned the
-                // strip into wallpaper, and those items are waiting on GitHub,
-                // not on User. Group them under one honest header; every other
-                // item keeps its own reason inline.
-                ForEach(nonGitHubAttentionItems, id: \.handle) { item in
-                    attentionLine(
-                        icon: item.status == .blocked ? "stop.circle" : "flag",
-                        text: item.status == .blocked
-                            ? "\(item.title)\(item.blockedReason.map { " — \($0)" } ?? "")"
-                            : "\(item.title)\(item.waitingOn.map { " — waiting on \($0)" } ?? "")"
-                    )
-                }
-                if !githubBlockedAttentionItems.isEmpty {
-                    attentionLine(
-                        icon: "stop.circle",
-                        text: "Blocked on GitHub checks or review — these move when GitHub does:"
-                    )
-                    ForEach(githubBlockedAttentionItems, id: \.handle) { item in
-                        HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Text("•").font(.caption).foregroundStyle(.secondary)
-                            Text(item.title).font(.callout).lineLimit(2)
-                            Spacer(minLength: 0)
-                        }
-                        .padding(.leading, 20)
+                if strip.hiddenItems > 0 || showAllAttention {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.15)) { showAllAttention.toggle() }
+                    } label: {
+                        Text(strip.revealLabel(showingAll: showAllAttention))
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.orange)
                     }
+                    .buttonStyle(.plain)
+                    .padding(.top, 2)
                 }
             }
             .padding(12)
@@ -274,10 +633,33 @@ struct DeskView: View {
         }
     }
 
-    private func attentionLine(icon: String, text: String) -> some View {
+    @ViewBuilder
+    private func attentionRow(_ line: DeskAttentionLine) -> some View {
+        switch line.shape {
+        case .primary:
+            attentionLine(icon: line.icon, text: line.text, emphasized: line.needsUserDirectly)
+        case .groupHeader:
+            attentionLine(icon: line.icon, text: line.text)
+                .padding(.top, 2)
+        case .groupChild:
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: line.icon)
+                    .font(.system(size: 5)).foregroundStyle(.secondary)
+                Text(line.text).font(.callout).lineLimit(2)
+                Spacer(minLength: 0)
+            }
+            .padding(.leading, 20)
+        }
+    }
+
+    private func attentionLine(icon: String, text: String, emphasized: Bool = false) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: icon).font(.caption).foregroundStyle(.orange)
-            Text(text).font(.callout).lineLimit(2)
+            Image(systemName: icon)
+                .font(emphasized ? .caption.weight(.semibold) : .caption)
+                .foregroundStyle(.orange)
+            Text(text)
+                .font(emphasized ? .callout.weight(.semibold) : .callout)
+                .lineLimit(2)
             Spacer(minLength: 0)
         }
     }
@@ -326,7 +708,11 @@ struct DeskView: View {
         // checking on what she's got with human eyes") — a monitoring surface
         // that hides itself when quiet reads as missing, not as quiet.
         sectionHeader("GitHub Command", systemImage: "arrow.triangle.pull")
-        if githubItems.isEmpty {
+        if let reason = githubLane.unavailableReason {
+            laneUnavailableNotice(
+                title: "GitHub Command state unavailable",
+                detail: reason)
+        } else if githubItems.isEmpty {
             Text("No tracked GitHub work in the command lane yet — items appear on the next tracking refresh, and anything actionable routes to codex automatically.")
                 .font(.callout).foregroundStyle(.tertiary)
                 .padding(.leading, 4)
@@ -492,7 +878,13 @@ struct DeskView: View {
     private var benchSection: some View {
         sectionHeader("On the bench", count: benchExecutions.isEmpty ? nil : benchExecutions.count,
                       systemImage: "hammer")
-        if benchExecutions.isEmpty {
+        if let reason = executionsLane.unavailableReason {
+            // "Quiet right now" would be a lie here: the lane didn't say quiet,
+            // it failed to answer.
+            laneUnavailableNotice(
+                title: "Execution lane unavailable",
+                detail: reason)
+        } else if benchExecutions.isEmpty {
             Text("Quiet right now — nothing running.")
                 .font(.callout).foregroundStyle(.tertiary)
                 .padding(.leading, 4)
@@ -620,6 +1012,10 @@ struct DeskView: View {
                         .font(.caption).foregroundStyle(.orange)
                         .lineLimit(1)
                 }
+                // Pursuits are ordinary desk items to the sequencer — a pursuit
+                // can be blocked on an item, parked, or next up like anything
+                // else, so it gets the same pills rather than a parallel story.
+                sequencingPills(item)
                 HStack(spacing: 12) {
                     Label {
                         Text(pursuit.doneLooksLike).lineLimit(1).truncationMode(.tail)
@@ -714,6 +1110,11 @@ struct DeskView: View {
 
     // MARK: section 6 — recently finished (items + executions)
 
+    /// Finished history grows without bound; the section doesn't. Newest
+    /// families first, capped, with an explicit reveal — the count in the
+    /// header stays the honest total (NEEDS_FIX 4).
+    private static let finishedGroupCap = 8
+
     @ViewBuilder
     private var finishedSection: some View {
         if !doneItems.isEmpty || !recentDoneExecutions.isEmpty {
@@ -721,7 +1122,22 @@ struct DeskView: View {
                           count: doneItems.count + recentDoneExecutions.count,
                           systemImage: "checkmark.seal")
             ForEach(recentDoneExecutions, id: \.id) { executionRow($0) }
-            ForEach(groups(doneItems), id: \.key) { groupView($0, section: "done") }
+            let allGroups = groups(doneItems.sorted { $0.updatedAt > $1.updatedAt })
+            let visible = showAllFinished ? allGroups : Array(allGroups.prefix(Self.finishedGroupCap))
+            ForEach(visible, id: \.key) { groupView($0, section: "done") }
+            if allGroups.count > Self.finishedGroupCap {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) { showAllFinished.toggle() }
+                } label: {
+                    Text(showAllFinished
+                         ? "Show recent only"
+                         : "Show all \(allGroups.count) finished")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .padding(.leading, 4)
+            }
         }
     }
 
@@ -871,6 +1287,10 @@ struct DeskView: View {
                  : "\(item.kind.rawValue) · \(item.project) · \(item.origin.rawValue)")
                 .font(.caption2.weight(.medium)).foregroundStyle(.tertiary)
                 .padding(.leading, 2)
+            // Sequencing sits ABOVE the free-text sub-line: blockers, parked
+            // dates and campaign progress are status-critical and must not be
+            // the thing that truncates away when a note is long.
+            sequencingPills(item)
             if !sub.isEmpty {
                 Text(sub)
                     .font(.caption).foregroundStyle(.secondary)
@@ -896,6 +1316,80 @@ struct DeskView: View {
         if let last = item.notes.last { parts.append("note: \(last.text)") }
         if !item.refs.isEmpty { parts.append("\(item.refs.count) ref\(item.refs.count == 1 ? "" : "s")") }
         return parts.joined(separator: "  ·  ")
+    }
+
+    // MARK: sequencing pills (rollup · blocked-on · deferred · cycle · next)
+    //
+    // Everything here reads off the ONE plan computed in load() — no row
+    // recomputes anything. Copy rules (public-honesty pass): plain English, no
+    // internal vocabulary. "waiting on 2.1" not "blockedOn"; "until 2026-08-14"
+    // not "deferUntil"; and the rollup says CLOSED, never "done" — the
+    // numerator counts canceled children too, and a canceled child was not done.
+    // Same word DeskProjection uses, so User's window and Agent's in-context
+    // projection can never disagree.
+
+    /// At most this many blocker aliases render inline; the rest collapse to
+    /// "+N" so a fan-in of ten blockers can't stretch the row.
+    private static let blockerAliasCap = 3
+
+    @ViewBuilder
+    private func sequencingPills(_ item: DeskItem) -> some View {
+        if let itemPlan = plan.byHandle[item.handle],
+           itemPlan.totalCount > 0
+            || !itemPlan.effectiveBlockers.isEmpty
+            || itemPlan.blockedByCycle
+            || itemPlan.isDeferred
+            || plan.nextUp.contains(item.handle) {
+            HStack(spacing: 6) {
+                // Campaign rollup — the parent row IS the progress bar.
+                if itemPlan.totalCount > 0 {
+                    Text("\(itemPlan.doneCount)/\(itemPlan.totalCount) closed")
+                        .capsuleTag(itemPlan.doneCount == itemPlan.totalCount ? .green : .gray)
+                }
+                if let blocked = blockedPillText(itemPlan) {
+                    Text(blocked)
+                        .lineLimit(1).truncationMode(.tail)
+                        .capsuleTag(.orange)
+                }
+                // Rare, and worse than an ordinary block: nothing here can ever
+                // clear itself, so it must never be quiet.
+                if itemPlan.blockedByCycle {
+                    Text("\u{26A0} these block each other")
+                        .lineLimit(1).truncationMode(.tail)
+                        .capsuleTag(.red)
+                }
+                // Taste pass: a bare "until 2026-08-14" doesn't say WHY the date
+                // matters — the pause icon carries "parked" so the pill reads
+                // right on the first glance without spending row width on prose.
+                if itemPlan.isDeferred, let raw = item.deferUntil,
+                   let day = DeskSequencing.deferDisplayDay(raw) {
+                    Label("until \(day)", systemImage: "pause.circle")
+                        .labelStyle(.titleAndIcon)
+                        .lineLimit(1)
+                        .capsuleTag(.gray)
+                }
+                // A MARKER, not a re-sort: User's ordering is his. The affordance
+                // points at the rows that are actually startable right now.
+                if plan.nextUp.contains(item.handle) {
+                    Label("start here", systemImage: "arrow.right.circle.fill")
+                        .labelStyle(.titleAndIcon)
+                        .lineLimit(1)
+                        .capsuleTag(.teal)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.leading, 2)
+        }
+    }
+
+    /// "waiting on 2.1, 2.3" — ALIASES, never handles. nil when every blocker
+    /// handle is unresolvable (a dangling edge is not a fact worth asserting).
+    private func blockedPillText(_ itemPlan: DeskSequencing.ItemPlan) -> String? {
+        let aliases = itemPlan.effectiveBlockers.compactMap { aliasByHandle[$0] }
+        guard !aliases.isEmpty else { return nil }
+        let shown = aliases.prefix(Self.blockerAliasCap).joined(separator: ", ")
+        let overflow = aliases.count - min(aliases.count, Self.blockerAliasCap)
+        return "waiting on \(shown)" + (overflow > 0 ? " +\(overflow)" : "")
     }
 
     // MARK: status pill
@@ -940,6 +1434,10 @@ struct DeskView: View {
 
     @MainActor private func load() async {
         let root = dataRoot
+        // M12: taken BEFORE the await, checked after. A load that lost the race
+        // publishes nothing at all — not its items, not its lanes, not its
+        // error — because a partial publish is the same stomp in slow motion.
+        let token = loadGate.begin()
         let snapshot = await Task.detached(priority: .userInitiated) {
             let deskState: DeskState?
             let deskError: String?
@@ -950,27 +1448,93 @@ struct DeskView: View {
                 deskState = nil
                 deskError = "Couldn't load the bench: \(error.localizedDescription)"
             }
-            // Execution and GitHub reads stay lenient and independent: one
-            // broken lane never blanks the other live Workshop projections.
-            let executions = await SwiftNativeWorkshopRunner(root: root).listAll()
-            let githubItems = (try? await GitHubCommandStore(
-                dataRoot: root
-            ).liveState().items) ?? []
+            // Execution and GitHub reads stay independent: one broken lane never
+            // blanks the other live Workshop projections. But "lenient" used to
+            // mean "silent" — a corrupt store returned [] and the surface said
+            // "Quiet right now". Each lane now reports rows OR a reason.
+            let runner = SwiftNativeWorkshopRunner(root: root)
+            let records = await runner.listAll()
+            let executions = DeskLaneState.classify(
+                rows: records,
+                probe: Self.probeExecutionRecords(runner.executionRecordsRoot),
+                noun: "execution record(s)")
+            let githubItems: DeskLaneState<GitHubCommandItem>
+            do {
+                githubItems = .rows(try await GitHubCommandStore(dataRoot: root).liveState().items)
+            } catch {
+                githubItems = .failed(error)
+            }
+            let plan = deskState.map { DeskSequencing.compute($0, now: Date()) } ?? DeskSequencing.Plan()
+            var aliases: [String: String] = [:]
+            for item in deskState?.items ?? [] { aliases[item.handle] = item.alias }
             return DeskViewSnapshot(
                 deskState: deskState,
                 deskError: deskError,
                 executions: executions,
-                githubItems: githubItems
+                githubItems: githubItems,
+                plan: plan,
+                aliasByHandle: aliases
             )
         }.value
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled, loadGate.accepts(token) else { return }
         if let state = snapshot.deskState {
             items = state.items
+            // Plan and alias map are replaced ATOMICALLY with the items they
+            // describe — a stale plan against fresh items would name blockers
+            // that no longer exist.
+            plan = snapshot.plan
+            aliasByHandle = snapshot.aliasByHandle
             loadError = nil
         } else {
             loadError = snapshot.deskError
         }
-        allExecutions = snapshot.executions
-        githubItems = snapshot.githubItems
+        executionsLane = snapshot.executions
+        githubLane = snapshot.githubItems
+    }
+
+    /// Ground truth for the silent-zero cross-check: what does the execution
+    /// store actually look like on disk, independent of the reader that
+    /// swallows its own failures?
+    ///
+    /// Mirrors `scanAllQueueWorkshopExecutions()` (WorkshopExecution+Runner.swift:1046)
+    /// exactly — it counts a `<root>/<id>/` directory iff that directory holds a
+    /// `mission.json`, which is precisely the marker the runner writes and the
+    /// scanner keys on. Two states the old bare count got wrong:
+    ///   • root unreadable → it returned 0, so the corrupt store rendered as an
+    ///     empty bench. That is the ONE case this check exists for.
+    ///   • reservation (`.reserved`, no mission.json yet) and cancelled dirs →
+    ///     it counted them, so a healthy empty bench got an "unavailable"
+    ///     banner. A cleanly-absent mission.json is the runner's own
+    ///     crash-safe ordering, not a lost record.
+    /// A record dir whose CONTENTS can't be listed still counts: unreadable is
+    /// not absent, and that skew is exactly what should surface.
+    nonisolated static func probeExecutionRecords(_ root: URL) -> DeskRecordProbe {
+        let fm = FileManager.default
+        var isDirectory: ObjCBool = false
+        guard fm.fileExists(atPath: root.path, isDirectory: &isDirectory) else { return .empty }
+        guard isDirectory.boolValue else {
+            return .unreadable("execution root is not a directory")
+        }
+        let entries: [URL]
+        do {
+            entries = try fm.contentsOfDirectory(
+                at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [])
+        } catch {
+            return .unreadable("\(error.localizedDescription)")
+        }
+        var count = 0
+        for entry in entries {
+            // Dot entries are the runner's own bookkeeping (.admission lock).
+            guard !entry.lastPathComponent.hasPrefix(".") else { continue }
+            guard (try? entry.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
+            else { continue }
+            if fm.fileExists(atPath: entry.appendingPathComponent("mission.json").path) {
+                count += 1
+            } else if (try? fm.contentsOfDirectory(atPath: entry.path)) == nil {
+                // Can't tell whether it holds a record — malformed, count it.
+                count += 1
+            }
+        }
+        return .records(count)
     }
 }

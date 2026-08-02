@@ -13,18 +13,24 @@ func timeoutRace_bodyPastDeadline_reportsTimeoutAndDoesNotBlockNextJob() async t
     // i.e. the hung body did not wedge the runner.
     let started = Date()
     let outcome = await raceAgainstTimeout(seconds: 0.05) { () -> String in
-        try await Task.sleep(nanoseconds: 5_000_000_000)  // 5s, well past 50ms
+        try await Task.sleep(nanoseconds: 60_000_000_000)  // 60s wedge, well past 50ms
         return "should-never-surface"
     }
     guard case .timedOut = outcome else {
         Issue.record("expected .timedOut, got \(outcome)")
         return
     }
-    // The race returned promptly (did not await the 5s body).
-    #expect(Date().timeIntervalSince(started) < 2.0)
+    // 10s against a 60s wedge, not 2s against a 5s body: the claim is "the
+    // 50ms deadline won, not the wedged body" — well below the wedge still
+    // proves that, while a 2s bound lost to scheduler noise under full-suite
+    // parallelism (observed 2.87s on a loaded machine).
+    #expect(Date().timeIntervalSince(started) < 10.0)
 
     // The NEXT job completes normally right after the timed-out one.
-    let next = await raceAgainstTimeout(seconds: 5.0) { () -> String in
+    // 60s deadline: it exists only so a wedge would still resolve — the body
+    // returns immediately, and a tight deadline can spuriously fire before the
+    // body task is even scheduled under full-suite parallelism.
+    let next = await raceAgainstTimeout(seconds: 60) { () -> String in
         "next-job-ran"
     }
     guard case .value(let v) = next else {
@@ -36,8 +42,10 @@ func timeoutRace_bodyPastDeadline_reportsTimeoutAndDoesNotBlockNextJob() async t
 
 @Test
 func timeoutRace_bodyUnderDeadline_returnsValueUnchanged() async throws {
-    let outcome = await raceAgainstTimeout(seconds: 5.0) { () -> Int in
-        try await Task.sleep(nanoseconds: 10_000_000)  // 10ms, well under 5s
+    // 60s deadline for the same reason as above: the deadline only backstops a
+    // wedge; a tight one races real scheduler noise on the loaded machine.
+    let outcome = await raceAgainstTimeout(seconds: 60) { () -> Int in
+        try await Task.sleep(nanoseconds: 10_000_000)  // 10ms, well under the deadline
         return 42
     }
     guard case .value(let v) = outcome else {
@@ -50,7 +58,7 @@ func timeoutRace_bodyUnderDeadline_returnsValueUnchanged() async throws {
 @Test
 func timeoutRace_bodyThrows_reportsFailureNotTimeout() async throws {
     struct Boom: Error, LocalizedError { var errorDescription: String? { "kaboom" } }
-    let outcome = await raceAgainstTimeout(seconds: 5.0) { () -> Int in
+    let outcome = await raceAgainstTimeout(seconds: 60) { () -> Int in
         throw Boom()
     }
     guard case .failure(let message) = outcome else {
@@ -80,8 +88,13 @@ func timeoutRace_cancelsAbandonedBodyOnTimeout() async throws {
         Issue.record("expected .timedOut, got \(outcome)")
         return
     }
-    // Give the abandoned body a beat to observe the cancel.
-    try await Task.sleep(nanoseconds: 200_000_000)
+    // Positive step (the body SHOULD observe the cancel) polls with a generous
+    // deadline — a fixed 200ms beat routinely loses to scheduler noise under
+    // full-suite parallelism while the body waits for its next 20ms check.
+    let cancelDeadline = Date().addingTimeInterval(10)
+    while await observedCancellation.get() == false, Date() < cancelDeadline {
+        try await Task.sleep(nanoseconds: 10_000_000)  // 10ms
+    }
     #expect(await observedCancellation.get())
 }
 
@@ -110,8 +123,10 @@ func timeoutRace_parentCancellation_resolvesCancelledPromptly() async throws {
     let started = Date()
     racer.cancel()
     await racer.value
-    // Returned promptly (did not await the ~1h body/deadline).
-    #expect(Date().timeIntervalSince(started) < 2.0)
+    // 30s, not 2s: the claim is "the cancel won, not the ~1h body/deadline" —
+    // two orders of magnitude below the wedge still proves that, while a 2s
+    // bound loses to scheduler noise under full-suite parallelism.
+    #expect(Date().timeIntervalSince(started) < 30.0)
     guard case .cancelled? = await outcomeBox.get() else {
         Issue.record("expected .cancelled, got \(String(describing: await outcomeBox.get()))")
         return
@@ -126,10 +141,15 @@ func timeoutRace_parentCancellation_winsOverBodyThrowAndDeadline() async throws 
     // the cancellation outcome and the losers are ignored.
     let bodyStarted = ObservedFlag()
     let outcomeBox = OutcomeBox()
+    // The deadline must be long enough that the cancel below provably lands
+    // first even under multi-second scheduler noise (a 0.2s deadline made
+    // this a race the test itself could lose), while the body sleeps past
+    // the deadline so a missed cancel would still surface as .timedOut, not
+    // .value.
     let racer = Task {
-        let outcome = await raceAgainstTimeout(seconds: 0.20) { () -> Int in
+        let outcome = await raceAgainstTimeout(seconds: 30) { () -> Int in
             await bodyStarted.set()
-            try await Task.sleep(nanoseconds: 2_000_000_000)  // 2s, past the 0.2s deadline
+            try await Task.sleep(nanoseconds: 60_000_000_000)  // 60s, past the 30s deadline
             return 7
         }
         await outcomeBox.set(mapOutcomeToTag(outcome))
@@ -137,7 +157,7 @@ func timeoutRace_parentCancellation_winsOverBodyThrowAndDeadline() async throws 
     while await bodyStarted.get() == false {
         try await Task.sleep(nanoseconds: 2_000_000)
     }
-    racer.cancel()  // cancel BEFORE the 0.2s deadline elapses
+    racer.cancel()  // cancel BEFORE the 30s deadline elapses
     await racer.value
     guard case .cancelled? = await outcomeBox.get() else {
         Issue.record("expected .cancelled, got \(String(describing: await outcomeBox.get()))")

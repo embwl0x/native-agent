@@ -52,15 +52,40 @@ public enum DeskNotifyEvaluator {
         state.items.compactMap { decision(for: $0, now: now) }
     }
 
-    /// Earliest future cooldown crossing for a changed direct/urgent item.
+    /// Earliest future moment this lane could fire, per item:
+    ///   • a PARKED item's own defer expiry — parking silences the shoulder-tap
+    ///     (see `decision`), so the park ending is itself a wake-worthy moment:
+    ///     an item that accumulated changes while parked must ping when it
+    ///     un-parks, not whenever the next unrelated event happens to wake the
+    ///     loop. Reported whether or not a cooldown is also outstanding, since
+    ///     the defer gate outranks it.
+    ///   • otherwise the cooldown crossing for an already-changed item.
     /// Initial notifications and already-due rows are handled by the event or
     /// startup reconciliation pass; returning only a future date prevents an
     /// exact-deadline owner from spinning on corrupt/unchanged state.
     public static func nextMeaningfulDeadline(_ state: DeskState, after now: Date) -> Date? {
         state.items.compactMap { item -> Date? in
             guard item.notify.level == .direct || item.notify.level == .urgent,
-                  !item.status.isTerminal,
-                  let lastRaw = item.notify.lastNotifiedAt,
+                  !item.status.isTerminal
+            else { return nil }
+            // Parked: the only thing that can unblock this item is the park
+            // ending — but wake for it ONLY if a ping actually follows, so the
+            // park end is a deadline for items with something to say, not for
+            // every parked row on the desk.
+            if DeskSequencing.isDeferred(item, now: now) {
+                guard let raw = item.deferUntil?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      let until = DeskSequencing.parseDeferStamp(raw), until > now
+                else { return nil }
+                guard let lastRaw = item.notify.lastNotifiedAt,
+                      let last = DeskClock.parseISO(lastRaw)
+                else { return until }   // never pinged ⇒ eligible the moment the park lifts
+                guard let updated = DeskClock.parseISO(item.updatedAt), updated > last
+                else { return nil }     // nothing pending ⇒ the park end is not news
+                let cooldown = item.notify.cooldown.flatMap(parseDuration) ?? defaultCooldown
+                // Both gates must clear; the later one is the real moment.
+                return max(until, last.addingTimeInterval(cooldown))
+            }
+            guard let lastRaw = item.notify.lastNotifiedAt,
                   let last = DeskClock.parseISO(lastRaw),
                   let updated = DeskClock.parseISO(item.updatedAt),
                   updated > last
@@ -76,6 +101,16 @@ public enum DeskNotifyEvaluator {
         guard item.notify.level == .direct || item.notify.level == .urgent else { return nil }
         // A finished item doesn't interrupt User.
         guard !item.status.isTerminal else { return nil }
+        // PARKING SILENCES THE SHOULDER-TAP TOO (audit 2026-08-02, finding 4).
+        // Both other desk lanes already honour the park — DeskSequencing drops a
+        // deferred item out of `nextUp`, DeskNagEvaluator refuses to call it
+        // stale — and this one didn't, so an item parked until September that
+        // picked up a ref today fired a direct push. "Not now" has to mean the
+        // same thing on every lane, and the loudest lane is the one where it
+        // matters most. The change is NOT lost: `updatedAt` still sits past
+        // `lastNotifiedAt`, so it fires on the first tick after the park ends —
+        // which `nextMeaningfulDeadline` above now schedules exactly.
+        guard !DeskSequencing.isDeferred(item, now: now) else { return nil }
 
         if let lastRaw = item.notify.lastNotifiedAt, let last = DeskClock.parseISO(lastRaw) {
             // Already pinged once: re-ping only on a REAL change since then

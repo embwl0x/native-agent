@@ -49,8 +49,12 @@ struct ViewFileRefreshTaskTests {
         #expect(await probe.count() == 2)
     }
 
+    // 10s deadline, not 2s: positive steps (a refresh SHOULD land) only need
+    // the deadline to exceed worst-case scheduler noise under full-suite
+    // parallelism — a green run still returns at the first 10ms poll that
+    // observes the count.
     private func waitUntil(
-        timeout: Duration = .seconds(2),
+        timeout: Duration = .seconds(10),
         condition: @escaping @Sendable () async -> Bool
     ) async throws {
         let clock = ContinuousClock()

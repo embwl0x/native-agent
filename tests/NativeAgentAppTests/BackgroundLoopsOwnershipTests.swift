@@ -61,7 +61,10 @@ struct BackgroundLoopsOwnershipTests {
         )
 
         await facade.start()
-        for _ in 0..<40 {
+        // 10s deadline, not 400ms: the positive step (the loop SHOULD fire)
+        // only needs the deadline to exceed worst-case scheduler noise under
+        // full-suite parallelism; a green run breaks at the first 10ms poll.
+        for _ in 0..<1000 {
             if await doctor.value > 0 { break }
             try await Task.sleep(for: .milliseconds(10))
         }
@@ -190,7 +193,8 @@ struct BackgroundLoopsOwnershipTests {
         )
 
         await facade.start()
-        for _ in 0..<40 {
+        // Same 10s deadline as above — generous positive-step poll.
+        for _ in 0..<1000 {
             if await heartbeat.value > 0 { break }
             try await Task.sleep(for: .milliseconds(10))
         }

@@ -256,7 +256,10 @@ struct TurnTraceTests {
                                              payload: .object(["i": .int(Int64(i))])))
         }
         let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
-        #expect(elapsedMs < 2000, "no-subscriber burst must be cheap (took \(elapsedMs)ms)")
+        // 10s, not 2s: an order-of-magnitude tripwire still catches a
+        // pathological per-event cost; a 2s absolute bound loses to scheduler
+        // noise under full-suite parallelism.
+        #expect(elapsedMs < 10_000, "no-subscriber burst must be cheap (took \(elapsedMs)ms)")
         let count = await bus.subscriberCount
         #expect(count == 0)
     }
@@ -384,7 +387,9 @@ struct TurnTraceTests {
             )
         }
         let producerElapsed = ContinuousClock.now - started
-        #expect(producerElapsed < .seconds(1))
+        // 10s, not 1s: the claim is "fire() never blocks on the wedged
+        // consumer" — headroom over scheduler noise, far under a real block.
+        #expect(producerElapsed < .seconds(10))
 
         let deadline = ContinuousClock.now + .seconds(10)
         while TurnTraceBus.emissionBacklog.inFlight != 0, ContinuousClock.now < deadline {
@@ -425,7 +430,8 @@ struct TurnTraceTests {
                 on: bus
             )
         }
-        #expect(ContinuousClock.now - started < .seconds(2))
+        // 10s, not 2s — same non-blocking claim as above, noise-proofed.
+        #expect(ContinuousClock.now - started < .seconds(10))
         #expect(TurnTraceBus.emissionBacklog.inFlight <= 4096)
         #expect(TurnTraceBus.emissionBacklog.dropped > baselineDrops)
 

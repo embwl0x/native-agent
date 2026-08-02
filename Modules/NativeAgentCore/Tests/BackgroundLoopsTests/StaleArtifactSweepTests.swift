@@ -428,7 +428,7 @@ private func makeLoop(
     _ = await loop.tickOutcome()
     let second = await loop.tickOutcome()
 
-    guard case .skipped(let reason) = second else {
+    guard case .skipped(let reason, _) = second else {
         Issue.record("expected .skipped, got \(second)"); return
     }
     #expect(reason.contains("already ran today"))

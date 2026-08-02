@@ -94,7 +94,12 @@ let extraDeps: [String: [String]] = [
     "MacControl": ["PersistenceCore"],
     "Onboarding": ["PersistenceCore", "PersonaEngine"],
     "MacAssistantStatus": ["PersistenceCore", "TrustCenter"],
-    "WorkshopExecution": ["PersistenceCore", "ProviderRouting", "ApprovalInbox"],
+    // MemoryV2 (2026-08-02, NORTHSTAR clause 1): a finished Workshop execution
+    // writes one prose memory of what it did, on the `missions` disclosure
+    // surface the policy already carried but nothing ever filled. No cycle —
+    // MemoryV2 depends on PersistenceCore/KnowledgeGraph/ApprovalInbox and
+    // never imports WorkshopExecution. See WorkshopExecution+MissionMemory.swift.
+    "WorkshopExecution": ["PersistenceCore", "ProviderRouting", "ApprovalInbox", "MemoryV2"],
     "WorkflowOrchestration": [
         "PersistenceCore",
         "ApprovalInbox",

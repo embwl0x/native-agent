@@ -16,6 +16,20 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+public enum UserMDGeneratorError: Error, CustomStringConvertible {
+    /// USER.md was requested on an install that has not completed onboarding.
+    /// Not a failure: writing it there would fabricate the identity anchor
+    /// onboarding is about to create.
+    case onboardingIncomplete
+
+    public var description: String {
+        switch self {
+        case .onboardingIncomplete:
+            return "USER.md generation is gated until onboarding completes"
+        }
+    }
+}
+
 public actor UserMDGenerator {
     // One owner: `UserMDAutogenMarkers` in NativeAgentCore. The Context
     // compiler cuts per-fact atoms on these exact strings and the flow
@@ -53,6 +67,47 @@ public actor UserMDGenerator {
         self.nowProvider = now
     }
 
+    /// True once this install has finished onboarding, and therefore owns a
+    /// real identity that USER.md is allowed to project.
+    ///
+    /// Two accepted proofs, in order:
+    ///   * `<dataRoot>/.onboarded` — the completion sentinel onboarding
+    ///     publishes last, after every persona doc verifies.
+    ///   * `SOUL.md` in the persona root — installs that predate the sentinel
+    ///     still carry their identity docs, and must keep regenerating.
+    ///
+    /// USER.md itself is deliberately NOT a proof: it is the file this
+    /// generator writes, so accepting it would be circular — exactly the
+    /// self-satisfying loop that hid the onboarding wizard on blank installs.
+    ///
+    /// gpt-5.5 review NEEDS_FIX 3 (2026-08-02) asked whether that contradicts
+    /// `Onboarding.startOnboarding`, which at the time counted a prose-bearing
+    /// USER.md as already-onboarded. It did, and the contradiction was resolved
+    /// in the OTHER direction: onboarding's start gate no longer accepts USER.md
+    /// either. Both gates now recognize exactly `.onboarded` and `SOUL.md`, so
+    /// no install can be "onboarded enough to hide the wizard" while also
+    /// "un-onboarded enough to refuse regeneration" — the stuck state the review
+    /// described.
+    ///
+    /// The alternative (teach this gate to accept identity-bearing USER.md
+    /// content) was rejected: `regenerate` REPLACES the whole document with its
+    /// own autogen body, so onboarding's prose survives only until the first
+    /// regeneration. A proof this generator can erase — and, with bullets in the
+    /// body, re-forge — is not a proof. An install carrying only a USER.md is
+    /// therefore treated as incomplete, and the wizard (which is now reachable
+    /// for it) is the recovery path.
+    public nonisolated var onboardingHasCompleted: Bool {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: dataRoot.appendingPathComponent(".onboarded").path) {
+            return true
+        }
+        let soul = (personaRoot ?? dataRoot
+            .appendingPathComponent("persona", isDirectory: true)
+            .appendingPathComponent(MemoryV2Defaults.personaID, isDirectory: true))
+            .appendingPathComponent("SOUL.md")
+        return fm.fileExists(atPath: soul.path)
+    }
+
     /// Path the generator writes to for a given persona. A resolved persona
     /// root is one active document, so it deliberately does not vary by the
     /// storage partition supplied by a caller.
@@ -76,6 +131,11 @@ public actor UserMDGenerator {
     /// expiry, coalescing every poke that arrives meanwhile.
     @discardableResult
     public func requestRegeneration(persona: String = MemoryV2Defaults.personaID) async throws -> URL? {
+        // Checked before the debounce bookkeeping so a pre-onboarding poke
+        // cannot schedule a trailing-edge task that will only fail later.
+        guard onboardingHasCompleted else {
+            throw UserMDGeneratorError.onboardingIncomplete
+        }
         let projectionPersona = projectionPersona(for: persona)
         if let last = lastRegen {
             let elapsed = nowProvider().timeIntervalSince(last)
@@ -118,10 +178,28 @@ public actor UserMDGenerator {
         }
     }
 
-    /// Unconditionally regenerate USER.md from active memories for `persona`.
-    /// Called on app launch and by `requestRegeneration` after debounce.
+    /// Regenerate USER.md from active memories for `persona`. Called on app
+    /// launch and by `requestRegeneration` after debounce.
+    ///
+    /// Throws `UserMDGeneratorError.onboardingIncomplete` on a machine that has
+    /// not finished onboarding — see `onboardingHasCompleted`.
     @discardableResult
     public func regenerate(persona: String = MemoryV2Defaults.personaID) async throws -> URL {
+        // fix-blank-install-onboarding (2026-08-02): USER.md is one of
+        // onboarding's OWN transaction targets, and its mere existence used to
+        // satisfy onboarding's `hasExisting`/`hasIdentityAnchor` checks. Launch
+        // called this generator unconditionally, so on a blank machine it
+        // created the persona dir and wrote a USER.md containing nothing but
+        // the autogen header — and that empty file made the install look
+        // already-onboarded. Whether the wizard ever appeared came down to
+        // which task won a race at launch: launch-first meant no wizard at all
+        // (unnamed agent, no SOUL/VOICE), wizard-first meant a Build that died
+        // on `persona_already_exists`. Gating generation on onboarding having
+        // completed removes the race entirely — before completion there is
+        // simply nothing to write, in either order.
+        guard onboardingHasCompleted else {
+            throw UserMDGeneratorError.onboardingIncomplete
+        }
         let projectionPersona = projectionPersona(for: persona)
         let target = userMDPath(persona: projectionPersona)
         let parent = target.deletingLastPathComponent()

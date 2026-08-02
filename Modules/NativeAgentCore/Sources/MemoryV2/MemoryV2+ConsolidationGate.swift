@@ -784,7 +784,18 @@ public enum MemoryConsolidationGate {
             personaRoot: environment.personaRoot,
             debounceInterval: 0
         )
-        let userMD = try await generator.regenerate(persona: MemoryV2Defaults.personaID)
+        // USER.md generation is gated until onboarding completes
+        // (fix-blank-install-onboarding, 2026-08-02) — writing it earlier
+        // fabricates the identity anchor onboarding itself is about to create.
+        // The rest of the reconcile (Spotlight, knowledge graph, invalidation)
+        // is independent of the persona doc, so a pre-onboarding install
+        // reconciles everything else rather than failing the whole run.
+        let userMD: URL
+        do {
+            userMD = try await generator.regenerate(persona: MemoryV2Defaults.personaID)
+        } catch UserMDGeneratorError.onboardingIncomplete {
+            userMD = generator.userMDPath(persona: MemoryV2Defaults.personaID)
+        }
 
         let memories = try await storage.listMemories(persona: nil, status: nil, limit: nil)
         let spotlightRecords = memories.filter {

@@ -126,10 +126,15 @@ public struct CognitiveNode: Sendable, Equatable, Identifiable {
         ] + metadata.keys.sorted().flatMap { key -> [String] in
             [key] + Self.stringSignals(from: metadata[key] ?? .null)
         })
+        // H3 (2026-08-02): an explicit classification is honored in BOTH
+        // directions. This used to discard an explicit `.live` whenever the
+        // inference disagreed, which made the escape hatch one-way: a turn the
+        // originator KNEW was live got re-inferred from its own words and
+        // demoted, while an explicit `.debug` was always respected. Since
+        // `CognitiveEvent.init` stamps the resolved kind into
+        // `metadata["turnKind"]`, that demotion re-fired on every node read,
+        // silently overriding the event's own resolved provenance.
         if let explicit = CognitiveTurnKind.from(metadataValue: metadata[CognitiveTurnKind.metadataKey]) {
-            if explicit == .live, inferred != .live {
-                return inferred
-            }
             return explicit
         }
 

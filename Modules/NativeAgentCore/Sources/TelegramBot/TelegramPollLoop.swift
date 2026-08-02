@@ -150,8 +150,14 @@ public struct TelegramPollLoop: LoopRunner {
         // scheduler keeps its cheap 2s cadence; this gate is what turns
         // "offline Mac = error spam every tick" into 1s→60s exponential
         // probing with jitter. Reset on the first successful poll.
+        //
+        // HEALTH-NEUTRAL: this skip means "I am not polling BECAUSE I am
+        // failing". Reported as a plain skip it reset the scheduler's
+        // consecutive-failure streak between every real failure (2s cadence,
+        // backoff window open in between), so the failure-streak push could
+        // never fire and a revoked token / offline Mac was silent forever.
         guard await pollBackoff.shouldAttempt() else {
-            return .skipped(reason: "Telegram poll backoff active")
+            return .backingOff(reason: "Telegram poll backoff active")
         }
 
         await syncCommandMenuIfNeeded()

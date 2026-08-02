@@ -1,6 +1,6 @@
 # path	needle	expected_count	classification	canonical_owner
-Modules/NativeAgentCore/Sources/BackgroundLoops/BackgroundLoops.swift	timeoutNanoseconds	1	timeout_retry_deadline	BackgroundLoops.tickWithTimeout
-Modules/NativeAgentCore/Sources/BackgroundLoops/BackgroundLoops.swift	try await Task.sleep(nanoseconds: nanos)	1	integrity_sweep	SwiftNativeLoopScheduler
+Modules/NativeAgentCore/Sources/BackgroundLoops/BackgroundLoops.swift	timeoutNanoseconds(timeout)	1	timeout_retry_deadline	BackgroundLoops.tickWithTimeout
+Modules/NativeAgentCore/Sources/BackgroundLoops/BackgroundLoops.swift	timeoutNanoseconds(delay)	1	integrity_sweep	SwiftNativeLoopScheduler
 Modules/NativeAgentCore/Sources/BackgroundLoops/BackgroundLoopsManager.swift	*	2	event_deadline	BackgroundLoopsManager.physiology
 Modules/NativeAgentCore/Sources/ChatOrchestration/ChatCompactionDistiller.swift	*	1	timeout_retry_deadline	ChatCompactionDistiller
 Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+AutonomyGate.swift	*	1	timeout_retry_deadline	AutonomyGate
@@ -38,7 +38,7 @@ Modules/NativeAgentCore/Sources/TelegramBot/TelegramPollLoop+ChatProgress.swift	
 Modules/NativeAgentCore/Sources/TelegramBot/TelegramVoiceTranscription.swift	*	2	timeout_retry_deadline	TelegramTranscriptionProcess
 Modules/NativeAgentCore/Sources/ToolExecution/ToolExecution+RunSandbox.swift	*	2	timeout_retry_deadline	ToolSandboxProcess
 Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration+Client.swift	*	1	timeout_retry_deadline	WorkflowAttemptOwner
-Modules/NativeAgentCore/Sources/WorkshopExecution/WorkshopExecution+Executor.swift	*	1	timeout_retry_deadline	WorkshopStepCancellationDeadline
+Modules/NativeAgentCore/Sources/WorkshopExecution/WorkshopExecution+Executor.swift	*	2	timeout_retry_deadline	WorkshopStepCancellationDeadline
 Modules/NativeAgentCore/Sources/WorkshopExecution/WorkshopExecution+PlannerLLM.swift	*	1	timeout_retry_deadline	WorkshopPlannerDeadline
 Sources/NativeAgentApp/AgentBridgeCompletionRouter.swift	*	1	timeout_retry_deadline	AgentBridgeCompletionRetry
 Sources/NativeAgentApp/AppDelegate+Launch.swift	*	1	timeout_retry_deadline	LaunchGraceDeadline
@@ -74,7 +74,7 @@ Sources/NativeAgentApp/PollScheduler.swift	*	1	visible_ui	PollScheduler
 Sources/NativeAgentApp/SchedulerDueJobRunner+Timeout.swift	*	1	user_schedule	SchedulerJobDeadline
 Sources/NativeAgentApp/SlimSettingsView.swift	*	1	visible_ui	SidebarUI
 Sources/NativeAgentApp/SkillLifecycleView.swift	*	2	visible_ui	SkillLifecycleUI
-Sources/NativeAgentApp/SlackSocketModeLoop.swift	*	4	external_protocol_poll	SlackSocketModeTransport
+Sources/NativeAgentApp/SlackSocketModeLoop.swift	*	5	external_protocol_poll	SlackSocketModeTransport
 Sources/NativeAgentApp/SpotlightOverlay.swift	*	1	visible_ui	SpotlightOverlayUI
 Sources/NativeAgentApp/SwiftCodexDeviceLoginManager.swift	*	3	external_protocol_poll	CodexDeviceLoginFlow
 Sources/NativeAgentApp/SystemToastBar.swift	*	1	visible_ui	SystemToastUI
@@ -99,3 +99,6 @@ iOS/NativeAgentMobile/Sources/VoiceInputController.swift	*	1	visible_ui	MobileVo
 iOS/NativeAgentMobile/Sources/iCloudBridge.swift	*	1	external_protocol_poll	MobileICloudBridgeTimeout
 iOS/NativeAgentMobile/Sources/iCloudSyncEngine+Actions.swift	*	4	external_protocol_poll	MobileICloudActionTransport
 iOS/NativeAgentMobile/Sources/iCloudSyncEngine+Snapshots.swift	*	1	external_protocol_poll	MobileICloudSnapshotFetch
+Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+SchemaBuilders.swift	try? await Task.sleep(nanoseconds: UInt64(deadline * 1_000_000_000))	1	timeout_retry_deadline	MCPToolCacheWarmDeadline
+Modules/NativeAgentCore/Sources/NativeAgentCore/LifecyclePrimitives.swift	try await Task.sleep(nanoseconds: BoundedWait.nanoseconds(deadline))	1	timeout_retry_deadline	BoundedWait.deadline
+Modules/NativeAgentCore/Sources/NativeAgentCore/LifecyclePrimitives.swift	try await Task.sleep(nanoseconds: nanoseconds(deadline))	1	timeout_retry_deadline	ScopedWaiter.parkDeadline

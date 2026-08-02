@@ -200,8 +200,13 @@ NativeAgent does not inject its entire tool catalog into every turn.
   bounded by UTF-8 bytes, retained temporarily in owner-only storage, and can be
   paged losslessly inside the same turn.
 - Every dispatch has a finite watchdog and exact no-progress recovery.
-- Tools, skills, MCP servers, workflows, and signed capability packs retain
-  distinct lifecycle and trust boundaries.
+- Tools, skills, MCP servers, and workflows retain distinct lifecycle and trust
+  boundaries. There is no capability-pack lane: signed packs were never built,
+  and the Capability Foundry surface that used to advertise one (alongside
+  On-Demand Plugins and App Readouts, all three hardcoded to zero) was removed
+  2026-08-02. What remains is an honest read-only index — it counts the four
+  stores above off disk and claims nothing else. The review queue and the
+  auto-implementation ledger are unported and render nowhere.
 
 Current families include files and shell, Git, Mac apps, Mail/Calendar/Contacts/
 Music, visible browser, screen vision, research, memory and graph, Workshop,

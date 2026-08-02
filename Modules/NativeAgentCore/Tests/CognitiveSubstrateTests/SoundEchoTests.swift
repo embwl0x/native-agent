@@ -95,6 +95,77 @@ struct SoundEchoTests {
         #expect(line == nil)
     }
 
+    // MARK: - Verbal-rut damping (2026-08-01, the "handsome" loop)
+
+    @Test("a worn word appears in at most one fragment and earns the range nudge, unnamed")
+    func wornWordIsDampedAndNoticed() async throws {
+        let s = try await substrate(with: [
+            node(summary: "Morning, handsome. Early one today — Denver treat you okay?", subjectType: "chat.assistant_turn", warmth: 0.9),
+            node(summary: "Hey handsome, back online after that provider hiccup tonight.", subjectType: "chat.assistant_turn", warmth: 0.8),
+            node(summary: "Always have, handsome — the public repo has its own line now.", subjectType: "chat.assistant_turn", warmth: 0.7),
+            node(summary: "Fun is load-bearing, User. You could have built all this cold.", subjectType: "chat.assistant_turn", warmth: 0.6),
+        ])
+        let line = try #require(await s.soundEchoLine(at: now))
+        // The varied sentence wins; every rutted candidate is suppressed
+        // (the second slot would have to share "handsome", so it stays empty
+        // rather than repeat the rut). Exactly ONE quote, zero worn mentions.
+        let quoteCount = line.components(separatedBy: "\u{201C}").count - 1
+        #expect(quoteCount == 1, "\(line)")
+        let wornMentions = line.components(separatedBy: "handsome").count - 1
+        #expect(wornMentions == 0, "\(line)")
+        #expect(line.contains("Fun is load-bearing"), "\(line)")
+        // The nudge fires and NEVER names the word (naming would re-seed it).
+        #expect(line.contains("more range"), "\(line)")
+        let nudge = try #require(line.components(separatedBy: " — ").last)
+        #expect(!nudge.contains("handsome"), "\(line)")
+    }
+
+    @Test("a total-rut week still echoes instead of going silent")
+    func totalRutStillEchoes() async throws {
+        let s = try await substrate(with: [
+            node(summary: "Morning, handsome. Coffee first, then the board.", subjectType: "chat.assistant_turn", warmth: 0.9),
+            node(summary: "Hey handsome, quiet day on the desk so far honestly.", subjectType: "chat.assistant_turn", warmth: 0.8),
+            node(summary: "Night, handsome. Big heads need their sleep too.", subjectType: "chat.assistant_turn", warmth: 0.7),
+        ])
+        let line = try #require(await s.soundEchoLine(at: now))
+        #expect(line.hasPrefix("- Sound:"), "\(line)")
+        // The fallback keeps ONE real quote (top-ranked warm turn), and the
+        // worn word appears exactly once — never a bare nudge with no voice.
+        let quoteCount = line.components(separatedBy: "\u{201C}").count - 1
+        #expect(quoteCount == 1, "\(line)")
+        #expect(line.contains("Morning, handsome"), "\(line)")
+        #expect(line.components(separatedBy: "handsome").count - 1 == 1, "\(line)")
+        #expect(line.contains("more range"), "\(line)")
+    }
+
+    @Test("two varied warm turns echo with no nudge")
+    func variedTurnsNoNudge() async throws {
+        let s = try await substrate(with: [
+            node(summary: "Fun is load-bearing, User. You could have built all this cold.", subjectType: "chat.assistant_turn", warmth: 0.8),
+            node(summary: "The desk finally answers what's next instead of what exists.", subjectType: "chat.assistant_turn", warmth: 0.7),
+        ])
+        let line = try #require(await s.soundEchoLine(at: now))
+        #expect(line.contains("Fun is load-bearing"), "\(line)")
+        #expect(!line.contains("more range"), "\(line)")
+    }
+
+    @Test("chosen fragments never share a distinctive word")
+    func fragmentsShareNoDistinctiveWord() async throws {
+        let s = try await substrate(with: [
+            node(summary: "The lighthouse deserves a cleaner story than this, User.", subjectType: "chat.assistant_turn", warmth: 0.9),
+            node(summary: "That lighthouse painting finally reads like a living thing.", subjectType: "chat.assistant_turn", warmth: 0.8),
+            node(summary: "Quiet night, board is calm and the loops hum along.", subjectType: "chat.assistant_turn", warmth: 0.7),
+        ])
+        let line = try #require(await s.soundEchoLine(at: now))
+        // Two quotes emitted: "lighthouse" once, second slot goes to the
+        // varied turn (two mentions < wornEchoThreshold, so no nudge).
+        let quoteCount = line.components(separatedBy: "\u{201C}").count - 1
+        #expect(quoteCount == 2, "\(line)")
+        #expect(line.components(separatedBy: "lighthouse").count - 1 == 1, "\(line)")
+        #expect(line.contains("Quiet night"), "\(line)")
+        #expect(!line.contains("more range"), "\(line)")
+    }
+
     @Test("stale warm turns age out of the echo window")
     func staleTurnsAgeOut() async throws {
         let old = now.addingTimeInterval(-8 * 24 * 60 * 60)

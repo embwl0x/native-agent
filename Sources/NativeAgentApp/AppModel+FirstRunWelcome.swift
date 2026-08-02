@@ -26,8 +26,12 @@ extension AppModel {
         NativeAgentPaths.dataRoot.appendingPathComponent(".needs_welcome", isDirectory: false)
     }
 
-    /// Written at onboarding completion. The greeting fires the first time the
-    /// user opens chat with a connected provider.
+    /// Arms the one-time welcome — IN PUBLIC-RELEASE BUNDLES ONLY.
+    ///
+    /// Called at onboarding completion, but a deliberate no-op everywhere else:
+    /// outside a public-release bundle no marker is written, so no greeting can
+    /// ever fire on a dev install (see the file header). Callers get no signal
+    /// either way; "marked" is not a postcondition of calling this.
     @MainActor
     func markFirstRunWelcomePending() {
         guard NativeAgentPaths.isPublicReleaseBundle else { return }

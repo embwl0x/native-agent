@@ -6,6 +6,51 @@ import Testing
 
 @Suite("Cognitive turn-kind propagation", .serialized)
 struct CognitiveTurnKindPropagationTests {
+    /// These tests run the runtime's REAL debounced microcycle scheduler, so
+    /// settlement has no fixed upper bound under full-suite parallelism.
+    /// Positive steps (a settlement SHOULD land) poll with a generous deadline;
+    /// the baseline read instead waits for quiescence (the receipt count
+    /// unchanged across a bounded window) because bootstrap may or may not own
+    /// a reconciliation microcycle. The old fixed 600ms sleeps were roving
+    /// flakes on a loaded machine.
+    private func microcycleReceiptCount(_ substrate: CognitiveSubstrate) async -> Int {
+        await substrate.receiptSnapshot().filter { $0.kind == "microcycle" }.count
+    }
+
+    private func waitForMicrocycleCount(
+        _ substrate: CognitiveSubstrate,
+        toReach expected: Int,
+        deadline: Duration = .seconds(10)
+    ) async throws {
+        let clock = ContinuousClock()
+        let limit = clock.now.advanced(by: deadline)
+        while await microcycleReceiptCount(substrate) < expected, clock.now < limit {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+    }
+
+    private func quiescentMicrocycleBaseline(
+        _ substrate: CognitiveSubstrate,
+        quietWindow: Duration = .milliseconds(500),
+        deadline: Duration = .seconds(10)
+    ) async throws -> Int {
+        let clock = ContinuousClock()
+        let limit = clock.now.advanced(by: deadline)
+        var count = await microcycleReceiptCount(substrate)
+        var quietSince = clock.now
+        while clock.now < limit {
+            try await Task.sleep(for: .milliseconds(50))
+            let next = await microcycleReceiptCount(substrate)
+            if next != count {
+                count = next
+                quietSince = clock.now
+            } else if clock.now - quietSince >= quietWindow {
+                return count
+            }
+        }
+        return count
+    }
+
     @Test("production manifest excludes orphan harness-learning scaffold")
     func productionManifestHasNoHarnessLearningLoop() {
         let root = FileManager.default.temporaryDirectory
@@ -27,9 +72,8 @@ struct CognitiveTurnKindPropagationTests {
             organismConfigurationOverride: .disabled
         )
         await runtime.bootstrap()
-        try await Task.sleep(nanoseconds: 600_000_000)
         let substrate = await runtime.substrateForIntegration()
-        let baseline = await substrate.receiptSnapshot().filter { $0.kind == "microcycle" }.count
+        let baseline = try await quiescentMicrocycleBaseline(substrate)
 
         await runtime.observe(event(
             id: "sensory-change",
@@ -38,7 +82,7 @@ struct CognitiveTurnKindPropagationTests {
             sessionId: "event-driven",
             runId: "event-driven-run"
         ))
-        try await Task.sleep(nanoseconds: 600_000_000)
+        try await waitForMicrocycleCount(substrate, toReach: baseline + 1)
 
         let after = await substrate.receiptSnapshot().filter { $0.kind == "microcycle" }.count
         #expect(after == baseline + 1)
@@ -59,9 +103,8 @@ struct CognitiveTurnKindPropagationTests {
             organismConfigurationOverride: .disabled
         )
         await runtime.bootstrap()
-        try await Task.sleep(nanoseconds: 600_000_000)
         let substrate = await runtime.substrateForIntegration()
-        let baseline = await substrate.receiptSnapshot().filter { $0.kind == "microcycle" }.count
+        let baseline = try await quiescentMicrocycleBaseline(substrate)
         let telemetryBefore = await runtime.microcycleTelemetrySnapshot()
 
         for index in 0..<12 {
@@ -73,7 +116,7 @@ struct CognitiveTurnKindPropagationTests {
                 runId: "event-burst-run"
             ))
         }
-        try await Task.sleep(nanoseconds: 600_000_000)
+        try await waitForMicrocycleCount(substrate, toReach: baseline + 1)
 
         let receipts = await substrate.receiptSnapshot().filter { $0.kind == "microcycle" }
         #expect(receipts.count == baseline + 1)
@@ -104,7 +147,8 @@ struct CognitiveTurnKindPropagationTests {
             organismConfigurationOverride: .disabled
         )
         await first.bootstrap()
-        try await Task.sleep(nanoseconds: 600_000_000)
+        let firstSubstrate = await first.substrateForIntegration()
+        let firstBaseline = try await quiescentMicrocycleBaseline(firstSubstrate)
         await first.observe(event(
             id: "persist-across-relaunch",
             kind: .userMessageReceived,
@@ -112,7 +156,17 @@ struct CognitiveTurnKindPropagationTests {
             sessionId: "relaunch",
             runId: "relaunch-run"
         ))
-        try await Task.sleep(nanoseconds: 600_000_000)
+        try await waitForMicrocycleCount(firstSubstrate, toReach: firstBaseline + 1)
+        // The app's real shutdown path makes persistence deterministic before
+        // relaunch — the old fixed 600ms sleep raced the durable write.
+        await first.flushForTermination()
+        // Receipts are DURABLE (receiptSnapshot reads the persistent store),
+        // so the relaunch assertion must wait for one MORE receipt than the
+        // count persisted here — waiting for "any microcycle receipt" would be
+        // satisfied by this first runtime's history and prove nothing about
+        // the wake reconciliation (gpt-5.5 review SHOULD-FIX).
+        let persistedCount = await firstSubstrate.receiptSnapshot()
+            .filter { $0.kind == "microcycle" }.count
 
         let relaunched = NativeCognitionRuntime(
             dataRoot: root,
@@ -120,11 +174,16 @@ struct CognitiveTurnKindPropagationTests {
             organismConfigurationOverride: .disabled
         )
         await relaunched.bootstrap()
-        try await Task.sleep(nanoseconds: 600_000_000)
         let substrate = await relaunched.substrateForIntegration()
+        // Positive steps: the restored node and a FRESH wake-reconciliation
+        // microcycle (beyond the persisted history) SHOULD land — poll with a
+        // generous deadline.
+        try await waitForMicrocycleCount(substrate, toReach: persistedCount + 1)
         let nodes = await substrate.snapshot().nodes
         #expect(nodes.contains { $0.subjectReference.id == "persist-across-relaunch" })
-        #expect(await substrate.receiptSnapshot().contains { $0.kind == "microcycle" })
+        #expect(await substrate.receiptSnapshot()
+            .filter { $0.kind == "microcycle" }.count >= persistedCount + 1,
+            "relaunch bootstrap must run its own wake-reconciliation microcycle")
     }
 
     @Test("debug bridge classification reaches tools and reply without poisoning the next live turn")

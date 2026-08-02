@@ -54,16 +54,20 @@ private func writeStore(_ root: URL, _ relative: String, _ json: String) throws 
     let client = SwiftNativeCapabilityFoundryClient(now: { Date(timeIntervalSince1970: 0) }, root: root)
     let result = try await client.capabilityFoundrySummary()
     #expect(result.status == "partial")
-    #expect(result.detail.contains("not yet wired"))
+    #expect(result.detail.contains("unported"))
     #expect(result.principle.hasPrefix("Tiny core runtime"))
     #expect(result.summary.total == 0)
     #expect(result.summary.review == 0)
     #expect(result.reviewQueue.isEmpty)
     #expect(result.recentArtifacts.isEmpty)
-    // Lane skeleton present with the canonical 7 lanes.
-    #expect(result.lanes.count == 7)
-    #expect(result.lanes.map { $0.id } == ["skill", "tool", "workflow", "mcp", "panel", "plugin", "catalog"])
+    // 2026-08-02 (E-1): ONLY lanes with a native source exist. The
+    // panel/plugin/catalog lanes were removed rather than reported as a
+    // permanent 0 — the Mac panel renders a card per lane, so a zero lane is a
+    // rendered claim about a system that does not exist.
+    #expect(result.lanes.count == 4)
+    #expect(result.lanes.map { $0.id } == ["skill", "tool", "workflow", "mcp"])
     #expect(result.lanes.allSatisfy { $0.count == 0 && $0.reviewCount == 0 })
+    #expect(result.lanes.allSatisfy { $0.endpoint?.hasPrefix("native:") == true })
     // Readouts the Mac panel surfaces.
     #expect(result.readouts.map { $0.id } == ["capabilities", "panels", "activity", "trust"])
     // hotPathContract policy strings present.
@@ -94,9 +98,10 @@ private func writeStore(_ root: URL, _ relative: String, _ json: String) throws 
     #expect(laneCounts["tool"] == 3)       // whole store, matching byKind
     #expect(laneCounts["workflow"] == 4)   // ALL definitions, templates included
     #expect(laneCounts["mcp"] == 1)
-    #expect(laneCounts["panel"] == 0)
-    #expect(laneCounts["plugin"] == 0)
-    #expect(laneCounts["catalog"] == 0)
+    // No unsourced lanes survive (E-1).
+    #expect(laneCounts["panel"] == nil)
+    #expect(laneCounts["plugin"] == nil)
+    #expect(laneCounts["catalog"] == nil)
 
     // Top summary: total = all entries; byKind mirrors per-store totals;
     // active = status in {active, ready} across the four stores.
@@ -125,9 +130,9 @@ private func writeStore(_ root: URL, _ relative: String, _ json: String) throws 
                     "lane \(lane.id) endpoint should name the native store, got \(endpoint)")
         }
     }
-    #expect(result.lanes.first { $0.id == "panel" }?.endpoint == nil)
-    #expect(result.lanes.first { $0.id == "plugin" }?.endpoint == nil)
-    #expect(result.lanes.first { $0.id == "catalog" }?.endpoint == nil)
+    // Every surviving lane names a real native store — there is no longer any
+    // lane without one (E-1).
+    #expect(result.lanes.allSatisfy { $0.endpoint != nil })
 }
 
 @Test func swiftNativeCountsInstalledSkillBodiesFromSharedInventory() async throws {

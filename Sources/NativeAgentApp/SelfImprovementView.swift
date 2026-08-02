@@ -111,8 +111,8 @@ struct SelfImprovementView: View {
         switch outcome {
         case .completed:
             return "Done — new proposals (if any) are in Activity → Approvals."
-        case .skipped(let reason):
-            if reason == "coalesced with active tick" {
+        case .skipped(let reason, _):
+            if outcome.isCoalescedSkip {
                 return "Already running — joined the active pass."
             }
             return "Not run — \(NativeClient.safeDoctorDetail(reason))."

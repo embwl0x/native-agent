@@ -409,4 +409,409 @@ struct DeskChatToolDispatchTests {
             Issue.record("expected refusal on non-pursuit, got: \(refused)"); return
         }
     }
+
+    // MARK: - Sequencing lane (desk_blocked_on / desk_defer)
+
+    @Test func sequencingToolsAreRegisteredEverywhere() async throws {
+        for n in ["desk_blocked_on", "desk_defer"] {
+            #expect(SwiftToolDispatcher.builtInToolNames.contains(n), "builtInToolNames missing \(n)")
+            #expect(!SwiftToolDispatcher.alwaysOnCoreNames.contains(n), "\(n) should be lazy, not always-on")
+        }
+        // Schema present (a tool with no schema is invisible to the model).
+        let d = dispatcher(hermeticRoot())
+        let schemas = d.builtInToolSchemas(includeFullMacFileTools: false)
+        _ = try #require(schemas.first { $0.name == "desk_blocked_on" })
+        _ = try #require(schemas.first { $0.name == "desk_defer" })
+    }
+
+    /// desk_blocked_on accepts the VISIBLE NUMBER for the target AND for every
+    /// blocker (invariant 2 — the addressability bug Agent caught live), and an
+    /// empty `blocked_on` clears the whole set.
+    @Test func blockedOnAcceptsVisibleNumbersForTargetAndBlockersAndClears() async throws {
+        let root = hermeticRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let d = dispatcher(root)
+
+        func add(_ title: String) async throws -> (handle: String, alias: String) {
+            let res = try await d.impl_desk_add_item(input: [
+                "kind": .string("plan"), "project": .string("na"), "title": .string(title),
+            ])
+            guard case .object(let o) = res, case .string(let h)? = o["handle"],
+                  case .string(let a)? = o["alias"] else {
+                throw NSError(domain: "test", code: 1, userInfo: [NSLocalizedDescriptionKey: "add malformed: \(res)"])
+            }
+            return (h, a)
+        }
+        let a = try await add("blocker A")
+        let b = try await add("blocker B")
+        let c = try await add("dependent C")
+
+        // Everything addressed by the VISIBLE NUMBER — target and both blockers.
+        let res = try await d.impl_desk_blocked_on(input: [
+            "handle": .string(c.alias),
+            "blocked_on": .string("\(a.alias), \(b.alias)"),
+        ])
+        guard case .object(let r) = res, r["status"] == .string("ok"),
+              case .string(let confirmation)? = r["confirmation"] else {
+            Issue.record("desk_blocked_on failed: \(res)"); return
+        }
+        #expect(confirmation.contains("blocked-on \(a.alias),\(b.alias)"), "confirmation: \(confirmation)")
+
+        let store = SwiftNativeDeskStore(dataRoot: root)
+        var row = try #require(try await store.liveState().items.first { $0.handle == c.handle })
+        #expect(row.blockedOn == [a.handle, b.handle])
+
+        // Derived: C is blocked, and never appears in next up.
+        let plan = DeskSequencing.compute(try await store.liveState())
+        #expect(plan.byHandle[c.handle]?.isReady == false)
+        #expect(!plan.nextUp.contains(c.handle))
+
+        // Empty string CLEARS.
+        let cleared = try await d.impl_desk_blocked_on(input: [
+            "handle": .string(c.alias),
+            "blocked_on": .string(""),
+        ])
+        guard case .object(let cl) = cleared, cl["status"] == .string("ok") else {
+            Issue.record("clear failed: \(cleared)"); return
+        }
+        row = try #require(try await store.liveState().items.first { $0.handle == c.handle })
+        #expect(row.blockedOn.isEmpty)
+        #expect(DeskSequencing.compute(try await store.liveState()).byHandle[c.handle]?.isReady == true)
+
+        // An unresolvable blocker number is an honest denial, not a silent no-op.
+        await #expect(throws: (any Error).self) {
+            _ = try await d.impl_desk_blocked_on(input: [
+                "handle": .string(c.alias), "blocked_on": .string("999"),
+            ])
+        }
+    }
+
+    // MARK: - desk_breakdown (one call: big idea → numbered campaign)
+
+    @Test func breakdownRegisteredEverywhere() async throws {
+        #expect(SwiftToolDispatcher.builtInToolNames.contains("desk_breakdown"))
+        #expect(!SwiftToolDispatcher.alwaysOnCoreNames.contains("desk_breakdown"))
+        let d = dispatcher(hermeticRoot())
+        let schemas = d.builtInToolSchemas(includeFullMacFileTools: false)
+        _ = try #require(schemas.first { $0.name == "desk_breakdown" })
+    }
+
+    /// The whole point: one call creates parent + ordered children + edges +
+    /// defer, and reports which children are actionable right now.
+    @Test func breakdownCreatesCampaignWithEdgesAndDefer() async throws {
+        let root = hermeticRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let d = dispatcher(root)
+
+        let res = try await d.impl_desk_breakdown(input: [
+            "project": .string("na"),
+            "title": .string("Ship the widget"),
+            "children": .array([
+                .object(["title": .string("Design the API")]),
+                .object(["title": .string("Build the store"), "blocked_on": .string("1")]),
+                .object(["title": .string("Wire the UI"), "blocked_on": .string("1,2")]),
+                .object(["title": .string("Beta window"), "defer_until": .string("2099-04-01")]),
+            ]),
+        ])
+        guard case .object(let r) = res, r["status"] == .string("ok"),
+              case .string(let parentAlias)? = r["parent"],
+              case .array(let plan)? = r["plan"],
+              case .array(let ready)? = r["ready_now"] else {
+            Issue.record("breakdown malformed: \(res)"); return
+        }
+        #expect(plan.count == 4)
+        // Only the unblocked, undeferred child is ready.
+        #expect(ready.count == 1)
+
+        let store = SwiftNativeDeskStore(dataRoot: root)
+        let state = try await store.liveState()
+        let parent = try #require(state.items.first { $0.alias == parentAlias })
+        func seq(_ alias: String) -> Int { Int(alias.split(separator: ".").last.map(String.init) ?? "") ?? Int.max }
+        let kids = state.items.filter { $0.parent == parent.handle }
+            .sorted { seq($0.alias) < seq($1.alias) }
+        #expect(kids.count == 4)
+        // Child 2 blocked on child 1; child 3 on 1+2; child 4 deferred.
+        #expect(kids[1].blockedOn == [kids[0].handle])
+        #expect(kids[2].blockedOn == [kids[0].handle, kids[1].handle])
+        #expect(kids[3].deferUntil == "2099-04-01")
+
+        // The cascade end-to-end through the TOOL surface: close 1, then 2 —
+        // child 3 becomes ready with no further blocked_on call.
+        let derived = DeskSequencing.compute(state)
+        #expect(derived.byHandle[kids[2].handle]?.isReady == false)
+        _ = try await d.impl_desk_close(input: [
+            "handle": .string(kids[0].alias), "outcome_summary": .string("done"),
+        ])
+        _ = try await d.impl_desk_close(input: [
+            "handle": .string(kids[1].alias), "outcome_summary": .string("done"),
+        ])
+        let after = DeskSequencing.compute(try await store.liveState())
+        #expect(after.byHandle[kids[2].handle]?.isReady == true)
+    }
+
+    /// Graft mode: children attach to an existing parent, project inherited.
+    @Test func breakdownGraftsOntoExistingItem() async throws {
+        let root = hermeticRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let d = dispatcher(root)
+        let created = try await d.impl_desk_add_item(input: [
+            "kind": .string("project"), "project": .string("atrium"), "title": .string("Existing campaign"),
+        ])
+        guard case .object(let c) = created, case .string(let alias)? = c["alias"],
+              case .string(let parentHandle)? = c["handle"] else {
+            Issue.record("add malformed"); return
+        }
+        let res = try await d.impl_desk_breakdown(input: [
+            "parent": .string(alias),
+            "children": .array([
+                .object(["title": .string("Grafted step")]),
+            ]),
+        ])
+        guard case .object(let r) = res, r["status"] == .string("ok") else {
+            Issue.record("graft failed: \(res)"); return
+        }
+        let store = SwiftNativeDeskStore(dataRoot: root)
+        let kid = try #require(try await store.liveState().items.first { $0.parent == parentHandle })
+        #expect(kid.project == "atrium")
+        #expect(kid.title == "Grafted step")
+    }
+
+    /// An invented child field is REFUSED loudly, never silently dropped —
+    /// the live-caught failure: `batch: 2` meaning ordering produced a flat
+    /// campaign with zero edges and an all-ready ready_now.
+    @Test func breakdownRefusesUnknownChildFieldsAndAcceptsArrayBlockedOn() async throws {
+        let root = hermeticRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let d = dispatcher(root)
+        await #expect(throws: (any Error).self) {
+            _ = try await d.impl_desk_breakdown(input: [
+                "project": .string("na"), "title": .string("Flat"),
+                "children": .array([
+                    .object(["title": .string("A")]),
+                    .object(["title": .string("B"), "batch": .int(2)]),
+                ]),
+            ])
+        }
+        let store = SwiftNativeDeskStore(dataRoot: root)
+        #expect(try await store.liveState().items.isEmpty)
+
+        // The natural LLM shape — blocked_on as an array of ints — works.
+        let res = try await d.impl_desk_breakdown(input: [
+            "project": .string("na"), "title": .string("Arrayed"),
+            "children": .array([
+                .object(["title": .string("First")]),
+                .object(["title": .string("Second"), "blocked_on": .array([.int(1)])]),
+            ]),
+        ])
+        guard case .object(let r) = res, r["status"] == .string("ok") else {
+            Issue.record("array blocked_on failed: \(res)"); return
+        }
+        let state = try await store.liveState()
+        let second = try #require(state.items.first { $0.title == "Second" })
+        let first = try #require(state.items.first { $0.title == "First" })
+        #expect(second.blockedOn == [first.handle])
+    }
+
+    /// A bad batch position fails BEFORE any write — no half-campaign.
+    @Test func breakdownBadPositionCreatesNothing() async throws {
+        let root = hermeticRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let d = dispatcher(root)
+        await #expect(throws: (any Error).self) {
+            _ = try await d.impl_desk_breakdown(input: [
+                "project": .string("na"), "title": .string("Doomed"),
+                "children": .array([
+                    .object(["title": .string("A"), "blocked_on": .string("7")]),
+                ]),
+            ])
+        }
+        let store = SwiftNativeDeskStore(dataRoot: root)
+        #expect(try await store.liveState().items.isEmpty)
+    }
+
+    /// desk_defer accepts a visible number, and an empty `until` clears.
+    @Test func deferAcceptsVisibleNumberAndClears() async throws {
+        let root = hermeticRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let d = dispatcher(root)
+
+        let created = try await d.impl_desk_add_item(input: [
+            "kind": .string("plan"), "project": .string("na"), "title": .string("park me"),
+        ])
+        guard case .object(let c) = created, case .string(let handle)? = c["handle"],
+              case .string(let alias)? = c["alias"] else {
+            Issue.record("add malformed: \(created)"); return
+        }
+        let store = SwiftNativeDeskStore(dataRoot: root)
+
+        let deferred = try await d.impl_desk_defer(input: [
+            "handle": .string(alias), "until": .string("2099-04-01"),
+        ])
+        guard case .object(let df) = deferred, df["status"] == .string("ok") else {
+            Issue.record("desk_defer failed: \(deferred)"); return
+        }
+        var row = try #require(try await store.liveState().items.first { $0.handle == handle })
+        #expect(row.deferUntil == "2099-04-01")
+        #expect(DeskSequencing.compute(try await store.liveState()).byHandle[handle]?.isDeferred == true)
+
+        // Empty CLEARS the park.
+        _ = try await d.impl_desk_defer(input: ["handle": .string(alias), "until": .string("")])
+        row = try #require(try await store.liveState().items.first { $0.handle == handle })
+        #expect(row.deferUntil == nil)
+        #expect(DeskSequencing.compute(try await store.liveState()).byHandle[handle]?.isReady == true)
+
+        // An unparseable date is refused HONESTLY (the store's message), not stored.
+        let bad = try await d.impl_desk_defer(input: [
+            "handle": .string(alias), "until": .string("whenever"),
+        ])
+        guard case .object(let bo) = bad, bo["status"] == .string("refused") else {
+            Issue.record("expected a refusal for an unparseable date, got: \(bad)"); return
+        }
+        row = try #require(try await store.liveState().items.first { $0.handle == handle })
+        #expect(row.deferUntil == nil)
+    }
+
+    // MARK: - desk_nag_control (Wave 3 nag lane)
+
+    /// FIVE-SITE REGISTRATION for the new desk tool: dispatch case, catalog
+    /// name, schema, Trust profile — and, deliberately, NOT always-on. The nag
+    /// switch is flipped in a conversation ABOUT the desk; it never needs to
+    /// occupy a slot in every turn's tool budget.
+    @Test func nagControlIsRegisteredEverywhereButNotAlwaysOn() async throws {
+        #expect(SwiftToolDispatcher.builtInToolNames.contains("desk_nag_control"))
+        #expect(!SwiftToolDispatcher.alwaysOnCoreNames.contains("desk_nag_control"))
+
+        let d = dispatcher(hermeticRoot())
+        let schemas = d.builtInToolSchemas(includeFullMacFileTools: false)
+        let schema = try #require(schemas.first { $0.name == "desk_nag_control" })
+        let parsed = try JSONValue.parse(schema.parametersJSON)
+        guard case .object(let obj) = parsed, case .array(let req)? = obj["required"] else {
+            Issue.record("desk_nag_control schema malformed"); return
+        }
+        #expect(req == [.string("action")], "Agent parses the intent; the tool takes explicit args")
+    }
+
+    /// enable → mute → unmute → status, driven exactly as Agent would drive it,
+    /// with the drift digest coming back IN the unmute reply.
+    @Test func nagControlEnableMuteUnmuteStatusRoundTrip() async throws {
+        let root = hermeticRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let d = dispatcher(root)
+        let configStore = DeskNagConfigStore(dataRoot: root)
+
+        // Default: OFF. Nothing on disk, nothing nagging.
+        #expect(await configStore.load().enabled == false)
+
+        // "Stay on me about the release track."
+        let enabled = try await d.impl_desk_nag_control(input: ["action": .string("enable")])
+        guard case .object(let e) = enabled, e["status"] == .string("ok") else {
+            Issue.record("enable failed: \(enabled)"); return
+        }
+        let projectScoped = try await d.impl_desk_nag_control(input: [
+            "action": .string("enable"), "scope_kind": .string("project"), "scope_id": .string("NativeAgent"),
+        ])
+        guard case .object(let p) = projectScoped, p["status"] == .string("ok") else {
+            Issue.record("project scope failed: \(projectScoped)"); return
+        }
+        var config = await configStore.load()
+        #expect(config.enabled)
+        #expect(config.scopes.contains(DeskNagScope(kind: .project, id: "NativeAgent", enabled: true)))
+
+        // "Go quiet, I'm busy this week."
+        let muted = try await d.impl_desk_nag_control(input: [
+            "action": .string("mute"), "until": .string("2099-01-01"),
+        ])
+        guard case .object(let m) = muted, m["status"] == .string("ok") else {
+            Issue.record("mute failed: \(muted)"); return
+        }
+        config = await configStore.load()
+        #expect(config.mutedUntil == "2099-01-01")
+        #expect(config.isMuted(now: Date()))
+        let windowBeforeUnmute = config.windowId
+
+        // Something lands on the desk while he's quiet.
+        _ = try await d.impl_desk_add_item(input: [
+            "kind": .string("plan"), "project": .string("NativeAgent"), "title": .string("notary credential refresh"),
+        ])
+
+        // "Alright, back on me." — the reply itself says what moved.
+        let unmuted = try await d.impl_desk_nag_control(input: ["action": .string("unmute")])
+        guard case .object(let u) = unmuted, u["status"] == .string("ok"),
+              case .array(let drift)? = u["drift"] else {
+            Issue.record("unmute malformed: \(unmuted)"); return
+        }
+        #expect(drift.count == 1, "unmuting must never be blind")
+        guard case .string(let line)? = drift.first else {
+            Issue.record("drift line malformed"); return
+        }
+        #expect(line.contains("notary credential refresh"))
+        config = await configStore.load()
+        #expect(config.mutedUntil == nil)
+        #expect(config.windowId == windowBeforeUnmute + 1, "unmute opens a new attention window")
+
+        // status reports the WHOLE config honestly.
+        let status = try await d.impl_desk_nag_control(input: ["action": .string("status")])
+        guard case .object(let s) = status, s["status"] == .string("ok"),
+              case .string(let summary)? = s["summary"], case .object = s["config"] else {
+            Issue.record("status malformed: \(status)"); return
+        }
+        #expect(summary.contains("nagging ON globally"))
+        #expect(summary.contains("project NativeAgent: on"))
+    }
+
+    /// Item scope takes the visible desk NUMBER (the addressability rule every
+    /// desk mutation follows) and stores the stable handle.
+    @Test func nagControlItemScopeResolvesTheVisibleNumber() async throws {
+        let root = hermeticRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let d = dispatcher(root)
+
+        let created = try await d.impl_desk_add_item(input: [
+            "kind": .string("plan"), "project": .string("na"), "title": .string("stay on this one"),
+        ])
+        guard case .object(let c) = created, case .string(let handle)? = c["handle"],
+              case .string(let alias)? = c["alias"] else {
+            Issue.record("add malformed: \(created)"); return
+        }
+        let res = try await d.impl_desk_nag_control(input: [
+            "action": .string("enable"), "scope_kind": .string("item"), "scope_id": .string(alias),
+        ])
+        guard case .object(let r) = res, r["status"] == .string("ok"),
+              case .string(let confirmation)? = r["confirmation"] else {
+            Issue.record("item scope failed: \(res)"); return
+        }
+        // Global is still off — the reply says so instead of implying pressure.
+        #expect(confirmation.contains("GLOBAL nag switch is off"))
+        let config = await DeskNagConfigStore(dataRoot: root).load()
+        #expect(config.scopes == [DeskNagScope(kind: .item, id: handle, enabled: true)],
+                "aliases are display; handles are identity")
+    }
+
+    /// A bad mute date is REFUSED honestly — never silently turned into
+    /// "quiet forever", and never a thrown tool error the model can't read.
+    @Test func nagControlRefusesAnUnparseableMuteDate() async throws {
+        let root = hermeticRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let d = dispatcher(root)
+
+        let res = try await d.impl_desk_nag_control(input: [
+            "action": .string("mute"), "until": .string("sometime next week"),
+        ])
+        guard case .object(let r) = res, r["status"] == .string("refused"),
+              case .string(let reason)? = r["reason"] else {
+            Issue.record("expected a refusal, got: \(res)"); return
+        }
+        #expect(reason.contains("yyyy-MM-dd"))
+        #expect(await DeskNagConfigStore(dataRoot: root).load().mutedUntil == nil)
+
+        // Omitting `until` IS the indefinite mute — an explicit sentinel, not a
+        // parse failure.
+        _ = try await d.impl_desk_nag_control(input: ["action": .string("mute")])
+        #expect(await DeskNagConfigStore(dataRoot: root).load().mutedUntil == DeskNagConfig.indefiniteMuteSentinel)
+
+        // An unknown action is an honest tool denial, not a no-op.
+        await #expect(throws: (any Error).self) {
+            _ = try await d.impl_desk_nag_control(input: ["action": .string("yell")])
+        }
+    }
 }

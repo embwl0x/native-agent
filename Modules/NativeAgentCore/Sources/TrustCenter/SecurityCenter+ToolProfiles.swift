@@ -70,6 +70,19 @@ extension SwiftNativeSecurityCenter {
         "desk_read", "desk_add_item", "desk_set_status", "desk_update_item",
         "desk_note", "desk_add_ref", "desk_set_cadence", "desk_set_notify",
         "desk_close", "desk_archive",
+        "desk_blocked_on", "desk_defer", "desk_breakdown",
+        // desk_nag_control: writes User's nag preferences to
+        // <dataRoot>/desk/nag_config.json. Same medium ledger-class write —
+        // "control" trips no keyword catcher, so register it explicitly.
+        "desk_nag_control",
+        // desk_open_pursuit / desk_work_log: registered at the other four
+        // sites since the pursuit lane shipped, missing HERE — so `desk_` fell
+        // through to no keyword catcher, resolved to {tool_call}/.low, and
+        // `rollbackRequired` was false for the only chat path that opens an
+        // origin=agent pursuit. Found 2026-08-02; DeskToolRegistrationTests
+        // now set-diffs all five sites so a 4-of-5 registration fails the
+        // build instead of waiting for an audit.
+        "desk_open_pursuit", "desk_work_log",
         // evolution chat tools (2026-06-11, U2b): the three privileged
         // self-evolution chat tools. evolution_propose is a critical-risk
         // evolution-store WRITE, self_install is a critical-risk install-card
@@ -402,13 +415,19 @@ extension SwiftNativeSecurityCenter {
             add("safe_read", .low)
             return ToolProfile(capabilities: capabilities, risk: risk)
         }
-        // Exact set of the nine desk MUTATIONS (NOT a `desk_` prefix) so a
-        // future desk_* read/admin tool can't silently inherit the write profile
+        // Exact set of the desk MUTATIONS (NOT a `desk_` prefix) so a future
+        // desk_* read/admin tool can't silently inherit the write profile
         // before it's explicitly classified (gpt-5.5 breadth review). Mirror of
         // the names registered in SwiftToolDispatcher+DeskTools.swift.
         let deskWriteTools: Set<String> = [
             "desk_add_item", "desk_set_status", "desk_update_item", "desk_note",
             "desk_add_ref", "desk_set_cadence", "desk_set_notify", "desk_close", "desk_archive",
+            "desk_blocked_on", "desk_defer", "desk_breakdown",
+            "desk_nag_control",
+            // Both are desk WRITES and belong here for the same reason as
+            // their siblings: desk_open_pursuit appends an origin=agent
+            // pursuit row, desk_work_log appends a work-log entry.
+            "desk_open_pursuit", "desk_work_log",
         ]
         if deskWriteTools.contains(tool) {
             add("ledger_write", .medium)

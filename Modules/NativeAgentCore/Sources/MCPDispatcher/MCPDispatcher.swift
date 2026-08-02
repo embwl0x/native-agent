@@ -412,6 +412,10 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
     let root: URL
     let persistence: any PersistenceCoreProtocol
     private let clock: @Sendable () -> Date
+    /// Same-module accessor for the injected clock (`clock` is `private`, so
+    /// file-scoped). `MCPSubprocess+LiveCache` stamps `createdAt` on the tools
+    /// cache through this so tests can pin the timestamp.
+    var clockNow: Date { clock() }
     /// Serializes mutating ledger ops (grant/revoke) — see ApprovalInbox
     /// for the pattern's rationale.
     private var mutationTail: Task<Void, Never>? = nil

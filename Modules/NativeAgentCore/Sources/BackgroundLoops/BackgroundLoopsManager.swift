@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 
 // MARK: - BackgroundLoopsManager
@@ -55,7 +56,10 @@ private actor LoopExecutionGate {
     private var runCount = 0
     private var idleWaiters: [IdleWait] = []
     private var joinCount = 0
-    private var joinWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Parked join-waiters. `ScopedWaiter` resumes EXACTLY once and is
+    /// race-safe against a resume that beats the park, so registering here
+    /// before parking can never strand a continuation.
+    private var joinWaiters: [ScopedWaiter] = []
     /// Bumped on every successful acquire. `finish` only acts when its token
     /// matches, so a wedged tick that force-released and then completed LATE
     /// can never close a gate a newer tick already owns.
@@ -74,7 +78,7 @@ private actor LoopExecutionGate {
         let observers = joinWaiters
         joinWaiters.removeAll()
         for observer in observers {
-            observer.resume()
+            _ = observer.resume()
         }
         await waitForIdle()
         return nil
@@ -92,6 +96,11 @@ private actor LoopExecutionGate {
         for waiter in waiters {
             waiter.continuation?.resume()
         }
+        // No request can coalesce into a tick that already finished, so any
+        // still-parked join-waiter is waiting on an event that can never
+        // happen. Releasing it here is the "every exit releases" half that
+        // `joinWaiters` was missing.
+        releaseJoinWaitersOnIdle()
     }
 
     func waitUntilIdle() async {
@@ -132,11 +141,52 @@ private actor LoopExecutionGate {
         Snapshot(lastRun: lastRun, runCount: runCount)
     }
 
-    func waitForCoalescedRequest() async {
-        guard joinCount == 0 else { return }
-        await withCheckedContinuation { continuation in
-            joinWaiters.append(continuation)
+    /// Parks until a coalescing request joins the active tick.
+    ///
+    /// fix-join-waiter-leak (2026-08-02): this used to append a BARE
+    /// continuation that only `acquireOrJoin` ever resumed. Every other exit —
+    /// the tick finishing with no join, the waiting Task being cancelled —
+    /// left the continuation parked in `joinWaiters` forever and hung the
+    /// awaiting Task for the life of the process. `finish` never touched
+    /// `joinWaiters` at all. The `IdleWait` path directly above already had the
+    /// right shape; this one didn't. Now: a `ScopedWaiter` that resumes exactly
+    /// once, is dropped from the registry on every exit, and carries a
+    /// deadline so "never joined" surfaces as a logged false, not a hang.
+    ///
+    /// Returns true only when a coalescing request actually arrived.
+    @discardableResult
+    func waitForCoalescedRequest(timeoutSeconds: TimeInterval = 10) async -> Bool {
+        guard joinCount == 0 else { return true }
+        let waiter = ScopedWaiter()
+        joinWaiters.append(waiter)
+        let joined = await withTaskCancellationHandler {
+            await waiter.park(
+                timeoutSeconds: timeoutSeconds,
+                reason: "coalesced loop join request"
+            )
+        } onCancel: {
+            Task { await self.dropJoinWaiter(waiter) }
         }
+        if !joined { dropJoinWaiter(waiter) }
+        return joined
+    }
+
+    /// Removes a join-waiter that resolved without a join (cancelled or timed
+    /// out). Resuming through the same one-shot latch keeps the resume count at
+    /// exactly one even if `acquireOrJoin` races us.
+    private func dropJoinWaiter(_ waiter: ScopedWaiter) {
+        _ = waiter.cancel()
+        guard let idx = joinWaiters.firstIndex(where: { $0 === waiter }) else { return }
+        joinWaiters.remove(at: idx)
+    }
+
+    /// Releases parked join-waiters when the gate goes idle without a join —
+    /// nothing can join a finished tick, so waiting further is a guaranteed
+    /// timeout.
+    func releaseJoinWaitersOnIdle() {
+        let parked = joinWaiters
+        joinWaiters.removeAll()
+        for waiter in parked { _ = waiter.cancel() }
     }
 }
 
@@ -181,6 +231,7 @@ private struct ManagedLoopRunner: LoopRunner {
     var loopId: String { underlying.loopId }
     var interval: TimeInterval { underlying.interval }
     var tickTimeoutOverride: TimeInterval? { underlying.tickTimeoutOverride }
+    var failureBackoffPolicy: LoopFailureBackoffPolicy? { underlying.failureBackoffPolicy }
 
     /// Single-release discipline: exactly one `finish` per `acquireOrJoin`,
     /// carrying the acquire's token. The underlying tick runs in an
@@ -412,8 +463,13 @@ public actor BackgroundLoopsManager {
             switch outcome {
             case .completed(let result):
                 await scheduler.recordResult(loopId: loopId, result: result ?? "completed")
-            case .skipped(let reason):
-                if reason != LoopTickOutcome.coalescedSkipReason {
+            case .skipped(let reason, _):
+                // `recordResult` clears the consecutive-failure streak, so an
+                // out-of-band run that skipped for a HEALTH-NEUTRAL reason
+                // (coalesced, or "backing off because I am failing") must not
+                // go through it — same accounting as the periodic path in
+                // SwiftNativeLoopScheduler.record.
+                if !outcome.isHealthNeutralSkip {
                     await scheduler.recordResult(loopId: loopId, result: "skipped: \(reason)")
                 }
             case .failed(let error):
@@ -425,9 +481,16 @@ public actor BackgroundLoopsManager {
             return .skipped(reason: "cancelled")
         } catch is TickTimeoutError {
             let error = "timeout after \(formatTimeout(registration.runner.tickTimeoutOverride ?? 300))"
+            // A TIMED-OUT tick did not complete its body, so it must NOT book a
+            // fresh durable last-run stamp — same accounting as the periodic
+            // path in `SwiftNativeLoopScheduler.runOneTick`. Without this a
+            // wedged weekly loop timing out through the manual/background-task
+            // path persisted `lastRun = now`, and restart catch-up slept another
+            // week instead of treating it as overdue (gpt-5.5 BLOCKING).
             await scheduler.recordFailure(
                 loopId: loopId,
-                error: error
+                error: error,
+                advanceDurableRun: false
             )
             await reschedulePhysiologyDeadline(loopId: loopId)
             return .failed(error: error)
@@ -633,8 +696,14 @@ public actor BackgroundLoopsManager {
         await scheduler._testTaskHandle(loopId: loopId)
     }
 
-    internal func _testWaitForCoalescedRequest(loopId: String) async {
-        await registrations[loopId]?.gate.waitForCoalescedRequest()
+    @discardableResult
+    internal func _testWaitForCoalescedRequest(
+        loopId: String,
+        timeoutSeconds: TimeInterval = 10
+    ) async -> Bool {
+        await registrations[loopId]?.gate.waitForCoalescedRequest(
+            timeoutSeconds: timeoutSeconds
+        ) ?? false
     }
 
     internal func _testPhysiologyDeadline(loopId: String) -> Date? {

@@ -200,24 +200,122 @@ extension SwiftNativeMCPDispatcher {
         let activePool: MCPSubprocessPool
         if let p = pool { activePool = p }
         else { activePool = await Self.ensurePool(for: servers) }
+        // F-B3 (2026-08-02): `mcp/cache/tools.json` is the ONLY producer of
+        // `mcp__<server>__<tool>` descriptors for the model (MCPToolBridge),
+        // and after the daemon was retired NOTHING wrote it — a working MCP
+        // server contributed zero tools with no error and no log. The
+        // handshake result is now stamped back to disk exactly where the
+        // daemon used to stamp it (see this file's header contract). `didFetch`
+        // makes the write happen on a REAL round-trip only, not on a memory
+        // cache hit.
+        let didFetch = _MCPLiveFetchFlag()
+        let tools: [JSONValue]
         if !cached {
             // Bug 7 fix (2026-05-31): route force-fresh through the cache
             // actor's `forceFill` so it cancels/awaits any in-flight
             // `getOrFill` for the same key before writing. Previously
             // bypassing the cache entirely allowed a slow in-flight fill
             // to clobber the newer force-fresh result on completion.
-            return try await MCPLiveCache.shared.forceFill(cacheKey) {
+            tools = try await MCPLiveCache.shared.forceFill(cacheKey) {
+                didFetch.mark()
+                let proc = try await activePool.get(serverId: serverId)
+                let result = try await proc.request(method: "tools/list", params: .object([:]))
+                return Self.extractArray(result, key: "tools")
+            }
+        } else {
+            tools = try await MCPLiveCache.shared.getOrFill(cacheKey) {
+                didFetch.mark()
                 let proc = try await activePool.get(serverId: serverId)
                 let result = try await proc.request(method: "tools/list", params: .object([:]))
                 return Self.extractArray(result, key: "tools")
             }
         }
-        return try await MCPLiveCache.shared.getOrFill(cacheKey) {
-            let proc = try await activePool.get(serverId: serverId)
-            let result = try await proc.request(method: "tools/list", params: .object([:]))
-            return Self.extractArray(result, key: "tools")
+        if didFetch.value {
+            await persistToolsCache(serverId: serverId, tools: tools)
+        }
+        return tools
+    }
+
+    /// Force a live `tools/list` handshake and stamp `mcp/cache/tools.json`.
+    /// Returns the descriptor count that landed in the cache.
+    ///
+    /// F-B3: the entry point for a startup / server-add warm sweep. Without a
+    /// caller of this (or of `listToolsLive`) an stdio server stays invisible
+    /// to the model — which is exactly the state the app shipped in.
+    @discardableResult
+    public func refreshToolsCache(
+        forServer serverId: String,
+        pool: MCPSubprocessPool? = nil
+    ) async throws -> Int {
+        // `listToolsLive(cached: false)` always performs a real round-trip and
+        // stamps the cache on the way out — no second write needed here.
+        try await listToolsLive(forServer: serverId, cached: false, pool: pool).count
+    }
+
+    /// Warm `mcp/cache/tools.json` for every bridgeable server. Per-server
+    /// failures are collected, NOT swallowed: the result maps serverId →
+    /// tool count on success or the error text on failure, and every failure
+    /// is also logged loudly to stderr. Never throws for one bad server —
+    /// one broken MCP server must not blind the model to the other five.
+    @discardableResult
+    public func refreshAllToolsCaches(
+        pool: MCPSubprocessPool? = nil
+    ) async -> [String: String] {
+        let servers = (try? await listServers()) ?? []
+        var report: [String: String] = [:]
+        for server in servers where server.status != "needs_setup" && server.status != "error" {
+            do {
+                let count = try await refreshToolsCache(forServer: server.id, pool: pool)
+                report[server.id] = "\(count)"
+                if count == 0 {
+                    FileHandle.standardError.write(Data(
+                        "MCPDispatcher: server '\(server.id)' completed tools/list but advertised ZERO tools — it will contribute no mcp__\(server.id)__* descriptors to the model.\n".utf8
+                    ))
+                }
+            } catch {
+                report[server.id] = "error: \(error)"
+                FileHandle.standardError.write(Data(
+                    "MCPDispatcher: tools-cache refresh FAILED for server '\(server.id)': \(error) — its tools stay invisible to the model.\n".utf8
+                ))
+            }
+        }
+        return report
+    }
+
+    /// Merge one server's live descriptors into `mcp/cache/tools.json`.
+    /// Actor-isolated, so concurrent per-server refreshes serialize their
+    /// read-modify-write against the shared file instead of clobbering.
+    private func persistToolsCache(serverId: String, tools: [JSONValue]) async {
+        let existing = await persistence.readJSON(toolsCachePath, defaultValue: .object([:]))
+        var dict: [String: JSONValue]
+        if case .object(let obj) = existing { dict = obj } else { dict = [:] }
+        dict[serverId] = .object([
+            "createdAt": .string(Self.isoTimestamp(clockNow)),
+            "tools": .array(tools),
+        ])
+        do {
+            try await persistence.writeJSON(.object(dict), to: toolsCachePath)
+        } catch {
+            // FAIL LOUD: a failed cache stamp means the model silently loses
+            // this server's tools on the next turn.
+            FileHandle.standardError.write(Data(
+                "MCPDispatcher: FAILED to write mcp/cache/tools.json for server '\(serverId)': \(error)\n".utf8
+            ))
         }
     }
+}
+
+/// One-shot "the fill closure actually ran" flag. The closure is `@Sendable`
+/// and runs detached inside `MCPLiveCache`, so the dispatcher can't observe a
+/// memory-cache hit vs. a real round-trip any other way.
+final class _MCPLiveFetchFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var flag = false
+    func mark() { lock.lock(); flag = true; lock.unlock() }
+    var value: Bool { lock.lock(); defer { lock.unlock() }; return flag }
+}
+
+extension SwiftNativeMCPDispatcher {
 
     /// Live `resources/list` against an stdio server. Same caching contract
     /// as `listToolsLive`.

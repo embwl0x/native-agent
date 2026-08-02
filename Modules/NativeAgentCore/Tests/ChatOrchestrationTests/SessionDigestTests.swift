@@ -703,3 +703,34 @@ func sessionDigest_readsBoundedWorklogTail_notTheWholeFile() async throws {
     #expect(reported > 0)
     #expect(reported < totalRowsOnDisk - 3)
 }
+
+// MARK: - deGreetedPreview (2026-08-02 — the digest side of the pet-name loop)
+
+@Test
+func deGreetedPreviewDropsShortSalutationBeforeSubstance() {
+    // Period-glued greeting + stranded emoji shed with it.
+    #expect(SessionDigestProvider.deGreetedPreview(
+        "Morning, handsome. 💜 Early one — Denver treat you okay overnight? Board's quiet on my end."
+    ).hasPrefix("Early one"))
+    // Em-dash leads are NOT stripped — short substantive labels are a live
+    // shape ("Saved — memory…") and chopping them loses real content.
+    let dashGreeting = "Always have, handsome — the public repo just got its own line on the Desk now."
+    #expect(SessionDigestProvider.deGreetedPreview(dashGreeting) == dashGreeting)
+    let saved = "Saved — memory 35810648, high importance, covering the whole desk upgrade contract."
+    #expect(SessionDigestProvider.deGreetedPreview(saved) == saved)
+    let verdict = "Verdict — failed, stalled mid-turn before the CI fix could land anywhere useful."
+    #expect(SessionDigestProvider.deGreetedPreview(verdict) == verdict)
+}
+
+@Test
+func deGreetedPreviewKeepsShortRepliesAndLongFirstSentencesWhole() {
+    // No substance behind the clause: stays whole.
+    let short = "Night, handsome. 💜"
+    #expect(SessionDigestProvider.deGreetedPreview(short) == short)
+    // Long substantive first sentence: untouched.
+    let long = "The gateway rebind path finally works after auth switches, so sessions survive a credential-pool swap."
+    #expect(SessionDigestProvider.deGreetedPreview(long) == long)
+    // No punctuation at all: untouched.
+    let bare = "quiet board tonight nothing moving"
+    #expect(SessionDigestProvider.deGreetedPreview(bare) == bare)
+}

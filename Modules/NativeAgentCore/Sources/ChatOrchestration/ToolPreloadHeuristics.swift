@@ -375,6 +375,11 @@ public enum ToolPreloadHeuristics {
                 "don't let me forget", "dont let me forget", "do not let me forget",
                 "track this", "track that", "add to the desk", "put on the desk",
                 "agent's desk", "my desk", "desk item", "kept list",
+                // Nag-lane trigger language (wave 3): how the user actually
+                // flips the switch in chat — without these, desk_nag_control
+                // is reachable only via an explicit tool_load next turn.
+                "stay on me", "keep on me", "nag me", "stop nagging",
+                "go quiet", "quiet down about",
             ],
             tools: [
                 // desk_read is ALWAYS-ON (alwaysOnCoreNames, 2026-06-29 User's
@@ -383,6 +388,14 @@ public enum ToolPreloadHeuristics {
                 "desk_add_item", "desk_set_status", "desk_update_item",
                 "desk_note", "desk_add_ref", "desk_set_cadence", "desk_set_notify",
                 "desk_close", "desk_archive",
+                // Sequencing mutations ride the same tracking-intent group —
+                // "this is blocked on that" / "park it until Friday" / "break
+                // this idea down" is the same capture flow, not a separate
+                // tool_load.
+                "desk_blocked_on", "desk_defer", "desk_breakdown",
+                // Nag control rides the same group: "stay on me about X" is
+                // tracking intent through and through (wave-3 open item #1).
+                "desk_nag_control",
                 // Workshop volition tools ride the same tracking-intent group so
                 // "open a pursuit" / progress logging is reachable without a
                 // separate tool_load (2026-07-11 review LOW).

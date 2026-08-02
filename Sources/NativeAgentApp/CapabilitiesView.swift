@@ -164,10 +164,16 @@ struct CapabilitiesView: View {
     private var capabilityFoundry: some View {
         NativePanel(title: "Capability Foundry", systemImage: "hammer") {
             if let foundry = appModel.capabilityFoundry {
+                // NO "self-built" / "review" pills (removed 2026-08-02, E-1).
+                // `summary.autoCreated` and `summary.review` are hardcoded 0 in
+                // SwiftNativeCapabilityFoundryClient — the auto-implementation
+                // ledger and the review pipeline are unported. A counter pill
+                // reading "0 review" claims a live queue that is empty; there is
+                // no queue. NORTHSTAR clause 2: every button works or doesn't
+                // exist. Both fields stay in the envelope for the MCP metadata
+                // consumer; nothing renders them until they count something.
                 HStack(spacing: 8) {
                     StatusBadge(text: foundry.status.uppercased(), status: foundry.status)
-                    InfoPill(text: "\(foundry.summary.autoCreated) self-built", systemImage: "wand.and.stars")
-                    InfoPill(text: "\(foundry.summary.review) review", systemImage: "checkmark.shield")
                     InfoPill(text: foundry.hotPathContract?.chatInjection ?? "compact index", systemImage: "bolt")
                     Spacer()
                 }
@@ -178,27 +184,12 @@ struct CapabilitiesView: View {
                     }
                 }
 
-                if !foundry.reviewQueue.isEmpty || !foundry.recentArtifacts.isEmpty {
-                    Divider()
-                    HStack(alignment: .top, spacing: 16) {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Review")
-                                .font(NativeAgentFont.label)
-                                .foregroundStyle(.secondary)
-                            ForEach(foundry.reviewQueue.prefix(5)) { artifact in
-                                CapabilityFoundryArtifactRow(artifact: artifact)
-                            }
-                        }
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Recent Builds")
-                                .font(NativeAgentFont.label)
-                                .foregroundStyle(.secondary)
-                            ForEach(foundry.recentArtifacts.prefix(5)) { artifact in
-                                CapabilityFoundryArtifactRow(artifact: artifact)
-                            }
-                        }
-                    }
-                }
+                // NO "Review" / "Recent Builds" columns (removed 2026-08-02, E-1).
+                // `capabilityFoundrySummary()` returns `reviewQueue: []` and
+                // `recentArtifacts: []` UNCONDITIONALLY — the review pipeline and
+                // the artifact ledger were never ported. These were two headed
+                // columns waiting on arrays that can never fill: lifecycle
+                // furniture around an empty system.
 
                 if let contract = foundry.hotPathContract {
                     Divider()
@@ -1045,58 +1036,6 @@ struct CapabilityFoundryLaneCard: View {
         case "panel": "rectangle.grid.2x2"
         case "plugin": "puzzlepiece.extension"
         case "catalog": "shippingbox"
-        default: "hammer"
-        }
-    }
-}
-
-struct CapabilityFoundryArtifactRow: View {
-    var artifact: CapabilityFoundryArtifact
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: icon)
-                .foregroundStyle(NativeAgentTheme.statusColor(artifact.status))
-                .frame(width: 20)
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 6) {
-                    Text(artifact.name.withoutStaleNextGenPhaseCopy)
-                        .font(.caption.weight(.semibold))
-                        .lineLimit(1)
-                    if artifact.autoCreated == true {
-                        Image(systemName: "wand.and.stars")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    StatusBadge(text: artifact.status.uppercased(), status: artifact.status)
-                }
-                HStack(spacing: 6) {
-                    InfoPill(text: artifact.kind, systemImage: "tag")
-                    if let risk = artifact.riskClass, !risk.isEmpty {
-                        InfoPill(text: risk, systemImage: "lock.shield")
-                    }
-                }
-                if let description = artifact.description, !description.isEmpty {
-                    Text(description.withoutStaleNextGenPhaseCopy)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                }
-            }
-        }
-        .textSelection(.enabled)
-    }
-
-    private var icon: String {
-        switch artifact.kind {
-        case "skill": "text.book.closed"
-        case "tool": "wrench.and.screwdriver"
-        case "workflow": "point.topleft.down.curvedto.point.bottomright.up"
-        case "mcp": "externaldrive.connected.to.line.below"
-        case "panel": "rectangle.grid.2x2"
-        case "plugin": "puzzlepiece.extension"
-        case "capability_pack", "catalog": "shippingbox"
         default: "hammer"
         }
     }

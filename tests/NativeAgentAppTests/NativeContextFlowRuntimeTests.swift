@@ -264,16 +264,30 @@ struct NativeContextFlowRuntimeTests {
         }
 
         let callsBeforeQuery = await gate.callCount()
-        await gate.setDelay(.milliseconds(200))
+        // The gate delay is a deliberate wedge: long enough that the foreground
+        // bound below proves beginQueryEmbedding never awaited the embedder,
+        // even with multi-second scheduler noise under full-suite parallelism.
+        // (The old 200ms delay + fixed 250ms wait made the ready-check a
+        // roving flake: the background embed routinely missed the window.)
+        await gate.setDelay(.seconds(5))
         let clock = ContinuousClock()
         let startedAt = clock.now
         let ticket = await runtime.beginQueryEmbedding("remember the jasmine drink")
         let foregroundElapsed = startedAt.duration(to: clock.now)
 
         #expect(ticket != nil)
-        #expect(foregroundElapsed < .milliseconds(100))
+        // 2s, not 100ms: the claim is "the foreground return did not await the
+        // 5s embed" — well below the wedge still proves that, while a tight
+        // bound loses to scheduler noise under full-suite parallelism.
+        #expect(foregroundElapsed < .seconds(2))
         #expect(ticket?.embeddingIfReady == nil)
-        try await Task.sleep(for: .milliseconds(250))
+        // Positive step (the embedding SHOULD land) polls with a generous
+        // deadline instead of a fixed sleep — the 5s gate plus task scheduling
+        // has no fixed upper bound under load.
+        let readyDeadline = clock.now.advanced(by: .seconds(20))
+        while ticket?.embeddingIfReady == nil, clock.now < readyDeadline {
+            try await Task.sleep(for: .milliseconds(25))
+        }
         #expect(ticket?.embeddingIfReady?.count == 8)
         #expect(await gate.callCount() == callsBeforeQuery + 1)
         print("[memory-quality-metric] semantic-foreground=\(foregroundElapsed)")

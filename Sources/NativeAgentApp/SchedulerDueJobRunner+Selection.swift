@@ -45,8 +45,13 @@ extension SchedulerDueJobRunner {
             await persistence.readJSON(jobsPath, defaultValue: .array([]))
         }
         guard case .array(let rows) = raw else { return [] }
-        var due: [DueJob] = []
-        for row in rows {
+        // The cap is applied AFTER an earliest-due-first sort. Walking file
+        // order and breaking at `maxJobs` meant a row late in jobs.json could
+        // starve behind head rows once the job list outgrew the cap, no matter
+        // how overdue it was. Ties keep file order (the index tiebreak makes
+        // the sort stable), so nothing else about selection changes.
+        var due: [(job: DueJob, index: Int)] = []
+        for (index, row) in rows.enumerated() {
             guard case .object(let obj) = row else { continue }
             guard SchedulerJobRuntime.bool(obj["enabled"], default: true) else { continue }
             let nextEpoch = SchedulerJobRuntime.epoch(from: obj["nextRunAt"])
@@ -57,10 +62,17 @@ extension SchedulerDueJobRunner {
             let kind = (SchedulerJobRuntime.string(obj["kind"]) ?? "notify").lowercased()
             let payload: [String: JSONValue]
             if case .object(let p)? = obj["payload"] { payload = p } else { payload = [:] }
-            due.append(DueJob(id: id, name: name, kind: kind, payload: payload, row: row, dueEpoch: nextEpoch))
-            if due.count >= maxJobs { break }
+            due.append((
+                DueJob(id: id, name: name, kind: kind, payload: payload, row: row, dueEpoch: nextEpoch),
+                index
+            ))
         }
-        return due
+        due.sort {
+            $0.job.dueEpoch == $1.job.dueEpoch
+                ? $0.index < $1.index
+                : $0.job.dueEpoch < $1.job.dueEpoch
+        }
+        return due.prefix(max(0, maxJobs)).map(\.job)
     }
 
     /// - Parameter reactivateCancelled: when true, a user-cancelled default

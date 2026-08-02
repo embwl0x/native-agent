@@ -55,6 +55,11 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
     case workSessionCapReached(scope: String, limit: Int, handle: String)
     case unknownReservation(reservationId: String, handle: String)
     case reservationAlreadyComplete(reservationId: String, handle: String)
+    // Sequencing edges (blocked-on / defer).
+    case blockedOnUnknown(handle: String, blocker: String)
+    case blockedOnSelf(handle: String)
+    case blockedOnCycle(handle: String, handles: [String])
+    case deferUntilUnparseable(handle: String, value: String)
     /// The compaction base exists on disk but does not decode. Replaying from
     /// the tail alone would silently blank every compacted item, so reads FAIL
     /// LOUD instead (fail-loud over fail-over).
@@ -102,6 +107,14 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
             return "desk: no reservation \(reservationId) on \(handle); reserve the slot before completing it"
         case let .reservationAlreadyComplete(reservationId, handle):
             return "desk: reservation \(reservationId) on \(handle) is already complete; a slot completes once"
+        case let .blockedOnUnknown(handle, blocker):
+            return "desk: cannot block \(handle) on '\(blocker)' — no live item with that handle; blockers point at ITEMS, not prose"
+        case .blockedOnSelf(let handle):
+            return "desk: \(handle) cannot block itself"
+        case let .blockedOnCycle(handle, handles):
+            return "desk: that edge would close a blocked-on cycle through \(handles.joined(separator: " → ")) — \(handle) would wait on itself"
+        case let .deferUntilUnparseable(handle, value):
+            return "desk: cannot defer \(handle) until '\(value)' — expected a yyyy-MM-dd day or a full ISO timestamp"
         case .compactionBaseCorrupt(let path):
             return "desk: compaction base at \(path) exists but does not decode — refusing to replay from the tail alone (that would silently drop every compacted item)"
         case .compactionBaseUnreadable(let path):
@@ -292,6 +305,25 @@ struct DeskFeed: Sendable {
     let base: DeskCompactionBase?
     var ops: [DeskOp]
     var fileOpCount: Int
+    /// What the raw op-log scan could not use — malformed lines and rows whose
+    /// op token this build does not know. Compaction REFUSES to run while this
+    /// is non-clean (see `SnapshotTailOpLog`'s unknown-row policy): the
+    /// truncate would erase exactly the rows we just skipped.
+    var integrity: SnapshotTailOpLog.OpLogIntegrity = .clean
+
+    /// The number the compaction threshold is compared against: PHYSICAL rows
+    /// in `desk_ops.jsonl`, not decoded ops (gpt-5.5 review 2026-08-02, finding
+    /// 2). `fileOpCount` counts what `DeskOp.fromJSON` accepted, so a feed of
+    /// 100k rows written by a newer build plus 10 this one understands measured
+    /// as 10 — under the threshold, so compaction never ran, so `mayCompact`
+    /// never logged the refusal, so the unbounded growth was invisible.
+    var compactionRowCount: Int { integrity.feedRowCount(decodedCount: fileOpCount) }
+
+    /// Account for ops this writer just appended to the file under the flock.
+    mutating func noteAppendedRows(_ count: Int) {
+        fileOpCount += count
+        integrity = integrity.appendingRows(count)
+    }
 
     /// Newest committed timestamp across base + tail — the Lamport floor every
     /// commit stamp must clear. After a truncate the tail can be empty; without
@@ -408,13 +440,23 @@ public struct SwiftNativeDeskStore: Sendable {
         _ op: DeskOp,
         feed: DeskFeed
     ) async throws -> (state: DeskState, feed: DeskFeed) {
-        try await persistence.appendJSONL(op.toJSON(), to: opsPath)
+        try await persistence.appendJSONLDurable(op.toJSON(), to: opsPath)
         changeBus.emit(StoreChange(store: .desk, path: opsPath))
-        var next = DeskFeed(base: feed.base, ops: feed.ops + [op], fileOpCount: feed.fileOpCount + 1)
+        // `integrity` CARRIES FORWARD: this is the post-append view of the SAME
+        // file, so the rows the read could not decode are still in it. Dropping
+        // it here would hand `compactIfNeededUnlocked` a clean-looking feed and
+        // defeat the unknown-row gate on exactly the append that trips the
+        // threshold — the one path the gate exists for.
+        var next = DeskFeed(
+            base: feed.base, ops: feed.ops + [op],
+            fileOpCount: feed.fileOpCount, integrity: feed.integrity
+        )
+        next.noteAppendedRows(1)
         let state = Self.compact(base: next.base, next.ops)
         try await persistence.writeJSON(state.toJSON(), to: statePath)
         if let newBase = try await compactIfNeededUnlocked(state: state, feed: next) {
-            next = DeskFeed(base: newBase, ops: [], fileOpCount: 0)
+            // Compaction ran ⇒ the gate passed ⇒ the rewritten feed is clean.
+            next = DeskFeed(base: newBase, ops: [], fileOpCount: 0, integrity: .clean)
         }
         return (state, next)
     }
@@ -424,8 +466,49 @@ public struct SwiftNativeDeskStore: Sendable {
     /// this is only the tail (plus a stale prefix in the crash window) — use
     /// `readFeedUnlocked`/`liveState` for anything semantic.
     public func readOpsUnlocked() async throws -> [DeskOp] {
-        let raw = try await persistence.readJSONL(opsPath)
-        return raw.compactMap { DeskOp.fromJSON($0) }
+        try await readOpsWithIntegrityUnlocked().ops
+    }
+
+    /// `readOpsUnlocked` plus the accounting of what the scan threw away.
+    /// `DeskOp.fromJSON` returns nil for an op token this build does not know
+    /// (DeskModels' tolerant `default:` arm) — tolerant on READ, but the count
+    /// has to survive to `compactIfNeededUnlocked`, which would otherwise
+    /// snapshot state folded without those rows and then delete them.
+    func readOpsWithIntegrityUnlocked() async throws -> (ops: [DeskOp], integrity: SnapshotTailOpLog.OpLogIntegrity) {
+        let (raw, report) = try await persistence.readJSONLReporting(opsPath)
+        let ops = raw.compactMap { DeskOp.fromJSON($0) }
+        let integrity = SnapshotTailOpLog.OpLogIntegrity(
+            malformedLineCount: report.malformedLineCount,
+            undecodableRowCount: raw.count - ops.count,
+            trailingPartialLine: report.trailingPartialLine,
+            physicalRowCount: report.physicalLineCount
+        )
+        SnapshotTailOpLog.noteIntegrity(integrity, feed: Self.logLabel, path: opsPath)
+        return (ops, integrity)
+    }
+
+    /// The desk feed's health for the Doctor surface (gpt-5.5 review
+    /// 2026-08-02, finding 3): what it cannot decode AND how big it has grown.
+    /// Refusing to compact is safe but not free — this is how that trade stops
+    /// being an invisible stderr line in a GUI app.
+    public func opLogHealth() async throws -> SnapshotTailOpLog.OpLogHealth {
+        let integrity = try await opLogIntegrity()
+        return SnapshotTailOpLog.OpLogHealth(
+            feed: Self.logLabel,
+            path: opsPath,
+            physicalRowCount: integrity.physicalRowCount,
+            byteCount: SnapshotTailOpLog.OpLogHealth.fileSize(opsPath),
+            compactionThreshold: opsCompactionThreshold,
+            integrity: integrity
+        )
+    }
+
+    /// The readable counter behind the log line: what the desk's op-log feed
+    /// currently cannot decode. Zero on a healthy desk. Non-zero means
+    /// compaction is (correctly) refusing to run and the feed is growing —
+    /// surface it rather than letting "the desk looks fine" be the only signal.
+    public func opLogIntegrity() async throws -> SnapshotTailOpLog.OpLogIntegrity {
+        try await readOpsWithIntegrityUnlocked().integrity
     }
 
     /// Reads the replayable feed: compaction base (if any) + the ops that
@@ -438,10 +521,10 @@ public struct SwiftNativeDeskStore: Sendable {
     /// does not decode throws — replaying from the tail alone would silently
     /// blank every compacted item.
     func readFeedUnlocked() async throws -> DeskFeed {
-        let ops = try await readOpsUnlocked()
+        let (ops, integrity) = try await readOpsWithIntegrityUnlocked()
         let fileOpCount = ops.count
         guard FileManager.default.fileExists(atPath: basePath.path) else {
-            return DeskFeed(base: nil, ops: ops, fileOpCount: fileOpCount)
+            return DeskFeed(base: nil, ops: ops, fileOpCount: fileOpCount, integrity: integrity)
         }
         // Read the bytes directly so a transient IO failure (EMFILE, a dataless
         // iCloud file) throws a RETRYABLE error instead of collapsing to the
@@ -460,7 +543,7 @@ public struct SwiftNativeDeskStore: Sendable {
         let tail = SnapshotTailOpLog.dropCompactedPrefix(
             ops, lastCompactedOpId: base.lastCompactedOpId, id: { $0.opId }
         )
-        return DeskFeed(base: base, ops: tail, fileOpCount: fileOpCount)
+        return DeskFeed(base: base, ops: tail, fileOpCount: fileOpCount, integrity: integrity)
     }
 
     /// Snapshot+truncate once the op-log file crosses the threshold. The
@@ -473,8 +556,21 @@ public struct SwiftNativeDeskStore: Sendable {
         state: DeskState,
         feed: DeskFeed
     ) async throws -> DeskCompactionBase? {
-        guard feed.fileOpCount >= opsCompactionThreshold,
-              let lastOpId = feed.ops.last?.opId, !lastOpId.isEmpty else { return nil }
+        // PHYSICAL rows, not decoded ops — see `DeskFeed.compactionRowCount`.
+        guard feed.compactionRowCount >= opsCompactionThreshold else { return nil }
+        // THE UNKNOWN-ROW GATE (audit 2026-08-02, finding 1). Desk truncates to
+        // an EMPTY tail, so a row skipped on read is a row deleted from the only
+        // place it exists. A stale DeskSweepCLI reading a newer app's feed is the
+        // live failure case — refuse rather than erase. See SnapshotTailOpLog.
+        //
+        // ORDERED BEFORE the lastOpId guard on purpose (gpt-5.5 review
+        // 2026-08-02, finding 2): in the worst skew — a feed where this build
+        // decodes NOTHING — `feed.ops` is empty, and asking for a last op id
+        // first would return nil silently, so the one loud product signal that
+        // the feed is wedged would never be emitted in the very case that needs
+        // it most.
+        guard SnapshotTailOpLog.mayCompact(feed.integrity, feed: Self.logLabel, path: opsPath) else { return nil }
+        guard let lastOpId = feed.ops.last?.opId, !lastOpId.isEmpty else { return nil }
         let liveHandles = Set(state.items.map(\.handle))
         // Alias high-water survives per LIVE parent scope ("" = top level,
         // always kept). An archived parent can never receive new children
@@ -770,6 +866,120 @@ public struct SwiftNativeDeskStore: Sendable {
         try await appendValidated(DeskOp(handle: handle, body: .setNotify(policy: policy)))
     }
 
+    // MARK: - Sequencing edges (blocked-on / defer)
+
+    /// setBlockedOn — REPLACE the whole blocker set for `handle`. Blockers are
+    /// stable handles of LIVE items (the chat lane resolves aliases first).
+    /// Validated UNDER THE OPS FLOCK against ops-derived live state so a refusal
+    /// can't race a sibling close: unknown blocker, self-block, and any edge that
+    /// would close a cycle are all refused.
+    ///
+    /// The ts is minted INSIDE the lock via commitStamp — a defaulted timestamp
+    /// parameter would be evaluated at the call site BEFORE the lock and could
+    /// commit behind a later-issued stamp (the trap this file documents).
+    @discardableResult
+    public func setBlockedOn(_ handle: String, blockers: [String]) async throws -> DeskOp {
+        try await persistence.withFileLock(opsPath) {
+            let feed = try await readFeedUnlocked()
+            let state = Self.compact(base: feed.base, feed.ops)
+            guard state.items.contains(where: { $0.handle == handle }) else {
+                throw DeskError.unknownHandle(handle)
+            }
+            let proposed = Self.normalizeBlockers(blockers)
+            try Self.validateBlockedOn(handle: handle, proposed: proposed, in: state)
+            let op = DeskOp(
+                ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs),
+                handle: handle,
+                body: .setBlockedOn(handles: proposed)
+            )
+            _ = try await appendAndRecompactUnlocked(op, feed: feed)
+            return op
+        }
+    }
+
+    /// setDeferUntil — park `handle` until a day (`yyyy-MM-dd`) or ISO stamp.
+    /// nil / empty CLEARS. An unparseable value is REFUSED rather than stored:
+    /// the read side treats an unparseable defer as NOT deferred (never park an
+    /// item forever silently), so accepting one here would quietly no-op.
+    @discardableResult
+    public func setDeferUntil(_ handle: String, until: String?) async throws -> DeskOp {
+        try await persistence.withFileLock(opsPath) {
+            let feed = try await readFeedUnlocked()
+            let state = Self.compact(base: feed.base, feed.ops)
+            guard state.items.contains(where: { $0.handle == handle }) else {
+                throw DeskError.unknownHandle(handle)
+            }
+            let trimmed = until?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let value: String? = (trimmed?.isEmpty == false) ? trimmed : nil
+            if let value, !DeskClock.isParseableDate(value) {
+                throw DeskError.deferUntilUnparseable(handle: handle, value: value)
+            }
+            let op = DeskOp(
+                ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs),
+                handle: handle,
+                body: .setDeferUntil(until: value)
+            )
+            _ = try await appendAndRecompactUnlocked(op, feed: feed)
+            return op
+        }
+    }
+
+    /// Trim, drop empties, dedup — preserving FIRST-SEEN order so the stored set
+    /// reads back the way the operator named it.
+    static func normalizeBlockers(_ raw: [String]) -> [String] {
+        var seen: Set<String> = []
+        var out: [String] = []
+        for candidate in raw {
+            let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, seen.insert(trimmed).inserted else { continue }
+            out.append(trimmed)
+        }
+        return out
+    }
+
+    /// Write-time gate for a proposed blocker set: every blocker must be a live
+    /// item, an item may not block itself, and the edge must not close a cycle in
+    /// the PROSPECTIVE graph (live edges with this item's edges replaced by the
+    /// proposal). A cycle is unresolvable — nothing in it can ever become ready.
+    static func validateBlockedOn(handle: String, proposed: [String], in state: DeskState) throws {
+        let liveHandles = Set(state.items.map(\.handle))
+        for blocker in proposed {
+            if blocker == handle { throw DeskError.blockedOnSelf(handle: handle) }
+            guard liveHandles.contains(blocker) else {
+                throw DeskError.blockedOnUnknown(handle: handle, blocker: blocker)
+            }
+        }
+        var edges: [String: [String]] = [:]
+        for item in state.items { edges[item.handle] = item.blockedOn }
+        edges[handle] = proposed
+
+        // Is `handle` reachable FROM any proposed blocker? If so the proposal
+        // closes a loop. DFS carries the path so the refusal can name it, and is
+        // bounded by both a visited set (existing cycles elsewhere in the graph
+        // can't hang it) and a depth cap.
+        for start in proposed {
+            var seen: Set<String> = []
+            var path: [String] = []
+            func reachesTarget(_ node: String, depth: Int) -> Bool {
+                guard depth <= deskMaxGraphDepth else { return false }
+                if node == handle {
+                    path.append(node)
+                    return true
+                }
+                guard seen.insert(node).inserted else { return false }
+                path.append(node)
+                for next in edges[node] ?? [] where reachesTarget(next, depth: depth + 1) {
+                    return true
+                }
+                path.removeLast()
+                return false
+            }
+            if reachesTarget(start, depth: 0) {
+                throw DeskError.blockedOnCycle(handle: handle, handles: [handle] + path)
+            }
+        }
+    }
+
     /// close_item -> status=done (or canceled), closedAt=now, summary=outcomeSummary.
     @discardableResult
     public func closeItem(_ handle: String, outcomeSummary: String, canceled: Bool = false) async throws -> DeskOp {
@@ -955,9 +1165,9 @@ public struct SwiftNativeDeskStore: Sendable {
                     // state once; the previous per-node recompaction was O(K×N)
                     // and wrote K transient projections that no reader could see
                     // while this same flock was held.
-                    try await persistence.appendJSONL(archiveOp.toJSON(), to: opsPath)
+                    try await persistence.appendJSONLDurable(archiveOp.toJSON(), to: opsPath)
                     feed.ops.append(archiveOp)
-                    feed.fileOpCount += 1
+                    feed.noteAppendedRows(1)
                     appendedCanonicalOp = true
                     if node.handle == handle { targetRecord = rec }
                 }
@@ -1511,6 +1721,20 @@ public struct SwiftNativeDeskStore: Sendable {
                 p.lastWorkedAt = op.ts
                 Self.recomputePursuitCounters(&p)
                 item.pursuit = p
+                item.updatedAt = op.ts
+                byHandle[op.handle] = item
+            case let .setBlockedOn(handles):
+                // Whole-set REPLACE, same orphan tolerance as every other
+                // mutation. Blockedness is DERIVED from this edge set on read
+                // (DeskSequencing) — no status op is written here, which is what
+                // makes the auto-unblock cascade need no writer at all.
+                guard var item = byHandle[op.handle] else { continue }
+                item.blockedOn = handles
+                item.updatedAt = op.ts
+                byHandle[op.handle] = item
+            case let .setDeferUntil(until):
+                guard var item = byHandle[op.handle] else { continue }
+                item.deferUntil = (until?.isEmpty == true) ? nil : until
                 item.updatedAt = op.ts
                 byHandle[op.handle] = item
             case let .workLog(receipt):

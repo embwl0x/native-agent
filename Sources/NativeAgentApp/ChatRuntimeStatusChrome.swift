@@ -212,7 +212,10 @@ struct HealthFixButton: View {
                 outcome = "Opened"
             case "doctor":
                 NativeAgentAppCoordinator.shared.request(.sidebar(.diagnostics))
-                let completed = await appModel.runDoctor(repair: false)
+                // This quick fix only claims to have OPENED Doctor and run it —
+                // failing checks are shown in the Diagnostics pane, not folded
+                // into this row's outcome.
+                let completed = await appModel.runDoctor(repair: false).didRun
                 outcome = completed ? "Doctor finished" : "Doctor unavailable"
                 failed = !completed
             default:

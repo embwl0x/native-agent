@@ -131,6 +131,15 @@ extension SwiftToolDispatcher {
         "desk_read", "desk_add_item", "desk_set_status", "desk_update_item",
         "desk_note", "desk_add_ref", "desk_set_cadence", "desk_set_notify",
         "desk_close", "desk_archive",
+        // Sequencing lane: blocked-on EDGES (not prose) + defer + one-call
+        // campaign breakdown. Same lazy, ledger_write class as the other
+        // mutations.
+        "desk_blocked_on", "desk_defer", "desk_breakdown",
+        // Nag lane (Wave 3): User's own switch for how hard the desk stays on
+        // him. Writes <dataRoot>/desk/nag_config.json, not the op-log — same
+        // lazy, medium ledger_write class. It does NOT ping (it configures
+        // what may ping), so it is not a notification tool.
+        "desk_nag_control",
         // Workshop pursuit lane (Wave A). desk_open_pursuit is the ONLY chat path
         // to an origin=agent pursuit (store-gated on dossier + open-pursuit cap);
         // desk_work_log appends a work receipt to a pursuit. Both lazy-loaded

@@ -389,7 +389,7 @@ private func openAIResponsesSSE(usage: [String: Any]?) -> Data {
             durationMs: 7
         )
         var rows: [[String: Any]] = []
-        for _ in 0..<200 {
+        for _ in 0..<400 {  // 10s deadline — positive step under suite load
             rows = readLLMCallRows(dataRoot: root)
             if !rows.isEmpty { break }
             try await Task.sleep(nanoseconds: 25_000_000)

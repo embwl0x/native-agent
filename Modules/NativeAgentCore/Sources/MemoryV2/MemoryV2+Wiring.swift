@@ -99,6 +99,40 @@ public struct ProposalRecord: Sendable, Codable, Equatable {
     }
 }
 
+// MARK: - Patch contract (fixture and SQLite must agree)
+
+/// THE ONE PLACE that says which untyped patch keys a storage backend keeps.
+///
+/// WHY IT IS A SHARED CONSTANT (gpt-5.5 review, 2026-08-02): the SQLite bridge
+/// (`MemoryStorageBridge.updateMemory`) merged an ALLOWLIST of untyped keys into
+/// `metadata_json` and dropped the rest, while the in-memory fixture
+/// (`InMemoryMemoryStorage.updateMemory`) merged EVERY untyped key into
+/// `extras`. So `patch(["foo": "bar"])` persisted in every test and was silently
+/// dropped in production — a test could pass against behaviour production does
+/// not have. That is the same defect class as the `recall_count` bug this
+/// allowlist was grown to fix, one layer up.
+///
+/// The SQLite side is the contract: a patch key that reaches `metadata_json` is
+/// a key some caller can later read back, and an open merge lets any caller
+/// mint arbitrary metadata (including keys the semantics layer owns). Adding a
+/// key here is a deliberate act — do it once, and both backends change together.
+public enum MemoryPatchContract {
+    /// Untyped keys that round-trip through metadata on BOTH backends.
+    ///
+    /// `pinned` — the Mac UI pin path (audit 2026-06-09; pin was a silent no-op).
+    /// `tags` / `importance` — surfaced back into typed slots by `toMemoryRecord`.
+    /// `recall_count` — `store()`'s duplicate guard bumps it (2026-07-24).
+    /// `source_history` / `duplicate_occurrences` — byte-identical collapse
+    /// provenance (2026-08-02).
+    ///
+    /// `kind` is deliberately ABSENT: it is semantics-owned (kind-scoped decay)
+    /// and no UI path patches it.
+    public static let untypedPassthroughKeys: Set<String> = [
+        "pinned", "tags", "importance", "recall_count",
+        "source_history", "duplicate_occurrences",
+    ]
+}
+
 // MARK: - MemoryStorageProtocol (the m1 seam)
 
 public protocol MemoryStorageProtocol: Sendable {
@@ -117,6 +151,14 @@ public protocol MemoryStorageProtocol: Sendable {
         embeddingEpoch: MemoryEmbeddingEpoch?
     ) async throws -> MemoryRecord
     func deleteMemory(id: String) async throws -> Bool
+
+    /// Newest-first identity handles for one writing lane's own rows (matched
+    /// by `source` prefix), ACTIVE only, bounded by `limit`. A REQUIREMENT with
+    /// a default implementation in `MemoryV2+LaneRetention` for the same
+    /// existential-dispatch reason as `matchesTombstone` below: extension-only,
+    /// the SQLite bridge's bounded query would never win over the fixture
+    /// default when reached through `any MemoryStorageProtocol`.
+    func memoryHandles(sourcePrefix: String, limit: Int?) async throws -> [MemoryLaneHandle]
 
     /// Dense-vector recall over the embeddings table. Returns the matching
     /// `MemoryRecord`s alongside their cosine score (higher = better).
@@ -533,6 +575,103 @@ extension SwiftNativeMemoryV2 {
         )
     }
 
+    // MARK: - Byte-identical collapse: keep the collapse, keep BOTH identities
+
+    /// How many occurrences of one collapsed memory keep their provenance.
+    /// Bounded because a lane that repeats forever must not grow one row's
+    /// metadata forever; the oldest occurrences fall off, `recall_count` keeps
+    /// counting past the cap.
+    static let duplicateProvenanceCap = 10
+
+    /// Metadata keys that are POLICY or shape, not the identity of a
+    /// particular occurrence. Merging these would just restate the row.
+    static let duplicateProvenanceIgnoredKeys: Set<String> = [
+        "kind", "permittedSurfaces", "tags", "recall_count", "confidence",
+        "importance", "pinned", "source_history", "duplicate_occurrences",
+    ]
+
+    /// What to patch onto an existing row when a byte-identical write lands, so
+    /// the repeat is traceable to BOTH runs (gpt-5.5 review A3).
+    ///
+    /// Pure, and deliberately generic: it merges whatever scalar metadata the
+    /// new write carries that the row does not already say, plus the new
+    /// source, plus the newer observation time. Nothing here knows about
+    /// Workshop — a mission's `workshop_execution_id` / `workshop_status` are
+    /// just the first caller's identity fields.
+    static func duplicateProvenancePatch(
+        existing: MemoryRecord,
+        newSource: String?,
+        newMetadata: JSONValue?
+    ) -> [String: JSONValue] {
+        func scalar(_ value: JSONValue) -> JSONValue? {
+            switch value {
+            case .string(let s): return .string(String(s.prefix(200)))
+            case .int, .double, .bool: return value
+            default: return nil
+            }
+        }
+        var extras: [String: JSONValue] = [:]
+        if case .object(let m)? = existing.extras { extras = m }
+        var newMeta: [String: JSONValue] = [:]
+        if case .object(let m)? = newMetadata { newMeta = m }
+        let source = (newSource ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var out: [String: JSONValue] = [:]
+
+        // 1. Source lineage — every distinct writer of this text, oldest first,
+        //    seeded from the row's own `source` so run #1 is never implied away.
+        var sources: [String] = []
+        if case .array(let arr)? = extras["source_history"] {
+            sources = arr.compactMap { if case .string(let s) = $0 { return s } else { return nil } }
+        }
+        if sources.isEmpty, let first = existing.sourceRunId, !first.isEmpty {
+            sources = [first]
+        }
+        if !source.isEmpty, !sources.contains(source) {
+            sources.append(source)
+        }
+        if sources.count > duplicateProvenanceCap {
+            sources = Array(sources.suffix(duplicateProvenanceCap))
+        }
+        if !sources.isEmpty {
+            out["source_history"] = .array(sources.map { .string($0) })
+        }
+
+        // 2. This occurrence's identity: the scalar metadata it carries that the
+        //    row does not already say, plus its source.
+        var identity: [String: JSONValue] = [:]
+        for (key, value) in newMeta where !duplicateProvenanceIgnoredKeys.contains(key) {
+            guard let value = scalar(value) else { continue }
+            if extras[key] == value { continue }
+            identity[key] = value
+        }
+        if !source.isEmpty { identity["source"] = .string(source) }
+        if !identity.isEmpty {
+            var occurrences: [JSONValue] = []
+            if case .array(let arr)? = extras["duplicate_occurrences"] { occurrences = arr }
+            let entry = JSONValue.object(identity)
+            // A literal re-write of the SAME occurrence (same ids, same times)
+            // is a retry, not a second run — count it, don't list it twice.
+            if occurrences.last != entry {
+                occurrences.append(entry)
+                if occurrences.count > duplicateProvenanceCap {
+                    occurrences = Array(occurrences.suffix(duplicateProvenanceCap))
+                }
+                out["duplicate_occurrences"] = .array(occurrences)
+            }
+        }
+
+        // 3. Observation time: the newest occurrence is when this was last true.
+        //    First-class column (the bridge maps `observed_at` → observedAt);
+        //    only ever moves FORWARD, and only for a parseable timestamp.
+        if case .string(let raw)? = newMeta["observed_at"],
+           MemoryRecallScoring.parseTimestamp(raw) != nil {
+            let current = existing.observedAt ?? ""
+            if raw > current { out["observed_at"] = .string(raw) }
+        }
+        return out
+    }
+
     /// Store a new memory record. Refuses (with `.underlying("tombstoned")`) if
     /// the content matches a rejection tombstone — the denylist gate. Otherwise
     /// embeds the content, inserts into storage, and returns the resulting
@@ -579,9 +718,24 @@ extension SwiftNativeMemoryV2 {
                 if case .double(let d)? = m["recall_count"] { currentCount = Int64(d) }
             }
             // Unknown patch keys merge into metadata_json (bridge contract).
+            var patch: [String: JSONValue] = ["recall_count": .int(currentCount + 1)]
+            // gpt-5.5 review A3 (2026-08-02): the collapse itself is deliberate
+            // and stays — repetition should be evidence, not clutter. What was
+            // WRONG is that the later occurrence lost its identity: two
+            // genuinely different events producing the same prose left the row
+            // pointing only at the first one, so the second was unrecoverable.
+            // The provenance of every occurrence now accumulates alongside the
+            // count, bounded, in metadata.
+            for (key, value) in Self.duplicateProvenancePatch(
+                existing: existing,
+                newSource: source,
+                newMetadata: metadata
+            ) {
+                patch[key] = value
+            }
             return try await storage.updateMemory(
                 id: existing.id,
-                patch: .object(["recall_count": .int(currentCount + 1)]),
+                patch: .object(patch),
                 newEmbedding: nil
             )
         }
@@ -867,11 +1021,47 @@ public actor InMemoryMemoryStorage: MemoryStorageProtocol {
             if case .string(let s)? = obj["text"] { rec.text = s }
             if case .string(let s)? = obj["content"] { rec.text = s }
             if case .string(let s)? = obj["status"] { rec.status = s }
-            if case .bool(let b)? = obj["pinned"] { rec.pinned = b }
             if case .double(let d)? = obj["confidence"] { rec.confidence = d }
-            if case .double(let d)? = obj["importance"] { rec.importance = d }
-            if case .string(let s)? = obj["layer"] { rec.layer = s }
-            if case .string(let s)? = obj["memoryKind"] { rec.memoryKind = s }
+            if case .int(let i)? = obj["confidence"] { rec.confidence = Double(i) }
+            if case .string(let s)? = obj["validFrom"] { rec.validFrom = s }
+            if case .string(let s)? = obj["valid_from"] { rec.validFrom = s }
+            if case .string(let s)? = obj["validTo"] { rec.validTo = s }
+            if case .string(let s)? = obj["valid_to"] { rec.validTo = s }
+            if case .string(let s)? = obj["observed_at"] { rec.observedAt = s }
+            if case .string(let s)? = obj["observedAt"] { rec.observedAt = s }
+            if let evidence = obj["evidence"] { rec.evidence = evidence }
+            // UNTYPED KEYS FOLLOW THE SQLITE CONTRACT, NOT A WIDER ONE.
+            //
+            // This fixture used to merge EVERY untyped key into `extras`, while
+            // `MemoryStorageBridge` (production SQLite) merges only
+            // `MemoryPatchContract.untypedPassthroughKeys` and DROPS the rest.
+            // So `patch(["foo": "bar"])` persisted here and vanished there — a
+            // test could pass against behaviour production does not have, which
+            // is exactly how the `recall_count` no-op survived (2026-07-24).
+            // The SQLite side is the contract; the allowlist is shared so the
+            // two cannot drift again (gpt-5.5 review, 2026-08-02).
+            let passthrough = obj.filter {
+                MemoryPatchContract.untypedPassthroughKeys.contains($0.key)
+            }
+            if !passthrough.isEmpty {
+                var meta: [String: JSONValue] = [:]
+                if case .object(let m)? = rec.extras { meta = m }
+                for (k, v) in passthrough { meta[k] = v }
+                rec.extras = .object(meta)
+                // …and surfaced back into the typed slots the same way
+                // `MemoryStorageBridge.toMemoryRecord` surfaces them, so a
+                // read-back through the fixture matches a read-back through
+                // SQLite instead of only agreeing about storage.
+                if case .bool(let b)? = passthrough["pinned"] { rec.pinned = b }
+                if case .double(let d)? = passthrough["importance"] { rec.importance = d }
+                if case .int(let i)? = passthrough["importance"] { rec.importance = Double(i) }
+                if case .array(let arr)? = passthrough["tags"] {
+                    let strings = arr.compactMap { value -> String? in
+                        if case .string(let t) = value { return t } else { return nil }
+                    }
+                    if !strings.isEmpty { rec.tags = strings }
+                }
+            }
         }
         rec.updatedAt = ISO8601DateFormatter().string(from: Date())
         records[id] = rec

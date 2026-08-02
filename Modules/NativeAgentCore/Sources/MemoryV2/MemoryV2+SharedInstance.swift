@@ -142,8 +142,18 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol {
             // write-time duplicate guard bumps it as merge-corroboration
             // evidence; without passthrough the bump silently no-oped on
             // production SQLite while the in-memory fixture hid it.
-            let passthroughKeys = ["pinned", "tags", "importance", "recall_count"]
-            let passthrough = obj.filter { passthroughKeys.contains($0.key) }
+            // source_history / duplicate_occurrences added 2026-08-02 (gpt-5.5
+            // review A3): store()'s byte-identical collapse writes the LATER
+            // run's provenance here. Without passthrough the second run's
+            // identity is dropped on production SQLite exactly the way the
+            // recall_count bump was.
+            // The allowlist lives in `MemoryPatchContract` so the in-memory
+            // fixture cannot drift from it (gpt-5.5 review, 2026-08-02): the
+            // fixture used to merge EVERY untyped key, so a test could pass on
+            // behaviour this bridge does not have.
+            let passthrough = obj.filter {
+                MemoryPatchContract.untypedPassthroughKeys.contains($0.key)
+            }
             if !passthrough.isEmpty {
                 guard let existing = try await storage.memory(id: id) else {
                     throw MemoryV2Error.recordNotFound
@@ -166,6 +176,12 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol {
 
     public func deleteMemory(id: String) async throws -> Bool {
         try await storage.deleteMemory(id: id)
+    }
+
+    /// Bounded, two-column lane enumeration straight from SQLite — overrides
+    /// the protocol's list-and-filter default (gpt-5.5 review A4).
+    public func memoryHandles(sourcePrefix: String, limit: Int?) async throws -> [MemoryLaneHandle] {
+        try await storage.laneHandles(sourcePrefix: sourcePrefix, limit: limit)
     }
 
     public func recall(embedding: [Float], topK: Int, persona: String?) async throws -> [ScoredMemoryRecord] {

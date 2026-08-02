@@ -106,6 +106,28 @@ final class OnboardingWizardState {
     var errorMessage: String?
     var pendingRecoveryNeedsReset = false
     var isLoading: Bool = false
+    /// True once this wizard has submitted a Build that did NOT succeed.
+    ///
+    /// fix-blank-install-onboarding (2026-08-02): the retry path re-read the
+    /// durable start state and called `onComplete()` whenever it reported
+    /// `hasExisting` — so a Build that failed with `persona_already_exists`
+    /// (pre-existing persona bytes this wizard did not write) dismissed the
+    /// wizard as though onboarding had SUCCEEDED, leaving an unnamed agent and
+    /// no identity docs. A failed Build is never completion; while this flag is
+    /// set, existing persona state is treated as the obstacle it is and the
+    /// user is offered the backup-preserving reset instead.
+    var buildFailed = false
+
+    /// True when the persona documents committed but the post-completion
+    /// scaffold repair did not succeed (gpt-5.5 review BLOCKING 2, 2026-08-02).
+    ///
+    /// Distinct from `buildFailed` on purpose. `buildFailed` means "pre-existing
+    /// persona bytes blocked this Build" and its remedy is the backup-preserving
+    /// reset. This means "identity landed, the app's own local files did not" —
+    /// resetting would throw away good identity docs over an unrelated problem,
+    /// so the retry re-runs the repair instead of re-reading start state (which
+    /// would see the now-committed docs and dismiss the wizard as complete).
+    var scaffoldRepairFailed = false
 
     // Name placeholder rotation
     private let nameSuggestions = ["Aria", "Max", "Ada", "Soren", "Clio", "Zev", "Noa"]
@@ -186,9 +208,21 @@ struct OnboardingWizard: View {
                     case .building:   BuildingStep()
                     case .done:       DoneStep(state: state, onComplete: onComplete)
                     case .error:      ErrorStep(state: state, onRetry: {
-                        // Re-read the durable start state before choosing a
-                        // retry path. A normal submit may have failed after
-                        // publishing its transaction manifest, so blindly
+                        // A scaffold-repair failure is NOT an onboarding-state
+                        // problem: the transaction already committed, so
+                        // re-reading start state would report `hasExisting` and
+                        // dismiss the wizard over the very scaffold that failed.
+                        // Retry the repair itself.
+                        if state.scaffoldRepairFailed {
+                            Task {
+                                withAnimation { state.step = .building }
+                                await finishSuccessfulOnboarding()
+                            }
+                            return
+                        }
+                        // Otherwise re-read the durable start state before
+                        // choosing a retry path. A normal submit may have failed
+                        // after publishing its transaction manifest, so blindly
                         // returning to Confirm can lose the payload-free
                         // recovery lane and retry with blank wizard fields.
                         Task { await loadOnboardingState() }
@@ -231,6 +265,9 @@ struct OnboardingWizard: View {
         // DaemonError.swiftOnlyRoute on fallthrough), and only the SwiftNative path is live.
         // R22: AppModel's canonical `client` already carries the shared runtime.
         let resp: OnboardingStartResponse
+        // Any path through start state is a fresh verdict; a stale scaffold flag
+        // must not hijack the next Retry.
+        state.scaffoldRepairFailed = false
         do {
             resp = try await appModel.startOnboarding()
         } catch {
@@ -268,7 +305,15 @@ struct OnboardingWizard: View {
             return
         }
         if resp.hasExisting {
-            onComplete()
+            switch Self.existingPersonaDisposition(buildFailed: state.buildFailed) {
+            case .alreadyOnboarded:
+                onComplete()
+            case .blockedNeedsReset:
+                state.pendingRecoveryNeedsReset = true
+                state.errorMessage = state.errorMessage
+                    ?? Self.buildFailureMessage(error: "persona_already_exists", detail: nil)
+                withAnimation { state.step = .error }
+            }
             return
         }
         state.pendingRecoveryNeedsReset = false
@@ -288,6 +333,7 @@ struct OnboardingWizard: View {
                 return
             }
             state.pendingRecoveryNeedsReset = false
+            state.buildFailed = false
             state.errorMessage = nil
             state.agentName = ""
             state.userName = ""
@@ -315,6 +361,7 @@ struct OnboardingWizard: View {
     }
 
     private func submitOnboarding() async {
+        state.scaffoldRepairFailed = false
         withAnimation { state.step = .building }
         do {
             let resp = try await appModel.completeOnboarding(
@@ -323,25 +370,97 @@ struct OnboardingWizard: View {
                 userName: state.trimmedUserName
             )
             if resp.ok {
+                state.buildFailed = false
                 await finishSuccessfulOnboarding()
             } else {
-                state.errorMessage = resp.detail ?? resp.error ?? "Onboarding failed."
+                state.buildFailed = true
+                state.errorMessage = Self.buildFailureMessage(error: resp.error, detail: resp.detail)
+                // `persona_already_exists` means unrelated persona bytes are in
+                // the way. That is precisely what reset (which BACKS UP before
+                // clearing) exists for, so surface the affordance instead of
+                // showing a raw error code with no way forward.
+                if resp.error == "persona_already_exists" {
+                    state.pendingRecoveryNeedsReset = true
+                }
                 withAnimation { state.step = .error }
             }
         } catch {
+            state.buildFailed = true
             state.errorMessage = error.localizedDescription
             withAnimation { state.step = .error }
         }
     }
 
+    /// What pre-existing persona state means to a wizard that is currently open.
+    enum ExistingPersonaDisposition: Equatable {
+        /// Someone else already onboarded this Mac — close the wizard.
+        case alreadyOnboarded
+        /// This wizard's own Build failed against that state; it is an
+        /// obstacle, not a success. Offer the backup-preserving reset.
+        case blockedNeedsReset
+    }
+
+    /// fix-blank-install-onboarding (2026-08-02): `hasExisting` alone used to
+    /// mean "done" on every path, so a Build that died on
+    /// `persona_already_exists` dismissed the wizard as if it had succeeded.
+    static func existingPersonaDisposition(buildFailed: Bool) -> ExistingPersonaDisposition {
+        buildFailed ? .blockedNeedsReset : .alreadyOnboarded
+    }
+
+    /// Raw backend error codes are not user-facing copy.
+    static func buildFailureMessage(error: String?, detail: String?) -> String {
+        switch error {
+        case "persona_already_exists":
+            return "Persona documents already exist on this Mac, so onboarding could not write its own. Reset will back them up before starting over."
+        case .some(let code) where detail == nil || detail?.isEmpty == true:
+            return "Onboarding failed (\(code))."
+        default:
+            return detail ?? error ?? "Onboarding failed."
+        }
+    }
+
+    /// Runs the fresh-install scaffold repair and only then declares onboarding
+    /// done. Reached from BOTH completion paths: submit-success and the
+    /// payload-free pending-recovery resume.
+    ///
+    /// Fresh-install scaffold (2026-07-04, User: "it starts with a bunch of red
+    /// warnings"): create the app-owned runtime JSON stores + bridge dirs now,
+    /// so first launch lands clean.
+    ///
+    /// gpt-5.5 review BLOCKING 2 (2026-08-02): the repair result was DISCARDED,
+    /// so a repair that threw — or that reported failing scaffold checks over a
+    /// store it could not fix — still wrote the first-run welcome marker and
+    /// showed "<Agent> is ready" over a broken install. A failed repair now
+    /// blocks completion and names what failed. The persona documents really did
+    /// commit at this point, so this is NOT `buildFailed` and must not offer
+    /// reset (which would back out good identity docs over a scaffold problem);
+    /// the actionable retry is the repair itself.
     private func finishSuccessfulOnboarding() async {
-        // Fresh-install scaffold (2026-07-04, User: "it starts with a
-        // bunch of red warnings"): create the app-owned runtime JSON stores +
-        // bridge dirs now, so first launch lands clean. Recovery reaches this
-        // same completion seam after the exact staged transaction is verified.
-        await appModel.runDoctor(repair: true)
+        let outcome = await appModel.runDoctor(repair: true)
+        guard outcome.didRun, outcome.failingScaffoldChecks.isEmpty else {
+            state.scaffoldRepairFailed = true
+            // Reset would back out the identity docs that DID commit. Never
+            // offer it for a scaffold problem.
+            state.pendingRecoveryNeedsReset = false
+            state.errorMessage = Self.scaffoldRepairFailureMessage(outcome)
+            withAnimation { state.step = .error }
+            return
+        }
+        state.scaffoldRepairFailed = false
         appModel.markFirstRunWelcomePending()
         withAnimation { state.step = .done }
+    }
+
+    /// Honest, actionable copy for a scaffold repair that did not succeed.
+    /// Says what DID land (identity docs) so the user is not told their work was
+    /// lost, names the failing check, and points at the one action that helps.
+    static func scaffoldRepairFailureMessage(_ outcome: AppModel.DoctorRunOutcome) -> String {
+        let detail = outcome.failureDetail.trimmingCharacters(in: .whitespacesAndNewlines)
+        return [
+            "Your identity documents were written, but setting up the app's local files did not finish, so this install is not ready yet.",
+            detail.isEmpty ? nil : detail,
+            "Retry the repair, or open Diagnostics to fix it and continue."
+        ].compactMap { $0 }.joined(separator: " ")
     }
 
 }

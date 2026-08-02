@@ -341,6 +341,63 @@ private final class _MCPStdinWriter: @unchecked Sendable {
     }
 }
 
+// MARK: - stderr tail ring
+
+/// Bounded ring buffer for an MCP child's stderr.
+///
+/// F-B4 (2026-08-02): `stderrPipe` was assigned and NEVER read. A pipe has a
+/// ~64KB kernel buffer; any MCP server that logs past it blocks forever in
+/// `write(2)`, stops answering JSON-RPC, gets evicted as wedged, respawns, and
+/// repeats — and the diagnostic bytes explaining why were thrown away. This
+/// drains the pipe continuously (so the child can never block) while retaining
+/// only the last `limit` bytes (so a chatty server can't grow memory without
+/// bound). Written from the readabilityHandler's background queue, read from
+/// the actor — hence the lock.
+final class _MCPStderrTail: @unchecked Sendable {
+    /// Retained tail size. 8KB is far below the pipe buffer yet large enough to
+    /// carry a Python/Node traceback, which is what a death reason usually is.
+    static let limit = 8 * 1024
+
+    private let lock = NSLock()
+    private var buffer = Data()
+    private var truncated = false
+
+    func append(_ chunk: Data) {
+        guard !chunk.isEmpty else { return }
+        lock.lock()
+        buffer.append(chunk)
+        if buffer.count > Self.limit {
+            buffer.removeFirst(buffer.count - Self.limit)
+            truncated = true
+        }
+        lock.unlock()
+    }
+
+    /// Last-N-bytes snapshot as text, whitespace-trimmed. Empty when the child
+    /// wrote nothing to stderr.
+    func snapshot() -> String {
+        lock.lock()
+        let data = buffer
+        let didTruncate = truncated
+        lock.unlock()
+        guard !data.isEmpty else { return "" }
+        let text = String(decoding: data, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return "" }
+        return didTruncate ? "…\(text)" : text
+    }
+
+    /// `snapshot()` clipped for embedding in a one-line error/eviction reason.
+    func reasonFragment(maxLength: Int = 600) -> String {
+        let text = snapshot()
+        guard !text.isEmpty else { return "" }
+        let oneLine = text.replacingOccurrences(of: "\n", with: " ⏎ ")
+        return oneLine.count <= maxLength
+            ? oneLine
+            : "…" + String(oneLine.suffix(maxLength))
+    }
+}
+
 // MARK: - MCPSubprocess
 
 /// One live MCP stdio child process. The actor owns the `Process`, the
@@ -370,6 +427,11 @@ public actor MCPSubprocess {
     public private(set) var writeTimeout: TimeInterval = 10
     private var stdoutPipe: Pipe?
     private var stderrPipe: Pipe?
+    /// F-B4: bounded tail of the child's stderr, continuously drained so the
+    /// child can never block writing to a full pipe. Survives `stop()` /
+    /// `_processDidTerminate` teardown on purpose — the death reason is read
+    /// AFTER the process is gone.
+    private var stderrTail: _MCPStderrTail?
     private var reader: MCPFrameReader?
     /// Event-driven task that drains completed stdout frames only after the
     /// readability handler signals new bytes or EOF.
@@ -514,6 +576,20 @@ public actor MCPSubprocess {
             }
         }
 
+        // F-B4: drain stderr continuously into a bounded ring. Without this the
+        // pipe fills at ~64KB and the child wedges in write(2) — it stops
+        // answering JSON-RPC, gets evicted, respawns, and wedges again, with
+        // the bytes that explain why discarded. We keep only the tail.
+        let tail = _MCPStderrTail()
+        stderr.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            if chunk.isEmpty {
+                handle.readabilityHandler = nil
+                return
+            }
+            tail.append(chunk)
+        }
+
         // Capture a non-isolated bridge into the actor so the
         // terminationHandler (which fires off-actor) can route through to
         // our internal `_processDidTerminate` after-the-fact.
@@ -526,8 +602,11 @@ public actor MCPSubprocess {
             try proc.run()
         } catch {
             stdout.fileHandleForReading.readabilityHandler = nil
+            stderr.fileHandleForReading.readabilityHandler = nil
             stdoutSignal.finish()
-            throw MCPSubprocessError.spawnFailed(error.localizedDescription)
+            throw MCPSubprocessError.spawnFailed(
+                Self.decorate(error.localizedDescription, withStderr: tail)
+            )
         }
 
         let writer: _MCPStdinWriter
@@ -537,9 +616,12 @@ public actor MCPSubprocess {
             )
         } catch {
             stdout.fileHandleForReading.readabilityHandler = nil
+            stderr.fileHandleForReading.readabilityHandler = nil
             stdoutSignal.finish()
             proc.terminate()
-            throw MCPSubprocessError.spawnFailed("stdin writer: \(error.localizedDescription)")
+            throw MCPSubprocessError.spawnFailed(
+                Self.decorate("stdin writer: \(error.localizedDescription)", withStderr: tail)
+            )
         }
         process = proc
         stdinHandle = stdin.fileHandleForWriting
@@ -547,6 +629,7 @@ public actor MCPSubprocess {
         writer.start()
         stdoutPipe = stdout
         stderrPipe = stderr
+        stderrTail = tail
         reader = frameReader
         stdoutDrainPassCount = 0
         startedAt = Date()
@@ -592,10 +675,29 @@ public actor MCPSubprocess {
             // notifications/initialized is a *notification* — no id, no waiter.
             try await sendNotification(method: "notifications/initialized", params: .object([:]))
         } catch {
+            // F-B4: the handshake is where a misconfigured server dies (bad
+            // interpreter, missing module, auth refusal) — and it explains
+            // itself on stderr. Carry that tail into the thrown error instead
+            // of discarding it; `stop()` below tears the child down but the
+            // ring survives.
+            let fragment = tail.reasonFragment()
             stop()
-            throw error
+            if fragment.isEmpty { throw error }
+            throw MCPSubprocessError.spawnFailed(
+                "handshake failed: \(error) — stderr: \(fragment)"
+            )
         }
         initialized = true
+    }
+
+    /// Test/diagnostic seam: last-8KB snapshot of the child's stderr.
+    public func stderrTailSnapshot() -> String {
+        stderrTail?.snapshot() ?? ""
+    }
+
+    private static func decorate(_ message: String, withStderr tail: _MCPStderrTail) -> String {
+        let fragment = tail.reasonFragment()
+        return fragment.isEmpty ? message : "\(message) — stderr: \(fragment)"
     }
 
     /// Send a JSON-RPC request and wait for its matching response. The id is
@@ -654,6 +756,7 @@ public actor MCPSubprocess {
         drainTask?.cancel()
         drainTask = nil
         stdoutPipe?.fileHandleForReading.readabilityHandler = nil
+        stderrPipe?.fileHandleForReading.readabilityHandler = nil
         if let proc = process, proc.isRunning {
             proc.terminate()
         }
@@ -717,10 +820,15 @@ public actor MCPSubprocess {
         // termination so the handler will replay it on install. Without
         // this, a process that exits within microseconds of start() would
         // silently evaporate — the pool would believe the start succeeded.
+        // F-B4: fold the stderr tail into the eviction reason so the pool's
+        // `lastError` (and the session-status row the user sees) carries WHY
+        // the child died instead of a bare "exited (status=1)".
+        let fragment = stderrTail?.reasonFragment() ?? ""
+        let decoratedReason = fragment.isEmpty ? reason : "\(reason) — stderr: \(fragment)"
         if let handler = terminationHandler {
-            handler(status, reason)
+            handler(status, decoratedReason)
         } else {
-            pendingTermination = (status: status, reason: reason)
+            pendingTermination = (status: status, reason: decoratedReason)
         }
         // Drain everything: stop() also failAllWaiters for us, and we don't
         // want to call stop() here because Process is already dead.
@@ -728,6 +836,7 @@ public actor MCPSubprocess {
         drainTask?.cancel()
         drainTask = nil
         stdoutPipe?.fileHandleForReading.readabilityHandler = nil
+        stderrPipe?.fileHandleForReading.readabilityHandler = nil
         process = nil
         stdinWriter?.stop()
         stdinWriter = nil

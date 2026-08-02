@@ -351,6 +351,10 @@ struct MemoryConsolidationGateTests {
         let fx = try await makeFixture()
         let personaRoot = fx.root.appendingPathComponent("persona", isDirectory: true)
         try FileManager.default.createDirectory(at: personaRoot, withIntermediateDirectories: true)
+        // Consolidation only ever runs on an install that finished onboarding,
+        // and USER.md regeneration is gated on that (fix-blank-install-
+        // onboarding, 2026-08-02). Model the sentinel the wizard publishes.
+        try Data("completed_at=test\n".utf8).write(to: fx.root.appendingPathComponent(".onboarded"))
         let spotlightClient = MockSpotlightIndexClient()
         let invalidations = ConsolidationInvalidationRecorder()
         let environment = MemoryConsolidationProjectionEnvironment(

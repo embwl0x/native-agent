@@ -251,21 +251,82 @@ extension CognitiveSubstrate {
             if lhs.lastActivatedAt != rhs.lastActivatedAt { return lhs.lastActivatedAt > rhs.lastActivatedAt }
             return lhs.id.uuidString < rhs.id.uuidString
         }
+        // Verbal-rut damping (2026-08-01, the "handsome" loop): her warmest
+        // turns are usually greetings, greetings reuse the same pet name, and
+        // quoting them back every turn locked her onto one word — echo reads
+        // it → she says it → the next capsule quotes it again. Two rules:
+        // (1) DIVERSITY — chosen fragments may not share a distinctive word,
+        // and fragments carrying a WORN word (one that appears across ≥3 of
+        // the window's candidate fragments) lose to varied ones; a total-rut
+        // week still echoes rather than going silent. (2) AWARENESS — when a
+        // rut exists her subconscious says so, WITHOUT naming the word:
+        // naming it would re-seed the exact loop this exists to break.
+        let fragged: [(fragment: String, tokens: Set<String>)] = ranked.compactMap { node in
+            guard let f = soundEchoFragment(node.summary) else { return nil }
+            return (f, Self.distinctiveEchoTokens(f))
+        }
+        guard !fragged.isEmpty else { return nil }
+        var tokenCounts: [String: Int] = [:]
+        for (_, tokens) in fragged {
+            for t in tokens { tokenCounts[t, default: 0] += 1 }
+        }
+        let worn = Set(tokenCounts.filter { $0.value >= Self.wornEchoThreshold }.keys)
+
         var fragments: [String] = []
         var seen = Set<String>()
-        for node in ranked {
-            guard fragments.count < Self.soundEchoCount else { break }
-            guard let fragment = soundEchoFragment(node.summary) else { continue }
-            if seen.insert(fragment.lowercased()).inserted {
-                fragments.append("\u{201C}\(fragment)\u{201D}")
+        var usedTokens = Set<String>()
+        func pick(allowWorn: Bool) {
+            for (fragment, tokens) in fragged {
+                guard fragments.count < Self.soundEchoCount else { return }
+                if !allowWorn, !tokens.isDisjoint(with: worn) { continue }
+                guard tokens.isDisjoint(with: usedTokens) else { continue }
+                if seen.insert(fragment.lowercased()).inserted {
+                    fragments.append("\u{201C}\(fragment)\u{201D}")
+                    usedTokens.formUnion(tokens)
+                }
             }
         }
+        pick(allowWorn: false)
+        if fragments.isEmpty { pick(allowWorn: true) }
         guard !fragments.isEmpty else { return nil }
         // "lately", not "when it landed" — warmth on her turn is the room's
         // temperature at encode (assistant completions never raise warmth
         // themselves), so the honest claim is what she sounded like in warm
         // moments, not proof the line landed (gpt-5.5 MED, 2026-07-03).
-        return "- Sound: lately you've sounded like \(fragments.joined(separator: " · "))"
+        var line = "- Sound: lately you've sounded like \(fragments.joined(separator: " · "))"
+        if !worn.isEmpty {
+            line += " — a few of the same words keep echoing lately; you've got more range than that"
+        }
+        return line
+    }
+
+    /// How many of the window's candidate fragments a distinctive word must
+    /// appear in before it counts as WORN (a verbal rut, not a coincidence).
+    static let wornEchoThreshold = 3
+
+    /// The words that make a fragment "sound like" something: lowercased,
+    /// letters-only, ≥4 chars, minus function words. Deliberately small and
+    /// generic — this is a diversity heuristic, never a censor list.
+    static let echoStopwords: Set<String> = [
+        "that", "this", "with", "have", "from", "your", "youre", "just",
+        "what", "about", "been", "were", "they", "them", "there", "here",
+        "when", "then", "than", "like", "really", "still", "into", "onto",
+        "over", "some", "more", "most", "very", "much", "cant", "dont",
+        "wont", "didnt", "youve", "weve", "theyre", "going", "gonna",
+    ]
+
+    static func distinctiveEchoTokens(_ text: String) -> Set<String> {
+        var tokens: Set<String> = []
+        var current = ""
+        for ch in text.lowercased() {
+            if ch.isLetter { current.append(ch) }
+            else {
+                if current.count >= 4, !echoStopwords.contains(current) { tokens.insert(current) }
+                current = ""
+            }
+        }
+        if current.count >= 4, !echoStopwords.contains(current) { tokens.insert(current) }
+        return tokens
     }
 
     /// First sentence of one of her turns. Deliberately NOT capsuleSignalText:

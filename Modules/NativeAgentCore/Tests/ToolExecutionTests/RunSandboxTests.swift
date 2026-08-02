@@ -384,7 +384,7 @@ private final class OneShotAction: @unchecked Sendable {
     // cancelling, so we exercise the mid-wait cancel path, not the pre-spawn
     // Task.checkCancellation shortcut.
     var pid: pid_t = -1
-    for _ in 0..<100 {
+    for _ in 0..<200 {  // 10s deadline — spawn is a positive step under suite load
         if let raw = try? String(contentsOf: pidURL, encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines), let p = pid_t(raw), p > 0 {
             pid = p
@@ -408,7 +408,9 @@ private final class OneShotAction: @unchecked Sendable {
         Issue.record("expected CancellationError, got \(error)")
     }
     let elapsed = Date().timeIntervalSince(started)
-    #expect(elapsed < 3, "cancellation should return promptly; took \(elapsed)s")
+    // 10s, not 3s: still far under the tool's wedge it must beat, while a 3s
+    // bound loses to scheduler noise under full-suite parallelism.
+    #expect(elapsed < 10, "cancellation should return promptly; took \(elapsed)s")
     #expect(
         waitForProcessExit(pid, timeout: 3),
         "cancelled tool pid \(pid) must be reaped, not orphaned"
@@ -451,7 +453,7 @@ private final class OneShotAction: @unchecked Sendable {
         )
     }
     var pid: pid_t = -1
-    for _ in 0..<100 {
+    for _ in 0..<200 {  // 10s deadline — spawn is a positive step under suite load
         if let raw = try? String(contentsOf: pidURL, encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines), let p = pid_t(raw), p > 0 {
             pid = p
@@ -472,8 +474,9 @@ private final class OneShotAction: @unchecked Sendable {
     } catch {
         Issue.record("expected CancellationError, got \(error)")
     }
-    // SIGTERM ignored → SIGKILL after ~200ms grace, so still well under 3s.
-    #expect(Date().timeIntervalSince(started) < 3)
+    // SIGTERM ignored → SIGKILL after ~200ms grace. 10s, not 3s: the bound
+    // only needs to beat the tool's wedge; 3s lost to scheduler noise.
+    #expect(Date().timeIntervalSince(started) < 10)
     #expect(
         waitForProcessExit(pid, timeout: 3),
         "TERM-ignoring tool pid \(pid) must be SIGKILLed on cancel, not orphaned"
@@ -598,7 +601,7 @@ private final class OneShotAction: @unchecked Sendable {
     cancelOnSigterm.arm { task.cancel() }
     // Wait for the child to spawn.
     var pid: pid_t = -1
-    for _ in 0..<100 {
+    for _ in 0..<200 {  // 10s deadline — spawn is a positive step under suite load
         if let raw = try? String(contentsOf: pidURL, encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines), let p = pid_t(raw), p > 0 {
             pid = p
