@@ -4,7 +4,7 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ---
 
-## Unreleased — weak-spot campaign round 3 (2026-08-02)
+## 0.3.3 — cognition range and lifecycle hardening (2026-08-02)
 
 Cognition took its first roadmap step in a month: appraisal now derives what
 matters to the agent from her own approved standing views (the shipped
