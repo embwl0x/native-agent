@@ -54,6 +54,27 @@ release_identity_leak_regex() {
   printf '%s' "$regex"
 }
 
+# release_personal_identity_hit_files <bundle> <regex>
+#
+# Search every staged file except the exact, verified MiniLM resource payload.
+# A general language-model vocabulary legitimately contains ordinary person
+# names, so applying a maintainer's local identity denylist to it creates false
+# positives. The exemption is deliberately tied to MemoryV2's known SwiftPM
+# resource bundle; similarly named files elsewhere remain in scope. Secret
+# value/file scans still cover the full Resources tree in release.sh.
+release_personal_identity_hit_files() {
+  local bundle="$1"
+  local regex="$2"
+  [[ -n "$regex" ]] || return 0
+
+  find "$bundle" \
+    \( -path '*/NativeAgentCore_MemoryV2.bundle/minilm_vocab.txt' \
+       -o -path '*/NativeAgentCore_MemoryV2.bundle/minilm.mlpackage/*' \) -prune -o \
+    -type f -print0 2>/dev/null \
+  | xargs -0 grep -IlE "$regex" 2>/dev/null \
+  || true
+}
+
 # release_assert_no_identity_strings <bundle>
 # Fails (returns 1) when any app-owned executable in the bundle carries a
 # private instance identity string.

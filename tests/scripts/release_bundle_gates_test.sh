@@ -26,6 +26,36 @@ printf '%s\n' 'private_fixture_identity' > "$DENYLIST"
 NATIVEAGENT_PRIVACY_DENYLIST_FILE="$DENYLIST" \
   release_assert_no_identity_strings "$BUNDLE" >/dev/null
 
+# A general model vocabulary legitimately contains ordinary names. Exempt only
+# the exact verified MemoryV2 payload; app content and lookalikes stay scanned.
+mkdir -p "$BUNDLE/Contents/Resources/NativeAgentCore_MemoryV2.bundle/minilm.mlpackage/Data"
+printf '%s\n' 'private_fixture_identity' \
+  > "$BUNDLE/Contents/Resources/NativeAgentCore_MemoryV2.bundle/minilm_vocab.txt"
+printf '%s\n' 'private_fixture_identity' \
+  > "$BUNDLE/Contents/Resources/NativeAgentCore_MemoryV2.bundle/minilm.mlpackage/Data/model.mlmodel"
+if [[ -n "$(release_personal_identity_hit_files "$BUNDLE" 'private_fixture_identity')" ]]; then
+  echo "FAIL: verified MiniLM payload was not exempted" >&2
+  exit 1
+fi
+
+printf '%s\n' 'private_fixture_identity' > "$BUNDLE/Contents/Resources/app-owned.txt"
+personal_hits="$(release_personal_identity_hit_files "$BUNDLE" 'private_fixture_identity')"
+if [[ "$personal_hits" != *'/app-owned.txt' ]]; then
+  echo "FAIL: app-owned resource identity was not detected" >&2
+  exit 1
+fi
+rm -f "$BUNDLE/Contents/Resources/app-owned.txt"
+
+mkdir -p "$BUNDLE/Contents/Resources/Lookalike.bundle"
+printf '%s\n' 'private_fixture_identity' \
+  > "$BUNDLE/Contents/Resources/Lookalike.bundle/minilm_vocab.txt"
+personal_hits="$(release_personal_identity_hit_files "$BUNDLE" 'private_fixture_identity')"
+if [[ "$personal_hits" != *'/Lookalike.bundle/minilm_vocab.txt' ]]; then
+  echo "FAIL: lookalike model resource was incorrectly exempted" >&2
+  exit 1
+fi
+rm -rf "$BUNDLE/Contents/Resources/Lookalike.bundle"
+
 printf '%s\n' 'private_fixture_identity' >> "$BIN"
 if NATIVEAGENT_PRIVACY_DENYLIST_FILE="$DENYLIST" \
   release_assert_no_identity_strings "$BUNDLE" >/dev/null 2>&1; then

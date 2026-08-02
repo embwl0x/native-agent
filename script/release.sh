@@ -914,7 +914,9 @@ assert_no_python_artifacts "$BUNDLE"
 # ZERO local-agent identity defaults in app-owned resources.
 # Scope is deliberate:
 #   - personal identifiers (handle / location / telegram id / email) fail
-#     ANYWHERE in the bundle — a hard privacy line, no exceptions.
+#     everywhere in app-owned content. The exact verified MiniLM model payload
+#     is exempt because a general vocabulary legitimately contains ordinary
+#     person names; similarly named files elsewhere remain fully scanned.
 #   - app-owned text resources fail on common API/OAuth/JWT/private-key token
 #     shapes. This catches pasted OpenAI/Anthropic/GitHub/Slack/Telegram/
 #     Google/AWS/Stripe-style secrets without flagging code variable names.
@@ -950,7 +952,7 @@ _SECRET_VALUE_RE='(sk-(proj-)?[A-Za-z0-9_-]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|gh[po
 _SECRET_FILE_RE='(^|/)(\.env($|[._-])|.*\.env$|\.npmrc$|\.pypirc$|\.netrc$|id_rsa$|id_dsa$|id_ecdsa$|id_ed25519$|credentials?\.(json|ya?ml|toml|ini)$|.*credentials?\.(json|ya?ml|toml|ini)$|token(s)?\.(json|ya?ml|toml|ini)$|.*token(s)?\.(json|ya?ml|toml|ini)$|oauth.*token.*\.(json|ya?ml|toml|ini)$|client_secret(s)?\.(json|ya?ml|toml|ini)$|.*client_secret.*\.(json|ya?ml|toml|ini)$|service[-_]?account.*\.(json|ya?ml|toml|ini)$|firebase-adminsdk.*\.json$|.*\.(pem|p12|pfx|jks|keystore|key|gpg|asc)$)'
 _raw_hits=""
 if [[ -n "$_PERSONAL_RE" ]]; then
-  _raw_hits="$(grep -rIlE "$_PERSONAL_RE" "$BUNDLE" 2>/dev/null || true)"
+  _raw_hits="$(release_personal_identity_hit_files "$BUNDLE" "$_PERSONAL_RE")"
 fi
 _personal_hits=""
 for _f in $_raw_hits; do
