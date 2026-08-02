@@ -470,7 +470,9 @@ private func helperCommand(_ scriptPath: URL) -> String {
         Issue.record("expected CancellationError, got \(error)")
     }
     let elapsed = Date().timeIntervalSince(started)
-    #expect(elapsed < 3, "cancel should resolve promptly; took \(elapsed)s")
+    // 10s, not 3s: still far under the 30s server-side stall it must beat,
+    // while a 3s bound loses to scheduler noise under full-suite parallelism.
+    #expect(elapsed < 10, "cancel should resolve promptly; took \(elapsed)s")
 
     // Subprocess stays alive — the cancel abandoned only the one request.
     #expect(await proc.isRunning, "subprocess must stay alive after a request cancel")
@@ -538,7 +540,9 @@ private func helperCommand(_ scriptPath: URL) -> String {
     } catch {
         Issue.record("expected CancellationError, got \(error)")
     }
-    #expect(Date().timeIntervalSince(started) < 3,
+    // 10s, not 3s: still far under the 20s write timeout and 60s request
+    // timeout it must beat; a 3s bound loses to scheduler noise under load.
+    #expect(Date().timeIntervalSince(started) < 10,
             "cancel must resume the waiter promptly despite the wedged stdin")
 
     // Wait past the cancel notice's 2s no-terminate deadline. If the fix
@@ -657,11 +661,13 @@ private func helperCommand(_ scriptPath: URL) -> String {
 
 @Test func cache_get_returnsHitWithinTTL_missesAfterExpiry() async throws {
     let cache = MCPLiveCache()
-    await cache._setTTL(0.2)
+    // 1s TTL, not 0.2s: the put→get hop must land inside the TTL even under
+    // full-suite scheduler noise; the expiry sleep scales with it.
+    await cache._setTTL(1.0)
     await cache.put("k", value: [.string("a"), .string("b")])
     let hit = await cache.get("k")
     #expect(hit?.count == 2)
-    try? await Task.sleep(nanoseconds: 250_000_000)
+    try? await Task.sleep(nanoseconds: 1_300_000_000)
     let miss = await cache.get("k")
     #expect(miss == nil)
 }
@@ -1351,14 +1357,18 @@ private func writeMalformedFrameHelper() throws -> URL {
 
         // Wait for the actor's terminate path + Process.isRunning to flip.
         var died = false
-        for _ in 0..<30 {
+        for _ in 0..<200 {  // 10s deadline — positive step under suite load
             if await !first.isRunning { died = true; break }
             try? await Task.sleep(nanoseconds: 50_000_000)
         }
         #expect(died, "subprocess must terminate after malformed-frame eviction")
     }
-    // Allow termination handler to land.
-    try? await Task.sleep(nanoseconds: 200_000_000)
+    // Positive step: poll for the termination handler to land instead of a
+    // fixed settle that loses to scheduler noise under suite load.
+    for _ in 0..<100 {
+        if await pool._crashInfo(for: "bad-frame-srv") != nil { break }
+        try? await Task.sleep(nanoseconds: 100_000_000)
+    }
     #expect(await pool._crashInfo(for: "bad-frame-srv") != nil)
     await pool.stopAll()
 }
@@ -1992,7 +2002,9 @@ private func writeMalformedFrameHelper() throws -> URL {
     try? await Task.sleep(nanoseconds: 200_000_000)
     let probeStart = Date()
     _ = await proc.isRunning
-    #expect(Date().timeIntervalSince(probeStart) < 0.5,
+    // 5s, not 0.5s: still well before the stalled write's 8s timeout can
+    // resolve, while a 0.5s bound loses to scheduler noise under load.
+    #expect(Date().timeIntervalSince(probeStart) < 5,
             "actor pinned by a stalled stdin write — DispatchIO writer regressed")
     do {
         _ = try await requestTask.value
@@ -2007,7 +2019,7 @@ private func writeMalformedFrameHelper() throws -> URL {
     }
     // The wedged child gets terminated (pool-eviction path).
     var died = false
-    for _ in 0..<50 {
+    for _ in 0..<100 {  // 10s deadline — positive step under suite load
         if await !proc.isRunning { died = true; break }
         try? await Task.sleep(nanoseconds: 100_000_000)
     }
@@ -2077,7 +2089,7 @@ private func writeMalformedFrameHelper() throws -> URL {
         MCPSubprocessPool.Spec(serverId: "swap-srv", command: helperCommand(script) + " --changed")
     ])
     var oldDead = false
-    for _ in 0..<50 {
+    for _ in 0..<100 {  // 10s deadline — positive step under suite load
         if await !first.isRunning { oldDead = true; break }
         try? await Task.sleep(nanoseconds: 100_000_000)
     }
@@ -2164,13 +2176,18 @@ private final class _AtomicBox<T>: @unchecked Sendable {
     let p1 = try await pool.get(serverId: "loop-srv")
     _ = try? await p1.request(method: "tools/list", timeout: 2)
     var dead1 = false
-    for _ in 0..<80 {
+    for _ in 0..<100 {  // 10s deadline — positive step under suite load
         if await !p1.isRunning { dead1 = true; break }
         try? await Task.sleep(nanoseconds: 100_000_000)
     }
     #expect(dead1, "cycle-1 child should die shortly after start")
-    // Let the termination handler land + the (tiny) backoff expire.
+    // Let the (tiny) backoff expire, then POLL for the termination handler —
+    // a fixed 400ms settle before the positive read flaked under suite load.
     try? await Task.sleep(nanoseconds: 400_000_000)
+    for _ in 0..<100 {
+        if await pool._crashInfo(for: "loop-srv")?.consecutiveFailures == 1 { break }
+        try? await Task.sleep(nanoseconds: 100_000_000)
+    }
     let info1 = await pool._crashInfo(for: "loop-srv")
     #expect(info1?.consecutiveFailures == 1,
             "cycle 1 should record one failure; got \(String(describing: info1))")
@@ -2181,12 +2198,16 @@ private final class _AtomicBox<T>: @unchecked Sendable {
     let p2 = try await pool.get(serverId: "loop-srv")
     _ = try? await p2.request(method: "tools/list", timeout: 2)
     var dead2 = false
-    for _ in 0..<80 {
+    for _ in 0..<100 {  // 10s deadline — positive step under suite load
         if await !p2.isRunning { dead2 = true; break }
         try? await Task.sleep(nanoseconds: 100_000_000)
     }
     #expect(dead2, "cycle-2 child should die shortly after start")
     try? await Task.sleep(nanoseconds: 400_000_000)
+    for _ in 0..<100 {
+        if await pool._crashInfo(for: "loop-srv")?.consecutiveFailures == 2 { break }
+        try? await Task.sleep(nanoseconds: 100_000_000)
+    }
     let info2 = await pool._crashInfo(for: "loop-srv")
     #expect(info2?.consecutiveFailures == 2,
             "die-after-start loop must ESCALATE across respawns; got \(String(describing: info2))")

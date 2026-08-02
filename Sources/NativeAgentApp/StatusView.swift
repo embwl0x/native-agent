@@ -67,7 +67,11 @@ struct StatusView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     } else {
-                        ForEach(appModel.activityEvents.prefix(8)) { event in
+                        // NEWEST first. `getActivity` returns the tail of events.jsonl in
+                        // file (chronological) order, so `.prefix` showed the OLDEST 8 of
+                        // the last 200 — on a 5,400-event feed that was a week stale while
+                        // today's entries sat just below (2026-08-02).
+                        ForEach(appModel.activityEvents.suffix(8).reversed()) { event in
                             ActivityRow(event: event)
                         }
                     }

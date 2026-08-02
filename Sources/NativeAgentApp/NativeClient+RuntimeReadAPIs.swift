@@ -42,6 +42,11 @@ import Browser
 import CapabilityFoundry
 
 extension NativeClient {
+    /// When THIS runtime started. `ProcessInfo.systemUptime` measures the
+    /// machine, which made Status report days of "uptime" for an app launched
+    /// a minute ago.
+    static let processStartedAt = Date()
+
     func getHealth() async throws -> RuntimeHealth {
         // DAEMON-KILL P1: Mac process IS the runtime. Return a synthetic
         // health snapshot reflecting the in-process state.
@@ -52,7 +57,11 @@ extension NativeClient {
             "app": "NativeAgent",
             "version": version,
             "dataDir": root.path,
-            "uptimeSeconds": ProcessInfo.processInfo.systemUptime,
+            // `systemUptime` is the MACHINE's uptime, not this process's — so
+            // Status reported ~36h on an app that had been running for one
+            // minute, and relaunching never reset it. The honest number is how
+            // long THIS runtime has been up (2026-08-02).
+            "uptimeSeconds": Date().timeIntervalSince(Self.processStartedAt),
         ]
         let data = try JSONSerialization.data(withJSONObject: payload)
         return try JSONDecoder.nativeAgent.decode(RuntimeHealth.self, from: data)

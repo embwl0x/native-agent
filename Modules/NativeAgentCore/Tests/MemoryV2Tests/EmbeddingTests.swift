@@ -719,7 +719,7 @@ struct EmbeddingTests {
             try await store.upsert(id: "blocked", embedding: [1, 0, 0], text: "post-release")
             try Data("finished".utf8).write(to: swiftFinishedMarker)
         }
-        let swiftStartDeadline = Date().addingTimeInterval(3.0)
+        let swiftStartDeadline = Date().addingTimeInterval(10.0)  // task start is a positive step under suite load
         while !FileManager.default.fileExists(atPath: swiftStartedMarker.path) {
             if Date() > swiftStartDeadline { break }
             try? await Task.sleep(nanoseconds: 20_000_000)

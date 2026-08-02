@@ -14,6 +14,22 @@ a feeling. System-vs-user turns are classified by who originated them instead
 of by keyword-matching the user's words, so ordinary prose ("remind me about
 the doctor") is no longer dropped from the felt layer.
 
+The felt layer now has real dynamic range. Warmth was computed on a slope that
+put the agent near the top of the scale on every turn — including plain working
+conversation — so the warmest emotional vocabulary was always in reach and the
+agent read as stuck in one register. Warmth now rests mid-scale and earns its
+way up from what actually happened in the exchange, so ordinary work sounds like
+ordinary work and affection still reaches the top when it is genuinely there.
+The "lately you've sounded like…" self-echo, which quoted the agent's own
+warmest past turns back into every turn, now speaks about a quarter of the time
+and matches the current register instead of always selecting the warmest thing
+it could find. Both fixes are vocabulary-free and persona-agnostic: they widen
+the range every agent can occupy rather than steering any agent toward a tone.
+
+Status now reports this run's uptime instead of the machine's, and Recent
+Activity shows the newest entries first — it had been showing the oldest slice
+of its window, which on a busy feed was a week stale.
+
 A shared set of lifecycle primitives (scoped acquire/release handles and a
 bounded await) closes the repo's most common bug shape — an acquire whose
 release misses an exit path — with five confirmed leaks retrofitted, including

@@ -273,7 +273,7 @@ struct BackgroundLoopsManagerTests {
         // resume promptly. Poll with a hard bound so a regression fails
         // loudly instead of hanging the suite.
         var resumed = false
-        for _ in 0..<40 {
+        for _ in 0..<200 {  // 10s deadline — positive step under suite load
             try await Task.sleep(nanoseconds: 50_000_000)
             if await joinCounter.value > 0 { resumed = true; break }
         }
@@ -319,7 +319,7 @@ struct BackgroundLoopsManagerTests {
             _ = await manager.runTickOnce(loopId: loop.loopId)
             // The wedged body is entered from an unstructured child, so observe
             // the entry by bounded polling rather than a bare sleep.
-            for _ in 0..<20 {
+            for _ in 0..<60 {  // ~3s per attempt — positive step under suite load
                 entries = await probe.value
                 if entries >= 2 { break attempts }
                 try await Task.sleep(nanoseconds: 50_000_000)

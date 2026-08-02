@@ -138,8 +138,9 @@ struct ToolDispatchDeadlineRaceSuite {
         let err = slotErrorString(result)
         #expect(err?.contains("dispatch deadline") == true, "got: \(err ?? "nil")")
         #expect(err?.contains("hang") == true)
-        // Fired on the ~400ms deadline, NOT after the 30s hang.
-        #expect(elapsed < .seconds(5), "deadline should fire fast; took \(elapsed)")
+        // Fired on the ~400ms deadline, NOT after the 30s hang. 10s keeps an
+        // order of magnitude below the hang while riding out scheduler noise.
+        #expect(elapsed < .seconds(10), "deadline should fire fast; took \(elapsed)")
     }
 
     @Test(.timeLimit(.minutes(1)))

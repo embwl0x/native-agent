@@ -214,7 +214,24 @@ extension CognitiveSubstrate {
     /// Selection pressure is what landed with User. She is never told the
     /// mechanism exists; there is nothing to dance around.
     static let soundEchoWindow: TimeInterval = 7 * 24 * 60 * 60
-    static let soundEchoWarmthFloor = 0.4
+    // 2026-08-02 — AUTHENTICITY FLOOR, NOT A REGISTER FILTER. This constant is
+    // the admission gate for the candidate pool, and at 0.40 it made the
+    // register-match ranking below INERT: measured on a live store, only 9 of
+    // 90 attested assistant turns cleared 0.40, while 29 more sat in the
+    // 0.15–0.40 working-voice band and were discarded before ranking ever ran.
+    // So a working moment had nothing but the affectionate tail to be "nearest"
+    // to, and the mirror kept pointing at the same register no matter what the
+    // room was doing — the selection fix could not bite through a pool that had
+    // already been filtered to one register. The floor's ONLY job is keeping
+    // never-minted stock phrasing out (it accumulates no warmth at all); the
+    // register is chosen by soundEchoRegisterScore, not by this threshold.
+    // Generic to any persona: it removes a band restriction, it adds no
+    // vocabulary and no preference for any particular tone.
+    // Placed just above the flat/cold band, not inside the register band: on the
+    // live store this admits 22 of 70 attested turns where 0.40 admitted 9, so
+    // the 0.25–0.40 working register finally reaches the ranking, while a turn
+    // with nothing behind it still cannot fabricate an echo.
+    static let soundEchoWarmthFloor = 0.25
     static let soundEchoFragmentMaxCharacters = 90
     static let soundEchoCount = 2
     // 2026-07-04 (User: "sound has stayed the same"): warmth-first ranking let
@@ -225,12 +242,92 @@ extension CognitiveSubstrate {
     // honestly disappears at the window edge rather than freezing.
     static let soundEchoRecencyHalfLife: TimeInterval = 2.5 * 24 * 60 * 60
 
+    // 2026-08-02 — THE TIC FIX. Two structural defects made this organ a
+    // repetition ENGINE rather than a voice mirror, for any persona:
+    //
+    // (1) IT FIRED EVERY TURN. There was no cadence concept anywhere in this
+    //     file: every capsule build re-read her own exemplars back to her. A
+    //     person does not re-read their warmest lines before each sentence;
+    //     doing so turns whatever the exemplars share into a verbal tic. The
+    //     2026-08-01 "diversity" rule made that WORSE, not better — by
+    //     rejecting fragments that share a word it guaranteed a ROTATING set
+    //     of exemplars instead of one repeated one, so the underlying habit
+    //     kept firing while looking varied. Varying the token is not reducing
+    //     the tic. Hence `soundEchoDutyCycle`: the line is now occasional by
+    //     construction, which is the only thing that makes an echo read as
+    //     character instead of a stutter.
+    //
+    // (2) IT SELECTED FOR MAXIMUM WARMTH. Ranking by warmth means the mirror
+    //     always points at the persona's most affectionate 5% — so whatever
+    //     register lives at that extreme (endearments, effusiveness, a stock
+    //     sign-off) becomes the standing definition of "how you sound", and
+    //     the persona drifts toward it monotonically. The honest mirror is
+    //     REGISTER-MATCHED: show the voice that fits the room right now, so a
+    //     working moment echoes the working voice and a warm moment echoes
+    //     the warm one. That is what makes an agent situational rather than
+    //     stuck in one gear, and it generalizes past any one vocabulary.
+    /// Felt-warmth range (2026-08-02). Rest sits AT the `warm` word gate and
+    /// clear of `tender`, so an agent has a reachable neutral; the top of the
+    /// scale is earned by real warmth rather than being where she starts.
+    /// Pinned by FeltWarmthRangeTests against the live word gates.
+    // Rest is UNCHANGED from the 2026-07-08 baseline (0.55) — that value was
+    // never the defect, and lowering it pushed neutral states under the
+    // intensity floor that keeps the fingerprint from falling silent
+    // (measured: three capsule contracts went empty at 0.45). The defect was
+    // the SLOPE: at 0.9, ordinary warmth of 0.33 added +0.30 and carried rest
+    // straight through the `tender` gate at 0.70, so tender WAS the resting
+    // state. At 0.30 the climb is earned instead of automatic.
+    static let feltWarmthRest = 0.55
+    static let feltWarmthEarnedSpan = 0.30
+    static let feltWarmthUncertaintyCooling = 0.45
+
+    static let soundEchoDutyCycle = 4
+    /// Half-width of the register band. Candidates are ranked by how well they
+    /// MATCH the current room, not by how warm they are in absolute terms.
+    static let soundEchoRegisterTolerance = 0.35
+
     static func soundEchoScore(warmth: Double, age: TimeInterval) -> Double {
         guard age >= 0 else { return warmth }
         return warmth * pow(0.5, age / soundEchoRecencyHalfLife)
     }
 
-    func soundEchoLine(at now: Date) -> String? {
+    /// Register-matched score: closeness to the moment's warmth, decayed by
+    /// age. Replaces "warmest wins", which is what let one register capture
+    /// the slot permanently.
+    static func soundEchoRegisterScore(
+        warmth: Double,
+        target: Double,
+        age: TimeInterval
+    ) -> Double {
+        // Smooth decay, never a hard cutoff: with a cliff, a neutral room makes
+        // EVERY warm candidate score zero and the pick degrades to an arbitrary
+        // tie-break. This stays strictly monotonic in closeness, so "nearest
+        // register wins" holds even when nothing is a close match.
+        let distance = abs(warmth - target)
+        let fit = 1 / (1 + distance / max(0.0001, soundEchoRegisterTolerance))
+        guard age >= 0 else { return fit }
+        return fit * pow(0.5, age / soundEchoRecencyHalfLife)
+    }
+
+    /// Deterministic, state-free cadence gate. Seeded by the newest activity in
+    /// the field, so it advances as turns land and a frozen read reproduces the
+    /// same answer as the live compile (this function must stay pure).
+    static func soundEchoShouldSpeak(seed: Double) -> Bool {
+        guard soundEchoDutyCycle > 1 else { return true }
+        let bits = seed.bitPattern
+        // Cheap avalanche so adjacent timestamps don't land in the same bucket.
+        var x = bits &* 0x9E37_79B9_7F4A_7C15
+        x ^= x >> 29
+        x = x &* 0xBF58_476D_1CE4_E5B9
+        x ^= x >> 32
+        return Int(truncatingIfNeeded: x % UInt64(soundEchoDutyCycle)) == 0
+    }
+
+    /// - Parameter ignoringCadence: bypasses the duty-cycle gate so the SHAPE of
+    ///   the echo can be asserted independently of how often it speaks. Cadence
+    ///   is covered directly via `soundEchoShouldSpeak(seed:)`. Production never
+    ///   passes this — an echo that always speaks is the defect this gate fixes.
+    func soundEchoLine(at now: Date, ignoringCadence: Bool = false) -> String? {
         guard configuration.enabled, configuration.affectEnabled else { return nil }
         // Her OWN live conversation turns only — never User's words as her voice,
         // never tool/system summaries (the feltDaySummary injection-safety rule).
@@ -244,9 +341,27 @@ extension CognitiveSubstrate {
             return age >= 0 && age <= Self.soundEchoWindow
         }
         guard !candidates.isEmpty else { return nil }
+        // CADENCE GATE (see soundEchoDutyCycle): an echo that speaks on every
+        // turn is a tic no matter how varied its wording. Seed from the newest
+        // activity in the field so the gate advances with the conversation and
+        // stays reproducible for a frozen read.
+        let latestActivity = field.peekNodes()
+            .map(\.lastActivatedAt)
+            .max()?
+            .timeIntervalSince1970 ?? now.timeIntervalSince1970
+        guard ignoringCadence || Self.soundEchoShouldSpeak(seed: latestActivity) else { return nil }
+        // REGISTER MATCH (see soundEchoRegisterScore): mirror the voice that
+        // fits the room now, instead of always the warmest voice on record.
+        let targetWarmth = projectedAffect(at: now).socialWarmth
         let ranked = candidates.sorted { lhs, rhs in
-            let lhsScore = Self.soundEchoScore(warmth: lhs.emotionalWarmth, age: now.timeIntervalSince(lhs.lastActivatedAt))
-            let rhsScore = Self.soundEchoScore(warmth: rhs.emotionalWarmth, age: now.timeIntervalSince(rhs.lastActivatedAt))
+            let lhsScore = Self.soundEchoRegisterScore(
+                warmth: lhs.emotionalWarmth,
+                target: targetWarmth,
+                age: now.timeIntervalSince(lhs.lastActivatedAt))
+            let rhsScore = Self.soundEchoRegisterScore(
+                warmth: rhs.emotionalWarmth,
+                target: targetWarmth,
+                age: now.timeIntervalSince(rhs.lastActivatedAt))
             if lhsScore != rhsScore { return lhsScore > rhsScore }
             if lhs.lastActivatedAt != rhs.lastActivatedAt { return lhs.lastActivatedAt > rhs.lastActivatedAt }
             return lhs.id.uuidString < rhs.id.uuidString
@@ -486,13 +601,51 @@ extension CognitiveSubstrate {
         // it toward tender, a tense exchange (uncertainty up) cools it below baseline.
         // Only the FELT warmth signal is shifted; valence still reads raw socialWarmth.
         let rawWarmth = chem?.warmth ?? currentAffect.socialWarmth
-        let feltWarmth = (0.55 + rawWarmth * 0.9 - currentAffect.uncertainty * 0.45).clamped01()
+        // 2026-08-02 — RANGE RESTORED. The 2026-07-08 baseline was the right
+        // intent (raw socialWarmth rests at 0, so reading it raw made warm
+        // moments land cold) but it overshot: it did not lift the floor, it
+        // parked the signal near the CEILING. Measured on a live store with
+        // rawWarmth 0.33, the old form produced 0.85 — and across the entire
+        // uncertainty range it never fell below 0.62, while the `tender` word
+        // gate is 0.70. So the agent was told she felt TENDER on essentially
+        // every turn, including pure work conversation, and expressed it the
+        // only way a tender agent can. That is not a verbal rut; it is an
+        // honest voice reporting a manufactured feeling.
+        //
+        // The defect is DYNAMIC RANGE, not the baseline's existence: with no
+        // reachable neutral, a persona cannot sound like work. So rest now
+        // lands AT the `warm` gate and below `tender`, and the top of the
+        // scale is EARNED by real warmth instead of being the resting state.
+        // Verified against the live word gates in feltFamilyWords:
+        //   rest      (raw 0.00) -> 0.55  warm yes, tender no
+        //   ordinary  (raw 0.33) -> 0.65  warm yes, tender no
+        //   affection (raw 0.70) -> 0.76  tender yes (earned)
+        //   cool end  (unc 0.60) -> 0.28  a tense working moment reads cool
+        // Uncertainty still cools, with a gentler slope so a tense working
+        // moment reads cool rather than cold.
+        //
+        // GENERAL, not tuned to one persona: no vocabulary here, and every
+        // install gets a reachable neutral instead of a permanent warm floor.
+        let feltWarmth = (Self.feltWarmthRest
+            + rawWarmth * Self.feltWarmthEarnedSpan
+            - currentAffect.uncertainty * Self.feltWarmthUncertaintyCooling).clamped01()
         return FeltSignals(
             valence: effectiveValence,
             arousal: currentAffect.arousal,
             warmth: feltWarmth,
             tension: max(chem?.vigilance ?? 0, currentAffect.uncertainty),
             pressure: chem?.urgency ?? currentAffect.taskPressure,
+            // Agent's adjacent finding (2026-08-02): absent chemical state
+            // makes these a hard 0, so the agent structurally cannot read
+            // tired or curious — the same pegging shape as the warmth ceiling,
+            // pointed the other way. Real, and NOT fixed here on purpose: a
+            // 0.5 midpoint looks right but `feltIntensity` weights fatigue at
+            // 0.20, so it silently adds +0.10 to EVERY felt intensity and makes
+            // deep words ("grieving") reachable in an ordinary sting — measured,
+            // it broke workspaceTintReachesTheFingerprint. A missing signal
+            // needs to read as UNKNOWN (absent from the intensity sum), which
+            // means optionality in FeltSignals, not a guessed midpoint. Boarded
+            // as its own change rather than smuggled into the range fix.
             fatigue: chem?.fatigue ?? 0,
             curiosity: chem?.curiosity ?? 0,
             clarity: chem?.coherence ?? 0.5,
