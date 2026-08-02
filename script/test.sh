@@ -34,6 +34,9 @@ echo "[test] GitHub Sparkle release publisher"
 "$ROOT/tests/scripts/github_release_updater_test.sh"
 
 
+echo "[test] compiled release bundle identity guards"
+"$ROOT/tests/scripts/release_bundle_gates_test.sh"
+
 echo "[test] public release source guards"
 "$ROOT/tests/scripts/public_release_source_guards_test.sh"
 

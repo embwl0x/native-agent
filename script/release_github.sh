@@ -31,9 +31,15 @@ MOBILE_SOURCE_KEY="${NATIVEAGENT_MOBILE_SOURCE_KEY:-mobile_app}"
 RELEASE_ENTITLEMENTS="${NATIVEAGENT_RELEASE_ENTITLEMENTS:-}"
 PROVISIONING_PROFILE="${NATIVEAGENT_PROVISIONING_PROFILE:-}"
 PRODUCTION_CLOUDKIT_SCHEMA="${NATIVEAGENT_PRODUCTION_CLOUDKIT_SCHEMA:-}"
+PRIVACY_DENYLIST_FILE="${NATIVEAGENT_PRIVACY_DENYLIST_FILE:-}"
 
 if [[ -z "$MAC_BUNDLE_ID" || "$MAC_BUNDLE_ID" == com.example.* ]]; then
   note_failure "set NATIVEAGENT_MAC_BUNDLE_ID to the stable public Mac bundle identifier."
+fi
+
+if [[ -z "${NATIVEAGENT_LOCAL_IDENTITY_RE:-}" && -z "${NATIVEAGENT_PRIVACY_RE:-}" ]]; then
+  [[ -r "$PRIVACY_DENYLIST_FILE" ]] \
+    || note_failure "set NATIVEAGENT_PRIVACY_DENYLIST_FILE to the ignored maintainer privacy denylist."
 fi
 if [[ -z "$BACKGROUND_TASK_PREFIX" || "$BACKGROUND_TASK_PREFIX" == com.example.* ]]; then
   note_failure "set NATIVEAGENT_BACKGROUND_TASK_PREFIX to the stable public background-task namespace."

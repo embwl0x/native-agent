@@ -135,6 +135,7 @@ NATIVEAGENT_ICLOUD_CONTAINER_ID=iCloud.io.github.embwl0x.nativeagent \
 NATIVEAGENT_RELEASE_ENTITLEMENTS=/secure/path/NativeAgent.cloudkit.public.entitlements \
 NATIVEAGENT_PROVISIONING_PROFILE=/secure/path/NativeAgent.DeveloperID.CloudKit.provisionprofile \
 NATIVEAGENT_PRODUCTION_CLOUDKIT_SCHEMA=/secure/path/production.ckdb \
+NATIVEAGENT_PRIVACY_DENYLIST_FILE=/secure/path/privacy_denylist.regex \
 ./script/release_github.sh --preflight
 ```
 
@@ -150,6 +151,7 @@ NATIVEAGENT_ICLOUD_CONTAINER_ID=iCloud.io.github.embwl0x.nativeagent \
 NATIVEAGENT_RELEASE_ENTITLEMENTS=/secure/path/NativeAgent.cloudkit.public.entitlements \
 NATIVEAGENT_PROVISIONING_PROFILE=/secure/path/NativeAgent.DeveloperID.CloudKit.provisionprofile \
 NATIVEAGENT_PRODUCTION_CLOUDKIT_SCHEMA=/secure/path/production.ckdb \
+NATIVEAGENT_PRIVACY_DENYLIST_FILE=/secure/path/privacy_denylist.regex \
 ./script/release_github.sh
 ```
 
@@ -163,6 +165,11 @@ template therefore remains team-neutral; do not hardcode a contributor's Team
 ID into it. Set
 `NATIVEAGENT_PUBLIC_DEVICE_SYNC=none` only for an explicitly standalone Mac
 release; that artifact cannot be advertised as iPhone-compatible.
+
+The privacy denylist is a maintainer-local, ignored file with one extended
+regular expression per line for private instance names and personal identifiers.
+Preflight requires it (or an explicit privacy/identity regex), and the same
+input is applied to resources and section-independent executable byte runs.
 
 Before advertising public Mac/iPhone continuity:
 

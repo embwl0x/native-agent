@@ -1062,11 +1062,9 @@ fi
 echo "[release] leak guard passed — blank slate bundle: no configured personal data, credentials, OAuth/token files, live or derived ContextFlow state, or local identity defaults"
 
 # A1.1-2026-08-02 — COMPILED-BINARY LEAK GATE. The guard above only inspects the
-# executable's string table when NATIVEAGENT_LOCAL_IDENTITY_RE is exported, and
-# that variable defaults to EMPTY, so on a normal machine the binary was never
-# actually scanned for the private instance names. This gate is unconditional
-# and hard-coded (claude|agent). Measured on the current unscrubbed dev binary:
-# 68 canonical-casing hits — i.e. this is exactly what shipped.
+# executable using an ignored maintainer denylist. Public release preflight
+# requires that input, so the scan cannot silently degrade while public source
+# never embeds the private identities it rejects.
 #
 # A1.5-2026-08-02 — BUNDLE ASSERTION. The state check above is scoped to
 # Contents/Resources and stops at the first hit; this one walks the WHOLE

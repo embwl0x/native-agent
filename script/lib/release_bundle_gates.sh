@@ -12,36 +12,10 @@
 # ---------------------------------------------------------------------------
 # A1.1 — compiled-binary identity leak gate
 # ---------------------------------------------------------------------------
-# The pre-existing text/binary identity guard in release.sh keys off
-# NATIVEAGENT_LOCAL_IDENTITY_RE, which defaults to EMPTY — so on a machine that
-# never exported that variable the "local identity names found in release
-# executable strings" check silently scanned for nothing. This gate is
-# unconditional and hard-coded: the two private instance identities may never
-# appear in a shipped executable, no configuration required.
-RELEASE_IDENTITY_LEAK_RE_CI='claude|agent'
-# Canonical casings a real source reference can produce (types, wire values,
-# routes, log tags, SCREAMING_CASE constants).
-RELEASE_IDENTITY_LEAK_RE_EXACT='Claude|CLAUDE|claude|Agent|AGENT|agent'
-
-# ALLOWLIST (investigated 2026-08-02, A1.1):
-# Measured against the unscrubbed dev binary
-# (dist/NativeAgent.app/Contents/MacOS/NativeAgentApp, 128MB):
-#   case-insensitive /claude|agent/  -> 784 matching runs
-#   canonical casings (above)         -> 780 matching runs
-#   difference                        ->   4, all Swift mangled-symbol /
-#                                          reflection-metadata noise: dense
-#                                          mixed-case letter runs that happen to
-#                                          contain the target letters in an order
-#                                          the case-insensitive scan matches, but
-#                                          in no casing any human or code
-#                                          generator writes. (No example string
-#                                          is embedded here on purpose — a
-#                                          literal one would itself trip this
-#                                          gate, and this file ships public.)
-# There is NO legitimate product string containing these names, so the allowlist
-# is a RULE, not a literal list: a run that matches case-insensitively but
-# contains none of the canonical casings is mangler noise and is reported as a
-# warning. Anything in a canonical casing fails the release, unconditionally.
+# The compiled-binary gate consumes maintainer-local patterns instead of
+# embedding private identities in public source. GitHub release preflight
+# requires NATIVEAGENT_LOCAL_IDENTITY_RE, NATIVEAGENT_PRIVACY_RE, or a readable
+# NATIVEAGENT_PRIVACY_DENYLIST_FILE, and the same input drives resource checks.
 #
 # WHY A BYTE SCAN AND NOT `strings`: macOS `strings` (cctools) parses the Mach-O
 # and only walks loadable sections — even with -a. Verified 2026-08-02 with a
@@ -60,31 +34,51 @@ release_identity_gate_binaries() {
   find "$bundle/Contents/MacOS" -type f -perm -u+x -print0 2>/dev/null
 }
 
+release_identity_leak_regex() {
+  local regex="${NATIVEAGENT_LOCAL_IDENTITY_RE:-}"
+  local privacy_regex="${NATIVEAGENT_PRIVACY_RE:-}"
+  local denylist_file="${NATIVEAGENT_PRIVACY_DENYLIST_FILE:-}"
+  local file_regex=""
+
+  if [[ -n "$denylist_file" && -r "$denylist_file" ]]; then
+    file_regex="$(grep -Ev '^[[:space:]]*(#|$)' "$denylist_file" | paste -sd'|' - || true)"
+  fi
+  for candidate in "$privacy_regex" "$file_regex"; do
+    [[ -n "$candidate" ]] || continue
+    if [[ -n "$regex" ]]; then
+      regex="($regex)|($candidate)"
+    else
+      regex="$candidate"
+    fi
+  done
+  printf '%s' "$regex"
+}
+
 # release_assert_no_identity_strings <bundle>
 # Fails (returns 1) when any app-owned executable in the bundle carries a
 # private instance identity string.
 release_assert_no_identity_strings() {
   local bundle="$1"
-  local exe fatal_hits noise_hits ci_hits exact_hits
+  local exe fatal_hits exact_hits identity_regex
   local any_binary=false
   local failed=false
+
+  identity_regex="$(release_identity_leak_regex)"
+  if [[ -z "$identity_regex" ]]; then
+    echo "ERROR: A1.1 leak gate has no maintainer identity/privacy denylist." >&2
+    return 1
+  fi
 
   while IFS= read -r -d '' exe; do
     any_binary=true
     # Section-agnostic: every maximal run of printable bytes, not just the
     # sections `strings` chooses to walk. See the WHY note above.
-    ci_hits="$(LC_ALL=C tr -c '[:print:]' '\n' < "$exe" 2>/dev/null | grep -Ei "$RELEASE_IDENTITY_LEAK_RE_CI" || true)"
-    [[ -n "$ci_hits" ]] || continue
-    exact_hits="$(printf '%s\n' "$ci_hits" | grep -E "$RELEASE_IDENTITY_LEAK_RE_EXACT" || true)"
-    noise_hits="$(printf '%s\n' "$ci_hits" | grep -Ev "$RELEASE_IDENTITY_LEAK_RE_EXACT" || true)"
-    if [[ -n "$noise_hits" ]]; then
-      echo "[leak-gate] note: $(printf '%s\n' "$noise_hits" | wc -l | tr -d ' ') mangled-symbol near-match(es) in $(basename "$exe") — allowlisted (no canonical casing)." >&2
-    fi
+    exact_hits="$(LC_ALL=C tr -c '[:print:]' '\n' < "$exe" 2>/dev/null | grep -E "$identity_regex" || true)"
     if [[ -n "$exact_hits" ]]; then
       failed=true
       # Prefer readable `strings` output for the evidence sample; fall back to
       # the raw runs when the leak lives where strings will not look.
-      fatal_hits="$(strings "$exe" 2>/dev/null | grep -E "$RELEASE_IDENTITY_LEAK_RE_EXACT" | sort -u || true)"
+      fatal_hits="$(strings "$exe" 2>/dev/null | grep -E "$identity_regex" | sort -u || true)"
       [[ -n "$fatal_hits" ]] || fatal_hits="$(printf '%s\n' "$exact_hits" | sort -u)"
       echo "" >&2
       echo "ERROR: A1.1 leak gate — private instance identity compiled into $exe" >&2
