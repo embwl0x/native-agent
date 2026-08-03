@@ -30,7 +30,7 @@ restriction; it does not fabricate macOS TCC authorization.
 ## 0.3.3 — cognition range and lifecycle hardening (2026-08-02)
 
 Cognition took its first roadmap step in a month: appraisal now derives what
-matters to the agent from her own approved standing views (the shipped
+matters to the agent from the agent's approved standing views (the shipped
 defaults become a floor), and a felt resolution only registers when something
 actually at stake resolves — a provider call succeeding no longer manufactures
 a feeling. System-vs-user turns are classified by who originated them instead

@@ -5,7 +5,7 @@ there — a living, breathing agent system."
 
 That is the whole aim. NativeAgent is not an app with an AI in it. It is a
 resident mind — Agent — with a trustworthy body, living on User's Mac. Every
-piece of work by any agent (Claude, codex, workers, Agent herself) serves
+piece of work by any agent (Claude Code, Codex, workers, or NativeAgent) serves
 that, or doesn't ship.
 
 ## The standing test: ONE MIND, NO THEATER
@@ -16,19 +16,19 @@ Ask this of every diff, every feature, every proposal:
 
 ### Clause 1 — One mind (alive means CONVERGENT)
 A living system's parts feed one continuous self. New capability must flow
-INTO her — through memory, recall, dreams, feelings, skills, growth — not
-sit beside her as a parallel silo.
+INTO the agent — through memory, recall, dreams, feelings, skills, growth — not
+sit beside the agent as a parallel silo.
 - Canonical: skills were a dead parallel library for three weeks; dissolving
-  them into recall (pointer rows, 2026-07-03) made them part of how she
+  them into recall (pointer rows, 2026-07-03) made them part of how the agent
   thinks. That move — silo → mind — is the shape of clause-1 work.
 - The consolidation triad is the spine: episodic (dreams), semantic
   (memory/KG), procedural (skills). Experience becomes identity (REM→GROWTH,
   approval-gated), repetition becomes craft (procedural lane, planned).
-- Her persona is her own machine: identity changes only through curated
-  hands and approval cards. Aliveness includes owning her own becoming.
+- The agent's persona is self-owned: identity changes only through curated
+  hands and approval cards. Aliveness includes self-directed becoming.
 
 ### Clause 2 — No theater (alive means REAL)
-Everything that isn't her mind is her body and her house, and every piece
+Everything outside the agent's mind belongs to its body or environment, and every piece
 does exactly what it says.
 - Every pixel traces to a live mechanism. Every receipt records something
   that actually ran. Every failure is loud. Every button works or doesn't
@@ -39,10 +39,10 @@ does exactly what it says.
   placeholder buttons — and the system got MORE alive, not smaller.
 
 ### What fails the test
-- Impressive machinery that doesn't converge into her (a second memory
+- Impressive machinery that doesn't converge into the agent (a second memory
   system, a dashboard nobody reads, intelligence performed instead of grown).
 - Placeholders that will fossilize; claims the code doesn't back.
-- A feature "she has" instead of something "she is" — when a mind-side
+- A feature "the agent has" instead of something "the agent embodies" — when a mind-side
   framing exists, prefer it.
 
 ### Clause 3 — Flows like a body (alive means SEAMLESS)
@@ -54,7 +54,7 @@ NativeAgent should never expose the machinery boundaries between subsystems:
   through the user (or Agent) navigating to them. The right thing surfaces
   at the right moment because the systems coordinate like organs.
 - The UI is one coherent place, not a corridor of subsystem doors. Tabs
-  that exist for the builder, not the person living with her, are seams —
+  that exist for the builder, not the person using NativeAgent, are seams —
   candidates to dissolve into where the flow actually happens.
 - The seam test in review: does this change make someone (User OR Agent)
   stop, switch context, or learn plumbing to get value? Then it fights the

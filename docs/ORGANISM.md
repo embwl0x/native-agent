@@ -122,7 +122,7 @@ Three seams, and only three:
    `vigilance` raises tension (`max` with substrate uncertainty), and
    `fatigue/curiosity/coherence/agency/confidence` map straight into the felt
    signals (`CognitiveSubstrate+Capsule.swift`, `feltSignalsForCapsule`). So body
-   state doesn't just append a line — it shades WHICH felt word she gets (a
+   state doesn't just append a line — it shades WHICH felt word the agent receives (a
    fatigued body reads `worn`, high coherence reads `clear-headed`). Same
    sanitization + budget rules as everything else in the capsule; under budget
    pressure the Body line drops BEFORE the felt core. Full signal map:

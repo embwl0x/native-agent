@@ -25,16 +25,16 @@ The target is not a pile of plugins. The target is a lightweight, coherent agent
 
 ## Next-Gen Coordination Quality
 
-NativeAgent is past the point where "more plugins/tools" is the main win. The next-gen work is coordination quality: Agent knows what kind of turn she is in, chooses the right surface, acts with receipts, tests herself, and improves without the user babysitting it.
+NativeAgent is past the point where "more plugins/tools" is the main win. The next-gen work is coordination quality: the agent knows the current turn type, chooses the right surface, acts with receipts, verifies the result, and improves without the user babysitting it.
 
 The durable improvement lanes are:
 
-1. Intent clarity before action. Agent should classify each turn as chat, memory update, build task, research, Mac control, self-improvement, approval, schedule, Telegram, or another routed class before loading tools/memory/policy.
+1. Intent clarity before action. The agent should classify each turn as chat, memory update, build task, research, Mac control, self-improvement, approval, schedule, Telegram, or another routed class before loading tools/memory/policy.
 2. Better receipts. Meaningful actions should leave a tiny readable receipt: what changed, why, what check proved it, and whether it is permanent or still provisional.
 3. Memory confidence levels. Memory should distinguish confirmed facts, temporary project state, inferred preferences, stale facts, and contradicted/corrected facts so the KG can stay useful without preserving wrong state.
 4. Self-improvement scoreboard. Improvements should be scored after use for speed, retries, user corrections, completion rate, prompt/context size, frozen states, and related quality signals; weak improvements should be reverted or archived.
 5. One command palette/search. Prefer a fast "Find anything" surface over more tabs, covering Telegram config, memory hygiene, provider settings, the capability index, approvals, Doctor, logs, and skills.
-6. Agent's operating map. Agent should always have a compact manifest of what she can do, what she is allowed to do, what she recently learned, what is broken/disabled, and what she can build if needed. This must be a tight manifest, not giant context.
+6. The agent's operating map. NativeAgent should always supply a compact manifest of what the agent can do, what the agent is allowed to do, what the agent recently learned, what is broken or disabled, and what the agent can build if needed. This must be a tight manifest, not giant context.
 
 Current implementation anchor: `/v1/coordination/summary` is the compact readout for these lanes, `/v1/command/palette` and `/v1/command/search` are the find-anything manifest (HTTP surface retired Wave 15, 2026-06-01; the Swift-native `CommandPalette` module — `commandPaletteResponse` / `searchCommandPalette` in `Modules/NativeAgentCore/Sources/CommandPalette/CommandPalette.swift` — is the sole live path), `/v1/router/plan` is the intent-classification entry point, `/v1/improvements/maturity` is the self-upgrade gate readout (HTTP surface retired Wave 16, 2026-06-01; readout still produced internally for `/v1/command/summary`), `/v1/connectors/proof` is the connector truth ledger, `/v1/multimodal/status` is the screen/photo/file/voice readiness map, and `/v1/mac-assistant/status` is the access/readiness map for Mac assistant watch setup. These surfaces must stay lazy and manifest-routed; they should not become prompt-mass injection paths.
 

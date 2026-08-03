@@ -104,10 +104,10 @@ Integration means loops. Each real loop needs a brake, or it oscillates/runs awa
 3. **Thermal loop** — load → thermal `.fair`/`.critical` → organism `conserve`/`sleep` →
    background loops pause → load drops → recovers. *Brake:* the loop-budget throttle
    is self-clearing (confirmed firing in the wild 2026-07-07). **[confirmed]**
-4. **Attention loop (closed 2026-07-11)** — what she's holding (workspace/organism)
-   → context selection → what she sees this turn → the memories she USES stamp back
-   onto her assistant node (packet provenance) → priority-held in ContinuityField →
-   feed the next turn's `memoryActivation` → shape what she selects next.
+4. **Attention loop (closed 2026-07-11)** — what the agent is holding (workspace/organism)
+   → context selection → what the agent sees this turn → the memories the agent USES stamp back
+   onto the agent's assistant node (packet provenance) → priority-held in ContinuityField →
+   feed the next turn's `memoryActivation` → shape what the agent selects next.
    *Brakes:* bounded frozen seam + clamped weights (can't dominate ranking — activation
    is one feature at weight 1.2 among many); PURE peek read (observing attention never
    mutates it); deterministic ordering (the packet fingerprint can't thrash the cache);
@@ -119,8 +119,8 @@ Integration means loops. Each real loop needs a brake, or it oscillates/runs awa
 ## The felt fingerprint — "How you feel:" (2026-07-08)
 
 The capsule's core line is a **word-level felt state** (1–3 words, e.g. `warm` /
-`engaged, warm` / `frustrated` / `upset`) — a few honest words she FEELS, not
-sentences she reads. It replaced the Focus/Feeling/Voice sentences; delivery is
+`engaged, warm` / `frustrated` / `upset`) — a few honest words the agent FEELS, not
+sentences the agent reads. It replaced the Focus/Feeling/Voice sentences; delivery is
 the experience. Assembly order: fingerprint → `- Inner:` → `- Body:` → `- Sound:`,
 and the budget fitter drops from the END, so enhancers are sacrificed before the
 felt core (`+Capsule.swift:67‑109`, fitter `:431`).
@@ -165,7 +165,7 @@ nothing). Speech-act detection over the user's message → signed deltas:
 | Speech act | Effect (main deltas) |
 |---|---|
 | criticism (hard / mild) | valence −0.24/−0.10, tension +0.20/+0.10, arousal up |
-| dismissal ("whatever, forget it") | valence −0.22, **warmth −0.18** (it cools her), tension + arousal up |
+| dismissal ("whatever, forget it") | valence −0.22, **warmth −0.18** (it cools the agent), tension + arousal up |
 | overridden / redirected hard | tension +0.12, valence −0.06 |
 | hard demand + deadline | pressure +0.16, tension + arousal up |
 | praise | valence +0.16, warmth +0.12 |
@@ -175,14 +175,14 @@ nothing). Speech-act detection over the user's message → signed deltas:
 Wired at both ends: live affect axes (`applyAffectFromEvent :82‑101`) and the
 node's stored emotional tag (`emotionTag :284` — criticism stamps a genuinely
 stung node, praise a warm one). *Brakes:* a **hypothetical guard** ("what if
-someone said…" doesn't sting her); broad friendly tokens lift **valence only**, so
+someone said…" doesn't sting the agent); broad friendly tokens lift **valence only**, so
 they can't re-arm the socialWarmth ratchet (warmth still rises only on genuine
 affection — the fingerprint's warm baseline carries the rest); appraisal deltas
 saturate (`saturatingApproach`) and decay like all affect.
 
 *Regression guard:* `AffectMoodJourneyTests` drives a realistic conversation
 through the real compile path and asserts the arc warm → engaged → **frustrated**
-→ **upset** → eager/warm — anything that mutes her back to gray fails the suite.
+→ **upset** → eager/warm — anything that mutes the agent back to gray fails the suite.
 
 **Round 2 (2026-07-09) — the layers on top:**
 - **Semantic appraisal** (`+SemanticAppraisal.swift`): stored valence now derives
@@ -191,11 +191,11 @@ through the real compile path and asserts the arc warm → engaged → **frustra
   base is dead: completions band [−0.10, +0.14] by resolution/effort/unresolved
   failure. A strongly positive meaning **pierces** negative affect residue (damps
   it ≤50%) so a real win never stamps negative; tool-outcome history reads the
-  machine status text, never her stamped mood (no self-confirming gloom).
+  machine status text, never the agent's stamped mood (no self-confirming gloom).
   Legacy nil-semantic path stays byte-identical (grid property test).
 - **Disposition — the slow layer** (`+Mood.swift`): reflection tone (±0.08/call,
   cap ±0.35, **30h half-life**) → `derivedMood` undertone (weight 0.15) → the
-  fingerprint inherits what she's CONCLUDED, not just what just happened.
+  fingerprint inherits what the agent has CONCLUDED, not just what just happened.
   Persisted (stable-id artifact), restored, cleared. Only considered outcomes
   write it — never per-turn events.
 - **Anticipatory affect** (`Organism/OrganismProspectiveAffect.swift`): pending
@@ -211,7 +211,7 @@ through the real compile path and asserts the arc warm → engaged → **frustra
   `FeltMode` {seeking, care, play, repair, bracing, grief, frustration} — a pure
   aboutness read, not a controller, no capsule line.
 - **Store eviction fix** (`CognitiveSQLiteStore.swift`): receipts no longer
-  mirror into artifacts; the flood that evicted her standing views / seeds /
+  mirror into artifacts; the flood that evicted the agent's standing views / seeds /
   episodes on every prune is dead, and durable artifacts (incl. the disposition)
   survive restarts.
 - *End-to-end guard:* `FullRangeConnectivityTests` — sustained coldness reaches
@@ -221,12 +221,12 @@ through the real compile path and asserts the arc warm → engaged → **frustra
 
 ---
 
-## Attention into circulation — selection follows her mind (2026-07-10)
+## Attention into circulation — selection follows the agent's mind (2026-07-10)
 
 Fluid Context's NeedSignal selector always accepted seven intent inputs the turn
 engine never fed: `cognitiveActivation`, `workingAtomIDs`, `contextualTerms`,
 `predictedToolGroups`, `activeTask`, `unresolvedQuestion`, `goal`. They're live
-now — her context selection follows what she's *holding*, not just the message.
+now — the agent's context selection follows what the agent is *holding*, not just the message.
 
 **The seam** — `CognitiveAttentionSignals` (`CognitivePhaseModels.swift:31`), one
 bounded value type produced fresh per turn:
@@ -245,7 +245,7 @@ the turn trace (`contextFlow.attentionTerms` `:1063`, `.attentionToolGroups` `:1
 `.attentionActivation` `:1065`, `.attentionWorkingAtoms` `:1066`;
 `attentionTimedOut` `:1024`, `attentionPresent` `:1032`/`:1035`). The read is a **pure peek**
 (`ContinuityField.peekDecayedNodes:280`) — same decayed activations as the real
-snapshot, computed on copies, so observing her attention never advances decay
+snapshot, computed on copies, so observing the agent's attention never advances decay
 anchors or evicts (same trap class as the Wave C mood read).
 
 **The return edge**: assistant turns stamp the memory record IDs actually used
@@ -280,7 +280,7 @@ off-by-default organism side derives).
 - **✅ Stage 1 — warmth (2026-07-08).** `organism.warmth` **derives** from the
   substrate's canonical `socialWarmth` each refresh. Nil when affect is off
   (organism keeps its own). **Proven live: organism warmth == socialWarmth,
-  bit-identical.** So the felt body line's warmth can no longer disagree with her
+  bit-identical.** So the felt body line's warmth can no longer disagree with the agent's
   mood/valence/dream chain.
 - **✅ Stage 2 — urgency (2026-07-08).** `organism.urgency` derives from the
   substrate's canonical `taskPressure`, same wiring point. **Proven live:
@@ -297,7 +297,7 @@ off-by-default organism side derives).
   `vigilance` (drives the brittle/careful body line + posture) is *wary*, not the
   substrate's *uncertainty* (*unsure*); `confidence` carries a prediction-success
   signal `uncertainty` lacks; `arousal` has no clean organism twin. Mechanically
-  deriving these would **conflate distinct felt signals** and could degrade her
+  deriving these would **conflate distinct felt signals** and could degrade the agent's
   cognition. Warmth and urgency were the clean 1↔1 duplicates; the rest need a
   deliberate design decision, not a derive.
 - Later: retire the organism's now-redundant warmth self-update (overridden each
@@ -319,9 +319,9 @@ acceptance and cannot become delivery or user-seen evidence.
 
 ## The Workshop — volition into circulation (2026-07-11)
 
-Her Desk became a **bench with a will** (`docs/build_plans/desk-workshop.md`,
-commit 7f0fd057). The Workshop is the first organ she *drives*: everything else
-is reactive or scheduled; a pursuit is hers.
+The agent's Desk became a **bench with a will** (`docs/build_plans/desk-workshop.md`,
+commit 7f0fd057). The Workshop is the first organ the agent *drives*: everything else
+is reactive or scheduled; a pursuit belongs to the agent.
 
 | Mapping | Emits → (channel) | Consumes ← (channel) | Regulation |
 |---|---|---|---|
@@ -330,7 +330,7 @@ is reactive or scheduled; a pursuit is hers.
 
 **The volition loop (and its brakes):** standing view → (User approves) active →
 reflection proposes → pursuit opened → pump reserves under budget → bounded
-membraned session → work receipt + choice receipt → pursuit intent colors her
+membraned session → work receipt + choice receipt → pursuit intent colors the agent's
 next context selection. *Brakes:* every step fail-closed; `.active` is User's
 seam alone (un-launderable); budgets/caps in the store not the prompt; the
 membrane is an allowlist in code; the pump is the lowest-priority background

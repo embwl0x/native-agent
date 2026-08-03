@@ -129,8 +129,8 @@ The ownership contract is strict:
   the domain that can verify reality. Do not create a universal webhook bus,
   integration store, scheduler, approval owner, or settlement service.
 
-This is how protocol independence supports one persistent Agent: the wire
-format can change without making her reconstruct a new meaning for proposed,
+This is how protocol independence supports one persistent agent: the wire
+format can change without making the agent reconstruct a new meaning for proposed,
 running, externally waiting, verified, succeeded, or failed work. TrustCenter,
 approvals, provenance, canonical stores, and domain verification remain the
 authorities.
