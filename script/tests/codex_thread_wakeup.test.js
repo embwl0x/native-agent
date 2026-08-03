@@ -63,6 +63,33 @@ test("trusted per-message working directory becomes the fresh thread workspace",
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test("app-verified repository profile grants network from any origin surface", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-github-chatlane-"));
+  fs.mkdirSync(path.join(dir, ".git"));
+  const entries = [entry({
+    messageId: "chat-lane-github-1",
+    text: "rebase the PR and push",
+    workingDirectory: dir,
+    executionProfile: "github-command-repository-network-v1",
+    origin: { surface: "telegram", destinationId: "12345" },
+  })];
+  const clean = wakeup.sanitizePayload(entries[0].payload);
+  const cleanEntries = [{ ...entries[0], payload: clean }];
+  const thread = wakeup.freshThreadStartParams({ cwd: "/tmp/nativeagent" }, cleanEntries);
+  const turn = wakeup.turnStartParams("thread-1", cleanEntries, {});
+  const canonicalDir = fs.realpathSync(dir);
+
+  assert.equal(clean.executionProfile, "github-command-repository-network-v1");
+  assert.equal(thread.cwd, canonicalDir);
+  assert.deepEqual(turn.sandboxPolicy, {
+    type: "workspaceWrite",
+    writableRoots: [canonicalDir, path.join(canonicalDir, ".git")],
+    networkAccess: true,
+  });
+  assert.equal(turn.sandboxPolicy.networkAccess, true);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test("GitHub execution privileges fail closed for spoofed or mixed bridge payloads", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-github-spoof-"));
   const base = {

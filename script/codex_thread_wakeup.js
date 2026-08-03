@@ -1221,10 +1221,16 @@ function trustedGitHubCommandWorkingDirectory(entries) {
   const directories = new Set();
   for (const entry of entries) {
     const payload = entry && entry.payload;
+    // Trust anchor is the app-verified executionProfile marker: the Swift
+    // dispatcher only writes it for a checkout it resolved itself, and
+    // sanitizePayload only preserves the exact constant. Any origin surface
+    // (github-command, chat lanes, etc.) may carry it; a payload with no
+    // origin at all still fails closed.
     if (!payload
         || payload.executionProfile !== GITHUB_COMMAND_EXECUTION_PROFILE
         || !payload.origin
-        || payload.origin.surface !== "github-command"
+        || typeof payload.origin.surface !== "string"
+        || payload.origin.surface.trim() === ""
         || typeof payload.workingDirectory !== "string"
         || !path.isAbsolute(payload.workingDirectory)) return null;
     let stat;
