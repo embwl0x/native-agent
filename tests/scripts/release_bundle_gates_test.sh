@@ -74,4 +74,33 @@ if NATIVEAGENT_PRIVACY_DENYLIST_FILE="$DENYLIST" \
   exit 1
 fi
 
+# A three-byte identity-shaped run in opaque executable bytes is not evidence
+# of a compiled string literal. The Mach-O-aware scan owns real short strings;
+# the raw fallback must not reject coincidental ARM64/model bytes. Stub strings
+# here to model a synthetic triplet that is absent from every recognized string
+# section. Keep this token independent of maintainer identity: the public
+# exporter deliberately rewrites real private names, which can change their
+# byte length and invalidate this exact three-byte boundary fixture.
+SHORT_BUNDLE="$TMP/ShortTriplet.app"
+SHORT_BIN="$SHORT_BUNDLE/Contents/MacOS/NativeAgentApp"
+FAKE_BIN="$TMP/fake-bin"
+mkdir -p "$(dirname "$SHORT_BIN")" "$FAKE_BIN"
+printf '\000Qzx\000' > "$SHORT_BIN"
+chmod +x "$SHORT_BIN"
+printf '#!/bin/sh\nexit 0\n' > "$FAKE_BIN/strings"
+chmod +x "$FAKE_BIN/strings"
+printf '%s\n' 'Qzx' > "$TMP/short_denylist.regex"
+PATH="$FAKE_BIN:$PATH" \
+  NATIVEAGENT_PRIVACY_DENYLIST_FILE="$TMP/short_denylist.regex" \
+  release_assert_no_identity_strings "$SHORT_BUNDLE" >/dev/null
+
+# The section-agnostic fallback still rejects substantial printable identity
+# data outside Mach-O string sections.
+printf '\000private_fixture_identity\000' >> "$SHORT_BIN"
+if PATH="$FAKE_BIN:$PATH" NATIVEAGENT_PRIVACY_DENYLIST_FILE="$DENYLIST" \
+  release_assert_no_identity_strings "$SHORT_BUNDLE" >/dev/null 2>&1; then
+  echo "FAIL: substantial raw identity data outside string sections was accepted" >&2
+  exit 1
+fi
+
 printf '%s\n' 'release bundle identity gates passed'

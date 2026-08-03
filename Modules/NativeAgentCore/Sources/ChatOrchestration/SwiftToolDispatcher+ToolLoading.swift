@@ -76,6 +76,32 @@ extension SwiftToolDispatcher {
         let groupIndex = ToolPreloadHeuristics.groupIndex(
             availableToolNames: Set(names)
         )
+        let codexHelper = AgentBridgeRuntime.codexHelperURL(repoRoot: rootForRead)
+        let claudeHelper = AgentBridgeRuntime.claudeHelperURL(repoRoot: rootForRead)
+        let codexBridge = AgentBridgeRuntime.readiness(
+            helper: codexHelper,
+            cliName: "codex",
+            bridgeConfigRoot: agentBridgeConfigRoot
+        )
+        let claudeBridge = AgentBridgeRuntime.readiness(
+            helper: claudeHelper,
+            cliName: "claude",
+            bridgeConfigRoot: agentBridgeConfigRoot
+        )
+        func bridgeReadinessRow(_ readiness: AgentBridgeRuntime.Readiness) -> JSONValue {
+            .object([
+                "status": .string(readiness.readyForAsyncRoundTrip
+                    ? "ready"
+                    : (readiness.readyToAttempt ? "return_path_unavailable" : "unavailable")),
+                "execution_ready": .bool(readiness.readyToAttempt),
+                "return_path_ready": .bool(readiness.returnPath.isReady),
+                "return_path_reason": .string(readiness.returnPath.reason),
+                "helper_present": .bool(readiness.helper != nil),
+                "runtime_present": .bool(readiness.runtime != nil),
+                "cli_present": .bool(readiness.cli != nil),
+                "authentication": .string("verified_on_execution"),
+            ])
+        }
         return .object([
             "status": .string("ok"),
             "runtime": .string("swift-native"),
@@ -106,6 +132,10 @@ extension SwiftToolDispatcher {
             "available_tools": .array(names.map { .string($0) }),
             "builder_available_tools": .array(availableBuilderTools.map { .string($0) }),
             "builder_policy_locked_tools": .array(lockedBuilderTools.map { .string($0) }),
+            "builder_bridge_readiness": .object([
+                "codex": bridgeReadinessRow(codexBridge),
+                "claude_code": bridgeReadinessRow(claudeBridge),
+            ]),
             "tools": .array(rows),
         ])
     }

@@ -4,6 +4,29 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ---
 
+## 0.3.7 — installed builder round trips and real project roots (2026-08-03)
+
+Public installations now ship the complete Codex and Claude Code bridge
+workers, start the authenticated result listener without Developer Mode, and
+report CLI/helper/authentication readiness separately. Both builders run as
+real local coding sessions and return their result to the originating
+NativeAgent conversation. Finder-safe discovery covers common user-local CLI
+and Node installations, and the Codex worker heals a stale daemon whose saved
+workspace path was replaced during an app reinstall.
+
+Full Mac YOLO exposes the native operator catalog on the next turn and may
+explicitly select an existing external project for native shell, Git, patch,
+Swift build/test, Codex, or Claude Code work. Ordinary trust modes remain
+workspace-scoped, and protected system/credential paths remain denied. A live
+fresh-install proof placed native Bash, Codex, and Claude at the same external
+Git root; their verified outcomes returned through the normal receipts and
+conversation path.
+
+Apple privacy remains a separate boundary. Documents, Desktop, Downloads, and
+other macOS-protected locations can still require the user's Files & Folders or
+Full Disk Access consent. Full Mac YOLO removes NativeAgent's own workspace
+restriction; it does not fabricate macOS TCC authorization.
+
 ## 0.3.3 — cognition range and lifecycle hardening (2026-08-02)
 
 Cognition took its first roadmap step in a month: appraisal now derives what

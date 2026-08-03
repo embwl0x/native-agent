@@ -145,7 +145,13 @@ let package = Package(
             // R10-N22: bundle docs/data-bounds.md so AboutView (or any in-app viewer)
             // can open it directly from the app bundle's Resources directory.
             resources: [
-                .copy("../../docs/data-bounds.md")
+                .copy("../../docs/data-bounds.md"),
+                // Public app-only installs do not have a source checkout. The
+                // async Codex / Claude Code bridges still need their durable
+                // wakeup workers, so ship the exact helpers as app resources
+                // instead of resolving only <repo>/script at runtime.
+                .copy("../../script/codex_thread_wakeup.js"),
+                .copy("../../script/claude_thread_wakeup.js")
             ]
         ),
         .testTarget(

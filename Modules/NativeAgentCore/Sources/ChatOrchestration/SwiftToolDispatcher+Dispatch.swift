@@ -392,7 +392,11 @@ extension SwiftToolDispatcher {
             // 2026-07-25: the append is followed by a real session wakeup
             // (script/claude_thread_wakeup.js) so the message no longer waits
             // for User to open a terminal; receipt rides under "wakeup".
-            return try await runClaudeMessage(input: input, configRootOverride: agentBridgeConfigRoot)
+            return try await runClaudeMessage(
+                input: input,
+                surface: surface,
+                configRootOverride: agentBridgeConfigRoot
+            )
         case "codex_message":
             // 2026-06-08 Agent -> Codex async return channel. Same durable
             // inbox shape as claude_message, plus a best-effort local Mac

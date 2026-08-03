@@ -40,7 +40,12 @@ If docs and code disagree, trust code/git, then update the stale doc.
   chat, Telegram, Slack, iOS-forwarded turns, bridge helpers, builder tools,
   TrustCenter, connector workspace actions, and compiled Workshop procedures
   consume that same root. Relative file-tool paths resolve there. It is
-  local/generated and gitignored.
+  local/generated and gitignored. The root is the safe default, not a hidden
+  ceiling on Full Mac YOLO: when that exact effect-time policy authorizes file
+  operations and outside-workspace access, native shell/build tools and
+  Codex/Claude handoffs may select an existing absolute external project.
+  Non-Full-Mac turns remain workspace-scoped, and sensitive authority paths
+  plus protected system mutation roots remain denied.
 - Persona source: `persona/`
 
 The installed app is built by `script/install_app.sh` and normally lives in the current user's `~/Applications/NativeAgent.app`.
@@ -61,6 +66,18 @@ Mac / iOS / Telegram / Slack / local bridge
 ```
 
 Normal chat should stay fast. Use lazy manifests, small continuity cards, bounded recall, and tool loading. Do not inject broad memory, tool, skill, or connector inventories into every turn.
+
+Full Mac is the deliberate exception to lazy native operator discovery. Once
+TrustCenter has filtered the inventory and Full Mac YOLO is active, every chat
+surface receives the native file, shell, Git, patch, build, Mac-control, and
+maintenance schemas on its next turn without a restart. This removes an LLM
+reconstruction/discovery loop. Full Mac also lets the agent name the actual
+project cwd for native shell/build work and for `codex_message` /
+`claude_message`; bridge workers no longer default real coding tasks into the
+empty NativeAgent scratch workspace. It does not bypass authenticated surface
+identity, connector readiness, protected approval floors, provenance,
+effect-time validation, receipts, or domain verification. Non-Full-Mac turns
+remain compact and lazy.
 
 ### Swarm workers
 
@@ -135,7 +152,7 @@ authorities.
 | `NativeContextFlowRuntime.swift` | App-owned ContextFlow composition, start/stop/reload, the single persisted Active/Observe Only/Off production mode, resident MemoryV2 and Desk/Workshop projections, attention handoff, and public pre-onboarding force-off. It does not own canonical memory/persona state or tool authority. |
 | `NativeAgentBuildIdentity.swift` | Fail-closed running-bundle identity from stamped version, full source object ID, and dirty-source truth. A revision is exact only when the bundle is clean and carries a full Git object ID. |
 | `AgentDisplayName.swift` | Mac adapter over the shared pure identity formatter. Visible UI reads the configured PersonaEngine profile name through `AppModel.agentDisplayName`; generic onboarding labels and missing profile state fall back to `NativeAgent` instead of becoming a fixed persona. |
-| `ClaudeBridge.swift` | Authenticated localhost `/claude/*` and `/codex/*` state/message/tool/events/debug routes, descriptor-published preferred-port fallback, external-MCP deny, bounded activity, bridge attachment metadata, and honest completion status projection for text, attachment-only, failed-pre-dispatch, in-progress, and outcome-unknown results |
+| `ClaudeBridge.swift` | Always-resident, authenticated localhost `/claude/*` and `/codex/*` return/state/message/tool/events/debug routes (independent of Developer Mode), descriptor-published preferred-port fallback, external-MCP deny, bounded activity, bridge attachment metadata, and honest completion status projection for text, attachment-only, failed-pre-dispatch, in-progress, and outcome-unknown results. Loopback binding, the private per-launch bearer, TrustCenter, approvals, and effect-time validation retain authority. |
 | `CodexCompletionLifecycle.swift` | Durable digest-bound claim/cache/delivery lifecycle for Codex completion returns: at-most-once Agent-turn admission, response synchronization before external send, per-artifact settlement, stable retry only for idempotent transports, and fail-closed ambiguity/corruption handling |
 | `AgentBridgeCompletionRouter.swift` | Routes a cached Codex completion to the persisted origin, requires Slack/Telegram semantic acceptance, and refuses to replay accepted or ambiguity-settled non-idempotent artifacts |
 | `NativeLoopbackListenerParameters.swift` | Shared listener-level loopback binding and preferred/consecutive/system-assigned fallback plan for the Mac Control and Codex/Claude bridges; each bridge publishes its selected port, while accept-time peer checks and bearer auth remain separate defense-in-depth gates |
@@ -546,6 +563,7 @@ Tool families belong here:
 | `SwiftToolDispatcher+MCP.swift` | MCP bridge name parsing and live MCP calls |
 | `SwiftToolDispatcher+ExternalConnectors.swift` | Connector-specific helper seams such as X fallback |
 | `SwiftToolDispatcher+AgentBridgeTools.swift` | `time_now`, `claude_message`, `codex_message`, invoke helpers |
+| `AgentBridgeRuntime.swift` | One deterministic owner for bundled wakeup-helper lookup, Finder-safe local Codex/Claude/Node discovery, child-process environment construction, and structural bridge readiness; it never owns authentication or verification |
 | `SwiftToolDispatcher+SubprocessSupport.swift` | Shared subprocess latches, timeout, bounded pipe buffers |
 | `SwiftToolDispatcher+BuilderTools.swift` | shell/bash/git/apply_patch/tests/build/install tool execution; on a fresh Mac with no selected developer directory, the shared Process environment suppresses Apple's interactive Command Line Tools prompt so `/usr/bin` toolchain shims fail honestly instead of opening installer UI |
 | `SwiftToolDispatcher+MacIntegration.swift` | Mail/Calendar/Contacts/Music/Scheduler bridge permission wrapper |

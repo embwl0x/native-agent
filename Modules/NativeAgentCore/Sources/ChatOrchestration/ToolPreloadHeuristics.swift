@@ -654,6 +654,31 @@ public enum ToolPreloadHeuristics {
             .subtracting(alreadyActive)
     }
 
+    /// Full Mac YOLO is an explicit user-selected operating posture. When its
+    /// file-ops gate makes the native shell surface available, keep the whole
+    /// policy-permitted Full-Mac tool family ready on the FIRST provider call
+    /// of every turn. This is still only schema readiness: dispatch rechecks
+    /// Full Mac, category policy, autonomy, provenance, and effect-time gates.
+    ///
+    /// Inferring the posture from the already policy-filtered available
+    /// inventory avoids a second TrustCenter read and makes a toggle effective
+    /// on the next turn without restarting the app. Ordinary/non-Full-Mac chat
+    /// remains lazy and byte-for-byte unchanged.
+    public static func immediateFullMacTools(
+        availableToolNames: Set<String>
+    ) -> Set<String> {
+        guard availableToolNames.contains("shell"),
+              availableToolNames.contains("bash") else { return [] }
+        let candidates = Set(["read_file", "list_dir", "write_file"])
+            .union(SwiftToolDispatcher.fullMacFileToolNames)
+            .union(SwiftToolDispatcher.fullMacSystemToolNames)
+            .union(SwiftToolDispatcher.fullMacAppToolNames)
+            .union(SwiftToolDispatcher.fullMacBuilderToolNames)
+            .union(SwiftToolDispatcher.fullMacRestartToolNames)
+            .union(SwiftToolDispatcher.fullMacEvolutionToolNames)
+        return candidates.intersection(availableToolNames)
+    }
+
     /// Mirror of the dispatch-time Mac Integration gate
     /// (ChatOrchestrationClient.dispatchMacIntegrationTool →
     /// MacIntegrationPermissionStore.shared.allows(integration, mode:)).
@@ -750,9 +775,8 @@ public enum ToolPreloadHeuristics {
         permissions: MacIntegrationPermissionStore = .shared,
         dataRoot: URL
     ) async -> Set<String> {
-        guard let prediction = predict(userMessage: userMessage) else { return activeTools }
         return await preloadIfConfident(
-            prediction: prediction,
+            prediction: predict(userMessage: userMessage),
             sessionId: sessionId,
             activeTools: activeTools,
             availableToolNames: availableToolNames,
@@ -773,16 +797,24 @@ public enum ToolPreloadHeuristics {
         permissions: MacIntegrationPermissionStore = .shared,
         dataRoot: URL
     ) async -> Set<String> {
-        guard let prediction else { return activeTools }
+        // Full Mac YOLO means native operator tools are resident immediately,
+        // not hidden behind a model-decided tool_catalog/tool_load detour.
+        // This union is request-scoped and deliberately does not grow the
+        // session store or add an I/O trace on every Full-Mac turn.
+        let immediatelyReady = immediateFullMacTools(
+            availableToolNames: availableToolNames
+        )
+        let effectiveActiveTools = activeTools.union(immediatelyReady)
+        guard let prediction else { return effectiveActiveTools }
         let catalogGated = preloadableNames(
             prediction: prediction,
             availableToolNames: availableToolNames,
-            alreadyActive: activeTools
+            alreadyActive: effectiveActiveTools
         )
         // Dispatch-gate mirror: Mac Integration policy denials drop out here
         // so a policy-denied tool is never preloaded (see header invariant).
         let names = await filterByMacIntegrationPolicy(catalogGated, permissions: permissions)
-        guard !names.isEmpty else { return activeTools }
+        guard !names.isEmpty else { return effectiveActiveTools }
         _ = store
         _ = sessionId
         await appendPreloadTraceRow(
@@ -791,7 +823,7 @@ public enum ToolPreloadHeuristics {
             surface: surface,
             dataRoot: dataRoot
         )
-        return activeTools.union(names)
+        return effectiveActiveTools.union(names)
     }
 
     // MARK: - Helpers

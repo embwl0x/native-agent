@@ -12,7 +12,10 @@ func claudeMessageIdempotency() async throws {
     defer { try? FileManager.default.removeItem(at: root) }
     let dispatcher = SwiftToolDispatcher(
         dataRoot: root,
-        agentBridgeConfigRoot: root
+        agentBridgeConfigRoot: root,
+        claudeMessageWakeupOverride: { _ in
+            .object(["status": .string("queued")])
+        }
     )
     let input: [String: JSONValue] = [
         "text": .string("follow up on the deploy"),

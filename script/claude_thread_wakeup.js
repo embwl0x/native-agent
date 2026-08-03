@@ -645,8 +645,8 @@ function resolveTimeoutSeconds(payload) {
 
 function resolveCwd(payload, pointer) {
   const candidates = [
-    pointer && pointer.cwd,
     payload && payload.cwd,
+    pointer && pointer.cwd,
     process.env.NATIVE_AGENT_CLAUDE_WAKE_CWD,
     path.join(os.homedir(), "Projects", "NativeAgent"),
     process.cwd(),
@@ -2250,6 +2250,7 @@ module.exports = {
   processTreeCpuMs,
   runWakeJob,
   sanitizePayload,
+  resolveCwd,
   sessionGone,
   topicRateLimit,
   topicSlug,

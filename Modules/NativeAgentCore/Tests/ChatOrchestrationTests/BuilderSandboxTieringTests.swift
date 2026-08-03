@@ -65,6 +65,60 @@ private func writePolicy(_ obj: [String: JSONValue], to root: URL) async throws 
     }
 }
 
+@Test func BuilderTier_yolo_may_start_in_an_external_project_but_workspace_mode_may_not() async throws {
+    let root = try tierTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let external = try tierTempRoot()
+    defer { try? FileManager.default.removeItem(at: external) }
+
+    let denied = await SwiftToolDispatcher.runShellLikeProcess(
+        toolName: "bash", executable: "/bin/bash", args: ["-c", "pwd"],
+        cwd: external.path, timeoutSeconds: 30, dataRoot: root
+    )
+    guard case .object(let deniedObject) = denied else {
+        Issue.record("workspace-mode result was not an object")
+        return
+    }
+    #expect(deniedObject["reason"] == .string("cwd_invalid_or_outside_workspace"))
+
+    try await writePolicy([
+        "permissionLevel": .string("full_mac_os"),
+        "fullMacNeverExpires": .bool(true),
+        "filePolicy": .object(["outsideWorkspaceDefault": .string("allow")]),
+    ], to: root)
+    let allowed = await SwiftToolDispatcher.runShellLikeProcess(
+        toolName: "bash", executable: "/bin/bash", args: ["-c", "pwd"],
+        cwd: external.path, timeoutSeconds: 30, dataRoot: root
+    )
+    guard case .object(let allowedObject) = allowed else {
+        Issue.record("Full Mac result was not an object")
+        return
+    }
+    #expect(allowedObject["status"] == .string("completed"))
+    #expect(allowedObject["cwd"] == .string(external.resolvingSymlinksInPath().path))
+    #expect(allowedObject["sandbox_mode"] == .string("off"))
+}
+
+@Test func BuilderTier_yolo_external_cwd_keeps_sensitive_path_floor() async throws {
+    let root = try tierTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try await writePolicy([
+        "permissionLevel": .string("full_mac_os"),
+        "fullMacNeverExpires": .bool(true),
+        "filePolicy": .object(["outsideWorkspaceDefault": .string("allow")]),
+    ], to: root)
+    let result = await SwiftToolDispatcher.runShellLikeProcess(
+        toolName: "bash", executable: "/bin/bash", args: ["-c", "pwd"],
+        cwd: "~/.ssh", timeoutSeconds: 30, dataRoot: root
+    )
+    guard case .object(let object) = result else {
+        Issue.record("sensitive-cwd result was not an object")
+        return
+    }
+    #expect(object["status"] == .string("failed"))
+    #expect(object["reason"] == .string("cwd_invalid_or_outside_workspace"))
+}
+
 // TIER 2 — the whole policy in one assertion: confinement is not execution
 // denial. `swift run` must succeed INSIDE the wrap (the SwiftPM nesting shim
 // doing its job) while an out-of-workspace write in the same spawn is denied.

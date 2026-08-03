@@ -49,8 +49,10 @@ private let availableFullMacOff: Set<String> = Set(SwiftToolDispatcher.builtInTo
 private let availableFullMacOn: Set<String> = availableFullMacOff
     .union(SwiftToolDispatcher.fullMacFileToolNames)
     .union(SwiftToolDispatcher.fullMacSystemToolNames)
+    .union(SwiftToolDispatcher.fullMacAppToolNames)
     .union(SwiftToolDispatcher.fullMacBuilderToolNames)
     .union(SwiftToolDispatcher.fullMacRestartToolNames)
+    .union(SwiftToolDispatcher.fullMacEvolutionToolNames)
 
 @Suite("ToolPreloadHeuristics")
 struct ToolPreloadHeuristicsTests {
@@ -364,9 +366,33 @@ struct ToolPreloadHeuristicsTests {
         #expect(ToolPreloadHeuristics.predict(userMessage: "   \n  ") == nil)
     }
 
-    @Test("no match leaves active set, store, and traces untouched")
-    func noMatchIsStatusQuo() async throws {
+    @Test("Full Mac off and no match leaves active set, store, and traces untouched")
+    func noMatchIsStatusQuoWithoutFullMac() async throws {
         let root = try makeTempRoot("nomatch")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ActiveToolsStore(dataRoot: root)
+        let sessionId = UUID().uuidString
+        let active: Set<String> = ["market_quote"]
+
+        let out = await ToolPreloadHeuristics.preloadIfConfident(
+            userMessage: "good morning, how are you today?",
+            sessionId: sessionId,
+            activeTools: active,
+            availableToolNames: availableFullMacOff,
+            surface: "chat",
+            store: store,
+            permissions: MacIntegrationPermissionStore(dataRoot: root),
+            dataRoot: root
+        )
+        #expect(out == active)
+        let persisted = await store.load(sessionId: sessionId).activeTools
+        #expect(persisted.isEmpty)
+        #expect(readTraceRows(root).isEmpty)
+    }
+
+    @Test("Full Mac YOLO makes native operator tools immediate without persistence or trace I/O")
+    func fullMacToolsAreImmediateOnNoMatch() async throws {
+        let root = try makeTempRoot("fullmac-immediate")
         defer { try? FileManager.default.removeItem(at: root) }
         let store = ActiveToolsStore(dataRoot: root)
         let sessionId = UUID().uuidString
@@ -382,10 +408,28 @@ struct ToolPreloadHeuristicsTests {
             permissions: MacIntegrationPermissionStore(dataRoot: root),
             dataRoot: root
         )
-        #expect(out == active)
+        let expected = ToolPreloadHeuristics.immediateFullMacTools(
+            availableToolNames: availableFullMacOn
+        )
+        #expect(out == active.union(expected))
+        #expect(out.contains("read_file"))
+        #expect(out.contains("shell"))
+        #expect(out.contains("git_status"))
+        #expect(out.contains("system_info"))
+        #expect(out.contains("mac_focus_app"))
+        #expect(out.contains("restart_app"))
+        #expect(out.contains("evolution_status"))
         let persisted = await store.load(sessionId: sessionId).activeTools
         #expect(persisted.isEmpty)
         #expect(readTraceRows(root).isEmpty)
+    }
+
+    @Test("partial inventories cannot impersonate Full Mac YOLO")
+    func immediateFullMacToolsRequiresShellPair() {
+        let partial = availableFullMacOff.union(["shell"])
+        #expect(ToolPreloadHeuristics.immediateFullMacTools(
+            availableToolNames: partial
+        ).isEmpty)
     }
 
     // MARK: gated-group exclusion
@@ -461,7 +505,7 @@ struct ToolPreloadHeuristicsTests {
             userMessage: "send an email to Dave about the launch",
             sessionId: sessionId,
             activeTools: [],
-            availableToolNames: availableFullMacOn,
+            availableToolNames: availableFullMacOff,
             surface: "chat",
             store: store,
             permissions: permissions,
@@ -491,7 +535,7 @@ struct ToolPreloadHeuristicsTests {
             userMessage: "send an email to Dave about the launch",
             sessionId: sessionId,
             activeTools: [],
-            availableToolNames: availableFullMacOn,
+            availableToolNames: availableFullMacOff,
             surface: "chat",
             store: store,
             permissions: permissions,
@@ -523,7 +567,7 @@ struct ToolPreloadHeuristicsTests {
             userMessage: "search my email for the launch",
             sessionId: UUID().uuidString,
             activeTools: [],
-            availableToolNames: availableFullMacOn,
+            availableToolNames: availableFullMacOff,
             surface: "chat",
             store: ActiveToolsStore(dataRoot: root),
             permissions: MacIntegrationPermissionStore(dataRoot: root),

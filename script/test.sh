@@ -83,6 +83,10 @@ echo "[test] NativeAgentCore Swift Testing shards"
 # assertion failure after heavy stderr/test-event output. Sharding by test target
 # keeps full coverage while avoiding helper-channel overload and isolates the
 # timing-sensitive ProviderRouting tests from SelfImprovement's git subprocesses.
+# Keep each shard serial too: ChatOrchestration contains real sandboxed SwiftPM
+# fixture builds, and parallel `dsymutil` children can block each other until a
+# tool watchdog fires or outlive an interrupted helper. Sharding still bounds
+# event volume; `--no-parallel` makes child-process ownership reliable.
 # For a single-command full Core sweep, use `swift test --package-path
 # Modules/NativeAgentCore --no-parallel`; do not use the bare parallel helper
 # path as the broad gate.
@@ -114,7 +118,7 @@ CORE_SWIFT_TEST_SHARDS=(
 )
 for shard in "${CORE_SWIFT_TEST_SHARDS[@]}"; do
   echo "[test] NativeAgentCore Swift Testing shard: $shard"
-  swift test ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} --package-path "$ROOT/Modules/NativeAgentCore" --disable-xctest --filter "^(${shard})\\."
+  swift test ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} --package-path "$ROOT/Modules/NativeAgentCore" --disable-xctest --no-parallel --filter "^(${shard})\\."
 done
 
 echo "[test] NativeAgentShared Swift tests"

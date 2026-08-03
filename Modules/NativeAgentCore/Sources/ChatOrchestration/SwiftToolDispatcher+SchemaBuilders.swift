@@ -1255,6 +1255,7 @@ extension SwiftToolDispatcher {
                             ("description", .string("How prominently to surface this to Claude. 'info' = goes in the digest. 'important' = highlighted. 'urgent' = surfaces with a 🚨 tag.")),
                         ])),
                         ("topic", strSchema("Optional short topic tag (e.g. 'bug-music-tcc', 'review-needed') so Claude can group related messages.")),
+                        ("working_directory", strSchema("Optional existing absolute project directory for this Claude Code session. Canonical NativeAgent workspace/source paths work normally; any other directory requires active Full Mac YOLO with outside-workspace access allowed. Use the real target project for coding work instead of leaving Claude in NativeAgent's scratch workspace.")),
                         ("timeout_seconds", intSchema("Optional wall-clock budget for Claude's spawned session, clamped 60-3600. Default 900. Build-sized work orders (multi-file Swift changes, test suites) MUST pass a larger value: 900s has killed real sessions mid-build.")),
                     ],
                     required: ["text"]
@@ -1343,6 +1344,7 @@ extension SwiftToolDispatcher {
                             ("description", .string("Optional thinking level for this task. Sol/Terra support Low through Ultra; Luna supports Low through Max.")),
                         ])),
                         ("fast", boolSchema("Optional Fast mode for this task. true selects Codex priority service; false selects default service.")),
+                        ("working_directory", strSchema("Optional existing absolute project directory for this Codex session. Canonical NativeAgent workspace/source paths work normally; any other directory requires active Full Mac YOLO with outside-workspace access allowed. Use this for local projects that are not represented by an owner/name GitHub remote.")),
                         ("repository", strSchema("Optional GitHub repository as 'owner/name' (never a filesystem path) when this task is work on a local checkout. NativeAgent resolves it to a local clone whose git remote actually points at that repository and runs Codex there with repository network access. Omit for ordinary messages; an unknown repository is ignored rather than failing the send.")),
                     ],
                     required: ["text"]
@@ -1963,7 +1965,7 @@ extension SwiftToolDispatcher {
                     parametersJSON: params(
                         properties: [
                             ("cmd", strSchema("Required. The shell command line. Passed as -c argument to /bin/sh.")),
-                            ("cwd", strSchema("Optional working directory. Must resolve inside the canonical NativeAgent workspace or a verified NativeAgent source checkout.")),
+                            ("cwd", strSchema("Optional existing working directory. Relative paths resolve in the canonical NativeAgent workspace/source checkout. Active Full Mac YOLO may select an ordinary absolute external project; sensitive authority and protected system paths remain denied.")),
                             ("timeout_seconds", intSchema("Optional. Default 120, max 600. Subprocess group gets SIGTERM then SIGKILL after 2s.")),
                         ],
                         required: ["cmd"]
@@ -1975,7 +1977,7 @@ extension SwiftToolDispatcher {
                     parametersJSON: params(
                         properties: [
                             ("cmd", strSchema("Required. The bash command line. Passed as -c argument to /bin/bash.")),
-                            ("cwd", strSchema("Optional working directory. Must resolve inside the canonical NativeAgent workspace or a verified NativeAgent source checkout.")),
+                            ("cwd", strSchema("Optional existing working directory. Relative paths resolve in the canonical NativeAgent workspace/source checkout. Active Full Mac YOLO may select an ordinary absolute external project; sensitive authority and protected system paths remain denied.")),
                             ("timeout_seconds", intSchema("Optional. Default 120, max 600.")),
                         ],
                         required: ["cmd"]
@@ -1987,7 +1989,7 @@ extension SwiftToolDispatcher {
                     parametersJSON: params(
                         properties: [
                             ("args", stringOrStringArraySchema("Required. Full argv to pass to git. Prefer ['status'], ['log','--oneline','-5'], ['diff','HEAD~1','HEAD']; a string like 'status --short' is also accepted.")),
-                            ("cwd", strSchema("Optional working directory inside the canonical NativeAgent workspace or a verified NativeAgent source checkout.")),
+                            ("cwd", strSchema("Optional existing working directory. Relative paths resolve in the canonical NativeAgent workspace/source checkout. Active Full Mac YOLO may select an ordinary absolute external project; sensitive authority and protected system paths remain denied.")),
                             ("timeout_seconds", intSchema("Optional. Default 60, max 600.")),
                         ],
                         required: ["args"]
@@ -1999,7 +2001,7 @@ extension SwiftToolDispatcher {
                     parametersJSON: params(
                         properties: [
                             ("patch", strSchema("Required. The unified diff text. Will be written to a tmpfile before git apply.")),
-                            ("cwd", strSchema("Optional working directory inside the canonical NativeAgent workspace or a verified NativeAgent source checkout.")),
+                            ("cwd", strSchema("Optional existing working directory. Relative paths resolve in the canonical NativeAgent workspace/source checkout. Active Full Mac YOLO may select an ordinary absolute external project; sensitive authority and protected system paths remain denied.")),
                             ("three_way", boolSchema("Optional. Default true (passes --3way to git apply). Set false for strict apply that fails fast on context mismatch.")),
                         ],
                         required: ["patch"]
@@ -2018,10 +2020,10 @@ extension SwiftToolDispatcher {
                 ),
                 requestedSchema(
                     name: "swift_build",
-                    description: "Run fixed-argv SwiftPM build INSIDE NativeAgent's outer sandbox-exec wrapper (workspace-confined). Command shape is `swift build --disable-sandbox --package-path <package_path> --configuration <debug|release>` plus optional product/target/jobs. Requires Trust Center Full Mac file_ops_allowed and follows builder-tool autonomy/audit rules. Use when you want the audited fixed-argv path; `bash`/`shell` SwiftPM builds are also confined and work.",
+                    description: "Run a fixed-argv SwiftPM build. Ordinary modes use NativeAgent's workspace-confined outer wrapper; active Full Mac YOLO may build an explicitly selected external package without that wrapper. Command shape is `swift build --disable-sandbox --package-path <package_path> --configuration <debug|release>` plus optional product/target/jobs. TrustCenter, autonomy, audit receipts, and sensitive-path fences still apply.",
                     parametersJSON: params(
                         properties: [
-                            ("package_path", strSchema("Optional Swift package directory. Defaults to a verified NativeAgent source checkout when present, otherwise the canonical workspace; it must remain inside one of those roots.")),
+                            ("package_path", strSchema("Optional Swift package directory. Defaults to a verified NativeAgent source checkout when present, otherwise the canonical workspace. Active Full Mac YOLO may select an ordinary external package directory.")),
                             ("configuration", strSchema("Optional. debug or release. Defaults to debug.")),
                             ("product", strSchema("Optional product name to build. Mutually exclusive with target.")),
                             ("target", strSchema("Optional target name to build. Mutually exclusive with product.")),
@@ -2034,10 +2036,10 @@ extension SwiftToolDispatcher {
                 ),
                 requestedSchema(
                     name: "swift_test",
-                    description: "Run fixed-argv SwiftPM tests INSIDE NativeAgent's outer sandbox-exec wrapper (workspace-confined). Command shape is `swift test --disable-sandbox --package-path <package_path> --configuration <debug|release>` plus optional filter/jobs. Requires Trust Center Full Mac file_ops_allowed and follows builder-tool autonomy/audit rules.",
+                    description: "Run fixed-argv SwiftPM tests. Ordinary modes use NativeAgent's workspace-confined outer wrapper; active Full Mac YOLO may test an explicitly selected external package without that wrapper. Command shape is `swift test --disable-sandbox --package-path <package_path> --configuration <debug|release>` plus optional filter/jobs. TrustCenter, autonomy, audit receipts, and sensitive-path fences still apply.",
                     parametersJSON: params(
                         properties: [
-                            ("package_path", strSchema("Optional Swift package directory. Defaults to a verified NativeAgent source checkout when present, otherwise the canonical workspace; it must remain inside one of those roots.")),
+                            ("package_path", strSchema("Optional Swift package directory. Defaults to a verified NativeAgent source checkout when present, otherwise the canonical workspace. Active Full Mac YOLO may select an ordinary external package directory.")),
                             ("configuration", strSchema("Optional. debug or release. Defaults to debug.")),
                             ("filter", strSchema("Optional SwiftPM --filter regex/specifier.")),
                             ("jobs", intSchema("Optional SwiftPM --jobs value, clamped 1...64.")),

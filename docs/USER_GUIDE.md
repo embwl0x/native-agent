@@ -97,6 +97,10 @@ NativeAgent keeps ordinary turns small by loading capabilities lazily.
 - The agent always receives a compact tool and skill contract.
 - `tool_catalog` or `list_tools` discovers capability names and groups;
   `tool_load` activates only what the current session needs.
+- With **Full Mac YOLO** active, the complete native operator set—files, shell,
+  Git, patching, builds, Mac control, and related maintenance tools—is available
+  on the next turn without `tool_catalog`, `tool_load`, or an app restart.
+  External-service readiness and protected safety floors still apply.
 - `list_skills` lists compact procedure summaries; `read_skill` loads one
   relevant body; `save_skill` is the canonical creation/update path.
 - Skills may recommend a procedure but cannot grant tools, permissions,
@@ -109,15 +113,30 @@ NativeAgent keeps ordinary turns small by loading capabilities lazily.
   not a successful connection; NativeAgent requires the provider's applicable
   validation path.
 
-For app-only/public installations, all file, shell, Git, patch, and build work
-belongs under:
+For app-only/public installations, the safe default for file, shell, Git,
+patch, and build work is:
 
 ```text
 ~/Library/Application Support/NativeAgent/workspace
 ```
 
 A verified source-backed developer install uses the checkout's `workspace/`.
-Every chat surface and Workshop resolves the same canonical workspace.
+Every chat surface and Workshop resolves the same canonical workspace for
+relative paths and ordinary trust modes. With Full Mac YOLO active, the agent
+may explicitly select an existing absolute project elsewhere on the Mac for
+native shell/build work or a Codex/Claude Code handoff. NativeAgent validates
+that directory again at dispatch time; protected system and credential/
+authority paths do not become valid coding roots.
+
+macOS privacy permission is separate from NativeAgent trust. On a new Mac, a
+project under **Documents**, **Desktop**, **Downloads**, Mail, Messages, or
+another protected location may require an Apple consent prompt or a manual
+grant in **System Settings → Privacy & Security → Files & Folders**. If the
+project must span multiple protected locations, grant **Full Disk Access** to
+NativeAgent and relaunch it. Full Mac YOLO removes NativeAgent's workspace and
+routine-approval restriction; it cannot silently grant itself macOS TCC
+authority. Projects in ordinary user-owned locations do not need this extra
+Apple permission.
 
 ## Trust modes and approvals
 
@@ -127,9 +146,12 @@ Slack, iPhone, and delegated or swarm work.
 - **Workspace** keeps file work inside approved workspace roots.
 - **Full Mac** allows broader file and Mac access for a time-bounded confirmed
   session.
-- **Developer Mode** enables shell, system control, and other developer-class
-  operations after restart; it does not erase protected floors.
-- **Full Mac YOLO** reduces routine approval friction within its policy, but
+- **Developer Mode** enables explicitly development-only behavior after restart;
+  it is not required for the normal Full Mac operator set and does not erase
+  protected floors.
+- **Full Mac YOLO** takes effect on the next turn and removes routine approval
+  and lazy-discovery friction within its policy. It also permits an explicit
+  external project cwd for native or delegated coding work, but
   external sends, money actions, self-modification application, protected OS
   mutations, connector proof, effect-time validation, and hard security checks
   retain their authority.
@@ -175,6 +197,10 @@ available to run provider turns and tools. See
 - Local Codex and Claude Code clients must read the authenticated bridge
   descriptor at `~/.config/claude-bridge/bridge.json`; never assume port 8771
   is free or bypass the published bearer token.
+- The local return listener starts automatically with NativeAgent. Developer
+  Mode is not required for Codex or Claude Code to return a completed turn;
+  TrustCenter and the normal action/approval gates still govern what either
+  builder may do.
 
 ### Codex and Claude Code as specialist builders
 
@@ -197,10 +223,28 @@ prompt:
   default is a fresh full thread for each independent handoff; it does not
   silently hijack whichever Codex task the user currently has open.
 - **Claude Code:** `claude_message` starts the real Claude Code CLI with a
-  durable session id. NativeAgent keeps one session pointer per topic and
-  working directory, so a follow-up on the same topic resumes the prior Claude
-  Code conversation, project context, and tool history instead of starting an
-  unaware one-shot process.
+  durable session id. NativeAgent keeps one session pointer per topic, so a
+  follow-up on the same topic resumes the prior Claude Code conversation and
+  tool history instead of starting an unaware one-shot process. An explicit
+  `working_directory` on a new work order wins over the saved pointer's cwd,
+  allowing that topic to move to the real target project deliberately.
+
+The NativeAgent app bundles both bridge workers; a public install does not need
+a NativeAgent source checkout. The coding products remain user-owned local
+organs: install and sign into Codex CLI and/or Claude Code on the same Mac, and
+install Node.js for the bundled bridge workers. NativeAgent searches standard
+system and user-local locations such as `~/.local/bin`, including when the app
+was launched from Finder and inherited no interactive-shell `PATH`. The
+`tool_catalog` response reports helper, runtime, CLI, and authenticated return
+path readiness separately. Authentication to the coding product is proven only
+when execution begins. Seeing a tool schema is therefore not a claim that an
+uninstalled, signed-out, or incomplete bridge is ready, and an unavailable
+return path fails before NativeAgent queues a message that cannot come back.
+
+Sessions and credentials belong to that Mac's own Codex or Claude Code
+installation. A new computer starts with its own clean builder history; the
+bridge does not import the maintainer's conversations, account, or private
+context from another machine.
 
 NativeAgent sends a bounded work order and the correct working directory; the
 builder then inspects the repository itself. It does **not** receive an

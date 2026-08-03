@@ -1518,6 +1518,32 @@ func swiftToolDispatcher_claudeMessageQueuesInboxAndWakesClaudeSession() async t
     #expect(await wakeup.all().count == 1)
 }
 
+@Test
+func swiftToolDispatcher_asyncBuilderMessagesFailBeforeQueueWithoutReturnBridge() async throws {
+    for tool in ["codex_message", "claude_message"] {
+        let root = try makeTempRoot("\(tool)-missing-return")
+        let configRoot = root.appendingPathComponent("config", isDirectory: true)
+        let tools = SwiftToolDispatcher(dataRoot: root, agentBridgeConfigRoot: configRoot)
+        let result = try await tools.dispatch(
+            tool: tool,
+            input: ["text": .string("round-trip probe")],
+            surface: "chat"
+        )
+        guard case .object(let object) = result else {
+            Issue.record("\(tool) should return an object")
+            continue
+        }
+        #expect(object["status"] == .string("failed"))
+        #expect(object["reason"] == .string("return_bridge_unavailable"))
+        #expect(object["detail"] == .string("token_missing"))
+        #expect(object["fix"] == .string("Keep NativeAgent open and retry. The authenticated local return bridge starts automatically; Developer Mode is not required."))
+        let inboxName = tool == "codex_message" ? "codex-nativeagent-bridge" : "claude-bridge"
+        #expect(FileManager.default.fileExists(
+            atPath: configRoot.appendingPathComponent(inboxName, isDirectory: true).path
+        ) == false)
+    }
+}
+
 /// Serialized on purpose: both tests below mutate PROCESS-WIDE environment
 /// (the kill switch and the helper's test seams). Run in parallel, the kill
 /// switch leaks into the end-to-end test and turns a real wake into
@@ -1667,7 +1693,7 @@ private func claudeWakeupHelperScriptURL() -> URL {
 }
 
 @Test
-func swiftToolDispatcher_githubCommandMaySelectVerifiedCodexWorkspaceButChatCannot() async throws {
+func swiftToolDispatcher_githubCommandMaySelectVerifiedCodexWorkspaceButOrdinaryChatCannot() async throws {
     let root = try makeTempRoot("codex-message-workspace")
     let configRoot = root.appendingPathComponent("config", isDirectory: true)
     let checkout = root.appendingPathComponent("target-checkout", isDirectory: true)
@@ -1692,7 +1718,7 @@ func swiftToolDispatcher_githubCommandMaySelectVerifiedCodexWorkspaceButChatCann
         ],
         surface: "github-command"
     )
-    _ = try await tools.dispatch(
+    let denied = try await tools.dispatch(
         tool: "codex_message",
         input: [
             "text": .string("ordinary chat"),
@@ -1703,11 +1729,114 @@ func swiftToolDispatcher_githubCommandMaySelectVerifiedCodexWorkspaceButChatCann
     )
 
     let inputs = await wakeup.all()
-    #expect(inputs.count == 2)
+    #expect(inputs.count == 1)
     #expect(inputs[0]["workingDirectory"] == .string(checkout.path))
     #expect(inputs[0]["executionProfile"] == .string("github-command-repository-network-v1"))
-    #expect(inputs[1]["workingDirectory"] == nil)
-    #expect(inputs[1]["executionProfile"] == nil)
+    guard case .object(let deniedObject) = denied else {
+        Issue.record("ordinary chat should return a denial envelope")
+        return
+    }
+    #expect(deniedObject["reason"] == .string("working_directory_outside_workspace_denied"))
+}
+
+@Test
+func swiftToolDispatcher_fullMacChatPassesExplicitProjectToCodexAndClaude() async throws {
+    let root = try makeTempRoot("full-mac-agent-bridge-cwd")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let dataRoot = root.appendingPathComponent("data", isDirectory: true)
+    let project = root.appendingPathComponent("external-project", isDirectory: true)
+    try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+    try writeTrustPolicy(dataRoot, .object([
+        "permissionLevel": .string("full_mac_os"),
+        "fullMacNeverExpires": .bool(true),
+        "filePolicy": .object(["outsideWorkspaceDefault": .string("allow")]),
+        "macControlPolicy": .object([
+            "enabled": .bool(true),
+            "file_ops_allowed": .bool(true),
+            "shell_allowed": .bool(true),
+            "remote_from_ios_allowed": .bool(true),
+            "approval_required_for": .array([]),
+        ]),
+    ]))
+
+    let codex = CodexWakeupInputRecorder()
+    let claude = CodexWakeupInputRecorder()
+    let tools = SwiftToolDispatcher(
+        dataRoot: dataRoot,
+        agentBridgeConfigRoot: root.appendingPathComponent("config", isDirectory: true),
+        codexMessageNotificationPermissionOverride: false,
+        codexMessageWakeupOverride: { input in
+            await codex.append(input)
+            return .object(["status": .string("sent")])
+        },
+        claudeMessageWakeupOverride: { input in
+            await claude.append(input)
+            return .object(["status": .string("sent")])
+        }
+    )
+
+    let common: [String: JSONValue] = [
+        "text": .string("inspect and build this project"),
+        "working_directory": .string(project.path),
+    ]
+    _ = try await tools.dispatch(tool: "codex_message", input: common, surface: "chat")
+    _ = try await tools.dispatch(tool: "claude_message", input: common, surface: "chat")
+
+    let codexInputs = await codex.all()
+    let claudeInputs = await claude.all()
+    #expect(codexInputs.first?["workingDirectory"] == .string(project.path))
+    #expect(claudeInputs.first?["cwd"] == .string(project.path))
+}
+
+@Test
+func swiftToolDispatcher_asyncBuilderSchemasAdvertiseExplicitWorkingDirectory() throws {
+    let dispatcher = SwiftToolDispatcher(dataRoot: FileManager.default.temporaryDirectory)
+    for name in ["codex_message", "claude_message"] {
+        let schema = try #require(
+            dispatcher.builtInToolSchemas(includeFullMacFileTools: false).first { $0.name == name }
+        )
+        let parsed = try JSONValue.parse(schema.parametersJSON)
+        guard case .object(let root) = parsed,
+              case .object(let properties)? = root["properties"] else {
+            Issue.record("\(name) schema is malformed")
+            return
+        }
+        #expect(properties["working_directory"] != nil)
+    }
+}
+
+@Test
+func swiftToolDispatcher_nonFullMacChatRejectsExplicitExternalBridgeProject() async throws {
+    let root = try makeTempRoot("non-full-mac-agent-bridge-cwd")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let dataRoot = root.appendingPathComponent("data", isDirectory: true)
+    let project = root.appendingPathComponent("external-project", isDirectory: true)
+    try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+    let codex = CodexWakeupInputRecorder()
+    let tools = SwiftToolDispatcher(
+        dataRoot: dataRoot,
+        agentBridgeConfigRoot: root.appendingPathComponent("config", isDirectory: true),
+        codexMessageNotificationPermissionOverride: false,
+        codexMessageWakeupOverride: { input in
+            await codex.append(input)
+            return .object(["status": .string("sent")])
+        }
+    )
+    let result = try await tools.dispatch(
+        tool: "codex_message",
+        input: [
+            "text": .string("inspect this project"),
+            "working_directory": .string(project.path),
+        ],
+        surface: "chat"
+    )
+    guard case .object(let object) = result else {
+        Issue.record("expected denial envelope")
+        return
+    }
+    #expect(object["reason"] == .string("working_directory_outside_workspace_denied"))
+    let dispatched = await codex.all()
+    #expect(dispatched.isEmpty)
 }
 
 @discardableResult

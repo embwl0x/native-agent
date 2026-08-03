@@ -238,6 +238,26 @@ test("first wake creates the topic pointer and the next wake resumes it", () => 
   assert.ok(fs.existsSync(path.join(ctx.bridgeDir, "wake-sessions", "other-work.txt")));
 });
 
+test("an explicit payload cwd overrides the topic pointer cwd", () => {
+  const ctx = makeRoot("payload-cwd");
+  const alternate = path.join(ctx.root, "external-project");
+  fs.mkdirSync(alternate, { recursive: true });
+  const marker = path.join(ctx.root, "cwd-invocations.txt");
+  const bin = fakeClaude(ctx.root, "ok", `pwd >> "${marker}"\necho "ack"`);
+  const env = baseEnv(ctx, bin);
+
+  const first = runHelper(env, payloadFor({ messageId: "payload-cwd-1", topic: "same topic" }));
+  assert.equal(first.status, "completed");
+  const second = runHelper(env, payloadFor({
+    messageId: "payload-cwd-2",
+    topic: "same topic",
+    cwd: alternate,
+  }));
+  assert.equal(second.status, "completed");
+  const cwds = fs.readFileSync(marker, "utf8").trim().split("\n");
+  assert.deepEqual(cwds, [fs.realpathSync(ctx.cwd), fs.realpathSync(alternate)]);
+});
+
 test("exit 0 with empty stdout is completed_without_reply, not success", () => {
   const ctx = makeRoot("empty");
   const bin = fakeClaude(ctx.root, "silent", "exit 0");

@@ -30,6 +30,7 @@ const REPLY_DELIVERIES_PATH = process.env.NATIVE_AGENT_CODEX_REPLY_DELIVERIES_PA
 const REPLY_RECOVERY_LOCK_DIR = process.env.NATIVE_AGENT_CODEX_REPLY_RECOVERY_LOCK ||
   path.join(BRIDGE_DIR, ".reply-jobs-recovery.lock");
 const BRIDGE_TOKEN_PATH = path.join(os.homedir(), ".config", "claude-bridge", "token");
+const BRIDGE_DESCRIPTOR_PATH = path.join(os.homedir(), ".config", "claude-bridge", "bridge.json");
 const ROLLOUT_PATH_CACHE = new Map();
 const UNHEALTHY_THREAD_STATUS_TYPES = new Set(["systemError"]);
 const FRESH_THREAD_MODE = "fresh_thread";
@@ -59,6 +60,43 @@ function loadJSON(file) {
   } catch {
     return {};
   }
+}
+
+function readBridgeDescriptor(file = BRIDGE_DESCRIPTOR_PATH) {
+  const value = loadJSON(file);
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value;
+}
+
+function codexReturnBridgeEndpoint(config = {}) {
+  const explicitHost = config.bridgeHost || process.env.NATIVE_AGENT_CODEX_BRIDGE_HOST;
+  const explicitPort = config.bridgePort || process.env.NATIVE_AGENT_CODEX_BRIDGE_PORT;
+  if (explicitHost || explicitPort) {
+    return {
+      host: String(explicitHost || "127.0.0.1"),
+      port: Number(explicitPort || 8771),
+      source: "explicit",
+    };
+  }
+
+  const descriptorPath = stringSetting(
+    config,
+    "bridgeDescriptorPath",
+    "NATIVE_AGENT_CODEX_BRIDGE_DESCRIPTOR_PATH",
+    BRIDGE_DESCRIPTOR_PATH
+  );
+  const descriptor = readBridgeDescriptor(descriptorPath);
+  if (descriptor) {
+    try {
+      const endpoint = new URL(String(descriptor.url || ""));
+      const host = endpoint.hostname;
+      const port = Number(endpoint.port);
+      if (endpoint.protocol === "http:" && ["127.0.0.1", "localhost", "::1", "[::1]"].includes(host) && Number.isInteger(port) && port > 0 && port <= 65535) {
+        return { host: host === "[::1]" ? "::1" : host, port, source: "descriptor", descriptorPath };
+      }
+    } catch {}
+  }
+  return { host: "127.0.0.1", port: 8771, source: "fallback" };
 }
 
 function nowISO() {
@@ -268,6 +306,79 @@ function socketOwnerPid() {
   return Number.isFinite(pid) && pid > 1 ? pid : null;
 }
 
+function parseLsofWorkingDirectory(output) {
+  let pid = null;
+  let inode = null;
+  let cwd = null;
+  for (const line of String(output || "").split("\n")) {
+    if (line.startsWith("p")) {
+      const value = parseInt(line.slice(1), 10);
+      if (Number.isFinite(value) && value > 1) pid = value;
+    } else if (line.startsWith("i")) {
+      const value = line.slice(1).trim();
+      if (value) inode = value;
+    } else if (line.startsWith("n")) {
+      const value = line.slice(1);
+      if (value) cwd = value;
+    }
+  }
+  return { pid, inode, cwd };
+}
+
+function daemonWorkingDirectoryMismatch(observed, current) {
+  if (!observed || !current) return false;
+  if (!observed.inode || current.inode == null) return false;
+  return String(observed.inode) !== String(current.inode);
+}
+
+/// A bridge-owned Codex daemon can outlive an app uninstall. If its cwd was
+/// the NativeAgent workspace, deleting and recreating that pathname leaves the
+/// process pinned to the unlinked OLD inode. `thread/start` then fails with the
+/// misleading app-server error "failed to load configuration: No such file or
+/// directory" even though ~/.codex/config.toml and the new workspace exist.
+/// lsof exposes the process-held inode; stat exposes the pathname's current
+/// inode. Comparing both catches the replacement without guessing from the
+/// RPC wording or restarting a healthy daemon whose cwd is simply elsewhere.
+function daemonWorkingDirectoryState() {
+  const pid = socketOwnerPid();
+  if (pid == null) return { status: "no_owner", mismatch: false };
+  const result = spawnSync("/usr/sbin/lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Ffni"], {
+    encoding: "utf8",
+    timeout: 5000,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (result.status !== 0) {
+    return { status: "cwd_unavailable", mismatch: false, pid };
+  }
+  const observed = parseLsofWorkingDirectory(result.stdout);
+  if (!observed.cwd) {
+    return { status: "cwd_unavailable", mismatch: false, pid };
+  }
+  const displayedPath = observed.cwd.replace(/\s+\(deleted\)$/, "");
+  let current;
+  try {
+    const stat = fs.statSync(displayedPath);
+    current = { inode: stat.ino, cwd: displayedPath };
+  } catch {
+    return {
+      status: "cwd_missing",
+      mismatch: true,
+      pid,
+      cwd: displayedPath,
+      observedInode: observed.inode,
+    };
+  }
+  const mismatch = daemonWorkingDirectoryMismatch(observed, current);
+  return {
+    status: mismatch ? "cwd_replaced" : "ok",
+    mismatch,
+    pid,
+    cwd: displayedPath,
+    observedInode: observed.inode,
+    currentInode: String(current.inode),
+  };
+}
+
 function pidAlive(pid) {
   try {
     process.kill(pid, 0);
@@ -431,6 +542,65 @@ async function healDaemonVersionDrift() {
     }
     const record = { action: "heal_failed", error: String((error && error.message) || error), at: nowISO() };
     appendHealLog(record);
+    return record;
+  }
+}
+
+/// Foreground repair for an app-server whose cwd inode was removed beneath
+/// it. Unlike version drift, this must heal before the current `thread/start`:
+/// the stale daemon cannot execute even one useful turn. The socket is the
+/// bridge-dedicated app-server daemon, never an interactive Codex session.
+async function ensureDaemonWorkingDirectoryAligned() {
+  const initial = daemonWorkingDirectoryState();
+  if (!initial.mismatch) return null;
+  try {
+    return await withDirLock(HEAL_LOCK_DIR, async () => {
+      const state = daemonWorkingDirectoryState();
+      if (!state.mismatch) {
+        return { action: "cwd_heal_noop_already_aligned", at: nowISO(), state };
+      }
+      for (const candidate of codexCandidates()) {
+        if (!candidate || !fs.existsSync(candidate)) continue;
+        const record = {
+          action: "cwd_heal",
+          at: nowISO(),
+          reason: state.status,
+          stalePid: state.pid || null,
+          cwd: state.cwd || null,
+          observedInode: state.observedInode || null,
+          currentInode: state.currentInode || null,
+          healed: false,
+        };
+        if (!stopDaemonForRestart(candidate)) {
+          record.failure = "stale_daemon_kill_failed";
+          appendHealLog(record);
+          daemonHealState.record = record;
+          return record;
+        }
+        if (socketOwnerPid() == null) removeStaleSocket();
+        record.restart = daemonControlStart(candidate);
+        const after = daemonWorkingDirectoryState();
+        record.after = after;
+        record.healed = after.status === "ok" && !after.mismatch;
+        if (!record.healed) record.failure = "restart_cwd_still_unavailable";
+        appendHealLog(record);
+        daemonHealState.record = record;
+        return record;
+      }
+      const record = { action: "cwd_heal_no_codex_candidate", at: nowISO(), healed: false };
+      appendHealLog(record);
+      daemonHealState.record = record;
+      return record;
+    }, { waitMs: 8000, preserveLiveOwner: true });
+  } catch (error) {
+    const record = {
+      action: "cwd_heal_failed",
+      at: nowISO(),
+      healed: false,
+      error: String(error && error.message || error),
+    };
+    appendHealLog(record);
+    daemonHealState.record = record;
     return record;
   }
 }
@@ -775,6 +945,11 @@ async function connectRpcOnce(timeoutMs) {
 
 async function connectRpc(timeoutMs) {
   ensureDaemon();
+  // A public reinstall can recreate NativeAgent's workspace while the
+  // bridge-dedicated Codex daemon survives. Repair that stale cwd inode before
+  // initializing RPC; no user restart or second codex_message should be
+  // required for the first fresh thread to work.
+  await ensureDaemonWorkingDirectoryAligned();
   try {
     return await connectRpcOnce(timeoutMs);
   } catch (error) {
@@ -2795,8 +2970,8 @@ function postBridgeMessage(text, sessionId, config, metadata = {}) {
     return Promise.resolve({ status: "failed", reason: "bridge_token_empty", tokenPath });
   }
 
-  const host = stringSetting(config, "bridgeHost", "NATIVE_AGENT_CODEX_BRIDGE_HOST", "127.0.0.1");
-  const port = numberSetting(config, "bridgePort", "NATIVE_AGENT_CODEX_BRIDGE_PORT", 8771);
+  const endpoint = codexReturnBridgeEndpoint(config);
+  const { host, port } = endpoint;
   // 11 min, deliberately ABOVE the app's 600s messageWorkDeadlineSeconds so
   // the two deadlines can never fire in the same second with an undefined
   // winner (2026-07-31 audit: identical 600s/600s produced a socket-destroy vs
@@ -3726,6 +3901,9 @@ module.exports = {
   attachConsumeAndReplyDelivery,
   brainControlsForEntries,
   daemonVersionsMismatch,
+  daemonWorkingDirectoryMismatch,
+  daemonWorkingDirectoryState,
+  parseLsofWorkingDirectory,
   deliverReplyJob,
   dirLockOwnerAlive,
   extractTurnResultFromRollout,
@@ -3736,6 +3914,8 @@ module.exports = {
   executionPolicyForEntries,
   freshThreadStartParams,
   postBridgeMessage,
+  codexReturnBridgeEndpoint,
+  readBridgeDescriptor,
   processStartIdentity,
   isTerminalBridgeReply,
   bridgeDeliveryRetryable,

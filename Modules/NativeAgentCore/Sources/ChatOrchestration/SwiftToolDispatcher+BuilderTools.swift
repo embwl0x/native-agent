@@ -53,7 +53,8 @@ extension SwiftToolDispatcher {
     // verified source checkout.
     static func builderNormalizeCwd(
         _ raw: String,
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        allowOutsideWorkspace: Bool = false
     ) -> String? {
         let expanded = NSString(string: raw).expandingTildeInPath
         let url = URL(fileURLWithPath: expanded)
@@ -71,7 +72,16 @@ extension SwiftToolDispatcher {
                 return resolved
             }
         }
-        return nil
+        guard allowOutsideWorkspace else { return nil }
+        // Full Mac/explicit break-glass may select an ordinary external
+        // project as cwd, but changing cwd must not become a quieter bypass of
+        // the same credential/authority and protected-system fences enforced
+        // by native file operations.
+        guard MacControlSensitivePathFence.reason(forPath: resolved) == nil,
+              MacControlSensitivePathFence.protectedSystemMutationReason(forPath: resolved) == nil else {
+            return nil
+        }
+        return resolved
     }
 
     static func builderSourceCheckoutRequiredEnvelope(tool: String, dataRoot: URL) -> JSONValue {
@@ -966,10 +976,20 @@ extension SwiftToolDispatcher {
         let runId = UUID().uuidString
         let started = Date()
 
+        // Resolve the effective confinement posture before cwd validation.
+        // Full Mac YOLO deliberately removes the workspace wrapper, so it must
+        // also be able to start in a user-selected external project. Ordinary
+        // modes retain the canonical workspace/source-checkout boundary.
+        let sandboxMode: BuilderShellSandboxMode = await Self.builderShellSandboxMode(dataRoot: dataRoot)
+
         // Normalize and bound-check cwd. On failure: write a pre-spawn
         // audit envelope, then return a clean denied envelope (carry the
         // audit_error if the write itself failed so it's visible).
-        guard let resolvedCwd = builderNormalizeCwd(cwd, dataRoot: dataRoot) else {
+        guard let resolvedCwd = builderNormalizeCwd(
+            cwd,
+            dataRoot: dataRoot,
+            allowOutsideWorkspace: sandboxMode == .off
+        ) else {
             let auditEntry: [String: Any] = [
                 "toolName": toolName,
                 "runId": runId,
@@ -1021,7 +1041,6 @@ extension SwiftToolDispatcher {
         // sandboxed shell/bash that runs `swift build` directly — documented; use
         // swift_build/swift_test for fixed SwiftPM work, run_tests for the repo
         // suite, invoke_codex for broader build work, or the kill switch.
-        let sandboxMode: BuilderShellSandboxMode = await Self.builderShellSandboxMode(dataRoot: dataRoot)
         let sandboxed = sandboxMode != .off
         let process = Process()
         if sandboxed {

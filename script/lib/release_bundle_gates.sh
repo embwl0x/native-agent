@@ -17,14 +17,17 @@
 # requires NATIVEAGENT_LOCAL_IDENTITY_RE, NATIVEAGENT_PRIVACY_RE, or a readable
 # NATIVEAGENT_PRIVACY_DENYLIST_FILE, and the same input drives resource checks.
 #
-# WHY A BYTE SCAN AND NOT `strings`: macOS `strings` (cctools) parses the Mach-O
-# and only walks loadable sections — even with -a. Verified 2026-08-02 with a
-# fixture whose identity strings were appended outside any section: `strings`
-# and `strings -a` both returned ZERO, the byte scan found them. `strings` also
-# needs a 4-char printable run, so it reported only 68 of the 780 real hits in
-# the dev binary. The gate therefore decides on a section-agnostic byte scan
-# (tr splits on every non-printable byte) and uses `strings` only to render
-# human-readable evidence.
+# WHY BOTH A MACH-O STRING SCAN AND A BYTE SCAN: macOS `strings` understands
+# Mach-O sections, which keeps arbitrary instruction/model bytes from becoming
+# false identity matches. `-n 3` is required for short maintainer names. It does
+# not inspect bytes appended outside a loadable section, however, so a second
+# section-agnostic scan covers printable runs of four or more bytes. Three-byte
+# raw runs are deliberately excluded: ARM64 instructions and opaque payloads
+# routinely contain coincidental triplets (the 0.3.4 public build contained
+# three such `User`/`user` byte sequences while carrying no corresponding string
+# literal). Source/resource identity gates cover three-character text outside
+# the executable, while real compiled string literals remain visible to the
+# Mach-O-aware scan.
 
 release_identity_gate_binaries() {
   # Executables owned by this app. Contents/Frameworks (Sparkle, third-party)
@@ -81,7 +84,7 @@ release_personal_identity_hit_files() {
 # private instance identity string.
 release_assert_no_identity_strings() {
   local bundle="$1"
-  local exe fatal_hits exact_hits identity_regex
+  local exe fatal_hits exact_hits section_hits raw_hits identity_regex
   local any_binary=false
   local failed=false
 
@@ -93,14 +96,20 @@ release_assert_no_identity_strings() {
 
   while IFS= read -r -d '' exe; do
     any_binary=true
-    # Section-agnostic: every maximal run of printable bytes, not just the
-    # sections `strings` chooses to walk. See the WHY note above.
-    exact_hits="$(LC_ALL=C tr -c '[:print:]' '\n' < "$exe" 2>/dev/null | grep -E "$identity_regex" || true)"
+    # Mach-O string sections catch real compiled literals, including 3-byte
+    # names. The raw pass additionally catches printable data outside sections,
+    # but only for runs long enough not to confuse ARM64 instruction bytes for
+    # human-readable identity text. See the WHY note above.
+    section_hits="$(strings -n 3 "$exe" 2>/dev/null | grep -E "$identity_regex" || true)"
+    raw_hits="$(LC_ALL=C tr -c '[:print:]' '\n' < "$exe" 2>/dev/null \
+      | awk 'length($0) >= 4' \
+      | grep -E "$identity_regex" || true)"
+    exact_hits="$(printf '%s\n%s\n' "$section_hits" "$raw_hits" | sed '/^$/d')"
     if [[ -n "$exact_hits" ]]; then
       failed=true
       # Prefer readable `strings` output for the evidence sample; fall back to
       # the raw runs when the leak lives where strings will not look.
-      fatal_hits="$(strings "$exe" 2>/dev/null | grep -E "$identity_regex" | sort -u || true)"
+      fatal_hits="$(printf '%s\n' "$section_hits" | sort -u || true)"
       [[ -n "$fatal_hits" ]] || fatal_hits="$(printf '%s\n' "$exact_hits" | sort -u)"
       echo "" >&2
       echo "ERROR: A1.1 leak gate — private instance identity compiled into $exe" >&2

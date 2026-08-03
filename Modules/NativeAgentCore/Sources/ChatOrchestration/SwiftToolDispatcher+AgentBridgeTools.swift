@@ -67,7 +67,11 @@ extension SwiftToolDispatcher {
     // reply back to Agent over the local bridge. Inbox append remains the
     // source of truth; the wakeup is an additive side effect whose receipt
     // rides in the tool result under "wakeup", exactly like codex_message.
-    func runClaudeMessage(input: [String: JSONValue], configRootOverride: URL? = nil) async throws -> JSONValue {
+    func runClaudeMessage(
+        input: [String: JSONValue],
+        surface: String = "chat",
+        configRootOverride: URL? = nil
+    ) async throws -> JSONValue {
         guard case .string(let text)? = input["text"], !text.isEmpty else {
             return .object([
                 "status": .string("failed"),
@@ -86,6 +90,13 @@ extension SwiftToolDispatcher {
             if case .string(let t)? = input["topic"], !t.isEmpty { return t }
             return nil
         }()
+        let workingDirectory: String?
+        switch await resolveAgentBridgeWorkingDirectory(input: input, surface: surface) {
+        case .success(let path):
+            workingDirectory = path
+        case .failure(let envelope):
+            return envelope
+        }
         // 2026-07-25: the helper clamps 60...3600 and defaults to 900. Before
         // this knob existed there was no way for a caller to say "this is a
         // build, not a question" — and 900s SIGTERMed two Claude sessions
@@ -98,6 +109,12 @@ extension SwiftToolDispatcher {
         }()
 
         let originSessionId = Self.extractSessionId(from: input)
+        if claudeMessageWakeupOverride == nil, claudeMessageWakeupHelperOverride == nil {
+            let returnPath = AgentBridgeRuntime.returnPathReadiness(configRoot: configRootOverride)
+            guard returnPath.isReady else {
+                return Self.returnBridgeUnavailableEnvelope(returnPath)
+            }
+        }
         let dir = Self.bridgeConfigDirectory(named: "claude-bridge", configRootOverride: configRootOverride)
         let inboxURL = dir.appendingPathComponent("claude-inbox.jsonl")
 
@@ -128,6 +145,7 @@ extension SwiftToolDispatcher {
             "read": .bool(false),
         ]
         if let topic { entry["topic"] = .string(topic) }
+        if let workingDirectory { entry["workingDirectory"] = .string(workingDirectory) }
         let inboxEntry = entry
 
         // 2026-07-21 audit: mirror the codex_message twin — flock'd
@@ -143,7 +161,10 @@ extension SwiftToolDispatcher {
                     return object["messageId"] == .string(messageId) || object["id"] == .string(messageId)
                 }
                 if case .object(let object)? = existing {
-                    guard object["text"] == .string(text) else { return "conflict" }
+                    guard object["text"] == .string(text),
+                          object["workingDirectory"] == inboxEntry["workingDirectory"] else {
+                        return "conflict"
+                    }
                     return "duplicate"
                 }
                 try await appendJSONLCapped(
@@ -181,6 +202,7 @@ extension SwiftToolDispatcher {
             "queuedAt": .string(timestamp),
             "note": .string("The durable inbox row is written, and NativeAgent also wakes a real Claude session with this message as its turn input. Her final reply comes back to you as a separate bridge event; do not wait on this tool result for it."),
         ]
+        if let workingDirectory { response["workingDirectory"] = .string(workingDirectory) }
         if deduplicated {
             // A duplicate message_id means this exact event already claimed its
             // wake job on first delivery. Re-firing would double-wake Claude.
@@ -194,7 +216,8 @@ extension SwiftToolDispatcher {
                 queuedAt: timestamp,
                 inboxPath: path,
                 originSessionId: originSessionId,
-                timeoutSeconds: timeoutSeconds
+                timeoutSeconds: timeoutSeconds,
+                workingDirectory: workingDirectory
             )
         }
         return .object(response)
@@ -215,7 +238,8 @@ extension SwiftToolDispatcher {
         queuedAt: String,
         inboxPath: String,
         originSessionId: String,
-        timeoutSeconds: Int? = nil
+        timeoutSeconds: Int? = nil,
+        workingDirectory: String? = nil
     ) async -> JSONValue {
         var payload: [String: JSONValue] = [
             "messageId": .string(messageId),
@@ -228,6 +252,7 @@ extension SwiftToolDispatcher {
         if let topic { payload["topic"] = .string(topic) }
         if !originSessionId.isEmpty { payload["sessionId"] = .string(originSessionId) }
         if let timeoutSeconds { payload["timeoutSeconds"] = .int(Int64(timeoutSeconds)) }
+        if let workingDirectory { payload["cwd"] = .string(workingDirectory) }
 
         if let claudeMessageWakeupOverride {
             return await claudeMessageWakeupOverride(payload)
@@ -242,7 +267,7 @@ extension SwiftToolDispatcher {
             ])
         }
 
-        guard let helper = Self.claudeWakeupHelperURL(
+        guard let helper = AgentBridgeRuntime.claudeHelperURL(
             override: claudeMessageWakeupHelperOverride,
             repoRoot: rootForRead
         ) else {
@@ -271,28 +296,29 @@ extension SwiftToolDispatcher {
         }.value
     }
 
-    private static func claudeWakeupHelperURL(override: URL?, repoRoot: URL) -> URL? {
-        let fm = FileManager.default
-        let envPath = ProcessInfo.processInfo.environment["NATIVE_AGENT_CLAUDE_WAKEUP_HELPER"]
-        let candidates: [URL?] = [
-            override,
-            envPath.map { URL(fileURLWithPath: $0).standardizedFileURL },
-            repoRoot.appendingPathComponent("script/claude_thread_wakeup.js").standardizedFileURL,
-        ]
-        for candidate in candidates.compactMap({ $0 }) where fm.isReadableFile(atPath: candidate.path) {
-            return candidate
-        }
-        return nil
-    }
-
     /// The helper claims the job and detaches; it must never hold the tool
     /// call for the length of Claude's turn. A deadline breach here is a
     /// helper bug, and it is reported as one rather than as a silent success.
     private static func runClaudeWakeupHelper(helper: URL, inputData: Data, cwd: URL) -> JSONValue {
+        let environment = AgentBridgeRuntime.processEnvironment()
+        guard let node = AgentBridgeRuntime.executableURL(named: "node", environment: environment) else {
+            return .object([
+                "status": .string("failed"),
+                "reason": .string("node_runtime_not_found"),
+                "helper": .string(helper.path),
+                "fix": .string("Install Node.js, then restart NativeAgent."),
+            ])
+        }
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["node", helper.path]
+        process.executableURL = node
+        process.arguments = [helper.path]
         process.currentDirectoryURL = cwd
+        var childEnvironment = environment
+        if childEnvironment["NATIVE_AGENT_CLAUDE_WAKE_CLAUDE_BIN"] == nil,
+           let claude = AgentBridgeRuntime.executableURL(named: "claude", environment: environment) {
+            childEnvironment["NATIVE_AGENT_CLAUDE_WAKE_CLAUDE_BIN"] = claude.path
+        }
+        process.environment = childEnvironment
 
         let stdin = Pipe()
         let stdout = Pipe()
@@ -514,6 +540,79 @@ extension SwiftToolDispatcher {
         return true
     }
 
+    private enum AgentBridgeWorkingDirectoryResolution {
+        case success(String?)
+        case failure(JSONValue)
+    }
+
+    /// Resolve an explicit bridge cwd at the same effect-time TrustCenter
+    /// boundary as native shell tools. Canonical workspace/source roots remain
+    /// valid in ordinary modes. An external directory requires active Full Mac
+    /// file authority plus the explicit outside-workspace allow posture.
+    private func resolveAgentBridgeWorkingDirectory(
+        input: [String: JSONValue],
+        surface: String
+    ) async -> AgentBridgeWorkingDirectoryResolution {
+        guard case .string(let raw)? = input["working_directory"] else {
+            return .success(nil)
+        }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return .failure(.object([
+                "status": .string("failed"),
+                "reason": .string("working_directory_invalid"),
+                "detail": .string("working_directory must name an existing directory."),
+            ]))
+        }
+        let expanded = NSString(string: trimmed).expandingTildeInPath
+        let url = URL(fileURLWithPath: expanded)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+        var isDirectory: ObjCBool = false
+        guard url.path.hasPrefix("/"),
+              FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            return .failure(.object([
+                "status": .string("failed"),
+                "reason": .string("working_directory_invalid"),
+                "workingDirectory": .string(url.path),
+                "detail": .string("working_directory must resolve to an existing absolute directory."),
+            ]))
+        }
+
+        if Self.builderAllowedRoots(dataRoot: dataRoot).contains(where: { root in
+            let rootPath = root.path
+            return url.path == rootPath || url.path.hasPrefix(rootPath + "/")
+        }) {
+            return .success(url.path)
+        }
+
+        if let reason = MacControlSensitivePathFence.reason(forPath: url.path)
+            ?? MacControlSensitivePathFence.protectedSystemMutationReason(forPath: url.path) {
+            return .failure(.object([
+                "status": .string("failed"),
+                "reason": .string("working_directory_sensitive_path_denied"),
+                "workingDirectory": .string(url.path),
+                "detail": .string(reason),
+            ]))
+        }
+
+        let access = await fullMacToolAccess(surface: surface)
+        guard access.fullMacActive,
+              access.fileOpsAllowed,
+              Self.builderYoloPermissionLevels.contains(access.permissionLevel),
+              access.outsideWorkspaceDefault == "allow" else {
+            return .failure(.object([
+                "status": .string("failed"),
+                "reason": .string("working_directory_outside_workspace_denied"),
+                "workingDirectory": .string(url.path),
+                "workspaceRoot": .string(Self.builderWorkspaceRoot(dataRoot: dataRoot).path),
+                "detail": .string("An external coding directory requires active Full Mac YOLO with outside-workspace access set to allow."),
+            ]))
+        }
+        return .success(url.path)
+    }
+
     func runCodexMessage(input: [String: JSONValue], surface: String) async throws -> JSONValue {
         guard case .string(let text)? = input["text"], !text.isEmpty else {
             return .object([
@@ -557,6 +656,16 @@ extension SwiftToolDispatcher {
             return url.path
         }()
 
+        let requestedDirectory: String?
+        if dispatcherSuppliedDirectory == nil {
+            switch await resolveAgentBridgeWorkingDirectory(input: input, surface: surface) {
+            case .success(let path): requestedDirectory = path
+            case .failure(let envelope): return envelope
+            }
+        } else {
+            requestedDirectory = nil
+        }
+
         // Trusted path B: any caller may name an owner/name GitHub repository.
         // It is NOT a path -- the app resolves it through the same
         // remote-verified resolver the GitHub Command lane uses, so the trust
@@ -565,6 +674,7 @@ extension SwiftToolDispatcher {
         // yields nil and the send proceeds with today's no-profile behavior.
         let repositoryResolvedDirectory: String? = {
             guard dispatcherSuppliedDirectory == nil,
+                  requestedDirectory == nil,
                   case .string(let raw)? = input["repository"] else { return nil }
             let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             guard Self.isWellFormedRepositorySlug(value) else { return nil }
@@ -576,14 +686,20 @@ extension SwiftToolDispatcher {
             return checkout.standardizedFileURL.path
         }()
 
-        let workingDirectory = dispatcherSuppliedDirectory ?? repositoryResolvedDirectory
+        let workingDirectory = dispatcherSuppliedDirectory ?? requestedDirectory ?? repositoryResolvedDirectory
         // This capability marker is created only from the trusted dispatcher
         // surface plus an app-verified checkout. It is never accepted from
         // model-authored input, topic text, or repository-controlled prose.
-        let executionProfile = workingDirectory == nil
-            ? nil
-            : "github-command-repository-network-v1"
+        let executionProfile = (dispatcherSuppliedDirectory != nil || repositoryResolvedDirectory != nil)
+            ? "github-command-repository-network-v1"
+            : nil
 
+        if codexMessageWakeupOverride == nil, codexMessageWakeupHelperOverride == nil {
+            let returnPath = AgentBridgeRuntime.returnPathReadiness(configRoot: agentBridgeConfigRoot)
+            guard returnPath.isReady else {
+                return Self.returnBridgeUnavailableEnvelope(returnPath)
+            }
+        }
         let dir = Self.bridgeConfigDirectory(
             named: "codex-nativeagent-bridge",
             configRootOverride: agentBridgeConfigRoot
@@ -641,7 +757,10 @@ extension SwiftToolDispatcher {
                     return object["messageId"] == .string(messageId) || object["id"] == .string(messageId)
                 }
                 if case .object(let object)? = existing {
-                    guard object["text"] == .string(text) else { return "conflict" }
+                    guard object["text"] == .string(text),
+                          object["workingDirectory"] == inboxEntry["workingDirectory"] else {
+                        return "conflict"
+                    }
                     return "duplicate"
                 }
                 try await persistence.appendJSONL(.object(inboxEntry), to: inboxURL)
@@ -674,6 +793,7 @@ extension SwiftToolDispatcher {
             "brain": brain.jsonValue,
             "note": .string("Codex can read this through the local NativeAgent bridge inbox; NativeAgent also attempts a local Mac notification, a Codex thread wakeup, and a reply watcher that delivers Codex's final answer back through the local bridge. If Codex is already busy, the wakeup is queued until that thread is idle."),
         ]
+        if let workingDirectory { response["workingDirectory"] = .string(workingDirectory) }
         response["notification"] = await postCodexMessageArrivalNotification(
             messageId: messageId,
             text: text,
@@ -711,6 +831,20 @@ extension SwiftToolDispatcher {
         return FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".config", isDirectory: true)
             .appendingPathComponent(name, isDirectory: true)
+    }
+
+    private static func returnBridgeUnavailableEnvelope(
+        _ readiness: AgentBridgeRuntime.ReturnPathReadiness
+    ) -> JSONValue {
+        .object([
+            "status": .string("failed"),
+            "reason": .string("return_bridge_unavailable"),
+            "detail": .string(readiness.reason),
+            "return_path_ready": .bool(false),
+            "token_present": .bool(readiness.tokenPresent),
+            "descriptor_present": .bool(readiness.descriptorPresent),
+            "fix": .string("Keep NativeAgent open and retry. The authenticated local return bridge starts automatically; Developer Mode is not required."),
+        ])
     }
 
     private func postCodexMessageArrivalNotification(
@@ -841,7 +975,7 @@ extension SwiftToolDispatcher {
             ])
         }
 
-        guard let helper = Self.codexWakeupHelperURL(
+        guard let helper = AgentBridgeRuntime.codexHelperURL(
             override: codexMessageWakeupHelperOverride,
             repoRoot: rootForRead
         ) else {
@@ -887,23 +1021,6 @@ extension SwiftToolDispatcher {
         return await Task.detached(priority: .utility) {
             Self.runCodexWakeupHelper(helper: helper, inputData: inputData, cwd: cwd)
         }.value
-    }
-
-    private static func codexWakeupHelperURL(override: URL?, repoRoot: URL) -> URL? {
-        let fm = FileManager.default
-        let envPath = ProcessInfo.processInfo.environment["NATIVE_AGENT_CODEX_WAKEUP_HELPER"]
-        let candidates: [URL?] = [
-            override,
-            envPath.map { URL(fileURLWithPath: $0).standardizedFileURL },
-            repoRoot.appendingPathComponent("script/codex_thread_wakeup.js").standardizedFileURL,
-            FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(".codex/scripts/nativeagent_codex_wakeup.js")
-                .standardizedFileURL,
-        ]
-        for candidate in candidates.compactMap({ $0 }) where fm.isReadableFile(atPath: candidate.path) {
-            return candidate
-        }
-        return nil
     }
 
     /// Concurrent accumulator for one child pipe.
@@ -981,10 +1098,25 @@ extension SwiftToolDispatcher {
     }
 
     private static func runCodexWakeupHelper(helper: URL, inputData: Data, cwd: URL) -> JSONValue {
+        let environment = AgentBridgeRuntime.processEnvironment()
+        guard let node = AgentBridgeRuntime.executableURL(named: "node", environment: environment) else {
+            return .object([
+                "status": .string("failed"),
+                "reason": .string("node_runtime_not_found"),
+                "helper": .string(helper.path),
+                "fix": .string("Install Node.js, then restart NativeAgent."),
+            ])
+        }
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["node", helper.path]
+        process.executableURL = node
+        process.arguments = [helper.path]
         process.currentDirectoryURL = cwd
+        var childEnvironment = environment
+        if childEnvironment["CODEX_BIN"] == nil,
+           let codex = AgentBridgeRuntime.executableURL(named: "codex", environment: environment) {
+            childEnvironment["CODEX_BIN"] = codex.path
+        }
+        process.environment = childEnvironment
 
         let stdin = Pipe()
         let stdout = Pipe()
@@ -1243,10 +1375,20 @@ extension SwiftToolDispatcher {
         // or ~/.claude/bin/, sometimes /opt/homebrew/bin/. Use `env` to
         // honor PATH. Process inherits the user's environment so MCP
         // config, auth, ~/.claude/settings.json all come along.
+        let environment = AgentBridgeRuntime.processEnvironment()
+        guard let claude = AgentBridgeRuntime.executableURL(named: "claude", environment: environment) else {
+            heartbeat.cancel()
+            return .object([
+                "status": .string("failed"),
+                "reason": .string("claude_cli_not_found"),
+                "fix": .string("Install and sign in to Claude Code, then restart NativeAgent."),
+            ])
+        }
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["claude"] + sessionArgs + ["-p", fullPrompt]
+        process.executableURL = claude
+        process.arguments = sessionArgs + ["-p", fullPrompt]
         process.currentDirectoryURL = URL(fileURLWithPath: sessionCwd)
+        process.environment = environment
 
         let stdout = Pipe()
         let stderr = Pipe()
@@ -1516,8 +1658,16 @@ extension SwiftToolDispatcher {
         let auditURL = auditDir.appendingPathComponent("\(runId).json")
         let lastMessageURL = auditDir.appendingPathComponent("\(runId)-last-message.txt")
 
+        let environment = AgentBridgeRuntime.processEnvironment()
+        guard let codex = AgentBridgeRuntime.executableURL(named: "codex", environment: environment) else {
+            return .object([
+                "status": .string("failed"),
+                "reason": .string("codex_cli_not_found"),
+                "fix": .string("Install and sign in to Codex CLI, then restart NativeAgent."),
+            ])
+        }
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.executableURL = codex
         let args = codexExecArguments(
             sandbox: sandbox,
             cwd: cwdRaw,
@@ -1527,8 +1677,9 @@ extension SwiftToolDispatcher {
             serviceTier: brain.serviceTier,
             prompt: fullPrompt
         )
-        process.arguments = args
+        process.arguments = Array(args.dropFirst())
         process.currentDirectoryURL = URL(fileURLWithPath: cwdRaw)
+        process.environment = environment
 
         let stdout = Pipe()
         let stderr = Pipe()

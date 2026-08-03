@@ -6,6 +6,7 @@ VERIFIER="$ROOT/script/verify_release_artifact.sh"
 SOURCE_RESOURCES="$ROOT/Modules/NativeAgentCore/Sources/MemoryV2/Resources"
 RESOURCE_REL="Modules/NativeAgentCore/Sources/MemoryV2/Resources"
 EXPECTED_BUNDLE="NativeAgentCore_MemoryV2.bundle"
+APP_RESOURCE_BUNDLE="NativeAgent_NativeAgentApp.bundle"
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/nativeagent-release-resource-tests.XXXXXX")"
 trap 'rm -rf "$TMP_ROOT"' EXIT
 
@@ -53,9 +54,21 @@ expect_success \
 
 staged_root="$TMP_ROOT/staged"
 clone_tree "$SOURCE_RESOURCES" "$staged_root/$EXPECTED_BUNDLE"
+mkdir -p "$staged_root/$APP_RESOURCE_BUNDLE"
+cp "$ROOT/script/codex_thread_wakeup.js" "$staged_root/$APP_RESOURCE_BUNDLE/"
+cp "$ROOT/script/claude_thread_wakeup.js" "$staged_root/$APP_RESOURCE_BUNDLE/"
 expect_success \
   "complete resources in expected SwiftPM bundle" \
   "$VERIFIER" --verify-resource-bundle "$staged_root"
+
+missing_bridge_root="$TMP_ROOT/missing-bridge"
+clone_tree "$SOURCE_RESOURCES" "$missing_bridge_root/$EXPECTED_BUNDLE"
+mkdir -p "$missing_bridge_root/$APP_RESOURCE_BUNDLE"
+cp "$ROOT/script/codex_thread_wakeup.js" "$missing_bridge_root/$APP_RESOURCE_BUNDLE/"
+expect_failure \
+  "missing Claude Code bridge helper" \
+  "exactly one Claude Code bridge helper; found 0" \
+  "$VERIFIER" --verify-resource-bundle "$missing_bridge_root"
 
 missing_root="$TMP_ROOT/missing"
 clone_tree "$SOURCE_RESOURCES" "$missing_root/$RESOURCE_REL"

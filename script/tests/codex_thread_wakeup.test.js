@@ -867,6 +867,32 @@ test("bridge completion payload carries the stable reply-job delivery id", async
   }
 });
 
+test("Codex reply delivery follows NativeAgent's published fallback port", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-codex-return-descriptor-"));
+  const descriptorPath = path.join(dir, "bridge.json");
+  try {
+    fs.writeFileSync(descriptorPath, JSON.stringify({
+      url: "http://127.0.0.1:49321",
+      host: "127.0.0.1",
+      port: 49321,
+    }));
+    assert.deepEqual(
+      wakeup.codexReturnBridgeEndpoint({ bridgeDescriptorPath: descriptorPath }),
+      { host: "127.0.0.1", port: 49321, source: "descriptor", descriptorPath }
+    );
+    assert.deepEqual(
+      wakeup.codexReturnBridgeEndpoint({
+        bridgeDescriptorPath: descriptorPath,
+        bridgeHost: "localhost",
+        bridgePort: 49999,
+      }),
+      { host: "localhost", port: 49999, source: "explicit" }
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("reply delivery identity is deterministic for a Codex thread and turn", () => {
   const first = wakeup.stableUUID("codex-reply:thread-1:turn-1");
   const duplicate = wakeup.stableUUID("codex-reply:thread-1:turn-1");
@@ -1126,6 +1152,25 @@ test("daemon version mismatch fires only on two concrete differing versions", ()
   assert.equal(wakeup.daemonVersionsMismatch(null), false);
   assert.equal(wakeup.daemonVersionsMismatch(undefined), false);
   assert.equal(wakeup.daemonVersionsMismatch({}), false);
+});
+
+test("daemon cwd identity detects a workspace pathname recreated under a live daemon", () => {
+  const observed = wakeup.parseLsofWorkingDirectory([
+    "p9044",
+    "fcwd",
+    "i695875",
+    "n/Users/example/Library/Application Support/NativeAgent/workspace",
+    "",
+  ].join("\n"));
+  assert.deepEqual(observed, {
+    pid: 9044,
+    inode: "695875",
+    cwd: "/Users/example/Library/Application Support/NativeAgent/workspace",
+  });
+  assert.equal(wakeup.daemonWorkingDirectoryMismatch(observed, { inode: 701433 }), true);
+  assert.equal(wakeup.daemonWorkingDirectoryMismatch(observed, { inode: 695875 }), false);
+  assert.equal(wakeup.daemonWorkingDirectoryMismatch({ cwd: observed.cwd }, { inode: 701433 }), false);
+  assert.equal(wakeup.daemonWorkingDirectoryMismatch(null, { inode: 701433 }), false);
 });
 
 // Heal-lock liveness (2026-07-17, audit G2): a healer killed mid-heal leaves

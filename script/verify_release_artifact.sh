@@ -254,6 +254,45 @@ verify_minilm_swiftpm_resources() {
   echo "[resources] verified staged MiniLM SwiftPM bundle: $expected_bundle"
 }
 
+verify_bridge_helper_source_resources() {
+  local repo_root="$1" codex_helper claude_helper
+  codex_helper="$repo_root/script/codex_thread_wakeup.js"
+  [[ -f "$codex_helper" && ! -L "$codex_helper" ]] \
+    || fail "source tree missing required Codex bridge helper: $codex_helper"
+  claude_helper=""
+  if [[ -f "$repo_root/script/claude_thread_wakeup.js" && ! -L "$repo_root/script/claude_thread_wakeup.js" ]]; then
+    claude_helper="$repo_root/script/claude_thread_wakeup.js"
+  elif [[ -f "$repo_root/script/claude_thread_wakeup.js" && ! -L "$repo_root/script/claude_thread_wakeup.js" ]]; then
+    claude_helper="$repo_root/script/claude_thread_wakeup.js"
+  fi
+  [[ -n "$claude_helper" ]] \
+    || fail "source tree missing required Claude Code bridge helper"
+  [[ "$(wc -c < "$codex_helper" | tr -d '[:space:]')" -gt 10000 ]] \
+    || fail "Codex bridge helper is unexpectedly small: $codex_helper"
+  [[ "$(wc -c < "$claude_helper" | tr -d '[:space:]')" -gt 10000 ]] \
+    || fail "Claude Code bridge helper is unexpectedly small: $claude_helper"
+  echo "[resources] verified bridge helper source resources"
+}
+
+verify_bridge_helper_bundle_resources() {
+  local contents_resources="$1" codex_hits claude_hits codex_count claude_count
+  codex_hits="$(find "$contents_resources" -type f -name 'codex_thread_wakeup.js' -print 2>/dev/null || true)"
+  claude_hits="$(find "$contents_resources" -type f \
+    \( -name 'claude_thread_wakeup.js' -o -name 'claude_thread_wakeup.js' \) \
+    -print 2>/dev/null || true)"
+  codex_count="$(printf '%s\n' "$codex_hits" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
+  claude_count="$(printf '%s\n' "$claude_hits" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
+  [[ "$codex_count" == "1" ]] \
+    || fail "release resources require exactly one Codex bridge helper; found $codex_count"
+  [[ "$claude_count" == "1" ]] \
+    || fail "release resources require exactly one Claude Code bridge helper; found $claude_count"
+  [[ "$(wc -c < "$codex_hits" | tr -d '[:space:]')" -gt 10000 ]] \
+    || fail "bundled Codex bridge helper is unexpectedly small: $codex_hits"
+  [[ "$(wc -c < "$claude_hits" | tr -d '[:space:]')" -gt 10000 ]] \
+    || fail "bundled Claude Code bridge helper is unexpectedly small: $claude_hits"
+  echo "[resources] verified staged Codex and Claude Code bridge helpers"
+}
+
 SPECIAL_MODE_COUNT=0
 [[ -n "$RESOURCE_SOURCE_ROOT" ]] && ((SPECIAL_MODE_COUNT += 1))
 [[ -n "$RESOURCE_BUNDLE_ROOT" ]] && ((SPECIAL_MODE_COUNT += 1))
@@ -266,8 +305,10 @@ if (( SPECIAL_MODE_COUNT == 1 )); then
     || fail "focused verification modes cannot be combined with artifact options"
   if [[ -n "$RESOURCE_SOURCE_ROOT" ]]; then
     verify_minilm_source_resources "$RESOURCE_SOURCE_ROOT"
+    verify_bridge_helper_source_resources "$RESOURCE_SOURCE_ROOT"
   elif [[ -n "$RESOURCE_BUNDLE_ROOT" ]]; then
     verify_minilm_swiftpm_resources "$RESOURCE_BUNDLE_ROOT"
+    verify_bridge_helper_bundle_resources "$RESOURCE_BUNDLE_ROOT"
   else
     verify_no_derived_context_state "$DERIVED_CONTEXT_SCAN_ROOT" "selected tree"
   fi
@@ -442,6 +483,7 @@ if [[ "$REQUIRE_CLEAN_SOURCE" == "true" && "$SOURCE_DIRTY" != "false" ]]; then
   fail "release artifact was built from a dirty or unknown source tree"
 fi
 verify_minilm_swiftpm_resources "$RESOURCES"
+verify_bridge_helper_bundle_resources "$RESOURCES"
 verify_no_derived_context_state "$RESOURCES" "release resources"
 require_absent "$RESOURCES/daemon"
 require_absent "$RESOURCES/native_agentd.py"

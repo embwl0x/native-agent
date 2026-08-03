@@ -188,33 +188,6 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         _ = descriptorFileURL.path.withCString { Darwin.unlink($0) }
     }
 
-    /// Sweep credentials left by a PREVIOUS run when this launch is gated off.
-    ///
-    /// A clean quit removes them; a crash or an upgrade into a gated build does
-    /// not, so a public install can inherit a token file and a descriptor
-    /// advertising a bearer for a port nobody is listening on (gpt-5.5 review,
-    /// NEEDS_FIX). The sweep is CONDITIONAL because `~/.config/claude-bridge/`
-    /// is shared across data roots: a second instance running with
-    /// `NATIVEAGENT_BRIDGE_FORCE=1` is a legitimate live publisher and must not
-    /// have its credentials deleted out from under it. The descriptor records
-    /// the publishing pid, so "is that process still alive" is the test —
-    /// no pid recorded (older schema) is treated as stale.
-    private func sweepStaleDiscoveryFilesWhenGatedOff() {
-        let ownPID = ProcessInfo.processInfo.processIdentifier
-        if let data = try? Data(contentsOf: descriptorFileURL),
-           let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-           let pid = (obj["processIdentifier"] as? NSNumber)?.int32Value,
-           pid != ownPID,
-           kill(pid, 0) == 0 || errno == EPERM {
-            NSLog(
-                "[ClaudeBridge] gated off; leaving discovery files alone — pid %d still owns them",
-                pid
-            )
-            return
-        }
-        removeDiscoveryFiles()
-    }
-
     // MARK: - Lifecycle
 
     /// Start the bridge on its preferred port, advancing deterministically on
@@ -255,62 +228,13 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         removeDiscoveryFiles()
     }
 
-    /// A1.2 (prerelease-upgrade-campaign): the bridge is a developer/agent
-    /// affordance, not a shipped feature. On a public install it bound
-    /// 127.0.0.1:8771 and minted a bearer token unconditionally, handing any
-    /// same-user process a full LLM-turn + tool-dispatch channel with no
-    /// user-visible purpose. Gate:
-    ///   * TrustPolicy `developerMode == true` (top-level key of
-    ///     `<dataRoot>/trust/policy.json`), OR
-    ///   * `NATIVEAGENT_BRIDGE_FORCE == "1"` in the process environment.
-    ///
-    /// Read straight from the live policy file — the SAME source
-    /// `MacControlBridge.bridgePolicyAllows` / `bridgeDestructiveActionsAllowed`
-    /// use — because this runs off-MainActor on the launch dispatch queue,
-    /// before `AppModel.trustPolicy` has loaded. Deliberately NOT a second
-    /// policy loader: same path, same key, same `as? Bool == true` semantics
-    /// (absent key ⇒ false ⇒ gated off).
-    nonisolated static func startGateAllows() -> Bool {
-        let policyURL = NativeAgentPaths.dataRoot
-            .appendingPathComponent("trust")
-            .appendingPathComponent("policy.json")
-        let json: [String: Any]? = {
-            guard let data = try? Data(contentsOf: policyURL) else { return nil }
-            return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        }()
-        return startGateAllows(
-            policyJSON: json,
-            forceEnvValue: ProcessInfo.processInfo.environment["NATIVEAGENT_BRIDGE_FORCE"]
-        )
-    }
-
-    /// Pure decision seam for `startGateAllows()` — same semantics, no I/O, so
-    /// tests can pin the gate without mutating the process environment or the
-    /// data root. `policyJSON == nil` models a missing/unparseable policy file.
-    nonisolated static func startGateAllows(
-        policyJSON: [String: Any]?,
-        forceEnvValue: String?
-    ) -> Bool {
-        if forceEnvValue == "1" { return true }
-        // STRICT: `as? Bool` would accept `{"developerMode": 1}` (Foundation
-        // bridges NSNumber to Bool). Damaged or tampered authority bytes must
-        // leave the bridge DOWN, so anything that isn't a real JSON `true`
-        // reads as false (gpt-5.5 review, BLOCKING).
-        return BridgeCore.strictBool(policyJSON?["developerMode"])
-    }
-
     private func startSync() {
-        // Gate BEFORE any bind and before `BridgeCore.generateToken()` — a
-        // gated-off launch must leave no listener, no in-memory token, and no
-        // token/descriptor file on disk.
-        guard Self.startGateAllows() else {
-            NSLog(
-                "[ClaudeBridge] not starting: developerMode is off and "
-                + "NATIVEAGENT_BRIDGE_FORCE != 1 — no port bound, no token minted"
-            )
-            sweepStaleDiscoveryFilesWhenGatedOff()
-            return
-        }
+        // The coding-organ return listener is ordinary NativeAgent
+        // infrastructure, not a developer-mode capability. It is always
+        // resident so installed Codex/Claude sessions can complete their
+        // authenticated round trip. Authority still comes from loopback-only
+        // binding, a per-launch private bearer, and the normal Trust Center /
+        // approval gates applied at each message and tool endpoint.
         stateLock.lock()
         let alreadyRunningOrStarting = bridgeListener.isActive || !_token.isEmpty
         stateLock.unlock()
@@ -391,24 +315,23 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
             return
         }
         let repoRoot = PersistenceCore.defaultDataRoot().deletingLastPathComponent()
-        let candidates: [URL?] = [
-            environment["NATIVE_AGENT_CODEX_WAKEUP_HELPER"].map {
-                URL(fileURLWithPath: $0).standardizedFileURL
-            },
-            repoRoot.appendingPathComponent("script/codex_thread_wakeup.js").standardizedFileURL,
-            FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(".codex/scripts/nativeagent_codex_wakeup.js")
-                .standardizedFileURL,
-        ]
-        guard let helper = candidates.compactMap({ $0 }).first(where: {
-            FileManager.default.isReadableFile(atPath: $0.path)
-        }) else {
+        guard let helper = AgentBridgeRuntime.codexHelperURL(repoRoot: repoRoot) else {
+            return
+        }
+        let processEnvironment = AgentBridgeRuntime.processEnvironment(base: environment)
+        guard let node = AgentBridgeRuntime.executableURL(named: "node", environment: processEnvironment) else {
             return
         }
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["node", helper.path, "--recover-reply-jobs"]
+        process.executableURL = node
+        process.arguments = [helper.path, "--recover-reply-jobs"]
         process.currentDirectoryURL = repoRoot
+        var childEnvironment = processEnvironment
+        if childEnvironment["CODEX_BIN"] == nil,
+           let codex = AgentBridgeRuntime.executableURL(named: "codex", environment: processEnvironment) {
+            childEnvironment["CODEX_BIN"] = codex.path
+        }
+        process.environment = childEnvironment
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice

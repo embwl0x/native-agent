@@ -36,12 +36,30 @@ trust, transcript, and receipt rules converge on the same orchestration path.
 | Trust | TrustCenter, SecurityCenter, Full Mac gates, connector proof, approval replay, exact receipts, signed iOS actions, and fail-closed persistence boundaries remain authoritative. |
 
 Local bridge clients should read `~/.config/claude-bridge/bridge.json`. NativeAgent prefers port 8771, advances when it is occupied, and publishes the actual loopback URL and bearer token together rather than requiring clients to assume a fixed port.
+The authenticated return listener is normal app infrastructure and starts on
+every launch; it is not hidden behind Developer Mode. Loopback-only binding,
+the private per-launch bearer, TrustCenter, approvals, and effect-time checks
+remain the authority boundaries.
 
 For serious repository work, the Codex and Claude Code bridges wake real,
 context-bearing coding sessions—not raw one-shot model calls—then return the
 builder's result to the originating NativeAgent session for canonical
 verification. The [builder bridge guide](docs/USER_GUIDE.md#codex-and-claude-code-as-specialist-builders)
 explains the division of labor, session continuity, permissions, and receipts.
+NativeAgent ships the bridge workers themselves. Each user installs and signs
+into Codex CLI and/or Claude Code on that Mac; Node.js is the small local
+runtime those bundled workers use. NativeAgent discovers common user-local
+install locations even when a Finder-launched app receives a minimal shell
+`PATH`. The catalog reports execution prerequisites and the live return path
+separately, so an installed CLI is never mistaken for a working round trip. It
+never copies another computer's builder history or credentials.
+
+With Full Mac YOLO active, the agent can explicitly place native tools, Codex,
+or Claude Code in an existing project outside NativeAgent's default workspace.
+This removes NativeAgent's workspace confinement; it does not bypass Apple's
+separate privacy controls. Projects under Documents, Desktop, Downloads, or
+other protected locations may first require approval in macOS **Privacy &
+Security → Files & Folders** or **Full Disk Access**.
 
 The detailed, evidence-backed inventory lives in
 [docs/CAPABILITIES.md](docs/CAPABILITIES.md).
@@ -242,7 +260,7 @@ drift.
 |---|---|
 | `persona/` | Private identity, voice, growth, and generated user profile |
 | `data/` | Chat, MemoryV2, context generations, cognition, Workshop, receipts, provider state, and local runtime ledgers |
-| `workspace/` (source install) or `~/Library/Application Support/NativeAgent/workspace` (app-only install) | Canonical drafts, projects, exports, and agent work product shared by every chat surface and Workshop |
+| `workspace/` (source install) or `~/Library/Application Support/NativeAgent/workspace` (app-only install) | Canonical safe default for drafts, projects, exports, and agent work product shared by every chat surface and Workshop. Full Mac YOLO may explicitly target another existing project directory for native shell/build or Codex/Claude Code work; ordinary modes remain workspace-scoped. |
 | `.runtime/` | Build, evaluation, and transient runtime artifacts |
 
 NativeAgent is local-first, but local does not mean unguarded. OAuth tokens,
