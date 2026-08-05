@@ -45,30 +45,36 @@ public struct MemoryDisclosureClassification: Sendable, Codable, Equatable {
 /// tool; this policy only decides whether a record may leave MemoryV2 for the
 /// requested persona/surface.
 public enum MemoryRecordDisclosurePolicy {
-    public static let allSurfaces: Set<String> = [
-        "chat", "telegram", "ios", "slack", "missions", "bridge",
-    ]
+    /// Carries BOTH spellings of the Workshop surface (P2-3). Nothing that
+    /// reaches `permits(surface:)` can still say `missions` — `canonicalSurface`
+    /// folds it first — but these sets are also written verbatim into memory
+    /// rows by `WorkshopExecutionMemory.metadata`, and a row that lists both
+    /// stays readable by a 0.3.x build whose `canonicalSurface` folds the other
+    /// direction (`workshop` -> `missions`). Never drop `missions`.
+    public static let allSurfaces: Set<String> = ([
+        "chat", "telegram", "ios", "slack", "bridge",
+    ] as Set<String>).union(WorkshopSurfaceVocabulary.bothSpellings)
     /// Telegram is User's authenticated personal surface — same trust tier as
     /// the Mac app and iOS (2026-07-20: its absence here silently filtered
     /// EVERY semantic recall on Telegram; only prompt-injectable no-human
     /// surfaces like slack stay outside local_private).
-    public static let localPrivateSurfaces: Set<String> = [
-        "chat", "telegram", "ios", "missions", "bridge",
-    ]
+    public static let localPrivateSurfaces: Set<String> = ([
+        "chat", "telegram", "ios", "bridge",
+    ] as Set<String>).union(WorkshopSurfaceVocabulary.bothSpellings)
 
-    /// Context's stable wire identifier for the Workshop/Missions surface is
-    /// `missions`. Accept the human-facing `workshop` spelling at memory
-    /// boundaries, but persist and compare only the canonical identifier.
+    /// The canonical wire identifier for the Workshop/Executions surface is
+    /// `workshop` (P2-3, 2026-08-05). It was `missions` through 0.3.7, so rows
+    /// already on disk list `missions` in `permittedSurfaces` forever — the
+    /// fold below is what keeps them readable, and it must never be removed.
     /// The agent bridges dispatch tools with surface "claude-bridge" /
     /// "codex-bridge"; their policy identity is `bridge` (2026-07-20: the
     /// unmapped spellings fail-closed every bridge recall).
     public static func canonicalSurface(_ value: String) -> String {
         let normalized = normalize(value)
         switch normalized {
-        case "workshop": return "missions"
         case "claude-bridge", "claude_bridge",
              "codex-bridge", "codex_bridge": return "bridge"
-        default: return normalized
+        default: return WorkshopSurfaceVocabulary.canonicalSurface(normalized)
         }
     }
 

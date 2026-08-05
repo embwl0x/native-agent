@@ -47,8 +47,8 @@ struct LaneRetentionHandlesTests {
 
         for index in 0..<5 {
             _ = try await memory.store(
-                content: "Workshop mission number \(index) completed and its outcome was verified.",
-                source: "workshop:mission-\(index)",
+                content: "Workshop execution number \(index) completed and its outcome was verified.",
+                source: "workshop:execution-\(index)",
                 metadata: .object(["kind": .string("operational")])
             )
         }
@@ -76,9 +76,9 @@ struct LaneRetentionHandlesTests {
         defer { try? FileManager.default.removeItem(at: root) }
         let (memory, bridge) = try sqliteMemoryWithBridge(root: root)
 
-        let content = "Workshop mission \"Rotate the credentials\" completed and was verified."
+        let content = "Workshop execution \"Rotate the credentials\" completed and was verified."
         let record = try await memory.store(
-            content: content, source: "workshop:mission-alpha",
+            content: content, source: "workshop:wsx-alpha",
             metadata: .object(["kind": .string("operational")]))
 
         _ = try await memory.archiveMemory(id: record.id)
@@ -92,7 +92,7 @@ struct LaneRetentionHandlesTests {
         // the same prose can be written again.
         #expect(try await bridge.isTombstoned(content: content) == false)
         let rerun = try await memory.store(
-            content: content, source: "workshop:mission-alpha-rerun",
+            content: content, source: "workshop:wsx-alpha-rerun",
             metadata: .object(["kind": .string("operational")]))
         #expect(rerun.id != record.id, "the archived row is not resurrected; a fresh one lands")
     }
@@ -104,16 +104,16 @@ struct LaneRetentionHandlesTests {
         defer { try? FileManager.default.removeItem(at: root) }
         let (memory, bridge) = try sqliteMemoryWithBridge(root: root)
 
-        let content = "Workshop mission \"Sweep the artifacts\" completed and was verified."
+        let content = "Workshop execution \"Sweep the artifacts\" completed and was verified."
         let record = try await memory.store(
-            content: content, source: "workshop:mission-alpha",
+            content: content, source: "workshop:wsx-alpha",
             metadata: .object(["kind": .string("operational")]))
         _ = try await memory.deleteMemory(id: record.id)
 
         #expect(try await bridge.isTombstoned(content: content))
         await #expect(throws: (any Error).self) {
             _ = try await memory.store(
-                content: content, source: "workshop:mission-alpha-rerun",
+                content: content, source: "workshop:wsx-alpha-rerun",
                 metadata: .object(["kind": .string("operational")]))
         }
     }

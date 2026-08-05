@@ -134,7 +134,7 @@ The event bus receives meaningful changes from all NativeAgent surfaces:
 - tool dispatch and tool results;
 - memory commits and corrections;
 - calendar, email, reminders, and app events;
-- mission state;
+- execution state;
 - scheduler events;
 - approval decisions;
 - provider failure or recovery;
@@ -226,7 +226,7 @@ new factual assertion   → provisional belief or memory proposal
 forecast                 → prediction ledger
 resolved tension         → workspace/field update
 failed expectation       → prediction error
-new commitment           → commitment/mission state
+new commitment           → commitment/execution state
 identity statement       → developmental self-model proposal
 successful procedure     → procedural candidate
 emotional significance  → episode metadata
@@ -812,7 +812,7 @@ Assimilation is required after:
 - a failed provider call;
 - a corrected user statement;
 - an approval outcome;
-- a mission completion;
+- a Workshop execution completion;
 - a verified external observation.
 
 ### 11.1 Assimilation input
@@ -842,7 +842,7 @@ struct CognitiveTurnOutcome: Sendable {
 - tool results become `observed` only through trusted dispatch receipts;
 - model claims become `inferred`;
 - predictions receive stable IDs and explicit resolution conditions;
-- commitments link to missions, scheduler jobs, or open-loop state;
+- commitments link to Workshop executions, scheduler jobs, or open-loop state;
 - identity changes enter a proposal queue;
 - emotional updates derive from event semantics and outcomes, not only generated text;
 - important experiences may create episodic-memory proposals;
@@ -991,7 +991,7 @@ A seed may:
 - generate a local deterministic update;
 - trigger a bounded reflective call;
 - become a user-facing question;
-- create a mission proposal;
+- create a Workshop execution proposal;
 - wait for a future observation;
 - archive as unresolved.
 
@@ -1485,7 +1485,7 @@ Required path:
 ```text
 thought seed
 → workspace
-→ explicit plan/mission/action proposal
+→ explicit plan/execution/action proposal
 → existing TurnPlan and policy gates
 → approval if required
 → tool execution
@@ -1647,7 +1647,7 @@ Events initially supported:
 - tool succeeded/failed;
 - user correction;
 - provider failure;
-- mission completed;
+- Workshop execution completed;
 - app wake/sleep.
 
 Acceptance:

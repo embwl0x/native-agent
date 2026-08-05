@@ -65,6 +65,7 @@ struct TelegramRestartCommandTests {
     @Test func restart_from_owner_private_chat_routes_to_shared_restart_routine() async throws {
         let restart = MockRestartRef(owners: [123])
         let bot = SwiftNativeTelegramBot(
+            dataRoot: hermeticTelegramDataRoot(),
             completenessDeps: TelegramBotCompletenessDeps(restart: restart)
         )
         let reply = try await bot.dispatchSwiftSlashCommand(
@@ -78,6 +79,7 @@ struct TelegramRestartCommandTests {
     @Test func restart_default_reason_when_no_args() async throws {
         let restart = MockRestartRef(owners: [123])
         let bot = SwiftNativeTelegramBot(
+            dataRoot: hermeticTelegramDataRoot(),
             completenessDeps: TelegramBotCompletenessDeps(restart: restart)
         )
         _ = try await bot.dispatchSwiftSlashCommand(
@@ -89,6 +91,7 @@ struct TelegramRestartCommandTests {
     @Test func restart_from_non_owner_chat_is_refused_without_firing() async throws {
         let restart = MockRestartRef(owners: [123])
         let bot = SwiftNativeTelegramBot(
+            dataRoot: hermeticTelegramDataRoot(),
             completenessDeps: TelegramBotCompletenessDeps(restart: restart)
         )
         let reply = try await bot.dispatchSwiftSlashCommand(
@@ -102,6 +105,7 @@ struct TelegramRestartCommandTests {
         // No owner on disk → NOBODY may restart, not "everybody may".
         let restart = MockRestartRef(owners: [])
         let bot = SwiftNativeTelegramBot(
+            dataRoot: hermeticTelegramDataRoot(),
             completenessDeps: TelegramBotCompletenessDeps(restart: restart)
         )
         let reply = try await bot.dispatchSwiftSlashCommand(
@@ -115,7 +119,7 @@ struct TelegramRestartCommandTests {
         // Legacy completeness path (no chatId threaded) must never restart,
         // even with the dep fully wired: nil sender is never the owner.
         let restart = MockRestartRef(owners: [123])
-        let bot = SwiftNativeTelegramBot()
+        let bot = SwiftNativeTelegramBot(dataRoot: hermeticTelegramDataRoot())
         let reply = await bot.dispatchCompletenessCommand(
             "/restart",
             args: [],
@@ -133,6 +137,7 @@ struct TelegramRestartCommandTests {
         let groupChatId = -100123 // Telegram group/supergroup ids are negative
         let restart = MockRestartRef(owners: [Int64(groupChatId)])
         let bot = SwiftNativeTelegramBot(
+            dataRoot: hermeticTelegramDataRoot(),
             completenessDeps: TelegramBotCompletenessDeps(restart: restart)
         )
         let reply = try await bot.dispatchSwiftSlashCommand(
@@ -149,6 +154,7 @@ struct TelegramRestartCommandTests {
         let groupChatId = -100123
         let restart = MockRestartRef(owners: [Int64(groupChatId)])
         let bot = SwiftNativeTelegramBot(
+            dataRoot: hermeticTelegramDataRoot(),
             completenessDeps: TelegramBotCompletenessDeps(restart: restart)
         )
         let reply = try await bot.dispatchSwiftSlashCommand(
@@ -161,6 +167,7 @@ struct TelegramRestartCommandTests {
     @Test func restart_with_missing_from_user_id_fails_closed() async throws {
         let restart = MockRestartRef(owners: [123])
         let bot = SwiftNativeTelegramBot(
+            dataRoot: hermeticTelegramDataRoot(),
             completenessDeps: TelegramBotCompletenessDeps(restart: restart)
         )
         let reply = try await bot.dispatchSwiftSlashCommand(
@@ -175,6 +182,7 @@ struct TelegramRestartCommandTests {
         // forged/synthetic shape and fails closed.
         let restart = MockRestartRef(owners: [123])
         let bot = SwiftNativeTelegramBot(
+            dataRoot: hermeticTelegramDataRoot(),
             completenessDeps: TelegramBotCompletenessDeps(restart: restart)
         )
         let reply = try await bot.dispatchSwiftSlashCommand(
@@ -190,6 +198,7 @@ struct TelegramRestartCommandTests {
     @Test func restart_detailed_dispatch_defers_terminate_arm_to_followup() async throws {
         let restart = MockRestartRef(owners: [123], provideArm: true)
         let bot = SwiftNativeTelegramBot(
+            dataRoot: hermeticTelegramDataRoot(),
             completenessDeps: TelegramBotCompletenessDeps(restart: restart)
         )
         let outcome = try await bot.dispatchSwiftSlashCommandDetailed(
@@ -205,6 +214,7 @@ struct TelegramRestartCommandTests {
 
     @Test func restart_without_wired_dep_reports_unsupported() async throws {
         let bot = SwiftNativeTelegramBot(
+            dataRoot: hermeticTelegramDataRoot(),
             completenessDeps: TelegramBotCompletenessDeps()
         )
         let reply = try await bot.dispatchSwiftSlashCommand(

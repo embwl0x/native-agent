@@ -360,7 +360,7 @@ func swiftNative_directRootSavesDoc() async throws {
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     try Data("# soul".utf8).write(to: root.appendingPathComponent("SOUL.md"))
 
-    let writer: any PersonaEngineWriting = SwiftNativePersonaEngine(root: root)
+    let writer: any PersonaEngineWriting = hermeticPersona(root: root)
     let saved = try await writer.savePersonalityDoc(id: "voice", content: "# V")
     #expect(saved.id == "VOICE")
     #expect(saved.content == "# V")
@@ -374,7 +374,7 @@ func swiftNative_onboardingGate() async throws {
     defer { try? FileManager.default.removeItem(at: root) }
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     // No SOUL.md -> not initialized.
-    let writer: any PersonaEngineWriting = SwiftNativePersonaEngine(root: root)
+    let writer: any PersonaEngineWriting = hermeticPersona(root: root)
     await #expect(throws: PersonaWriteError.self) {
         _ = try await writer.savePersonalityDoc(id: "USER", content: "x")
     }

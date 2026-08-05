@@ -490,12 +490,184 @@ func appChatToolDispatcher_emitsBoundedOwnerPrewarmHints() async throws {
     _ = try await dispatcher.dispatch(tool: "desk_read", input: [:], surface: "chat")
     _ = try await dispatcher.dispatch(tool: "x_search", input: [:], surface: "telegram")
 
+    // Prewarm delivery is off the dispatch path now, so the assertions below
+    // are about what EVENTUALLY reaches the planner, not what has landed by
+    // the time dispatch returns. See the timing tests further down.
+    await dispatcher.drainPendingContextPrewarm()
+
     let hints = await capture.hints
     #expect(hints.contains { $0.0 == .file && $0.1 == "docs/map.md" })
     #expect(hints.contains { $0.0 == .desk && $0.1 == "agent-desk" })
     #expect(hints.contains { $0.0 == .toolResult && $0.1 == "x_search" })
     #expect(hints.contains { $0.0 == .organism })
     #expect(hints.allSatisfy { !$0.2.isEmpty && $0.2.count <= 32 })
+}
+
+/// A prewarm sink that blocks until the test releases it, and records exactly
+/// when each hint arrived relative to the dispatch that produced it.
+private actor GatedPrewarmSink {
+    private var gate: CheckedContinuation<Void, Never>?
+    private var opened = false
+    private(set) var hints: [(ContextPrewarmHintKind, String)] = []
+    private(set) var startedCount = 0
+
+    func record(_ kind: ContextPrewarmHintKind, id: String) async {
+        startedCount += 1
+        if !opened {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                gate = continuation
+            }
+        }
+        hints.append((kind, id))
+    }
+
+    func open() {
+        opened = true
+        gate?.resume()
+        gate = nil
+    }
+
+    func waitUntilStarted() async {
+        while startedCount == 0 {
+            await Task.yield()
+        }
+    }
+}
+
+/// FIX-A ordering probe: the tool result must be returned to the turn BEFORE
+/// any prewarm work runs. The old code awaited `prewarmAfterToolResult` inline,
+/// which meant a full lowercase-and-rank pass over every atom in the active
+/// context generation — on the ContextFlowCoordinator actor the next turn needs
+/// — sat between the tool finishing and the model seeing its result.
+@Test
+func appChatToolDispatcher_returnsToolResultWithoutAwaitingPrewarm() async throws {
+    let sink = GatedPrewarmSink()
+    let dispatcher = AppChatToolDispatcher(
+        inner: StubInnerToolDispatcher(),
+        enforceAutonomySecurity: false,
+        organismPostureProvider: { nil },
+        contextPrewarm: { kind, id, _ in
+            await sink.record(kind, id: id)
+        }
+    )
+
+    // The sink is wedged: any dispatch that awaited prewarm would deadlock
+    // here and the test would time out rather than fail.
+    let result = try await dispatcher.dispatch(
+        tool: "x_search",
+        input: ["query": .string("q")],
+        surface: "telegram"
+    )
+
+    // Byte-identical result, delivered while prewarm is still blocked.
+    #expect(result == .object([
+        "tool": .string("x_search"),
+        "surface": .string("telegram"),
+        "delegated": .bool(true),
+    ]))
+    let landed = await sink.hints
+    #expect(landed.isEmpty)
+
+    // ...and it still eventually populates once the sink unblocks.
+    await sink.waitUntilStarted()
+    await sink.open()
+    await dispatcher.drainPendingContextPrewarm()
+    let after = await sink.hints
+    #expect(after.count == 1)
+    #expect(after[0].0 == .toolResult)
+    #expect(after[0].1 == "x_search")
+}
+
+/// The relay is serial on purpose: prewarm hints carry a monotonic revision and
+/// dedupe by event id, so bare per-call `Task.detached` would let a turn's tool
+/// results reach the planner out of order. This pins submission order.
+@Test
+func appChatToolDispatcher_prewarmHintsReachThePlannerInDispatchOrder() async throws {
+    let capture = ContextPrewarmCapture()
+    let dispatcher = AppChatToolDispatcher(
+        inner: StubInnerToolDispatcher(),
+        enforceAutonomySecurity: false,
+        organismPostureProvider: { nil },
+        contextPrewarm: { kind, id, terms in
+            // Uneven work per hint — a racing implementation reorders here.
+            try? await Task.sleep(nanoseconds: id == "read_file" ? 5_000_000 : 100_000)
+            await capture.record(kind, id: id, terms: terms)
+        }
+    )
+
+    _ = try await dispatcher.dispatch(tool: "read_file", input: [:], surface: "chat")
+    _ = try await dispatcher.dispatch(tool: "x_search", input: [:], surface: "chat")
+    _ = try await dispatcher.dispatch(tool: "desk_read", input: [:], surface: "chat")
+    await dispatcher.drainPendingContextPrewarm()
+
+    let hints = await capture.hints
+    #expect(hints.map { $0.1 } == ["read_file", "x_search", "agent-desk"])
+}
+
+/// Both hints for one tool result (the primary hint and the organism-posture
+/// follow-up) must stay adjacent and ordered — they were two sequential awaits
+/// in the same function before, and the planner keys on that pairing.
+@Test
+func appChatToolDispatcher_organismPostureHintFollowsItsPrimaryHint() async throws {
+    let capture = ContextPrewarmCapture()
+    let posture = OrganismBehaviorPosture(
+        generatedAt: .distantPast,
+        enabled: true,
+        posture: "steady",
+        claimDiscipline: .normal,
+        toolStrategy: .normal,
+        directives: []
+    )
+    let dispatcher = AppChatToolDispatcher(
+        inner: StubInnerToolDispatcher(),
+        enforceAutonomySecurity: false,
+        organismPostureProvider: { posture },
+        contextPrewarm: { kind, id, terms in
+            await capture.record(kind, id: id, terms: terms)
+        }
+    )
+
+    _ = try await dispatcher.dispatch(tool: "x_search", input: [:], surface: "chat")
+    _ = try await dispatcher.dispatch(tool: "desk_read", input: [:], surface: "chat")
+    await dispatcher.drainPendingContextPrewarm()
+
+    let hints = await capture.hints
+    #expect(hints.map { $0.0 } == [.toolResult, .organism, .desk, .organism])
+    // Both hints of a pair carry the identical term vector, as they did when
+    // one function body emitted them back to back.
+    #expect(hints[0].2 == hints[1].2)
+    #expect(hints[2].2 == hints[3].2)
+}
+
+/// The hints are computed synchronously from the settled result, so what the
+/// planner receives is a pure function of the dispatch — the relay only moves
+/// WHEN it is delivered, never WHAT.
+@Test
+func appChatToolDispatcher_prewarmHintsAreAPureFunctionOfTheSettledCall() {
+    let result: JSONValue = .object([
+        "tool": .string("read_file"),
+        "surface": .string("chat"),
+        "delegated": .bool(true),
+    ])
+    let hints = AppChatToolDispatcher.prewarmHints(
+        tool: "read_file",
+        input: ["path": .string("docs/map.md"), "limit": .int(10)],
+        result: result,
+        surface: "chat"
+    )
+    #expect(hints.count == 1)
+    #expect(hints[0].kind == .file)
+    #expect(hints[0].id == "docs/map.md")
+    #expect(Array(hints[0].terms.prefix(4)) == ["read_file", "chat", "limit", "path"])
+
+    let again = AppChatToolDispatcher.prewarmHints(
+        tool: "read_file",
+        input: ["path": .string("docs/map.md"), "limit": .int(10)],
+        result: result,
+        surface: "chat"
+    )
+    #expect(again.map(\.terms) == hints.map(\.terms))
+    #expect(again.map(\.id) == hints.map(\.id))
 }
 
 @Test

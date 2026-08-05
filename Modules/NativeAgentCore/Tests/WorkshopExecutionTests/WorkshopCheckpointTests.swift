@@ -8,7 +8,7 @@ import PersistenceCore
 
 private func makeTempRoot() throws -> URL {
     let dir = FileManager.default.temporaryDirectory
-        .appendingPathComponent("MissionCheckpointTests-\(UUID().uuidString)")
+        .appendingPathComponent("WorkshopCheckpointTests-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     return dir
 }
@@ -321,7 +321,7 @@ struct EscalatorSuite {
             now: { Date(timeIntervalSince1970: 1_700_000_000) },
             uuid: { uuidProvider.next() }
         )
-        let execution = "shape-mission"
+        let execution = "shape-execution"
         let cp = makeCheckpoint(
             id: "cp-x", executionId: execution, summary: "summary line"
         )

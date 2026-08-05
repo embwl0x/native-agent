@@ -6,7 +6,7 @@ import Foundation
 // provider adapters without changing any public signatures. Two consumers:
 //   - `surface`  — bound by SwiftNativeLLMClient around every adapter call so
 //     the per-call `llm.call` telemetry row can carry the calling surface
-//     (chat / telegram / missions / dream...). Adapters read it at
+//     (chat / telegram / executions / dream...). Adapters read it at
 //     record time; unbound → "unknown".
 //   - `sessionId` — bound by the ChatOrchestration tool loop around its
 //     llm.completeMessages / llm.streamMessages calls so the OpenAI
@@ -209,7 +209,7 @@ public protocol LLMClient: Sendable {
     /// the prompt API; SwiftNativeLLMClient overrides and routes to provider
     /// adapters that can emit canonical structured messages. `surface` pins
     /// provider/model selection to the calling surface's active.json
-    /// preference (chat / missions / dream / telegram...); the prior
+    /// preference (chat / executions / dream / telegram...); the prior
     /// non-surface entry point was collapsed into this one (tightness sweep
     /// 2026-07-17 — it had no production callers, only forwarders/defaults).
     func completeMessages(
@@ -234,7 +234,7 @@ public protocol LLMClient: Sendable {
 }
 
 extension LLMClient {
-    /// Surface-aware variant. Non-chat callers (missions, dream, REM,
+    /// Surface-aware variant. Non-chat callers (executions, dream, REM,
     /// telegram) pass their own surface so the dispatch layer's active.json
     /// provider selection honors the right surface. Default implementation
     /// delegates for clients that are not surface-aware.

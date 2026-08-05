@@ -201,7 +201,7 @@ extension NativeClient {
                 "releaseChecklist": try Self.codableJSON(try await getReleaseChecklist()),
             ])
 
-        case "mission.durable.checkpoint":
+        case "execution.durable.checkpoint":
             return .object([
                 "actionId": .string(id),
                 "missions": try Self.codableJSON(try await getWorkshopExecutions()),

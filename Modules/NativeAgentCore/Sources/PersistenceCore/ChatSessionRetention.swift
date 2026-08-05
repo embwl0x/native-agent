@@ -437,11 +437,44 @@ public enum ChatSessionRetention {
     /// Prune the archive tier: age-drop transcripts and line-cap the archived
     /// sessions index. Mirrors `InstalledPhysiologySoak.pruneOldDayFiles` (list,
     /// filter, drop) and never throws — pruning is opportunistic cleanup.
+    ///
+    /// PERF (wave 2): `enforce` runs inside the sessions lock on EVERY message
+    /// append, and this pass used to `contentsOfDirectory` + per-file
+    /// `resourceValues` the entire archive transcript tier every time (1530
+    /// files on the live root) plus take the index lock and rewrite-scan a
+    /// 20k-line cap file — all to learn that nothing had aged past a 180-day
+    /// cutoff. It now runs when there is a REASON to:
+    ///
+    ///   • the archive tier CHANGED since the last pass (an archival landed —
+    ///     new transcript file, new index row), or
+    ///   • `pruneMinIntervalSeconds` has elapsed, which is what makes the
+    ///     purely time-driven half (a file crossing the age cutoff, an index
+    ///     that must re-cap) still happen on an idle tier, or
+    ///   • this process has never pruned this root.
+    ///
+    /// Wave-1 FIX-C rejected throttling retention ITSELF because archiving
+    /// removes a row from `sessions.json` and `SessionDigestProvider
+    /// .latestPriorSession` renders the newest remaining row into the next
+    /// session's prompt. That reasoning does not reach here: this function only
+    /// ever touches `chat/archive/**`, which no prompt-assembly path reads. The
+    /// bounded effect of the throttle is that an archived transcript already
+    /// 180 days old may survive up to `pruneMinIntervalSeconds` longer, and the
+    /// archived-sessions index may sit up to that long above its 20k-line cap.
     private static func pruneArchive(dataRoot: URL, now: Date) {
         let fm = FileManager.default
         let archiveDir = dataRoot
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("archive", isDirectory: true)
+
+        guard pruneIsDue(archiveDir: archiveDir, now: now) else { return }
+        // Stamp the tier as it stood BEFORE the scan (gpt-5.5 wave-2
+        // NEEDS_FIX): stamping after the pass would mark an archival that
+        // landed mid-pass as already handled, delaying it up to the full
+        // interval. Storing the pre-scan stamp means our own deletions read
+        // as a change and cost one extra no-op scan next pass (≤1 per
+        // interval) — a mid-pass landing is never missed.
+        let preScanStamp = archiveTierStamp(archiveDir)
+        defer { notePruneCompleted(archiveDir: archiveDir, now: now, stamp: preScanStamp) }
 
         // 1. Age-prune archived transcript files.
         let messagesDir = archiveDir.appendingPathComponent("messages", isDirectory: true)
@@ -479,6 +512,107 @@ public enum ChatSessionRetention {
                 maxLines: archivedSessionsIndexMaxLines
             )
         }
+    }
+
+    // MARK: - Archive-prune throttle (perf wave 2)
+
+    /// Longest an idle archive tier goes un-pruned. The tier is invisible to
+    /// every prompt-assembly path, so this bounds only how late a 180-day-old
+    /// transcript is deleted and how late the archived index is re-capped.
+    public static let pruneMinIntervalSeconds: TimeInterval = 10 * 60
+
+    /// The archive tier's cheap change signal: the (mtime, size) of the
+    /// transcript directory and of the archived-sessions index. An archival
+    /// mutates one or both — a new transcript file changes the directory's
+    /// mtime, a new index row changes the index's mtime and size.
+    private struct ArchiveTierStamp: Equatable {
+        let messagesSeconds: Int
+        let messagesNanoseconds: Int
+        let messagesSize: Int64
+        let indexSeconds: Int
+        let indexNanoseconds: Int
+        let indexSize: Int64
+    }
+
+    private struct PruneMark {
+        let at: Date
+        let stamp: ArchiveTierStamp
+    }
+
+    private static let pruneStateLock = NSLock()
+    nonisolated(unsafe) private static var pruneMarks: [String: PruneMark] = [:]
+    /// Bound on distinct data roots tracked at once — every insert has a
+    /// matching eviction, so a process that walks many temp roots (the test
+    /// suite) cannot grow this map without limit.
+    private static let pruneMarksMax = 16
+
+    private static func archiveTierStamp(_ archiveDir: URL) -> ArchiveTierStamp {
+        func statOf(_ url: URL) -> (Int, Int, Int64) {
+            var info = stat()
+            guard stat(url.path, &info) == 0 else { return (-1, -1, -1) }
+            return (info.st_mtimespec.tv_sec, info.st_mtimespec.tv_nsec, Int64(info.st_size))
+        }
+        let messages = statOf(archiveDir.appendingPathComponent("messages", isDirectory: true))
+        let index = statOf(archiveDir.appendingPathComponent("sessions.jsonl"))
+        return ArchiveTierStamp(
+            messagesSeconds: messages.0,
+            messagesNanoseconds: messages.1,
+            messagesSize: messages.2,
+            indexSeconds: index.0,
+            indexNanoseconds: index.1,
+            indexSize: index.2
+        )
+    }
+
+    /// True when the prune should actually run, and RECORDS the decision. The
+    /// mark is stamped only when the answer is yes, so a skipped pass leaves
+    /// the previous deadline in place rather than sliding it forward.
+    private static func pruneIsDue(archiveDir: URL, now: Date) -> Bool {
+        let key = archiveDir.resolvingSymlinksInPath().path
+        let stamp = archiveTierStamp(archiveDir)
+        pruneStateLock.lock()
+        defer { pruneStateLock.unlock() }
+        if let mark = pruneMarks[key],
+           mark.stamp == stamp,
+           now.timeIntervalSince(mark.at) < pruneMinIntervalSeconds,
+           now >= mark.at {
+            return false
+        }
+        if pruneMarks[key] == nil, pruneMarks.count >= pruneMarksMax {
+            pruneMarks.removeAll()
+        }
+        pruneMarks[key] = PruneMark(at: now, stamp: stamp)
+        pruneRunCount += 1
+        return true
+    }
+
+    /// Test seam: how many passes actually scanned the tier.
+    nonisolated(unsafe) private static var pruneRunCount = 0
+
+    public static func _archivePruneRunCountForTesting() -> Int {
+        pruneStateLock.lock()
+        defer { pruneStateLock.unlock() }
+        return pruneRunCount
+    }
+
+    /// Stamp with the tier as it stood BEFORE the scan (caller captures it).
+    /// Our own deletions therefore read as a change next pass — one no-op
+    /// rescan per real prune — in exchange for never missing an archival
+    /// that lands while the pass is running.
+    private static func notePruneCompleted(archiveDir: URL, now: Date, stamp: ArchiveTierStamp) {
+        let key = archiveDir.resolvingSymlinksInPath().path
+        pruneStateLock.lock()
+        pruneMarks[key] = PruneMark(at: now, stamp: stamp)
+        pruneStateLock.unlock()
+    }
+
+    /// TEST HOOK ONLY: forget every prune deadline (a fresh-process
+    /// equivalent). Never called by product code.
+    public static func _resetArchivePruneThrottleForTesting() {
+        pruneStateLock.lock()
+        pruneMarks.removeAll()
+        pruneRunCount = 0
+        pruneStateLock.unlock()
     }
 
     private static func isStaleEmpty(

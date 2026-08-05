@@ -153,13 +153,16 @@ struct AutonomyPromotionInboxAdapter: AutonomyPromotionInboxPort {
     /// approval-history scan (the loop treats `action` as a tool name).
     static let metaActions: Set<String> = [
         "autonomy.promote", "self_improvement.apply", "approval",
-        "backup_restore", "mission.step", "memory.repair",
+        "backup_restore", WorkshopStepApprovalAction.canonical, "memory.repair",
     ]
     static let metaPrefixes: [String] = ["memory.", "improvement."]
 
     private static func isToolCard(_ action: String) -> Bool {
         if action.isEmpty { return false }
-        if metaActions.contains(action) { return false }
+        // P2-4: history rows carry `mission.step`; the allowlist carries
+        // `execution.step`. Canonicalize or every historical step-approval is
+        // misread as a tool card and inflates the promotion counters.
+        if metaActions.contains(ExecutionEventVocabulary.canonicalKind(action)) { return false }
         if metaPrefixes.contains(where: { action.hasPrefix($0) }) { return false }
         return true
     }

@@ -557,7 +557,7 @@ extension NativeClient {
     }
 
     // WAVE 37 (2026-06-02) W20 §6.159: single construction point for the
-    // SwiftNative missions read seam. The four read getters (getMissions /
+    // SwiftNative executions read seam. The four read getters (getWorkshopExecutions /
     // getQueuedMissions / getMissionDetail / getMissionTimeline) previously
     // each constructed
     //   WorkshopExecution.SwiftNativeWorkshopRunner(planner: WorkshopExecution.HTTPCodexMissionPlannerLLM())
@@ -571,9 +571,9 @@ extension NativeClient {
     // root exactly as the inline construction did.
     func makeWorkshopExecutionRunner() -> WorkshopExecution.SwiftNativeWorkshopRunner {
         // TOOL-AWARE planner: inject the real SwiftToolDispatcher catalog so a
-        // submitted mission can plan and run actual tools, not only
+        // submitted execution can plan and run actual tools, not only
         // chat.synthesize (root cause fixed 2026-06-15). This is THE submit
-        // path — planning happens here when a mission is submitted.
+        // path — planning happens here when an execution is submitted.
         WorkshopExecution.SwiftNativeWorkshopRunner(
             planner: WorkshopExecution.SwiftNativeWorkshopPlannerLLM(
                 connectorActionsProvider: makeWorkshopPlannerConnectorActionsProvider(),

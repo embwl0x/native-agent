@@ -88,7 +88,7 @@ private func makeFullFixture(root: URL, currentId: String) throws -> SessionDige
     try write(
         """
         [
-          {"id": "m1", "title": "Stale mission", "status": "done",
+          {"id": "m1", "title": "Stale execution", "status": "done",
            "updatedAt": "2026-06-01T00:00:00.443113+00:00"},
           {"id": "m2", "title": "Trace ledger port", "status": "done",
            "completedAt": "2026-06-10T07:30:00.123456+00:00"}
@@ -152,7 +152,7 @@ private func makeDigestEngine(
     recallHits: [MemoryRecallHit] = []
 ) -> SwiftNativeTurnEngine {
     SwiftNativeTurnEngine(
-        persona: SwiftNativePersonaEngine(root: personaRoot),
+        persona: hermeticPersona(root: personaRoot),
         memory: recallHits.isEmpty ? nil : FixedRecallStubD(hits: recallHits),
         router: StubRoutingD(),
         trust: hermeticTrust(),
@@ -182,7 +182,7 @@ func sessionDigest_renders_from_synthetic_prior_session() async throws {
     #expect(!d.contains("PRE-ANCHOR"))                      // anchor filter
     #expect(d.contains("Workshop: 1 task(s) updated"))
     #expect(d.contains("Trace ledger port"))
-    #expect(!d.contains("Stale mission"))                   // anchor filter
+    #expect(!d.contains("Stale execution"))                   // anchor filter
     #expect(d.contains("Standup from claude"))
     #expect(d.contains("DIGEST-STANDUP-MARKER"))
     #expect(d.contains("Dream diary: 1 new entry (latest: 2026-06-10.md)"))
@@ -292,7 +292,7 @@ func sessionDigest_source_errors_fail_open() async throws {
     #expect(digest.hasPrefix(SessionDigestProvider.headerLine))
     #expect(digest.contains("Previous session"))
     #expect(!digest.contains("Traces:"))
-    #expect(!digest.contains("Missions:"))
+    #expect(!digest.contains("Executions:"))
 }
 
 // MARK: - engine integration: injection point + cache invariant

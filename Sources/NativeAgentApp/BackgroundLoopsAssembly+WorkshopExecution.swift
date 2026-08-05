@@ -18,16 +18,16 @@ import SelfImprovement
 // MARK: - Workshop Executor
 
 extension BackgroundLoopsAssembly {
-    // MARK: - Mission executor (executor port, 2026-06-10)
+    // MARK: - Execution executor (executor port, 2026-06-10)
     //
-    // Production wiring for WorkshopExecutorLoop (Missions+Executor.swift):
+    // Production wiring for WorkshopExecutorLoop (Executions+Executor.swift):
     // the module stays ApprovalInbox/ChatOrchestration-free, so the LLM
     // call, the gated tool-dispatch chain, the approval stager, and the
     // enableAutonomy+missionPolicy gate are all injected here — the same
     // shape as makeREMProposalStager / makeWeeklySelfImprovementLoop.
 
     /// Build the fully wired executor. ONE construction point: the
-    /// background drain loop AND NativeClient's mission.step
+    /// background drain loop AND NativeClient's execution.step
     /// resume-on-approve executor both come through here so resume runs
     /// with the exact closures the original drain ran with.
     static func makeWorkshopExecutor(
@@ -37,7 +37,7 @@ extension BackgroundLoopsAssembly {
         let usesLiveAppBody = dataRoot == PersistenceCore.defaultDataRoot()
         let cognition = cognitionRuntime ?? self.cognitionRuntime(for: dataRoot)
         // LLM steps route through the SAME per-surface planner client the
-        // mission planner uses ("missions" surface picker, OAuth-direct
+        // execution planner uses ("missions" surface picker, OAuth-direct
         // adapters, 120s timeout — daemon run_codex(timeout=120) parity).
         let plannerRouter = SwiftNativeProviderRouting(
             dataRoot: dataRoot,
@@ -59,7 +59,8 @@ extension BackgroundLoopsAssembly {
             runLedgerDataRoot: dataRoot)
         let measuredLLMStep: WorkshopStepMeasuredLLM = { prompt in
             let (model, output) = try await planner.runCodex(
-                prompt: prompt, surface: "missions", timeoutSeconds: 120)
+                prompt: prompt, surface: WorkshopSurfaceVocabulary.canonical,
+                timeoutSeconds: 120)
             return WorkshopStepLLMCompletion(
                 model: model,
                 text: output,
@@ -68,7 +69,7 @@ extension BackgroundLoopsAssembly {
             )
         }
         // TOOL-CAPABLE synthesize turn (synthesize-quality fix, 2026-06-11).
-        // Found live by Agent on mission 752636c5: a bare completion has no
+        // Found live by Agent on execution 752636c5: a bare completion has no
         // tool access, so the synthesize model refused ("I can't access your
         // filesystem") and the refusal scored `succeeded`. Route synthesize
         // steps through the production chat tool loop over a RESTRICTED,
@@ -79,9 +80,9 @@ extension BackgroundLoopsAssembly {
         // "read_only" blocks write-class tools at the FileAccess layer too —
         // belt-and-suspenders with the name allowlist. surface "missions"
         // resolves the per-surface model via the same picker the planner uses.
-        // This is an EPHEMERAL mission turn: it does not mint a random chat
+        // This is an EPHEMERAL execution turn: it does not mint a random chat
         // session, read chat history, autocompact, or append transcript state.
-        // Model, provider, Think, and Fast all resolve from the missions surface.
+        // Model, provider, Think, and Fast all resolve from the executions surface.
         let measuredTooledLLMStep: WorkshopStepMeasuredLLM = { prompt in
             let restricted = WorkshopSynthesizeReadOnlyToolDispatcher(
                 inner: SwiftToolDispatcher(
@@ -102,7 +103,7 @@ extension BackgroundLoopsAssembly {
             let response = try await client.runEphemeralToolTurn(
                 message: prompt,
                 fileAccess: "read_only",
-                surface: "missions"
+                surface: WorkshopSurfaceVocabulary.canonical
             )
             guard let providerCallCount = response.providerCallCount else {
                 throw NSError(domain: "WorkshopExecutor", code: 500, userInfo: [
@@ -119,19 +120,19 @@ extension BackgroundLoopsAssembly {
         // Tool steps go through the SAME gated chain chat uses
         // (fileAccess gate → autonomy gate → real tools). approvalFiler nil
         // → CONFIRM-tier tools fail closed at the dispatch layer; the
-        // mission-level approval staging (trustRequired / needs_approval)
+        // execution-level approval staging (trustRequired / needs_approval)
         // happens ABOVE this in the executor via the stager below.
         // fileAccess "auto" resolves from the Trust policy (full-mac under
-        // wide-open/yolo) — matching chat, so a mission can write outside the
+        // wide-open/yolo) — matching chat, so an execution can write outside the
         // workspace (e.g. ~/Desktop) when the user's posture allows. Was "workspace"
-        // (daemon-era workspace-write sandbox), which silently confined mission
-        // file writes and is why a "create ~/Desktop/x" mission never landed
+        // (daemon-era workspace-write sandbox), which silently confined execution
+        // file writes and is why a "create ~/Desktop/x" execution never landed
         // the file (2026-06-15, the user: full-mac yolo, "she does everything").
-        // Inject the MacIntegrationToolBridge so mission tool steps can run the
+        // Inject the MacIntegrationToolBridge so execution tool steps can run the
         // Mac-integration tools (calendar/mail/contacts/reminders/etc.) — chat
-        // wires this; missions used a bare SwiftToolDispatcher(), so those tools
+        // wires this; executions used a bare SwiftToolDispatcher(), so those tools
         // failed with "MacIntegrationToolBridge not injected" (2026-06-15, found
-        // live: a morning-brief mission planned mac_calendar_list_upcoming then
+        // live: a morning-brief execution planned mac_calendar_list_upcoming then
         // failed at execution). file/shell tools don't need it; mac_* do.
         let gatedTools = makeGatedToolDispatchClient(
             tools: SwiftToolDispatcher(
@@ -188,14 +189,14 @@ extension BackgroundLoopsAssembly {
     }
 
     /// enableAutonomy + missionPolicy gate, mirroring the daemon's posture:
-    /// the executor only RUNS missions when the trust policy explicitly has
+    /// the executor only RUNS executions when the trust policy explicitly has
     /// enableAutonomy on, AND the missionPolicy half allows.
     ///
     /// gpt-5.5 executor-port blocker #7 (2026-06-10): this gate used to (a)
     /// construct SwiftNativeTrustCenter() on the DEFAULT data root, ignoring
     /// the dataRoot the whole assembly was built against, and (b) treat a
     /// present-but-malformed missionPolicy (string/array/scalar) as ALLOW
-    /// while the submit-side gate (SwiftNativeWorkshopRunner.missionsAllowed)
+    /// while the submit-side gate (SwiftNativeWorkshopRunner.workshopExecutionsAllowed)
     /// denies it. Fixed: dataRoot is passed through, and the missionPolicy
     /// half is evaluated by the SAME shared rule submit uses —
     /// SwiftNativeWorkshopRunner.missionPolicyAllows (developerMode pyTruthy
@@ -211,11 +212,11 @@ extension BackgroundLoopsAssembly {
         return SwiftNativeWorkshopRunner.workshopPolicyAllows(policy)
     }
 
-    /// mission.step approval stager: ONE ApprovalInbox record per blocked
-    /// step (NativeClient.resolveApproval's "mission.step" executor resumes
+    /// execution.step approval stager: ONE ApprovalInbox record per blocked
+    /// step (NativeClient.resolveApproval's "execution.step" executor resumes
     /// the Workshop execution on approve/deny) plus a card in
     /// notifications/inbox.jsonl with card id == approval id — the exact
-    /// REM-stager contract. Dedupe: an existing PENDING mission.step
+    /// REM-stager contract. Dedupe: an existing PENDING execution.step
     /// approval for the same Workshop execution+step is reused (a re-staged step after
     /// a failed resume must not double-file). Fails closed (nil) on any
     /// list/create/card error — the executor then FAILS the step honestly.
@@ -225,7 +226,9 @@ extension BackgroundLoopsAssembly {
             let pending: [ApprovalRecord]
             do {
                 pending = try await inbox.list(
-                    filter: ApprovalFilter(status: "pending", action: "mission.step"))
+                    filter: ApprovalFilter(
+                        status: "pending",
+                        action: WorkshopStepApprovalAction.canonical))
             } catch {
                 FileHandle.standardError.write(Data(
                     "WorkshopStepStager: dedupe list failed for \(req.executionId)/\(req.stepId): \(error)\n".utf8))
@@ -249,11 +252,11 @@ extension BackgroundLoopsAssembly {
             }
             let body: JSONValue = .object([
                 "title": .string(req.title),
-                "action": .string("mission.step"),
+                "action": .string(WorkshopStepApprovalAction.canonical),
                 "risk": .string("medium"),
                 "reason": .string(req.reason),
                 "payload": .object([
-                    "kind": .string("mission.step"),
+                    "kind": .string(WorkshopStepApprovalAction.canonical),
                     "mission_id": .string(req.executionId),
                     "step_id": .string(req.stepId),
                     "tool": .string(req.tool),
@@ -292,7 +295,7 @@ extension BackgroundLoopsAssembly {
         let card: JSONValue = .object([
             "id": .string(approvalId),
             "created_at": .string(fmt.string(from: Date())),
-            "source": .string("missions"),
+            "source": .string("workshop"),
             "severity": .string("actionable"),
             "title": .string(req.title),
             "summary": .string("Workshop execution \(req.executionId) is blocked on step \(req.stepId) (\(req.tool))."),
@@ -336,7 +339,7 @@ extension BackgroundLoopsAssembly {
                 itemId: approvalId,
                 title: req.title,
                 summary: "Workshop execution \(req.executionId) is blocked on step \(req.stepId) (\(req.tool)).",
-                source: "missions",
+                source: "workshop",
                 severity: "actionable"
             )
         }
@@ -347,12 +350,12 @@ extension BackgroundLoopsAssembly {
     ///
     /// gpt-5.5 executor-port blocker #1 (2026-06-10): the ASSEMBLED executor
     /// instance is also published to WorkshopExecutorRef.shared here, so
-    /// NativeClient.startMission can route explicit "Start mission" requests
+    /// NativeClient.startWorkshopExecution can route explicit "Start execution" requests
     /// through the SAME actor (same injected LLM/tool/stager closures, same
     /// actor serialization) the background drain loop runs — mirror of the
     /// AppRestartCoordinator.shared.configure app-boot wiring pattern.
     /// assembleAllLoops → BackgroundLoopsManager.start() calls this once at
-    /// app launch; until then the ref is unconfigured and startMission
+    /// app launch; until then the ref is unconfigured and startWorkshopExecution
     /// throws an honest "executor not running" error.
     static func makeWorkshopExecutorLoopRunner(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
@@ -372,8 +375,8 @@ extension BackgroundLoopsAssembly {
 /// Process-wide handle to the ASSEMBLED WorkshopExecutorLoop (gpt-5.5
 /// executor-port blocker #1, 2026-06-10). The executor actor is constructed
 /// with injected closures in BackgroundLoopsAssembly.makeMissionExecutor and
-/// registered as a background loop at app boot; NativeClient.startMission
-/// needs that SAME instance to serve the UI "Start mission" path (the
+/// registered as a background loop at app boot; NativeClient.startWorkshopExecution
+/// needs that SAME instance to serve the UI "Start execution" path (the
 /// WorkshopRunnerClient protocol's start() deliberately throws — the runner
 /// holds no executor closures). Same shared-singleton wiring shape as
 /// AppRestartCoordinator.shared.configure: the app layer configures it at

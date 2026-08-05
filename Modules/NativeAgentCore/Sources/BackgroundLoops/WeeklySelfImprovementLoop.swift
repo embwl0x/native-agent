@@ -35,7 +35,7 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
     /// weekly self-improvement LLM pass. The scheduler's default 300s budget
     /// cancels long LLM passes mid-call with no user-visible trace (audit
     /// 2026-06-09 — same lesson as telegram_poll / mission_executor; the
-    /// mission-runner comment already cited a "self-improvement override" —
+    /// execution-runner comment already cited a "self-improvement override" —
     /// this makes that claim true).
     public var tickTimeoutOverride: TimeInterval? { 3600 }
 
@@ -64,12 +64,12 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
     /// (the pre-U2b behavior, and the honest default for non-repo installs).
     private let fileCodeFinding: (@Sendable (SelfImprovementProposal) async throws -> Void)?
     /// MEASURE leg (north-star, 2026-06-15): a compact week-over-week
-    /// mission-outcome summary so the self-improvement brain reasons over REAL
+    /// execution-outcome summary so the self-improvement brain reasons over REAL
     /// job OUTCOMES (completion rate / steps / wall-time trend), not only
-    /// chat/error/doctor proxies. Injected so this module gains no Missions dep
+    /// chat/error/doctor proxies. Injected so this module gains no Executions dep
     /// (same dependency-clean rule as stageProposal); the assembly wires it to
     /// `SwiftNativeWorkshopRunner.weeklyOutcomeStats()`. Default "" → the signal
-    /// is omitted (pre-MEASURE behavior, honest for installs with no missions).
+    /// is omitted (pre-MEASURE behavior, honest for installs with no executions).
     private let workshopOutcomes: @Sendable () async -> String
 
     public init(

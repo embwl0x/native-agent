@@ -24,7 +24,12 @@ public struct KGNativeStackStatus: Equatable, Sendable {
     /// `MemoryV2NativeStackSnapshot.load()` pattern in ContentView (same data
     /// root, same SQLite store, same Spotlight sentinel) but scoped to the KG
     /// view's compact header.
-    @MainActor
+    /// Render-cost audit F9: this was annotated `@MainActor`, which forced the
+    /// two `FileManager` stat syscalls below onto the main thread on every
+    /// KG-view appear. Nothing in here touches main-actor state — it reads a
+    /// path from `PersistenceCore`, stats two files, and awaits a detached
+    /// CloudKit probe — so the annotation only cost main-thread time. Callers
+    /// already `await` it, so dropping the isolation needs no call-site change.
     public static func load(graphCounts: (entities: Int, edges: Int)) async -> KGNativeStackStatus {
         let dataRoot = PersistenceCore.defaultDataRoot()
         var status = KGNativeStackStatus.empty

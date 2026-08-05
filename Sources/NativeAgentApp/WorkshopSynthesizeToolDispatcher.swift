@@ -3,9 +3,9 @@ import NativeAgentCore
 import ChatOrchestration
 import PersistenceCore
 
-// Synthesize-quality fix (2026-06-11, found live by Agent on mission 752636c5).
+// Synthesize-quality fix (2026-06-11, found live by Agent on execution 752636c5).
 //
-// A `chat.synthesize` mission step used to run a BARE LLM completion with NO
+// A `chat.synthesize` execution step used to run a BARE LLM completion with NO
 // tool access — so the model couldn't read the files/memory it was asked to
 // summarize and refused ("I can't access your filesystem, here's some jq").
 // The refusal was scored `succeeded`.
@@ -14,7 +14,7 @@ import PersistenceCore
 // BackgroundLoopsAssembly.makeMissionExecutor). This wrapper is the RESTRICTED,
 // READ-ONLY tool surface that turn is allowed to use: a hard allowlist over the
 // real SwiftToolDispatcher. Defense-in-depth — even if the system prompt or the
-// model tries a write/shell/mission tool, the dispatcher refuses by NAME before
+// model tries a write/shell/execution tool, the dispatcher refuses by NAME before
 // the call reaches any backend. The autonomy gate (AutonomyGatedDispatcher,
 // wired by makeChatOrchestrationClient) still applies ON TOP of this for the
 // read tools that survive the allowlist.

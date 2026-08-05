@@ -50,7 +50,8 @@ private let scriptedFindings = """
 
 @Test func weeklySI_loopId_and_interval() {
     let loop = WeeklySelfImprovementLoop(
-        llm: StubLLMClient(response: ""), isEnabled: { true }, stageProposal: { _ in }
+        llm: StubLLMClient(response: ""), dataRoot: hermeticDataRoot(),
+        isEnabled: { true }, stageProposal: { _ in }
     )
     #expect(loop.loopId == "self_improvement_sweep")
     #expect(loop.interval == 7 * 24 * 60 * 60)
@@ -190,7 +191,7 @@ private let scriptedFindings = """
     #expect(!FileManager.default.fileExists(atPath: request.path))
 }
 
-// MEASURE leg (north-star, 2026-06-15): the injected mission-outcome trend must
+// MEASURE leg (north-star, 2026-06-15): the injected execution-outcome trend must
 // reach the self-improvement LLM prompt so the improvement brain reasons over
 // real job outcomes, not just chat/error/doctor proxies.
 
@@ -236,7 +237,7 @@ private final class PromptCapturingLLM: LLMClient, @unchecked Sendable {
     await loop.tick()
     #expect(llm.callCount == 1)
     // No Workshop execution-outcomes header when the provider returns empty.
-    #expect(llm.capturedPrompt?.contains("Mission outcomes") == false)
+    #expect(llm.capturedPrompt?.contains("Execution outcomes") == false)
 }
 
 // MEASURE attribution: the weekly digest persists the Workshop execution-outcome snapshot

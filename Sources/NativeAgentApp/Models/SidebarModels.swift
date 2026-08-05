@@ -54,7 +54,7 @@ enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
     case memory = "Memory"               // alias → .memories
     case settingsHub = "Settings (Hub)"  // alias → .settings
     case approvals = "Approvals"         // alias → .activity
-    case legacyWorkshop = "Missions"       // compatibility wire ID; retired alias → .workshop
+    case legacyWorkshop = "Executions"       // compatibility wire ID; retired alias → .workshop
     case desk = "Desk"                   // retired alias → .workshop
     case work = "Work"                   // alias → .workshop
     case skillLifecycle = "Skill Lifecycle" // alias → .skills
@@ -81,7 +81,7 @@ enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    // 2026-06-06: Missions promoted to primary (daily-use, was buried in
+    // 2026-06-06: Executions promoted to primary (daily-use, was buried in
     // Advanced causing sidebar auto-scroll to pull it to top on click).
     // Personality + Connectors stay Advanced — set-once tabs.
     // 2026-07-22: Trust promoted to primary between Providers and Mac

@@ -181,7 +181,7 @@ func ToolLoopBudget_restores_old_surface_defaults_and_clamps_overrides() async t
 @Test
 func executeTurnWithToolLoop_no_tools_returns_immediately() async throws {
     let dir = try makeTempDir("no-tools")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let llm = MockLLMClient(scriptedResponses: ["just plain text, no tool calls here"])
     let tools = MockToolDispatchClient()
     let engine = makeEngine(persona: persona, llm: llm, tools: tools)
@@ -196,7 +196,7 @@ func executeTurnWithToolLoop_no_tools_returns_immediately() async throws {
 @Test
 func executeTurnWithToolLoop_default_chat_budget_allows_more_than_six_rounds() async throws {
     let dir = try makeTempDir("more-than-six")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let calls = (0..<7).map { idx in
         #"{"tool_calls":[{"id":"c\#(idx)","type":"function","function":{"name":"echo","arguments":"{}"}}]}"#
     }
@@ -217,7 +217,7 @@ func executeTurnWithToolLoop_default_chat_budget_allows_more_than_six_rounds() a
 @Test
 func executeTurnWithToolLoop_one_tool_call_dispatched_then_final() async throws {
     let dir = try makeTempDir("one-call")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     // Iter 1: OpenAI-style tool call. Iter 2: plain final reply.
     let toolCall = #"{"tool_calls":[{"id":"c1","type":"function","function":{"name":"echo","arguments":"{\"x\":1}"}}]}"#
     let llm = MockLLMClient(scriptedResponses: [toolCall, "final answer using tool output"])
@@ -285,7 +285,7 @@ func toolCallParserRejectsMarkdownPseudoCallsAndFencedMarkers() {
 @Test
 func executeTurnWithToolLoopBouncesMarkdownPseudoCallBeforeDispatch() async throws {
     let dir = try makeTempDir("markdown-pseudo-call")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let malformed = """
     **Tool Call: echo**
     ```json
@@ -313,7 +313,7 @@ func executeTurnWithToolLoopBouncesMarkdownPseudoCallBeforeDispatch() async thro
 @Test
 func dispatchIterationCallsDropsStructuredPlaceholderToolNames() async throws {
     let dir = try makeTempDir("placeholder-dispatch")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let llm = MockLLMClient(scriptedResponses: ["done"])
     let tools = MockToolDispatchClient(scripted: ["echo": .string("ok")])
     let engine = makeEngine(persona: persona, llm: llm, tools: tools)
@@ -355,7 +355,7 @@ func dispatchIterationCallsDropsStructuredPlaceholderToolNames() async throws {
 @Test
 func executeTurnWithToolLoop_emits_progress_for_tool_use_and_result() async throws {
     let dir = try makeTempDir("progress")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let toolCall = #"{"tool_calls":[{"id":"c1","type":"function","function":{"name":"echo","arguments":"{\"x\":1}"}}]}"#
     let llm = MockLLMClient(scriptedResponses: [toolCall, "final"])
     let tools = MockToolDispatchClient(scripted: ["echo": .string("ok")])
@@ -395,7 +395,7 @@ func executeTurnWithToolLoop_emits_progress_for_tool_use_and_result() async thro
 @Test
 func executeTurnWithToolLoop_providerSafeAliases_dispatchBackToInternalToolNames() async throws {
     let dir = try makeTempDir("provider-alias")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let internalName = "mcp__nativeagent-internal__agent.operating_map"
     let providerName = "mcp_nativeagent_internal_agent_operating_map"
     let params = Data(#"{"type":"object","properties":{}}"#.utf8)
@@ -441,7 +441,7 @@ func executeTurnWithToolLoop_providerSafeAliases_dispatchBackToInternalToolNames
 @Test
 func executeTurnWithToolLoop_multiple_tools_per_iteration() async throws {
     let dir = try makeTempDir("multi")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let twoCalls = #"{"tool_calls":[{"id":"c1","type":"function","function":{"name":"alpha","arguments":"{}"}},{"id":"c2","type":"function","function":{"name":"beta","arguments":"{}"}}]}"#
     let llm = MockLLMClient(scriptedResponses: [twoCalls, "done"])
     let tools = MockToolDispatchClient(scripted: [
@@ -461,7 +461,7 @@ func executeTurnWithToolLoop_multiple_tools_per_iteration() async throws {
 @Test
 func executeTurnWithToolLoop_max_iterations_returns_readable_fallback() async throws {
     let dir = try makeTempDir("max")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     // Every response is a tool call → never reaches a final reply.
     let alwaysCall = #"{"tool_calls":[{"id":"c1","type":"function","function":{"name":"echo","arguments":"{}"}}]}"#
     let llm = MockLLMClient(scriptedResponses: [alwaysCall])
@@ -478,7 +478,7 @@ func executeTurnWithToolLoop_max_iterations_returns_readable_fallback() async th
 @Test
 func executeTurnWithToolLoop_stopsAnIdenticalNoProgressCycleWithoutDisablingTheTool() async throws {
     let dir = try makeTempDir("no-progress")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let alwaysCall = #"{"tool_calls":[{"id":"c1","type":"function","function":{"name":"echo","arguments":"{\"query\":\"same\"}"}}]}"#
     let llm = MockLLMClient(scriptedResponses: [alwaysCall])
     let tools = MockToolDispatchClient(scripted: ["echo": .string("unchanged")])
@@ -517,7 +517,7 @@ func toolLoopNoProgressGuard_resetsWhenArgumentsOrResultsChange() {
 @Test
 func executeTurnWithToolLoop_OpenAI_function_call_format_detected() async throws {
     let dir = try makeTempDir("oai-fn")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     // The older single-call shape: `function_call` object, not `tool_calls` array.
     let fnCall = #"{"function_call":{"name":"echo","arguments":"{\"k\":\"v\"}"}}"#
     let llm = MockLLMClient(scriptedResponses: [fnCall, "ok done"])
@@ -538,7 +538,7 @@ func executeTurnWithToolLoop_OpenAI_function_call_format_detected() async throws
 @Test
 func executeTurnWithToolLoop_Anthropic_tool_use_format_detected() async throws {
     let dir = try makeTempDir("anth")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let xml = "<tool_use name=\"echo\">{\"q\":42}</tool_use>"
     let llm = MockLLMClient(scriptedResponses: [xml, "all done"])
     let tools = MockToolDispatchClient(scripted: ["echo": .string("ok")])
@@ -559,7 +559,7 @@ func executeTurnWithToolLoop_Anthropic_tool_use_format_detected() async throws {
 @Test
 func executeTurnWithToolLoop_tool_dispatch_failure_continues_with_error_in_prompt() async throws {
     let dir = try makeTempDir("err")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let call = #"{"tool_calls":[{"id":"c1","type":"function","function":{"name":"broken","arguments":"{}"}}]}"#
     let llm = MockLLMClient(scriptedResponses: [call, "recovered from tool error"])
     let tools = FailingToolDispatch()
@@ -581,7 +581,7 @@ func executeTurnWithToolLoop_tool_dispatch_failure_continues_with_error_in_promp
 @Test
 func executeTurnWithToolLoop_toolDispatches_recorded_in_order() async throws {
     let dir = try makeTempDir("order")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     // Iter 1: alpha. Iter 2: beta. Iter 3: final.
     let one = #"{"tool_calls":[{"id":"c1","type":"function","function":{"name":"alpha","arguments":"{}"}}]}"#
     let two = #"{"tool_calls":[{"id":"c2","type":"function","function":{"name":"beta","arguments":"{}"}}]}"#
@@ -597,7 +597,7 @@ func executeTurnWithToolLoop_toolDispatches_recorded_in_order() async throws {
 @Test
 func executeTurnWithToolLoop_no_double_count_on_LLM_retry() async throws {
     let dir = try makeTempDir("nodup")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     // The same tool name is called by the LLM in two SEPARATE iterations.
     // Each iteration must produce exactly one dispatch — never carry over.
     let call = #"{"tool_calls":[{"id":"c","type":"function","function":{"name":"echo","arguments":"{}"}}]}"#
@@ -615,7 +615,7 @@ func executeTurnWithToolLoop_no_double_count_on_LLM_retry() async throws {
 @Test
 func executeTurnWithToolLoop_injects_session_id_for_scratchpad_read() async throws {
     let dir = try makeTempDir("scratch-session")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let call = #"{"tool_calls":[{"id":"c1","type":"function","function":{"name":"scratchpad_read","arguments":"{\"key\":\"plan\"}"}}]}"#
     let llm = MockLLMClient(scriptedResponses: [call, "done"])
     let tools = MockToolDispatchClient(scripted: ["scratchpad_read": .string("ok")])
@@ -675,7 +675,7 @@ private final class FlagWritingToolDispatch: ToolDispatchClient, @unchecked Send
 @Test
 func executeTurnWithToolLoop_cancelFlagMidLoop_throwsCancellation() async throws {
     let dir = try makeTempDir("cancel-mid")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let flagPath = dir.appendingPathComponent("cancelled.flag")
     // The model keeps calling a tool forever; the tool writes the cancel flag
     // on its first dispatch. The loop's iteration-top poll then halts on the
@@ -699,7 +699,7 @@ func executeTurnWithToolLoop_cancelFlagMidLoop_throwsCancellation() async throws
 @Test
 func executeTurnWithToolLoop_preExistingCancelFlag_throwsBeforeFirstProviderCall() async throws {
     let dir = try makeTempDir("cancel-pre")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let flagPath = dir.appendingPathComponent("cancelled.flag")
     try Data().write(to: flagPath)
     let llm = MockLLMClient(scriptedResponses: ["unreached"])
@@ -719,7 +719,7 @@ func executeTurnWithToolLoop_preExistingCancelFlag_throwsBeforeFirstProviderCall
 @Test
 func executeTurnWithToolLoop_absentCancelFlag_completesNormally() async throws {
     let dir = try makeTempDir("cancel-none")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let flagPath = dir.appendingPathComponent("cancelled.flag")  // never created
     let toolCall = #"{"tool_calls":[{"id":"c1","type":"function","function":{"name":"echo","arguments":"{}"}}]}"#
     let llm = MockLLMClient(scriptedResponses: [toolCall, "final answer"])

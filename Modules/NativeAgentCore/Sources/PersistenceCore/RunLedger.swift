@@ -5,7 +5,7 @@ import Foundation
 /// Native writer for the cross-surface run ledger at `<dataRoot>/runs/runs.json`.
 ///
 /// This is the Swift-native writer: every discrete native run (invoke_codex / invoke_claude
-/// sub-agent spawns, agent-swarm dispatches, mission planner LLM calls)
+/// sub-agent spawns, agent-swarm dispatches, execution planner LLM calls)
 /// appends one row here at completion.
 ///
 /// Contract notes:
@@ -21,7 +21,7 @@ import Foundation
 /// - The ledger is bounded (`maxRetainedRuns`, newest kept) and every
 ///   read-modify-write runs under the cross-process `withFileLock` flock
 ///   with an atomic rewrite, so concurrent producers (chat tool loop,
-///   background mission executor, Mac UI swarm) can't interleave or tear
+///   background execution executor, Mac UI swarm) can't interleave or tear
 ///   the file.
 /// - Appends are BEST-EFFORT by design: a ledger-write failure must never
 ///   fail the run it records. Failures are logged loudly to stderr instead

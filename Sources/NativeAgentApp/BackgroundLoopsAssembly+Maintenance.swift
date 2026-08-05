@@ -131,7 +131,7 @@ extension BackgroundLoopsAssembly {
                 }
             },
             // MEASURE leg (north-star, 2026-06-15): feed the real week-over-week
-            // mission-outcome trend into the weekly analysis so the improvement
+            // execution-outcome trend into the weekly analysis so the improvement
             // brain sees whether Agent is actually completing more jobs in fewer
             // steps — not just chat/error/doctor proxies. Read-only runner bound
             // to the same dataRoot (the scoreboard only scans mission.json; the

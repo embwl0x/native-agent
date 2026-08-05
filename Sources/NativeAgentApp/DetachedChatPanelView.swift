@@ -44,6 +44,23 @@ struct DetachedChatPanelView: View {
     @State private var resizeBurstToken = 0
     @State private var resizeWasAtBottom = false
     @State private var resizeSettleTask: Task<Void, Never>?
+    // Render-cost audit F1 — streaming-delta scroll throttle.
+    //
+    // `.onChange(of: messages.last?.content)` fires on every coalesced delta
+    // (~14 Hz for the whole turn, `chatStreamCoalesceSeconds = 0.07`), and each
+    // one forced a LazyVStack realization/measurement pass toward the bottom
+    // anchor. The main window has solved this since chat-smoothness phase 1;
+    // the panel just never got the coordinator. Same type, same call shape as
+    // `ChatView+SessionActions.swift:72-80`.
+    //
+    // THROTTLE ONLY — no behavior change. The coordinator's `autoFollow` gate
+    // is a no-op here on purpose: nothing in this panel ever calls
+    // `disarmFollow()`, so it stays `true` for the panel's whole life and the
+    // guard always passes. Adding the user-disarm (the other half of F1) fixes
+    // a real UX defect but is a behavior change, held as a separate NEEDS-USER
+    // item. What lands here is strictly "same scrolls, at most ~6 Hz instead of
+    // ~14 Hz" — the 0.16 s non-animated floor in `scrollToBottom`.
+    @State private var scrollCoordinator = ChatScrollCoordinator()
     @State private var isCapturing = false
     @State private var toastMessage: String?
     @State private var voiceInput = VoiceInputController()
@@ -128,6 +145,9 @@ struct DetachedChatPanelView: View {
             inputFocused = true
         }
         .onDisappear {
+            // F1: invalidate any scroll scheduled against the now-dead proxy
+            // (same contract as `ChatView.swift:1032`).
+            scrollCoordinator.markViewDisappeared()
             // H5: hand the uncommitted draft back so closing the panel never
             // eats typed text (the main window adopts it on session switch).
             appModel.commitChatDraft(panelDraft, sessionId: sessionId)
@@ -242,8 +262,16 @@ struct DetachedChatPanelView: View {
                 }
             }
             .onChange(of: messages.last?.content) {
-                // Follow streaming deltas to the bottom.
-                proxy.scrollTo(detachedBottomAnchor, anchor: .bottom)
+                // Follow streaming deltas to the bottom — coalesced (F1). The
+                // message-COUNT path above stays immediate and animated: an
+                // append is one event, not a 14 Hz stream, and deferring it
+                // would be a visible timing change on bubble entrance.
+                scrollCoordinator.scrollToBottom(
+                    proxy,
+                    bottomAnchor: detachedBottomAnchor,
+                    animated: false,
+                    delay: 0
+                )
             }
         }
     }

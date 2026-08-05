@@ -161,9 +161,9 @@ extension NativeClient {
         return record
     }
 
-    // WAVE 40 W07 (§6.220): missions CRUD-admin WRITE seam behind
+    // WAVE 40 W07 (§6.220): executions CRUD-admin WRITE seam behind
     // `.missionsWrites` (default OFF). The SwiftNative write impls
-    // (SwiftNativeWorkshopRunner.submit / updateMission / cancel) and their
+    // (SwiftNativeWorkshopRunner.submit / updateWorkshopExecution / cancel) and their
     // cross-process flock on workshop/executions/<id>/{mission.json,timeline.jsonl}
     // were built in waves 33/34/35 W07; this flips the CONSUMER seam so the Mac
     // UI's create/update/cancel land natively without the daemon.
@@ -173,7 +173,7 @@ extension NativeClient {
         // as the Python handler. submit()
         // validates a non-empty objective (throws WorkshopExecutionError.invalidRequest
         // "missing_objective", parity with the daemon's 400). NOTHING
-        // auto-starts in submit itself; the mission lands in `queued` and
+        // auto-starts in submit itself; the execution lands in `queued` and
         // WorkshopExecutorLoop (executor port, 2026-06-10 — registered via
         // BackgroundLoopsAssembly, gated on enableAutonomy + missionPolicy)
         // claims and runs it on its next drain pass.
@@ -199,7 +199,7 @@ extension NativeClient {
     func getTriggers() async throws -> [TriggerRecord] {
         // SUBSYSTEM #17 cluster C3 (2026-05-31): SwiftNative TriggerScheduler
         // covers list/enable/disable/configure for both schedules behind the
-        // .triggerScheduler flag. fire_now for supported inbox/mission cases is
+        // .triggerScheduler flag. fire_now for supported inbox/execution cases is
         // native; unsupported cases fail closed.
         return try await swiftListWorkshopTriggers()
     }
@@ -750,7 +750,7 @@ extension NativeClient {
 
     func inboxTriggerFireNow(_ name: String, stub: Bool) async throws -> (itemId: String?, wasStub: Bool) {
         // Wave 12 (2026-05-31): SwiftNative path covers the stub=true canonical
-        // kinds (file_watch/idle/time/mission_complete/session_pattern). The
+        // kinds (file_watch/idle/time/execution_complete/session_pattern). The
         // non-stub action path now fails closed if the Swift scheduler cannot
         // execute it.
         // FIRE site: carries the paired-device push sender (see
@@ -817,7 +817,7 @@ extension NativeClient {
             // returns "running"; the SwiftNative submit() persists "queued"
             // and execution is deferred to WorkshopExecutorLoop's next drain
             // pass (executor port, 2026-06-10) rather than a submit-time
-            // auto-start. Cosmetic only — this drives the "Mission queued:
+            // auto-start. Cosmetic only — this drives the "Execution queued:
             // <id>" toast, not control flow; loadMissions() re-reads the
             // live status from the queue right after. Reporting the enqueue
             // status is honest.
@@ -831,19 +831,19 @@ extension NativeClient {
         )
     }
 
-    // Swift-native mission start. Do not synthesize `running`: the Missions
+    // Swift-native execution start. Do not synthesize `running`: the Executions
     // module owns execution state.
     //
     // gpt-5.5 executor-port blocker #1 (2026-06-10): this used to call the
     // WorkshopRunnerClient protocol's start(), which deliberately throws
     // .unavailable (the runner holds no executor closures) — the UI "Start
-    // mission" path was dead. Explicit starts now route through the
+    // execution" path was dead. Explicit starts now route through the
     // ASSEMBLED WorkshopExecutorLoop instance published at app boot by
     // BackgroundLoopsAssembly.makeMissionExecutorLoopRunner →
     // WorkshopExecutorRef.shared (the AppRestartCoordinator.shared.configure
     // wiring pattern). Unconfigured ref (headless/test process, loops not
     // started yet) → honest "executor not running" error, never a silent
-    // no-op; the mission stays durably queued for the next drain pass.
+    // no-op; the execution stays durably queued for the next drain pass.
     func startWorkshopExecution(id: String) async throws -> WorkshopActionResult {
         let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
@@ -869,7 +869,7 @@ extension NativeClient {
 
     // DAEMON-DEAD PORT (2026-06-02): read the approvals file, mark the matching
     // step record approved, write back under a flock. Then return the current
-    // mission detail (native read).
+    // execution detail (native read).
     //
     // R5 (eval E06 fix-3): canonical path is `<root>/workflows/approvals/requests.json`
     // — matches the ApprovalInbox list reader source-of-truth

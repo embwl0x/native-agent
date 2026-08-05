@@ -18,7 +18,7 @@ struct ProviderSettingsView: View {
     // If you add a surface to MODEL_SURFACES, append it here too (keep order).
     // Last synced 2026-07-15.
     static let canonicalSurfaces = [
-        "chat", "ios", "telegram", "slack", "missions", "autonomy", "swarms",
+        "chat", "ios", "telegram", "slack", "workshop", "autonomy", "swarms",
         "dream", "rem", "training", "memory", "heartbeat", "diagnostics",
         "cognition_reflection", "compaction",
     ]
@@ -280,7 +280,7 @@ struct ProviderSettingsView: View {
         switch surface {
         case "chat":      return "Chat"
         case "ios":       return "iPhone"
-        case "missions":  return "Workshop" // Stable provider-surface wire id.
+        case "workshop", "missions":  return "Workshop" // Canonical + 0.3.x wire ids.
         case "training":  return "Training"
         case "dream":     return "Dream"
         case "telegram":  return "Telegram"

@@ -10,7 +10,7 @@
 //
 // This is DISTINCT from the ApprovalInbox module (the human-gate approvals
 // QUEUE). The notification Inbox is the agent's proactively-surfaced-item feed:
-// trigger fires, mission-complete notices, proactive-autonomy ideas,
+// trigger fires, execution-complete notices, proactive-autonomy ideas,
 // harness-learning cards, idle check-ins, etc. Wave 30 W20 documented that it
 // had NO Swift module; this module fills that gap.
 //

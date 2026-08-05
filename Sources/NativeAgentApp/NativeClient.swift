@@ -47,8 +47,8 @@ import Research
 import MultimodalTTS
 // TriggerScheduler owns inbox and Workshop trigger list/enable/disable/configure.
 // Inbox /fire_now is Swift-native for stub=true canonical
-// kinds (file_watch/idle/time/mission_complete/session_pattern); stub=false
-// fails closed unless Swift can execute it. Mission trigger fire-now routes
+// kinds (file_watch/idle/time/execution_complete/session_pattern); stub=false
+// fails closed unless Swift can execute it. Execution trigger fire-now routes
 // through SwiftNativeWorkshopRunner.
 import TriggerScheduler
 import WorkshopExecution

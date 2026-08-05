@@ -137,7 +137,7 @@ private func makeEngine(
     tools: any ToolDispatchClient
 ) -> SwiftNativeTurnEngine {
     SwiftNativeTurnEngine(
-        persona: SwiftNativePersonaEngine(root: root),
+        persona: hermeticPersona(root: root),
         memory: nil,
         router: StubRoutingForTrace(prefs: [
             "chat": SurfacePreference(surface: "chat", model: "client-model", reasoningEffort: "high"),

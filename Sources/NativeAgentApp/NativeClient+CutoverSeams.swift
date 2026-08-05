@@ -157,7 +157,7 @@ extension NativeClient {
     //
     // v1 callers: none yet — this is a public seam for future
     // vision-decision-loop work (e.g. /show slash command, autonomous
-    // mission step). The composer button still goes through
+    // execution step). The composer button still goes through
     // ContentView.NativeScreenCapture.captureImageBase64() which delegates
     // to the SAME ScreenVision module under the hood.
     @MainActor

@@ -96,7 +96,7 @@ private func makeHook(
 }
 
 @Test func selfHeal_loopId_and_surface() {
-    let loop = SelfHealingHook(llm: DiagLLM(), fileProposal: { _, _ in })
+    let loop = SelfHealingHook(llm: DiagLLM(), dataRoot: hermeticDataRoot(), fileProposal: { _, _ in })
     #expect(loop.loopId == "self_healing")
     #expect(SelfHealingHook.surface == "diagnostics")
     #expect(loop.interval == 30 * 60)

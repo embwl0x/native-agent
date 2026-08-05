@@ -156,10 +156,10 @@ extension AppModel {
             compiledPersonality = fresh("personality", try? await api.getCompiledPersonality(surface: "chat"))
         case .legacyWorkshop:
             // 2026-06-06 sidebar-fix v3: removed the approvals side-effect
-            // refresh. It was causing the sidebar to scroll on Missions click:
-            // updating BOTH appModel.missions AND appModel.approvals in the
+            // refresh. It was causing the sidebar to scroll on Executions click:
+            // updating BOTH appModel.executions AND appModel.approvals in the
             // same render cycle changed TWO sidebar badge counts at once
-            // (Missions running-count + Activity pending-count), triggering
+            // (Executions running-count + Activity pending-count), triggering
             // a double re-layout that shifted the scroll position. Approvals
             // have their own refresh in the .activity case and the sidebar's
             // own 30s poll; they don't need to ride along with WorkshopExecution.
@@ -480,6 +480,46 @@ extension AppModel {
         )
     }
 
+    /// Render-cost audit F14. `nextRefreshStatus` stamps `lastAttemptAt: now`
+    /// on every call, so the `Equatable` struct can never equal its
+    /// predecessor. Observation fires on *write*, not on *change*, so every
+    /// poll of an idle, fully-successful system invalidated every reader of
+    /// the status — including the root `ContentView`, which reads
+    /// `sidebarActivityRefreshStatus`.
+    ///
+    /// This returns nil when the fresh status does not need to be stored.
+    ///
+    /// **Only valid for a status whose sole rendered projection is `isStale`**
+    /// (equivalently: `failedEndpoints.isEmpty`). Verified reader set for
+    /// `sidebarActivityRefreshStatus` at the time of writing:
+    /// `ContentView.swift:103` and `:115`, both `?.isStale == true`. Nothing
+    /// renders its `lastAttemptAt` or `lastSuccessAt`, so carrying the old
+    /// timestamps forward is unobservable.
+    ///
+    /// It is deliberately NOT used for `panelRefreshStatus`, whose timestamps
+    /// *are* rendered — `panelStaleNotice(for:)` feeds both of them into
+    /// `approximateAgeDescription`, and that string has to keep aging.
+    static func staleFlagOnlyStatusToStore(
+        previous: PanelRefreshStatus?,
+        failedEndpoints: [String],
+        at now: Date
+    ) -> PanelRefreshStatus? {
+        // A first-ever status is always stored: `nil` vs non-nil is itself a
+        // rendered distinction (`compactReadPresentationState` treats nil as
+        // "loading").
+        guard let previous else {
+            return nextRefreshStatus(previous: nil, failedEndpoints: failedEndpoints, at: now)
+        }
+        // Compare the whole failure list, not just `isStale`: a different set
+        // of failed endpoints is a different outcome even when both are
+        // non-empty, and this keeps the helper honest if a future reader ever
+        // renders the list.
+        guard previous.failedEndpoints == failedEndpoints else {
+            return nextRefreshStatus(previous: previous, failedEndpoints: failedEndpoints, at: now)
+        }
+        return nil
+    }
+
     static func keepingLastGood<Value>(_ previous: Value, fetched: Value?) -> Value {
         fetched ?? previous
     }
@@ -528,18 +568,31 @@ extension AppModel {
             nextInbox,
             nextMemoryProposals
         )
-        approvals = Self.keepingLastGood(approvals, fetched: approvalRows)
-        inboxItems = Self.keepingLastGood(inboxItems, fetched: inboxRows)
-        memoryProposals = Self.keepingLastGood(memoryProposals, fetched: proposalRows)
+        // Render-cost audit F13/F14: this is a file-watch-driven refresh
+        // (`ContentView.swift:130-143`), so it fires on any touch of the
+        // approvals/inbox/memory files — including SQLite WAL churn that
+        // changed nothing. Each of these four writes invalidates the root
+        // `ContentView` (it reads `pendingActivityCount`, which fans out to
+        // these collections). Observation fires on write, not on change, so
+        // gate every one: an unchanged badge refresh now performs zero writes
+        // and triggers zero render passes.
+        let nextApprovalRows = Self.keepingLastGood(approvals, fetched: approvalRows)
+        if approvals != nextApprovalRows { approvals = nextApprovalRows }
+        let nextInboxRows = Self.keepingLastGood(inboxItems, fetched: inboxRows)
+        if inboxItems != nextInboxRows { inboxItems = nextInboxRows }
+        let nextProposalRows = Self.keepingLastGood(memoryProposals, fetched: proposalRows)
+        if memoryProposals != nextProposalRows { memoryProposals = nextProposalRows }
         var failed: [String] = []
         if approvalRows == nil { failed.append("approvals") }
         if inboxRows == nil { failed.append("inbox") }
         if proposalRows == nil { failed.append("memory proposals") }
-        sidebarActivityRefreshStatus = Self.nextRefreshStatus(
+        if let nextStatus = Self.staleFlagOnlyStatusToStore(
             previous: sidebarActivityRefreshStatus,
             failedEndpoints: failed,
             at: Date()
-        )
+        ) {
+            sidebarActivityRefreshStatus = nextStatus
+        }
     }
 
     // S.1: touch a draft key to mark it recently used; call on every chatDrafts write.

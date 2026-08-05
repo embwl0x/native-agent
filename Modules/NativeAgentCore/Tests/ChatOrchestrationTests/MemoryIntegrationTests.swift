@@ -73,7 +73,7 @@ private func makeWiredClient(
     llm: any LLMClient,
     promoter: (any MemoryPromoting)? = nil
 ) -> SwiftNativeChatOrchestrationClient {
-    let persona = SwiftNativePersonaEngine(root: root)
+    let persona = hermeticPersona(root: root)
     let tools = MockToolDispatchClient()
     let engine = SwiftNativeTurnEngine(
         persona: persona,

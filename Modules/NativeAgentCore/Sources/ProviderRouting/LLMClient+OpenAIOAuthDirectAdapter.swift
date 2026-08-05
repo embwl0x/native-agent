@@ -13,7 +13,7 @@ import PersistenceCore
 // OPENAI_API_KEY field is literally `null` in `auth.json`; the real
 // credentials live in `auth.json::tokens.access_token` (a ChatGPT OAuth JWT,
 // endpoint-scoped to `chatgpt.com`, NOT `api.openai.com`). The Python
-// mission planner uses `openai_oauth_direct.py` which POSTs to
+// execution planner uses `openai_oauth_direct.py` which POSTs to
 // `https://chatgpt.com/backend-api/codex/responses` with that JWT as Bearer.
 // This Swift adapter mirrors that path.
 //

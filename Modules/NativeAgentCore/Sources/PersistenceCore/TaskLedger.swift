@@ -8,7 +8,7 @@ import Foundation
 // speak "append-under-flock"; no daemon, no server.
 //
 // MODULE HOME: PersistenceCore. The ledger is pure JSONL + flock IO with NO
-// provider / LLM / mission dependencies, so the least-coupled home is the IO
+// provider / LLM / execution dependencies, so the least-coupled home is the IO
 // foundation everything already depends on. PersistenceCore depends only on
 // NativeAgentCore; ChatOrchestration and BackgroundLoops (the two Swift
 // consumers) already list PersistenceCore as a dependency — so this adds ZERO

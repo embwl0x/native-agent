@@ -7,7 +7,7 @@ struct TrustWorkshopPolicy: Codable, Hashable {
     var allowBackgroundExecutions: Bool?
     var requireReceipts: Bool?
     var autoCreateWorkshopExecutionFromChat: Bool?
-    // PATCH-2026-05-07: missions-b master gate for autonomous mission submission
+    // PATCH-2026-05-07: executions-b master gate for autonomous execution submission
     var enabled: Bool?
     var showTimeline: Bool?
 
@@ -18,7 +18,7 @@ struct TrustWorkshopPolicy: Codable, Hashable {
     }
 }
 
-// PATCH-2026-05-07: missions-b Self-test result model
+// PATCH-2026-05-07: executions-b Self-test result model
 struct WorkshopSelfTestResult: Codable, Hashable {
     var status: String
     var executionId: String

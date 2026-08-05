@@ -9,7 +9,7 @@ import Foundation
 // truth.
 //
 // MODULE HOME: PersistenceCore — same reasoning as TaskLedger. Pure JSONL +
-// flock IO, no provider / LLM / mission dependency, zero new Package.swift
+// flock IO, no provider / LLM / execution dependency, zero new Package.swift
 // edges.
 //
 // STABLE HANDLES survive everything ("desk_" + lowercased UUID). The view

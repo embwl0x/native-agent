@@ -432,7 +432,7 @@ extension CognitiveSubstrate {
     /// NO NEW EXPOSURE SURFACE (gpt-5.5 HIGH, 2026-07-02): only LIVE
     /// conversationFocus/correction nodes may be NAMED here — the dream prompt
     /// already consumes the full conversation text but deliberately DROPS tool
-    /// rows, so a felt toolObservation/providerHealth/mission/appLifecycle
+    /// rows, so a felt toolObservation/providerHealth/execution/appLifecycle
     /// summary must never ride into the LLM through this section. The mood-band
     /// line still integrates over ALL felt nodes (a number + band word carries
     /// no content), but the named lines are conversation-only.

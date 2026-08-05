@@ -60,7 +60,7 @@ Current implementation anchors:
 | CCS-P1-D11 | Tool succeeded/failed event ingress | Done | Structured chat and text-compat/Telegram tool progress emit bounded redacted cognitive tool-start/result events; focused chat tests cover both paths |
 | CCS-P1-D12 | User correction event ingress | Done | iOS/iCloud reject/cancel/delete/dismiss actions are classified as `userCorrection` through `MacSyncActionRouter` and `NativeCognitiveEventFactory`; focused app test covers remote rejection |
 | CCS-P1-D13 | Provider failure event ingress | Done | iOS/iCloud provider action failures are classified as `providerFailure` with redacted metadata; focused app test covers provider failure redaction |
-| CCS-P1-D14 | Mission completed event ingress | Done | `MissionExecutorLoop` emits terminal mission records through an injected sink and app assembly forwards to cognition; focused app test covers mission terminal event construction |
+| CCS-P1-D14 | Workshop execution completed event ingress | Done | `WorkshopExecutorLoop` emits terminal execution records through an injected sink and app assembly forwards to cognition; focused app test covers execution terminal event construction |
 | CCS-P1-D15 | App wake/sleep event ingress | Done | `NativeCognitionRuntime.bootstrap()` and termination hooks |
 | CCS-P1-A1 | Deterministic tests | Done | Focused substrate tests |
 | CCS-P1-A2 | Active nodes capped | Done | Capacity eviction tests |

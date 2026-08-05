@@ -215,7 +215,8 @@ struct GateResolverDisagreementTests {
             router: W1Router(chatModel: "claude-opus-4-8"),
             codex: W1NoopAdapter("codex"),
             anthropic: W1NoopAdapter("anthropic"),
-            openAI: W1NoopAdapter("openai")
+            openAI: W1NoopAdapter("openai"),
+            moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
         )
 
         var events: [LLMMessageStreamEvent] = []
@@ -249,7 +250,8 @@ struct GateResolverDisagreementTests {
             router: W1Router(chatModel: "gpt-5.5"),
             codex: W1NoopAdapter("codex"),
             anthropic: W1NoopAdapter("anthropic"),
-            openAI: W1NoopAdapter("openai")
+            openAI: W1NoopAdapter("openai"),
+            moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
         )
         var texts: [String] = []
         for try await ev in client.streamMessages(
@@ -268,7 +270,8 @@ struct GateResolverDisagreementTests {
             router: W1Router(chatModel: "claude-opus-4-8"),
             codex: W1NoopAdapter("codex"),
             anthropic: W1NoopAdapter("anthropic"),
-            openAI: W1NoopAdapter("openai")
+            openAI: W1NoopAdapter("openai"),
+            moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
         )
         var texts: [String] = []
         for try await ev in client.streamMessages(

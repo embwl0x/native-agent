@@ -3,9 +3,9 @@ import Foundation
 @testable import WorkshopExecution
 import PersistenceCore
 
-// MEASURE leg (north-star, 2026-06-15): the mission outcome scoreboard.
+// MEASURE leg (north-star, 2026-06-15): the execution outcome scoreboard.
 // Tests the PURE aggregator core over synthetic samples (deterministic, no
-// I/O, no clock) plus the record→sample parser against real mission timestamp
+// I/O, no clock) plus the record→sample parser against real execution timestamp
 // format.
 
 private func sample(

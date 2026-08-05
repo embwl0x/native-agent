@@ -578,11 +578,11 @@ private func stageSavedPolicy(at root: URL, _ value: JSONValue) throws {
         return
     }
     #expect(security["killSwitchEnabled"] == .bool(true))
-    guard case .object(let mission)? = policy["missionPolicy"] else {
-        Issue.record("missing fail-closed mission policy")
+    guard case .object(let execution)? = policy["missionPolicy"] else {
+        Issue.record("missing fail-closed execution policy")
         return
     }
-    #expect(mission["allowBackgroundMissions"] == .bool(false))
+    #expect(execution["allowBackgroundMissions"] == .bool(false))
     #expect(try Data(contentsOf: path) == damaged)
 }
 
@@ -608,7 +608,7 @@ private func stageSavedPolicy(at root: URL, _ value: JSONValue) throws {
 struct SwiftNativeTrustPolicyTests {
 
 @Test func defaultTrustPolicy_autonomyDefault_is_supervised() async throws {
-    let tc = SwiftNativeTrustCenter()
+    let tc = hermeticTrust()
     let p = tc.defaultTrustPolicy()
     if case .string(let s)? = p["autonomyDefault"] {
         #expect(s == "supervised")
@@ -618,7 +618,7 @@ struct SwiftNativeTrustPolicyTests {
 }
 
 @Test func defaultTrustPolicy_filePolicy_outsideWorkspaceDefault_is_deny() async throws {
-    let tc = SwiftNativeTrustCenter()
+    let tc = hermeticTrust()
     let p = tc.defaultTrustPolicy()
     guard case .object(let fp)? = p["filePolicy"],
           case .string(let v)? = fp["outsideWorkspaceDefault"] else {
@@ -721,7 +721,7 @@ private func bundle(default d: String, overrides: [String: JSONValue]) -> [Strin
 }
 
 @Test func autonomyForTool_exact_match_wins_over_glob() async throws {
-    let tc = SwiftNativeTrustCenter()
+    let tc = hermeticTrust()
     let b = bundle(default: "auto", overrides: [
         "mac.shell": .string("send_approval"),
         "mac.*": .string("auto"),
@@ -736,7 +736,7 @@ private func bundle(default d: String, overrides: [String: JSONValue]) -> [Strin
     // `default:"auto"` (the builder-tools auto-fire situation) with NO explicit
     // evolution key, and prove the shipped default still resolves to confirm —
     // the exact match wins over the auto default fallback.
-    let tc = SwiftNativeTrustCenter()
+    let tc = hermeticTrust()
     var overrides = SwiftNativeTrustCenter.workshopExecutionsDefaultToolAutonomy
     overrides["default"] = .string("auto")   // saved default = auto
     let b = bundle(default: "supervised", overrides: overrides)
@@ -748,7 +748,7 @@ private func bundle(default d: String, overrides: [String: JSONValue]) -> [Strin
 }
 
 @Test func autonomyForTool_github_mutations_stay_confirm_when_default_is_auto() async throws {
-    let tc = SwiftNativeTrustCenter()
+    let tc = hermeticTrust()
     var overrides = SwiftNativeTrustCenter.workshopExecutionsDefaultToolAutonomy
     overrides["default"] = .string("auto")
     let b = bundle(default: "supervised", overrides: overrides)
@@ -758,7 +758,7 @@ private func bundle(default d: String, overrides: [String: JSONValue]) -> [Strin
 }
 
 @Test func autonomyForTool_readOnlyResidentInspection_isAutoOnExistingAndFreshInstalls() async throws {
-    let tc = SwiftNativeTrustCenter()
+    let tc = hermeticTrust()
     var overrides = SwiftNativeTrustCenter.workshopExecutionsDefaultToolAutonomy
     overrides["default"] = .string("send_approval")
     let b = bundle(default: "supervised", overrides: overrides)
@@ -769,7 +769,7 @@ private func bundle(default d: String, overrides: [String: JSONValue]) -> [Strin
 }
 
 @Test func autonomyForTool_glob_match_more_specific_wins() async throws {
-    let tc = SwiftNativeTrustCenter()
+    let tc = hermeticTrust()
     // fewer wildcards beats more wildcards.
     let b = bundle(default: "auto", overrides: [
         "mac.*": .string("send_approval"),
@@ -779,7 +779,7 @@ private func bundle(default d: String, overrides: [String: JSONValue]) -> [Strin
 }
 
 @Test func autonomyForTool_glob_longer_beats_shorter() async throws {
-    let tc = SwiftNativeTrustCenter()
+    let tc = hermeticTrust()
     // Same wildcard count → longer pattern wins.
     let b = bundle(default: "auto", overrides: [
         "mac.shell.*": .string("destructive_strong"),
@@ -789,7 +789,7 @@ private func bundle(default d: String, overrides: [String: JSONValue]) -> [Strin
 }
 
 @Test func autonomyForTool_alphabetical_tiebreak() async throws {
-    let tc = SwiftNativeTrustCenter()
+    let tc = hermeticTrust()
     // Same wildcard count + same length → alphabetical (smaller string wins).
     let b = bundle(default: "auto", overrides: [
         "b.*": .string("send_approval"),
@@ -800,7 +800,7 @@ private func bundle(default d: String, overrides: [String: JSONValue]) -> [Strin
 }
 
 @Test func autonomyForTool_falls_back_to_default_key() async throws {
-    let tc = SwiftNativeTrustCenter()
+    let tc = hermeticTrust()
     let b = bundle(default: "auto", overrides: [
         "default": .string("send_approval"),
     ])
@@ -808,13 +808,13 @@ private func bundle(default d: String, overrides: [String: JSONValue]) -> [Strin
 }
 
 @Test func autonomyForTool_falls_back_to_autonomyDefault() async throws {
-    let tc = SwiftNativeTrustCenter()
+    let tc = hermeticTrust()
     let b = bundle(default: "confirm", overrides: [:])
     #expect(tc.autonomyForTool("anything.at_all", policy: b) == "confirm")
 }
 
 @Test func autonomyForTool_invalid_levels_are_skipped() async throws {
-    let tc = SwiftNativeTrustCenter()
+    let tc = hermeticTrust()
     let b = bundle(default: "auto", overrides: [
         "exact.tool": .string("bogus_level"),
         "exact.*": .string("send_approval"),
@@ -824,14 +824,14 @@ private func bundle(default d: String, overrides: [String: JSONValue]) -> [Strin
 }
 
 @Test func autonomyForTool_empty_name_returns_autonomyDefault() async throws {
-    let tc = SwiftNativeTrustCenter()
+    let tc = hermeticTrust()
     let b = bundle(default: "blocked", overrides: ["*": .string("auto")])
     #expect(tc.autonomyForTool("", policy: b) == "blocked")
     #expect(tc.autonomyForTool("   ", policy: b) == "blocked")
 }
 
 @Test func autonomyForTool_default_key_never_glob_matches() async throws {
-    let tc = SwiftNativeTrustCenter()
+    let tc = hermeticTrust()
     // "default" is a literal key, never a glob — so a tool literally named
     // "default" should NOT match it as a glob; rather, exact-match rule
     // applies. Confirm a non-"default" tool falls through to the special key.
@@ -849,7 +849,7 @@ private func bundle(default d: String, overrides: [String: JSONValue]) -> [Strin
 // notably ChatOrchestration+AutonomyGate, which only sets `autonomyDefault`
 // when the policy carries a string value for it.
 @Test func autonomyForTool_absent_autonomyDefault_fails_closed_to_send_approval() async throws {
-    let tc = SwiftNativeTrustCenter()
+    let tc = hermeticTrust()
     // No `autonomyDefault` key whatsoever.
     let noDefault: [String: JSONValue] = [
         "autonomyOverrides": .object(["mac.shell": .string("blocked")]),
@@ -864,7 +864,7 @@ private func bundle(default d: String, overrides: [String: JSONValue]) -> [Strin
 }
 
 @Test func defaultTrustPolicy_includes_swarmPolicy() async throws {
-    let tc = SwiftNativeTrustCenter()
+    let tc = hermeticTrust()
     let p = tc.defaultTrustPolicy()
     guard case .object(let sp)? = p["swarmPolicy"] else {
         Issue.record("swarmPolicy missing"); return

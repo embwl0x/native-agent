@@ -96,7 +96,7 @@ struct FullRangeConnectivityTests {
         await say(s, .toolFailed, "Build failed with a linker error", clock: clock)
         await say(s, .userMessageReceived, "let's dig in and fix it together", clock: clock)
         await say(s, .toolSucceeded, "Build passed after the fix", clock: clock)
-        await say(s, .workshopExecutionCompleted, "Mission complete: the release shipped", importance: 1, clock: clock)
+        await say(s, .workshopExecutionCompleted, "Execution complete: the release shipped", importance: 1, clock: clock)
         let last = await say(s, .userMessageReceived, "we did it — that's the fix, great work, you nailed it!", clock: clock)
         let bright = ["eager", "excited", "proud", "delighted", "warm", "engaged", "pleased", "playful", "relieved", "hopeful"]
         #expect(bright.contains { last.contains($0) },

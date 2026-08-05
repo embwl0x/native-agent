@@ -17,6 +17,12 @@ actor GitHubCommandRuntime {
     static let shared = GitHubCommandRuntime.live()
 
     private let store: GitHubCommandStore
+    private let dataRoot: URL
+    /// Last (mtime,size) fingerprint of the op-log pair this runtime replayed
+    /// from. nil until the first replay, so the first tick after launch always
+    /// replays. See `processConnectorChangesIfChanged`.
+    private var opLogFingerprint: String?
+    private var connectorReplayCount = 0
     private let observationLoader: ObservationLoader
     private let bridgeSender: BridgeSender
     private let notificationSender: NotificationSender
@@ -32,6 +38,7 @@ actor GitHubCommandRuntime {
         outcomeObserver: @escaping OutcomeObserver = { _ in }
     ) {
         self.store = GitHubCommandStore(dataRoot: dataRoot)
+        self.dataRoot = dataRoot
         self.observationLoader = observationLoader
         self.bridgeSender = bridgeSender
         self.notificationSender = notificationSender
@@ -158,8 +165,55 @@ actor GitHubCommandRuntime {
 
     /// Called after a connector refresh has already written live observations.
     func processConnectorChanges() async {
+        connectorReplayCount += 1
         await processPendingWork()
     }
+
+    /// A1/FIX-2: the 300s github_tracking tick used to call
+    /// `processConnectorChanges()` unconditionally, so every tick paid a full
+    /// `liveState()` decode + reducer replay of a ~2MB op log (~630MB/day) just
+    /// to learn nothing had changed.
+    ///
+    /// The replay now runs when the connector actually refreshed, OR when the
+    /// op-log pair's (mtime,size) fingerprint differs from the one we last
+    /// replayed from. The out-of-process-writer recovery property is PRESERVED
+    /// exactly: the periodic tick still fingerprints both files every 300s and
+    /// replays on ANY change — an external append (size grows), a compaction
+    /// (base rewritten, ops truncated, size SHRINKS), or a same-size rewrite
+    /// with a new mtime. It skips only when the bytes it would decode are
+    /// provably the bytes it already decoded.
+    ///
+    /// The fingerprint is captured BEFORE the replay on purpose. Work done
+    /// during the replay mutates the op log and therefore invalidates the
+    /// stamp we just took, which costs one extra replay next tick — the safe
+    /// direction. Capturing it afterwards would fold a concurrent external
+    /// write into the cache without ever having processed it.
+    func processConnectorChangesIfChanged(refreshed: Bool) async {
+        let fingerprint = opLogFingerprintNow()
+        guard refreshed || opLogFingerprint != fingerprint else { return }
+        opLogFingerprint = fingerprint
+        await processConnectorChanges()
+    }
+
+    private func opLogFingerprintNow() -> String {
+        let directory = dataRoot.appendingPathComponent("workshop/github_command", isDirectory: true)
+        return [
+            directory.appendingPathComponent("ops.jsonl"),
+            directory.appendingPathComponent("ops_base.json"),
+        ]
+        .map { url -> String in
+            guard let values = try? url.resourceValues(
+                forKeys: [.contentModificationDateKey, .fileSizeKey]
+            ), let size = values.fileSize else { return "-" }
+            let stamp = values.contentModificationDate?.timeIntervalSince1970 ?? -1
+            return "\(stamp):\(size)"
+        }
+        .joined(separator: "|")
+    }
+
+    /// Test seam: how many full `liveState()` replay cycles this runtime has
+    /// actually performed.
+    func _testConnectorReplayCount() -> Int { connectorReplayCount }
 
     /// The existing codex_message completion lane supplies message ids. The
     /// store correlates them, records the work log, enters verifying, and only

@@ -14,7 +14,7 @@ import PersistenceCore
 // spawn — is refused BY NAME before the call reaches any backend. This is the
 // ceiling: even if the model, the system prompt, or a future surface tries a
 // forbidden tool, the dispatcher says no (H1: workshop sessions never inherit
-// the generic mission path's `fileAccess:auto` + full dispatcher).
+// the generic execution path's `fileAccess:auto` + full dispatcher).
 //
 // Because ChatOrchestration builds a turn's tool schemas from the dispatcher's
 // `listAvailableToolSchemas()` (ChatOrchestration+TurnEngine.swift:583), this
@@ -61,7 +61,7 @@ public struct WorkshopToolProfile: ToolDispatchClient {
     /// built-in names. Conservative on purpose: anything not here (and not the
     /// artifact tool) is refused, so a future tool is unavailable to workshop
     /// until someone deliberately adds it — no silent privilege creep. Mirrors
-    /// the mission synthesize read-only surface, plus desk read + desk_work_log.
+    /// the execution synthesize read-only surface, plus desk read + desk_work_log.
     public static let allowed: Set<String> = [
         // filesystem READS
         "read_file", "list_dir",
@@ -183,8 +183,8 @@ public enum WorkshopMembraneError: Error, LocalizedError, Equatable {
 }
 
 /// Containment-checked writer for a single pursuit's workshop folder
-/// (`data/workshop/<handle>/`). Mirrors the mission-checkpoint path guard
-/// (Missions+Checkpoints.swift:143): reject `..`, path separators, NUL, and
+/// (`data/workshop/<handle>/`). Mirrors the execution-checkpoint path guard
+/// (Executions+Checkpoints.swift:143): reject `..`, path separators, NUL, and
 /// control characters, then assert the canonicalized target stays under the
 /// handle root. Belt-and-suspenders — the component check AND the resolved-path
 /// prefix check both have to pass.

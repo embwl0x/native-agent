@@ -208,7 +208,7 @@ public actor WorkshopExecutorLoop {
     /// Approval-wait deadline in nanoseconds (0 = disabled, the DEFAULT). A
     /// Workshop execution `blocked_on_approval` with no human to approve it freezes
     /// forever — the exact unattended-job stall this leg exists to kill. When
-    /// set (env `NATIVE_AGENT_MISSION_APPROVAL_TIMEOUT_SECONDS`), drainOnce
+    /// set (env `NATIVE_AGENT_EXECUTION_APPROVAL_TIMEOUT_SECONDS`), drainOnce
     /// auto-fails a blocked Workshop execution whose block has outlived the deadline. OFF
     /// by default on purpose: for INTERACTIVE use a pending approval is correct
     /// behaviour (the user will click it later), not a stall — only headless/
@@ -222,30 +222,30 @@ public actor WorkshopExecutorLoop {
     /// asking for approval is honored even under yolo).
     private let stepApprovalEnforced: @Sendable () async -> Bool
     private let terminalEventSink: WorkshopTerminalEventSink?
-    /// Resolves the mission→memory recorder LAZILY, on the first terminal event.
+    /// Resolves the execution→memory recorder LAZILY, on the first terminal event.
     /// Lazy because the production writer touches `SwiftNativeMemoryV2.shared`,
     /// which opens the SQLite store on first access — constructing an executor
-    /// must not have that side effect. See `defaultMissionMemoryProvider`.
-    private let missionMemoryProvider: @Sendable () -> WorkshopMissionMemoryRecorder?
+    /// must not have that side effect. See `defaultExecutionMemoryProvider`.
+    private let executionMemoryProvider: @Sendable () -> WorkshopExecutionMemoryRecorder?
     /// The write queue, built on first terminal event from the resolved
     /// recorder. Terminal transitions HAND OFF to this and return; they never
-    /// wait on the memory store. See ``WorkshopMissionMemoryQueue``.
-    private var missionMemoryQueue: WorkshopMissionMemoryQueue?
+    /// wait on the memory store. See ``WorkshopExecutionMemoryQueue``.
+    private var executionMemoryQueue: WorkshopExecutionMemoryQueue?
     private let now: @Sendable () -> Date
     /// One-shot startup orphan-reclaim, memoized as a Task so EVERY fresh-claim
     /// path (drainOnce, start, resumeAfterApproval) awaits the SAME reclaim to
     /// COMPLETION before it claims/flips anything. This is the barrier that
-    /// makes "a `running` mission seen at reclaim time is necessarily a dead
+    /// makes "a `running` execution seen at reclaim time is necessarily a dead
     /// prior instance's orphan" actually true: no claim by THIS process can
     /// land before the reclaim finishes (gpt-5.5 review: a bare bool let
-    /// start() claim a live mission that the first drain then wrongly failed).
+    /// start() claim a live execution that the first drain then wrongly failed).
     ///
     /// PROCESS-WIDE (per data-root), NOT per-instance (gpt-5.5 re-review): the
     /// app may build MORE THAN ONE executor instance on the same root — the
     /// background drain (WorkshopExecutorRef.shared) AND a cold-start fallback in
-    /// applyResolvedMissionStep when the ref isn't configured yet. Per-instance
+    /// applyResolvedWorkshopStep when the ref isn't configured yet. Per-instance
     /// memoization gave each its OWN once-guard, so a fallback resume instance
-    /// could flip a mission blocked→running and the drain instance's first
+    /// could flip an execution blocked→running and the drain instance's first
     /// reclaim would then fail it as a crash orphan. Keying the barrier on
     /// `root.path` makes both instances share ONE reclaim: it runs exactly once
     /// per process per root, before any claim by any instance. Unique temp roots
@@ -265,7 +265,7 @@ public actor WorkshopExecutorLoop {
     /// - Parameters:
     ///   - maxActive: concurrent-running cap, re-checked INSIDE the claim
     ///     lock. Defaults to the daemon's slot-gate constant
-    ///     (`NATIVE_AGENT_MAX_ACTIVE_MISSIONS`, default 3 — the retired daemon).
+    ///     (`NATIVE_AGENT_MAX_ACTIVE_EXECUTIONS`, default 3).
     ///   - cancellationPollInterval: compatibility-only legacy label. The
     ///     executor no longer polls; cancellation is driven by canonical-file
     ///     change edges. The value is intentionally ignored.
@@ -274,7 +274,7 @@ public actor WorkshopExecutorLoop {
     ///   - stepTimeoutInterval: HARD per-step deadline (seconds). nil →
     ///     `defaultStepTimeoutSeconds()` (env override, else 1500s backstop,
     ///     below the 1800s drain pass-timeout); <= 0 disables it. Backstop
-    ///     against a wedged tool in an unattended mission — generous by design
+    ///     against a wedged tool in an unattended execution — generous by design
     ///     so it never preempts a tool with its own (shorter) timeout.
     public init(
         root: URL = PersistenceCore.defaultDataRoot(),
@@ -293,7 +293,7 @@ public actor WorkshopExecutorLoop {
         approvalTimeoutInterval: TimeInterval? = nil,
         stepApprovalEnforced: @escaping @Sendable () async -> Bool = { true },
         terminalEventSink: WorkshopTerminalEventSink? = nil,
-        missionMemory: WorkshopMissionMemoryRecorder? = nil,
+        executionMemory: WorkshopExecutionMemoryRecorder? = nil,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.root = root
@@ -315,7 +315,7 @@ public actor WorkshopExecutorLoop {
         // Clamp below the drain pass-timeout so the clean per-step failure
         // fires before the pass releases and retries its claim, regardless of
         // env/param — including an existing
-        // NATIVE_AGENT_MISSION_STEP_TIMEOUT_SECONDS=3600 (gpt-5.5 review). Real
+        // NATIVE_AGENT_EXECUTION_STEP_TIMEOUT_SECONDS=3600 (gpt-5.5 review). Real
         // max runtime is already bounded by the pass timeout, so this costs no
         // capability. Non-finite / <=0 → disabled (no deadline task). The cap
         // also makes the UInt64 conversion overflow-proof.
@@ -336,29 +336,29 @@ public actor WorkshopExecutorLoop {
         self.approvalTimeoutNanos = UInt64(safeApprovalSecs * 1_000_000_000)
         self.stepApprovalEnforced = stepApprovalEnforced
         self.terminalEventSink = terminalEventSink
-        self.missionMemoryProvider = Self.missionMemoryProvider(
-            injected: missionMemory,
+        self.executionMemoryProvider = Self.executionMemoryProvider(
+            injected: executionMemory,
             root: root
         )
         self.now = now
     }
 
-    /// Mission→memory wiring rule, in one place.
+    /// Execution→memory wiring rule, in one place.
     ///
     /// An INJECTED recorder always wins (tests, and any future caller that wants
     /// a different store). Otherwise the default writer is used ONLY when this
     /// executor is running against the process's default data root — the same
     /// root `SwiftNativeMemoryV2.shared` is rooted at. An executor on a temp root
     /// (every test, every fixture) gets no recorder rather than silently writing
-    /// fixture missions into User's real memory store.
+    /// fixture executions into User's real memory store.
     ///
     /// This is why the plug needs no app-assembly wiring: production builds its
     /// executor on the default root, so it is on by default, in-module, and any
     /// future executor construction inherits it.
-    private static func missionMemoryProvider(
-        injected: WorkshopMissionMemoryRecorder?,
+    private static func executionMemoryProvider(
+        injected: WorkshopExecutionMemoryRecorder?,
         root: URL
-    ) -> @Sendable () -> WorkshopMissionMemoryRecorder? {
+    ) -> @Sendable () -> WorkshopExecutionMemoryRecorder? {
         if let injected {
             return { injected }
         }
@@ -367,12 +367,12 @@ public actor WorkshopExecutorLoop {
             return { nil }
         }
         return {
-            WorkshopMissionMemoryRecorder(
-                writer: SwiftNativeWorkshopMissionMemoryWriter(),
+            WorkshopExecutionMemoryRecorder(
+                writer: SwiftNativeWorkshopExecutionMemoryWriter(),
                 log: { level, message in
                     // A failed write must be findable (gpt-5.5 review A1): the
                     // whole sink used to go through `.info`, which is exactly
-                    // where a "she can't remember this mission" line goes to
+                    // where a "she can't remember this execution" line goes to
                     // die at default log level.
                     switch level {
                     case .error: Self.logger.error("\(message, privacy: .public)")
@@ -383,16 +383,19 @@ public actor WorkshopExecutorLoop {
         }
     }
 
-    /// `NATIVE_AGENT_MAX_ACTIVE_MISSIONS` — the SAME env var the daemon's
-    /// `_max_active_missions` read and that
-    /// `SwiftNativeWorkshopRunner.missionSlotsCap()` already mirrors.
+    /// `NATIVE_AGENT_MAX_ACTIVE_EXECUTIONS` (P2-5), or the deprecated
+    /// `NATIVE_AGENT_MAX_ACTIVE_MISSIONS`, which still WINS when both are set —
+    /// the SAME env var
+    /// `SwiftNativeWorkshopRunner.effectiveWorkshopExecutionSlotsCap()` mirrors.
     static func defaultMaxActive() -> Int {
-        let env = ProcessInfo.processInfo.environment
-        return max(1, Int(env["NATIVE_AGENT_MAX_ACTIVE_MISSIONS"] ?? "") ?? 3)
+        let raw = ExecutionEnvVocabulary.value(canonical: "NATIVE_AGENT_MAX_ACTIVE_EXECUTIONS")
+        return max(1, Int(raw ?? "") ?? 3)
     }
 
     /// Default per-step hard deadline in SECONDS. Reads
-    /// `NATIVE_AGENT_MISSION_STEP_TIMEOUT_SECONDS` (>=0) if set, else 1500s.
+    /// `NATIVE_AGENT_EXECUTION_STEP_TIMEOUT_SECONDS` (>=0) if set — or the
+    /// deprecated `NATIVE_AGENT_MISSION_STEP_TIMEOUT_SECONDS`, which wins when
+    /// both are set — else 1500s.
     /// Stays below the WorkshopExecutorDrainRunner pass-timeout (1800s,
     /// BackgroundLoopsAssembly) so a genuinely wedged step records a clean
     /// timeout failure instead of repeatedly releasing the pass claim.
@@ -400,24 +403,26 @@ public actor WorkshopExecutorLoop {
     /// 600s) — a backstop against a wedged tool, not a per-step budget. Tune
     /// DOWN via the env var for faster unattended recovery; keep it < 1800s.
     static func defaultStepTimeoutSeconds() -> TimeInterval {
-        let env = ProcessInfo.processInfo.environment
-        if let raw = env["NATIVE_AGENT_MISSION_STEP_TIMEOUT_SECONDS"]?
-            .trimmingCharacters(in: .whitespaces), let v = TimeInterval(raw) {
+        if let raw = ExecutionEnvVocabulary.value(
+            canonical: "NATIVE_AGENT_EXECUTION_STEP_TIMEOUT_SECONDS"
+        ), let v = TimeInterval(raw) {
             return max(0, v)
         }
         return 1500
     }
 
     /// Default approval-wait deadline in SECONDS. Reads
-    /// `NATIVE_AGENT_MISSION_APPROVAL_TIMEOUT_SECONDS` (>=0) if set, else 0
+    /// `NATIVE_AGENT_EXECUTION_APPROVAL_TIMEOUT_SECONDS` (>=0) if set — or the
+    /// deprecated `NATIVE_AGENT_MISSION_APPROVAL_TIMEOUT_SECONDS`, which wins
+    /// when both are set — else 0
     /// (DISABLED). Off by default: an interactive Workshop execution waiting on the user to
     /// click an approval is correct behaviour, not a stall, so auto-failing it
     /// would destroy legitimate pending work. Headless/unattended runs that
     /// genuinely have no human set the env var (e.g. 21600 = 6h) to opt in.
     static func defaultApprovalTimeoutSeconds() -> TimeInterval {
-        let env = ProcessInfo.processInfo.environment
-        if let raw = env["NATIVE_AGENT_MISSION_APPROVAL_TIMEOUT_SECONDS"]?
-            .trimmingCharacters(in: .whitespaces), let v = TimeInterval(raw) {
+        if let raw = ExecutionEnvVocabulary.value(
+            canonical: "NATIVE_AGENT_EXECUTION_APPROVAL_TIMEOUT_SECONDS"
+        ), let v = TimeInterval(raw) {
             return max(0, v)
         }
         return 0
@@ -510,15 +515,15 @@ public actor WorkshopExecutorLoop {
         await Self.orphanReclaimOnce.run(root.path) { await self.reconcileOrphanedRunning() }
     }
 
-    /// One-time startup reconcile (crash/restart orphan recovery). A mission
+    /// One-time startup reconcile (crash/restart orphan recovery). An execution
     /// left "running" by a crash is never re-claimed yet still counts against
     /// maxActive: a silent slot leak that degrades throughput across restarts.
     /// Parent/pass cancellation is recovered in-process at the claim boundary;
     /// fail only true startup orphans HONESTLY (not requeue: a
-    /// partially-run mission may have side-effecting steps, and silently
+    /// partially-run execution may have side-effecting steps, and silently
     /// re-running them is the fabricated-state shape the W6 audit closed) so
     /// the slot frees and the user sees it did not finish. CAS require:running
-    /// → never clobbers a mission that has since moved on.
+    /// → never clobbers an execution that has since moved on.
     private func reconcileOrphanedRunning() async {
         let orphans = await scanQueue().filter { $0.status == "running" }
         for orphan in orphans {
@@ -540,15 +545,15 @@ public actor WorkshopExecutorLoop {
         }
     }
 
-    /// Auto-fail missions stuck `blocked_on_approval` past the approval-wait
+    /// Auto-fail executions stuck `blocked_on_approval` past the approval-wait
     /// deadline — the "no human is coming" stall this trust leg targets.
     /// No-op when `approvalTimeoutNanos == 0` (the default), so interactive
     /// installs never lose a pending approval.
     ///
     /// "Blocked since" = the stable `executed_at` of the latest
     /// blocked_on_approval STEP record (set ONCE when the step blocked;
-    /// runSteps appends it via outcome.toJSON). NOT the mission's `updatedAt`:
-    /// `updateMission` bumps updatedAt on unrelated title/objective patches,
+    /// runSteps appends it via outcome.toJSON). NOT the execution's `updatedAt`:
+    /// `updateWorkshopExecution` bumps updatedAt on unrelated title/objective patches,
     /// which would silently EXTEND the wait every time (gpt-5.5 review). Fall
     /// back to updatedAt only when no such record/timestamp exists. Both are
     /// persisted in mission.json, so the clock survives restarts.
@@ -557,11 +562,11 @@ public actor WorkshopExecutorLoop {
     /// CAS-claims `blocked_on_approval → running` BEFORE it executes the step
     /// (resumeAfterApproval). So this sweep and a concurrent resume are
     /// mutually exclusive — whichever flips OUT of blocked_on_approval first
-    /// wins under the per-mission flock; the loser's CAS fails and bails. A
-    /// mission can therefore never be failed-by-timeout mid-execution. (Resume
+    /// wins under the per-execution flock; the loser's CAS fails and bails. A
+    /// execution can therefore never be failed-by-timeout mid-execution. (Resume
     /// and the drain that runs this sweep share ONE executor instance via
     /// WorkshopExecutorRef.shared, so the once-only orphan-reclaim barrier spans
-    /// both — see applyResolvedMissionStep.)
+    /// both — see applyResolvedWorkshopStep.)
     private func reconcileTimedOutApprovals() async {
         guard approvalTimeoutNanos > 0 else { return }
         let deadlineSecs = TimeInterval(approvalTimeoutNanos) / 1_000_000_000
@@ -611,7 +616,7 @@ public actor WorkshopExecutorLoop {
         return nil
     }
 
-    /// Explicit single-mission start — the executor-backed replacement for
+    /// Explicit single-execution start — the executor-backed replacement for
     /// the daemon's start() on the QUEUED path. v1 does NOT port the
     /// failed/cancelled re-run branch (rerun_count++) — re-runs stay
     /// unsupported until a caller needs them.
@@ -619,7 +624,7 @@ public actor WorkshopExecutorLoop {
     public func start(executionId: String) async throws -> WorkshopExecutionRecord {
         let trimmed = executionId.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { throw WorkshopExecutionError.invalidRequest("empty missionId") }
-        // Reclaim orphans BEFORE this explicit start claims — else a mission
+        // Reclaim orphans BEFORE this explicit start claims — else an execution
         // started here (before the first background drain) would be seen as a
         // "running" orphan by that drain and wrongly failed (gpt-5.5 review).
         await ensureOrphansReconciled()
@@ -647,23 +652,23 @@ public actor WorkshopExecutorLoop {
     /// Atomically transition queued→running.
     ///
     /// gpt-5.5 executor-port blocker #4 (2026-06-10): the slot-cap re-check
-    /// used to live inside the PER-MISSION lock only — two claimers working
-    /// on DIFFERENT missions serialized on nothing shared, so both could
+    /// used to live inside the PER-EXECUTION lock only — two claimers working
+    /// on DIFFERENT executions serialized on nothing shared, so both could
     /// read runningCount == 0 and both claim, bursting past maxActive. The
     /// WHOLE scan+claim now runs inside ONE queue-level cross-process flock
-    /// (`queueClaimLockTarget`); the per-mission RMW stays nested inside it.
+    /// (`queueClaimLockTarget`); the per-execution RMW stays nested inside it.
     /// Lock order is always queue-claim-lock → mission.json-lock; nothing
     /// takes them in the other order (cancel()/mutators take only the
-    /// mission lock and never the claim lock), so there is no ordering cycle.
+    /// execution lock and never the claim lock), so there is no ordering cycle.
     ///
     /// Inside the claim:
-    ///   - re-read status INSIDE the mission lock and require "queued" (two
+    ///   - re-read status INSIDE the execution lock and require "queued" (two
     ///     concurrent executors — same process or cross-process — race here;
     ///     exactly one sees "queued");
     ///   - re-check the running-count slot cap INSIDE the same critical
     ///     section (the W6 check-then-act flag: the daemon checked capacity
     ///     outside the claim).
-    /// Returns nil when the mission was not claimable (already claimed, not
+    /// Returns nil when the execution was not claimable (already claimed, not
     /// queued, or no slot free).
     private func claim(_ executionId: String) async throws -> WorkshopExecutionRecord? {
         // Uniform locking (L7, 2026-08-01): `withFileLock` is a
@@ -714,7 +719,7 @@ public actor WorkshopExecutorLoop {
         return try await persistence.withFileLock(executionRecordJSON, work)
     }
 
-    // MARK: mission run loop (port of _run_mission_locked, the retired daemon)
+    // MARK: execution run loop (port of _run_mission_locked, the retired daemon)
 
     private func runClaimedWorkshopExecution(_ claimed: WorkshopExecutionRecord) async {
         let executionId = claimed.id
@@ -809,7 +814,7 @@ public actor WorkshopExecutorLoop {
             if durablyCompletedStepIDs.contains(step.id) { continue }
             // current_step_id tracking + the daemon's per-step "still
             // running?" re-read (L801-L803), folded into ONE locked CAS
-            // (blocker #2): a mission cancelled — or otherwise transitioned —
+            // (blocker #2): an execution cancelled — or otherwise transitioned —
             // since the previous step aborts the loop BEFORE the next step
             // executes, with no read-then-write window in between.
             let stepClaim = try await casMutateWorkshopExecution(executionId, require: ["running"]) { rec in
@@ -828,7 +833,7 @@ public actor WorkshopExecutorLoop {
                 throw CancellationError()
             }
             // Daemon order (L813-L817) hardened to a CAS (blocker #2): only
-            // a still-"running" mission accepts the step record. A cancel
+            // a still-"running" execution accepts the step record. A cancel
             // that landed DURING the step wins — skip the append AND the
             // receipt/timeline writes below.
             let appendWrite = try await casMutateWorkshopExecution(executionId, require: ["running"]) { rec in
@@ -916,7 +921,7 @@ public actor WorkshopExecutorLoop {
         // success criterion is enforced here. Execution 251da950 recorded
         // `completed` with output "I don't have the required phrase." against
         // an objective demanding the exact phrase "Workshop live proof
-        // passed." — steps succeeding is not the mission succeeding. An unmet
+        // passed." — steps succeeding is not the execution succeeding. An unmet
         // expected_outputs entry or exact-output objective records `failed`,
         // inside the same CAS so a cancel race can't split the decision.
         let verificationCheckedAt = SwiftNativeWorkshopRunner.isoTimestamp(now())
@@ -1175,12 +1180,12 @@ public actor WorkshopExecutorLoop {
     /// this exact step" replay — the only caller that may skip the gate.
     private func executeStep(execution: WorkshopExecutionRecord, step: WorkshopExecutionStep, bypassApproval: Bool) async -> WorkshopStepOutcome {
         let nowStr = SwiftNativeWorkshopRunner.isoTimestamp(now())
-        // Approval gate (v1 reduced rule per the build plan): the mission's
+        // Approval gate (v1 reduced rule per the build plan): the execution's
         // trustRequired escalates every step; a step may also mark itself.
         // YOLO: under wide-open trust stepApprovalEnforced() is false, so the
-        // planner's per-tool `needs_approval` default does NOT gate (missions
-        // run unattended). An EXPLICIT per-mission trustRequired != "none" is
-        // still honored regardless — a mission deliberately asking for approval
+        // planner's per-tool `needs_approval` default does NOT gate (executions
+        // run unattended). An EXPLICIT per-execution trustRequired != "none" is
+        // still honored regardless — an execution deliberately asking for approval
         // gates even under yolo.
         let enforceStepAutonomy = await stepApprovalEnforced()
         // Non-yolo: the planner's per-step autonomy_hint must NOT be able to
@@ -1234,7 +1239,7 @@ public actor WorkshopExecutorLoop {
             // execute_step. DIVERGENCE (delta
             // review 2026-06-10): the event is emitted by the CALLER after
             // the blocked-status CAS wins — appending it here races cancel()
-            // and leaves a blocked event in the timeline of a mission whose
+            // and leaves a blocked event in the timeline of an execution whose
             // status write the CAS correctly skipped.
             return WorkshopStepOutcome(
                 stepId: step.id, status: "blocked_on_approval",
@@ -1388,7 +1393,7 @@ public actor WorkshopExecutorLoop {
         } catch let timeout as WorkshopStepTimedOut {
             // Wedged tool exceeded the hard step deadline → honest failed step
             // (NOT cancelled — nothing cancelled it; it ran out of time). The
-            // runSteps `failed` branch fails the mission + emits a visible
+            // runSteps `failed` branch fails the execution + emits a visible
             // timeline event carrying this error string.
             // Sub-second deadlines (tests) report ms so the diagnostic isn't a
             // misleading "_0s" (gpt-5.5 review); production (>=1s) reports s.
@@ -1401,11 +1406,11 @@ public actor WorkshopExecutorLoop {
                 executedAt: nowStr
             )
         } catch is WorkshopExecutionCancelledDuringStep {
-            return WorkshopStepOutcome(stepId: step.id, status: "cancelled", error: "mission_cancelled", executedAt: nowStr)
+            return WorkshopStepOutcome(stepId: step.id, status: "cancelled", error: "execution_cancelled", executedAt: nowStr)
         } catch is CancellationError {
             // Parent task cancelled — surface as a cancelled step; the
             // caller's post-step re-read decides what sticks on disk.
-            return WorkshopStepOutcome(stepId: step.id, status: "cancelled", error: "mission_cancelled", executedAt: nowStr)
+            return WorkshopStepOutcome(stepId: step.id, status: "cancelled", error: "execution_cancelled", executedAt: nowStr)
         } catch {
             // daemon L1426-L1431: any dispatch exception → failed step.
             return WorkshopStepOutcome(stepId: step.id, status: "failed", error: String(describing: error), executedAt: nowStr)
@@ -1492,7 +1497,7 @@ public actor WorkshopExecutorLoop {
     /// correctness does NOT: every post-step mission.json write is a
     /// compare-and-swap (casMutateMission) that re-reads the status in-lock
     /// and only transitions from "running"/"blocked_on_approval", so a
-    /// late-finishing step can never overwrite a cancelled mission —
+    /// late-finishing step can never overwrite a cancelled execution —
     /// pinned by cancelDuringNonCooperativeStepNeverOverwritesCancelled.
     /// Full (hard-deadline) preemption is a ledgered follow-up, not this
     /// port's scope.
@@ -1534,9 +1539,9 @@ public actor WorkshopExecutorLoop {
             // HARD STEP DEADLINE (the "ledgered follow-up" the comment above
             // deferred): a wedged tool (dead network, an MCP server that never
             // answers, a stalled stream) reaches NO cancel() in an unattended
-            // mission, so without this it hangs the step forever — and because
-            // drainOnce awaits each mission and slots are capped, enough hung
-            // steps starve ALL mission throughput until restart. The deadline
+            // execution, so without this it hangs the step forever — and because
+            // drainOnce awaits each execution and slots are capped, enough hung
+            // steps starve ALL execution throughput until restart. The deadline
             // throws WorkshopStepTimedOut → dispatchStep records a clean
             // `failed` step → the slot frees. SAME cooperative-cancellation
             // limit as the watcher: a NON-cooperative wedge (a tight sync loop
@@ -1584,10 +1589,10 @@ public actor WorkshopExecutorLoop {
 
     // MARK: resume after approval (port of _resume_after_approval_locked, L1461-L1590)
 
-    /// Resume a mission blocked on a step approval. `approved == true` must
+    /// Resume an execution blocked on a step approval. `approved == true` must
     /// actually EXECUTE the approved step (W6: resume must never
     /// mark-without-executing), then continue the remaining plan steps.
-    /// `approved == false` marks the step rejected and fails the mission.
+    /// `approved == false` marks the step rejected and fails the execution.
     @discardableResult
     public func resumeAfterApproval(
         executionId: String,
@@ -1635,12 +1640,12 @@ public actor WorkshopExecutorLoop {
             throw WorkshopExecutionError.invalidRequest("mission_step_not_waiting_on_approval:\(existingStatus)")
         }
 
-        // gpt-5.5 executor-port blocker #3 (2026-06-10): IN-LOCK MISSION-
+        // gpt-5.5 executor-port blocker #3 (2026-06-10): IN-LOCK EXECUTION-
         // status precondition. The guards above check the STEP record — but
-        // a CANCELLED (or failed/completed) mission can still carry a
+        // a CANCELLED (or failed/completed) execution can still carry a
         // blocked_on_approval step record, and its approval card stays
         // clickable. Approving that stale card must NOT execute the step or
-        // flip the mission back to running. Require the MISSION status be
+        // flip the execution back to running. Require the EXECUTION status be
         // blocked_on_approval, read under the mission.json flock so the
         // check cannot interleave with an in-flight cancel()'s RMW. (The
         // step executes AFTER the lock is released — holding a flock across
@@ -1697,16 +1702,16 @@ public actor WorkshopExecutorLoop {
         guard let planStep = execution.plan.first(where: { $0.id == stepId }) else {
             throw WorkshopExecutionError.invalidRequest("Step \(stepId) not found in Workshop execution \(executionId)")
         }
-        // CLAIM the mission OUT of blocked_on_approval into running BEFORE we
+        // CLAIM the execution OUT of blocked_on_approval into running BEFORE we
         // execute the step. This is the fix for the approval-timeout race: the
         // sweep (reconcileTimedOutApprovals) only CAS-fails blocked_on_approval
-        // missions, so once we've flipped to running it can't touch us — and if
+        // executions, so once we've flipped to running it can't touch us — and if
         // the sweep (or a cancel) flipped us first, THIS CAS loses and we bail
         // WITHOUT executing. Previously resume ran the step while still
-        // blocked_on_approval, so the sweep could fail the mission mid-step.
-        // Whoever leaves blocked_on_approval first wins under the per-mission
+        // blocked_on_approval, so the sweep could fail the execution mid-step.
+        // Whoever leaves blocked_on_approval first wins under the per-execution
         // flock; the loser aborts cleanly. A crash after this claim leaves the
-        // mission "running" → the startup orphan-reclaim fails it honestly,
+        // execution "running" → the startup orphan-reclaim fails it honestly,
         // instead of a half-run blocked step that re-executes on re-approval.
         let claimWrite = try await casMutateWorkshopExecution(executionId, require: ["blocked_on_approval"]) { rec in
             rec.status = "running"
@@ -1798,31 +1803,31 @@ public actor WorkshopExecutorLoop {
         // never awaited (gpt-5.5 review A1, BLOCKING). `recorder.record` embeds,
         // inserts, then sweeps retention; awaiting it here meant a busy SQLite
         // or a stalled embedder held the terminal path and the executor did not
-        // advance to the next queued mission. The queue preserves order, keeps
+        // advance to the next queued execution. The queue preserves order, keeps
         // the write, and logs its own failures at `.error`.
-        // `waitForMissionMemoryWrites()` is the seam for anyone who needs the
+        // `waitForExecutionMemoryWrites()` is the seam for anyone who needs the
         // tail (shutdown, tests).
-        await resolvedMissionMemoryQueue(building: true)?.enqueue(record, reason: reason)
+        await resolvedExecutionMemoryQueue(building: true)?.enqueue(record, reason: reason)
     }
 
-    /// Resolve — and on first use, build — the mission-memory queue.
+    /// Resolve — and on first use, build — the execution-memory queue.
     /// `building: false` never constructs one, so the wait seam cannot create a
     /// queue (and thus touch `SwiftNativeMemoryV2.shared`) as a side effect.
-    private func resolvedMissionMemoryQueue(building: Bool) -> WorkshopMissionMemoryQueue? {
-        if let missionMemoryQueue { return missionMemoryQueue }
-        guard building, let recorder = missionMemoryProvider() else { return nil }
-        let queue = WorkshopMissionMemoryQueue(recorder: recorder)
-        missionMemoryQueue = queue
+    private func resolvedExecutionMemoryQueue(building: Bool) -> WorkshopExecutionMemoryQueue? {
+        if let executionMemoryQueue { return executionMemoryQueue }
+        guard building, let recorder = executionMemoryProvider() else { return nil }
+        let queue = WorkshopExecutionMemoryQueue(recorder: recorder)
+        executionMemoryQueue = queue
         return queue
     }
 
-    /// Await every mission-memory write handed off so far. Nothing on the
+    /// Await every execution-memory write handed off so far. Nothing on the
     /// execution path calls this — it exists so shutdown and tests can observe
     /// a lane that is deliberately off the hot path.
     ///
     /// `timeout` is the SHUTDOWN CONTRACT (gpt-5.5 review, BLOCKING 1,
     /// 2026-08-02). Production quit stops loops, MCP, context and cognition
-    /// under a 3s budget and never drained this queue, so a terminal mission
+    /// under a 3s budget and never drained this queue, so a terminal execution
     /// whose write was still in embed/SQLite left `mission.json` on disk with
     /// no memory behind it — silently. Draining fixes that; draining
     /// UNBOUNDED would trade a lost memory for a hung quit, so an unfinished
@@ -1831,13 +1836,13 @@ public actor WorkshopExecutorLoop {
     /// Returns true when the tail actually drained. `nil` timeout = wait
     /// forever (tests).
     @discardableResult
-    public func waitForMissionMemoryWrites(timeout: TimeInterval? = nil) async -> Bool {
-        guard let queue = resolvedMissionMemoryQueue(building: false) else { return true }
+    public func waitForExecutionMemoryWrites(timeout: TimeInterval? = nil) async -> Bool {
+        guard let queue = resolvedExecutionMemoryQueue(building: false) else { return true }
         guard let timeout, timeout.isFinite, timeout > 0 else {
             await queue.drain()
             return true
         }
-        let gate = WorkshopMissionMemoryGate()
+        let gate = WorkshopExecutionMemoryGate()
         let drain = Task.detached(priority: .utility) {
             await queue.drain()
             gate.signal(true)
@@ -1856,7 +1861,7 @@ public actor WorkshopExecutorLoop {
             Self.logger.error(
                 """
                 [workshop-memory] shutdown drain ABANDONED after \(timeout, privacy: .public)s with \
-                \(pending, privacy: .public) mission-memory write(s) still pending — those missions are on \
+                \(pending, privacy: .public) execution-memory write(s) still pending — those executions are on \
                 disk and she will not remember them.
                 """
             )
@@ -1875,16 +1880,16 @@ public actor WorkshopExecutorLoop {
     /// last written inside `within` (default 7 days) are considered, and at most
     /// `maxRecords` (default 100) of them, newest first. 7 days because the loss
     /// window it repairs is "the last time this app was killed", not "all of
-    /// history", and because the store's own mission lane only keeps
+    /// history", and because the store's own execution lane only keeps
     /// `retentionCap` (200) rows anyway — rescanning a year of executions on
     /// every launch would read hundreds of files to re-mint memories retention
     /// is about to archive. The scan reads directory MODIFICATION DATES first
     /// and only opens `mission.json` for the survivors, so the file reads are
     /// bounded by `maxRecords`, not by the size of the history.
     ///
-    /// Returns the number of missions handed to the write queue.
+    /// Returns the number of executions handed to the write queue.
     @discardableResult
-    public func reconcileMissedMissionMemories(
+    public func reconcileMissedExecutionMemories(
         within: TimeInterval = 7 * 24 * 3600,
         maxRecords: Int = 100
     ) async -> Int {
@@ -1910,15 +1915,15 @@ public actor WorkshopExecutorLoop {
         .map { $0 }
         // Resolve the queue only once there is something to reconcile: on the
         // production root, building it opens the MemoryV2 SQLite store, and a
-        // launch with no recent missions should not pay for that here.
-        guard !recent.isEmpty, let queue = resolvedMissionMemoryQueue(building: true) else { return 0 }
+        // launch with no recent executions should not pay for that here.
+        guard !recent.isEmpty, let queue = resolvedExecutionMemoryQueue(building: true) else { return 0 }
 
         // KNOWN EDGE, deliberately accepted: `recordedSources` sees ACTIVE rows
-        // only, so a mission whose memory retention already ARCHIVED reads as
+        // only, so an execution whose memory retention already ARCHIVED reads as
         // missing and gets re-written. It costs one duplicate narrative at
         // worst (`store()` collapses byte-identical content), and it only
         // reaches a row that is both inside the 7-day window AND already past
-        // the 200-row cap — i.e. 200+ missions in a week. Widening the read to
+        // the 200-row cap — i.e. 200+ executions in a week. Widening the read to
         // archived rows would trade that for re-reading retired history on
         // every launch, which is the cost this window exists to avoid.
         let known = await queue.recordedSources()
@@ -1931,11 +1936,11 @@ public actor WorkshopExecutorLoop {
                   case .string(let id)? = object["id"], !id.isEmpty else { continue }
             let record = SwiftNativeWorkshopRunner.recordFromJSON(object)
             guard ["completed", "failed", "cancelled"].contains(record.status) else { continue }
-            guard case .remember = WorkshopMissionMemory.decide(record) else { continue }
-            guard !known.contains(WorkshopMissionMemory.source(for: record)) else { continue }
+            guard case .remember = WorkshopExecutionMemory.decide(record) else { continue }
+            guard !known.contains(WorkshopExecutionMemory.source(for: record)) else { continue }
             Self.logger.info(
                 """
-                [workshop-memory] reconcile: terminal mission \(id, privacy: .public) \
+                [workshop-memory] reconcile: terminal execution \(id, privacy: .public) \
                 (status \(record.status, privacy: .public)) has no memory — re-queuing the write \
                 that a crash or a killed shutdown lost.
                 """
@@ -1945,7 +1950,7 @@ public actor WorkshopExecutorLoop {
         }
         if reconciled > 0 {
             Self.logger.info(
-                "[workshop-memory] reconcile: re-queued \(reconciled, privacy: .public) missed mission memories"
+                "[workshop-memory] reconcile: re-queued \(reconciled, privacy: .public) missed execution memories"
             )
         }
         return reconciled
@@ -2058,7 +2063,7 @@ public actor WorkshopExecutorLoop {
     /// component (gpt-5.5 executor-port blocker #5, 2026-06-10). Step ids
     /// come from LLM planner output and are kept VERBATIM by the plan
     /// parsers (WorkshopExecution.swift parsePlanJSON / parsePlanSteps), so a step id
-    /// like "../mission" would escape receiptsDir. Whitelist [A-Za-z0-9._-];
+    /// like "../execution" would escape receiptsDir. Whitelist [A-Za-z0-9._-];
     /// every other scalar becomes "_"; empty input → nil (caller must
     /// reject). Capped at 180 chars so the ".json"-suffixed name stays under
     /// the 255-byte filename limit. The caller-appended ".json" suffix also
@@ -2078,7 +2083,7 @@ public actor WorkshopExecutorLoop {
     /// Swift port. Best-effort: a receipt IO failure must not fail the step
     /// (the durable record is steps_completed in mission.json).
     /// SECURITY (blocker #5): stepId is planner-derived — sanitize before it
-    /// becomes a path component so "../mission" cannot escape receiptsDir.
+    /// becomes a path component so "../execution" cannot escape receiptsDir.
     private func writeReceipt(executionId: String, outcome: WorkshopStepOutcome) async {
         guard outcome.status != "blocked_on_approval" else { return }  // not executed
         guard let safeStepId = Self.sanitizedPathComponent(outcome.stepId) else {
@@ -2099,8 +2104,8 @@ public actor WorkshopExecutorLoop {
     enum SynthesizeVerdict: Equatable { case ok, refusal, empty }
 
     /// Refusal phrases. CONSERVATIVE on purpose — false-FAIL is worse than
-    /// false-pass for long missions (a wrongly-failed synthesize step burns a
-    /// whole mission), so a phrase here only triggers a refusal when it ALSO
+    /// false-pass for long executions (a wrongly-failed synthesize step burns a
+    /// whole execution), so a phrase here only triggers a refusal when it ALSO
     /// co-occurs with a SHORT, non-substantive body (see validateSynthesizeOutput).
     /// A legitimate answer that merely MENTIONS access ("the file you can't
     /// access from iOS is X, here is its content: ...") is long + substantive,
@@ -2233,7 +2238,7 @@ public actor WorkshopExecutorLoop {
 
     /// Substitute `{{step:<id>}}` tokens in a tool step's args with the FULL
     /// text output of the referenced completed step. The planner emits these
-    /// tokens (see planMission) so a tool step — typically write_file — can
+    /// tokens (see planWorkshopExecution) so a tool step — typically write_file — can
     /// consume a PRIOR step's output. chat.synthesize steps don't need it
     /// (buildLLMPrompt already threads prior outputs into their prompt); this is
     /// the tool-arg equivalent. Contract is a flat string-valued args object

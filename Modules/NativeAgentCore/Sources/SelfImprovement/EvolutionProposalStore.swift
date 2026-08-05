@@ -7,7 +7,7 @@ import PersistenceCore
 // Durable store for self-evolution proposals at
 // `<dataRoot>/evolution/proposals.json`, every mutation CAS'd under the
 // repo's cross-process flock convention (PersistenceCore withFileLock —
-// missions casMutateMission precedent).
+// executions casMutateMission precedent).
 //
 // SAFETY INVARIANT (plan design #7): evolution proposals are NEVER
 // auto-approvable. Live policy has `autoApproveLowRiskImprovements: true`;

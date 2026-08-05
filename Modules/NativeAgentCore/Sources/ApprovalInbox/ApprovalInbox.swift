@@ -152,7 +152,9 @@ extension ApprovalRecord {
 public struct ApprovalFilter: Sendable, Equatable {
     /// "pending", "resolved", "denied", "canceled", "orphaned", or nil for all.
     public var status: String?
-    /// If set, only records whose `action` matches exactly.
+    /// If set, only records whose `action` matches — compared through
+    /// `ExecutionEventVocabulary`, so `mission.step` and `execution.step`
+    /// are the same filter.
     public var action: String?
 
     public init(status: String? = nil, action: String? = nil) {
@@ -278,7 +280,13 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         }
         return sorted.filter { record in
             if let s = filter.status, record.status != s { return false }
-            if let a = filter.action, record.action != a { return false }
+            // P2-4: `mission.step` records written before 0.3.8 sit in
+            // approvals.jsonl forever and are never rewritten. Match through
+            // the vocabulary bridge so an old record answers a new-vocabulary
+            // filter and a new record answers an old-vocabulary one.
+            if let a = filter.action, !ExecutionEventVocabulary.matches(record.action, a) {
+                return false
+            }
             return true
         }
     }

@@ -192,7 +192,7 @@ func dreamCycle_writesOneCombinedEntryForTheDay() async throws {
         ("assistant","Yeah — the persona-bypass rule is the load-bearing piece.")
     ])
     seedSession(root, id: "sessB", lines: [
-        ("user","Quick aside about the missions UI."),
+        ("user","Quick aside about the executions UI."),
         ("assistant","Noted — the poll fix lands the terminal status.")
     ])
 

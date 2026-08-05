@@ -44,7 +44,7 @@ import PersistenceCore
 //     "client_id":     "9d1c250a-..." }
 //
 // Refresh races: multiple adapter instances (BackgroundLoopsAssembly,
-// Missions, ChatOrchestrationClient, etc) each construct a fresh
+// Executions, ChatOrchestrationClient, etc) each construct a fresh
 // AnthropicOAuthDirectAdapter. The refresh_token is single-use, so two
 // concurrent instances racing on the same file BURN the next refresh. We
 // share an AsyncSerialQueue actor across all instances keyed by the

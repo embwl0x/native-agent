@@ -143,7 +143,7 @@ extension NativeClient {
             chat: pref("chat"),
             telegram: pref("telegram"),
             ios: surfacePrefs["ios"],
-            executions: surfacePrefs["missions"],
+            executions: ProviderRoutingSurfaceLookup.value(surfacePrefs, WorkshopSurfaceVocabulary.canonical),
             autonomy: surfacePrefs["autonomy"],
             swarms: surfacePrefs["swarms"],
             dream: surfacePrefs["dream"],

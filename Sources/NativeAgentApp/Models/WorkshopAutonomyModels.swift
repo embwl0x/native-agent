@@ -19,11 +19,11 @@ struct WorkshopExecutionRecord: Identifiable, Codable, Hashable {
     var completedAt: String?
     var receiptCount: Int?
 
-    // PATCH-2026-05-07: mission-decode-tolerance The daemon has two mission
+    // PATCH-2026-05-07: execution-decode-tolerance The daemon has two execution
     // stores: the new queue (snake_case `created_at` / `updated_at`, no
     // `phase` field) and the legacy store (camelCase). Both flow through
     // GET /v1/missions. This custom decoder accepts either casing and
-    // gives queue missions a sensible default phase, so the dashboard
+    // gives queue executions a sensible default phase, so the dashboard
     // doesn't silently go empty after a queue submission.
     enum CodingKeys: String, CodingKey {
         case id, title, objective, status, phase, priority, deskHandle

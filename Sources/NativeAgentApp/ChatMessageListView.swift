@@ -758,6 +758,75 @@ final class ChatMarkdownCache: @unchecked Sendable {
     }
 }
 
+// Render-cost audit F10 — process-wide attachment image cache.
+//
+// The 2026-07-21 fix (decode cached in `@State`, read detached) is correct but
+// the cache is per-VIEW-INSTANCE: `LazyVStack` recycling (scroll away and back)
+// and tab teardown (`ContentView.swift`'s detail `switch` destroys the Chat
+// tree on leave) both re-read the file from disk and re-decode it. This is the
+// shared tier, mirroring `ChatMarkdownCache`'s shape.
+//
+// BOUNDED BY BYTES, NOT ENTRY COUNT. `NSCache.totalCostLimit` with a cost of
+// decoded pixel bytes — an entry cap would let a handful of large screenshots
+// hold hundreds of MB while a hundred thumbnails held almost nothing.
+//
+// SAME PIXELS. The full-size `NSImage` is cached exactly as decoded; there is
+// no downsample to the 360 pt display size (that would be a visible change and
+// is deliberately out of scope). A hit returns the identical object the miss
+// path would have produced from the same bytes.
+//
+// KEY = FILE IDENTITY, NOT PATH. Keying on path alone would serve stale pixels
+// if a file is rewritten in place. The key carries size + modification time, so
+// changed bytes miss. The stat is one syscall on a hit, versus a full read +
+// decode before.
+final class ChatImageCache: @unchecked Sendable {
+    static let shared = ChatImageCache()
+
+    private let cache = NSCache<NSString, NSImage>()
+    /// ~96 MB of decoded pixels. Well under what a chat with a few screenshots
+    /// needs, and `NSCache` also evicts under memory pressure on its own.
+    private static let byteBudget = 96 * 1024 * 1024
+
+    private init() {
+        cache.totalCostLimit = Self.byteBudget
+    }
+
+    /// Identity of the file at `url` — nil when it cannot be stat'd (the caller
+    /// then skips the cache entirely rather than caching under a guessed key).
+    /// Safe to call off the main actor.
+    static func identityKey(for url: URL) -> String? {
+        // stat-strength identity (gpt-5.5 wave-2 NEEDS_FIX): Date+size
+        // misses a same-second or metadata-preserving rewrite; dev+inode+
+        // size+mtime_ns matches the Desk/transcript memo stamps.
+        var info = stat()
+        guard stat(url.path, &info) == 0 else { return nil }
+        return "\(url.path)|\(info.st_dev)|\(info.st_ino)|\(info.st_size)|\(info.st_mtimespec.tv_sec).\(info.st_mtimespec.tv_nsec)"
+    }
+
+    static func image(forKey key: String) -> NSImage? {
+        shared.cache.object(forKey: key as NSString)
+    }
+
+    static func store(_ image: NSImage, forKey key: String) {
+        shared.cache.setObject(image, forKey: key as NSString, cost: pixelByteCost(image))
+    }
+
+    /// Decoded pixel bytes at 4 bytes/pixel. Prefers the largest bitmap rep's
+    /// true pixel dimensions (which differ from `size` on Retina assets); falls
+    /// back to point size for vector/unknown reps. Floored at 1 so a degenerate
+    /// image can never be a zero-cost entry that `NSCache` keeps forever.
+    static func pixelByteCost(_ image: NSImage) -> Int {
+        var pixels = 0
+        for rep in image.representations {
+            pixels = max(pixels, rep.pixelsWide * rep.pixelsHigh)
+        }
+        if pixels == 0 {
+            pixels = Int(max(0, image.size.width) * max(0, image.size.height))
+        }
+        return max(1, pixels * 4)
+    }
+}
+
 struct MessageBubble: View {
     var message: ChatMessage
     /// Whether this is the last assistant message in the list (enables Regenerate action)
@@ -1139,14 +1208,28 @@ private struct MessageLocalImageAttachmentView: View {
 
     private func loadImage() async {
         guard let path = imagePath else { return }
+        let url = URL(fileURLWithPath: path)
+        // F10: consult the shared cache first. The stat stays off the main
+        // actor like the read does — a hit costs one syscall instead of a full
+        // file read + decode, and returns the identical decoded image.
+        let key = await Task.detached(priority: .userInitiated) {
+            ChatImageCache.identityKey(for: url)
+        }.value
+        if let key, let cached = ChatImageCache.image(forKey: key) {
+            loadedImage = cached
+            return
+        }
         // Keep the disk read off the render path; NSImage decoding stays lazy.
         let data = await Task.detached(priority: .userInitiated) {
-            try? Data(contentsOf: URL(fileURLWithPath: path))
+            try? Data(contentsOf: url)
         }.value
         guard let data, let image = NSImage(data: data) else {
             loadFailed = true
             return
         }
+        // Only cache under a real file identity; an unstat-able file stays
+        // uncached rather than being keyed on a guess.
+        if let key { ChatImageCache.store(image, forKey: key) }
         loadedImage = image
     }
 }

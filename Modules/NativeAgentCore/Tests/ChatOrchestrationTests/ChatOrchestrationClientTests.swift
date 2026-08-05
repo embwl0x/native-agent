@@ -843,7 +843,7 @@ private func makeEngine(
     turnTraceBus: TurnTraceBus = .shared,
     router: (any ProviderRoutingProtocol)? = nil
 ) -> SwiftNativeTurnEngine {
-    let persona = SwiftNativePersonaEngine(root: root)
+    let persona = hermeticPersona(root: root)
     return SwiftNativeTurnEngine(
         persona: persona,
         memory: nil,
@@ -4039,7 +4039,8 @@ func chatClient_freezesOneCheckedRouteAcrossContextAndMultipleProviderCalls() as
         router: router,
         codex: adapter,
         anthropic: adapter,
-        openAI: adapter
+        openAI: adapter,
+        moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
     )
     let tools = SwiftToolDispatcher(dataRoot: root)
     let engine = makeEngine(root: root, llm: llm, tools: tools, router: router)
@@ -4086,7 +4087,8 @@ func chatClient_streamingFreezesOneCheckedRouteAcrossIOSProviderCalls() async th
         router: router,
         codex: adapter,
         anthropic: adapter,
-        openAI: adapter
+        openAI: adapter,
+        moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
     )
     let tools = SwiftToolDispatcher(dataRoot: root)
     let engine = makeEngine(root: root, llm: llm, tools: tools, router: router)

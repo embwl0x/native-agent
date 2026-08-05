@@ -231,7 +231,7 @@ private func writeFile(_ contents: String, to url: URL) throws {
 @Test func listPersonaDocs_empty_dir_returns_empty() async throws {
     let tmp = try makeTempRoot()
     defer { try? FileManager.default.removeItem(at: tmp) }
-    let engine = SwiftNativePersonaEngine(root: tmp)
+    let engine = hermeticPersona(root: tmp)
     let docs = try await engine.listPersonaDocs()
     #expect(docs.isEmpty)
 }
@@ -242,7 +242,7 @@ private func writeFile(_ contents: String, to url: URL) throws {
     try writeFile("Voice content", to: tmp.appendingPathComponent("VOICE.md"))
     try writeFile("Soul content", to: tmp.appendingPathComponent("SOUL.md"))
     try writeFile("User content", to: tmp.appendingPathComponent("USER.md"))
-    let engine = SwiftNativePersonaEngine(root: tmp)
+    let engine = hermeticPersona(root: tmp)
     let docs = try await engine.listPersonaDocs()
     let ids = docs.map(\.id)
     #expect(ids == ["SOUL", "USER", "VOICE"], "expected ASC sort, got \(ids)")
@@ -254,7 +254,7 @@ private func writeFile(_ contents: String, to url: URL) throws {
     try writeFile("not markdown", to: tmp.appendingPathComponent("notes.txt"))
     try writeFile("Soul", to: tmp.appendingPathComponent("SOUL.md"))
     try writeFile("config", to: tmp.appendingPathComponent("config.json"))
-    let engine = SwiftNativePersonaEngine(root: tmp)
+    let engine = hermeticPersona(root: tmp)
     let docs = try await engine.listPersonaDocs()
     #expect(docs.map(\.id) == ["SOUL"])
 }
@@ -265,7 +265,7 @@ private func writeFile(_ contents: String, to url: URL) throws {
     try writeFile("system", to: tmp.appendingPathComponent(".DS_Store"))
     try writeFile("hidden md", to: tmp.appendingPathComponent(".hidden.md"))
     try writeFile("Soul", to: tmp.appendingPathComponent("SOUL.md"))
-    let engine = SwiftNativePersonaEngine(root: tmp)
+    let engine = hermeticPersona(root: tmp)
     let docs = try await engine.listPersonaDocs()
     #expect(docs.map(\.id) == ["SOUL"])
 }
@@ -277,7 +277,7 @@ private func writeFile(_ contents: String, to url: URL) throws {
     try writeFile("backup1", to: tmp.appendingPathComponent("SOUL.md.bak"))
     try writeFile("backup2", to: tmp.appendingPathComponent("USER.md.pre-2026-05-07.bak"))
     try writeFile("capevict", to: tmp.appendingPathComponent("USER.pre-capevict-2026-05-16T143455.bak"))
-    let engine = SwiftNativePersonaEngine(root: tmp)
+    let engine = hermeticPersona(root: tmp)
     let docs = try await engine.listPersonaDocs()
     #expect(docs.map(\.id) == ["SOUL"], "expected only SOUL, got \(docs.map(\.id))")
 }
@@ -290,7 +290,7 @@ private func writeFile(_ contents: String, to url: URL) throws {
     try writeFile("Soul", to: tmp.appendingPathComponent("SOUL.md"))
     try writeFile("Soul template", to: tmp.appendingPathComponent("SOUL.template.md"))
     try writeFile("User template", to: tmp.appendingPathComponent("USER.template.md"))
-    let engine = SwiftNativePersonaEngine(root: tmp)
+    let engine = hermeticPersona(root: tmp)
     let docs = try await engine.listPersonaDocs()
     let ids = docs.map(\.id)
     #expect(ids == ["SOUL", "SOUL.template", "USER.template"], "got \(ids)")
@@ -303,7 +303,7 @@ private func writeFile(_ contents: String, to url: URL) throws {
     let subdir = tmp.appendingPathComponent("custom", isDirectory: true)
     try FileManager.default.createDirectory(at: subdir, withIntermediateDirectories: true)
     try writeFile("Nested", to: subdir.appendingPathComponent("NESTED.md"))
-    let engine = SwiftNativePersonaEngine(root: tmp)
+    let engine = hermeticPersona(root: tmp)
     let docs = try await engine.listPersonaDocs()
     #expect(docs.map(\.id) == ["SOUL"], "must not descend into subdirs")
 }
@@ -312,7 +312,7 @@ private func writeFile(_ contents: String, to url: URL) throws {
     let tmp = try makeTempRoot()
     defer { try? FileManager.default.removeItem(at: tmp) }
     try writeFile("hi", to: tmp.appendingPathComponent("SOUL.md"))
-    let engine = SwiftNativePersonaEngine(root: tmp)
+    let engine = hermeticPersona(root: tmp)
     let doc = try await engine.getPersonaDoc(id: "SOUL")
     #expect(doc != nil)
     #expect(doc?.content == "hi")
@@ -322,7 +322,7 @@ private func writeFile(_ contents: String, to url: URL) throws {
     let tmp = try makeTempRoot()
     defer { try? FileManager.default.removeItem(at: tmp) }
     try writeFile("hi", to: tmp.appendingPathComponent("SOUL.md"))
-    let engine = SwiftNativePersonaEngine(root: tmp)
+    let engine = hermeticPersona(root: tmp)
     let doc = try await engine.getPersonaDoc(id: "MISSING")
     #expect(doc == nil)
 }
@@ -335,7 +335,7 @@ private func writeFile(_ contents: String, to url: URL) throws {
     // Non-ASCII content — bytes != characters.
     let content = "Claude 🚀\nVoice\nLine 3\nüñïçødé"
     try writeFile(content, to: tmp.appendingPathComponent("SOUL.md"))
-    let engine = SwiftNativePersonaEngine(root: tmp)
+    let engine = hermeticPersona(root: tmp)
     let docs = try await engine.listPersonaDocs()
     #expect(docs.count == 1)
     let expected = content.utf8.count
@@ -349,7 +349,7 @@ private func writeFile(_ contents: String, to url: URL) throws {
     let url = tmp.appendingPathComponent("SOUL.md")
     try writeFile("x", to: url)
     let fsMtime = try (FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date)
-    let engine = SwiftNativePersonaEngine(root: tmp)
+    let engine = hermeticPersona(root: tmp)
     let docs = try await engine.listPersonaDocs()
     #expect(docs.count == 1)
     if let fs = fsMtime {
@@ -366,7 +366,7 @@ private func writeFile(_ contents: String, to url: URL) throws {
     defer { try? FileManager.default.removeItem(at: tmp) }
     let content = "Claude SOUL\n# Heading\nLine with unicode ✨ ü\n"
     try writeFile(content, to: tmp.appendingPathComponent("SOUL.md"))
-    let engine = SwiftNativePersonaEngine(root: tmp)
+    let engine = hermeticPersona(root: tmp)
     let docs = try await engine.listPersonaDocs()
     #expect(docs.count == 1)
     #expect(docs[0].id == "SOUL")
@@ -414,7 +414,7 @@ private func writeFile(_ contents: String, to url: URL) throws {
         try writeFile(content, to: tmp.appendingPathComponent("\(id).md"))
     }
 
-    let engine = SwiftNativePersonaEngine(root: tmp)
+    let engine = hermeticPersona(root: tmp)
     let docs = try await engine.listPersonaDocs()
 
     // Same count.
@@ -460,7 +460,7 @@ private func writeFile(_ contents: String, to url: URL) throws {
     try FileManager.default.setAttributes([.modificationDate: soulMtime], ofItemAtPath: soulURL.path)
     try FileManager.default.setAttributes([.modificationDate: userMtime], ofItemAtPath: userURL.path)
 
-    let engine = SwiftNativePersonaEngine(root: tmp)
+    let engine = hermeticPersona(root: tmp)
     let listing = try await engine.listPersonaDocSpecs()
 
     // Five fixed specs, in load-bearing order.
@@ -644,7 +644,7 @@ private func writeFile(_ contents: String, to url: URL) throws {
     // diverged from the daemon's 5-placeholder response.
     let tmp = try makeTempRoot()
     defer { try? FileManager.default.removeItem(at: tmp) }
-    let listing = try await SwiftNativePersonaEngine(root: tmp).listPersonaDocSpecs()
+    let listing = try await hermeticPersona(root: tmp).listPersonaDocSpecs()
     #expect(listing.docs.count == 5)
     #expect(listing.docs.map(\.id) == ["SOUL", "VOICE", "GROWTH", "USER", "AGENTS"])
     for spec in listing.docs {

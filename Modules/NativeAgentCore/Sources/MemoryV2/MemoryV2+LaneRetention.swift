@@ -3,14 +3,14 @@
 //
 // WHY THIS EXISTS (gpt-5.5 review A2/A4, 2026-08-02):
 //
-// A lane that writes one row per event (Workshop missions, and any lane like
+// A lane that writes one row per event (Workshop executions, and any lane like
 // it) has to bound itself — MemoryV2's own removes do not cover it: capacity
 // eviction only fires above 2,000 rows and the stale-archive pass is gated
 // behind two human approvals. Before this file the Workshop lane bounded itself
 // with `deleteMemory`, and deletion MINTS A CONTENT TOMBSTONE
 // (`MemoryV2+Storage.deleteMemory` → `upsertTombstone`). A tombstone is a
 // statement that a claim was REJECTED. Applying it to a row evicted for AGE is
-// a category error with a real failure: rerun the same mission to the same
+// a category error with a real failure: rerun the same execution to the same
 // outcome six months later, the narrative is byte-identical, and `store()`
 // refuses it as "tombstoned" — the lane silently stops remembering repeats.
 //

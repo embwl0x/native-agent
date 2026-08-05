@@ -276,7 +276,7 @@ private func runNonStreamingScenario(
     grownPromptCompat: Bool
 ) async throws -> RunObservation {
     let dir = try makeTempDir(tag)
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let llm = MessagesCapturingLLM(scriptedResponses: scriptedResponses)
     let engine = makeEngine(persona: persona, llm: llm, tools: tools)
     let capture = EventShapeCapture()
@@ -306,7 +306,7 @@ private func runStreamingScenario(
     grownPromptCompat: Bool
 ) async throws -> RunObservation {
     let dir = try makeTempDir(tag)
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let llm = StreamingMessagesCapturingLLM(scriptedEvents: scriptedEvents)
     let engine = makeEngine(persona: persona, llm: llm, tools: tools)
     let capture = EventShapeCapture()
@@ -597,7 +597,7 @@ func appendOnlyQA_S8_streamingInterstitialProse_persistsInOrder() async throws {
         "search_kg": .string("kg-body"),
     ])
     let dir = try makeTempDir("s8")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let llm = StreamingMessagesCapturingLLM(scriptedEvents: events)
     let engine = makeEngine(persona: persona, llm: llm, tools: tools)
     let deltas = DeltaTextCapture()

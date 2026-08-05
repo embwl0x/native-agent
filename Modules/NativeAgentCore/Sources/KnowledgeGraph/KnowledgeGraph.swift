@@ -24,7 +24,7 @@
 // HTTP-backed. See CUTOVER_PLAN.md §6.34.
 //
 // The `/v1/graph/*` family is a SEPARATE subsystem (Runtime.build_graph_index
-// over missions + memories + embeddings) and is NOT in scope for this module.
+// over executions + memories + embeddings) and is NOT in scope for this module.
 
 import Foundation
 import PersistenceCore

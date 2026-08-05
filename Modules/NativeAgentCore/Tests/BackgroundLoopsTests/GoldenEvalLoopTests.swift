@@ -25,7 +25,7 @@ private func goldenTempDir(_ tag: String) -> URL {
 }
 
 @Test func goldenEval_loopId_and_interval() {
-    let loop = GoldenEvalLoop(isEnabled: { false }, submitGoldenJobs: { _ in 0 })
+    let loop = GoldenEvalLoop(dataRoot: hermeticDataRoot(), isEnabled: { false }, submitGoldenJobs: { _ in 0 })
     #expect(loop.loopId == "golden_eval")
     #expect(loop.interval == 7 * 24 * 60 * 60)
 }
@@ -90,7 +90,7 @@ private final class ReceivedDate: @unchecked Sendable {
 @Test func goldenEval_passesLoopClockToSubmitter() async {
     let dir = goldenTempDir("clock")
     defer { try? FileManager.default.removeItem(at: dir) }
-    // The submitter MUST receive the loop's `now` (so each mission's createdAt
+    // The submitter MUST receive the loop's `now` (so each execution's createdAt
     // keys to the same ISO-week bucket the marker used) — NOT a fresh Date()
     // (gpt-5.5 re-review HIGH: shared timestamp source).
     let fixed = Date(timeIntervalSince1970: 1_780_000_000)

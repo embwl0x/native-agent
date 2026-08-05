@@ -132,7 +132,7 @@ private actor EphemeralWorkshopCognitionProbe: CognitiveRuntimeProviding {
             capsule: CognitiveCapsule(
                 generatedAt: fixedAt,
                 mode: .inject,
-                stableKernel: "Resident mission state:",
+                stableKernel: "Resident execution state:",
                 dynamicContext: "- Focus: exact ephemeral projection marker",
                 provenanceNodeIds: [],
                 truncated: false
@@ -175,13 +175,14 @@ struct WorkshopExecutionEphemeralToolTurnTests {
             router: router,
             codex: EphemeralWorkshopExecutionRecordingAdapter(providerId: "codex", response: "wrong-codex-route"),
             anthropic: executions,
-            openAI: chat
+            openAI: chat,
+            moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
         )
         let tools = EphemeralWorkshopExecutionNoTools()
         let cognition = EphemeralWorkshopCognitionProbe()
         let trust = SwiftNativeTrustCenter(dataRoot: root)
         let engine = SwiftNativeTurnEngine(
-            persona: SwiftNativePersonaEngine(root: root),
+            persona: hermeticPersona(root: root),
             memory: nil,
             router: router,
             trust: trust,
@@ -213,7 +214,11 @@ struct WorkshopExecutionEphemeralToolTurnTests {
         #expect(chat.snapshot().isEmpty)
         let call = try #require(executions.snapshot().first)
         #expect(call.model == "claude-opus-4-8")
-        #expect(call.surface == "missions")
+        // The router fake is keyed with the LEGACY `missions` and the caller
+        // above asks for `missions` too — yet the surface reaching the provider
+        // is the CANONICAL one. One fold at the turn entry, no spelling leaks
+        // past it (P2-3).
+        #expect(call.surface == "workshop")
         #expect(call.reasoningEffort == "low")
         #expect(call.serviceTier == "priority")
         #expect(call.sessionId == nil)

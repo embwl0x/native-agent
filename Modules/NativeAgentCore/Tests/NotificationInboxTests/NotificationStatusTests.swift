@@ -85,7 +85,7 @@ private func aval(_ env: JSONValue, _ key: String) -> [JSONValue]? {
 
 // The fixed actionCategories literal must match the daemon exactly:
 //   approval (approve/deny, medium), doctor (open_doctor/repair_safe, low),
-//   mission (open_mission, low).
+//   execution (open_mission, low).
 @Test func notificationStatus_actionCategoriesAreFixedLiteral() async throws {
     let fix = try StatusFixture()
     defer { fix.cleanup() }

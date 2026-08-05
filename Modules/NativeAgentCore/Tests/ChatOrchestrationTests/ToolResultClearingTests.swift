@@ -383,7 +383,7 @@ func toolLoop_10_iterations_stubs_results_1_to_4_keeps_5_to_10_full() async thro
     // Keep-window boundary: current (10) + keepFullIterations=5 priors
     // (5-9) stay full — so exactly-5 is the FIRST kept iteration.
     let dir = try makeTempDir("ten-iter")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let calls = (1...10).map { i in
         #"{"tool_calls":[{"id":"c\#(i)","type":"function","function":{"name":"t\#(i)","arguments":"{}"}}]}"#
     }
@@ -429,7 +429,7 @@ func toolLoop_10_iterations_stubs_results_1_to_4_keeps_5_to_10_full() async thro
 @Test
 func toolLoop_within_keep_window_nothing_is_stubbed() async throws {
     let dir = try makeTempDir("six-iter")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let calls = (1...6).map { i in
         #"{"tool_calls":[{"id":"c\#(i)","type":"function","function":{"name":"t\#(i)","arguments":"{}"}}]}"#
     }
@@ -457,7 +457,7 @@ func toolLoop_within_keep_window_nothing_is_stubbed() async throws {
 func streamingToolLoop_10_iterations_stubs_results_1_to_4_keeps_5_to_10_full() async throws {
     // Same exactly-5 keep-window boundary as the non-streaming sibling.
     let dir = try makeTempDir("ten-iter-stream")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     var events: [[LLMMessageStreamEvent]] = (1...10).map { i in
         [.toolCall(LLMStreamToolCall(id: "c\(i)", name: "t\(i)", inputJSON: Data("{}".utf8)))]
     }
@@ -511,7 +511,7 @@ func toolLoop_clearing_keeps_engine_persistence_surfaces_byte_identical() async 
     // Serialize both surfaces to JSONL files and compare bytes against a
     // control built straight from the scripted full bodies.
     let dir = try makeTempDir("persist")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let calls = (1...10).map { i in
         #"{"tool_calls":[{"id":"c\#(i)","type":"function","function":{"name":"t\#(i)","arguments":"{}"}}]}"#
     }

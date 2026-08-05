@@ -11,22 +11,22 @@ import ProviderRouting
 /// intentionally empty until the connector action
 /// registry is wired in Swift. The LLM call goes through the in-app
 /// `SwiftNativeLLMClient`: one checked routing snapshot admits the complete
-/// missions provider/model/effort/tier tuple, and the task-local admission is
+/// executions provider/model/effort/tier tuple, and the task-local admission is
 /// passed through `LLMClient.complete(prompt:system:model:surface:)`. Timeout enforcement (60s in
 /// the planner caller) lives inside `runCodex` via `withThrowingTaskGroup`.
 /// Any LLM throw, any router throw, any timeout is wrapped as
-/// `WorkshopExecutionError.plannerFailure(...)` so the outer `planMission` stub
+/// `WorkshopExecutionError.plannerFailure(...)` so the outer `planWorkshopExecution` stub
 /// fallback path is hit — byte-for-byte parity with the Python broad-except
 /// at the retired daemon. The surface is carried through the final client call
 /// so active-provider selection and the surface's Think/Fast controls cannot
 /// fall back to chat. CancellationError propagates distinctly from WorkshopExecutionError
 /// so a cancelled submit() never lands a stub.
-/// Process-global tool catalog for the mission planner. WorkshopExecution
+/// Process-global tool catalog for the execution planner. WorkshopExecution
 /// can't import ChatOrchestration (the tool-catalog source), so the APP
 /// configures this ONCE at launch (BackgroundLoopsManager.start) with a
 /// provider built from SwiftToolDispatcher's schemas. Every planner that isn't
 /// given an explicit provider — notably the trigger scheduler's
-/// makeWorkshopRunner — reads it, so AUTONOMOUS triggered missions get the same
+/// makeWorkshopRunner — reads it, so AUTONOMOUS triggered executions get the same
 /// real tools as manually-submitted ones. Unconfigured (tests) → empty →
 /// synthesis-only, preserving prior behaviour. Set-once-at-launch; lock-guarded.
 public enum WorkshopPlannerCatalog {
@@ -182,7 +182,7 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
         // WAVE 28 (2026-06-01): same OAuth-direct wiring for Anthropic — the user's
         // env has no ANTHROPIC_API_KEY; setup_token lives in
         // data/providers/anthropic_oauth_direct.json. Without this, claude-*
-        // missions fail .notConfigured.
+        // executions fail .notConfigured.
         self.llm = llm ?? SwiftNativeLLMClient(
             router: resolvedRouter,
             codex: CodexAdapter(),
@@ -207,11 +207,15 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
     }
 
     public func runCodex(prompt: String, surface: String, timeoutSeconds: Int) async throws -> (model: String, output: String) {
-        // Admit the complete mission tuple from one checked generation. The
+        // Admit the complete execution tuple from one checked generation. The
         // shared LLM client may reread authority to detect corruption, but the
         // task-local tuple prevents a valid picker change from splicing a new
         // provider/effort/tier into this already-started planner call.
-        let routingSurface = surface == "workshop" ? "missions" : surface
+        // P2-3: the routing vocabulary used to be `missions` and this line
+        // translated INTO it. It is `workshop` now, so the translation runs the
+        // other way and a caller still passing `missions` lands on the same
+        // preference instead of falling through to the chat-surface seed.
+        let routingSurface = canonicalRoutingSurface(surface)
         let routingSnapshot: ProviderRoutingSnapshot
         do {
             routingSnapshot = try await router.checkedRoutingSnapshot()
@@ -224,7 +228,11 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
             }
             throw WorkshopExecutionError.plannerFailure("provider routing unavailable")
         }
-        let preference = routingSnapshot.preferences[routingSurface]
+        // Read through the vocabulary bridge, not a raw subscript: a router
+        // conformer whose snapshot is still keyed `missions` would otherwise
+        // miss and fall back to the CHAT model — a silent wrong-model run, not
+        // a failure anyone would notice.
+        let preference = ProviderRoutingSurfaceLookup.value(routingSnapshot.preferences, routingSurface)
             ?? routingSnapshot.preferences["chat"]
         guard let preference,
               !preference.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -232,7 +240,8 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
         }
         let resolvedModel = preference.model
         let resolvedEffort = preference.reasoningEffort
-        let resolvedProvider = routingSnapshot.activeProviders[routingSurface]
+        let resolvedProvider = ProviderRoutingSurfaceLookup
+            .value(routingSnapshot.activeProviders, routingSurface)
             ?? router.inferProviderForModel(resolvedModel)
         let resolvedTier = preference.serviceTier
         // Re-check cancellation between router-prefs resolution and the LLM

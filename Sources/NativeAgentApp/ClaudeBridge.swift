@@ -2092,7 +2092,7 @@ private func anyToJSONValue(_ value: Any) throws -> JSONValue {
 ///
 /// The claude/codex bridge surfaces are human-OUT-of-the-loop. Per the user's call
 /// ("the bridges should be open"), every NativeAgent-NATIVE tool — builder
-/// (shell/git/…), integration-send (mail/messages/…), self-evolution, mission,
+/// (shell/git/…), integration-send (mail/messages/…), self-evolution, execution,
 /// memory — is fully available on the bridge, gated by the SAME chain as local
 /// Mac chat (yolo window for builder, the self_install approval card for
 /// evolution, `read_only` fileAccess + no-approval-inbox on the /claude/tool

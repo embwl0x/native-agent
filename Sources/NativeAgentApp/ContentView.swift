@@ -83,14 +83,21 @@ struct ContentView: View {
     }
 
     var body: some View {
-        ZStack {
+        // Render-cost audit: make the root's invalidation rate a NUMBER, not an
+        // argument. Gated behind the existing `NATIVE_AGENT_RENDER_AUDIT=1`
+        // env check inside `RenderAudit` — when it is off, `bump` reads one
+        // already-computed `Bool` and returns, so this costs nothing in a
+        // normal run. This is the counter that proves F13 (the sidebar badge
+        // scalar) actually cut root re-evaluations.
+        RenderAudit.bump("contentview.body")
+        return ZStack {
             NavigationSplitView {
                 // S.5: when onboarding overlay is shown, hide the nav content from accessibility
                 // (OnboardingTourOverlay already carries .isModal; this prevents VoiceOver reaching behind it)
                 // 2026-06-06 sidebar-fix v6: restored to the standard
                 // List(selection:)+sidebar pattern that renders correctly.
                 // .scrollDisabled broke rendering; manual ScrollView+VStack
-                // broke rendering. The missions-click scroll-shift is a
+                // broke rendering. The executions-click scroll-shift is a
                 // known issue tracked separately — at least the sidebar
                 // works again. isSelected is still passed for the orange
                 // highlight (since List's own selection styling differs).
@@ -364,7 +371,7 @@ struct ContentView: View {
 
     // PATCH-2026-06-06: command-palette — sidebar badge counts for the
     // "needs your eyes" tabs. .activity stays the combined inbox/approvals
-    // queue; .missions surfaces currently-running missions. Skills/MCP
+    // queue; .executions surfaces currently-running executions. Skills/MCP
     // have no pending count yet, so they return 0.
     private func sidebarBadgeCount(for item: SidebarItem) -> Int {
         switch item {

@@ -10,7 +10,7 @@ import NativeAgentTestSupport
 
 private func makeTempRoot() throws -> URL {
     let dir = FileManager.default.temporaryDirectory
-        .appendingPathComponent("MissionsTests-\(UUID().uuidString)")
+        .appendingPathComponent("WorkshopExecutionsTests-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     return dir
 }
@@ -23,7 +23,7 @@ private func makeTempRoot() throws -> URL {
 // fresh temp dir makes the suite hermetic by construction.
 private func hermeticWorkshopExecutionRoot() -> URL {
     let dir = FileManager.default.temporaryDirectory
-        .appendingPathComponent("MissionsTests-\(UUID().uuidString)")
+        .appendingPathComponent("WorkshopExecutionsTests-\(UUID().uuidString)")
     try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     return dir
 }
@@ -154,7 +154,7 @@ private func fixedUUID(_ s: String = "11111111-1111-1111-1111-111111111111") -> 
 
 // MARK: - Stub fallback fast paths
 
-@Suite("SwiftNativeWorkshopRunner: planMission stub fallback")
+@Suite("SwiftNativeWorkshopRunner: planWorkshopExecution stub fallback")
 struct StubFallbackSuite {
     @Test func autonomyDisabledReturnsStub() async throws {
         let runner = SwiftNativeWorkshopRunner(executorAvailable: true, root: hermeticWorkshopExecutionRoot(),
@@ -205,7 +205,7 @@ struct StubFallbackSuite {
 
 // MARK: - planWorkshopExecution happy paths
 
-@Suite("SwiftNativeWorkshopRunner: planMission happy path")
+@Suite("SwiftNativeWorkshopRunner: planWorkshopExecution happy path")
 struct PlanHappyPathSuite {
     @Test func plannerReturns3StepsAreValidated() async throws {
         let output = """
@@ -478,7 +478,7 @@ struct ConcurrencySuite {
             let data = try Data(contentsOf: runner.executionRecordPath(id))
             let parsed = try JSONValue.parse(data)
             guard case .object(let o) = parsed else {
-                Issue.record("mission \(id) not parseable as object"); continue
+                Issue.record("execution \(id) not parseable as object"); continue
             }
             #expect(str(o["id"]) == id)
         }
@@ -486,7 +486,7 @@ struct ConcurrencySuite {
 }
 
 // MARK: - Factory
-// Fix 8: makeWorkshopRunner() has no runtime: parameter — missions always
+// Fix 8: makeWorkshopRunner() has no runtime: parameter — executions always
 // proceed native. Tests updated to match the no-runtime-param signature.
 
 @Suite("makeWorkshopRunner: factory")
@@ -499,7 +499,7 @@ struct FactorySuite {
 
     @Test func factoryAlwaysProceedsNative() async throws {
         // Fix 8 rewrite of the retired external-runtime delegation path:
-        // missions always proceed native now.
+        // executions always proceed native now.
         let runner = makeWorkshopRunner()
         #expect(runner is SwiftNativeWorkshopRunner,
                 "makeWorkshopRunner must always return SwiftNativeWorkshopRunner (cutover complete)")
@@ -717,7 +717,7 @@ private final class MockLLMClient: LLMClient, @unchecked Sendable {
     }
 }
 
-// Mock router that seeds the 'missions' surface with a fixed model.
+// Mock router that seeds the 'executions' surface with a fixed model.
 private final class MockRouter: ProviderRoutingProtocol, @unchecked Sendable {
     let surfaceModel: String
     init(surfaceModel: String) { self.surfaceModel = surfaceModel }
@@ -759,7 +759,10 @@ private final class SlowLLM: LLMClient, @unchecked Sendable {
 }
 
 // Mock router that returns DIFFERENT models per surface so a test can prove
-// production code reads prefs["missions"] and not prefs["chat"] / something else.
+// production code reads the WORKSHOP surface's preference and not prefs["chat"]
+// / something else. Its map is minted from MODEL_SURFACES, i.e. the CANONICAL
+// vocabulary — while the caller below still passes the 0.3.x "missions". That
+// mismatch is the point (P2-3).
 private final class SurfaceDiscriminatingMockRouter: ProviderRoutingProtocol, @unchecked Sendable {
     func listProviders() async throws -> [Provider] { [] }
     func getProvider(id: String) async throws -> Provider { throw ProviderRoutingError.providerNotFound }
@@ -1003,14 +1006,16 @@ struct HTTPCodexPlannerLLMSuite {
     }
 
     @Test func resolvesModelForWorkshopExecutionsSurfaceNotChat() async throws {
-        // Surface discrimination: when runCodex is called with surface="missions",
-        // the LLMClient MUST be called with the model bound to "missions" — NOT
-        // the model bound to "chat" or any other surface.
+        // Surface discrimination ACROSS vocabularies: runCodex is called with the
+        // legacy surface "missions" while the router's map is keyed by the
+        // canonical "workshop". The LLMClient must still receive the WORKSHOP
+        // model — falling through to "chat" here is the silent wrong-model bug
+        // the P2-3 bridge exists to prevent.
         let mock = MockLLMClient(output: "{\"steps\":[]}")
         let router = SurfaceDiscriminatingMockRouter()
         let planner = SwiftNativeWorkshopPlannerLLM(llm: mock, router: router, runLedgerDataRoot: nil)
         _ = try? await planner.runCodex(prompt: "p", surface: "missions", timeoutSeconds: 60)
-        #expect(mock.lastModel == "model-for-missions")
+        #expect(mock.lastModel == "model-for-workshop")
         // Sanity: also verify the "chat" model would have been different.
         #expect(mock.lastModel != "model-for-chat")
     }
@@ -1018,12 +1023,13 @@ struct HTTPCodexPlannerLLMSuite {
     @Test func routesThroughWorkshopExecutionsProviderAndPreservesSurfaceControls() async throws {
         let router = WorkshopExecutionRouteRouter()
         let chat = WorkshopExecutionRouteRecordingAdapter(providerId: "openai", response: "wrong-chat-route")
-        let executions = WorkshopExecutionRouteRecordingAdapter(providerId: "anthropic", response: "mission-route")
+        let executions = WorkshopExecutionRouteRecordingAdapter(providerId: "anthropic", response: "execution-route")
         let client = SwiftNativeLLMClient(
             router: router,
             codex: WorkshopExecutionRouteRecordingAdapter(providerId: "codex", response: "wrong-codex-route"),
             anthropic: executions,
-            openAI: chat
+            openAI: chat,
+            moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
         )
         let planner = SwiftNativeWorkshopPlannerLLM(
             llm: client,
@@ -1032,17 +1038,20 @@ struct HTTPCodexPlannerLLMSuite {
         )
 
         let result = try await planner.runCodex(
-            prompt: "plan this mission",
+            prompt: "plan this execution",
             surface: "missions",
             timeoutSeconds: 60
         )
 
         #expect(result.model == "claude-opus-4-8")
-        #expect(result.output == "mission-route")
+        #expect(result.output == "execution-route")
         #expect(chat.snapshot().isEmpty)
+        // The router fake is keyed with the LEGACY "missions" and the caller
+        // passes "missions" too, yet the surface carried into the adapter is the
+        // CANONICAL one: writers emit `workshop` from here on (P2-3).
         #expect(executions.snapshot() == [WorkshopExecutionRouteRecordingAdapter.Call(
             model: "claude-opus-4-8",
-            surface: "missions",
+            surface: "workshop",
             reasoningEffort: "low",
             serviceTier: "priority",
             sessionId: nil
@@ -1052,7 +1061,7 @@ struct HTTPCodexPlannerLLMSuite {
     @Test func plannerFreezesFirstCheckedTupleAcrossSharedLLMReread() async throws {
         let router = RotatingWorkshopRouteRouter()
         let anthropic = WorkshopExecutionRouteRecordingAdapter(
-            providerId: "anthropic", response: "frozen-mission-route"
+            providerId: "anthropic", response: "frozen-execution-route"
         )
         let openAI = WorkshopExecutionRouteRecordingAdapter(
             providerId: "openai", response: "wrong-new-generation"
@@ -1063,7 +1072,8 @@ struct HTTPCodexPlannerLLMSuite {
                 providerId: "codex", response: "wrong-codex-route"
             ),
             anthropic: anthropic,
-            openAI: openAI
+            openAI: openAI,
+            moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
         )
         let planner = SwiftNativeWorkshopPlannerLLM(
             llm: client,
@@ -1079,11 +1089,14 @@ struct HTTPCodexPlannerLLMSuite {
 
         #expect(router.callCount == 2)
         #expect(result.model == "claude-opus-4-8")
-        #expect(result.output == "frozen-mission-route")
+        #expect(result.output == "frozen-execution-route")
         #expect(openAI.snapshot().isEmpty)
+        // The router fake's snapshot is keyed with the LEGACY "missions" while
+        // the caller passes the canonical "workshop" — the mismatched pair. The
+        // surface carried into the adapter is canonical either way (P2-3).
         #expect(anthropic.snapshot() == [WorkshopExecutionRouteRecordingAdapter.Call(
             model: "claude-opus-4-8",
-            surface: "missions",
+            surface: "workshop",
             reasoningEffort: "high",
             serviceTier: "priority",
             sessionId: nil
@@ -1113,7 +1126,7 @@ struct HTTPCodexPlannerLLMSuite {
     @Test func submitPropagatesCancellation() async throws {
         // End-to-end cancellation: a cancelled submit() must NOT write a mission.json.
         let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("MissionsTests-CancelE2E-\(UUID().uuidString)")
+            .appendingPathComponent("WorkshopExecutionsTests-CancelE2E-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let router = MockRouter(surfaceModel: "gpt-5.4-mini")
@@ -1356,7 +1369,7 @@ private final class SlowPersistenceCore: PersistenceCoreProtocol, @unchecked Sen
 // MARK: - WAVE 32 W07: read-side (listing / detail / timeline)
 //
 // Exercises SwiftNativeWorkshopRunner.listAll / listActive / listHistory /
-// getMission / readTimeline / listLegacyMissions / listMissionsMerged against
+// getMission / readTimeline / listLegacyWorkshopExecutions / listWorkshopExecutionsMerged against
 // hand-seeded on-disk state. These mirror the retired daemon TaskQueue reads
 // (L363-L414) + the retired daemon GET /v1/missions merge order (L51360-L51366)
 // + list_missions (L5325-L5329). State is seeded directly via the persistence
@@ -1604,7 +1617,7 @@ struct SwiftNativeWorkshopRunnerWireFidelityTests {
 
 // MARK: - writes (wave 33 W07)
 //
-// Exercises SwiftNativeWorkshopRunner.cancel + updateMission against hand-seeded
+// Exercises SwiftNativeWorkshopRunner.cancel + updateWorkshopExecution against hand-seeded
 // on-disk state. Mirrors MissionRunner.cancel and the
 // queue-bridge branch of Runtime.update_mission.
 // State is seeded directly via the persistence core so the writes are tested in
@@ -1705,7 +1718,7 @@ struct SwiftNativeWorkshopRunnerWriteTests {
         let runner = SwiftNativeWorkshopRunner(executorAvailable: true, root: root, persistence: p, planner: ThrowingWorkshopPlannerLLM())
         do {
             _ = try await runner.cancel(executionId: "ghost")
-            Issue.record("expected throw for missing mission")
+            Issue.record("expected throw for missing execution")
         } catch let e as WorkshopExecutionError {
             #expect(e == .invalidRequest("Workshop execution not found: ghost"))
         }
@@ -1966,17 +1979,17 @@ struct SwiftNativeWorkshopRunnerWriteTests {
 
 // MARK: - WAVE 41 W01 (REOPEN §6.220-rd2 #1) — write-side parity gates
 //
-// Closes the wave-40 W07 reopen: Mac native mission writes previously bypassed
+// Closes the wave-40 W07 reopen: Mac native execution writes previously bypassed
 // the daemon's three submission semantics — the missionPolicy gate
 // (_missions_allowed), the _mission_slots capacity gate, and record_activity.
-// These tests pin all three on submit() + updateMission().
+// These tests pin all three on submit() + updateWorkshopExecution().
 
 @Suite("SwiftNativeWorkshopRunner: write-side parity gates (wave 41 W01)")
 struct WorkshopExecutionWriteParityGateTests {
 
     /// Write a `trust/policy.json` under `root` with the given missionPolicy
-    /// shape. `missionPolicyEnabled == nil` omits the `enabled` key entirely;
-    /// `missionPolicyAbsent == true` omits the whole missionPolicy object.
+    /// shape. `workshopPolicyEnabled == nil` omits the `missionPolicy.enabled` key entirely;
+    /// `workshopPolicyAbsent == true` omits the whole missionPolicy object.
     private func seedTrustPolicy(
         root: URL,
         persistence: SwiftNativePersistenceCore,
@@ -2160,7 +2173,7 @@ struct WorkshopExecutionWriteParityGateTests {
     @Test func updateReturnsNilWhenWorkshopPolicyDisabled() async throws {
         // The daemon runs the queue-bridge ONLY inside `if _missions_allowed()`.
         // Off → native returns nil so the daemon legacy path stays Python.
-        // A real queue mission EXISTS on disk, but the gate must short-circuit
+        // A real queue execution EXISTS on disk, but the gate must short-circuit
         // BEFORE matching it.
         let root = try makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2169,11 +2182,11 @@ struct WorkshopExecutionWriteParityGateTests {
         try await seedTrustPolicy(root: root, persistence: p, runner: runner, workshopPolicyEnabled: false)
         try await seedQueueWorkshopExecution(runner: runner, persistence: p, id: "m1", status: "running")
         let rec = try await runner.updateWorkshopExecution(WorkshopExecutionUpdate(id: "m1", status: "completed"))
-        #expect(rec == nil, "policy off → updateMission must return nil (daemon legacy fallthrough)")
+        #expect(rec == nil, "policy off → updateWorkshopExecution must return nil (daemon legacy fallthrough)")
         // And the Workshop execution on disk must be UNTOUCHED.
         let data = try Data(contentsOf: runner.executionRecordPath("m1"))
         guard case .object(let o) = try JSONValue.parse(data) else { Issue.record("bad json"); return }
-        #expect(str(o["status"]) == "running", "policy-off update must not mutate the mission")
+        #expect(str(o["status"]) == "running", "policy-off update must not mutate the execution")
     }
 
     // MARK: (b) _mission_slots capacity gate
@@ -2196,7 +2209,7 @@ struct WorkshopExecutionWriteParityGateTests {
         try await seedQueueWorkshopExecution(runner: runner, persistence: p, id: "b", status: "running")
         do {
             _ = try await runner.submit(spec: WorkshopExecutionSpec(title: "T", objective: "O"))
-            Issue.record("expected .missionsBusy when slots are full")
+            Issue.record("expected .workshopExecutionsBusy when slots are full")
         } catch let e as WorkshopExecutionError {
             #expect(e == .workshopExecutionsBusy("missions_busy: too many active or pending Workshop executions"))
             #expect(e.parityErrorCode == "missions_busy")
@@ -2235,7 +2248,7 @@ struct WorkshopExecutionWriteParityGateTests {
         let result = try await runner.submit(spec: WorkshopExecutionSpec(title: "MyTitle", objective: "O"))
         let events = readActivityEvents(runner)
         let created = events.filter { str($0["title"]) == "Workshop task created" }
-        #expect(created.count == 1, "submit must emit exactly one 'Mission created' activity row")
+        #expect(created.count == 1, "submit must emit exactly one 'Execution created' activity row")
         guard let ev = created.first else { return }
         #expect(str(ev["kind"]) == "mission")
         #expect(str(ev["detail"]) == "MyTitle")
@@ -2265,7 +2278,7 @@ struct WorkshopExecutionWriteParityGateTests {
         #expect(str(ev["missionId"]) == "m1")
         guard case .object(let payload)? = ev["payload"] else { Issue.record("payload missing"); return }
         #expect(str(payload["status"]) == "completed")
-        // queue Mission has no phase → null (documented §6.240).
+        // queue Execution has no phase → null (documented §6.240).
         #expect(payload["phase"] == .null)
     }
 
@@ -2296,7 +2309,7 @@ struct WorkshopExecutionWriteParityGateTests {
     }
 
     @Test func unknownWorkshopExecutionUpdateEmitsNoActivity() async throws {
-        // nil return (not a queue mission) → no activity row (daemon records on
+        // nil return (not a queue execution) → no activity row (daemon records on
         // its OWN legacy path, which stays Python).
         let root = try makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2324,7 +2337,7 @@ struct WorkshopExecutionWriteParityGateTests {
     // MARK: (c) record_activity — secret redaction (gpt-5.5 review #4)
 
     @Test func submitActivityRedactsSecretInTitle() async throws {
-        // A real-looking OpenAI key in the mission title must be redacted in the
+        // A real-looking OpenAI key in the execution title must be redacted in the
         // Activity feed (parity with the daemon's redact_secret_text).
         let root = try makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2392,10 +2405,10 @@ struct ExecutorGateSuite {
     @Test func defaultRunnerEnqueuesNowThatExecutorExists() async throws {
         // NEW CONTRACT (executor port, 2026-06-10): default
         // executorAvailable=true — WorkshopExecutorLoop drains queued
-        // missions, so a default-constructed runner accepts submits and
-        // lands the mission durably in `queued`.
+        // executions, so a default-constructed runner accepts submits and
+        // lands the execution durably in `queued`.
         let tmp = FileManager.default.temporaryDirectory
-            .appendingPathComponent("missions-exec-gate-\(UUID().uuidString)")
+            .appendingPathComponent("executions-exec-gate-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: tmp) }
         let recorder = RecordingWorkshopPlannerLLM { _ in ("m", "{\"steps\":[]}") }
         let runner = SwiftNativeWorkshopRunner(root: tmp, planner: recorder)
@@ -2412,7 +2425,7 @@ struct ExecutorGateSuite {
         // check, planner, and any file IO. The planner recording proves no
         // LLM call was burned.
         let tmp = FileManager.default.temporaryDirectory
-            .appendingPathComponent("missions-exec-gate-off-\(UUID().uuidString)")
+            .appendingPathComponent("executions-exec-gate-off-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: tmp) }
         let recorder = RecordingWorkshopPlannerLLM { _ in ("m", "{\"steps\":[]}") }
         let runner = SwiftNativeWorkshopRunner(executorAvailable: false, root: tmp, planner: recorder)

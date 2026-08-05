@@ -28,7 +28,7 @@ extension SwiftToolDispatcher {
     /// downstream, so this tool adds no new policy.
     private func workshopRunner() -> SwiftNativeWorkshopRunner {
         // TOOL-AWARE planner: inject THIS dispatcher's own tool catalog so a
-        // chat-submitted mission plans against the same tools the chat loop
+        // chat-submitted execution plans against the same tools the chat loop
         // sees, not only chat.synthesize (root cause fixed 2026-06-15). Capped
         // to 40 to bound prompt size (the planner itself prefixes 30).
         SwiftNativeWorkshopRunner(

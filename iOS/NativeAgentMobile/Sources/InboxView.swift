@@ -70,7 +70,11 @@ struct InboxItemRecord: Identifiable, Codable, Hashable, Sendable {
         if source == "dream_cycle"               { return "moon.stars.fill" }
         if source == "rem_cycle"                 { return "sparkles" }
         if source.hasPrefix("trigger:file_watch") { return "doc.text.magnifyingglass" }
-        if source.hasPrefix("mission_complete")   { return "checkmark.circle.fill" }
+        // P2-4: `execution_complete:<id>` is the canonical source; historical
+        // cards synced from the Mac still say `mission_complete:<id>`.
+        if source.hasPrefix("execution_complete") || source.hasPrefix("mission_complete") {
+            return "checkmark.circle.fill"
+        }
         if source == "idle_checkin"               { return "clock.fill" }
         if source.hasPrefix("trigger:morning_brief") { return "sun.horizon.fill" }
         if source.hasPrefix("trigger:stuck_pattern") { return "arrow.trianglehead.2.clockwise" }
@@ -88,7 +92,9 @@ struct InboxItemRecord: Identifiable, Codable, Hashable, Sendable {
         if source.hasPrefix("trigger:morning_brief") { return "MORNING-BRIEF" }
         if source.hasPrefix("trigger:stuck_pattern") { return "STUCK-PATTERNS" }
         if source == "idle_checkin"                  { return "IDLE-CHECKIN" }
-        if source.hasPrefix("mission_complete")      { return "WORKSHOP" }
+        if source.hasPrefix("execution_complete") || source.hasPrefix("mission_complete") {
+            return "WORKSHOP"
+        }
         return source.uppercased().prefix(14).description
     }
 

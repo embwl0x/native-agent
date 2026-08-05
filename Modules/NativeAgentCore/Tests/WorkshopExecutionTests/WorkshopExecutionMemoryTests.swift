@@ -23,7 +23,7 @@ import PersistenceCore
 
 private func makeTempRoot(_ label: String) throws -> URL {
     let dir = FileManager.default.temporaryDirectory
-        .appendingPathComponent("WorkshopMissionMemoryTests-\(label)-\(UUID().uuidString)")
+        .appendingPathComponent("WorkshopExecutionMemoryTests-\(label)-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     return dir
 }
@@ -40,7 +40,7 @@ private func stepOutcome(_ id: String, _ status: String, text: String = "") -> J
 }
 
 private func fixtureRecord(
-    id: String = "mission-1",
+    id: String = "wsx-1",
     title: String = "Sweep the stale release artifacts",
     objective: String = "Delete build artifacts older than 30 days from the release staging dir.",
     status: String,
@@ -74,7 +74,7 @@ private func fixtureRecord(
 
 // MARK: - Fake writer
 
-private actor FakeMissionMemoryWriter: WorkshopMissionMemoryWriting {
+private actor FakeExecutionMemoryWriter: WorkshopExecutionMemoryWriting {
     struct Written: Sendable {
         let id: String
         let content: String
@@ -102,7 +102,7 @@ private actor FakeMissionMemoryWriter: WorkshopMissionMemoryWriting {
                 Written(
                     id: "seed-\(String(format: "%04d", index))",
                     content: "seeded \(index)",
-                    source: "\(WorkshopMissionMemory.sourcePrefix)seed-\(index)",
+                    source: "\(WorkshopExecutionMemory.sourcePrefix)seed-\(index)",
                     metadata: .object([:]),
                     // Ascending timestamps: seed-0000 is the OLDEST.
                     createdAt: String(format: "2026-01-01T00:%02d:00Z", index % 60)
@@ -112,7 +112,7 @@ private actor FakeMissionMemoryWriter: WorkshopMissionMemoryWriting {
         }
     }
 
-    func writeMissionMemory(content: String, source: String, metadata: JSONValue) async throws -> String {
+    func writeExecutionMemory(content: String, source: String, metadata: JSONValue) async throws -> String {
         if failWrites { throw MemoryV2Error.storageUnavailable }
         counter += 1
         let id = "mem-\(counter)"
@@ -133,17 +133,17 @@ private actor FakeMissionMemoryWriter: WorkshopMissionMemoryWriting {
     /// that returns the whole lane hides exactly the non-convergence the sweep
     /// had (it would look bounded here and leave ~801 rows on the real store).
     /// Same class of divergence as the fixture/SQLite metadata contract.
-    func missionMemories(sourcePrefix: String) async throws -> [WorkshopMissionMemoryHandle] {
+    func executionMemories(sourcePrefix: String) async throws -> [WorkshopExecutionMemoryHandle] {
         let live = written
             .filter { $0.source.hasPrefix(sourcePrefix) && !retired.contains($0.id) }
             .sorted { $0.createdAt == $1.createdAt ? $0.id > $1.id : $0.createdAt > $1.createdAt }
-        let limit = WorkshopMissionMemory.retentionCap + WorkshopMissionMemory.retentionSweepWindow
+        let limit = WorkshopExecutionMemory.retentionCap + WorkshopExecutionMemory.retentionSweepWindow
         return live.prefix(limit).map {
-            WorkshopMissionMemoryHandle(id: $0.id, createdAt: $0.createdAt, source: $0.source)
+            WorkshopExecutionMemoryHandle(id: $0.id, createdAt: $0.createdAt, source: $0.source)
         }
     }
 
-    func retireMissionMemory(id: String) async throws {
+    func retireExecutionMemory(id: String) async throws {
         if failRetire { throw MemoryV2Error.storageUnavailable }
         retired.append(id)
     }
@@ -155,7 +155,7 @@ private actor FakeMissionMemoryWriter: WorkshopMissionMemoryWriting {
 /// for its 2s timeout, a CoreML embed stalling). Used to MEASURE that the
 /// terminal path does not wait on it — see
 /// `aStalledMemoryWriteDoesNotHoldUpExecutionCompletion`.
-private actor StallingMissionMemoryWriter: WorkshopMissionMemoryWriting {
+private actor StallingExecutionMemoryWriter: WorkshopExecutionMemoryWriting {
     /// Backstop so a REGRESSION (an awaited write) fails the test instead of
     /// hanging the suite forever. Far above any load-induced jitter, so the
     /// elapsed-time assertion is not a race.
@@ -166,7 +166,7 @@ private actor StallingMissionMemoryWriter: WorkshopMissionMemoryWriting {
 
     func release() { released = true }
 
-    func writeMissionMemory(content: String, source: String, metadata: JSONValue) async throws -> String {
+    func writeExecutionMemory(content: String, source: String, metadata: JSONValue) async throws -> String {
         entered += 1
         let deadline = Date().addingTimeInterval(Self.hangCapSeconds)
         while !released, Date() < deadline {
@@ -176,32 +176,32 @@ private actor StallingMissionMemoryWriter: WorkshopMissionMemoryWriting {
         return "stalled-\(completed)"
     }
 
-    func missionMemories(sourcePrefix: String) async throws -> [WorkshopMissionMemoryHandle] { [] }
-    func retireMissionMemory(id: String) async throws {}
+    func executionMemories(sourcePrefix: String) async throws -> [WorkshopExecutionMemoryHandle] { [] }
+    func retireExecutionMemory(id: String) async throws {}
 }
 
 private final class LogSpy: @unchecked Sendable {
     private let lock = NSLock()
-    private var lines: [(level: WorkshopMissionMemoryLogLevel, text: String)] = []
-    func append(_ level: WorkshopMissionMemoryLogLevel, _ line: String) {
+    private var lines: [(level: WorkshopExecutionMemoryLogLevel, text: String)] = []
+    func append(_ level: WorkshopExecutionMemoryLogLevel, _ line: String) {
         lock.lock(); lines.append((level, line)); lock.unlock()
     }
-    var all: [(level: WorkshopMissionMemoryLogLevel, text: String)] {
+    var all: [(level: WorkshopExecutionMemoryLogLevel, text: String)] {
         lock.lock(); defer { lock.unlock() }; return lines
     }
     func contains(_ needle: String) -> Bool { all.contains { $0.text.contains(needle) } }
     /// Severity matters: production routes this sink through `Logger.info`, so
     /// a failure logged at `.info` is not actually loud (gpt-5.5 review A1).
-    func level(containing needle: String) -> WorkshopMissionMemoryLogLevel? {
+    func level(containing needle: String) -> WorkshopExecutionMemoryLogLevel? {
         all.first { $0.text.contains(needle) }?.level
     }
-    var sink: WorkshopMissionMemoryLog { { [self] level, line in append(level, line) } }
+    var sink: WorkshopExecutionMemoryLog { { [self] level, line in append(level, line) } }
 }
 
 // MARK: - Suite
 
-@Suite("WorkshopMissionMemory")
-struct WorkshopMissionMemoryTests {
+@Suite("WorkshopExecutionMemory")
+struct WorkshopExecutionMemoryTests {
 
     // MARK: narrative shape
 
@@ -214,35 +214,35 @@ struct WorkshopMissionMemoryTests {
                 status: .satisfied, checkedAt: "2026-08-02T10:00:00Z", methods: ["file_bytes"]
             )
         )
-        let text = WorkshopMissionMemory.narrative(record, reason: nil)
+        let text = WorkshopExecutionMemory.narrative(record, reason: nil)
 
-        #expect(text.hasPrefix("Workshop mission \"Sweep the stale release artifacts\" completed."))
+        #expect(text.hasPrefix("Workshop execution \"Sweep the stale release artifacts\" completed."))
         #expect(text.contains("The objective was: Delete build artifacts older than 30 days"))
         #expect(text.contains("2 of 2 planned steps succeeded."))
-        #expect(text.contains("verified against the mission's own success criterion"))
+        #expect(text.contains("verified against the execution's own success criterion"))
         #expect(text.contains("What came of it: Removed 14 artifacts, freed 2.1 GB."))
         #expect(text.contains("It was started by manual."))
         // A memory, not a receipt: no identifiers in the prose.
-        #expect(!text.contains("mission-1"))
+        #expect(!text.contains("wsx-1"))
         #expect(!text.contains("/tmp/receipts"))
     }
 
     @Test func failedNarrativeCarriesTheFailureNotJustTheStatus() {
         let record = fixtureRecord(
-            id: "mission-2",
+            id: "execution-2",
             status: "failed",
             stepsCompleted: [stepOutcome("step-0", "succeeded"), stepOutcome("step-1", "failed")]
         )
-        let text = WorkshopMissionMemory.narrative(
+        let text = WorkshopExecutionMemory.narrative(
             record, reason: "rm: /Volumes/staging: Operation not permitted"
         )
-        #expect(text.hasPrefix("Workshop mission \"Sweep the stale release artifacts\" failed."))
+        #expect(text.hasPrefix("Workshop execution \"Sweep the stale release artifacts\" failed."))
         #expect(text.contains("1 of 2 planned steps succeeded."))
         #expect(text.contains("What went wrong: rm: /Volumes/staging: Operation not permitted"))
     }
 
     @Test func verificationFailureIsRecordedAsAFailedOutcomeNotASuccess() {
-        // The honesty gate's own case: every step succeeded, the mission did not.
+        // The honesty gate's own case: every step succeeded, the execution did not.
         let record = fixtureRecord(
             status: "failed",
             plan: 1,
@@ -258,7 +258,7 @@ struct WorkshopMissionMemoryTests {
                 detail: "expected output \"proof passed\" absent"
             )
         )
-        let text = WorkshopMissionMemory.narrative(record, reason: nil)
+        let text = WorkshopExecutionMemory.narrative(record, reason: nil)
         #expect(text.contains("failed."))
         #expect(text.contains("Verification of the declared outcome failed"))
         #expect(text.contains("What went wrong: expected output"))
@@ -274,17 +274,17 @@ struct WorkshopMissionMemoryTests {
                 stepOutcome("a", "succeeded"), stepOutcome("b", "succeeded"), stepOutcome("c", "succeeded"),
             ]
         )
-        #expect(WorkshopMissionMemory.narrative(record, reason: nil).contains("3 of 3 planned steps succeeded."))
+        #expect(WorkshopExecutionMemory.narrative(record, reason: nil).contains("3 of 3 planned steps succeeded."))
     }
 
     @Test func metadataCarriesTheReceiptFieldsAndTheDisclosureSurfaces() {
         let record = fixtureRecord(status: "completed", stepsCompleted: [stepOutcome("step-0", "succeeded")])
-        guard case .object(let meta) = WorkshopMissionMemory.metadata(record, reason: nil) else {
+        guard case .object(let meta) = WorkshopExecutionMemory.metadata(record, reason: nil) else {
             Issue.record("metadata is not an object")
             return
         }
         #expect(meta["kind"] == .string("operational"))
-        #expect(meta["workshop_execution_id"] == .string("mission-1"))
+        #expect(meta["workshop_execution_id"] == .string("wsx-1"))
         #expect(meta["workshop_status"] == .string("completed"))
         #expect(meta["workshop_steps_planned"] == .int(2))
         #expect(meta["workshop_steps_succeeded"] == .int(1))
@@ -299,20 +299,20 @@ struct WorkshopMissionMemoryTests {
     // MARK: what is dropped, and that the drop is LOUD
 
     @Test func cancelledBeforeAnyStepRanIsDroppedAndLogged() async {
-        let writer = FakeMissionMemoryWriter()
+        let writer = FakeExecutionMemoryWriter()
         let spy = LogSpy()
-        let recorder = WorkshopMissionMemoryRecorder(writer: writer, log: spy.sink)
+        let recorder = WorkshopExecutionMemoryRecorder(writer: writer, log: spy.sink)
 
         let id = await recorder.record(fixtureRecord(status: "cancelled"), reason: nil)
         #expect(id == nil)
         #expect(await writer.written.isEmpty)
-        #expect(spy.contains("DROPPED mission mission-1"))
+        #expect(spy.contains("DROPPED execution wsx-1"))
         #expect(spy.contains("cancelled_before_any_step_ran"))
     }
 
     @Test func cancelledAfterRealWorkIsStillRemembered() async {
-        let writer = FakeMissionMemoryWriter()
-        let recorder = WorkshopMissionMemoryRecorder(writer: writer, log: { _, _ in })
+        let writer = FakeExecutionMemoryWriter()
+        let recorder = WorkshopExecutionMemoryRecorder(writer: writer, log: { _, _ in })
         let record = fixtureRecord(status: "cancelled", stepsCompleted: [stepOutcome("step-0", "succeeded")])
         #expect(await recorder.record(record, reason: "cancelled by user") != nil)
         let written = await writer.written
@@ -321,31 +321,31 @@ struct WorkshopMissionMemoryTests {
     }
 
     @Test func nonTerminalStatusIsDroppedWithItsStatusNamed() async {
-        let writer = FakeMissionMemoryWriter()
+        let writer = FakeExecutionMemoryWriter()
         let spy = LogSpy()
-        let recorder = WorkshopMissionMemoryRecorder(writer: writer, log: spy.sink)
+        let recorder = WorkshopExecutionMemoryRecorder(writer: writer, log: spy.sink)
         #expect(await recorder.record(fixtureRecord(status: "running"), reason: nil) == nil)
         #expect(spy.contains("non_terminal_status:running"))
     }
 
     @Test func aWriteFailureIsLoudNotSilent() async {
-        let writer = FakeMissionMemoryWriter(failWrites: true)
+        let writer = FakeExecutionMemoryWriter(failWrites: true)
         let spy = LogSpy()
-        let recorder = WorkshopMissionMemoryRecorder(writer: writer, log: spy.sink)
+        let recorder = WorkshopExecutionMemoryRecorder(writer: writer, log: spy.sink)
         let record = fixtureRecord(status: "completed", stepsCompleted: [stepOutcome("step-0", "succeeded")])
         #expect(await recorder.record(record, reason: nil) == nil)
-        #expect(spy.contains("ERROR writing mission mission-1 memory"))
+        #expect(spy.contains("ERROR writing execution wsx-1 memory"))
         // …and loud means LOUD: `.error`, not the `.info` production would swallow.
-        #expect(spy.level(containing: "ERROR writing mission mission-1 memory") == .error)
+        #expect(spy.level(containing: "ERROR writing execution wsx-1 memory") == .error)
     }
 
     // MARK: retention — every add has a remove
 
     @Test func retentionEvictsOldestBeyondTheCapAndLogsWhatItDropped() async {
-        let writer = FakeMissionMemoryWriter()
-        await writer.seed(count: WorkshopMissionMemory.retentionCap)
+        let writer = FakeExecutionMemoryWriter()
+        await writer.seed(count: WorkshopExecutionMemory.retentionCap)
         let spy = LogSpy()
-        let recorder = WorkshopMissionMemoryRecorder(writer: writer, log: spy.sink)
+        let recorder = WorkshopExecutionMemoryRecorder(writer: writer, log: spy.sink)
 
         // Cap + 1 rows exist after this write → exactly one eviction.
         let record = fixtureRecord(status: "completed", stepsCompleted: [stepOutcome("step-0", "succeeded")])
@@ -353,9 +353,9 @@ struct WorkshopMissionMemoryTests {
 
         let retired = await writer.retired
         #expect(retired == ["seed-0000"])           // the oldest, not the newest
-        #expect(await writer.liveIDs.count == WorkshopMissionMemory.retentionCap)
-        #expect(spy.contains("retention: archived mission memory seed-0000"))
-        #expect(spy.contains("exceeds cap \(WorkshopMissionMemory.retentionCap)"))
+        #expect(await writer.liveIDs.count == WorkshopExecutionMemory.retentionCap)
+        #expect(spy.contains("retention: archived execution memory seed-0000"))
+        #expect(spy.contains("exceeds cap \(WorkshopExecutionMemory.retentionCap)"))
     }
 
     /// NEEDS_FIX 3 (gpt-5.5 review, 2026-08-02) — THE SWEEP HAS TO CONVERGE.
@@ -363,16 +363,16 @@ struct WorkshopMissionMemoryTests {
     /// The read is bounded to `retentionCap + retentionSweepWindow` (400) rows.
     /// The old sweep archived `dropFirst(cap)` of THAT SLICE and stopped, so a
     /// lane sitting at 1,000 active rows went to ~801 and stayed there — it
-    /// crept toward the cap only if more missions ever finished, and never
+    /// crept toward the cap only if more executions ever finished, and never
     /// converged at all if none did. A bound that only holds while the lane is
     /// busy is not a bound.
     ///
     /// One `record()` call must leave the lane AT the cap.
     @Test func retentionConvergesToTheCapInASingleSweepEvenFarOverIt() async {
-        let writer = FakeMissionMemoryWriter()
+        let writer = FakeExecutionMemoryWriter()
         await writer.seed(count: 1000)
         let spy = LogSpy()
-        let recorder = WorkshopMissionMemoryRecorder(writer: writer, log: spy.sink)
+        let recorder = WorkshopExecutionMemoryRecorder(writer: writer, log: spy.sink)
 
         _ = await recorder.record(
             fixtureRecord(status: "completed", stepsCompleted: [stepOutcome("step-0", "succeeded")]),
@@ -381,7 +381,7 @@ struct WorkshopMissionMemoryTests {
 
         // Pre-fix: 1001 - 200 archived in one slice = 801 live.
         #expect(
-            await writer.liveIDs.count == WorkshopMissionMemory.retentionCap,
+            await writer.liveIDs.count == WorkshopExecutionMemory.retentionCap,
             "the sweep left the lane above its own cap"
         )
         // It took more than one pass, and said so.
@@ -395,10 +395,10 @@ struct WorkshopMissionMemoryTests {
     /// The backstop is loud, not silent: a writer whose archive always fails
     /// must not spin, and must say the lane is unbounded.
     @Test func aRetentionSweepThatCannotArchiveGivesUpLoudly() async {
-        let writer = FakeMissionMemoryWriter(failRetire: true)
+        let writer = FakeExecutionMemoryWriter(failRetire: true)
         await writer.seed(count: 500)
         let spy = LogSpy()
-        let recorder = WorkshopMissionMemoryRecorder(writer: writer, log: spy.sink)
+        let recorder = WorkshopExecutionMemoryRecorder(writer: writer, log: spy.sink)
 
         _ = await recorder.record(
             fixtureRecord(status: "completed", stepsCompleted: [stepOutcome("step-0", "succeeded")]),
@@ -411,10 +411,10 @@ struct WorkshopMissionMemoryTests {
     }
 
     @Test func retentionDoesNothingBelowTheCap() async {
-        let writer = FakeMissionMemoryWriter()
+        let writer = FakeExecutionMemoryWriter()
         await writer.seed(count: 3)
         let spy = LogSpy()
-        let recorder = WorkshopMissionMemoryRecorder(writer: writer, log: spy.sink)
+        let recorder = WorkshopExecutionMemoryRecorder(writer: writer, log: spy.sink)
         _ = await recorder.record(
             fixtureRecord(status: "completed", stepsCompleted: [stepOutcome("step-0", "succeeded")]),
             reason: nil
@@ -427,7 +427,7 @@ struct WorkshopMissionMemoryTests {
     ///
     /// Against the REAL store, because the whole defect lives in MemoryV2's
     /// delete path: `deleteMemory` upserts a rejection tombstone for the
-    /// deleted CONTENT, so the next mission producing the same prose is refused
+    /// deleted CONTENT, so the next execution producing the same prose is refused
     /// as `tombstoned` and the lane silently stops remembering repeats. On the
     /// pre-fix code the final write here fails and `rerun` is nil.
     @Test func retentionArchivesRatherThanTombstoningSoARepeatIsStillRemembered() async throws {
@@ -436,14 +436,14 @@ struct WorkshopMissionMemoryTests {
         let memory = try makeMemory(root: root)
         let spy = LogSpy()
         // cap 1 so the sweep is provable without writing 201 rows.
-        let recorder = WorkshopMissionMemoryRecorder(
-            writer: SwiftNativeWorkshopMissionMemoryWriter(memory: memory),
+        let recorder = WorkshopExecutionMemoryRecorder(
+            writer: SwiftNativeWorkshopExecutionMemoryWriter(memory: memory),
             retentionCap: 1,
             log: spy.sink
         )
 
         let first = fixtureRecord(
-            id: "mission-alpha",
+            id: "wsx-alpha",
             title: "Sweep the stale release artifacts",
             status: "completed",
             plan: 1,
@@ -457,7 +457,7 @@ struct WorkshopMissionMemoryTests {
         try await Task.sleep(nanoseconds: 1_100_000_000)
 
         let second = fixtureRecord(
-            id: "mission-beta",
+            id: "wsx-beta",
             title: "Rotate the provider credentials",
             objective: "Rotate the anthropic oauth credential and re-verify the handshake.",
             status: "completed",
@@ -468,9 +468,9 @@ struct WorkshopMissionMemoryTests {
         _ = try #require(await recorder.record(second, reason: nil))
 
         // The sweep ran and took the OLDEST out of the lane…
-        #expect(spy.contains("retention: archived mission memory \(firstID)"))
-        let live = try await SwiftNativeWorkshopMissionMemoryWriter(memory: memory)
-            .missionMemories(sourcePrefix: WorkshopMissionMemory.sourcePrefix)
+        #expect(spy.contains("retention: archived execution memory \(firstID)"))
+        let live = try await SwiftNativeWorkshopExecutionMemoryWriter(memory: memory)
+            .executionMemories(sourcePrefix: WorkshopExecutionMemory.sourcePrefix)
         #expect(!live.map(\.id).contains(firstID), "an archived row is out of the active lane")
         #expect(live.count == 1)
 
@@ -481,15 +481,15 @@ struct WorkshopMissionMemoryTests {
         #expect(archived.status == "archived")
         #expect(archived.text.contains("Sweep the stale release artifacts"))
 
-        // THE POINT: run the same mission to the same outcome again and she can
+        // THE POINT: run the same execution to the same outcome again and she can
         // still remember it. Pre-fix this threw "tombstoned".
         let rerun = await recorder.record(first, reason: nil)
         #expect(rerun != nil, "an age-evicted memory must not become a rejection tombstone")
-        #expect(!spy.contains("ERROR writing mission mission-alpha"))
+        #expect(!spy.contains("ERROR writing execution wsx-alpha"))
         #expect(spy.level(containing: "tombstoned") == nil)
     }
 
-    // MARK: END TO END — a finished mission is a recallable memory
+    // MARK: END TO END — a finished execution is a recallable memory
 
     /// Real MemoryV2 over a temp-dir SQLite store with the deterministic mock
     /// embedder — the same `store()`/`recallMemory()` path chat uses.
@@ -514,17 +514,17 @@ struct WorkshopMissionMemoryTests {
         ).scored.map(\.record)
     }
 
-    @Test func endToEndCompletedMissionBecomesARecallableMissionsMemory() async throws {
+    @Test func endToEndCompletedExecutionBecomesARecallableWorkshopMemory() async throws {
         let root = try makeTempRoot("e2e-completed")
         defer { try? FileManager.default.removeItem(at: root) }
         let memory = try makeMemory(root: root)
-        let recorder = WorkshopMissionMemoryRecorder(
-            writer: SwiftNativeWorkshopMissionMemoryWriter(memory: memory),
+        let recorder = WorkshopExecutionMemoryRecorder(
+            writer: SwiftNativeWorkshopExecutionMemoryWriter(memory: memory),
             log: { _, _ in }
         )
 
         let id = "verified-exact-output"
-        try await seedMissionMemoryExecution(
+        try await seedExecutionMemoryExecution(
             root: root,
             id: id,
             title: "Exact output",
@@ -538,14 +538,14 @@ struct WorkshopMissionMemoryTests {
                 )
             },
             isEnabled: { true },
-            missionMemory: recorder
+            executionMemory: recorder
         )
         await executor.drainOnce()
         // The memory write is deliberately OFF the terminal path (A1), so a
         // reader has to wait for the tail before asserting on it.
-        await executor.waitForMissionMemoryWrites()
+        await executor.waitForExecutionMemoryWrites()
 
-        // The mission really did finish.
+        // The execution really did finish.
         let persistence = SwiftNativePersistenceCore()
         let raw = await persistence.readJSON(
             root.appendingPathComponent("workshop/executions/\(id)/mission.json"), defaultValue: .null
@@ -557,23 +557,23 @@ struct WorkshopMissionMemoryTests {
         #expect(object["status"] == .string("completed"))
 
         // …and she can remember it, ON THE MISSIONS SURFACE.
-        let hits = try await recall(memory, query: "Workshop mission Exact output completed", surface: "missions")
-        let mission = try #require(hits.first { ($0.sourceRunId ?? "").hasPrefix("workshop:") })
-        #expect(mission.sourceRunId == "workshop:\(id)")
-        #expect(mission.text.contains("Workshop mission \"Exact output\" completed."))
-        #expect(mission.text.contains("Workshop live proof passed"))
+        let hits = try await recall(memory, query: "Workshop execution Exact output completed", surface: "missions")
+        let execution = try #require(hits.first { ($0.sourceRunId ?? "").hasPrefix("workshop:") })
+        #expect(execution.sourceRunId == "workshop:\(id)")
+        #expect(execution.text.contains("Workshop execution \"Exact output\" completed."))
+        #expect(execution.text.contains("Workshop live proof passed"))
 
         // `workshop` is the human spelling of the same surface — the mapping the
         // policy already carried, now with something behind it.
-        #expect(!(try await recall(memory, query: mission.text, surface: "workshop")).isEmpty)
+        #expect(!(try await recall(memory, query: execution.text, surface: "workshop")).isEmpty)
         // And it flows into the rest of her mind rather than sitting in a
-        // missions-only silo…
-        #expect(!(try await recall(memory, query: mission.text, surface: "chat")).isEmpty)
+        // executions-only silo…
+        #expect(!(try await recall(memory, query: execution.text, surface: "chat")).isEmpty)
         // …but never onto a prompt-injectable no-human surface.
-        #expect((try await recall(memory, query: mission.text, surface: "slack")).isEmpty)
+        #expect((try await recall(memory, query: execution.text, surface: "slack")).isEmpty)
 
         // The disclosure policy itself agrees, directly.
-        let classification = try #require(MemoryRecordDisclosurePolicy.classify(mission))
+        let classification = try #require(MemoryRecordDisclosurePolicy.classify(execution))
         #expect(classification.permits(surface: "missions", personaID: nil))
         #expect(classification.permits(surface: "workshop", personaID: nil))
         #expect(!classification.permits(surface: "slack", personaID: nil))
@@ -583,13 +583,13 @@ struct WorkshopMissionMemoryTests {
         let root = try makeTempRoot("e2e-failed")
         defer { try? FileManager.default.removeItem(at: root) }
         let memory = try makeMemory(root: root)
-        let recorder = WorkshopMissionMemoryRecorder(
-            writer: SwiftNativeWorkshopMissionMemoryWriter(memory: memory),
+        let recorder = WorkshopExecutionMemoryRecorder(
+            writer: SwiftNativeWorkshopExecutionMemoryWriter(memory: memory),
             log: { _, _ in }
         )
 
         let id = "failing-tool-step"
-        try await seedMissionMemoryExecution(
+        try await seedExecutionMemoryExecution(
             root: root,
             id: id,
             title: "Copy the release notes",
@@ -604,10 +604,10 @@ struct WorkshopMissionMemoryTests {
                 throw MemoryV2Error.underlying("staging directory is read-only")
             },
             isEnabled: { true },
-            missionMemory: recorder
+            executionMemory: recorder
         )
         await executor.drainOnce()
-        await executor.waitForMissionMemoryWrites()
+        await executor.waitForExecutionMemoryWrites()
 
         let persistence = SwiftNativePersistenceCore()
         let raw = await persistence.readJSON(
@@ -620,11 +620,11 @@ struct WorkshopMissionMemoryTests {
         #expect(object["status"] == .string("failed"))
 
         let hits = try await recall(memory, query: "Copy the release notes failed", surface: "missions")
-        let mission = try #require(hits.first { ($0.sourceRunId ?? "").hasPrefix("workshop:") })
-        #expect(mission.text.contains("Workshop mission \"Copy the release notes\" failed."))
-        #expect(mission.text.contains("staging directory is read-only"))
+        let execution = try #require(hits.first { ($0.sourceRunId ?? "").hasPrefix("workshop:") })
+        #expect(execution.text.contains("Workshop execution \"Copy the release notes\" failed."))
+        #expect(execution.text.contains("staging directory is read-only"))
         // Failures are remembered with the same disclosure reach as successes.
-        let classification = try #require(MemoryRecordDisclosurePolicy.classify(mission))
+        let classification = try #require(MemoryRecordDisclosurePolicy.classify(execution))
         #expect(classification.permits(surface: "missions", personaID: nil))
     }
 
@@ -634,7 +634,7 @@ struct WorkshopMissionMemoryTests {
     /// which embeds, inserts, then sweeps retention. A SQLite busy-timeout or a
     /// stalled CoreML embed therefore held the executor's terminal transition,
     /// and the drain / `start()` / approval-resume did not advance to the next
-    /// queued mission — even though the terminal CAS and the Desk receipt had
+    /// queued execution — even though the terminal CAS and the Desk receipt had
     /// already landed.
     ///
     /// Measured, not asserted: the writer stalls for `stallSeconds`, and
@@ -646,12 +646,12 @@ struct WorkshopMissionMemoryTests {
         defer { try? FileManager.default.removeItem(at: root) }
         // The writer stalls until this test releases it — the shape of a SQLite
         // busy-timeout or a wedged embed, without a wall-clock guess.
-        let writer = StallingMissionMemoryWriter()
+        let writer = StallingExecutionMemoryWriter()
         let spy = LogSpy()
-        let recorder = WorkshopMissionMemoryRecorder(writer: writer, log: spy.sink)
+        let recorder = WorkshopExecutionMemoryRecorder(writer: writer, log: spy.sink)
 
         let id = "stalled-memory"
-        try await seedMissionMemoryExecution(
+        try await seedExecutionMemoryExecution(
             root: root, id: id, title: "Exact output",
             objective: "Return exactly: Workshop live proof passed."
         )
@@ -663,14 +663,14 @@ struct WorkshopMissionMemoryTests {
                 )
             },
             isEnabled: { true },
-            missionMemory: recorder
+            executionMemory: recorder
         )
 
         let started = Date()
         await executor.drainOnce()
         let elapsed = Date().timeIntervalSince(started)
 
-        // The mission really did reach terminal…
+        // The execution really did reach terminal…
         let persistence = SwiftNativePersistenceCore()
         let raw = await persistence.readJSON(
             root.appendingPathComponent("workshop/executions/\(id)/mission.json"), defaultValue: .null
@@ -683,7 +683,7 @@ struct WorkshopMissionMemoryTests {
         // …without waiting on the store. The bound is a quarter of the writer's
         // 30s hang cap: an AWAITED write cannot come in under it at any load,
         // and a handed-off one returns in milliseconds.
-        #expect(elapsed < StallingMissionMemoryWriter.hangCapSeconds / 4,
+        #expect(elapsed < StallingExecutionMemoryWriter.hangCapSeconds / 4,
                 "terminal path took \(elapsed)s while the memory write was stalled")
         // The write has NOT finished — the terminal path really did move on
         // without it. (Whether the detached task has been scheduled yet is a
@@ -692,10 +692,10 @@ struct WorkshopMissionMemoryTests {
 
         // And it is not LOST: released, the tail completes for anyone who waits.
         await writer.release()
-        await executor.waitForMissionMemoryWrites()
+        await executor.waitForExecutionMemoryWrites()
         #expect(await writer.entered == 1)
         #expect(await writer.completed == 1)
-        #expect(spy.contains("remembered mission \(id)"))
+        #expect(spy.contains("remembered execution \(id)"))
     }
 
     // MARK: NEEDS_FIX 2 — the queue is bounded, and the bound is loud
@@ -708,14 +708,14 @@ struct WorkshopMissionMemoryTests {
     ///
     /// Pre-fix this test cannot even be written: there is no bound to hit.
     @Test func aStalledQueueRefusesNewWritesAtItsBoundAndNamesWhatItDropped() async throws {
-        let writer = StallingMissionMemoryWriter()
+        let writer = StallingExecutionMemoryWriter()
         let spy = LogSpy()
-        let recorder = WorkshopMissionMemoryRecorder(writer: writer, log: spy.sink)
-        let queue = WorkshopMissionMemoryQueue(recorder: recorder, maxPending: 3)
+        let recorder = WorkshopExecutionMemoryRecorder(writer: writer, log: spy.sink)
+        let queue = WorkshopExecutionMemoryQueue(recorder: recorder, maxPending: 3)
 
         for index in 0..<6 {
             await queue.enqueue(
-                fixtureRecord(id: "mission-\(index)", status: "completed",
+                fixtureRecord(id: "execution-\(index)", status: "completed",
                               stepsCompleted: [stepOutcome("step-0", "succeeded")]),
                 reason: nil
             )
@@ -726,13 +726,13 @@ struct WorkshopMissionMemoryTests {
         #expect(await queue.pendingCount() == 3)
 
         // LOUD: `.error` (production routes `.info` into a level nobody reads)
-        // and the mission's own identity, not just a count.
+        // and the execution's own identity, not just a count.
         #expect(spy.contains("QUEUE FULL"))
         #expect(spy.level(containing: "QUEUE FULL") == .error)
-        #expect(spy.contains("DROPPED the mission memory for mission-3"))
-        #expect(spy.contains("DROPPED the mission memory for mission-5"))
+        #expect(spy.contains("DROPPED the execution memory for execution-3"))
+        #expect(spy.contains("DROPPED the execution memory for execution-5"))
         // The ones that made it in are not dropped.
-        #expect(!spy.contains("DROPPED the mission memory for mission-0"))
+        #expect(!spy.contains("DROPPED the execution memory for execution-0"))
 
         // Let the stall go so the suite doesn't leave detached tasks spinning,
         // and prove the bound RECOVERS: drained, the queue accepts again.
@@ -740,7 +740,7 @@ struct WorkshopMissionMemoryTests {
         await queue.drain()
         #expect(await queue.pendingCount() == 0)
         await queue.enqueue(
-            fixtureRecord(id: "mission-after", status: "completed",
+            fixtureRecord(id: "execution-after", status: "completed",
                           stepsCompleted: [stepOutcome("step-0", "succeeded")]),
             reason: nil
         )
@@ -751,20 +751,20 @@ struct WorkshopMissionMemoryTests {
     // MARK: BLOCKING 1 — shutdown drains, bounded; crash is reconciled
 
     /// Production quit stops loops/MCP/context/cognition under a 3s budget and
-    /// used NEVER to drain this queue, so a mission that reached terminal
+    /// used NEVER to drain this queue, so an execution that reached terminal
     /// moments before quit left `mission.json` on disk with no memory behind
-    /// it — silently. `waitForMissionMemoryWrites(timeout:)` is the drain, and
+    /// it — silently. `waitForExecutionMemoryWrites(timeout:)` is the drain, and
     /// it is BOUNDED: a wedged writer must not hold up quit, and an abandoned
     /// drain must SAY so rather than look like success.
     @Test func shutdownDrainIsBoundedAndReportsWhatItAbandoned() async throws {
         let root = try makeTempRoot("shutdown-drain")
         defer { try? FileManager.default.removeItem(at: root) }
-        let writer = StallingMissionMemoryWriter()
+        let writer = StallingExecutionMemoryWriter()
         let spy = LogSpy()
-        let recorder = WorkshopMissionMemoryRecorder(writer: writer, log: spy.sink)
+        let recorder = WorkshopExecutionMemoryRecorder(writer: writer, log: spy.sink)
 
         let id = "shutdown-stalled"
-        try await seedMissionMemoryExecution(
+        try await seedExecutionMemoryExecution(
             root: root, id: id, title: "Exact output",
             objective: "Return exactly: Workshop live proof passed."
         )
@@ -776,25 +776,25 @@ struct WorkshopMissionMemoryTests {
                 )
             },
             isEnabled: { true },
-            missionMemory: recorder
+            executionMemory: recorder
         )
         await executor.drainOnce()
 
         // The write is stalled. The shutdown drain must give up ON TIME…
         let started = Date()
-        let drained = await executor.waitForMissionMemoryWrites(timeout: 0.5)
+        let drained = await executor.waitForExecutionMemoryWrites(timeout: 0.5)
         let elapsed = Date().timeIntervalSince(started)
         #expect(drained == false, "a stalled write must be reported as abandoned, never as drained")
-        #expect(elapsed < StallingMissionMemoryWriter.hangCapSeconds / 4,
+        #expect(elapsed < StallingExecutionMemoryWriter.hangCapSeconds / 4,
                 "shutdown drain took \(elapsed)s — it is not bounded")
         #expect(await writer.completed == 0)
 
         // …and when the store IS responsive, the same call actually drains,
         // which is the case that makes the wiring worth having.
         await writer.release()
-        #expect(await executor.waitForMissionMemoryWrites(timeout: 30) == true)
+        #expect(await executor.waitForExecutionMemoryWrites(timeout: 30) == true)
         #expect(await writer.completed == 1)
-        #expect(spy.contains("remembered mission \(id)"))
+        #expect(spy.contains("remembered execution \(id)"))
     }
 
     /// The crash half: nothing drains, because the process died. At next launch
@@ -804,10 +804,10 @@ struct WorkshopMissionMemoryTests {
         let root = try makeTempRoot("reconcile-crash")
         defer { try? FileManager.default.removeItem(at: root) }
 
-        // "Previous process": runs the mission to terminal with NO recorder
+        // "Previous process": runs the execution to terminal with NO recorder
         // wired — exactly the on-disk state a crash mid-write leaves behind.
         let id = "crash-lost-memory"
-        try await seedMissionMemoryExecution(
+        try await seedExecutionMemoryExecution(
             root: root, id: id, title: "Exact output",
             objective: "Return exactly: Workshop live proof passed."
         )
@@ -823,26 +823,26 @@ struct WorkshopMissionMemoryTests {
         await crashed.drainOnce()
 
         // "Next launch": same root, a working recorder.
-        let writer = FakeMissionMemoryWriter()
+        let writer = FakeExecutionMemoryWriter()
         let spy = LogSpy()
         let relaunched = WorkshopExecutorLoop(
             root: root,
             isEnabled: { true },
-            missionMemory: WorkshopMissionMemoryRecorder(writer: writer, log: spy.sink)
+            executionMemory: WorkshopExecutionMemoryRecorder(writer: writer, log: spy.sink)
         )
-        let reconciled = await relaunched.reconcileMissedMissionMemories()
-        await relaunched.waitForMissionMemoryWrites()
+        let reconciled = await relaunched.reconcileMissedExecutionMemories()
+        await relaunched.waitForExecutionMemoryWrites()
 
         #expect(reconciled == 1)
         let written = await writer.written
         #expect(written.count == 1)
-        #expect(written.first?.source == "\(WorkshopMissionMemory.sourcePrefix)\(id)")
-        #expect(written.first?.content.contains("Workshop mission \"Exact output\" completed.") == true)
+        #expect(written.first?.source == "\(WorkshopExecutionMemory.sourcePrefix)\(id)")
+        #expect(written.first?.content.contains("Workshop execution \"Exact output\" completed.") == true)
 
         // IDEMPOTENT: a second launch must not mint a second memory for the
-        // same mission — the fake now reports `source` the way SQLite does.
-        let again = await relaunched.reconcileMissedMissionMemories()
-        await relaunched.waitForMissionMemoryWrites()
+        // same execution — the fake now reports `source` the way SQLite does.
+        let again = await relaunched.reconcileMissedExecutionMemories()
+        await relaunched.waitForExecutionMemoryWrites()
         #expect(again == 0)
         #expect(await writer.written.count == 1)
     }
@@ -853,8 +853,8 @@ struct WorkshopMissionMemoryTests {
     @Test func reconciliationOnlyLooksAtARecentBoundedWindow() async throws {
         let root = try makeTempRoot("reconcile-window")
         defer { try? FileManager.default.removeItem(at: root) }
-        let id = "ancient-mission"
-        try await seedMissionMemoryExecution(
+        let id = "ancient-execution"
+        try await seedExecutionMemoryExecution(
             root: root, id: id, title: "Exact output",
             objective: "Return exactly: Workshop live proof passed."
         )
@@ -875,32 +875,32 @@ struct WorkshopMissionMemoryTests {
             [.modificationDate: Date().addingTimeInterval(-30 * 24 * 3600)], ofItemAtPath: dir.path
         )
 
-        let writer = FakeMissionMemoryWriter()
+        let writer = FakeExecutionMemoryWriter()
         let relaunched = WorkshopExecutorLoop(
             root: root,
             isEnabled: { true },
-            missionMemory: WorkshopMissionMemoryRecorder(writer: writer, log: { _, _ in })
+            executionMemory: WorkshopExecutionMemoryRecorder(writer: writer, log: { _, _ in })
         )
-        #expect(await relaunched.reconcileMissedMissionMemories() == 0, "outside the window")
+        #expect(await relaunched.reconcileMissedExecutionMemories() == 0, "outside the window")
         // …and the same record IS picked up when the window covers it, so the
         // zero above is the window's doing and not a broken scan.
-        #expect(await relaunched.reconcileMissedMissionMemories(within: 60 * 24 * 3600) == 1)
+        #expect(await relaunched.reconcileMissedExecutionMemories(within: 60 * 24 * 3600) == 1)
         // maxRecords is the other bound.
-        #expect(await relaunched.reconcileMissedMissionMemories(
+        #expect(await relaunched.reconcileMissedExecutionMemories(
             within: 60 * 24 * 3600, maxRecords: 0
         ) == 0)
-        await relaunched.waitForMissionMemoryWrites()
+        await relaunched.waitForExecutionMemoryWrites()
     }
 
     @Test func executorOnATempRootWiresNoWriterByDefault() async throws {
         // The hermetic guarantee: an executor that is NOT on the default data
         // root must never reach `SwiftNativeMemoryV2.shared`. Proven by the
-        // absence of any mission dir side effect — the run completes normally
+        // absence of any execution dir side effect — the run completes normally
         // with no injected recorder and no crash from an unwired store.
         let root = try makeTempRoot("no-default-writer")
         defer { try? FileManager.default.removeItem(at: root) }
         let id = "no-writer"
-        try await seedMissionMemoryExecution(
+        try await seedExecutionMemoryExecution(
             root: root, id: id, title: "Exact output",
             objective: "Return exactly: Workshop live proof passed."
         )
@@ -931,7 +931,7 @@ struct WorkshopMissionMemoryTests {
 // MARK: - Local seeding helper
 
 @discardableResult
-private func seedMissionMemoryExecution(
+private func seedExecutionMemoryExecution(
     root: URL,
     id: String,
     title: String,

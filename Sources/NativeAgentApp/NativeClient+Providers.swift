@@ -779,13 +779,56 @@ extension NativeClient {
         // W1.2: prefer DoctorAutoRunLoop's cached <dataRoot>/doctor/latest.json
         // when its runAt is <60s old, so the health card doesn't re-run every
         // probe per call. Stale or missing → fall through to a live runDoctor.
+        //
+        // A1/FIX-1a (2026-08-05): that 60s contract was DEAD on arrival. Its
+        // only producer, DoctorAutoRunLoop, ticks on a SEVEN-DAY cadence, so
+        // latest.json was permanently older than 60s (live file last written
+        // Jun 19) and every 15s health-pill poll fell through to a full 9-check
+        // doctor sweep — ~4 full sweeps per minute for as long as chat was
+        // focused. getHealthCard now WRITES the snapshot it just computed, in
+        // DoctorAutoRunLoop's exact wire shape (core checks only,
+        // `{"checks":[...],"runAt":...}`), so the reader finally has a live
+        // producer. Verdicts are unchanged: the live-owner coverage checks are
+        // still recomputed on EVERY call and override their cached ids, and
+        // only the offline core checks are ever served from the 60s window.
         let now = ISO8601DateFormatter().string(from: Date())
-        if let cached = readCachedHealthCard(now: now) {
-            return await mergingLiveDoctorCoverage(into: cached, now: now)
+        let liveChecks = await liveDoctorCoverageChecks()
+        return await Self.makeHealthCard(
+            now: now,
+            cachePath: Self.doctorCachePath(),
+            liveChecks: liveChecks,
+            runCoreChecks: { try await makeDoctorChecks().runAll(repair: false, checkLLM: true) }
+        )
+    }
+
+    /// The Core doctor result type. Aliased because the app target has its own
+    /// `DoctorCheck` model struct, so an app-target test cannot `import
+    /// DoctorChecks` without making the name ambiguous.
+    typealias CoreCheckResult = CheckResult
+
+    static func doctorCachePath() -> URL {
+        PersistenceCore.defaultDataRoot().appendingPathComponent("doctor/latest.json")
+    }
+
+    /// Testable core of `getHealthCard`. `runCoreChecks` is the offline
+    /// DoctorChecks sweep (the expensive part); `liveChecks` are the app's
+    /// live-owner coverage rows, already computed by the caller because BOTH
+    /// paths need them fresh.
+    static func makeHealthCard(
+        now: String,
+        cachePath: URL,
+        liveChecks: [DoctorCheck],
+        runCoreChecks: () async throws -> [CheckResult]
+    ) async -> HealthCard {
+        if let cached = readCachedHealthCard(at: cachePath, now: now) {
+            return mergeHealthCard(cached: cached, liveChecks: liveChecks, now: now)
         }
         do {
-            let report = try await runDoctor(repair: false)
-            let subs: [HealthCardSubsystem] = report.checks.map { c in
+            let core = try await runCoreChecks()
+            await persistDoctorSnapshot(core, to: cachePath, runAt: now)
+            let subs: [HealthCardSubsystem] = (core.map {
+                DoctorCheck(id: $0.id, title: $0.title, status: $0.status, detail: $0.detail, repair: $0.repair)
+            } + liveChecks).map { c in
                 HealthCardSubsystem(
                     id: c.id,
                     label: c.title,
@@ -794,7 +837,7 @@ extension NativeClient {
                     fixAction: c.repair
                 )
             }
-            return HealthCard(overall: report.status, subsystems: subs, createdAt: now)
+            return HealthCard(overall: doctorRollup(subs.map(\.status)), subsystems: subs, createdAt: now)
         } catch {
             let err = HealthCardSubsystem(
                 id: "doctor",
@@ -807,14 +850,36 @@ extension NativeClient {
         }
     }
 
+    /// Mirrors `DoctorAutoRunLoop.encodePayload` byte-for-byte: the same
+    /// JSONEncoder(.sortedKeys) → JSONValue round-trip, the same
+    /// `{"checks": [...], "runAt": "..."}` object, the same atomic writeJSON.
+    /// Only the offline core checks are persisted — live coverage rows are
+    /// per-call truth and would otherwise leak into SelfHealingHook's and the
+    /// heartbeat's reading of this file.
+    ///
+    /// Best-effort: a write failure costs the next call a live doctor run,
+    /// i.e. exactly the pre-fix behavior. It can never produce a wrong verdict.
+    static func persistDoctorSnapshot(_ results: [CheckResult], to path: URL, runAt: String) async {
+        do {
+            let enc = JSONEncoder()
+            enc.outputFormatting = [.sortedKeys]
+            let checksValue = try JSONValue.parse(try enc.encode(results))
+            let payload = JSONValue.object(["checks": checksValue, "runAt": .string(runAt)])
+            try FileManager.default.createDirectory(
+                at: path.deletingLastPathComponent(), withIntermediateDirectories: true
+            )
+            try await SwiftNativePersistenceCore().writeJSON(payload, to: path)
+        } catch {
+            NSLog("health_card: doctor snapshot cache write failed: \(error.localizedDescription)")
+        }
+    }
+
     private struct CachedDoctorPayload: Decodable {
         let checks: [DoctorCheck]
         let runAt: String?
     }
 
-    private func readCachedHealthCard(now: String) -> HealthCard? {
-        let path = PersistenceCore.defaultDataRoot()
-            .appendingPathComponent("doctor/latest.json")
+    static func readCachedHealthCard(at path: URL, now: String) -> HealthCard? {
         guard let data = try? Data(contentsOf: path),
               let payload = try? JSONDecoder().decode(CachedDoctorPayload.self, from: data),
               let runAtString = payload.runAt,
@@ -832,11 +897,6 @@ extension NativeClient {
         }
         let rollup = Self.doctorRollup(subs.map(\.status))
         return HealthCard(overall: rollup, subsystems: subs, createdAt: now)
-    }
-
-    private func mergingLiveDoctorCoverage(into cached: HealthCard, now: String) async -> HealthCard {
-        let liveChecks = await liveDoctorCoverageChecks()
-        return Self.mergeHealthCard(cached: cached, liveChecks: liveChecks, now: now)
     }
 
     static func mergeHealthCard(cached: HealthCard, liveChecks: [DoctorCheck], now: String) -> HealthCard {

@@ -10,7 +10,7 @@ import Testing
 // C-2 (unbounded wait under a file lock): `executeOrAwaitCanonicalProcedure`
 // runs INSIDE `ProcedureArtifactStore.invoke`'s
 // `withFileLock(invocations.jsonl)` — an untimed cross-process LOCK_EX. Its
-// `for await` observation had no deadline, so a mission that never reached a
+// `for await` observation had no deadline, so an execution that never reached a
 // terminal status wedged not just this caller but EVERY procedure invocation in
 // EVERY process queued behind that flock.
 //
@@ -107,7 +107,7 @@ struct WorkshopLifecycleBoundsTests {
         #expect(observed == nil)
 
         // A "running" record appearing AFTER the barrier armed is a live
-        // mission, not a startup orphan: the second instance must not reclaim
+        // execution, not a startup orphan: the second instance must not reclaim
         // it, proving both instances shared the one-shot.
         let second = WorkshopExecutorLoop(root: root, llmStep: { _ in ("m", "done") })
         await second.drainOnce()

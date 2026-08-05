@@ -233,7 +233,9 @@ struct NativeAgentMobileApp: App {
     @UIApplicationDelegateAdaptor(NativeAgentMobilePushDelegate.self) private var pushDelegate
     @StateObject private var pairingStore = PairingStore()
     @StateObject private var bridgeClient = MacBridgeClient()
-    @StateObject private var voiceInput = VoiceInputController()
+    // PERF-2026-08-05: `@Observable` controller — `@State`/`.environment` is the
+    // Observation idiom (`@StateObject`/`.environmentObject` require ObservableObject).
+    @State private var voiceInput = VoiceInputController()
     @StateObject private var voiceOutput = VoiceOutputController()
     private let notificationDelegate = NativeAgentNotificationDelegate()
     @State private var bridgeNotificationObserverID: UUID?
@@ -271,7 +273,7 @@ struct NativeAgentMobileApp: App {
                     ContentView()
                         .environmentObject(pairingStore)
                         .environmentObject(bridgeClient)
-                        .environmentObject(voiceInput)
+                        .environment(voiceInput)
                         .environmentObject(voiceOutput)
                         .onAppear {
                             configureNotifications()

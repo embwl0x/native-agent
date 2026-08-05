@@ -284,7 +284,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
             let body = Data(#"{"ok":true,"result":[]}"#.utf8)
             return (makeResponse(req.url!, 200), body)
         }
-        let bot = SwiftNativeTelegramBot()
+        let bot = SwiftNativeTelegramBot(dataRoot: hermeticTelegramDataRoot())
         _ = try await bot.longPoll(token: tokenStr, offset: 42, timeoutSeconds: 25, session: session)
         let url = captured?.url?.absoluteString ?? ""
         #expect(captured?.httpMethod == "GET")
@@ -300,7 +300,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let session = mockSession { req in
             (makeResponse(req.url!, 200), Data(raw.utf8))
         }
-        let bot = SwiftNativeTelegramBot()
+        let bot = SwiftNativeTelegramBot(dataRoot: hermeticTelegramDataRoot())
         let result = try await bot.longPoll(token: tokenStr, offset: 0, session: session)
         #expect(result.updates.count == 1)
         let u = result.updates[0]
@@ -319,7 +319,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let session = mockSession { req in
             (makeResponse(req.url!, 200), Data(raw.utf8))
         }
-        let bot = SwiftNativeTelegramBot()
+        let bot = SwiftNativeTelegramBot(dataRoot: hermeticTelegramDataRoot())
         let result = try await bot.longPoll(token: tokenStr, offset: 0, session: session)
         let replyTo = try #require(result.updates.first?.message?.replyTo)
         #expect(replyTo.messageId == 1)
@@ -350,7 +350,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let session = mockSession { req in
             (makeResponse(req.url!, 200), Data(raw.utf8))
         }
-        let bot = SwiftNativeTelegramBot()
+        let bot = SwiftNativeTelegramBot(dataRoot: hermeticTelegramDataRoot())
         let result = try await bot.longPoll(token: tokenStr, offset: 0, session: session)
         #expect(result.nextOffset == 10)
     }
@@ -359,7 +359,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let session = mockSession { req in
             (makeResponse(req.url!, 200), Data(#"{"ok":true,"result":[]}"#.utf8))
         }
-        let bot = SwiftNativeTelegramBot()
+        let bot = SwiftNativeTelegramBot(dataRoot: hermeticTelegramDataRoot())
         let result = try await bot.longPoll(token: tokenStr, offset: 100, session: session)
         #expect(result.nextOffset == 100)
         #expect(result.updates.isEmpty)
@@ -369,7 +369,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let session = mockSession { req in
             (makeResponse(req.url!, 200), Data(#"{"ok":false,"description":"bad token"}"#.utf8))
         }
-        let bot = SwiftNativeTelegramBot()
+        let bot = SwiftNativeTelegramBot(dataRoot: hermeticTelegramDataRoot())
         do {
             _ = try await bot.longPoll(token: tokenStr, offset: 0, session: session)
             Issue.record("expected throw")
@@ -384,7 +384,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let session = mockSession { req in
             (makeResponse(req.url!, 401), Data())
         }
-        let bot = SwiftNativeTelegramBot()
+        let bot = SwiftNativeTelegramBot(dataRoot: hermeticTelegramDataRoot())
         do {
             _ = try await bot.longPoll(token: tokenStr, offset: 0, session: session)
             Issue.record("expected throw")
@@ -399,7 +399,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let session = mockSession { req in
             (makeResponse(req.url!, 500), Data())
         }
-        let bot = SwiftNativeTelegramBot()
+        let bot = SwiftNativeTelegramBot(dataRoot: hermeticTelegramDataRoot())
         do {
             _ = try await bot.longPoll(token: tokenStr, offset: 0, session: session)
             Issue.record("expected throw")
@@ -414,7 +414,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let session = mockSession { _ in
             throw URLError(.notConnectedToInternet)
         }
-        let bot = SwiftNativeTelegramBot()
+        let bot = SwiftNativeTelegramBot(dataRoot: hermeticTelegramDataRoot())
         do {
             _ = try await bot.longPoll(token: tokenStr, offset: 0, session: session)
             Issue.record("expected throw")
@@ -438,7 +438,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
     }
 
     @Test func dispatchSwiftSlashCommand_unknown_returns_nil() async throws {
-        let bot = SwiftNativeTelegramBot()
+        let bot = SwiftNativeTelegramBot(dataRoot: hermeticTelegramDataRoot())
         let reply = try await bot.dispatchSwiftSlashCommand("/xyzzy_unknown", args: [], chatId: 1)
         #expect(reply == nil)
     }
@@ -467,7 +467,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
-            bot: SwiftNativeTelegramBot(),
+            bot: SwiftNativeTelegramBot(dataRoot: hermeticTelegramDataRoot()),
             session: session,
             offsetURL: tmp,
             sendMessage: { _, _, _ in /* no-op */ }
@@ -548,7 +548,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
-            bot: SwiftNativeTelegramBot(),
+            bot: SwiftNativeTelegramBot(dataRoot: hermeticTelegramDataRoot()),
             session: session,
             offsetURL: tmp,
             sendMessage: { _, chatId, text in await sent.append(chatId, text) },
@@ -590,7 +590,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
-            bot: SwiftNativeTelegramBot(),
+            bot: SwiftNativeTelegramBot(dataRoot: hermeticTelegramDataRoot()),
             session: session,
             offsetURL: tmp,
             sendMessage: { _, chatId, text in await capture.send(chatId, text) },
@@ -641,7 +641,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
-            bot: SwiftNativeTelegramBot(),
+            bot: SwiftNativeTelegramBot(dataRoot: hermeticTelegramDataRoot()),
             session: session,
             offsetURL: tmp,
             sendMessage: { _, chatId, text in await capture.send(chatId, text) },
@@ -695,6 +695,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let capture = Capture()
         let routing = TelegramModelRoutingCapture()
         let bot = SwiftNativeTelegramBot(
+            dataRoot: hermeticTelegramDataRoot(),
             completenessDeps: TelegramBotCompletenessDeps(routing: routing)
         )
 
@@ -758,6 +759,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let capture = Capture()
         let routing = TelegramModelRoutingCapture()
         let bot = SwiftNativeTelegramBot(
+            dataRoot: hermeticTelegramDataRoot(),
             completenessDeps: TelegramBotCompletenessDeps(routing: routing)
         )
 
@@ -814,6 +816,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let capture = Capture()
         let routing = TelegramModelRoutingCapture()
         let bot = SwiftNativeTelegramBot(
+            dataRoot: hermeticTelegramDataRoot(),
             completenessDeps: TelegramBotCompletenessDeps(routing: routing)
         )
 
@@ -2013,7 +2016,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
-            bot: SwiftNativeTelegramBot(),
+            bot: SwiftNativeTelegramBot(dataRoot: hermeticTelegramDataRoot()),
             session: session,
             offsetURL: tmp,
             sendMessage: { _, _, _ in }
@@ -2037,7 +2040,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
             captured = req
             return (makeResponse(req.url!, 200), Data(#"{"ok":true,"result":[]}"#.utf8))
         }
-        let bot = SwiftNativeTelegramBot()
+        let bot = SwiftNativeTelegramBot(dataRoot: hermeticTelegramDataRoot())
         let weirdToken = "abc/def:ghi?xyz"
         _ = try await bot.longPoll(token: weirdToken, offset: 0, timeoutSeconds: 25, session: session)
         let url = captured?.url?.absoluteString ?? ""
@@ -2167,7 +2170,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
             captured = req
             return (makeResponse(req.url!, 200), Data(#"{"ok":true,"result":[]}"#.utf8))
         }
-        let bot = SwiftNativeTelegramBot()
+        let bot = SwiftNativeTelegramBot(dataRoot: hermeticTelegramDataRoot())
         _ = try await bot.longPoll(token: tokenStr, offset: 0, timeoutSeconds: 25, session: session)
         #expect(captured?.timeoutInterval == 35)
     }

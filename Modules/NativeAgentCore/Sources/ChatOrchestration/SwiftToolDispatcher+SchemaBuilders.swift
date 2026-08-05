@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -65,7 +66,7 @@ actor MCPToolCatalogWarmer {
     }
 
     static let liveSweep: Sweep = { root in
-        _ = await SwiftNativeMCPDispatcher(root: root).refreshAllToolsCaches()
+        _ = await MCPWarmSweepLedger.shared.sweep(root: root)
     }
 
     /// Synchronous, allocation-cheap entry point for the tool-catalog build.
@@ -119,6 +120,176 @@ actor MCPToolCatalogWarmer {
     /// Test seam.
     func _testState() -> (inFlight: Bool, finished: Int, lastStartedAt: Date?) {
         (inFlight, finishedSweeps, lastStartedAt)
+    }
+}
+
+// MARK: - Warm-sweep per-server change gate (perf wave 2, F6)
+
+/// Decides which stdio servers a warm sweep actually has to handshake.
+///
+/// `refreshAllToolsCaches` forces a live `tools/list` round-trip for EVERY
+/// configured server on every sweep — and because the subprocess pool reaps
+/// idle servers, a 300s-cadence sweep re-spawns each of them, waits out the
+/// handshake, and rewrites `mcp/cache/tools.json` with descriptors that are
+/// byte-for-byte the ones already there. This ledger skips the servers that
+/// provably cannot have changed and sweeps the rest exactly as before.
+///
+/// A server is skipped only when ALL of these hold:
+///   • its manifest sources — `mcp/servers.json` and `research/config.json`,
+///     which is where the auto-merged `searxng-local` default comes from — are
+///     byte-identical (device, inode, size, mtime_ns) to the last SUCCESSFUL
+///     handshake's, and
+///   • its own command line (transport, endpoint, command, status) is
+///     unchanged, and
+///   • that handshake is younger than `maxHandshakeAge`.
+///
+/// The age ceiling is the deliberate part: a server whose PACKAGE is upgraded
+/// in place (`npx some-mcp-server@latest`) changes no file this process can
+/// see, so without it a newly-added tool would stay invisible forever. With it,
+/// the model still picks that tool up — within an hour instead of five minutes.
+/// A failed handshake never marks, so a broken server retries on every sweep.
+actor MCPWarmSweepLedger {
+    static let shared = MCPWarmSweepLedger()
+
+    /// Longest an unchanged server goes without a fresh handshake.
+    ///
+    /// 3600s. gpt-5.5 wave-2 review: production sweeps cannot START more
+    /// often than the warmer's 300s rearm, so a 300s ceiling here skips
+    /// nothing — the ledger's savings require the ceiling to exceed the
+    /// sweep cadence. The ONLY pickup this ceiling delays is a
+    /// stat-INVISIBLE in-place package upgrade (`npx …@latest` with no
+    /// manifest/config/command change): any visible change busts the stat
+    /// check and re-handshakes on the next sweep at today's ≤5min latency
+    /// regardless of this value. Named bound for User: invisible upgrades
+    /// reach the model in ≤60min instead of ≤5min; drop this back toward
+    /// 300 to undo (and forfeit the skip savings).
+    static let maxHandshakeAge: TimeInterval = 60 * 60
+
+    struct Signature: Sendable, Equatable {
+        let manifest: String
+        let commandLine: String
+    }
+
+    private struct Mark: Sendable {
+        let signature: Signature
+        let at: Date
+    }
+
+    private let maxHandshakeAge: TimeInterval
+    private let clock: @Sendable () -> Date
+    /// key: "<resolved root path>|<serverId>"
+    private var marks: [String: Mark] = [:]
+    /// Test seam: servers actually handshaken across this ledger's lifetime.
+    private(set) var handshakes = 0
+    /// Test seam: servers skipped because nothing about them had changed.
+    private(set) var skips = 0
+
+    init(
+        maxHandshakeAge: TimeInterval = MCPWarmSweepLedger.maxHandshakeAge,
+        clock: @escaping @Sendable () -> Date = { Date() }
+    ) {
+        self.maxHandshakeAge = maxHandshakeAge
+        self.clock = clock
+    }
+
+    /// Same contract as `refreshAllToolsCaches`: never throws, returns
+    /// serverId → tool count or error text, and logs every failure and every
+    /// zero-tool result loudly. Skipped servers are reported as "skipped" and
+    /// leave `mcp/cache/tools.json` untouched — which is the point: their
+    /// catalog bytes are already the bytes a handshake would rewrite.
+    @discardableResult
+    func sweep(root: URL) async -> [String: String] {
+        let dispatcher = SwiftNativeMCPDispatcher(root: root)
+        let servers = (try? await dispatcher.listServers()) ?? []
+        let manifest = await Self.manifestStamp(dispatcher: dispatcher, root: root)
+        let rootKey = root.resolvingSymlinksInPath().path
+        let now = clock()
+
+        var report: [String: String] = [:]
+        var liveKeys: Set<String> = []
+        for server in servers where server.status != "needs_setup" && server.status != "error" {
+            let key = "\(rootKey)|\(server.id)"
+            liveKeys.insert(key)
+            let signature = Signature(manifest: manifest, commandLine: Self.commandLine(server))
+            if let mark = marks[key],
+               mark.signature == signature,
+               now.timeIntervalSince(mark.at) >= 0,
+               now.timeIntervalSince(mark.at) < maxHandshakeAge {
+                skips += 1
+                report[server.id] = "skipped"
+                continue
+            }
+            do {
+                let count = try await dispatcher.refreshToolsCache(forServer: server.id)
+                handshakes += 1
+                // MARK ON SUCCESS ONLY. A server that threw, or that has not
+                // completed a handshake at all, must stay on the sweep list.
+                marks[key] = Mark(signature: signature, at: now)
+                report[server.id] = "\(count)"
+                if count == 0 {
+                    FileHandle.standardError.write(Data(
+                        "MCPDispatcher: server '\(server.id)' completed tools/list but advertised ZERO tools — it will contribute no mcp__\(server.id)__* descriptors to the model.\n".utf8
+                    ))
+                }
+            } catch {
+                handshakes += 1
+                report[server.id] = "error: \(error)"
+                FileHandle.standardError.write(Data(
+                    "MCPDispatcher: tools-cache refresh FAILED for server '\(server.id)': \(error) — its tools stay invisible to the model.\n".utf8
+                ))
+            }
+        }
+        // Every insert has a matching remove: a server deleted from the
+        // manifest, or a data root that will never be swept again, must not
+        // hold a mark for the process lifetime.
+        marks = marks.filter { !$0.key.hasPrefix("\(rootKey)|") || liveKeys.contains($0.key) }
+        return report
+    }
+
+    /// The manifest sources' combined stat identity. Both files feed
+    /// `listServers()`: `servers.json` is the manifest proper, and
+    /// `research/config.json` supplies `searxng_base_url` for the auto-merged
+    /// default server, so a change to either can change a server's command
+    /// line without touching the other.
+    private static func manifestStamp(dispatcher: SwiftNativeMCPDispatcher, root: URL) async -> String {
+        let paths = [await dispatcher.serversPath, await dispatcher.configPath]
+        return paths.map(fileStamp).joined(separator: "|")
+    }
+
+    /// stat-strength, with "does not exist" as a distinct value from "could not
+    /// be stat'd" — the latter is unknowable, so it never compares equal to
+    /// itself and the server is always swept.
+    private static func fileStamp(_ url: URL) -> String {
+        var info = stat()
+        if stat(url.path, &info) == 0 {
+            return "\(info.st_dev):\(info.st_ino):\(info.st_size):\(info.st_mtimespec.tv_sec).\(info.st_mtimespec.tv_nsec)"
+        }
+        return errno == ENOENT ? "absent" : "unknown:\(UUID().uuidString)"
+    }
+
+    /// The server's own identity within the manifest. Deliberately built from
+    /// named scalar fields in a fixed order rather than by serializing the
+    /// record: dictionary serialization has no guaranteed key order, and a
+    /// signature that flaps would either never skip or skip on a false match.
+    private static func commandLine(_ server: MCPServer) -> String {
+        [
+            server.transport,
+            server.endpoint,
+            server.command ?? "",
+            server.status,
+        ].joined(separator: "\u{1F}")
+    }
+
+    /// Test seam.
+    func _testStats() -> (handshakes: Int, skips: Int, marks: Int) {
+        (handshakes, skips, marks.count)
+    }
+
+    /// Test seam: fresh-process equivalent.
+    func reset() {
+        marks.removeAll()
+        handshakes = 0
+        skips = 0
     }
 }
 
@@ -1585,13 +1756,13 @@ extension SwiftToolDispatcher {
                     required: ["text"]
                 )
             ),
-            // workshop_submit / workshop_status — Agent's mission chat lane (U5
-            // W-I). She could neither submit nor check a mission from chat
+            // workshop_submit / workshop_status — Agent's execution chat lane (U5
+            // W-I). She could neither submit nor check an execution from chat
             // (zero mission_* hits anywhere in ChatOrchestration; her own
             // honest refusal caught it). These are STANDARD tools — no Process
             // spawn — so they live in the always-on catalog block, NOT the
             // includeFullMacFileTools-gated block. They are NOT every-turn-hot
-            // (a user submits/checks a mission occasionally), so they are
+            // (a user submits/checks an execution occasionally), so they are
             // LAZY-LOADED: catalog-visible + in builtInToolNames, but NOT in
             // alwaysOnCoreNames — the same classification as
             // scheduler_create_job. workshop_submit is a THIN SHIM into the
@@ -1629,7 +1800,7 @@ extension SwiftToolDispatcher {
             // task_ledger_post / task_ledger_list (U6, 2026-06-11): the
             // cross-agent task ledger — shared who-owns-what / done / blocked
             // state for Claude / Agent / Codex. Same wiring canon as the
-            // mission tools: always-on catalog block, LAZY-LOADED (NOT
+            // execution tools: always-on catalog block, LAZY-LOADED (NOT
             // alwaysOnCoreNames). task_ledger_post is a medium WRITE (appends
             // an event under the shared flock; bridge-allowed as of 2026-06-13,
             // actor-pinned to `agent`); task_ledger_list is a read. Claude/Codex

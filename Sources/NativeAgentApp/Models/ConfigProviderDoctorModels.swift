@@ -159,7 +159,58 @@ struct ModelRoutingCurrent: Codable, Hashable {
 
     enum CodingKeys: String, CodingKey {
         case chat, telegram, ios, autonomy, swarms, dream, training
-        case executions = "missions" // compatibility wire ID (routing-config surface key)
+        case executions = "workshop"
+        // P2-3: the routing-config surface key was `missions` through 0.3.7.
+        // The runtime emits `workshop` now, but a cached/older routing payload
+        // (or an iOS build a version behind) can still carry the old key, so
+        // `executions` decodes new-then-old and encodes only the new one.
+        case legacyExecutions = "missions"
+    }
+
+    // Restated because the custom `init(from:)` below suppresses synthesis.
+    init(
+        chat: ModelSurfacePreference,
+        telegram: ModelSurfacePreference,
+        ios: ModelSurfacePreference? = nil,
+        executions: ModelSurfacePreference? = nil,
+        autonomy: ModelSurfacePreference? = nil,
+        swarms: ModelSurfacePreference? = nil,
+        dream: ModelSurfacePreference? = nil,
+        training: ModelSurfacePreference? = nil
+    ) {
+        self.chat = chat
+        self.telegram = telegram
+        self.ios = ios
+        self.executions = executions
+        self.autonomy = autonomy
+        self.swarms = swarms
+        self.dream = dream
+        self.training = training
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        chat = try c.decode(ModelSurfacePreference.self, forKey: .chat)
+        telegram = try c.decode(ModelSurfacePreference.self, forKey: .telegram)
+        ios = try c.decodeIfPresent(ModelSurfacePreference.self, forKey: .ios)
+        executions = try c.decodeIfPresent(ModelSurfacePreference.self, forKey: .executions)
+            ?? c.decodeIfPresent(ModelSurfacePreference.self, forKey: .legacyExecutions)
+        autonomy = try c.decodeIfPresent(ModelSurfacePreference.self, forKey: .autonomy)
+        swarms = try c.decodeIfPresent(ModelSurfacePreference.self, forKey: .swarms)
+        dream = try c.decodeIfPresent(ModelSurfacePreference.self, forKey: .dream)
+        training = try c.decodeIfPresent(ModelSurfacePreference.self, forKey: .training)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(chat, forKey: .chat)
+        try c.encode(telegram, forKey: .telegram)
+        try c.encodeIfPresent(ios, forKey: .ios)
+        try c.encodeIfPresent(executions, forKey: .executions)
+        try c.encodeIfPresent(autonomy, forKey: .autonomy)
+        try c.encodeIfPresent(swarms, forKey: .swarms)
+        try c.encodeIfPresent(dream, forKey: .dream)
+        try c.encodeIfPresent(training, forKey: .training)
     }
 }
 
@@ -452,7 +503,11 @@ extension TrustTrainingPolicy {
     // route_through_promotion added via CodingKeys-free approach below
 }
 
-struct TrainingRunSummary: Codable, Identifiable {
+// Perf wave 2 (render-cost audit F11 follow-up): `Equatable` so `refreshAll`
+// can route these through `setIfChanged`. All stored properties are
+// String/Int/Bool/optionals or already-`Hashable` nested types, so the
+// conformance is synthesized — no behavior of its own.
+struct TrainingRunSummary: Codable, Identifiable, Equatable {
     var id: String { run_id }
     var run_id: String
     var started_at: String?
@@ -465,7 +520,7 @@ struct TrainingRunSummary: Codable, Identifiable {
     var verdict: String?  // "PASS" / "REGRESSION" / "RUNNING"
 }
 
-struct TrainingProposalSummary: Codable, Identifiable {
+struct TrainingProposalSummary: Codable, Identifiable, Equatable {
     var id: String { proposal_id }
     var proposal_id: String
     var staged_at: String?
@@ -496,7 +551,7 @@ struct PromotionPatch: Codable, Hashable {
     var after_sha: String?
 }
 
-struct PromotionCandidateSummary: Codable, Identifiable {
+struct PromotionCandidateSummary: Codable, Identifiable, Equatable {
     var id: String { candidate_id }
     var candidate_id: String
     var submitted_at: String?

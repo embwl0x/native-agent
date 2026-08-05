@@ -13,7 +13,10 @@ import NativeAgentShared
 struct ChatView: View {
     @EnvironmentObject private var bridgeClient: MacBridgeClient
     @EnvironmentObject private var pairingStore: PairingStore
-    @EnvironmentObject private var voiceInput: VoiceInputController
+    // PERF-2026-08-05: `@Observable` — this view body reads only `isListening`,
+    // `isStarting`, `transcript`, `statusText`, `error` and `lastFinalTranscript`,
+    // so the ~45Hz `audioLevel` tap write no longer invalidates the chat screen.
+    @Environment(VoiceInputController.self) private var voiceInput
     @EnvironmentObject private var voiceOutput: VoiceOutputController
     @Environment(\.scenePhase) private var scenePhase
     // chat-smoothness phase 6: respect Reduce Motion on the bubble entrance.

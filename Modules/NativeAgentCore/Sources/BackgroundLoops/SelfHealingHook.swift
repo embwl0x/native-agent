@@ -221,7 +221,12 @@ public struct SelfHealingHook: LoopRunner {
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
-        let checks = obj["checks"] as? [[String: Any]] ?? []
+        // Malformed or shape-shifted snapshot = UNAVAILABLE, never "healthy"
+        // (gpt-5.5 wave-1 NEEDS_FIX: `{}` or an older shape must not read as
+        // 0 failing → healthy:true).
+        guard let checks = obj["checks"] as? [[String: Any]] else {
+            return nil
+        }
         let anyFail = checks.contains { ($0["status"] as? String) == "fail" }
         return DoctorSnapshot(healthy: !anyFail, rawText: text)
     }

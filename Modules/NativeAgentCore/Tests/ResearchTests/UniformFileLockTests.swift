@@ -16,6 +16,12 @@ struct ResearchUniformFileLockTests {
 
         func makeClient() -> SwiftNativeResearchClient {
             SwiftNativeResearchClient(
+                // Hermetic: `dataRoot:` defaults to PersistenceCore
+                // .defaultDataRoot() — the LIVE data root under `swift test`.
+                // Every path this test cares about is overridden below, but the
+                // bare default is still the repo trap class, so pin it to the
+                // suite's own temp root.
+                dataRoot: root,
                 persistence: probe,
                 http: UnreachableHTTPClient(),
                 docker: NoDockerExecutor(),

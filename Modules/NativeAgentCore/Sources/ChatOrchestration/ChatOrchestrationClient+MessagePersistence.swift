@@ -16,6 +16,121 @@ import SwarmRuns
 import MacIntegration
 import CognitiveSubstrate
 
+/// Process-wide, stat-validated line count for chat transcript JSONL files.
+///
+/// The session index needs one number per persisted message: how many rows the
+/// transcript now holds. Deriving it by reading every byte of the file is
+/// correct but costs O(session bytes) per append and gets slower every day the
+/// session lives. Writers in THIS process know the delta exactly (+1 per
+/// appended row), so the count is carried forward instead of rediscovered.
+///
+/// The safety property is that a cached count is only ever served for a file
+/// that is byte-for-byte the one it was measured against: every entry carries
+/// the `(device, inode, size, mtime)` stamp observed at record time, and any
+/// mismatch — an external writer, a compaction rewrite, a truncation, a
+/// deletion, a restore — falls back to a full recount. A stale cache cannot be
+/// served; the worst case is that it is discarded and we pay what we used to.
+///
+/// Correctness of the count itself relies on callers doing their read/append/
+/// record under the transcript's cross-process `flock`, which they do.
+final class ChatTranscriptLineCountCache: @unchecked Sendable {
+    /// Identity + content stamp. Any field changing means "not the same bytes".
+    struct Stamp: Equatable, Sendable {
+        var device: Int32
+        var inode: UInt64
+        var size: Int64
+        var modifiedSeconds: Int
+        var modifiedNanoseconds: Int
+    }
+
+    private struct Entry {
+        var stamp: Stamp
+        var count: Int
+    }
+
+    static let shared = ChatTranscriptLineCountCache()
+
+    private let lock = NSLock()
+    private var entries: [String: Entry] = [:]
+    private var fullRecounts: [String: Int] = [:]
+
+    /// Current line count for `path`, recomputing only when the file on disk is
+    /// not the one this cache last measured.
+    func count(at path: URL, recount: (URL) -> Int) -> Int {
+        let key = path.path
+        let before = Self.stamp(of: path)
+        if let before {
+            lock.lock()
+            let cached = entries[key]
+            lock.unlock()
+            if let cached, cached.stamp == before {
+                return cached.count
+            }
+        }
+        let counted = recount(path)
+        lock.lock()
+        fullRecounts[key, default: 0] += 1
+        // Only cache when the file did not move under the read. If it did, the
+        // pairing of (count, stamp) would be a lie — drop it and let the next
+        // caller recount.
+        if let before, let after = Self.stamp(of: path), before == after {
+            entries[key] = Entry(stamp: after, count: counted)
+        } else {
+            entries[key] = nil
+        }
+        lock.unlock()
+        return counted
+    }
+
+    /// Record a count the caller established authoritatively (it just wrote the
+    /// file under the lock). Returns the same count for call-site chaining.
+    @discardableResult
+    func record(count: Int, at path: URL) -> Int {
+        let key = path.path
+        lock.lock()
+        if let stamp = Self.stamp(of: path) {
+            entries[key] = Entry(stamp: stamp, count: count)
+        } else {
+            entries[key] = nil
+        }
+        lock.unlock()
+        return count
+    }
+
+    func invalidate(at path: URL) {
+        lock.lock()
+        entries[path.path] = nil
+        lock.unlock()
+    }
+
+    /// Test/diagnostic probe: how many full byte scans this cache has paid for
+    /// `path`. A cache that is working keeps this at 1 for a hot session.
+    func fullRecountCount(at path: URL) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return fullRecounts[path.path] ?? 0
+    }
+
+    func resetForTesting() {
+        lock.lock()
+        entries.removeAll()
+        fullRecounts.removeAll()
+        lock.unlock()
+    }
+
+    private static func stamp(of path: URL) -> Stamp? {
+        var info = stat()
+        guard stat(path.path, &info) == 0 else { return nil }
+        return Stamp(
+            device: info.st_dev,
+            inode: info.st_ino,
+            size: Int64(info.st_size),
+            modifiedSeconds: info.st_mtimespec.tv_sec,
+            modifiedNanoseconds: info.st_mtimespec.tv_nsec
+        )
+    }
+}
+
 /// Request-scoped transcript intent. Regenerate/retry callers provide the
 /// assistant row they mean to replace without widening every provider/tool-loop
 /// protocol. Only the final successful assistant append opts into consuming it;
@@ -571,6 +686,15 @@ extension SwiftNativeChatOrchestrationClient {
         // locked rewrite dropping a concurrent append. (Immutable binding: a
         // @Sendable closure cannot capture the mutable `record`.)
         let messageRow: JSONValue = .object(record)
+        // Line-count bookkeeping happens INSIDE this lock, on purpose. Both
+        // branches below know exactly how many rows the transcript holds when
+        // they commit — the append branch adds one line to whatever was there,
+        // the replacement branch rewrites a known row set — so the session
+        // index sync below can validate that count with a stat instead of
+        // re-deriving it by reading every byte of the file. Doing it under the
+        // same lock that guards the write is what makes the recorded count
+        // trustworthy: no other lock-respecting writer, in this process or
+        // another, can slip a row in between the read and the record.
         let replacedTurnTraceID: String? = try await persistence.withFileLock(path) {
             if canonicalAssistantCompletion,
                role == "assistant",
@@ -596,9 +720,20 @@ extension SwiftNativeChatOrchestrationClient {
                 var replaced = rows
                 replaced[index] = messageRow
                 try Self.writeJSONLAtomically(replaced, to: path)
+                // A replacement is row-count neutral by construction: one row
+                // swapped in place of exactly one match. `writeJSONLAtomically`
+                // emits one non-blank line per row, which is precisely what
+                // `countJSONLLines` counts.
+                ChatTranscriptLineCountCache.shared.record(count: replaced.count, at: path)
                 return priorTurnTraceID
             } else {
+                let priorCount = ChatTranscriptLineCountCache.shared.count(
+                    at: path,
+                    recount: Self.countJSONLLines(at:)
+                )
                 try await persistence.appendJSONL(messageRow, to: path)
+                // `appendJSONL` writes exactly one serialized line plus "\n".
+                ChatTranscriptLineCountCache.shared.record(count: priorCount + 1, at: path)
                 return nil
             }
         }
@@ -1105,7 +1240,19 @@ extension SwiftNativeChatOrchestrationClient {
         let preview = Self.previewText(content)
         let title = normalizedRole == "user" ? Self.titleText(content) : nil
         let sourceKey = Self.sessionSourceKey(for: sessionId, source: source)
-        let messageCount = Self.countJSONLLines(at: messagesPath)
+        // Same value, same moment, same definition as the old
+        // `countJSONLLines(at: messagesPath)` that stood here — this count is
+        // NOT advisory bookkeeping. `SessionDigestProvider.swift:243` renders
+        // it into the next session's prompt ("Previous session "X" (N
+        // messages) ended ..."), so it has to stay byte-exact. The cache only
+        // removes the full byte scan when a stat proves the transcript is
+        // still the one the count was measured against; anything else — an
+        // external writer, a compaction rewrite, a truncation — recounts and
+        // returns exactly what the scan would have.
+        let messageCount = ChatTranscriptLineCountCache.shared.count(
+            at: messagesPath,
+            recount: Self.countJSONLLines(at:)
+        )
         let persistence = self.persistence
         let retentionClock = self.clock
         try await persistence.withFileLock(sessionsPath) {
@@ -1157,6 +1304,25 @@ extension SwiftNativeChatOrchestrationClient {
             }
             let out = try ChatSessionIndexFile.serializedData(for: remaining)
             try out.write(to: sessionsPath, options: .atomic)
+            // Retention stays here, inside the lock and on every message, and
+            // the perf audit's proposal to move or debounce it is REJECTED.
+            // Two independent reasons:
+            //
+            // 1. Lock: it does its own read-modify-rewrite of this exact file,
+            //    and its documented contract (ChatSessionRetention.swift:47)
+            //    is that the caller holds the sessions lock. Outside it, it
+            //    races the write two lines above.
+            // 2. Prompt bytes: archiving REMOVES a row from `sessions.json`,
+            //    and `SessionDigestProvider.latestPriorSession` (:293) picks
+            //    the newest remaining row to render into the next session's
+            //    prompt. Delaying an archive delays a row's disappearance from
+            //    that candidate set, so a throttle is not byte-identical — it
+            //    is a (small, self-healing) change in what the model sees.
+            //
+            // The waste the audit measured is real but lives one level down:
+            // `pruneArchive` stats the whole archive tier on every pass, and
+            // that part IS invisible to the prompt. Throttling belongs there,
+            // in PersistenceCore, not at this call site.
             _ = try? ChatSessionRetention.enforce(dataRoot: dataRoot, now: retentionClock())
         }
     }

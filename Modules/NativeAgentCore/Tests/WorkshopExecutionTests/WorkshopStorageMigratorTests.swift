@@ -9,21 +9,21 @@ struct WorkshopStorageMigratorTests {
         let root = try temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let legacy = root.appendingPathComponent("missions", isDirectory: true)
-        try write("old-record", to: legacy.appendingPathComponent("queue/execution-1/mission.json"))
+        try write("old-record", to: legacy.appendingPathComponent("queue/wsx-1/mission.json"))
         try write("old-trigger", to: legacy.appendingPathComponent("triggers.json"))
         try write("old-flat", to: legacy.appendingPathComponent("missions.json"))
-        try write("backup", to: legacy.appendingPathComponent("queue.bak.pre-reap/execution-old/mission.json"))
+        try write("backup", to: legacy.appendingPathComponent("queue.bak.pre-reap/wsx-old/mission.json"))
 
         let stamp = Date(timeIntervalSince1970: 1_700_000_000)
         let report = try WorkshopStorageMigrator.migrateIfNeeded(dataRoot: root, now: stamp)
 
         #expect(report.didMigrate)
         #expect(!FileManager.default.fileExists(atPath: legacy.path))
-        #expect(try read(root.appendingPathComponent("workshop/executions/execution-1/mission.json")) == "old-record")
+        #expect(try read(root.appendingPathComponent("workshop/executions/wsx-1/mission.json")) == "old-record")
         #expect(try read(root.appendingPathComponent("workshop/triggers.json")) == "old-trigger")
         #expect(try read(root.appendingPathComponent("workshop/legacy_executions.json")) == "old-flat")
         let archive = try #require(report.archiveRelativePath)
-        #expect(try read(root.appendingPathComponent(archive).appendingPathComponent("queue.bak.pre-reap/execution-old/mission.json")) == "backup")
+        #expect(try read(root.appendingPathComponent(archive).appendingPathComponent("queue.bak.pre-reap/wsx-old/mission.json")) == "backup")
         let receipt = try #require(report.receiptRelativePath)
         #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent(receipt).path))
     }

@@ -212,17 +212,17 @@ extension SwiftNativeTrustCenter: OriginAwareAutonomyResolver {
         switch surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "chat", "codex-bridge", "claude-bridge":
             return true
-        case "mission", "missions":
-            // Missions run LOCALLY on the Mac and only when the mission
+        case "workshop", "mission", "missions":
+            // Executions run LOCALLY on the Mac and only when the execution
             // executor's own gate is on (enableAutonomy + missionPolicy via
-            // missionExecutorGate), AND builder elevation here is already
-            // behind MacControlGate.fullMacActive (yolo) above. So a mission
+            // workshopExecutorGate), AND builder elevation here is already
+            // behind MacControlGate.fullMacActive (yolo) above. So an execution
             // builder step (shell/git/apply_patch/run_tests/swift_build/
             // swift_test) under full-mac
             // yolo is the SAME trust surface as local chat — elevate it. This
             // is NOT a remote surface (remote chat stays confirm-class for
             // builder shell tools), so it can't let a remote message spawn a
-            // shell (2026-06-15, the user: full-mac yolo, "missions do everything").
+            // shell (2026-06-15, the user: full-mac yolo, "executions do everything").
             return true
         default:
             return false
@@ -231,7 +231,7 @@ extension SwiftNativeTrustCenter: OriginAwareAutonomyResolver {
 
     private nonisolated static func isInteractiveChatSurface(_ surface: String) -> Bool {
         switch surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "", "chat", "codex-bridge", "claude-bridge", "mission", "missions",
+        case "", "chat", "codex-bridge", "claude-bridge", "workshop", "mission", "missions",
              "telegram", "slack", "ios", "icloud", "iphone", "ipad", "mobile", "watch", "remote":
             return true
         default:

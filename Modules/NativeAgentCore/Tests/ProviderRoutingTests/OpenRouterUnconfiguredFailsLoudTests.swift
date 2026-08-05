@@ -114,7 +114,8 @@ struct OpenRouterUnconfiguredFailsLoudTests {
             codex: codex,
             anthropic: InertAdapter("anthropic"),
             openAI: InertAdapter("openai"),
-            openRouter: nil  // the whole point: OpenRouter is NOT configured
+            openRouter: nil,  // the whole point: OpenRouter is NOT configured
+            moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
         )
     }
 
@@ -205,7 +206,8 @@ struct OpenRouterUnconfiguredFailsLoudTests {
             codex: codex,
             anthropic: InertAdapter("anthropic"),
             openAI: InertAdapter("openai"),
-            openRouter: OR()
+            openRouter: OR(),
+            moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
         )
         let reply = try await client.complete(
             prompt: "hi", system: nil, model: nil, surface: "chat", tools: nil

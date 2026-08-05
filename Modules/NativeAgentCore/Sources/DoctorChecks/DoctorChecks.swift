@@ -633,13 +633,103 @@ public struct RuntimeJSONStoresCheck: RepairingDoctorCheck {
 
 // MARK: - ChatMessagesIntegrityCheck
 
+/// Per-file scan memo for `ChatMessagesIntegrityCheck`, keyed on the file's
+/// (modification date, size). A JSONL file whose mtime AND size are both
+/// unchanged since the last scan cannot have become malformed, so re-parsing
+/// every line of it produces the same per-file numbers the previous scan
+/// already produced. The verdict is rebuilt from those numbers exactly as if
+/// the parse had run — this is a work skip, never a verdict skip.
+///
+/// Process-wide (`static`) because the doctor runner builds a fresh check
+/// value per run; entries are keyed on absolute path so alternate data roots
+/// (tests, secondary roots) never collide.
+actor ChatMessagesScanCache {
+    /// stat-strength identity (gpt-5.5 wave-1 NEEDS_FIX): Date+size alone
+    /// misses a same-size metadata-preserving replacement; device+inode+
+    /// nanosecond mtimespec matches ChatTranscriptLineCountCache's stamp.
+    struct Stamp: Sendable, Equatable {
+        let device: Int32
+        let inode: UInt64
+        let size: Int64
+        let modifiedSeconds: Int
+        let modifiedNanoseconds: Int
+    }
+
+    struct Entry: Sendable, Equatable {
+        let stamp: Stamp
+        let totalLines: Int
+        let malformedLines: Int
+        let unreadable: Bool
+    }
+
+    private var entries: [String: Entry] = [:]
+
+    func lookup(path: String, stamp: Stamp?) -> Entry? {
+        guard let stamp, let entry = entries[path], entry.stamp == stamp else { return nil }
+        return entry
+    }
+
+    func store(path: String, entry: Entry) {
+        entries[path] = entry
+    }
+
+    /// Drops memos for files that no longer exist so the map cannot grow
+    /// without bound across a long-lived process (state-lifecycle audit: every
+    /// insert needs a matching remove).
+    /// Scoped to the directory that was just scanned. The memo is
+    /// process-wide, but a scan only has authority over its OWN root — an
+    /// unscoped filter lets a check on an alternate data root evict the live
+    /// root's memos (and vice versa) on every run.
+    func retain(paths: Set<String>, under prefix: String) {
+        entries = entries.filter { !$0.key.hasPrefix(prefix) || paths.contains($0.key) }
+    }
+
+    /// Test seam: forget everything (a fresh-process equivalent).
+    func reset() {
+        entries.removeAll()
+    }
+
+    func count() -> Int { entries.count }
+}
+
 public struct ChatMessagesIntegrityCheck: RepairingDoctorCheck {
     public let id: String = "chat_messages"
     public let title: String = "Chat Message Logs"
     private let root: URL
 
+    /// Process-wide memo. Injectable so a test can own an isolated one.
+    static let sharedScanCache = ChatMessagesScanCache()
+    private let scanCache: ChatMessagesScanCache
+
+    /// Memo key. Symlinks are resolved so the same file reached through
+    /// `/var/...` and `/private/var/...` is one entry, and so directory-scoped
+    /// eviction can compare against a canonical prefix.
+    static func cacheKey(_ url: URL) -> String {
+        url.resolvingSymlinksInPath().path
+    }
+
+    /// stat identity of a file, or nil when unreadable — a nil stamp never
+    /// matches a stored memo, so the file is always re-scanned.
+    static func fingerprint(_ file: URL) -> ChatMessagesScanCache.Stamp? {
+        var info = stat()
+        guard stat(file.path, &info) == 0 else { return nil }
+        return ChatMessagesScanCache.Stamp(
+            device: info.st_dev,
+            inode: info.st_ino,
+            size: Int64(info.st_size),
+            modifiedSeconds: info.st_mtimespec.tv_sec,
+            modifiedNanoseconds: info.st_mtimespec.tv_nsec
+        )
+    }
+
     public init(root: URL = defaultDataRoot()) {
         self.root = root
+        self.scanCache = Self.sharedScanCache
+    }
+
+    init(root: URL, scanCache: ChatMessagesScanCache) {
+        self.root = root
+        self.scanCache = scanCache
     }
 
     public func run(repair: Bool) async -> CheckResult {
@@ -687,22 +777,58 @@ public struct ChatMessagesIntegrityCheck: RepairingDoctorCheck {
         var malformedFiles: [URL] = []
         var repairedFiles: [String] = []
 
+        // A1/FIX-1b: the (mtime,size) memo is consulted only on the read-only
+        // path. Repair mode rewrites files, so it always re-parses and lets the
+        // rewritten fingerprint invalidate the old memo naturally.
+        let useCache = !repair
+        var scannedPaths: Set<String> = []
+
         for file in files {
+            let cacheKey = Self.cacheKey(file)
+            scannedPaths.insert(cacheKey)
+            let fingerprint = Self.fingerprint(file)
+            if useCache,
+               let memo = await scanCache.lookup(path: cacheKey, stamp: fingerprint) {
+                totalLines += memo.totalLines
+                malformedLines += memo.malformedLines
+                if memo.unreadable || memo.malformedLines > 0 { malformedFiles.append(file) }
+                continue
+            }
             guard let text = try? String(contentsOf: file, encoding: .utf8) else {
                 malformedFiles.append(file)
+                if useCache, let fingerprint {
+                    await scanCache.store(
+                        path: cacheKey,
+                        entry: .init(
+                            stamp: fingerprint,
+                            totalLines: 0, malformedLines: 0, unreadable: true
+                        )
+                    )
+                }
                 continue
             }
             var validLines: [String] = []
             var fileMalformed = 0
+            var fileTotal = 0
             for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
                 let line = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
                 if line.isEmpty { continue }
-                totalLines += 1
+                fileTotal += 1
                 if let data = line.data(using: .utf8), (try? JSONValue.parse(data)) != nil {
                     validLines.append(line)
                 } else {
                     fileMalformed += 1
                 }
+            }
+            totalLines += fileTotal
+            if useCache, let fingerprint {
+                await scanCache.store(
+                    path: cacheKey,
+                    entry: .init(
+                        stamp: fingerprint,
+                        totalLines: fileTotal, malformedLines: fileMalformed, unreadable: false
+                    )
+                )
             }
             if fileMalformed > 0 {
                 malformedLines += fileMalformed
@@ -724,6 +850,12 @@ public struct ChatMessagesIntegrityCheck: RepairingDoctorCheck {
                     }
                 }
             }
+        }
+
+        if useCache {
+            await scanCache.retain(
+                paths: scannedPaths, under: Self.cacheKey(dir) + "/"
+            )
         }
 
         if repair, !repairedFiles.isEmpty {
@@ -1146,16 +1278,58 @@ public actor SwiftNativeDoctorChecks: DoctorChecksProtocol {
 
     public func runAll(repair: Bool, checkLLM: Bool) async throws -> [CheckResult] {
         // Note: checkLLM intentionally unused — see class docstring.
-        var results: [CheckResult] = []
-        results.reserveCapacity(checks.count)
-        for check in checks {
-            if let repairable = check as? any RepairingDoctorCheck {
-                results.append(await repairable.run(repair: repair))
+        //
+        // A1/FIX-1c: REPAIR stays strictly sequential. Repairing checks mutate
+        // app-owned state (create directories, back up and rewrite files) and
+        // their ordering is part of the contract, so nothing about that path
+        // changes. The repair:false path is read-only — every check only stats,
+        // reads and parses its own subtree — so the checks are independent and
+        // run concurrently. Results are re-sorted back into declaration order,
+        // so the emitted array (and therefore the rollup, the wire shape, and
+        // every consumer's index assumptions) is byte-identical to the
+        // sequential run.
+        if repair {
+            var results: [CheckResult] = []
+            results.reserveCapacity(checks.count)
+            for check in checks {
+                if let repairable = check as? any RepairingDoctorCheck {
+                    results.append(await repairable.run(repair: true))
+                } else {
+                    results.append(await check.run())
+                }
+            }
+            return results
+        }
+        // gpt-5.5 wave-1 NEEDS_FIX: StorageCheck is NOT read-only even under
+        // repair:false — it creates the root/subdirectory tree and writes a
+        // probe file. Mutating checks run sequentially FIRST (so the tree
+        // exists before readers race it on a fresh root); only genuinely
+        // read-only checks join the concurrent group. Output order stays
+        // declaration order.
+        var sequentialResults: [(Int, CheckResult)] = []
+        var concurrentChecks: [(Int, any DoctorCheck)] = []
+        for (index, check) in checks.enumerated() {
+            if check is StorageCheck {
+                sequentialResults.append((index, await check.run()))
             } else {
-                results.append(await check.run())
+                concurrentChecks.append((index, check))
             }
         }
-        return results
+        let ordered = await withTaskGroup(of: (Int, CheckResult).self) { group in
+            for (index, check) in concurrentChecks {
+                group.addTask {
+                    if let repairable = check as? any RepairingDoctorCheck {
+                        return (index, await repairable.run(repair: false))
+                    }
+                    return (index, await check.run())
+                }
+            }
+            var collected = sequentialResults
+            collected.reserveCapacity(checks.count)
+            for await item in group { collected.append(item) }
+            return collected
+        }
+        return ordered.sorted { $0.0 < $1.0 }.map(\.1)
     }
 
     public func runCheck(id: String, repair: Bool) async throws -> CheckResult? {

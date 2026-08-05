@@ -98,7 +98,7 @@ let extraDeps: [String: [String]] = [
     // writes one prose memory of what it did, on the `missions` disclosure
     // surface the policy already carried but nothing ever filled. No cycle —
     // MemoryV2 depends on PersistenceCore/KnowledgeGraph/ApprovalInbox and
-    // never imports WorkshopExecution. See WorkshopExecution+MissionMemory.swift.
+    // never imports WorkshopExecution. See WorkshopExecution+ExecutionMemory.swift.
     "WorkshopExecution": ["PersistenceCore", "ProviderRouting", "ApprovalInbox", "MemoryV2"],
     "WorkflowOrchestration": [
         "PersistenceCore",

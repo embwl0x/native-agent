@@ -9,7 +9,7 @@ import PersistenceCore
 // The cross-agent task ledger chat lane. task_ledger_post is a medium WRITE
 // (appends an event under the shared flock; bridge-DENIED); task_ledger_list is
 // a read (bridge-ALLOWED). Classified LAZY-LOAD (catalog-visible +
-// builtInToolNames, NOT alwaysOnCoreNames), same shape as the mission tools.
+// builtInToolNames, NOT alwaysOnCoreNames), same shape as the execution tools.
 
 @Suite("TaskLedgerChatToolDispatch")
 struct TaskLedgerChatToolDispatchTests {

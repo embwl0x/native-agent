@@ -648,7 +648,7 @@ private enum ProviderSurfaceCommitTestFailure: Error {
     """
     let sn = try makeSN(body)
     let prefs = try await sn.computeModelPreferences()
-    #expect(prefs["missions"]?.model == PRIMARY_MODEL)
+    #expect(prefs["workshop"]?.model == PRIMARY_MODEL)
     #expect(prefs["autonomy"]?.model == PRIMARY_MODEL)
     #expect(prefs["swarms"]?.model == PRIMARY_MODEL)
     // 2026-06-05 dream-design-restore: the daemon-era seeds for `dream` /
@@ -686,7 +686,7 @@ private enum ProviderSurfaceCommitTestFailure: Error {
 @Test func computeModelPreferences_executions_autonomy_swarms_seed_to_PRIMARY_MODEL() async throws {
     let sn = try makeSN()
     let prefs = try await sn.computeModelPreferences()
-    #expect(prefs["missions"]?.model == PRIMARY_MODEL)
+    #expect(prefs["workshop"]?.model == PRIMARY_MODEL)
     #expect(prefs["autonomy"]?.model == PRIMARY_MODEL)
     #expect(prefs["swarms"]?.model == PRIMARY_MODEL)
 }
@@ -814,6 +814,10 @@ private enum ProviderSurfaceCommitTestFailure: Error {
     // Mixed real-world-ish surfaces file: string overrides plus non-string
     // scalars (int / double / bool / null) to pin the native
     // `str(value or "")` compatibility rules for migrated picker data.
+    //
+    // P2-3: the `missions` key below is deliberately the 0.3.x spelling — this
+    // fixture IS a live-shaped legacy picker file, so the expectation is a
+    // mismatched pair: old key on disk, canonical key out of the picker.
     let surfacesBody = """
     {
       "chat": {"model": "claude-opus-4-7", "reasoningEffort": "high"},
@@ -835,7 +839,7 @@ private enum ProviderSurfaceCommitTestFailure: Error {
         // `slack` is a chat-like remote surface. Unpinned, it inherits
         // chat's model/effort, but the picker can pin it independently.
         "slack": ("claude-opus-4-7", "high"),
-        "missions": ("1.5", "high"),
+        "workshop": ("1.5", "high"),
         "autonomy": ("True", "high"),
         "swarms": (PRIMARY_MODEL, "high"),
         "dream": ("123", "high"),
@@ -979,4 +983,125 @@ private enum ProviderSurfaceCommitTestFailure: Error {
         missing.isEmpty,
         "iOS ProviderSettingsView.canonicalSurfaces is missing canonical MODEL_SURFACES: \(missing). Append them (keep order) and update surfaceLabel()."
     )
+}
+
+// MARK: - P2-3: the `missions` -> `workshop` routing-surface seam
+//
+// Every case below is a MISMATCHED pair on purpose. The picker files on a live
+// 0.3.x install are keyed `missions`; the runtime asks for `workshop`. A test
+// that wrote and read the same spelling would pass no matter which way the
+// bridge was wired.
+
+@Test func legacyMissionsPinInSurfacesFileResolvesUnderTheWorkshopSurface() async throws {
+    // Live-shaped 0.3.7 surfaces.json: ONLY the legacy key exists.
+    let sn = try makeSN("""
+    {"chat":{"model":"gpt-5.6-sol"},
+     "missions":{"model":"claude-opus-4-8","reasoningEffort":"low"}}
+    """)
+    let prefs = try await sn.computeModelPreferences()
+    #expect(prefs["workshop"]?.model == "claude-opus-4-8")
+    #expect(prefs["workshop"]?.reasoningEffort == "low")
+    // And it is a real pin, not a seed that happens to match.
+    #expect(await sn.pinnedModelStringForSurface("workshop") == "claude-opus-4-8")
+    // The routing map only ever speaks the canonical vocabulary now.
+    #expect(prefs["missions"] == nil)
+}
+
+@Test func legacyMissionsSurfaceArgumentStillResolvesAfterTheRename() async throws {
+    // A caller a version behind (iOS, a saved shortcut) still says "missions".
+    // It must resolve, not throw `.invalidRequest` as an unknown surface.
+    let sn = try makeSN("""
+    {"chat":{"model":"gpt-5.6-sol"},"workshop":{"model":"claude-opus-4-8"}}
+    """)
+    let pref = try await sn.modelForSurface("missions")
+    #expect(pref.model == "claude-opus-4-8")
+    #expect(await sn.pinnedModelStringForSurface("missions") == "claude-opus-4-8")
+}
+
+@Test func legacyActiveProviderKeyResolvesUnderTheWorkshopSurface() async throws {
+    let paths = try makeProviderRoutingTestPaths(
+        surfacesBody: #"{"missions":{"model":"claude-opus-4-8"}}"#,
+        activeBody: #"{"chat":"openai","missions":"anthropic"}"#
+    )
+    defer { try? FileManager.default.removeItem(at: paths.root) }
+    let sn = SwiftNativeProviderRouting(
+        dataRoot: paths.root,
+        surfacesPathOverride: paths.surfaces,
+        activeProviderPathOverride: paths.active
+    )
+    let snapshot = try await sn.checkedRoutingSnapshot()
+    #expect(snapshot.activeProviders["workshop"] == "anthropic")
+    #expect(snapshot.activeProviders["missions"] == nil)
+    #expect(snapshot.pinnedModels["workshop"] == "claude-opus-4-8")
+}
+
+@Test func savingTheWorkshopSurfaceRetiresTheLegacyKeyInsteadOfDuplicatingIt() async throws {
+    // The write-side migration: a legacy entry is replaced, not shadowed. Two
+    // entries for one surface is the state where a later read has to guess.
+    let paths = try makeProviderRoutingTestPaths(
+        surfacesBody: #"{"chat":{"model":"gpt-5.6-sol"},"missions":{"model":"old-model"}}"#,
+        activeBody: #"{"missions":"anthropic"}"#
+    )
+    defer { try? FileManager.default.removeItem(at: paths.root) }
+    let sn = SwiftNativeProviderRouting(
+        dataRoot: paths.root,
+        surfacesPathOverride: paths.surfaces,
+        activeProviderPathOverride: paths.active
+    )
+    try await sn.saveSurfaceConfiguration(
+        surface: "workshop",
+        model: "new-model",
+        reasoningEffort: "high",
+        serviceTier: nil,
+        providerId: "openai"
+    )
+
+    let surfacesJSON = try JSONSerialization.jsonObject(
+        with: Data(contentsOf: paths.surfaces)
+    ) as? [String: Any]
+    #expect(surfacesJSON?["missions"] == nil, "legacy surface key must be retired on write")
+    #expect(((surfacesJSON?["workshop"] as? [String: Any])?["model"] as? String) == "new-model")
+    // An untouched surface keeps its bytes — this is not a flag-day rewrite.
+    #expect(((surfacesJSON?["chat"] as? [String: Any])?["model"] as? String) == "gpt-5.6-sol")
+
+    let activeJSON = try JSONSerialization.jsonObject(
+        with: Data(contentsOf: paths.active)
+    ) as? [String: Any]
+    #expect(activeJSON?["missions"] == nil)
+    #expect(activeJSON?["workshop"] as? String == "openai")
+}
+
+@Test func savingViaTheLegacySurfaceNameWritesTheCanonicalKey() async throws {
+    // The old spelling as an ARGUMENT (not a file key): accepted, canonicalized.
+    let paths = try makeProviderRoutingTestPaths()
+    defer { try? FileManager.default.removeItem(at: paths.root) }
+    let sn = SwiftNativeProviderRouting(
+        dataRoot: paths.root,
+        surfacesPathOverride: paths.surfaces,
+        activeProviderPathOverride: paths.active
+    )
+    try await sn.saveSurfacePreference(
+        surface: "missions",
+        model: "claude-opus-4-8",
+        reasoningEffort: "high",
+        serviceTier: nil
+    )
+    let surfacesJSON = try JSONSerialization.jsonObject(
+        with: Data(contentsOf: paths.surfaces)
+    ) as? [String: Any]
+    #expect(surfacesJSON?["missions"] == nil, "writers emit only the canonical spelling")
+    #expect(((surfacesJSON?["workshop"] as? [String: Any])?["model"] as? String) == "claude-opus-4-8")
+}
+
+@Test func surfaceLookupBridgeReadsAMapKeyedInEitherVocabulary() {
+    // The reader bridge itself, both directions. Conformers outside this module
+    // (test doubles, app-side wrappers) can still hand back a legacy-keyed map.
+    let legacyKeyed = ["missions": 1, "chat": 2]
+    let canonicalKeyed = ["workshop": 3, "chat": 4]
+    #expect(ProviderRoutingSurfaceLookup.value(legacyKeyed, "workshop") == 1)
+    #expect(ProviderRoutingSurfaceLookup.value(legacyKeyed, "missions") == 1)
+    #expect(ProviderRoutingSurfaceLookup.value(canonicalKeyed, "missions") == 3)
+    #expect(ProviderRoutingSurfaceLookup.value(canonicalKeyed, "workshop") == 3)
+    // A non-Workshop miss must NOT fall back to the legacy key.
+    #expect(ProviderRoutingSurfaceLookup.value(legacyKeyed, "telegram") == nil)
 }

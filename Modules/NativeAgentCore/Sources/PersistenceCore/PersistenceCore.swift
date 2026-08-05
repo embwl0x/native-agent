@@ -1133,7 +1133,7 @@ public func enforceJSONLByteCap(
 /// to its newest `maxLines` lines, logging what the rotation dropped. Every
 /// live `activity/events.jsonl` writer routes through here so no append path
 /// can grow the feed unbounded again (PersonaEngine doc-save emit, Skills,
-/// Missions, SchedulerDueJobRunner).
+/// Executions, SchedulerDueJobRunner).
 ///
 /// Locking: when `takeLock` is true (default) the append+cap runs under
 /// `withFileLock(path)` — for EVERY conformer, not just the SwiftNative impl —

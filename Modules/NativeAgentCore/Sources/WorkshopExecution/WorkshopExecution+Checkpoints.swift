@@ -1,10 +1,10 @@
-// v1 — Autonomous-mission-depth foundation.
+// v1 — Autonomous-execution-depth foundation.
 //
-// Persistence + escalation primitives for missions that run unattended for
+// Persistence + escalation primitives for executions that run unattended for
 // hours and periodically checkpoint state or escalate to the user when blocked.
 // v1 is the storage layer ONLY: checkpoints + escalations + inbox card.
-// v2 will add the self-correction loop, multi-mission orchestration, and
-// mission resume from a chosen checkpoint.
+// v2 will add the self-correction loop, multi-execution orchestration, and
+// execution resume from a chosen checkpoint.
 //
 // Layout (under PersistenceCore.defaultDataRoot()):
 //
@@ -16,7 +16,7 @@
 //                                                     2026-07-23; was the dead
 //                                                     <root>/inbox/ silo)
 //
-// NOTE on the missions root: the existing SwiftNativeWorkshopRunner writes its
+// NOTE on the executions root: the existing SwiftNativeWorkshopRunner writes its
 // queue under <root>/missions/QUEUE/<id>/ (note the extra "queue" dir). This
 // new subsystem writes one level higher, under <root>/missions/<id>/, so the
 // checkpoints/escalations log does NOT interleave inside the runner's queue
@@ -215,7 +215,7 @@ public actor SwiftNativeWorkshopCheckpointStore {
         }
     }
 
-    /// Read all checkpoints for a mission in chronological (file) order.
+    /// Read all checkpoints for an execution in chronological (file) order.
     /// Missing file -> []. FAIL-CLOSED on a malformed line: this store is the
     /// SOLE writer of checkpoints.jsonl in v1 (no foreign producer to be
     /// tolerant of), so a record we cannot decode means corruption, and

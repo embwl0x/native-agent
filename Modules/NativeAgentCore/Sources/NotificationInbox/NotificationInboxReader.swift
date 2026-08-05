@@ -154,7 +154,7 @@ public struct SwiftNativeNotificationInbox: NotificationInboxReader {
         // partially enrich without the runtime parser). This is the conservative
         // parity choice — most inboxes contain at least one proactive card, so
         // in practice list often falls back today; reads of a pure
-        // trigger/mission inbox are served natively. The enrichment port closes
+        // trigger/execution inbox are served natively. The enrichment port closes
         // this (CUTOVER_PLAN.md §6.55).
         if items.contains(where: { sourceNeedsEnrichment($0.source) }) {
             return nil

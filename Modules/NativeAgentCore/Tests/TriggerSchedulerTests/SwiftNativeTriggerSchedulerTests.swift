@@ -209,13 +209,14 @@ struct DefaultsSuite {
         defer { try? FileManager.default.removeItem(at: root) }
         let client = makeClient(root: root)
         let configs = try await client.listInboxTriggers()
-        // Daemon default order: file_watch, idle_checkin, morning_brief,
-        // mission_followup, stuck_pattern.
+        // Default order: file_watch, idle_checkin, morning_brief,
+        // execution_followup (P2-4; `mission_followup` before 0.3.8),
+        // stuck_pattern.
         #expect(configs.count == 5)
-        #expect(configs.map(\.name) == ["file_watch", "idle_checkin", "morning_brief", "mission_followup", "stuck_pattern"])
-        // mission_followup is the only one enabled by default.
+        #expect(configs.map(\.name) == ["file_watch", "idle_checkin", "morning_brief", "execution_followup", "stuck_pattern"])
+        // execution_followup is the only one enabled by default.
         let enabled = configs.filter(\.enabled).map(\.name)
-        #expect(enabled == ["mission_followup"])
+        #expect(enabled == ["execution_followup"])
     }
 
     @Test func listWorkshopExecutionsReturnsDefaultsWhenFileMissing() async throws {
@@ -292,10 +293,10 @@ struct RoundTripSuite {
         #expect(raw.count == 1)
         guard case .object(let obj) = raw[0] else { Issue.record("entry not an object"); return }
         #expect(obj["enabled"] == .bool(false))
-        // Critical: the missions-shape extras (objective/title/trust_required)
+        // Critical: the executions-shape extras (objective/title/trust_required)
         // must round-trip — these are the fields daemon's TriggerScheduler
-        // reads to build the Mission. Dropping them would silently break
-        // the morning_brief mission.
+        // reads to build the Execution. Dropping them would silently break
+        // the morning_brief execution.
         #expect(obj["objective"] == .string("Read calendar + email summary, draft a morning brief"))
         #expect(obj["title"] == .string("Morning Brief"))
         #expect(obj["trust_required"] == .string("send_approval"))
@@ -524,7 +525,7 @@ struct FireCarveSuite {
         #expect(str(o["severity"]) == "important")
         #expect(str(o["title"]) == "Morning brief — \(label)")
         // DELIBERATE CHANGE (2026-07-09): the brief carries REAL content now.
-        // Under a bare temp root (no desk, no missions, no inbox, no sessions)
+        // Under a bare temp root (no desk, no executions, no inbox, no sessions)
         // with the worklog seam pointed at a nonexistent file, every section
         // fails open and the summary states that plainly. It is a true claim
         // about real state — not a placeholder — so `stub` is false.
@@ -549,7 +550,10 @@ struct FireCarveSuite {
         #expect(result.status == "fired")
         guard let o = obj(try #require(result.item)) else { Issue.record("no item"); return }
         #expect(str(o["severity"]) == "actionable")
-        #expect((str(o["source"]) ?? "").hasPrefix("mission_complete:"))
+        // Mismatched pair (P2-4): the seeded config file above is 0.3.x
+        // vocabulary and the fire request uses the old NAME, but the card this
+        // writes carries the CANONICAL source prefix.
+        #expect((str(o["source"]) ?? "").hasPrefix("execution_complete:"))
         #expect(str(o["title"]) == "Workshop complete: Stub task")
     }
 
@@ -617,10 +621,10 @@ struct FireCarveSuite {
         #expect(items.isEmpty)
     }
 
-    // ── Mission: native enqueue (WAVE 21) ────────────────────────────────
+    // ── Execution: native enqueue (WAVE 21) ────────────────────────────────
     //
-    // Mission fire_now now calls SwiftNativeWorkshopRunner.submit() in-process.
-    // The factory makeTriggerScheduler threads the production mission runner
+    // Execution fire_now now calls SwiftNativeWorkshopRunner.submit() in-process.
+    // The factory makeTriggerScheduler threads the production execution runner
     // through makeWorkshopRunner() so this path uses the real planner instead of
     // the SwiftNativeWorkshopRunner test stub default.
 
@@ -666,11 +670,11 @@ struct FireCarveSuite {
         }
     }
 
-    // ── Mission: default-runner executor gate (2026-06-10) ──────────────
+    // ── Execution: default-runner executor gate (2026-06-10) ──────────────
     //
     // NEW CONTRACT (executor port, 2026-06-10): the scheduler's DEFAULT
     // runner now has executorAvailable=true — WorkshopExecutorLoop drains the
-    // queue — so a mission trigger fire ENQUEUES. The constructor-false test
+    // queue — so an execution trigger fire ENQUEUES. The constructor-false test
     // below proves the honest-refusal gate still works when explicitly off.
 
     @Test func fireWorkshopExecutionDefaultRunnerEnqueues() async throws {
@@ -1045,14 +1049,14 @@ struct FactorySuite {
 }
 
 // MARK: - Wave 21 review fixes (FIX #1 + FIX #5)
-// Fix 8: FIX #1 test rewritten. The old test verified that missions delegate
+// Fix 8: FIX #1 test rewritten. The old test verified that executions delegate
 // to another runtime. Workshop execution
 // always proceed native — there is no Python delegate path. The test is
-// rewritten as 'missions always proceed native' per the task spec.
+// rewritten as 'executions always proceed native' per the task spec.
 
 @Suite("SwiftNativeTriggerScheduler: wave 21 review fixes")
 struct Wave21ReviewFixSuite {
-    /// Fix 8 rewrite of FIX #1: missions always proceed native (cutover complete).
+    /// Fix 8 rewrite of FIX #1: executions always proceed native (cutover complete).
     /// The old 'delegates to Python when flag off' assertion is replaced by
     /// 'fireMissionTrigger takes the SwiftNative enqueue path unconditionally'.
     @Test func fireWorkshopExecutionAlwaysProceedsNative() async throws {
@@ -1075,7 +1079,7 @@ struct Wave21ReviewFixSuite {
         let result = try await client.fireWorkshopTrigger(name: "morning_brief")
         // Workshop always proceed native — status is "fired" with a native Workshop execution id.
         #expect(result.status == "fired")
-        // The mission id is non-nil and not the Python sentinel.
+        // The execution id is non-nil and not the Python sentinel.
         #expect(result.executionId != nil)
         #expect(result.executionId != "py-delegated-mid")
         // A native Workshop execution record WAS written to disk.
@@ -1682,7 +1686,7 @@ struct PeriodicFireReviewFixSuite {
             .appendingPathComponent("executions", isDirectory: true)
         if FileManager.default.fileExists(atPath: queueDir.path) {
             let children = (try? FileManager.default.contentsOfDirectory(at: queueDir, includingPropertiesForKeys: nil)) ?? []
-            #expect(children.isEmpty, "no mission should have been enqueued — occurrence already consumed")
+            #expect(children.isEmpty, "no execution should have been enqueued — occurrence already consumed")
         }
     }
 }
@@ -1732,7 +1736,7 @@ struct TriggerConfigJSONSuite {
 //
 // EMPIRICAL ONLY — opt-in via NA_WAVE25_EMPIRICAL=1. Calls the PRODUCTION
 // `makeWorkshopRunner()` factory (fix 8: no runtime: param — always native)
-// and invokes the real `planMission(...)` path. This is
+// and invokes the real `planWorkshopExecution(...)` path. This is
 // the hard gate that distinguishes wave-25 retirement (real LLM plan) from
 // retirement-deferred (stub fallback because the production environment
 // lacks API credentials for the planner's resolved surface).
@@ -1774,7 +1778,7 @@ struct Wave25EmpiricalSuite {
             triggerSource: "wave25_empirical",
             trustRequired: "send_approval"
         )
-        // Use the internal `_planMissionWithReason` seam so the harness ALSO
+        // Use the internal `_planWorkshopExecutionWithReason` seam so the harness ALSO
         // captures the planner's failure reason (e.g. `LLMError.notConfigured(openai)`)
         // when the LLM call falls back to the stub. Q1-NIT of the wave-25
         // gpt-5.5 review: without this, the harness only prints `fromStub=true`
@@ -1786,7 +1790,7 @@ struct Wave25EmpiricalSuite {
         do {
             (plan, reason) = try await native._planWorkshopExecutionWithReason(spec: spec)
         } catch {
-            Issue.record("EMPIRICAL: planMission threw: \(error)")
+            Issue.record("EMPIRICAL: planWorkshopExecution threw: \(error)")
             return
         }
         // Print machine-readable result lines so the orchestrator can grep
@@ -1806,5 +1810,97 @@ struct Wave25EmpiricalSuite {
             print("WAVE25_EMPIRICAL_RESULT verdict=RETIREMENT_READY_REAL_LLM_PLAN")
         }
         // We do NOT #expect on fromStub here — both outcomes are valid empirical results.
+    }
+}
+
+// MARK: - P2-4: the mission_* -> execution_* trigger seam
+
+/// `inbox/trigger_config.json` on a live 0.3.x install still carries
+/// `{"name":"mission_followup","kind":"mission_complete"}`. The file is the
+/// user's config and is never rewritten wholesale, so the new binary has to
+/// read it, list it, toggle it, and fire it — while the defaults it seeds for a
+/// fresh install use the canonical spelling. Every case below crosses the two.
+@Suite("SwiftNativeTriggerScheduler: mission -> execution vocabulary")
+struct TriggerVocabularySeamSuite {
+
+    private func seedLegacyFollowup(root: URL, enabled: Bool = true) throws {
+        try seedInbox([
+            .object([
+                "name": .string("mission_followup"),
+                "kind": .string("mission_complete"),
+                "enabled": .bool(enabled),
+                "config": .object([:]),
+                "description": .string("Notify when a Workshop task completes."),
+            ]),
+        ], root: root)
+    }
+
+    @Test func legacyConfigFileListsUnderTheCanonicalName() async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try seedLegacyFollowup(root: root)
+        let configs = try await makeClient(root: root).listInboxTriggers()
+        #expect(configs.map(\.name) == ["execution_followup"])
+        #expect(configs.first?.kind == "execution_complete")
+    }
+
+    @Test func canonicalNameTogglesARowStoredWithTheLegacyName() async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try seedLegacyFollowup(root: root, enabled: true)
+        let client = makeClient(root: root)
+        let status = try await client.disableInboxTrigger(name: "execution_followup")
+        #expect(status.status != "not_found")
+        #expect(try await client.listInboxTriggers().first?.enabled == false)
+
+        // The row's STORED name is untouched — the config file is the user's,
+        // not ours to rewrite.
+        let raw = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: root
+                .appendingPathComponent("inbox", isDirectory: true)
+                .appendingPathComponent("trigger_config.json"))
+        ) as? [[String: Any]]
+        #expect(raw?.first?["name"] as? String == "mission_followup")
+    }
+
+    @Test func legacyNameTogglesARowStoredWithTheCanonicalName() async throws {
+        // The mirror: a fresh install's canonical config, addressed by a client
+        // still on the old spelling.
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try seedInbox([
+            .object([
+                "name": .string("execution_followup"),
+                "kind": .string("execution_complete"),
+                "enabled": .bool(true),
+                "config": .object([:]),
+            ]),
+        ], root: root)
+        let client = makeClient(root: root)
+        let status = try await client.disableInboxTrigger(name: "mission_followup")
+        #expect(status.status != "not_found")
+        #expect(try await client.listInboxTriggers().first?.enabled == false)
+    }
+
+    @Test func canonicalNameFiresARowStoredWithTheLegacyName() async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try seedLegacyFollowup(root: root)
+        let result = try await makeClient(root: root)
+            .fireInboxTrigger(name: "execution_followup", isStub: true)
+        #expect(result.status == "fired")
+        guard let o = obj(try #require(result.item)) else { Issue.record("no item"); return }
+        // Writers emit the canonical source prefix even off a legacy config row.
+        #expect((str(o["source"]) ?? "").hasPrefix("execution_complete:"))
+    }
+
+    @Test func anUnknownTriggerNameIsStillNotFound() async throws {
+        // The fold must not have loosened name matching into a wildcard.
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try seedLegacyFollowup(root: root)
+        let result = try await makeClient(root: root)
+            .fireInboxTrigger(name: "some_other_trigger", isStub: true)
+        #expect(result.status == "not_found")
     }
 }

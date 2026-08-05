@@ -96,7 +96,7 @@ private final class FailingStreamingLLM: StreamingLLMClient, MessagesStreamingLL
 private func makeClientES(root: URL, streaming: any StreamingLLMClient) -> SwiftNativeChatOrchestrationClient {
     let llm = UnusedLLMES()
     let engine = SwiftNativeTurnEngine(
-        persona: SwiftNativePersonaEngine(root: root),
+        persona: hermeticPersona(root: root),
         memory: nil,
         router: StubRoutingES(),
         trust: hermeticTrust(),

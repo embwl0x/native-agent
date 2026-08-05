@@ -304,7 +304,7 @@ actor NativeContextFlowRuntime: ContextTurnPreparing {
     private var memoryRuntime: SwiftNativeMemoryV2?
     private var memoryPressureSource: DispatchSourceMemoryPressure?
     /// One kqueue-backed invalidation reader over the canonical Desk feed and
-    /// Workshop mission records. It carries no payload and owns no work state;
+    /// Workshop execution records. It carries no payload and owns no work state;
     /// every edge makes the existing ContextFlow coordinator reread the stores.
     private var residentWorkObservationTask: Task<Void, Never>?
     private var starting = false

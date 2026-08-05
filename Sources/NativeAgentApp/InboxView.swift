@@ -1,6 +1,7 @@
 // PATCH-2026-05-07: proactive-inbox-1 InboxView — proactive inbox card strip
 import SwiftUI
 import NativeAgentShared
+import NativeAgentCore
 
 // MARK: - Models
 
@@ -135,7 +136,10 @@ struct InboxItemRecord: Identifiable, Codable, Hashable {
         if source == "dream_cycle"               { return "moon.stars.fill" }
         if source == "rem_cycle"                 { return "sparkles" }
         if source.hasPrefix("trigger:file_watch") { return "doc.text.magnifyingglass" }
-        if source.hasPrefix("mission_complete")   { return "checkmark.circle.fill" }
+        // P2-4: cards already in inbox.jsonl carry `mission_complete:<id>`.
+        if ExecutionEventVocabulary.hasKindPrefix(source, WorkshopCompletionTrigger.canonicalKind) {
+            return "checkmark.circle.fill"
+        }
         if source == "idle_checkin"               { return "clock.fill" }
         if source.hasPrefix("trigger:morning_brief") { return "sun.horizon.fill" }
         if source.hasPrefix("trigger:stuck_pattern") { return "arrow.trianglehead.2.clockwise" }
@@ -153,7 +157,9 @@ struct InboxItemRecord: Identifiable, Codable, Hashable {
         if source.hasPrefix("trigger:morning_brief") { return "MORNING-BRIEF" }
         if source.hasPrefix("trigger:stuck_pattern") { return "STUCK-PATTERNS" }
         if source == "idle_checkin" { return "IDLE-CHECKIN" }
-        if source.hasPrefix("mission_complete") { return "WORKSHOP" }
+        if ExecutionEventVocabulary.hasKindPrefix(source, WorkshopCompletionTrigger.canonicalKind) {
+            return "WORKSHOP"
+        }
         // ui-taste-sweep 2026-06-07: previously fell through to
         // `String(source.uppercased().prefix(14))` which truncated
         // "scheduled_proactive_scan" → "SCHEDULED_PROA" (mid-word, leaking
@@ -266,7 +272,8 @@ struct InboxTriggerConfig: Identifiable, Codable, Hashable {
         case "file_watch":       return "File Watcher"
         case "idle_checkin":     return "Idle Check-In"
         case "morning_brief":    return "Morning Brief"
-        case "mission_followup": return "Workshop Follow-up"
+        case WorkshopCompletionTrigger.canonicalName,
+             WorkshopCompletionTrigger.legacyName: return "Workshop Follow-up"
         case "stuck_pattern":    return "Stuck Pattern"
         default:                 return name
         }
@@ -277,7 +284,8 @@ struct InboxTriggerConfig: Identifiable, Codable, Hashable {
         case "file_watch":       return "doc.text.magnifyingglass"
         case "idle_checkin":     return "clock"
         case "morning_brief":    return "sun.horizon"
-        case "mission_followup": return "checkmark.circle"
+        case WorkshopCompletionTrigger.canonicalName,
+             WorkshopCompletionTrigger.legacyName: return "checkmark.circle"
         case "stuck_pattern":    return "arrow.trianglehead.2.clockwise"
         default:                 return "bolt"
         }

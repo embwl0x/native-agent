@@ -250,7 +250,7 @@ final class DeskStoreTests: XCTestCase {
         }
 
         // 1 — watch, stale 42m (lastRefreshAt 42m ago, staleAfter 30m).
-        let i1 = item("1", kind: .watch, project: "na", title: "missions list refresh lag -> #50",
+        let i1 = item("1", kind: .watch, project: "na", title: "executions list refresh lag -> #50",
                       cadence: Cadence(mode: .on_ask, lastRefreshAt: DeskClock.nowISO(now.addingTimeInterval(-2520)), staleAfter: "30m"))
         // 2 — plan with 3 refs + 3 children; the `now` child highlights inline.
         let i2 = item("2", kind: .plan, project: "atrium", title: "clean-rebuild cmd center",
@@ -280,7 +280,7 @@ final class DeskStoreTests: XCTestCase {
         let expected = """
         desk · owner · rev \(gen) · stale ok
         status: watch · flag · now · next · todo · done · blocked
-        1 watch na · missions list refresh lag -> #50 · stale:42m
+        1 watch na · executions list refresh lag -> #50 · stale:42m
         2 plan atrium · clean-rebuild cmd center · now session store -> GRDB · 1/3 closed · refs:3
           2.1 done GRDB schema scaffold
           2.2 now session store -> GRDB
@@ -292,7 +292,7 @@ final class DeskStoreTests: XCTestCase {
           2.2 now session store -> GRDB
           4.1 next read issues + draft plan
           2.3 next outbound dispatch queue
-          1 watch missions list refresh lag -> #50
+          1 watch executions list refresh lag -> #50
           2 watch clean-rebuild cmd center
         """
         XCTAssertEqual(rendered, expected)
@@ -1576,5 +1576,61 @@ final class DeskStoreTests: XCTestCase {
         XCTAssertTrue(rendered.contains("blocked-on 1,2,3+2"), rendered)
         XCTAssertFalse(rendered.contains("desk_"), "the projection must never render a raw handle")
         XCTAssertFalse(rendered.contains("h_1 "), "the projection must never render a raw handle")
+    }
+
+    // MARK: - Wave 5: drift surfacing in the projection
+
+    private func driftItem(notes: [DeskNote], status: DeskStatus = .todo) -> DeskState {
+        let opened = "2026-07-01T10:00:00.000000+00:00"
+        var item = seqItem("1", status: status)
+        item.notes = notes
+        return DeskState(items: [item], generatedTs: opened)
+    }
+
+    private func note(_ offsetHour: Int, _ text: String) -> DeskNote {
+        DeskNote(ts: "2026-07-0\(offsetHour)T10:00:00.000000+00:00", text: text)
+    }
+
+    private var renderNow: Date { Date(timeIntervalSince1970: 1_780_000_000) }
+
+    /// A drift flag reaches the compact line AND the note line even on an item
+    /// whose status is plain `todo` — drift is the desk contradicting itself, and
+    /// the old blocked/flag-only note gate would have hidden exactly that.
+    func test_drift_note_surfaces_on_a_non_blocked_item() {
+        let drift = DeskDrift(handle: "h_1", kind: .untrackedButShipped, refKeys: ["gh:o/r#7"],
+                              detail: "d", observedAt: "2026-07-02T10:00:00.000000+00:00")
+        let rendered = DeskProjection.render(driftItem(notes: [note(2, drift.noteText)]), now: renderNow)
+        XCTAssertTrue(rendered.contains("⚑ drift:untracked_but_shipped"), rendered)
+        XCTAssertTrue(rendered.contains("  note: ⚑ drift["), rendered)
+    }
+
+    /// The flag is DERIVED from the tail of the note trail, so anything newer
+    /// clears it. This is the property that makes drift un-stickable: there is no
+    /// stored bit to leave on after reality moves back.
+    func test_drift_segment_clears_when_a_newer_note_lands() {
+        let drift = DeskDrift(handle: "h_1", kind: .blockedButShipped, refKeys: ["gh:o/r#7"],
+                              detail: "d", observedAt: "2026-07-02T10:00:00.000000+00:00")
+        let state = driftItem(notes: [note(2, drift.noteText), note(3, "User: reopened it, still working")])
+        let rendered = DeskProjection.render(state, now: renderNow)
+        XCTAssertFalse(rendered.contains("⚑ drift"), rendered)
+        XCTAssertFalse(rendered.contains("  note:"), "a todo item's ordinary note is not high-signal")
+    }
+
+    /// `hasPrefix`, not `contains`: a note that merely QUOTES the marker cannot
+    /// forge a flag. Same spoofing rule the applier's dedupe uses.
+    func test_note_quoting_the_marker_does_not_forge_a_drift_flag() {
+        let state = driftItem(notes: [note(2, "asked her why the ⚑ drift flag fired last week")])
+        let rendered = DeskProjection.render(state, now: renderNow)
+        XCTAssertFalse(rendered.contains("⚑ drift:"), rendered)
+    }
+
+    /// A receipt is not a drift — an auto-resolved item stays quiet on the line.
+    func test_receipt_note_is_not_rendered_as_drift() {
+        let resolve = DeskAutoResolve(handle: "h_1", expectedUpdatedAt: "x", refKeys: ["gh:o/r#7"],
+                                      evidence: ["gh:o/r#7: merged — e"],
+                                      observedAt: "2026-07-02T10:00:00.000000+00:00",
+                                      materialFingerprint: "f")
+        let rendered = DeskProjection.render(driftItem(notes: [note(2, resolve.receiptNote)]), now: renderNow)
+        XCTAssertFalse(rendered.contains("⚑ drift"), rendered)
     }
 }

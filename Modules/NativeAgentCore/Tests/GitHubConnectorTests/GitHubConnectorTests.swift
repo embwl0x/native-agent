@@ -666,3 +666,97 @@ private func tempRoot() throws -> URL {
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     return root
 }
+
+// MARK: - Wave 5: what the cadence learner is allowed to call a "change"
+
+/// The learner counts a differing fingerprint as evidence the ref MOVED
+/// UPSTREAM, and needs three such changes before it trusts an interval. So the
+/// fingerprint must contain nothing the local clock can move on its own.
+///
+/// `signature` fails that test: it folds in `stale`, which is
+/// `isStale(updatedAt, hours:)` against `Date()`. Here the upstream row is
+/// byte-identical and only the staleness WINDOW differs — a stand-in for the
+/// same PR observed before and after it crosses the threshold. `signature`
+/// changes; the observation fingerprint must not.
+@Test func githubObservationFingerprintIgnoresLocalClockStaleness() throws {
+    let row: [String: Any] = [
+        "number": 7,
+        "state": "open",
+        "updated_at": "2020-01-01T00:00:00Z",   // long past → stale under any short window
+        "title": "A pull request",
+        "html_url": "https://github.com/owner/repo/pull/7",
+    ]
+    let fresh = try #require(GitHubConnectorActions.testTrackingFingerprints(pullRow: row, staleHours: 1_000_000))
+    let aged = try #require(GitHubConnectorActions.testTrackingFingerprints(pullRow: row, staleHours: 1))
+
+    #expect(fresh.signature != aged.signature, "precondition: signature IS clock-sensitive")
+    #expect(fresh.observation == aged.observation,
+            "a ref nobody touched must not read as a change just because it aged")
+    #expect(!aged.observation.contains("stale"))
+}
+
+/// A real upstream move still registers — the fix must not flatten the
+/// fingerprint into something that never changes.
+@Test func githubObservationFingerprintTracksRealUpstreamChange() throws {
+    var row: [String: Any] = [
+        "number": 7, "state": "open", "updated_at": "2026-07-15T10:00:00Z",
+        "title": "A pull request", "html_url": "https://github.com/owner/repo/pull/7",
+    ]
+    let before = try #require(GitHubConnectorActions.testTrackingFingerprints(pullRow: row, staleHours: 72))
+    row["state"] = "closed"
+    row["updated_at"] = "2026-07-16T10:00:00Z"
+    let after = try #require(GitHubConnectorActions.testTrackingFingerprints(pullRow: row, staleHours: 72))
+    #expect(before.observation != after.observation)
+}
+
+/// END-TO-END through the real wiring: a hand-written desk card that links a PR
+/// gets FLAGGED when the PR merges (it never opted into auto-close), and the
+/// cadence lane records the observation. This is the closest thing to a live
+/// proof available without the network — it drives `upsertDesk`, which is what
+/// the refresh loop calls, so it exercises entity -> DeskObservedRef ->
+/// evaluator -> applier -> op-log for real.
+@Test func githubRefreshReconcilesTheWholeBoardNotJustTrackerRows() async throws {
+    let root = try tempRoot()
+    let key = "owner/repo#pr#7"
+    func entity(state: String, updatedAt: String) -> JSONValue {
+        .object([
+            "key": .string(key), "repository": .string("owner/repo"), "number": .int(7),
+            "kind": .string("pull_request"), "title": .string("Make Hermes sturdier"),
+            "state": .string(state), "updatedAt": .string(updatedAt),
+            "url": .string("https://github.com/owner/repo/pull/7"),
+            "reviewState": .string("approved"), "checks": .string("passing"),
+            "needsUser": .bool(false), "blocked": .bool(false), "stale": .bool(false),
+        ])
+    }
+
+    // User's OWN card. `.plan`, no refresh sources — the tracker does not own it
+    // and must never close it, but it does point at the PR.
+    let store = SwiftNativeDeskStore(dataRoot: root)
+    let mine = try await store.createItem(kind: .plan, project: "Hermes", title: "land the Hermes work")
+    _ = try await store.addRef(mine.handle, ref: DeskRef(kind: .ghPr(
+        repo: "owner/repo", number: 7, title: "Make Hermes sturdier", status: "open", checks: nil
+    )))
+
+    // The PR merges. The refresh reconciles the whole board against it.
+    _ = try await GitHubConnectorActions.testUpsertTrackingEntities(
+        [entity(state: "closed", updatedAt: "2026-07-10T12:00:00Z")],
+        project: "Hermes", changedKeys: [key], dataRoot: root
+    )
+
+    let after = try #require(try await store.liveState().items.first { $0.handle == mine.handle })
+    #expect(after.status.isTerminal == false, "NO UNINVITED CLOSES: this card never opted in")
+    let flag = try #require(after.notes.last)
+    #expect(DeskObservationEvaluator.driftKind(inNote: flag.text) == .untrackedButShipped)
+    #expect(flag.text.contains("owner/repo#pr#7"))
+    // ...and it reaches the surface User actually reads.
+    let rendered = DeskProjection.render(try await store.liveState())
+    #expect(rendered.contains("⚑ drift:untracked_but_shipped"))
+    #expect(rendered.contains("  note: ⚑ drift["))
+
+    // And the cadence lane saw the observation, so it can start learning.
+    let stats = await DeskCadenceStore(dataRoot: root).load()
+    let stat = try #require(stats.refs[key])
+    #expect(stat.observations == 1)
+    #expect(stat.changes == 0, "the first fingerprint is a baseline, not a change")
+    #expect(stat.lastFingerprint?.contains("stale") == false)
+}

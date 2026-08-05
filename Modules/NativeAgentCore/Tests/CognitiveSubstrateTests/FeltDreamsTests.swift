@@ -94,7 +94,7 @@ struct FeltDreamsTests {
         #expect(summary.count <= 600, "summary must be bounded ≤600 chars: \(summary.count)")
     }
 
-    /// NO NEW EXPOSURE (gpt-5.5 HIGH, 2026-07-02): felt tool/system/mission
+    /// NO NEW EXPOSURE (gpt-5.5 HIGH, 2026-07-02): felt tool/system/execution
     /// nodes may feed the mood-band COUNT, but their summaries must NEVER be
     /// named — the dream prompt deliberately drops tool rows, so a felt
     /// toolObservation riding in through the felt section would be a brand-new
@@ -109,13 +109,13 @@ struct FeltDreamsTests {
                 // if the population weren't filtered.
                 node(summary: "SECRET-TOOL-OUTPUT sk-deadbeef result blob", kind: .toolObservation, valence: 0.9, arousal: 0.9, warmth: 0.9, createdAt: now, lastActivatedAt: now),
                 node(summary: "PROVIDER-FAILURE trace with endpoint internals", kind: .providerHealth, valence: -0.9, arousal: 0.9, warmth: 0.0, createdAt: now, lastActivatedAt: now),
-                node(summary: "MISSION-INTERNAL summary of scheduled job", kind: .workshopExecution, valence: 0.8, arousal: 0.8, warmth: 0.8, createdAt: now, lastActivatedAt: now),
+                node(summary: "EXECUTION-INTERNAL summary of scheduled job", kind: .workshopExecution, valence: 0.8, arousal: 0.8, warmth: 0.8, createdAt: now, lastActivatedAt: now),
             ],
             clock: clock, label: "no-tool-naming")
         let summary = try #require(await s.feltDaySummary(at: clock.now()))
         #expect(!summary.contains("SECRET-TOOL-OUTPUT"), "tool summary leaked into the dream felt section: \(summary)")
         #expect(!summary.contains("PROVIDER-FAILURE"), "provider summary leaked: \(summary)")
-        #expect(!summary.contains("MISSION-INTERNAL"), "mission summary leaked: \(summary)")
+        #expect(!summary.contains("EXECUTION-INTERNAL"), "execution summary leaked: \(summary)")
         #expect(summary.contains("roadmap"), "the conversation memory should still be named: \(summary)")
         // The band count still integrates over all felt nodes (a count carries
         // no content) — 4 felt moments here.

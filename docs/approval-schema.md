@@ -41,7 +41,7 @@ Common values for the `action` field:
 
 | Action                   | Description |
 |--------------------------|-------------|
-| `submitMission`          | Submit a new mission objective. |
+| `submitMission`          | Submit a new Workshop execution objective. |
 | `approveStep`            | Approve a pending improvement/approval step. |
 | `rejectStep`             | Reject a pending step. |
 | `approveMemoryProposal`  | Accept a staged memory proposal. |

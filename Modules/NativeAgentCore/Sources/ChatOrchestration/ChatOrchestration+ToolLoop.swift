@@ -109,7 +109,7 @@ public enum ToolLoopBudget {
             return 90
         case "swarm", "swarms", "worker", "workers":
             return 80
-        case "autonomy", "mission", "missions", "background":
+        case "autonomy", "workshop", "mission", "missions", "background":
             return 80
         default:
             return 60
@@ -130,7 +130,7 @@ public enum ToolLoopBudget {
 // so a wedged tool (dead network, an MCP server that never answers, a stuck
 // subprocess) freezes that one dispatch forever. On any surface the whole
 // turn then hangs until the app restarts. This is
-// the same freeze class loop #1 fixed for the mission *step* path, on the
+// the same freeze class loop #1 fixed for the execution *step* path, on the
 // OTHER execution path: the chat tool loop driving an autonomous turn.
 //
 // runSingleDispatch races each dispatch against a
@@ -152,7 +152,7 @@ public enum ToolLoopBudget {
 // all of which complete in seconds-to-minutes normally). It is a backstop
 // against "hangs forever," not a tight per-tool SLA.
 //
-// RESIDUAL (identical to the mission step deadline, gpt-5.5-concurred): a
+// RESIDUAL (identical to the execution step deadline, gpt-5.5-concurred): a
 // NON-cooperative sync wedge that never suspends / swallows CancellationError
 // can't be preempted — structured concurrency awaits the child at scope exit,
 // so the group can't return until that child does. Every realistic I/O hang
@@ -178,7 +178,7 @@ public enum ToolDispatchDeadline {
     /// machine-driven set in `ToolLoopBudget.defaultIterations` (+ "training").
     static func isUnattended(surface: String) -> Bool {
         switch surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "autonomy", "mission", "missions", "background",
+        case "autonomy", "workshop", "mission", "missions", "background",
              "swarm", "swarms", "worker", "workers", "training":
             return true
         default:
@@ -1623,6 +1623,9 @@ extension SwiftNativeTurnEngine {
         // cross-process cancel), so existing callers are byte-identical.
         cancelFlagPath: URL? = nil
     ) async throws -> TurnEngineResult {
+        // P2-3: fold the Workshop surface once at the loop entry (see
+        // buildTurnContext) so the whole tool loop threads one vocabulary.
+        let surface = WorkshopSurfaceVocabulary.foldLegacySpelling(surface)
         // An image-only turn (no caption text) is valid when the pre-built
         // context carries image blocks — don't reject it as empty.
         if userMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty

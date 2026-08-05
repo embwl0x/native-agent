@@ -356,7 +356,7 @@ public enum WorkshopStorageMigrator {
         timestamp: String,
         fileManager: FileManager
     ) -> URL {
-        let base = "missions-pre-workshop-\(timestamp)"
+        let base = "executions-pre-workshop-\(timestamp)"
         var candidate = archiveRoot.appendingPathComponent(base, isDirectory: true)
         var suffix = 2
         while fileManager.fileExists(atPath: candidate.path) {

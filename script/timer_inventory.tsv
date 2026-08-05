@@ -1,6 +1,7 @@
 # path	needle	expected_count	classification	canonical_owner
 Modules/NativeAgentCore/Sources/BackgroundLoops/BackgroundLoops.swift	timeoutNanoseconds(timeout)	1	timeout_retry_deadline	BackgroundLoops.tickWithTimeout
 Modules/NativeAgentCore/Sources/BackgroundLoops/BackgroundLoops.swift	timeoutNanoseconds(delay)	1	integrity_sweep	SwiftNativeLoopScheduler
+Modules/NativeAgentCore/Sources/BackgroundLoops/BackgroundLoops.swift	timeoutNanoseconds(window)	1	integrity_sweep	SwiftNativeLoopScheduler.flushLoopState
 Modules/NativeAgentCore/Sources/BackgroundLoops/BackgroundLoopsManager.swift	*	2	event_deadline	BackgroundLoopsManager.physiology
 Modules/NativeAgentCore/Sources/ChatOrchestration/ChatCompactionDistiller.swift	*	1	timeout_retry_deadline	ChatCompactionDistiller
 Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+AutonomyGate.swift	*	1	timeout_retry_deadline	AutonomyGate

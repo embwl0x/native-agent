@@ -32,7 +32,7 @@ extension AppDelegate {
             )
             if report.didMigrate {
                 NSLog(
-                    "[workshop-migration] absorbed legacy Missions storage: moved=%d deduplicated=%d conflicts=%d archive=%@ receipt=%@",
+                    "[workshop-migration] absorbed legacy Executions storage: moved=%d deduplicated=%d conflicts=%d archive=%@ receipt=%@",
                     report.moved.count,
                     report.deduplicated.count,
                     report.conflictsPreservedInArchive.count,
@@ -131,12 +131,12 @@ extension AppDelegate {
         // a Task body races the first system wake on cold launch.
         Self.registerBackgroundTaskHandlers()
 
-        // Make the mission planner TOOL-AWARE for EVERY path, incl. the
+        // Make the execution planner TOOL-AWARE for EVERY path, incl. the
         // autonomous trigger scheduler (which builds its runner via the core
         // makeWorkshopRunner and so can't be wired per-call-site). Configured
         // SYNCHRONOUSLY here, before any detached loop/trigger task spawns, so
-        // a mission Agent fires on her own plans real tools — not synthesis-only
-        // (2026-06-15, the user: missions do everything, including unattended).
+        // an execution Agent fires on her own plans real tools — not synthesis-only
+        // (2026-06-15, the user: executions do everything, including unattended).
         WorkshopExecution.WorkshopPlannerCatalog.configure(makeWorkshopPlannerConnectorActionsProvider())
 
         // restart_app / Telegram /restart (2026-06-10): inject the AppKit
@@ -189,7 +189,7 @@ extension AppDelegate {
             let loops = BackgroundLoopsAssembly.assembleAllLoops()
             await BackgroundLoopsManager.shared.start(loops: loops)
             // CRASH RECONCILIATION for the Workshop→memory lane (gpt-5.5
-            // review BLOCKING 1, 2026-08-02). Mission-memory writes are handed
+            // review BLOCKING 1, 2026-08-02). Execution-memory writes are handed
             // off to a detached queue, so a crash — or a kill inside the 3s
             // termination budget — can leave a terminal `mission.json` on disk
             // with no memory behind it. `applicationWillTerminate` drains the
@@ -200,7 +200,7 @@ extension AppDelegate {
             // WorkshopExecutorRef is configured by the loop assembly — a
             // sibling Task.detached would race it and find the ref nil.
             if let executor = WorkshopExecutorRef.shared.current() {
-                _ = await executor.reconcileMissedMissionMemories()
+                _ = await executor.reconcileMissedExecutionMemories()
             }
         }
         Task.detached(priority: .utility) {
@@ -272,10 +272,10 @@ extension AppDelegate {
                 dataRoot: PersistenceCore.defaultDataRoot())
             // U5 W-A item 3 (2026-06-11): generic resolve→execute crash-
             // window reconcile for the four kinds that lacked launch
-            // coverage (rem.proposal, mission.step, self_improvement.apply,
+            // coverage (rem.proposal, execution.step, self_improvement.apply,
             // browser.open_url). Re-fires the SAME executors resolveApproval
             // runs, keyed on "resolved + no executedAction annotation";
-            // per-kind idempotency hooks (REM status-flip no-op, mission
+            // per-kind idempotency hooks (REM status-flip no-op, execution
             // in-lock staleApproval guard, approved-only self-improvement,
             // browser runs.json terminal-state cap) keep re-runs from
             // double-executing side effects.
@@ -428,20 +428,20 @@ extension AppDelegate {
             await BackgroundLoopsManager.shared.stop()
             group.leave()
         }
-        // Workshop mission memories are written OFF the terminal path by a
+        // Workshop execution memories are written OFF the terminal path by a
         // detached queue, and `BackgroundLoopsManager.stop()` cancels loop
         // tasks — it does not drain that queue (gpt-5.5 review BLOCKING 1,
-        // 2026-08-02). Without this, a mission that reached terminal moments
+        // 2026-08-02). Without this, an execution that reached terminal moments
         // before quit left `mission.json` on disk and no memory: she did the
         // work and could not remember it. Bounded BELOW the 3s budget so a
         // wedged SQLite/embedder can never hold up quit — an unfinished drain
         // logs what it abandoned instead of blocking. The crash case (this
         // never runs at all) is repaired at next launch by
-        // `reconcileMissedMissionMemories`.
+        // `reconcileMissedExecutionMemories`.
         group.enter()
         Task.detached {
             await WorkshopExecutorRef.shared.current()?
-                .waitForMissionMemoryWrites(timeout: 2.5)
+                .waitForExecutionMemoryWrites(timeout: 2.5)
             group.leave()
         }
         // MCP stdio children don't reliably exit on stdin EOF — stop the

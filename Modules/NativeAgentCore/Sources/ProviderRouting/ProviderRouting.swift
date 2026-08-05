@@ -299,10 +299,22 @@ public struct ProviderRoutingSnapshot: Sendable, Equatable {
 /// compaction summary into a richer recollection. Unpinned it follows the chat
 /// model (same seed-to-chat rule as `memory`/`ios`) so the summary is written in
 /// the assistant's current voice; the user can pin a cheaper model from Providers.
+/// `missions` was renamed to `workshop` on 2026-08-05 (P2-3). It is NOT listed
+/// here anymore — instead every surface entering this module is folded through
+/// `canonicalRoutingSurface`, and `providers/surfaces.json` / `active.json` keys
+/// are folded at their single read seam (`reconciledPickerState`). A 0.3.x
+/// install whose picker files still say `missions` therefore keeps its pin.
 public let MODEL_SURFACES: [String] = [
-    "chat", "ios", "telegram", "slack", "missions", "autonomy", "swarms", "dream", "rem", "training",
+    "chat", "ios", "telegram", "slack", "workshop", "autonomy", "swarms", "dream", "rem", "training",
     "memory", "heartbeat", "diagnostics", "cognition_reflection", "compaction",
 ]
+
+/// The ONE bridge every routing entry point runs its `surface` argument
+/// through. Callers on 0.3.x wire vocabulary (`missions`) and callers on the
+/// new one (`workshop`) resolve to the same preference, pin, and provider hint.
+public func canonicalRoutingSurface(_ surface: String) -> String {
+    WorkshopSurfaceVocabulary.canonicalSurface(surface)
+}
 
 /// MUST stay in sync with the retired daemon (`REASONING_EFFORT_OPTIONS`).
 public let REASONING_EFFORT_OPTIONS: [String] = ["none", "low", "medium", "high", "xhigh", "max", "ultra"]
@@ -383,7 +395,7 @@ extension ProviderRoutingProtocol {
     }
 
     public func pinnedModelStringForSurfaceChecked(_ surface: String) async throws -> String? {
-        try await checkedRoutingSnapshot().pinnedModels[surface]
+        ProviderRoutingSurfaceLookup.value(try await checkedRoutingSnapshot().pinnedModels, surface)
     }
 
     public func inferProviderForModel(_ modelId: String) -> String? {
@@ -422,7 +434,9 @@ extension ProviderRoutingProtocol {
     /// surface seed.
     public func modelStringForSurface(_ surface: String) async -> String? {
         guard let prefs = try? await computeModelPreferences() else { return nil }
-        if let m = prefs[surface]?.model, !m.isEmpty { return m }
+        if let m = ProviderRoutingSurfaceLookup.value(prefs, surface)?.model, !m.isEmpty {
+            return m
+        }
         return nil
     }
 
@@ -438,6 +452,23 @@ extension ProviderRoutingProtocol {
     /// "no pin" so they continue to fall back through their own paths.
     public func pinnedModelStringForSurface(_ surface: String) async -> String? {
         return nil
+    }
+}
+
+/// P2-3 reader bridge for any surface-keyed routing map.
+///
+/// Both vocabularies can appear on EITHER side here: a caller still passing
+/// `missions` (iOS a version behind, an old script), and a preferences map
+/// produced by a conformer that has not been renamed (test doubles, and the
+/// protocol defaults running over a fake `computeModelPreferences`). Trying the
+/// canonical key and then the legacy key is what keeps a mismatched pair from
+/// resolving to nil and silently falling back to the chat-surface model.
+public enum ProviderRoutingSurfaceLookup {
+    public static func value<V>(_ map: [String: V], _ surface: String) -> V? {
+        let canonical = WorkshopSurfaceVocabulary.canonicalSurface(surface)
+        if let hit = map[canonical] { return hit }
+        guard canonical == WorkshopSurfaceVocabulary.canonical else { return nil }
+        return map[WorkshopSurfaceVocabulary.legacy]
     }
 }
 
@@ -622,6 +653,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         seedMissingControls: Bool,
         overwriteExisting: Bool
     ) -> [String: JSONValue] {
+        let root = canonicalizeRootForWrite(root, surface: surface)
         if !overwriteExisting, root[surface] != nil { return root }
         var updated = root
         var entry: [String: JSONValue] = [:]
@@ -647,9 +679,28 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         providerId: String,
         overwriteExisting: Bool
     ) -> [String: JSONValue] {
+        let root = canonicalizeRootForWrite(root, surface: surface)
         if !overwriteExisting, root[surface] != nil { return root }
         var updated = root
         updated[surface] = .string(providerId)
+        return updated
+    }
+
+    /// P2-3 write-side migration, applied ONLY to the surface actually being
+    /// mutated. Rewriting a picker file wholesale would be a flag day; folding
+    /// just the key we are about to overwrite means the legacy `missions` entry
+    /// is retired exactly when its replacement is written, so the file can
+    /// never end up carrying two entries that disagree about the same surface.
+    /// Untouched surfaces keep their bytes.
+    private nonisolated static func canonicalizeRootForWrite(
+        _ root: [String: JSONValue],
+        surface: String
+    ) -> [String: JSONValue] {
+        guard surface == WorkshopSurfaceVocabulary.canonical,
+              let legacyEntry = root[WorkshopSurfaceVocabulary.legacy] else { return root }
+        var updated = root
+        updated.removeValue(forKey: WorkshopSurfaceVocabulary.legacy)
+        if updated[surface] == nil { updated[surface] = legacyEntry }
         return updated
     }
 
@@ -728,7 +779,16 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
                 description: "surface preference"
             )
             let active = try Self.loadActiveProviderStateChecked(at: self.activeProviderPath)
-            return (surfaces, active)
+            // P2-3 read seam. Both picker files are keyed by surface, and a
+            // 0.3.x install has `missions` keys in them. Fold here — the ONE
+            // place either file becomes in-memory state — so the snapshot,
+            // preferences, and pins all speak the canonical vocabulary. The
+            // files themselves are left untouched; only a later WRITE migrates
+            // them (see `updatedSurfaceRoot` / `updatedActiveRoot`).
+            return (
+                WorkshopSurfaceVocabulary.canonicalizeSurfaceKeys(surfaces),
+                WorkshopSurfaceVocabulary.canonicalizeSurfaceKeys(active)
+            )
         }
     }
 
@@ -822,8 +882,14 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
 
     public func saveModelConfig(_ body: JSONValue) async throws -> ModelPreferences {
         guard case .object(let obj) = body,
-              let surface = Self.firstString(obj, keys: ["surface"]),
-              MODEL_SURFACES.contains(surface) else {
+              let rawSurface = Self.firstString(obj, keys: ["surface"]) else {
+            throw ProviderRoutingError.invalidRequest
+        }
+        // P2-3: accept the 0.3.x `missions` spelling from any caller (iOS one
+        // version behind, a saved shortcut, an old script) and route it to the
+        // canonical surface rather than rejecting it as unknown.
+        let surface = canonicalRoutingSurface(rawSurface)
+        guard MODEL_SURFACES.contains(surface) else {
             throw ProviderRoutingError.invalidRequest
         }
         let model = Self.firstString(obj, keys: ["model"])
@@ -857,6 +923,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         seedMissingControls: Bool = false,
         overwriteExisting: Bool = true
     ) async throws {
+        let surface = canonicalRoutingSurface(surface)
         guard MODEL_SURFACES.contains(surface) else { throw ProviderRoutingError.invalidRequest }
         if let providerId {
             guard !providerId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -961,6 +1028,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         seedMissingControls: Bool = false,
         overwriteExisting: Bool = true
     ) async throws {
+        let surface = canonicalRoutingSurface(surface)
         guard MODEL_SURFACES.contains(surface) else { throw ProviderRoutingError.invalidRequest }
         try FileManager.default.createDirectory(
             at: surfaceTransactionPath.deletingLastPathComponent(),
@@ -991,6 +1059,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
     }
 
     public func setActiveProvider(surface: String, providerId: String) async throws {
+        let surface = canonicalRoutingSurface(surface)
         guard MODEL_SURFACES.contains(surface),
               !providerId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw ProviderRoutingError.invalidRequest
@@ -1403,7 +1472,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             "chat": chatModel,
             "ios": chatModel,
             "telegram": telegramModel,
-            "missions": PRIMARY_MODEL,
+            "workshop": PRIMARY_MODEL,
             "autonomy": PRIMARY_MODEL,
             "swarms": PRIMARY_MODEL,
             "dream": "gpt-5.4-mini",
@@ -1473,6 +1542,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
     /// Lookup a single surface. Throws `.invalidRequest` if the surface
     /// is not a known MODEL_SURFACE — mirrors the daemon's contract.
     public func modelForSurface(_ surface: String) async throws -> SurfacePreference {
+        let surface = canonicalRoutingSurface(surface)
         guard MODEL_SURFACES.contains(surface) else {
             throw ProviderRoutingError.invalidRequest
         }
@@ -1629,7 +1699,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
     }
 
     public func pinnedModelStringForSurfaceChecked(_ surface: String) async throws -> String? {
-        try await checkedRoutingSnapshot().pinnedModels[surface]
+        ProviderRoutingSurfaceLookup.value(try await checkedRoutingSnapshot().pinnedModels, surface)
     }
 
     /// Parse `providers/surfaces.json` into (surfaceModels, surfaceEfforts)

@@ -497,7 +497,9 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         let active = routingSnapshot.activeProviders
         let turnProvider = LLMCallContext.providerId?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let requestedProvider = turnProvider?.isEmpty == false ? turnProvider : active[surface]
+        let requestedProvider = turnProvider?.isEmpty == false
+            ? turnProvider
+            : ProviderRoutingSurfaceLookup.value(active, surface)
         if let activeProvider = requestedProvider,
            let activeChoice = adapterChoice(forProviderId: activeProvider) {
             if let inferred = inferredProviderId(forModel: model),
@@ -712,7 +714,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         for surface: String,
         routingSnapshot: ProviderRoutingSnapshot
     ) -> (effort: String?, serviceTier: String?) {
-        let pref = routingSnapshot.preferences[surface]
+        let pref = ProviderRoutingSurfaceLookup.value(routingSnapshot.preferences, surface)
             ?? routingSnapshot.preferences["chat"]
         return (
             LLMCallContext.reasoningEffort ?? pref?.reasoningEffort,
@@ -732,7 +734,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         if let requestedModel, !requestedModel.isEmpty {
             return requestedModel
         }
-        let model = routingSnapshot.preferences[surface]?.model
+        let model = ProviderRoutingSurfaceLookup.value(routingSnapshot.preferences, surface)?.model
             ?? routingSnapshot.preferences["chat"]?.model
             ?? ""
         guard !model.isEmpty else {

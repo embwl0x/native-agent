@@ -16,16 +16,16 @@ import TrustCenter
 import MacControl
 import SelfImprovement
 
-// MARK: - Mission planner tool catalog injection
+// MARK: - Execution planner tool catalog injection
 //
-// The Missions module cannot import ChatOrchestration (it would create a
+// The Executions module cannot import ChatOrchestration (it would create a
 // dependency cycle / pull the whole tool stack into the planner), so the real
 // tool catalog that makes the planner TOOL-AWARE is injected from the app
 // layer here. Without this the planner's availableConnectorActions() returns
-// `[]` and missions can ONLY ever emit chat.synthesize steps — they can
+// `[]` and executions can ONLY ever emit chat.synthesize steps — they can
 // describe work but never DO it (root cause fixed 2026-06-15).
 //
-// Each entry is `{id, description}` exactly as planMission reads it
+// Each entry is `{id, description}` exactly as planWorkshopExecution reads it
 // (WorkshopExecution.swift ~L900). Source is SwiftToolDispatcher's own tool schemas —
 // the same catalog the chat tool loop sees. Capped to 40 to bound prompt size
 // (the planner itself prefixes 30 before rendering the menu).
@@ -81,7 +81,7 @@ private actor LazyDispatcherHolder {
     }
 }
 
-/// Append the tool's arg names to its description so the mission planner fills
+/// Append the tool's arg names to its description so the execution planner fills
 /// the RIGHT args (e.g. shell needs `cmd` — without this the planner emitted a
 /// shell step with no cmd → "missing_cmd" failure; 2026-06-15). `*` marks
 /// required args.
@@ -364,7 +364,7 @@ enum BackgroundLoopsAssembly {
             // a quiet day makes no provider call; organism-gated (runs only in a
             // `normal` posture), reserves a Desk slot BEFORE any session, and
             // runs one bounded work session behind the WorkshopToolProfile
-            // membrane. Distinct from the mission executor above (Phase 2 re-homes
+            // membrane. Distinct from the execution executor above (Phase 2 re-homes
             // that engine); this is the new self-pursuit work lane.
             makeWorkshopPumpLoop(dataRoot: dataRoot, cognitionRuntime: cognition),
             makeCognitionMaintenanceLoop(runtime: cognition),

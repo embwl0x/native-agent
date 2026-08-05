@@ -46,7 +46,9 @@ struct MacSyncActionRouter {
         func clean(_ key: String) -> String {
             (payload[key] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        let surface = clean("surface").lowercased()
+        // Fold the legacy `missions` spelling before the MODEL_SURFACES guard —
+        // an iOS build or signed action one version behind still sends it.
+        let surface = WorkshopSurfaceVocabulary.canonicalSurface(clean("surface").lowercased())
         let providerID = clean("provider_id")
         let model = clean("model")
         let reasoning = clean("reasoning_effort").lowercased()
@@ -498,8 +500,10 @@ struct MacSyncActionRouter {
                 // that the selected provider cannot actually serve.
                 let recovered = try await SwiftNativeProviderRouting()
                     .checkedRoutingSnapshot()
-                guard let preference = recovered.preferences[request.surface],
-                      let providerID = recovered.activeProviders[request.surface],
+                guard let preference = ProviderRoutingSurfaceLookup.value(
+                          recovered.preferences, request.surface),
+                      let providerID = ProviderRoutingSurfaceLookup.value(
+                          recovered.activeProviders, request.surface),
                       !providerID.isEmpty else {
                     throw ProviderRoutingError.configurationFailed(
                         "Surface selection did not recover a complete tuple"

@@ -545,7 +545,8 @@ private final class SuspendedAdapter: LLMAdapter, @unchecked Sendable {
         codex: SpyAdapter(providerId: "codex"),
         anthropic: SpyAdapter(providerId: "anthropic"),
         openAI: adapter,
-        lifecycleObserver: capture
+        lifecycleObserver: capture,
+        moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
     )
 
     let output = try await TurnTraceContext.$turnId.withValue("turn-1") {
@@ -578,7 +579,8 @@ private final class SuspendedAdapter: LLMAdapter, @unchecked Sendable {
         codex: SpyAdapter(providerId: "codex"),
         anthropic: SpyAdapter(providerId: "anthropic"),
         openAI: FailingAdapter(providerId: "openai"),
-        lifecycleObserver: capture
+        lifecycleObserver: capture,
+        moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
     )
 
     await #expect(throws: LLMError.self) {
@@ -596,7 +598,8 @@ private final class SuspendedAdapter: LLMAdapter, @unchecked Sendable {
         codex: SpyAdapter(providerId: "codex"),
         anthropic: SpyAdapter(providerId: "anthropic"),
         openAI: SuspendedAdapter(providerId: "openai"),
-        lifecycleObserver: capture
+        lifecycleObserver: capture,
+        moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
     )
 
     let task = Task {
@@ -618,7 +621,8 @@ private final class SuspendedAdapter: LLMAdapter, @unchecked Sendable {
         codex: SpyAdapter(providerId: "codex"),
         anthropic: SpyAdapter(providerId: "anthropic"),
         openAI: SpyAdapter(providerId: "openai", response: "streamed"),
-        lifecycleObserver: capture
+        lifecycleObserver: capture,
+        moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
     )
 
     var text = ""
@@ -641,7 +645,8 @@ private final class SuspendedAdapter: LLMAdapter, @unchecked Sendable {
     let codex = SpyAdapter(providerId: "codex")
     let client = SwiftNativeLLMClient(
         router: MockRouter(chatModel: "ignored"),
-        codex: codex, anthropic: anthropic, openAI: openAI
+        codex: codex, anthropic: anthropic, openAI: openAI,
+        moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
     )
     let out = try await client.complete(prompt: "p", system: nil, model: "claude-3-sonnet")
     #expect(out == "A")
@@ -656,7 +661,8 @@ private final class SuspendedAdapter: LLMAdapter, @unchecked Sendable {
     let codex = SpyAdapter(providerId: "codex")
     let client = SwiftNativeLLMClient(
         router: MockRouter(chatModel: "ignored"),
-        codex: codex, anthropic: anthropic, openAI: openAI
+        codex: codex, anthropic: anthropic, openAI: openAI,
+        moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
     )
     let out = try await client.complete(prompt: "p", system: nil, model: "gpt-5.5")
     #expect(out == "O")
@@ -674,7 +680,8 @@ private final class SuspendedAdapter: LLMAdapter, @unchecked Sendable {
         codex: codex,
         anthropic: anthropic,
         openAI: openAI,
-        xaiOAuthDirect: xai
+        xaiOAuthDirect: xai,
+        moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
     )
     let out = try await client.complete(prompt: "p", system: nil, model: "grok-4.3")
     #expect(out == "X")
@@ -690,7 +697,8 @@ private final class SuspendedAdapter: LLMAdapter, @unchecked Sendable {
     let codex = SpyAdapter(providerId: "codex", response: "C")
     let client = SwiftNativeLLMClient(
         router: MockRouter(chatModel: "ignored"),
-        codex: codex, anthropic: anthropic, openAI: openAI
+        codex: codex, anthropic: anthropic, openAI: openAI,
+        moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
     )
     let out = try await client.complete(prompt: "p", system: nil, model: "llama-3")
     #expect(out == "C")
@@ -717,7 +725,8 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
         codex: codex,
         anthropic: anthropic,
         openAI: openAI,
-        moonshot: moonshot
+        moonshot: moonshot,
+        moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
     )
     let out = try await client.complete(prompt: "p", system: nil, model: modelID)
     #expect(out == "M")
@@ -790,7 +799,8 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
     let codex = SpyAdapter(providerId: "codex")
     let client = SwiftNativeLLMClient(
         router: MockRouter(chatModel: "claude-3-haiku"),
-        codex: codex, anthropic: anthropic, openAI: openAI
+        codex: codex, anthropic: anthropic, openAI: openAI,
+        moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
     )
     let out = try await client.complete(prompt: "p", system: nil, model: nil)
     #expect(out == "fromRouter")
@@ -813,7 +823,8 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
             active: ["telegram": "anthropic"],
             providers: ["anthropic": provider]
         ),
-        codex: codex, anthropic: anthropic, openAI: openAI
+        codex: codex, anthropic: anthropic, openAI: openAI,
+        moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
     )
     let out = try await client.completeMessages(
         messages: [.user("p")],
@@ -838,7 +849,8 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
         ),
         codex: SpyAdapter(providerId: "codex"),
         anthropic: anthropic,
-        openAI: openAI
+        openAI: openAI,
+        moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
     )
 
     let out = try await client.complete(
@@ -865,7 +877,8 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
         ),
         codex: codex,
         anthropic: anthropic,
-        openAI: openAI
+        openAI: openAI,
+        moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
     )
 
     await #expect(throws: MockRouter.CheckedFailure.unavailable) {
@@ -889,7 +902,8 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
         codex: SpyAdapter(providerId: "codex"),
         anthropic: SpyAdapter(providerId: "anthropic"),
         openAI: apiKey,
-        openAIOAuthDirect: oauth
+        openAIOAuthDirect: oauth,
+        moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
     )
     let out = try await client.completeMessages(
         messages: [.user("p")], system: nil, model: "gpt-5.6-sol",
@@ -907,7 +921,8 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
         router: MockRouter(chatModel: "gpt-5.6-sol", active: ["chat": "codex"]),
         codex: codex,
         anthropic: SpyAdapter(providerId: "anthropic"),
-        openAI: openAI
+        openAI: openAI,
+        moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
     )
 
     let out = try await client.completeMessages(
@@ -928,7 +943,8 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
         codex: SpyAdapter(providerId: "codex"),
         anthropic: SpyAdapter(providerId: "anthropic"),
         openAI: apiKey,
-        openAIOAuthDirect: oauth
+        openAIOAuthDirect: oauth,
+        moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
     )
     let out = try await LLMCallContext.$providerId.withValue("openai_oauth_direct") {
         try await client.complete(
@@ -961,7 +977,8 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
         codex: codex,
         anthropic: anthropic,
         openAI: openAI,
-        xaiOAuthDirect: xai
+        xaiOAuthDirect: xai,
+        moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
     )
     let out = try await client.completeMessages(
         messages: [.user("p")],
@@ -1283,7 +1300,8 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
         router: MockRouter(chatModel: "ignored"),
         codex: codexAdapter,
         anthropic: SpyAdapter(providerId: "anthropic"),
-        openAI: SpyAdapter(providerId: "openai")
+        openAI: SpyAdapter(providerId: "openai"),
+        moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
     )
     var collected: [String] = []
     // "llama-3" doesn't match claude/anthropic/gpt/openai prefixes — falls into
@@ -1326,7 +1344,8 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
     let codex = StreamSpyAdapter(providerId: "codex", scripted: ["C"])
     let client = SwiftNativeLLMClient(
         router: MockRouter(chatModel: "ignored"),
-        codex: codex, anthropic: anthropic, openAI: openAI
+        codex: codex, anthropic: anthropic, openAI: openAI,
+        moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
     )
     var collected: [String] = []
     for try await chunk in client.stream(prompt: "p", system: nil, model: "claude-3-opus") {
@@ -1503,7 +1522,8 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
         router: MockRouter(chatModel: "ignored"),
         codex: tracker,
         anthropic: SpyAdapter(providerId: "anthropic"),
-        openAI: SpyAdapter(providerId: "openai")
+        openAI: SpyAdapter(providerId: "openai"),
+        moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
     )
     let consumer = Task { () -> Void in
         do {

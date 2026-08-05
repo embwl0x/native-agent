@@ -270,7 +270,7 @@ public struct WorkshopCompiledLocalFileCopyInvocation: Sendable {
     ///
     /// fix-locked-unbounded-wait (2026-08-02): this observation runs INSIDE
     /// `ProcedureArtifactStore.invoke`'s `withFileLock(invocations.jsonl)` —
-    /// an untimed cross-process `LOCK_EX`. With three Workshop missions already
+    /// an untimed cross-process `LOCK_EX`. With three Workshop executions already
     /// running, `claim` returns nil, `start` throws, and the wait below used to
     /// be unbounded: the record stayed `queued`, nothing ever wrote it again,
     /// and EVERY procedure invocation in EVERY process wedged behind the flock.

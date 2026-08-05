@@ -226,7 +226,7 @@ private final class ScriptedToolDispatchPCT: ToolDispatchClient, @unchecked Send
 
 private func makeEnginePCT(root: URL, llm: any LLMClient, tools: any ToolDispatchClient) -> SwiftNativeTurnEngine {
     SwiftNativeTurnEngine(
-        persona: SwiftNativePersonaEngine(root: root),
+        persona: hermeticPersona(root: root),
         memory: nil,
         router: StubRoutingPCT(),
         trust: hermeticTrust(),

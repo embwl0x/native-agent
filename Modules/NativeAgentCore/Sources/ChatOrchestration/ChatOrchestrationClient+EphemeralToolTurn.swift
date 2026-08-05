@@ -4,7 +4,7 @@ import TrustCenter
 
 extension SwiftNativeChatOrchestrationClient {
     /// Executes a one-shot tool-capable turn without creating chat session state.
-    /// The caller owns the tool scope; mission synthesis supplies its restricted
+    /// The caller owns the tool scope; execution synthesis supplies its restricted
     /// read-only dispatcher. All configured schemas are request-scoped through
     /// `turnActiveTools`, so no `ActiveToolsStore` row or transcript is needed.
     public func runEphemeralToolTurn(
@@ -19,6 +19,9 @@ extension SwiftNativeChatOrchestrationClient {
         verifiedSessionId: String? = nil,
         surface: String
     ) async throws -> ChatResponse {
+        // P2-3: fold before anything derives from it (projection session id,
+        // autonomy resolution, the provider-facing surface).
+        let surface = WorkshopSurfaceVocabulary.foldLegacySpelling(surface)
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty && attachments.isEmpty {
             throw ChatOrchestrationError.emptyMessage
@@ -54,7 +57,7 @@ extension SwiftNativeChatOrchestrationClient {
             imageBlocks: baseContext.imageBlocks,
             fluidContextTurn: baseContext.fluidContextTurn
         )
-        // Ephemeral/mission turns are still turns of the same resident mind.
+        // Ephemeral/execution turns are still turns of the same resident mind.
         // Freeze and commit the existing cognitive projection once, then feed
         // that exact capsule/posture through the ordinary runtime-context seam.
         // The synthetic identity is request-scoped and creates no chat session

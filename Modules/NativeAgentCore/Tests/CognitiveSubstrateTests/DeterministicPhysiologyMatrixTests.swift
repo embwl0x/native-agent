@@ -378,7 +378,7 @@ private func runDeterministicPhysiologyScript(_ rig: PhysiologyMatrixRig) async 
         kind: .workshopExecutionCompleted,
         summary: "Workshop execution failed.",
         turnKind: .system,
-        metadata: ["status": .string("failed"), "missionId": .string("mission-1")]
+        metadata: ["status": .string("failed"), "missionId": .string("wsx-1")]
     )
     rig.clock.advance(10)
     _ = await rig.observe(
@@ -386,7 +386,7 @@ private func runDeterministicPhysiologyScript(_ rig: PhysiologyMatrixRig) async 
         kind: .workshopExecutionCompleted,
         summary: "Workshop execution completed.",
         turnKind: .system,
-        metadata: ["status": .string("completed"), "missionId": .string("mission-1")]
+        metadata: ["status": .string("completed"), "missionId": .string("wsx-1")]
     )
     let correlation: [String: JSONValue] = ["predictionCorrelationId": .string("provider-call-1")]
     rig.clock.advance(10)
@@ -644,7 +644,7 @@ struct DeterministicPhysiologyMatrixTests {
             kind: .workshopExecutionCompleted,
             summary: "Workshop receipt says failed.",
             turnKind: .system,
-            metadata: ["status": .string("failed"), "missionId": .string("mission-exact")]
+            metadata: ["status": .string("failed"), "missionId": .string("execution-exact")]
         )
         let workshopBlocked = await rig.organism.snapshot()
         rig.clock.advance(2)
@@ -653,7 +653,7 @@ struct DeterministicPhysiologyMatrixTests {
             kind: .workshopExecutionCompleted,
             summary: "Workshop receipt says completed.",
             turnKind: .system,
-            metadata: ["status": .string("completed"), "missionId": .string("mission-exact")]
+            metadata: ["status": .string("completed"), "missionId": .string("execution-exact")]
         )
         let workshopClosed = await rig.organism.snapshot()
 

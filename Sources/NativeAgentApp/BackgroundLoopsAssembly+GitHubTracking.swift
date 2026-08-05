@@ -55,7 +55,13 @@ private struct GitHubTrackingRunner: LoopRunner {
     func tickOutcome() async -> LoopTickOutcome {
         do {
             let refreshed = try await GitHubConnectorActions.refreshTrackingIfDue(dataRoot: dataRoot)
-            await runtime.processConnectorChanges()
+            // A1/FIX-2: replay the command store only when the refresh wrote
+            // something OR the op log changed underneath us. The runtime still
+            // fingerprints both op-log files on EVERY tick, so an out-of-process
+            // writer is still picked up within one 300s period — the tick just
+            // no longer pays a 2MB decode + reducer replay to discover that
+            // nothing moved.
+            await runtime.processConnectorChangesIfChanged(refreshed: refreshed)
             if refreshed {
                 await GitHubApprovalEdgeNotifier.shared.evaluateSnapshot(dataRoot: dataRoot)
             }

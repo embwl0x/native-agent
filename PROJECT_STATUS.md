@@ -711,7 +711,7 @@ is active. The current store has one base artifact, one activation artifact,
 13 manual and one automatic invocation, 13 verified invocations, and zero
 corrupt artifacts. A dedicated natural GPT-5.6 turn selected the exact typed
 operation; GPT-5.6 interpreted the request and composed the reply, while the
-compiled Workshop mission completed in about 316 ms with zero planning or step
+compiled Workshop execution completed in about 316 ms with zero planning or step
 provider calls and exact 163-byte verification. The trace records one
 `workshop_submit` dispatch/execution; the compiled result branch sets
 `ordinary_fallback_submitted=false`. The result then appeared as an observed

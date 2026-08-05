@@ -51,7 +51,7 @@ extension NativeClient {
         let runner = makeWorkshopExecutionRunner()
         let merged = await runner.listWorkshopExecutionsMerged()
         let data = try JSONValue.array(merged).serializedData(pretty: false)
-        return try Self.decodeLossyArray(data, context: "getWorkshopExecutions(swift Workshop; surface=missions)")
+        return try Self.decodeLossyArray(data, context: "getWorkshopExecutions(swift Workshop; surface=executions)")
     }
 
     func getRuns() async throws -> [RunRecord] {

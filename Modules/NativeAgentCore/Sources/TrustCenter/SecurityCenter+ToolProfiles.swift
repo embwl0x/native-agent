@@ -43,9 +43,9 @@ extension SwiftNativeSecurityCenter {
         // registration it would route through the unsigned path; the explicit
         // memory_write tag branch in profile() pins the capability shape.)
         "commit_memory",
-        // workshop_submit / workshop_status (2026-06-11, U5 W-I): Agent's mission
+        // workshop_submit / workshop_status (2026-06-11, U5 W-I): Agent's execution
         // chat lane. workshop_submit is a medium-risk write (a thin shim into
-        // the mission queue; the executor's own gates apply downstream),
+        // the execution queue; the executor's own gates apply downstream),
         // workshop_status is a low-risk read. Neither spawns a Process. Register
         // explicitly so SecurityCenter.evaluateTool routes them through the
         // built-in path and the dedicated profile branches pin their shapes —
@@ -377,7 +377,7 @@ extension SwiftNativeSecurityCenter {
             add("skill_write", .low)
             return ToolProfile(capabilities: capabilities, risk: risk)
         }
-        // workshop_submit (2026-06-11, U5 W-I): medium-risk mission queue write.
+        // workshop_submit (2026-06-11, U5 W-I): medium-risk execution queue write.
         // A thin shim into SwiftNativeWorkshopRunner.submit — no Mac filesystem
         // mutation, no process spawn. The executor's own missionPolicy gate,
         // slot cap, and per-step approval gates apply downstream; this profile

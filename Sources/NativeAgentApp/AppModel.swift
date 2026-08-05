@@ -302,8 +302,15 @@ final class AppModel {
     var routePlan: IntentRoutePlan?
     var workflows: [WorkflowRecord] = []
     var workflowRuns: [WorkflowRun] = []
-    var approvals: [ApprovalRequest] = []
-    var inboxItems: [InboxItemRecord] = []
+    // Render-cost audit F13: `didSet` keeps `pendingActivityCount` derived from
+    // EVERY mutation path, not just the badge refresh — see the invariant note
+    // on `recomputePendingActivityCount()`.
+    var approvals: [ApprovalRequest] = [] {
+        didSet { recomputePendingActivityCount() }
+    }
+    var inboxItems: [InboxItemRecord] = [] {
+        didSet { recomputePendingActivityCount() }
+    }
     var mcpServers: [MCPServerRecord] = []
     var mcpSessions: [MCPSessionStatus] = []
     var mcpConsent: [MCPConsentRecord] = []
@@ -497,8 +504,13 @@ final class AppModel {
 
     // PATCH-2026-05-07: self-improvement-ui Beyond B.1/B.3 state
     var trainingRuns: [TrainingRunSummary] = []
-    var trainingProposals: [TrainingProposalSummary] = []
-    var promotionCandidates: [PromotionCandidateSummary] = []
+    // F13: both feed `pendingSelfImprovementCount` → `pendingActivityCount`.
+    var trainingProposals: [TrainingProposalSummary] = [] {
+        didSet { recomputePendingActivityCount() }
+    }
+    var promotionCandidates: [PromotionCandidateSummary] = [] {
+        didSet { recomputePendingActivityCount() }
+    }
     var promotionPending: [PromotionCandidateSummary] = []
     var selfImprovementError: String?
     // PATCH-2026-05-29: dreams-tab error surface for the Dreams tab (kept separate
@@ -506,7 +518,9 @@ final class AppModel {
     // Self-Improvement view's banner).
     var dreamError: String?
     // PATCH-2026-05-07: living-memory Memory proposals state
-    var memoryProposals: [MemoryProposalRecord] = []
+    var memoryProposals: [MemoryProposalRecord] = [] {
+        didSet { recomputePendingActivityCount() }
+    }
     var pendingMemoryProposalsCount: Int {
         memoryProposals.filter { $0.status == "pending" }.count
     }
@@ -559,8 +573,39 @@ final class AppModel {
         pendingTrainingProposalCount + pendingPromotionCandidateCount
     }
 
-    var pendingActivityCount: Int {
+    /// Render-cost audit F13 — the root `ContentView` observes ONE scalar.
+    ///
+    /// This used to be a computed property fanning out to five stored
+    /// collections (`approvals`, `inboxItems`, `memoryProposals`,
+    /// `trainingProposals`, `promotionCandidates`). Reading it inside
+    /// `ContentView.body` (`ContentView.swift:372`, the sidebar badge)
+    /// registered an Observation dependency on all five, so ANY write to ANY
+    /// of them re-ran the root body — which contains the whole
+    /// `NavigationSplitView` and the inline `switch` that constructs the detail
+    /// view, `case .chat: ChatView()` included.
+    ///
+    /// **Staleness invariant.** The scalar is not maintained by the badge
+    /// refresh (that would go stale the moment any other path mutated a
+    /// collection — approve an approval, mark an inbox item read, `refreshAll`
+    /// landing new proposals). It is maintained by a `didSet` on each of the
+    /// five backing collections, so it is recomputed by *every* write to *any*
+    /// of them regardless of which code path performed it. Adding a sixth
+    /// source to the sum without adding its `didSet` is the one way to break
+    /// this; `SidebarBadgeScalarTests` pins each of the five and asserts the
+    /// scalar equals the recomputed sum.
+    private(set) var pendingActivityCount: Int = 0
+
+    /// The authoritative sum. Kept as a separate computed property so tests
+    /// (and the `didSet` invariant) have one place to compare against.
+    var computedPendingActivityCount: Int {
         pendingApprovalsCount + pendingInboxCount + pendingMemoryProposalsCount + pendingSelfImprovementCount
+    }
+
+    /// Re-derive the badge scalar. Equality-gated so an unchanged badge after a
+    /// changed collection still performs zero observable writes on the root.
+    func recomputePendingActivityCount() {
+        let next = computedPendingActivityCount
+        if pendingActivityCount != next { pendingActivityCount = next }
     }
 
     /// PATCH-2026-06-06: activity-flatten — when Cmd+Shift+A / Cmd+Shift+I

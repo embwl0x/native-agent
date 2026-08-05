@@ -22,7 +22,7 @@ extension BackgroundLoopsAssembly {
 
     /// Interval health heartbeat (U2b wave 3, plan design #6). Reads
     /// `HEARTBEAT.md` from the persona dir, gathers a compact live signal
-    /// block (pending evolution / stuck missions / Full-Mac expiry / Doctor),
+    /// block (pending evolution / stuck executions / Full-Mac expiry / Doctor),
     /// and surfaces deterministic anomalies as stable inbox cards. Clean
     /// assessments skip the LLM; anomalous assessments use the app's own LLM
     /// (heartbeat surface picker) only to phrase the alert. The checklist read,
@@ -178,7 +178,10 @@ extension BackgroundLoopsAssembly {
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
-        let checks = obj["checks"] as? [[String: Any]] ?? []
+        // Malformed shape = unknown, not healthy (gpt-5.5 wave-1 NEEDS_FIX).
+        guard let checks = obj["checks"] as? [[String: Any]] else {
+            return nil
+        }
         return !checks.contains { ($0["status"] as? String) == "fail" }
     }
 
@@ -304,7 +307,21 @@ extension BackgroundLoopsAssembly {
             )
         }
 
-        let checks = obj["checks"] as? [[String: Any]] ?? []
+        // Malformed/shape-shifted snapshot reads as UNVERIFIABLE, not as
+        // "0 failing" (gpt-5.5 wave-1 NEEDS_FIX).
+        guard let checks = obj["checks"] as? [[String: Any]] else {
+            return (
+                "Doctor: latest.json is unreadable (unexpected shape).",
+                nil,
+                HeartbeatIssue(
+                    id: "doctor-malformed",
+                    summary: "Doctor snapshot has an unexpected shape.",
+                    detail: "data/doctor/latest.json exists but has no readable `checks` array, so heartbeat cannot verify the health checklist.",
+                    priority: 20,
+                    actions: []
+                )
+            )
+        }
         let fails = checks.filter { ($0["status"] as? String) == "fail" }
         let warns = checks.filter { ($0["status"] as? String) == "warn" }
         var line = "Doctor: \(fails.count) failing, \(warns.count) warning, \(checks.count) total."
@@ -450,7 +467,7 @@ extension BackgroundLoopsAssembly {
         return (
             line + " Stale: " + rows + ".",
             HeartbeatIssue(
-                id: "mission-stuck", // compatibility wire ID: persisted in heartbeat status/dedup state
+                id: "execution-stuck", // compatibility wire ID: persisted in heartbeat status/dedup state
                 summary: "\(stale.count) Workshop execution(s) look stuck.",
                 detail: "\(stale.count) Workshop execution(s) have been queued/running/blocked longer than \(Int(heartbeatExecutionStuckAge / 3600))h: \(rows).",
                 priority: 35,

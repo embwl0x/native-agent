@@ -208,7 +208,7 @@ private func makeProfile(root: URL, handle: String = "desk_test") -> WorkshopToo
     let llm = WorkshopScriptedLLM()
     let trust = SwiftNativeTrustCenter(dataRoot: root)
     let engine = SwiftNativeTurnEngine(
-        persona: SwiftNativePersonaEngine(root: root),
+        persona: hermeticPersona(root: root, dataRoot: root),
         memory: nil,
         router: router,
         trust: trust,
@@ -252,7 +252,7 @@ private func makeProfile(root: URL, handle: String = "desk_test") -> WorkshopToo
     let llm = WorkshopForcedLoadLLM()
     let trust = SwiftNativeTrustCenter(dataRoot: root)
     let engine = SwiftNativeTurnEngine(
-        persona: SwiftNativePersonaEngine(root: root),
+        persona: hermeticPersona(root: root, dataRoot: root),
         memory: nil,
         router: router,
         trust: trust,

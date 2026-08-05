@@ -223,7 +223,7 @@ private func runNativeLoop(
     let llm = NativeScriptedLLM(scripts: scripts, errorAtCall: errorAtCall)
     let toolClient = SchemaToolDispatchClient(scripted: scriptedTools)
     let engine = SwiftNativeTurnEngine(
-        persona: SwiftNativePersonaEngine(root: root),
+        persona: hermeticPersona(root: root),
         memory: nil,
         router: StubRoutingNative(),
         trust: hermeticTrust(),

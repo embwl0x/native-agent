@@ -311,7 +311,7 @@ func serialFallback_envFlagParsing() {
 @Test
 func parallelBatch_resultsReassembleInOriginalIndexOrder() async throws {
     let dir = try makeTempDir("reassembly")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     // First call is the SLOWEST — completion order is the reverse of issue
     // order, so passing this test requires index-ordered reassembly.
     let tools = InstrumentedToolDispatch(
@@ -370,7 +370,7 @@ func parallelBatch_resultsReassembleInOriginalIndexOrder() async throws {
 @Test
 func parallelBatch_respectsConcurrencyCapOfFour() async throws {
     let dir = try makeTempDir("cap")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let names = [
         "read_file", "list_dir", "search_kg",
         "recall_memory", "session_search", "mail_search",
@@ -397,7 +397,7 @@ func parallelBatch_respectsConcurrencyCapOfFour() async throws {
 @Test
 func mixedBatch_serialSlotNeverOverlapsNeighboringGroups_orderPreserved() async throws {
     let dir = try makeTempDir("mixed")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     // [read_file, search_kg] parallel → write_file serial → [recall_memory,
     // list_dir] parallel. Groups must run strictly in order.
     let tools = InstrumentedToolDispatch(
@@ -451,7 +451,7 @@ func mixedBatch_serialSlotNeverOverlapsNeighboringGroups_orderPreserved() async 
 @Test
 func parallelBatch_oneFailureIsIsolated_siblingsAndOrderIntact() async throws {
     let dir = try makeTempDir("failure")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let tools = InstrumentedToolDispatch(
         scripted: ["read_file": .string("r-ok"), "search_kg": .string("s-ok")],
         delaysNs: ["read_file": 40_000_000, "search_kg": 40_000_000],
@@ -494,7 +494,7 @@ func parallelBatch_oneFailureIsIsolated_siblingsAndOrderIntact() async throws {
 @Test
 func parallelBatch_turnCancellation_cancelsInFlightChildren() async throws {
     let dir = try makeTempDir("cancel")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     // Children sleep 5s; the test cancels the turn once 2+ are in flight.
     // Task.sleep throws CancellationError on cancel → each slot resolves to
     // the serial-identical error-object result and the turn ends promptly.
@@ -554,7 +554,7 @@ func parallelBatch_turnCancellation_cancelsInFlightChildren() async throws {
 @Test
 func serialFallbackOverride_forcesStrictlySequentialExecution() async throws {
     let dir = try makeTempDir("fallback")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let tools = InstrumentedToolDispatch(
         scripted: [
             "read_file": .string("r"), "list_dir": .string("l"), "search_kg": .string("s"),
@@ -592,7 +592,7 @@ func serialFallbackOverride_forcesStrictlySequentialExecution() async throws {
 @Test
 func streamingLoop_parallelBatch_sameReassemblyContract() async throws {
     let dir = try makeTempDir("streaming")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let tools = InstrumentedToolDispatch(
         scripted: ["read_file": .string("rr"), "search_kg": .string("kk")],
         delaysNs: ["read_file": 60_000_000, "search_kg": 5_000_000]
@@ -627,7 +627,7 @@ func streamingLoop_parallelBatch_sameReassemblyContract() async throws {
 @Test
 func streamingLoop_countsProviderCallsAcrossIterations() async throws {
     let dir = try makeTempDir("stream-count")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let tools = InstrumentedToolDispatch(scripted: ["read_file": .string("rr")])
     let call = openAIBatch([(id: "c1", name: "read_file")])
     // Two tool-call iterations, then a plain final reply → 3 provider calls.
@@ -648,7 +648,7 @@ func streamingLoop_countsProviderCallsAcrossIterations() async throws {
 @Test
 func streamingLoop_countsSingleProviderCallOnImmediateReply() async throws {
     let dir = try makeTempDir("stream-count-1")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let tools = InstrumentedToolDispatch(scripted: [:])
     let llm = MessagesCapturingLLM(scripted: ["straight answer"])
     let engine = makeEngine(persona: persona, llm: llm, tools: tools)
@@ -664,7 +664,7 @@ func streamingLoop_countsSingleProviderCallOnImmediateReply() async throws {
 @Test
 func streamingLoop_countsProviderCallOnExhaustion() async throws {
     let dir = try makeTempDir("stream-count-exhaust")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let tools = InstrumentedToolDispatch(scripted: ["read_file": .string("rr")])
     let call = openAIBatch([(id: "c1", name: "read_file")])
     // Every response is a tool call → the loop exhausts at maxIterations.
@@ -713,7 +713,7 @@ private final class SchemaAdvertisingToolDispatch: ToolDispatchClient, @unchecke
 @Test
 func structuredStreamingLoop_announceWithoutAct_bouncesOnceThenAccepts() async throws {
     let dir = try makeTempDir("struct-announce")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let tools = SchemaAdvertisingToolDispatch(scripted: ["recall_memory": .string("clean")])
     // Iteration 1: pure narration, no tool call → completion-contract bounce.
     // Iteration 2: the real final answer → accepted.
@@ -747,7 +747,7 @@ func structuredStreamingLoop_announceWithoutAct_bouncesOnceThenAccepts() async t
 @Test
 func structuredStreamingLoop_secondAnnounceAcceptedAsFinal_noLoop() async throws {
     let dir = try makeTempDir("struct-announce-cap")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let tools = SchemaAdvertisingToolDispatch(scripted: ["recall_memory": .string("clean")])
     // Three consecutive announcements: bounce twice, then accept the third as
     // final so a model that refuses to act can never loop.
@@ -770,7 +770,7 @@ func structuredStreamingLoop_secondAnnounceAcceptedAsFinal_noLoop() async throws
 @Test
 func structuredBlockingLoop_announceWithoutAct_bouncesOnceThenAccepts() async throws {
     let dir = try makeTempDir("struct-announce-blocking")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let tools = SchemaAdvertisingToolDispatch(scripted: ["recall_memory": .string("clean")])
     let llm = MessagesCapturingLLM(scripted: [
         "Reading the README now.",
@@ -804,7 +804,7 @@ func structuredBlockingLoop_announceWithoutAct_bouncesOnceThenAccepts() async th
 @Test
 func structuredBlockingLoop_emptyReply_bouncesOnceThenAccepts() async throws {
     let dir = try makeTempDir("struct-empty-blocking")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let tools = SchemaAdvertisingToolDispatch(scripted: ["recall_memory": .string("clean")])
     // Iteration 1: empty reply (thinking-only) → empty-reply bounce.
     // Iteration 2: the real final answer → accepted.
@@ -836,7 +836,7 @@ func structuredBlockingLoop_emptyReply_bouncesOnceThenAccepts() async throws {
 @Test
 func structuredBlockingLoop_secondEmptyReplyAcceptedAsFinal_noLoop() async throws {
     let dir = try makeTempDir("struct-empty-blocking-cap")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let tools = SchemaAdvertisingToolDispatch(scripted: ["recall_memory": .string("clean")])
     // Three consecutive empty replies: bounce twice, then accept the third as
     // final so a provider that only ever thinks can never loop.
@@ -861,7 +861,7 @@ func structuredBlockingLoop_secondEmptyReplyAcceptedAsFinal_noLoop() async throw
 @Test
 func structuredStreamingLoop_emptyReply_bouncesOnceThenAccepts() async throws {
     let dir = try makeTempDir("struct-empty-streaming")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let tools = SchemaAdvertisingToolDispatch(scripted: ["recall_memory": .string("clean")])
     let llm = MessagesCapturingLLM(scripted: [
         "",
@@ -889,7 +889,7 @@ func structuredStreamingLoop_emptyReply_bouncesOnceThenAccepts() async throws {
 @Test
 func structuredStreamingLoop_secondEmptyReplyAcceptedAsFinal_noLoop() async throws {
     let dir = try makeTempDir("struct-empty-streaming-cap")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let tools = SchemaAdvertisingToolDispatch(scripted: ["recall_memory": .string("clean")])
     let llm = MessagesCapturingLLM(scripted: ["", "", "", "never-reached"])
     let engine = makeEngine(persona: persona, llm: llm, tools: tools)
@@ -907,7 +907,7 @@ func structuredStreamingLoop_secondEmptyReplyAcceptedAsFinal_noLoop() async thro
 @Test
 func parallelBatches_groupPerIteration_clearingSweepAgesThemAsOneIteration() async throws {
     let dir = try makeTempDir("clearing")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     // 8 iterations of a 2-call parallel batch, then a final reply. Results
     // are >180 chars so the sweep stubs them once they age out of the keep
     // window (current + keepFullIterations).
@@ -987,7 +987,7 @@ func parallelBatches_groupPerIteration_clearingSweepAgesThemAsOneIteration() asy
 @Test
 func singleParallelSafeCall_runsSequential_keepsExactSerialProgressOrder() async throws {
     let dir = try makeTempDir("single")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let tools = InstrumentedToolDispatch(scripted: ["read_file": .string("ok")])
     let batch = openAIBatch([(id: "c1", name: "read_file")])
     let llm = MessagesCapturingLLM(scripted: [batch, "fin"])

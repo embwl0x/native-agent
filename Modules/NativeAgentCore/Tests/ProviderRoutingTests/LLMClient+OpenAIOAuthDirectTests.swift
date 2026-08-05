@@ -838,7 +838,8 @@ private func stubSession() -> URLSession {
             codex: SpyAdapter2(providerId: "codex"),
             anthropic: SpyAdapter2(providerId: "anthropic"),
             openAI: openAI,
-            openAIOAuthDirect: ExhaustedOAuth()
+            openAIOAuthDirect: ExhaustedOAuth(),
+            moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
         )
         do {
             _ = try await client.complete(prompt: "p", system: nil, model: "gpt-5.5")
@@ -1099,7 +1100,8 @@ private func stubSession() -> URLSession {
             codex: SpyAdapter2(providerId: "codex"),
             anthropic: SpyAdapter2(providerId: "anthropic"),
             openAI: openAI,
-            openAIOAuthDirect: oauth
+            openAIOAuthDirect: oauth,
+            moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
         )
         let out = try await client.complete(prompt: "p", system: nil, model: "gpt-5.5")
         #expect(out == "from-oauth")
@@ -1123,7 +1125,8 @@ private func stubSession() -> URLSession {
             codex: SpyAdapter2(providerId: "codex"),
             anthropic: SpyAdapter2(providerId: "anthropic"),
             openAI: openAI,
-            openAIOAuthDirect: ThrowingOAuthAdapter()
+            openAIOAuthDirect: ThrowingOAuthAdapter(),
+            moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
         )
         do {
             _ = try await client.complete(prompt: "p", system: nil, model: "gpt-5.5")
@@ -1147,7 +1150,8 @@ private func stubSession() -> URLSession {
             codex: SpyAdapter2(providerId: "codex"),
             anthropic: SpyAdapter2(providerId: "anthropic"),
             openAI: openAI,
-            openAIOAuthDirect: TransientOAuthAdapter()
+            openAIOAuthDirect: TransientOAuthAdapter(),
+            moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
         )
         do {
             _ = try await client.complete(prompt: "p", system: nil, model: "gpt-5.5")
@@ -1178,7 +1182,8 @@ private func stubSession() -> URLSession {
             codex: SpyAdapter2(providerId: "codex"),
             anthropic: SpyAdapter2(providerId: "anthropic"),
             openAI: openAI,
-            openAIOAuthDirect: ThrowingOAuthAdapter()
+            openAIOAuthDirect: ThrowingOAuthAdapter(),
+            moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
         )
         var chunks: [String] = []
         do {
@@ -1206,7 +1211,8 @@ private func stubSession() -> URLSession {
             codex: SpyAdapter2(providerId: "codex"),
             anthropic: anthropic,
             openAI: SpyAdapter2(providerId: "openai"),
-            anthropicOAuthDirect: ThrowingAnthropicOAuthAdapter()
+            anthropicOAuthDirect: ThrowingAnthropicOAuthAdapter(),
+            moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
         )
         var chunks: [String] = []
         do {
@@ -1229,7 +1235,8 @@ private func stubSession() -> URLSession {
             router: MockRouter2(chatModel: "ignored"),
             codex: SpyAdapter2(providerId: "codex"),
             anthropic: SpyAdapter2(providerId: "anthropic"),
-            openAI: openAI
+            openAI: openAI,
+            moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
         )
         let out = try await client.complete(prompt: "p", system: nil, model: "gpt-5.5")
         #expect(out == "from-apikey")

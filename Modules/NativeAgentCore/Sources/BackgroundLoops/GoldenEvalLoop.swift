@@ -2,24 +2,24 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-/// Weekly submission of the fixed GOLDEN-EVAL missions (MEASURE leg v2 of the
+/// Weekly submission of the fixed GOLDEN-EVAL executions (MEASURE leg v2 of the
 /// north-star). Submitting the SAME jobs on a cadence gives the outcome
 /// scoreboard a CONTROLLED, comparable week-over-week cohort — organic
-/// single-user mission volume is too sparse for a stable trend, so the
+/// single-user execution volume is too sparse for a stable trend, so the
 /// scoreboard's completion-rate signal needs a fixed denominator to move
 /// against. The jobs are tagged `GoldenEvalJobs.triggerSource` so the
 /// scoreboard can isolate them (`weeklyOutcomeStats(onlyTriggerSource:)`).
 ///
-/// OFF BY DEFAULT (opt-in via `isEnabled`): golden jobs submit REAL missions
+/// OFF BY DEFAULT (opt-in via `isEnabled`): golden jobs submit REAL executions
 /// that EXECUTE — the planner runs and steps dispatch, which costs tokens. A
 /// fresh install must NEVER spend tokens on a hidden weekly eval; the user
 /// turns it on deliberately (the same gate philosophy as every other
 /// autonomous loop). When disabled, `tick()` is a silent no-op.
 ///
 /// Dependency-clean: the actual submission is an injected closure (the assembly
-/// wires it to the mission runner + `GoldenEvalJobs.jobs`), so BackgroundLoops
-/// gains no Missions dependency — the same pattern as WeeklySelfImprovementLoop's
-/// stageProposal / missionOutcomes closures.
+/// wires it to the execution runner + `GoldenEvalJobs.jobs`), so BackgroundLoops
+/// gains no Executions dependency — the same pattern as WeeklySelfImprovementLoop's
+/// stageProposal / workshopOutcomes closures.
 public struct GoldenEvalLoop: LoopRunner {
     public let loopId: String = "golden_eval"
     public let interval: TimeInterval
@@ -33,11 +33,11 @@ public struct GoldenEvalLoop: LoopRunner {
     /// `goldenEvalEnabled` preference). No spend until the user opts in.
     private let isEnabled: @Sendable () async -> Bool
     /// Submits the golden jobs and returns how many were submitted (for the
-    /// log). Receives the loop's `now` so the submitter can stamp each mission's
+    /// log). Receives the loop's `now` so the submitter can stamp each execution's
     /// `createdAt` from the SAME instant the week-marker is keyed on — otherwise
-    /// a batch straddling Monday 00:00 UTC could mark week N while a mission
+    /// a batch straddling Monday 00:00 UTC could mark week N while an execution
     /// record lands in week N+1's scoreboard bucket (gpt-5.5 re-review HIGH).
-    /// Injected so this module needs no Missions / WorkshopExecutionSpec dependency.
+    /// Injected so this module needs no Executions / WorkshopExecutionSpec dependency.
     private let submitGoldenJobs: @Sendable (Date) async -> Int
 
     public init(

@@ -54,7 +54,7 @@ struct SkillLifecycleView: View {
                 Button {
                     Task {
                         await appModel.loadSkillManifests()
-                        loadSyncReceipt()
+                        await loadSyncReceipt()
                     }
                 } label: {
                     Label("Refresh", systemImage: "arrow.clockwise")
@@ -151,7 +151,7 @@ struct SkillLifecycleView: View {
         }
         .task {
             await appModel.loadSkillManifests()
-            loadSyncReceipt()
+            await loadSyncReceipt()
         }
         .sheet(item: $reviewTarget) { info in
             SkillReviewSheet(info: info, onDismiss: {
@@ -170,12 +170,18 @@ struct SkillLifecycleView: View {
 
     /// Read the pointer-sync receipt the launch/mutation syncs write. Absent
     /// file → no line (fresh install before first sync).
-    private func loadSyncReceipt() {
+    ///
+    /// Render-cost audit F9: the `Data(contentsOf:)` + `JSONSerialization`
+    /// pair used to run synchronously on the MainActor on every appear. Same
+    /// parse, same resulting line, now off the main thread.
+    private func loadSyncReceipt() async {
         let receipt = PersistenceCore.defaultDataRoot()
             .appendingPathComponent("skills/.pointer_sync_receipt.json")
-        guard let data = try? Data(contentsOf: receipt),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: String]
-        else {
+        let obj = await Task.detached(priority: .utility) { () -> [String: String]? in
+            guard let data = try? Data(contentsOf: receipt) else { return nil }
+            return try? JSONSerialization.jsonObject(with: data) as? [String: String]
+        }.value
+        guard let obj else {
             syncReceiptLine = nil
             return
         }
@@ -292,18 +298,34 @@ private struct SkillBodySheet: View {
             // Bounded read (gpt-5.5 review MED): a malformed registry/body
             // row must not turn this sheet into an arbitrary-file viewer.
             // Only the two skills roots are readable here.
-            let raw = URL(fileURLWithPath: info.registry.path).standardizedFileURL
+            // Resolve symlinks BEFORE the prefix check and read the RESOLVED
+            // path (gpt-5.5 wave-1 BLOCKING): a lexical prefix check on the
+            // raw path passes for `bodies/x.md → /anywhere/else`, and
+            // String(contentsOf:) follows the link. Resolving both sides
+            // closes the escape and the check/read race on the same inode
+            // path.
+            let raw = URL(fileURLWithPath: info.registry.path)
+                .standardizedFileURL.resolvingSymlinksInPath()
             let allowedRoots = [
                 PersistenceCore.defaultDataRoot()
                     .appendingPathComponent("skills/bodies", isDirectory: true),
                 PersonaRootResolver.resolve()
                     .appendingPathComponent("skills/bodies", isDirectory: true),
-            ].map { $0.standardizedFileURL.path.hasSuffix("/") ? $0.standardizedFileURL.path : $0.standardizedFileURL.path + "/" }
+            ].map { root -> String in
+                let resolved = root.standardizedFileURL.resolvingSymlinksInPath().path
+                return resolved.hasSuffix("/") ? resolved : resolved + "/"
+            }
             guard allowedRoots.contains(where: { raw.path.hasPrefix($0) }) else {
                 body_ = ""
                 return
             }
-            body_ = (try? String(contentsOf: raw, encoding: .utf8)) ?? ""
+            // Render-cost audit F9: the body can be arbitrarily large; read it
+            // off the MainActor. The root check above stays on main — it is
+            // pure path arithmetic, and keeping it here keeps the security
+            // gate ahead of any I/O.
+            body_ = await Task.detached(priority: .utility) {
+                (try? String(contentsOf: raw, encoding: .utf8)) ?? ""
+            }.value
         }
     }
 }

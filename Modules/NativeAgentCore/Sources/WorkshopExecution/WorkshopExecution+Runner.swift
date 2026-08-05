@@ -21,7 +21,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     /// uniformly regardless of which other params they pass. Default TRUE
     /// since the executor port landed (2026-06-10,
     /// docs/build_plans/missions-executor-port.md): WorkshopExecutorLoop
-    /// (WorkshopExecution+Executor.swift) drains queued missions, so submit() is
+    /// (WorkshopExecution+Executor.swift) drains queued executions, so submit() is
     /// honest again. Pass `false` explicitly to restore the honest-refusal
     /// gate (e.g. an embedding that registers no executor loop).
     public init(
@@ -85,17 +85,17 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
 
     // WAVE 41 W01 (REOPEN §6.220-rd2 #1) — write-side parity helpers.
     //
-    // Mac native mission writes (submit/create, update) MUST mirror the three
+    // Mac native execution writes (submit/create, update) MUST mirror the three
     // daemon submission semantics they previously bypassed:
     //   (a) the missionPolicy.enabled gate (`Runtime._missions_allowed`,
     //       the retired daemon) — the daemon route 403s create when
     //       missionPolicy is off;
-    //   (b) the mission-slots capacity gate (`_mission_slots` BoundedSemaphore,
+    //   (b) the execution-slots capacity gate (`_mission_slots` BoundedSemaphore,
     //       the retired daemon / L734) — submit() raises MissionsBusyError
     //       when no slot is free;
     //   (c) the Activity feed row (`Runtime.record_activity`, the retired daemon
     //       L5288-L5308) the legacy create/update handlers emit so the Mac
-    //       Activity view shows mission events.
+    //       Activity view shows execution events.
     // These read/append plain JSON files co-located with the daemon under the
     // SAME data root, so the WorkshopExecution module stays self-contained (no new
     // TrustCenter inter-module dependency — same in-module-trust-gate pattern
@@ -143,7 +143,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     ///   `bool(policy.get("developerMode")) or
     ///    bool(policy.get("missionPolicy", {}).get("enabled", False))`
     /// evaluated with merged-default semantics. Public + static so the
-    /// app-layer EXECUTOR gate (BackgroundLoopsAssembly.missionExecutorGate)
+    /// app-layer EXECUTOR gate (BackgroundLoopsAssembly.workshopExecutorGate)
     /// evaluates the EXACT same rules as this submit-side gate — gpt-5.5
     /// executor-port blocker #7 flagged the two gates diverging (the
     /// executor gate treated a present-but-malformed missionPolicy as ALLOW
@@ -180,19 +180,25 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     /// Mirror of the `_mission_slots` capacity:
     /// `BoundedSemaphore(max_active + max_pending)` where the two counts come
     /// from the SAME env vars (defaults 3 + 32 = 35). The daemon holds one
-    /// permit for a mission's whole queued→running lifetime (acquire in
+    /// permit for an execution's whole queued→running lifetime (acquire in
     /// submit() L734, release in _run_mission's finally), so the live count is
-    /// the number of missions in a non-terminal state. We can't hold a
+    /// the number of executions in a non-terminal state. We can't hold a
     /// cross-process semaphore for the daemon executor's lifetime, so we mirror
     /// the EFFECT: count active (queued/running/blocked_on_approval) queue
-    /// missions and refuse a new submit when that count is already at the cap —
+    /// executions and refuse a new submit when that count is already at the cap —
     /// the same condition under which the daemon's `acquire(blocking=False)`
     /// would fail.
     private static func workshopExecutionSlotsCap() -> Int {
-        let env = ProcessInfo.processInfo.environment
-        // Python: max(1, int(...)) for active; max(0, int(...)) for pending.
-        let active = max(1, Int(env["NATIVE_AGENT_MAX_ACTIVE_MISSIONS"] ?? "") ?? 3)
-        let pending = max(0, Int(env["NATIVE_AGENT_MAX_PENDING_MISSIONS"] ?? "") ?? 32)
+        // P2-5: canonical names are `..._EXECUTIONS`; the `..._MISSIONS`
+        // spellings are the public 0.3.x contract and still win when both are
+        // set, so a launch agent that pins the old name is never silently
+        // overridden. Reading one logs a single deprecation line.
+        let active = max(1, Int(
+            ExecutionEnvVocabulary.value(canonical: "NATIVE_AGENT_MAX_ACTIVE_EXECUTIONS") ?? ""
+        ) ?? 3)
+        let pending = max(0, Int(
+            ExecutionEnvVocabulary.value(canonical: "NATIVE_AGENT_MAX_PENDING_EXECUTIONS") ?? ""
+        ) ?? 32)
         return active + pending
     }
 
@@ -258,7 +264,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     /// REDACTION: the daemon runs title/detail through `redact_secret_text` and
     /// payload through `redact_secret_value`
     /// before writing. gpt-5.5 review #4 flagged the prior native path's missing
-    /// redaction as a real parity/security gap (user-entered mission text could
+    /// redaction as a real parity/security gap (user-entered execution text could
     /// land an OAuth token / API key verbatim in the Activity feed). This path
     /// now mirrors the retired daemon through the NativeAgentCore-owned
     /// `NativeAgentSecretRedactor`: title/detail use `redactText`, while payload
@@ -295,7 +301,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
                 logLabel: "Workshop"
             )
         } catch {
-            // An activity-feed write must NEVER unwind the mission write that
+            // An activity-feed write must NEVER unwind the execution write that
             // already landed durably (parity with the daemon, where
             // record_activity is fire-and-forget after the state change).
             Self.logger.info("record_activity append failed: \(String(describing: error), privacy: .public)")
@@ -310,7 +316,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         return plan
     }
 
-    /// Same as planMission, but also returns the failure reason (or nil)
+    /// Same as planWorkshopExecution, but also returns the failure reason (or nil)
     /// when the LLM path falls back to the deterministic stub for any reason
     /// OTHER than the clean autonomy-disabled / autonomy-not-applicable case.
     /// submit() uses this to emit the Python `planner_fallback` timeline
@@ -350,7 +356,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         }
         // Render the FULL tool menu (was prefix(30) — which silently cut
         // builder/shell tools from the planner's view, so "run a shell command"
-        // missions picked the wrong tool and failed; 2026-06-15, the user: missions
+        // executions picked the wrong tool and failed; 2026-06-15, the user: executions
         // do everything). Cap high (200) only as a prompt-size backstop.
         let toolsSummary = availableTools.prefix(200).map { t in
             "  - \(t.id): \(t.description) [autonomy=\(t.autonomy)]"
@@ -405,7 +411,11 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         // Call codex.
         let rawOutput: String
         do {
-            (_, rawOutput) = try await planner.runCodex(prompt: prompt, surface: "missions", timeoutSeconds: 60)
+            (_, rawOutput) = try await planner.runCodex(
+                prompt: prompt,
+                surface: WorkshopSurfaceVocabulary.canonical,
+                timeoutSeconds: 60
+            )
         } catch is CancellationError {
             throw CancellationError()
         } catch {
@@ -440,7 +450,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         // default-constructed runner accepts submits. The gate stays for
         // callers that explicitly construct with `executorAvailable: false`
         // (no executor loop registered) — accepting a submit there would
-        // queue a mission that can never run while burning a planner LLM
+        // queue an execution that can never run while burning a planner LLM
         // call, the "fabricated success" shape the audit closed everywhere
         // else.
         guard executorAvailable else {
@@ -473,7 +483,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         // capacity guard at the TOP of MissionRunner.submit,
         // which the runner checks AFTER its objective validation (L728) and
         // BEFORE planning + file IO. Refuse a new submit when the queue is
-        // already at (max_active + max_pending) active missions.
+        // already at (max_active + max_pending) active executions.
         try await assertSlotAvailable()
 
         // Build the Workshop execution record.
@@ -533,7 +543,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
                 .write(to: workshopExecutionDir(id).appendingPathComponent(".reserved"))
         }
 
-        // Ensure mission dir + receipts/ exist (daemon does this in
+        // Ensure execution dir + receipts/ exist (daemon does this in
         // TaskQueue.enqueue at L350-L352). receipts_dir is the absolute
         // path string the Python side writes.
         let dir = workshopExecutionDir(id)
@@ -576,7 +586,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
 
         // ORDER MATTERS — wave-12 gpt-5.5 finding #4.
         // Write timeline.jsonl FIRST so a crash between the two writes leaves
-        // a mission with no mission.json (cleanly absent, scanner skips it)
+        // an execution with no mission.json (cleanly absent, scanner skips it)
         // rather than a mission.json with no enqueued event in the timeline
         // (poisoned audit trail). The Python side writes mission.json first
         // (L353-L359), which has the inverse failure mode; wave 21 fixes
@@ -585,7 +595,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         // emitted BEFORE the enqueued event when the codex path bailed.
         //
         // Each timeline append is wrapped in withFileLock(timeline).
-        // timeline.jsonl can be appended concurrently by Swift mission
+        // timeline.jsonl can be appended concurrently by Swift execution
         // planning/execution paths and the trigger scheduler;
         // O_APPEND alone does not keep a record contiguous across the
         // appendBytes short-write loop, so an unlocked concurrent append can
@@ -656,15 +666,15 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         // WAVE 41 W01 (c) Activity row — mirror the daemon legacy create_mission's
         // record_activity:
         //   record_activity("mission", "Workshop task created", title, "ok",
-        //                   mission["id"], {"missionId": mission["id"]})
+        //                   execution["id"], {"missionId": execution["id"]})
         // emitted right after the durable write (the daemon records once the
-        // mission is persisted, with NO cancellation point between).
+        // execution is persisted, with NO cancellation point between).
         //
         // gpt-5.5 review #5: this MUST sit BEFORE the post-write
         // checkCancellation() below. A landed mission.json write is durable; if a
-        // cancel were checked first, the mission would exist on disk with NO
+        // cancel were checked first, the execution would exist on disk with NO
         // Activity row — the exact gap the reopen flags. Emitting here guarantees
-        // every durably-created mission gets its row. recordActivity is
+        // every durably-created execution gets its row. recordActivity is
         // non-fatal (logs on IO failure) so it never unwinds the landed write.
         await recordActivity(
             kind: "mission",
@@ -677,7 +687,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
 
         try Task.checkCancellation() // cancel after the write+activity should NOT fire the detached auto-start
 
-        // Daemon retired (fac-F1): no fire-and-forget auto-start. The mission
+        // Daemon retired (fac-F1): no fire-and-forget auto-start. The execution
         // lands durably on disk in `queued`; WorkshopExecutorLoop's next drain
         // pass (BackgroundLoops-registered, gated on enableAutonomy +
         // missionPolicy) claims and runs it.
@@ -696,23 +706,23 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         // deliberately doesn't hold (module stays dependency-clean). Callers
         // that want an explicit start should call
         // WorkshopExecutorLoop.start(missionId:); the background loop drains
-        // queued missions on its own. This protocol stub keeps surfacing a
+        // queued executions on its own. This protocol stub keeps surfacing a
         // typed error rather than silently no-op (W6).
         throw WorkshopExecutionError.unavailable
     }
 
-    // MARK: cancel (WAVE 33 W07 — mission-lifecycle WRITE)
+    // MARK: cancel (WAVE 33 W07 — execution-lifecycle WRITE)
     //
     // Port of MissionRunner.cancel. The WHOLE
     // read-mutate-write runs inside one withFileLock(mission.json) critical
     // section. This is intentionally STRONGER than the Python side: Python's
     // TaskQueue.get reads mission.json OUTSIDE file_lock (only the subsequent
     // _write_json is locked), so the daemon executor could in principle mutate
-    // the file between Python's read and write. With `.missions` ON in
+    // the file between Python's read and write. With `.executions` ON in
     // production the Swift daemon-bridge and the Python executor BOTH touch
     // this file, so we hold the cross-process flock across the full
     // read→mutate→write to make the cancel atomic against the executor and
-    // against a concurrent updateMission(). The flock is the SAME advisory
+    // against a concurrent updateWorkshopExecution(). The flock is the SAME advisory
     // lock the Python file_lock(path) uses (the retired daemon <->
     // PersistenceCore+FileLock.swift), so mutual exclusion holds across both
     // processes.
@@ -727,11 +737,11 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
 
         // Mutate-under-flock. Returns the post-cancel record AND whether a
         // timeline event needs appending (skip the append on the idempotent
-        // already-cancelled no-op, matching Python's early `return mission`).
+        // already-cancelled no-op, matching Python's early `return execution`).
         let work: @Sendable () async throws -> (record: WorkshopExecutionRecord, didCancel: Bool) = { [persistence] in
             let raw = await persistence.readJSON(executionRecordJSON, defaultValue: .null)
             guard case .object(let obj) = raw, case .string(let gotId)? = obj["id"], !gotId.isEmpty else {
-                // Mirror Python's `if mission is None: raise ValueError(...)`.
+                // Mirror Python's `if execution is None: raise ValueError(...)`.
                 throw WorkshopExecutionError.invalidRequest("Workshop execution not found: \(trimmed)")
             }
             var record = SwiftNativeWorkshopRunner.recordFromJSON(obj)
@@ -783,7 +793,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         // there is no deadlock and no lock-ordering hazard with the timeline
         // lock acquired below. The Python side now wraps _append_jsonl in
         // file_lock(path), taking the SAME advisory lock on
-        // `<timeline>.lock`. Without this, a `.missions`-ON Swift cancel and a
+        // `<timeline>.lock`. Without this, a `.executions`-ON Swift cancel and a
         // concurrent Python executor timeline append (e.g. a `failed`/`step`
         // event mid-cancel) could interleave into a torn JSONL line and break
         // the strict reader. timeline.jsonl's lock is distinct from
@@ -814,19 +824,19 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         return record
     }
 
-    // MARK: updateMission (WAVE 33 W07 — queue-bridge field patch)
+    // MARK: updateWorkshopExecution (WAVE 33 W07 — queue-bridge field patch)
     //
     // Port of the `_missions_allowed()` queue-bridge branch of
     // Runtime.update_mission. Applies the
-    // field patches to the queue mission's mission.json under flock and
+    // field patches to the queue execution's mission.json under flock and
     // returns the post-patch record. Returns nil when the id is NOT a queue
-    // mission. Historical missions.jsonl rows are a different file shape and
+    // execution. Historical missions.jsonl rows are a different file shape and
     // are not handled by this queue bridge. Whole read-mutate-write held under
     // the flock, same rationale as cancel().
     public func updateWorkshopExecution(_ patch: WorkshopExecutionUpdate) async throws -> WorkshopExecutionRecord? {
         let id = patch.id.trimmingCharacters(in: .whitespacesAndNewlines)
         if id.isEmpty {
-            // Empty id never matches a queue mission; return nil so callers
+            // Empty id never matches a queue execution; return nil so callers
             // surface Unknown/unsupported through the Swift path.
             return nil
         }
@@ -848,11 +858,11 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
 
         // The work closure returns (record?, changed) so the caller can emit the
         // Activity row only when a real patch landed (matching the daemon's
-        // `if changed:` save gate). nil record == not a queue mission.
+        // `if changed:` save gate). nil record == not a queue execution.
         let work: @Sendable () async throws -> (record: WorkshopExecutionRecord, changed: Bool)? = { [persistence] in
             let raw = await persistence.readJSON(executionRecordJSON, defaultValue: .null)
             guard case .object(let obj) = raw, case .string(let gotId)? = obj["id"], !gotId.isEmpty else {
-                // Not a queue mission → nil, daemon falls through to legacy.
+                // Not a queue execution → nil, daemon falls through to legacy.
                 return nil
             }
             var record = SwiftNativeWorkshopRunner.recordFromJSON(obj)
@@ -918,10 +928,10 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         } catch let e as WorkshopExecutionError {
             throw e
         } catch {
-            throw WorkshopExecutionError.persistenceFailure("updateMission mission.json write failed: \(error)")
+            throw WorkshopExecutionError.persistenceFailure("updateWorkshopExecution mission.json write failed: \(error)")
         }
 
-        // Not a queue mission → nil; daemon falls through to its legacy path.
+        // Not a queue execution → nil; daemon falls through to its legacy path.
         guard let outcome else { return nil }
 
         // WAVE 41 W01 (c) Activity row — mirror the daemon legacy update_mission's
@@ -930,14 +940,14 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         //                   "ok" if status not in {failed, blocked} else "warn",
         //                   mission_id, {"status": ..., "phase": ...})
         // Emit ONLY when a real change landed (the daemon writes — and so emits —
-        // only inside `if changed`). The queue Mission has no `phase` field
+        // only inside `if changed`). The queue Execution has no `phase` field
         // (documented §6.220), so payload.phase mirrors that as null, exactly
         // like the daemon's queue-bridge would if it recorded.
         //
         // DELIBERATE DAEMON-QUEUE-PATH DIVERGENCE (documented §6.240): the daemon's
         // queue-bridge update branch (L5448-L5468) returns BEFORE record_activity —
         // only its LEGACY path (L5490) emits the row. This native bridge emits the
-        // SAME-shape row so the Mac Activity feed shows queue-mission updates the
+        // SAME-shape row so the Mac Activity feed shows queue-execution updates the
         // legacy path would show; a daemon queue-bridge update emits none. This is
         // the intent of the reopen ("native writes emit no record_activity rows")
         // and is gated behind default-OFF .missionsWrites.
@@ -968,7 +978,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     //
     // The lock is on timeline.jsonl's OWN `.lock` sibling — distinct from
     // mission.json's lock — so it never nests inside or contends with the
-    // read-mutate-write critical section that submit()/cancel()/updateMission()
+    // read-mutate-write critical section that submit()/cancel()/updateWorkshopExecution()
     // hold on mission.json. Uniform locking (2026-08-01): EVERY persistence
     // conformer takes this lock — mock persistence included — pinned by
     // UniformFileLockTests; do not restore an unlocked mock path.
@@ -984,7 +994,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         }
     }
 
-    // MARK: reads (WAVE 32 W07 — mission listing / detail / timeline)
+    // MARK: reads (WAVE 32 W07 — execution listing / detail / timeline)
     //
     // Read-side port of the daemon's GET /v1/missions, GET /v1/missions/<id>,
     // and GET /v1/missions/<id>/timeline handlers (the retired daemon
@@ -996,13 +1006,13 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     // The compatibility record shape is preserved under Workshop ownership.
     // Reads remain lock-free, matching the prior behavior.
 
-    /// Path to the LEGACY flat mission store (the retired daemon:
+    /// Path to the LEGACY flat execution store (the retired daemon:
     /// `self.missions_path = root / "missions" / "missions.json"`). This is a
     /// SEPARATE store from the queue dir — a flat JSON list of camelCase
-    /// mission dicts created by `create_mission`. GET /v1/missions MERGES
+    /// execution dicts created by `create_mission`. GET /v1/missions MERGES
     /// queue + legacy (L51363-L51365: `new_missions + old_missions`), so the
     /// SwiftNative list-read must read BOTH or it silently drops every legacy
-    /// mission.
+    /// execution.
     public nonisolated var legacyWorkshopExecutionsPath: URL {
         root
             .appendingPathComponent("workshop", isDirectory: true)
@@ -1019,7 +1029,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         return Self.recordFromJSON(obj)
     }
 
-    /// Byte-faithful single-mission read for the GET /v1/missions/<id> seam
+    /// Byte-faithful single-execution read for the GET /v1/missions/<id> seam
     ///. Returns the asdict-equivalent object
     /// WITHOUT the `timeline` key (the caller attaches it); nil when absent.
     /// gpt-5.5 finding #1: use this (not getMission(...)?.toJSON()) so `plan`
@@ -1080,7 +1090,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         return await scanAllQueueWorkshopExecutions().filter { live.contains($0.record.status) }.map(\.record)
     }
 
-    /// `TaskQueue.list_history`: terminal missions,
+    /// `TaskQueue.list_history`: terminal executions,
     /// sorted by updated_at DESC, capped at 20 — the `active=false` query
     /// branch of GET /v1/missions.
     public func listHistory() async -> [WorkshopExecutionRecord] {
@@ -1119,7 +1129,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     public func listWorkshopExecutionsMerged() async -> [JSONValue] {
         // Queue first (created_at DESC), faithful asdict bytes; then legacy
         // verbatim. Matches the retired daemon `new_missions +
-        // old_missions`. gpt-5.5 finding #1: emit via readJSONForMission so the
+        // old_missions`. gpt-5.5 finding #1: emit via readJSONForWorkshopExecution so the
         // raw `plan` survives instead of being normalized by WorkshopExecutionRecord.
         let queue = await scanAllQueueWorkshopExecutions()
             .sorted { $0.record.createdAt > $1.record.createdAt }
@@ -1130,14 +1140,14 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
 
     /// Build a WorkshopExecutionRecord from a persisted mission.json object, mirroring
     /// Byte-faithful read serialization mirroring the daemon's HTTP wire output
-    /// for a single mission: `asdict(TaskQueue._from_dict(data))` (missions.py
+    /// for a single execution: `asdict(TaskQueue._from_dict(data))` (missions.py
     /// L432-L450 + dataclasses.asdict). gpt-5.5 review (wave 32 W07) finding #1:
     /// Python preserves `plan` / `steps_completed` / `expected_outputs` /
     /// `result` VERBATIM (`list(data.get(k) or [])` — raw dicts unchanged) and
     /// only `str()`-coerces the scalar string fields. Round-tripping `plan`
     /// through `WorkshopExecutionRecord`/`WorkshopExecutionStep` would NORMALIZE it (default a
     /// missing tool_or_action, drop unknown keys), altering the wire bytes vs
-    /// the daemon. So the wire paths (listMissionsMerged, getMissionDetail) use
+    /// the daemon. So the wire paths (listWorkshopExecutionsMerged, getWorkshopExecutionWireJSON) use
     /// THIS, not `recordFromJSON(...).toJSON()`. Defaults match _from_dict:
     /// status->"queued", trigger_source->"manual", trust_required->"none",
     /// rerun_count->0 (graceful coerce; the daemon never writes a non-int).
@@ -1340,7 +1350,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
             }()
             // Python: dict(s.get("args") or {}) — None/missing/empty-dict → {};
             // a non-dict truthy value (string/array/number) raises TypeError,
-            // which cascades to the outer planMission stub-fallback path.
+            // which cascades to the outer planWorkshopExecution stub-fallback path.
             let args: JSONValue
             switch sobj["args"] ?? .null {
             case .null:

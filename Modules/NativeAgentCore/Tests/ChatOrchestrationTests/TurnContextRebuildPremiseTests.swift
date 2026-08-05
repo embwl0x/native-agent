@@ -152,7 +152,7 @@ private func premiseEngine(
     clock: @escaping @Sendable () -> Date = { Date(timeIntervalSince1970: 1_780_000_000) }
 ) -> SwiftNativeTurnEngine {
     SwiftNativeTurnEngine(
-        persona: SwiftNativePersonaEngine(root: personaRoot),
+        persona: hermeticPersona(root: personaRoot),
         memory: memory,
         router: PremiseStubRouting(),
         trust: hermeticTrust(),

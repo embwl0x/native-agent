@@ -52,7 +52,7 @@ private final class MockProviderRouting: ProviderRoutingRef, @unchecked Sendable
 private func makeBotWithDeps(
     routing: MockProviderRouting? = nil
 ) async -> SwiftNativeTelegramBot {
-    let bot = SwiftNativeTelegramBot()
+    let bot = SwiftNativeTelegramBot(dataRoot: hermeticTelegramDataRoot())
     let deps = TelegramBotCompletenessDeps(routing: routing)
     await bot.registerCompletenessDeps(deps)
     return bot
@@ -199,6 +199,7 @@ struct TelegramBotCompletenessTests {
         let routing = MockProviderRouting()
         routing.surfaceResult = ("gpt-5.5", "openai_oauth_direct")
         let bot = SwiftNativeTelegramBot(
+            dataRoot: hermeticTelegramDataRoot(),
             completenessDeps: TelegramBotCompletenessDeps(routing: routing)
         )
         let reply = try await bot.dispatchSwiftSlashCommand("/model", args: [], chatId: 1)

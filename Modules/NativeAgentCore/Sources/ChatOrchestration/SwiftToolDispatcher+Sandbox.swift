@@ -509,7 +509,7 @@ extension SwiftToolDispatcher {
         // it resolves relative paths against repoRoot and does NOT expand `~`,
         // so "~/Desktop/x" would land at <repoRoot>/~/Desktop/x (a literal `~`
         // dir) instead of $HOME/Desktop/x. Full-mac file ops (danger-full-access
-        // sandbox) should honor `~` (2026-06-15: caught live — a mission wrote
+        // sandbox) should honor `~` (2026-06-15: caught live — an execution wrote
         // agent_yolo.txt under the repo's `~/` instead of the real Desktop).
         var resolvedInput = input
         for key in ["path", "source", "destination", "dest", "src", "to", "from"] {

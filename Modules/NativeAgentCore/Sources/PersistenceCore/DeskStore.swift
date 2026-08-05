@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 // MARK: - SwiftNativeDeskStore — append-under-flock event store for Agent Desk
@@ -362,6 +363,11 @@ public struct SwiftNativeDeskStore: Sendable {
     /// tests.
     let opsCompactionThreshold: Int
 
+    /// The `liveState()` replay memo this store consults. Defaults to the
+    /// process-wide one; injectable so a test can own an isolated memo rather
+    /// than racing every other desk suite for its 8 entries.
+    let liveStateMemo: DeskLiveStateMemo
+
     public init(
         dataRoot: URL,
         persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore(),
@@ -372,6 +378,21 @@ public struct SwiftNativeDeskStore: Sendable {
         self.persistence = persistence
         self.changeBus = changeBus
         self.opsCompactionThreshold = max(2, opsCompactionThreshold)
+        self.liveStateMemo = SwiftNativeDeskStore.sharedLiveStateMemo
+    }
+
+    init(
+        dataRoot: URL,
+        persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore(),
+        changeBus: StoreChangeBus = .shared,
+        opsCompactionThreshold: Int = 2_048,
+        liveStateMemo: DeskLiveStateMemo
+    ) {
+        self.dataRoot = dataRoot
+        self.persistence = persistence
+        self.changeBus = changeBus
+        self.opsCompactionThreshold = max(2, opsCompactionThreshold)
+        self.liveStateMemo = liveStateMemo
     }
 
     private var deskDir: URL { dataRoot.appendingPathComponent("desk", isDirectory: true) }
@@ -1238,11 +1259,68 @@ public struct SwiftNativeDeskStore: Sendable {
     /// (gpt-5.5 compaction review HIGH). The ops-first ordering in
     /// readFeedUnlocked only protects readers whose two reads are not
     /// separated by a full append+compact cycle; the lock closes the rest.
+    /// PERF (wave 2, F5): the replay is MEMOIZED on the feed's (device, inode,
+    /// size, mtime_ns) identity for BOTH files it reads — `desk_ops.jsonl` and
+    /// `desk_ops_base.json`. One desk event fans out into ~5 `liveState()`
+    /// calls (desk_notify's `nextMeaningfulDeadline` + `tickOutcome`,
+    /// workshop_pump's `nextMeaningfulDeadline` + the pump's own read), each
+    /// re-decoding the live 352KB op-log plus the 179KB base and re-running the
+    /// reducer to produce the SAME bytes.
+    ///
+    /// Three properties keep this a work skip and never a truth skip:
+    ///
+    /// 1. **The flock is still taken, and the stat happens INSIDE it.** The
+    ///    lock ordering, the blocking behaviour against a concurrent writer,
+    ///    and the "no reader may straddle a compaction" guarantee documented
+    ///    above are all unchanged. Only the decode+reduce is skipped.
+    /// 2. **Compaction invalidates.** It rewrites the base (new mtime/size AND
+    ///    a new inode — `writeJSON` is atomic-replace) and truncates the ops
+    ///    file to zero. Either half alone changes the stamp.
+    /// 3. **A racing non-flock writer cannot poison the memo.** The stamp is
+    ///    taken before the read and RE-TAKEN after it; the entry is stored only
+    ///    if the two agree, so a write that lands mid-read costs one wasted
+    ///    replay rather than caching a torn view.
+    ///
+    /// The one skipped side effect is `SnapshotTailOpLog.noteIntegrity`'s
+    /// stderr line, which is already dedupe-latched per (feed, path, summary)
+    /// after its first emission — so a memo hit suppresses nothing the
+    /// unmemoized path would have printed a second time.
     public func liveState() async throws -> DeskState {
         try await persistence.withFileLock(opsPath) {
+            let key = Self.memoKey(opsPath)
+            let before = Self.feedStamp(opsPath: opsPath, basePath: basePath)
+            if let cached = await liveStateMemo.lookup(key: key, stamp: before) {
+                return cached
+            }
             let feed = try await readFeedUnlocked()
-            return Self.compact(base: feed.base, feed.ops)
+            let state = Self.compact(base: feed.base, feed.ops)
+            let after = Self.feedStamp(opsPath: opsPath, basePath: basePath)
+            if let before, after == before {
+                await liveStateMemo.store(key: key, stamp: before, state: state)
+            }
+            return state
         }
+    }
+
+    /// Process-wide `liveState()` memo. Keyed on the ops path so alternate data
+    /// roots (tests, secondary roots, the sweep CLI's root) never collide.
+    static let sharedLiveStateMemo = DeskLiveStateMemo()
+
+    /// Symlinks are resolved so the same desk reached through `/var/...` and
+    /// `/private/var/...` is one entry (wave-1 review: an unresolved key both
+    /// double-caches and defeats eviction).
+    static func memoKey(_ opsPath: URL) -> String {
+        opsPath.resolvingSymlinksInPath().path
+    }
+
+    /// The feed's identity: a stat-strength stamp for each of the two files a
+    /// replay reads. `nil` means at least one file's state is UNKNOWABLE (a
+    /// stat that failed for a reason other than "does not exist"), which never
+    /// matches a stored stamp and is never stored — that path always replays.
+    static func feedStamp(opsPath: URL, basePath: URL) -> DeskLiveStateMemo.FeedStamp? {
+        guard let ops = DeskLiveStateMemo.fileStamp(opsPath),
+              let base = DeskLiveStateMemo.fileStamp(basePath) else { return nil }
+        return DeskLiveStateMemo.FeedStamp(ops: ops, base: base)
     }
 
     /// All archived item records, in feed (append) order.
@@ -1797,5 +1875,118 @@ public struct SwiftNativeDeskStore: Sendable {
             result.append(item); emitted.insert(item.handle)
         }
         return result
+    }
+}
+
+// MARK: - liveState() replay memo (perf wave 2, F5)
+
+/// Process-wide memo behind `SwiftNativeDeskStore.liveState()`.
+///
+/// Every entry is keyed on the ops path AND stamped with the stat identity of
+/// the two files a replay reads. A hit is only ever served while the caller
+/// holds the ops flock, so this is strictly a decode+reduce skip: the lock, the
+/// blocking behaviour, and the compaction-straddle guarantee are untouched.
+actor DeskLiveStateMemo {
+    /// One file's stat-strength identity. `absent` is a first-class state, not
+    /// an error: a fresh desk has no `desk_ops_base.json` until the first
+    /// compaction, and that is the steady state for most installs — refusing to
+    /// memoize it would leave the common case unfixed. Creation, deletion, and
+    /// atomic replacement all move between/among these cases and invalidate.
+    enum FileStamp: Sendable, Equatable {
+        case absent
+        case present(device: Int32, inode: UInt64, size: Int64, seconds: Int, nanoseconds: Int)
+    }
+
+    struct FeedStamp: Sendable, Equatable {
+        let ops: FileStamp
+        let base: FileStamp
+    }
+
+    /// `nil` when the file's state cannot be determined — a stat that failed
+    /// for any reason OTHER than "no such file". A nil stamp never matches and
+    /// is never stored, so an unknowable feed always pays the full replay.
+    static func fileStamp(_ url: URL) -> FileStamp? {
+        var info = stat()
+        if stat(url.path, &info) == 0 {
+            return .present(
+                device: info.st_dev,
+                inode: info.st_ino,
+                size: Int64(info.st_size),
+                seconds: info.st_mtimespec.tv_sec,
+                nanoseconds: info.st_mtimespec.tv_nsec
+            )
+        }
+        return errno == ENOENT ? .absent : nil
+    }
+
+    /// Bound on distinct data roots held at once. Roots are few (live + any
+    /// test/secondary root); the cap exists so a long-lived process that walks
+    /// many temp roots cannot grow this map without limit — every insert has a
+    /// matching eviction.
+    static let maxEntries = 8
+
+    private struct Entry: Sendable {
+        let stamp: FeedStamp
+        let state: DeskState
+    }
+
+    private var entries: [String: Entry] = [:]
+    /// Least-recently-stored first; the eviction order for `maxEntries`.
+    private var order: [String] = []
+    /// PER-KEY hit/miss tallies. Test-only, and per-key on purpose: the memo is
+    /// process-wide, so global counters are polluted by every other desk suite
+    /// running concurrently in the same test process.
+    private var counters: [String: (hits: Int, misses: Int)] = [:]
+
+    func lookup(key: String, stamp: FeedStamp?) -> DeskState? {
+        var tally = counters[key] ?? (0, 0)
+        defer { note(key: key, tally: tally) }
+        guard let stamp, let entry = entries[key], entry.stamp == stamp else {
+            tally.misses += 1
+            return nil
+        }
+        tally.hits += 1
+        return entry.state
+    }
+
+    private func note(key: String, tally: (hits: Int, misses: Int)) {
+        if counters[key] == nil, counters.count >= Self.maxEntries * 4 {
+            counters.removeAll()
+        }
+        counters[key] = tally
+    }
+
+    func store(key: String, stamp: FeedStamp, state: DeskState) {
+        if entries[key] == nil {
+            order.append(key)
+            while order.count > Self.maxEntries, let oldest = order.first {
+                order.removeFirst()
+                entries[oldest] = nil
+            }
+        }
+        entries[key] = Entry(stamp: stamp, state: state)
+    }
+
+    /// Test seam: fresh-process equivalent for ONE feed. Key-scoped on
+    /// purpose — this memo is process-wide, so a global wipe from one test
+    /// silently re-warms every other test running beside it.
+    func forget(key: String) {
+        entries[key] = nil
+        order.removeAll { $0 == key }
+        counters[key] = nil
+    }
+
+    /// Test seam: fresh-process equivalent for everything. Only safe when no
+    /// other desk work is in flight.
+    func reset() {
+        entries.removeAll()
+        order.removeAll()
+        counters.removeAll()
+    }
+
+    /// Test seam: this key's tallies plus the live entry count.
+    func _testStats(key: String) -> (hits: Int, misses: Int, entries: Int) {
+        let tally = counters[key] ?? (0, 0)
+        return (tally.hits, tally.misses, entries.count)
     }
 }

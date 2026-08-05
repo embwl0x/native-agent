@@ -320,6 +320,17 @@ extension GitHubConnectorActions {
         ).json
     }
 
+    /// (signature, observationFingerprint) for one PR row at a given staleness
+    /// window. The seam exists so a test can hold the UPSTREAM row fixed and vary
+    /// only the local-clock-derived `stale` bit.
+    static func testTrackingFingerprints(
+        pullRow: [String: Any],
+        staleHours: Int
+    ) -> (signature: String, observation: String)? {
+        guard let entity = basicPREntity(pullRow, repo: "owner/repo", staleHours: staleHours) else { return nil }
+        return (entity.signature, entity.observationFingerprint)
+    }
+
     static func testUpsertTrackingEntities(
         _ rows: [JSONValue],
         project: String,
@@ -565,6 +576,22 @@ private struct TrackingEntity: Sendable, Equatable {
         [state, updatedAt, reviewState ?? "", checks ?? "", mergeable ?? "", needsUser ? "user" : "", blocked ? "blocked" : "", stale ? "stale" : ""].joined(separator: "|")
     }
 
+    /// Fingerprint for the CADENCE LEARNER, which counts "this differs from last
+    /// time" as evidence that the ref moved upstream.
+    ///
+    /// NOT `signature`. `signature` folds in `stale`, and `stale` is
+    /// `isStale(updatedAt, hours:)` — a comparison against the LOCAL CLOCK. A PR
+    /// nobody has touched flips it false→true the moment it crosses the staleness
+    /// window, so `signature` would report a change on a ref where upstream did
+    /// nothing at all: a fabricated sample in the EWMA, and a third of the
+    /// evidence the learner needs before it trusts an interval. Everything below
+    /// is a value GitHub reported. `needsUser`/`blocked` are dropped for the same
+    /// reason they'd be redundant — they derive from `reviewState`/`checks`,
+    /// which are already here.
+    var observationFingerprint: String {
+        [state, updatedAt, reviewState ?? "", checks ?? "", mergeable ?? ""].joined(separator: "|")
+    }
+
     var json: JSONValue {
         var o: [String: JSONValue] = [
             "key": .string(key), "repository": .string(repo), "number": .int(Int64(number)),
@@ -714,10 +741,42 @@ private enum GitHubProjectTracker {
     static func refreshIfDue(dataRoot: URL) async throws -> Bool {
         guard let config = try? loadConfig(dataRoot: dataRoot) else { return false }
         if let snapshot = try? await loadSnapshot(dataRoot: dataRoot),
-           let refreshed = DeskClock.parseISO(snapshot.refreshedAt),
-           Date().timeIntervalSince(refreshed) < Double(config.refreshIntervalMinutes * 60) { return false }
+           let refreshed = DeskClock.parseISO(snapshot.refreshedAt) {
+            let due = await learnedDueInterval(
+                dataRoot: dataRoot,
+                entities: snapshot.entities,
+                configuredSeconds: Double(config.refreshIntervalMinutes * 60),
+                now: Date()
+            )
+            if Date().timeIntervalSince(refreshed) < due { return false }
+        }
         _ = try await refresh(dataRoot: dataRoot, force: false)
         return true
+    }
+
+    /// How long this snapshot may sit before it is refetched, given what the
+    /// cadence lane LEARNED about the refs in it. The policy (configured rate is
+    /// a floor, learning may only stretch, partial knowledge stretches nothing)
+    /// lives in `DeskCadenceLearner.batchIntervalSeconds` — it is a cadence rule,
+    /// not a GitHub one, and it is tested there. This is the IO shim.
+    ///
+    /// Note `refresh(force:)` keeps its own gate on the raw configured interval.
+    /// That gate is the rate-limit backstop for direct callers; this one only
+    /// ever makes the opportunistic path fire LESS often, so the two never fight.
+    static func learnedDueInterval(
+        dataRoot: URL,
+        entities: [TrackingEntity],
+        configuredSeconds: Double,
+        now: Date
+    ) async -> Double {
+        guard !entities.isEmpty else { return configuredSeconds }
+        let stats = await DeskCadenceStore(dataRoot: dataRoot).load()
+        return DeskCadenceLearner.batchIntervalSeconds(
+            refKeys: entities.map(\.key),
+            stats: stats,
+            configuredSeconds: configuredSeconds,
+            now: now
+        )
     }
 
     static func refresh(dataRoot: URL, force: Bool) async throws -> TrackingSnapshot {
@@ -1288,7 +1347,76 @@ private enum GitHubProjectTracker {
             _ = try await store.archiveItem(item.handle)
             archived += 1
         }
+
+        // Wave 5 — hand this refresh's observed reality to the desk. Everything
+        // above only touches rows the TRACKER owns; this pass covers the rest
+        // of the board, which is where stale state actually accumulates: a card
+        // User filed himself that points at a PR, a campaign blocked on an issue
+        // that closed last week. Those get drift FLAGS (they never opted into
+        // auto-close), while rows that did opt in resolve themselves with the
+        // receipt attached. Ordering matters: the tracker's own sweep ran
+        // first, so anything it already closed is terminal here and produces
+        // no second decision.
+        await reconcileObservedReality(entities: entities, store: store, dataRoot: dataRoot)
+
         return (created, updated, archived)
+    }
+
+    /// Build observations from this refresh and reconcile the desk against
+    /// them. Deliberately best-effort: a failure here must never fail the
+    /// tracker refresh that produced the data, so it logs and returns.
+    fileprivate static func reconcileObservedReality(
+        entities: [TrackingEntity],
+        store: SwiftNativeDeskStore,
+        dataRoot: URL
+    ) async {
+        guard !entities.isEmpty else { return }
+        let now = Date()
+        let observedAt = DeskClock.nowISO()
+        let observations = entities.map { entity -> DeskObservedRef in
+            let terminal = entity.state.lowercased() != "open"
+            let merged = entity.commandObservation?.isMerged == true
+            // The receipt is quoted state plus a link — never a paraphrase, and
+            // never empty, because empty evidence is what forbids the close.
+            let evidence = "\(entity.kind == "pull_request" ? "PR" : "issue") #\(entity.number) "
+                + "\(merged ? "merged" : entity.state) in \(entity.repo) as of \(entity.updatedAt) — \(entity.url)"
+            return DeskObservedRef(
+                refKey: entity.key,
+                status: merged ? "merged" : entity.state,
+                terminal: terminal,
+                evidence: evidence,
+                source: "github",
+                observedAt: observedAt,
+                // Content digest, not the fetch envelope and not anything the
+                // local clock can move (see `observationFingerprint`): an
+                // unchanged PR polled ten times records ten observations and
+                // zero changes, which is what lets the learner stretch.
+                fingerprint: entity.observationFingerprint
+            )
+        }
+
+        let cadenceStore = DeskCadenceStore(dataRoot: dataRoot)
+        for observation in observations {
+            do {
+                _ = try await cadenceStore.recordObservation(
+                    refKey: observation.refKey,
+                    fingerprint: observation.fingerprint,
+                    at: now
+                )
+            } catch {
+                NSLog("[desk-observe] cadence record failed for \(observation.refKey): \(error)")
+            }
+        }
+
+        do {
+            let state = try await store.liveState()
+            let verdict = DeskObservationEvaluator.evaluate(state, observations: observations, now: now)
+            guard !verdict.isEmpty else { return }
+            let outcome = try await DeskObservationApplier.apply(verdict, to: store)
+            NSLog("[desk-observe] \(outcome.summary)")
+        } catch {
+            NSLog("[desk-observe] reconciliation failed: \(error)")
+        }
     }
 
     private static func trackingKey(_ item: DeskItem) -> String? {

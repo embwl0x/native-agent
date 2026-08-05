@@ -115,19 +115,38 @@ final class TurnInspectorStore {
         // Drop any pending drop-count poll from the now-dead subscription so a
         // stale count can't be re-armed under the next generation.
         pendingDropCheck = nil
+        // Land whatever the debounce was holding. Dropping it instead would
+        // leave `cards` missing the final events of the session AND leave
+        // `cardsRefreshScheduled` latched true, so the next `start()` would
+        // never schedule again.
+        flushPendingCardsRefresh()
     }
 
     private func ingestLive(_ event: TurnTraceEvent, subscriptionId: UUID) {
+        appendLive(event)
+        // Tag the pending poll with the CURRENT generation so a poll queued by a
+        // dead subscription can't survive a stop()/restart.
+        pendingDropCheck = (subscriptionId, liveGeneration)
+        scheduleDropRefresh()
+    }
+
+    /// Ring append + debounced regroup. Split out of `ingestLive` so the
+    /// F12 debounce tests drive the PRODUCTION path rather than a re-typed
+    /// copy of it — standing up a real bus subscription in a test would also
+    /// push trace events through the shared persist lane, which is the
+    /// hermeticity trap this repo already paid for once.
+    private func appendLive(_ event: TurnTraceEvent) {
         liveEvents.append(event)
         // Bound the ring: drop oldest beyond the cap.
         if liveEvents.count > Self.liveEventCap {
             liveEvents.removeFirst(liveEvents.count - Self.liveEventCap)
         }
-        if mode == .live { recomputeCards() }
-        // Tag the pending poll with the CURRENT generation so a poll queued by a
-        // dead subscription can't survive a stop()/restart.
-        pendingDropCheck = (subscriptionId, liveGeneration)
-        scheduleDropRefresh()
+        if mode == .live { scheduleCardsRefresh() }
+    }
+
+    /// Test seam: the live-ingest path minus the bus subscription.
+    func _appendLiveForTesting(_ event: TurnTraceEvent) {
+        appendLive(event)
     }
 
     /// Coalesced drop-count poll: at most one in-flight bus query regardless of
@@ -164,6 +183,9 @@ final class TurnInspectorStore {
 
     func setMode(_ newMode: Mode) {
         guard newMode != mode else { return }
+        // A live-ingest debounce still in flight would fire under the NEW mode
+        // and regroup the wrong source. Drop it; both branches below recompute.
+        cancelPendingCardsRefresh()
         mode = newMode
         if newMode == .replay {
             Task { await loadReplay(for: replayDate) }
@@ -173,6 +195,8 @@ final class TurnInspectorStore {
     }
 
     func clearLive() {
+        // User-initiated: the list must empty NOW, not up to a debounce later.
+        cancelPendingCardsRefresh()
         liveEvents.removeAll()
         if mode == .live { recomputeCards() }
     }
@@ -204,10 +228,77 @@ final class TurnInspectorStore {
         replayEvents = result.events
         replaySkipped = result.skipped
         replayLoading = false
-        if mode == .replay { recomputeCards() }
+        if mode == .replay {
+            // Same reason as `setMode`: a live-ingest debounce landing after
+            // this would regroup with the wrong source.
+            cancelPendingCardsRefresh()
+            recomputeCards()
+        }
     }
 
     // MARK: Card recompute
+
+    /// Render-cost audit F12 — coalesced card recompute.
+    ///
+    /// `recomputeCards()` re-buckets, per-bucket-sorts, re-allocates every row
+    /// and final-sorts the whole ring (cap 4000), then wholesale replaces the
+    /// observed `cards` array — so every `Identifiable` row is a new object and
+    /// the `ForEach` re-diffs the entire list. Firing that once per trace event
+    /// is O(n log n) per event, i.e. O(n² log n) over a session, and while the
+    /// Inspector tab is open during a live turn it was the hottest loop in the
+    /// app.
+    ///
+    /// This is a trailing debounce with the same ownership shape as
+    /// `scheduleDropRefresh()` above: one in-flight token, re-armed by the
+    /// events that arrive during the window, so N events in a window cost ONE
+    /// regroup instead of N.
+    ///
+    /// **Deliberately debounce-only.** Incremental append (the other half of
+    /// F12) would change what the grouping produces and is held as a separate
+    /// NEEDS-USER item. Debouncing changes only *when* rows appear — batched by
+    /// at most `cardsDebounceSeconds` on a developer-gated diagnostics tab —
+    /// and every user-initiated transition (`setMode`, `clearLive`,
+    /// `loadReplay`, `stop`) cancels or flushes the pending window, so nothing
+    /// the user asked for is ever deferred.
+    private static let cardsDebounceSeconds: TimeInterval = 0.1
+    private var cardsRefreshScheduled = false
+    private var cardsRefreshTask: Task<Void, Never>?
+
+    private func scheduleCardsRefresh() {
+        guard !cardsRefreshScheduled else { return }
+        cardsRefreshScheduled = true
+        cardsRefreshTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(Self.cardsDebounceSeconds * 1_000_000_000))
+            guard let self, !Task.isCancelled else { return }
+            self.cardsRefreshTask = nil
+            self.cardsRefreshScheduled = false
+            self.recomputeCards()
+        }
+    }
+
+    /// Drop a pending window without regrouping. The caller is about to
+    /// recompute (or replace the source) itself.
+    private func cancelPendingCardsRefresh() {
+        cardsRefreshTask?.cancel()
+        cardsRefreshTask = nil
+        cardsRefreshScheduled = false
+    }
+
+    /// Drop a pending window and apply it immediately.
+    private func flushPendingCardsRefresh() {
+        guard cardsRefreshScheduled else { return }
+        cancelPendingCardsRefresh()
+        recomputeCards()
+    }
+
+    /// Test seam: drive the debounce to completion deterministically instead of
+    /// racing `cardsDebounceSeconds` in a test.
+    func _flushPendingCardsRefreshForTesting() {
+        flushPendingCardsRefresh()
+    }
+
+    /// Test seam: true while a debounced regroup is armed.
+    var _hasPendingCardsRefreshForTesting: Bool { cardsRefreshScheduled }
 
     private func recomputeCards() {
         let source = (mode == .live) ? liveEvents : replayEvents

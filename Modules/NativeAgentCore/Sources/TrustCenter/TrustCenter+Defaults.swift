@@ -129,6 +129,10 @@ extension SwiftNativeTrustCenter {
                 "chat": .string("openai_oauth_direct"),
                 "ios": .string("openai_oauth_direct"),
                 "telegram": .string("openai_oauth_direct"),
+                // Both spellings: the merge below is default-union-saved, so a
+                // saved 0.3.x policy keyed `missions` keeps working while a
+                // canonical reader finds `workshop` (P2-3).
+                "workshop": .string("openai_oauth_direct"),
                 "missions": .string("openai_oauth_direct"),
                 "training": .string("openai_oauth_direct"),
                 "dream": .string("openai_oauth_direct"),

@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import NativeAgentCore
 
 // MARK: - Stable identifiers
 
@@ -87,16 +88,24 @@ public enum ContextStableID {
 public struct ContextSurface: RawRepresentable, Codable, Hashable, Sendable, Comparable {
     public let rawValue: String
 
+    /// P2-3: `missions` was the Workshop surface's wire id through 0.3.7 and is
+    /// still stored in `context.db`'s `permitted_surfaces_json`. Folding it here
+    /// — the single construction point, which `Codable` synthesis also routes
+    /// through — means an atom persisted with `missions` and a request minted
+    /// with `workshop` still compare equal. Without the fold the two
+    /// vocabularies never intersect and every Workshop context read returns
+    /// zero atoms, silently.
     public init(rawValue: String) {
         let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        self.rawValue = normalized.isEmpty ? "unknown" : normalized
+        if normalized.isEmpty { self.rawValue = "unknown"; return }
+        self.rawValue = WorkshopSurfaceVocabulary.canonicalSurface(normalized)
     }
 
     public static let chat = ContextSurface(rawValue: "chat")
     public static let telegram = ContextSurface(rawValue: "telegram")
     public static let ios = ContextSurface(rawValue: "ios")
     public static let slack = ContextSurface(rawValue: "slack")
-    public static let workshop = ContextSurface(rawValue: "missions") // compatibility wire ID
+    public static let workshop = ContextSurface(rawValue: WorkshopSurfaceVocabulary.canonical)
     public static let bridge = ContextSurface(rawValue: "bridge")
 
     public static func < (lhs: Self, rhs: Self) -> Bool {

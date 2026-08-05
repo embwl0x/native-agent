@@ -596,7 +596,7 @@ extension SwiftNativeMemoryV2 {
     /// Pure, and deliberately generic: it merges whatever scalar metadata the
     /// new write carries that the row does not already say, plus the new
     /// source, plus the newer observation time. Nothing here knows about
-    /// Workshop — a mission's `workshop_execution_id` / `workshop_status` are
+    /// Workshop — an execution's `workshop_execution_id` / `workshop_status` are
     /// just the first caller's identity fields.
     static func duplicateProvenancePatch(
         existing: MemoryRecord,

@@ -734,7 +734,7 @@ struct ProviderSettingsView: View {
         switch surface {
         case "chat":      return "Chat"
         case "ios":       return "iPhone"
-        case "missions":  return "Workshop"
+        case "workshop", "missions":  return "Workshop"
         case "training":  return "Training"
         case "dream":     return "Dream"
         case "telegram":  return "Telegram"

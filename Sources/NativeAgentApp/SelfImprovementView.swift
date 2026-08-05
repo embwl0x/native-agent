@@ -16,7 +16,12 @@ struct SelfImprovementView: View {
     @State private var runNote: String = ""
 
     var body: some View {
-        ScrollView {
+        // Render-cost audit: same env-gated counter as `contentview.body`.
+        // This view reads `trainingRuns` / `trainingProposals` /
+        // `promotionCandidates`, the three fields that gained equality gates in
+        // perf wave 2 — so this is the before/after number for those.
+        RenderAudit.bump("selfimprovement.body")
+        return ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 // ── The switch ────────────────────────────────────────────
                 Toggle(isOn: $enabled) {
@@ -74,7 +79,7 @@ struct SelfImprovementView: View {
             .padding()
         }
         .navigationTitle("Self-Improvement")
-        .task { loadDigest() }
+        .task { await loadDigest() }
     }
 
     @MainActor
@@ -104,7 +109,7 @@ struct SelfImprovementView: View {
         } catch {
             runNote += " Request cleanup could not be verified: \(NativeClient.safeDoctorDetail(error.localizedDescription))."
         }
-        loadDigest()
+        await loadDigest()
     }
 
     static func manualRunNote(for outcome: LoopTickOutcome) -> String {
@@ -121,25 +126,43 @@ struct SelfImprovementView: View {
         }
     }
 
-    private func loadDigest() {
+    /// Newest-wins selection over already-stat'ed candidates. Extracted from
+    /// `loadDigest` so the ordering rule is testable without a filesystem, and
+    /// so each file is stat'ed once instead of twice per `max(by:)` comparison.
+    /// Semantics are unchanged: latest modification date wins; ties keep the
+    /// earlier element in enumeration order (`max(by:)` only replaces on a
+    /// strict increase); an unreadable date is `.distantPast` at the call site.
+    nonisolated static func newestDigest(_ dated: [(url: URL, modified: Date)]) -> URL? {
+        dated.max(by: { $0.modified < $1.modified })?.url
+    }
+
+    /// Render-cost audit F4: this used to be a synchronous MainActor method —
+    /// a directory enumeration, O(n log n) stat syscalls, and a full digest
+    /// read, all blocking the main thread on every appear. Same work, same
+    /// result, now on a utility thread. `digest` already starts empty, so the
+    /// pre-load frame is the one that always rendered first anyway.
+    private func loadDigest() async {
         let dir = NativeAgentPaths.dataRoot
             .appendingPathComponent("self_improvement", isDirectory: true)
             .appendingPathComponent("digests", isDirectory: true)
-        let fm = FileManager.default
-        guard let files = try? fm.contentsOfDirectory(
-                at: dir, includingPropertiesForKeys: [.contentModificationDateKey]),
-              let latest = files
-                .filter({ $0.pathExtension == "md" })
-                .max(by: { a, b in
-                    let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]))?
+        let loaded = await Task.detached(priority: .utility) { () -> (text: String, date: String)? in
+            let fm = FileManager.default
+            guard let files = try? fm.contentsOfDirectory(
+                    at: dir, includingPropertiesForKeys: [.contentModificationDateKey])
+            else { return nil }
+            let dated = files
+                .filter { $0.pathExtension == "md" }
+                .map { url -> (url: URL, modified: Date) in
+                    let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
                         .contentModificationDate ?? .distantPast
-                    let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]))?
-                        .contentModificationDate ?? .distantPast
-                    return da < db
-                }),
-              let text = try? String(contentsOf: latest, encoding: .utf8)
-        else { digest = ""; digestDate = ""; return }
-        digest = text
-        digestDate = latest.deletingPathExtension().lastPathComponent
+                    return (url, modified)
+                }
+            guard let latest = SelfImprovementView.newestDigest(dated),
+                  let text = try? String(contentsOf: latest, encoding: .utf8)
+            else { return nil }
+            return (text, latest.deletingPathExtension().lastPathComponent)
+        }.value
+        digest = loaded?.text ?? ""
+        digestDate = loaded?.date ?? ""
     }
 }

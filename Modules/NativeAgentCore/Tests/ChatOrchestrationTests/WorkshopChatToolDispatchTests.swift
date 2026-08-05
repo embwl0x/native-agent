@@ -7,7 +7,7 @@ import WorkshopExecution
 
 // MARK: - workshop_submit / workshop_status dispatcher-surface tests (U5 W-I)
 //
-// Agent's mission chat lane: she could neither submit nor check a mission from
+// Agent's execution chat lane: she could neither submit nor check an execution from
 // chat (zero mission_* hits anywhere in ChatOrchestration; her own honest
 // refusal caught it). These are STANDARD tools — no Process spawn —
 // classified LAZY-LOAD (catalog-visible + builtInToolNames, NOT
@@ -83,7 +83,7 @@ struct WorkshopExecutionChatToolDispatchTests {
 
     @Test func workshopToolsAreLazyLoadedBuiltIns() {
         // Catalog-visible + dispatchable after a tool_load, but NOT hot core:
-        // a user submits/checks a mission occasionally, so they ride the
+        // a user submits/checks an execution occasionally, so they ride the
         // lazy-load lane (same as scheduler_create_job) — they must NOT be in
         // alwaysOnCoreNames (keeps the hot-core budget at 21).
         #expect(SwiftToolDispatcher.builtInToolNames.contains("workshop_submit"))
@@ -231,7 +231,7 @@ struct WorkshopExecutionChatToolDispatchTests {
         let root = hermeticRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         // Seed a trust policy that explicitly disables Workshop executions (and no
-        // developerMode) → the runner's missionsAllowed() gate refuses.
+        // developerMode) → the runner's workshopExecutionsAllowed() gate refuses.
         let trustDir = root.appendingPathComponent("trust", isDirectory: true)
         try FileManager.default.createDirectory(at: trustDir, withIntermediateDirectories: true)
         let policy: JSONValue = .object([

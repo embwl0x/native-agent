@@ -18,8 +18,8 @@ import TrustCenter
 //    reservation, SwiftNativeDeskStore.reserveWorkSession) — an absent/forged/stale
 //    reservation refuses BEFORE any LLM call.
 //  * M6 (no infinite wedge): the turn runs under a FINITE deadline. Contrast
-//    Missions+Executor.swift:154, where the approval-wait timeout is disabled by
-//    default and a blocked mission can freeze forever. A workshop session that
+//    Executions+Executor.swift:154, where the approval-wait timeout is disabled by
+//    default and a blocked execution can freeze forever. A workshop session that
 //    can't finish (a wedged tool, a needs-User outward step) resolves to a finite
 //    `blocked` receipt within the deadline — in-flight, then done, never stuck.
 
@@ -56,7 +56,7 @@ public struct WorkshopSessionRequest: Sendable, Equatable {
 }
 
 /// A session's honest outcome, keyed by (handle, reservationId) for the M8
-/// receipt log. Compact — never the O(all missions) scoreboard.
+/// receipt log. Compact — never the O(all executions) scoreboard.
 public struct WorkshopSessionReceipt: Sendable, Equatable {
     public let handle: String
     public let reservationId: String
@@ -224,8 +224,8 @@ public struct WorkshopSession: WorkshopSessionRunning {
         }
     }
 
-    /// The production turn: one ephemeral, read-only tool turn on the existing
-    /// "missions" surface.
+    /// The production turn: one ephemeral, read-only tool turn on the
+    /// "workshop" surface (P2-3; "missions" on 0.3.x installs).
     /// surface. No chat session state, no transcript, her pinned model resolves
     /// from the surface picker. The membrane governs writes.
     static func productionTurnExecutor(
@@ -251,7 +251,7 @@ public struct WorkshopSession: WorkshopSessionRunning {
                 autonomyResolver: WorkshopAutonomyResolver(
                     base: SwiftNativeTrustCenter(dataRoot: dataRoot)
                 ),
-                surface: "missions"
+                surface: WorkshopSurfaceVocabulary.canonical
             )
             return (response.model, response.output)
         }
@@ -271,7 +271,10 @@ struct WorkshopAutonomyResolver: AutonomyResolver {
     let base: any AutonomyResolver
 
     func autonomyLevel(forTool toolName: String, surface: String) async throws -> String {
-        guard ["missions", "workshop"].contains(surface),
+        // Reader seam: a turn may still arrive carrying the 0.3.x `missions`
+        // surface. Deny-by-default here means an unfolded spelling would refuse
+        // every Workshop tool, so fold before the membership test.
+        guard WorkshopSurfaceVocabulary.isWorkshopSurface(surface),
               WorkshopToolProfile.isPermitted(toolName) else {
             return "deny"
         }

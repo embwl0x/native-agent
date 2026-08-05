@@ -238,7 +238,7 @@ extension NativeClient {
     }
 
     /// Generic launch reconcile for approval kinds whose executors
-    /// had NO crash-window coverage (rem.proposal, mission.step,
+    /// had NO crash-window coverage (rem.proposal, execution.step,
     /// self_improvement.apply, browser.open_url). `resolveApproval`
     /// persists the record terminal BEFORE its executor runs; a crash in
     /// that window leaves a resolved record whose work never happened.
@@ -254,7 +254,7 @@ extension NativeClient {
     ///   - rem.proposal: REMProposalStore.setStatus no-ops when the row
     ///     already holds the target status, and applyDenial early-returns
     ///     on an already-denied row — a re-fire just heals the annotation.
-    ///   - mission.step: the executor consults the MISSION'S OWN STATE —
+    ///   - execution.step: the executor consults the EXECUTION'S OWN STATE —
     ///     an in-lock `blocked_on_approval` precondition (staleApproval
     ///     throw) plus step-record guards — so a step that already executed
     ///     is refused and annotated honestly, never blind-rerun (the plan's
@@ -320,7 +320,7 @@ extension NativeClient {
                 shouldReconcile: { _ in true },
                 execute: { await client.applyResolvedREMProposal(from: $0) }),
             ApprovalExecutionReconcileKind(
-                action: "mission.step",
+                action: WorkshopStepApprovalAction.canonical,
                 shouldReconcile: { _ in true },
                 execute: { await client.applyResolvedWorkshopStep(from: $0) }),
             ApprovalExecutionReconcileKind(
@@ -749,19 +749,21 @@ extension NativeClient {
         return nil
     }
 
-    /// Resumes a mission blocked on a step approval (executor port,
+    /// Resumes an execution blocked on a step approval (executor port,
     /// 2026-06-10 — mirror of applyResolvedREMProposal's shape). Approved →
     /// WorkshopExecutorLoop.resumeAfterApproval actually EXECUTES the blocked
     /// step (W6: resume must never mark-without-executing) and continues the
-    /// plan; denied → step rejected + mission failed (also via the
+    /// plan; denied → step rejected + execution failed (also via the
     /// executor, so the timeline + step record stay daemon-shaped). Every
     /// branch annotates the approval record executed/FAILED. On an
     /// infrastructure failure the blocked step's approval_id claim is
     /// CLEARED so a later pass can re-stage a fresh approval instead of
     /// dead-ending on a stamp that no longer matches anything.
     private func applyResolvedWorkshopStep(from rec: ApprovalRecord) async {
-        // Self-defensive: only ever acts on a resolved mission.step record.
-        guard rec.action == "mission.step",
+        // Self-defensive: only ever acts on a resolved workshop-step record,
+        // in EITHER vocabulary — a step blocked before the 0.3.8 upgrade is
+        // resolved by the new binary and must still execute (P2-4).
+        guard ExecutionEventVocabulary.matches(rec.action, WorkshopStepApprovalAction.canonical),
               rec.status == "resolved",
               let decision = rec.decision else { return }
         guard case .object(let payload) = rec.payload,
@@ -783,7 +785,7 @@ extension NativeClient {
         // LESS: the executor's startup orphan-reclaim barrier is memoized
         // per-DATA-ROOT (not per-instance), so a fallback instance and the drain
         // instance share ONE reclaim — the drain's first reclaim can never fail
-        // a mission this resume flipped blocked→running (gpt-5.5 re-review). The
+        // an execution this resume flipped blocked→running (gpt-5.5 re-review). The
         // shared instance is still preferred to keep one actor serializing all
         // Workshop work. makeWorkshopExecutor wires the same LLM/tool/stager
         // closures the drain uses.
@@ -829,10 +831,10 @@ extension NativeClient {
             }
         } catch WorkshopExecutionError.staleApproval(let detail) {
             // gpt-5.5 executor-port blocker #3 (2026-06-10): stale card —
-            // the mission is no longer blocked_on_approval (cancelled/
+            // the execution is no longer blocked_on_approval (cancelled/
             // failed/completed since the card was staged). The executor
             // refused to run the step; annotate the approval record
-            // honestly. Do NOT clear the claim (the mission is not coming
+            // honestly. Do NOT clear the claim (the execution is not coming
             // back to this approval) and do NOT report a generic failure.
             NSLog("[workshopStep] \(decision) skipped for \(executionId)/\(stepId): \(detail)")
             try? await Self.annotateApprovalExecution(
@@ -928,10 +930,10 @@ extension NativeClient {
             // No decision filter: deny ACTS too (tombstone + status flip),
             // and cancel clears the staging stamp. The executor self-guards.
             await applyResolvedREMProposal(from: rec)
-        } else if rec.action == "mission.step" {
+        } else if ExecutionEventVocabulary.matches(rec.action, WorkshopStepApprovalAction.canonical) {
             // Executor port (2026-06-10): approve EXECUTES the blocked step
-            // and continues the mission; deny rejects the step and fails the
-            // mission; cancel clears the claim. The executor self-guards.
+            // and continues the execution; deny rejects the step and fails the
+            // execution; cancel clears the claim. The executor self-guards.
             await applyResolvedWorkshopStep(from: rec)
         } else if rec.action == "memory.repair" {
             // U3 wave-1 item 3: approve applies the one-shot repair (backup

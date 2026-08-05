@@ -16,7 +16,7 @@ import CoreSpotlight
 import CloudKit
 #endif
 
-// PATCH-2026-05-19: ui-pull-together — Missions keeps mission-adjacent
+// PATCH-2026-05-19: ui-pull-together — Executions keeps execution-adjacent
 // operational pages only. Self-Improvement owns harness proposals separately.
 private enum WorkshopMode: String, CaseIterable, Identifiable {
     case desk = "Bench"

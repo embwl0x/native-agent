@@ -7,6 +7,27 @@ export CLANG_MODULE_CACHE_PATH="$ROOT/.runtime/clang-module-cache"
 export SWIFT_MODULE_CACHE_PATH="$ROOT/.runtime/swift-module-cache"
 mkdir -p "$CLANG_MODULE_CACHE_PATH" "$SWIFT_MODULE_CACHE_PATH"
 
+# 2026-08-05 hermetic-tests sweep: many Core types default their `dataRoot:`
+# init parameter to `PersistenceCore.defaultDataRoot()`, which walks up from CWD
+# and resolves to THIS repo's `data/` under `swift test` — the LIVE app data
+# root. Any test that constructs such a type bare then READS and WRITES real
+# user state; `SwiftNativePersonaEngine(root:)` alone appended 739 phantom
+# "<DOC>.md updated" rows to data/activity/events.jsonl this way.
+#
+# The primary fix is per-target `Hermetic*Support.swift` helpers pinning
+# `dataRoot:` explicitly. This export is the SECOND line of defence: the env var
+# is the first branch `defaultDataRoot()` consults, so any residual bare default
+# resolves into a throwaway dir instead of the checkout. PersistenceCoreTests'
+# `HermeticDataRootCanaryTests` pins that branch ordering.
+NATIVE_AGENT_TEST_DATA_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/nativeagent-test-dataroot.XXXXXX")"
+export NATIVE_AGENT_DATA_ROOT="$NATIVE_AGENT_TEST_DATA_ROOT"
+cleanup_test_data_root() {
+  [[ -n "${NATIVE_AGENT_TEST_DATA_ROOT:-}" ]] && rm -rf "$NATIVE_AGENT_TEST_DATA_ROOT"
+  return 0
+}
+trap cleanup_test_data_root EXIT
+echo "[test] hermetic NATIVE_AGENT_DATA_ROOT=$NATIVE_AGENT_DATA_ROOT"
+
 # 2026-07-21 audit: every tests/scripts/*.sh suite MUST be invoked by this
 # script — an unwired guard test greens forever (the MiniLM resource-guard
 # suite sat orphaned this way until today). Fail the gate on any orphan.

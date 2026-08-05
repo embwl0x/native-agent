@@ -10,6 +10,63 @@ import PersonaEngine
 import TrustCenter
 import WorkshopExecution
 
+/// FIFO relay for fire-and-forget work that must leave a hot path immediately
+/// but still reach its consumer in submission order.
+///
+/// The naive fix for "stop awaiting this" is a bare `Task.detached` per call,
+/// which drops ordering: N tool results in a turn would race, and a hint
+/// planner that dedupes on a monotonic `revision` can then observe them out of
+/// order. Chaining each task on its predecessor keeps the exact serialization
+/// the inline `await` gave us, while the enqueue itself is synchronous and
+/// allocation-cheap on the caller.
+///
+/// Detached on purpose: this work is housekeeping that outlives the turn that
+/// produced it, so a cancelled turn must not silently drop already-observed
+/// results, and it should never inherit the turn's priority.
+final class SerialDetachedRelay: @unchecked Sendable {
+    private let label: String
+    private let lock = NSLock()
+    private var tail: Task<Void, Never>?
+
+    init(label: String) {
+        self.label = label
+    }
+
+    /// Append `work` to the chain. Returns the handle for the enqueued unit so
+    /// tests can await one specific submission; production callers discard it.
+    @discardableResult
+    func enqueue(_ work: @escaping @Sendable () async -> Void) -> Task<Void, Never> {
+        lock.lock()
+        let previous = tail
+        let next = Task.detached(priority: .utility) {
+            if let previous {
+                _ = await previous.value
+            }
+            await work()
+        }
+        tail = next
+        lock.unlock()
+        return next
+    }
+
+    /// Wait for everything enqueued before this call. Because the chain is
+    /// strictly serial, awaiting the current tail awaits the whole backlog.
+    func drain() async {
+        if let current = currentTail() {
+            _ = await current.value
+        }
+    }
+
+    /// Deliberately synchronous and `nonisolated`: `NSLock.lock()` is
+    /// unavailable from an async context, so the critical section stays out of
+    /// one entirely and `drain` only awaits the handle it hands back.
+    private func currentTail() -> Task<Void, Never>? {
+        lock.lock()
+        defer { lock.unlock() }
+        return tail
+    }
+}
+
 /// App-owned tool shim for chat surfaces.
 ///
 /// Core's SwiftToolDispatcher intentionally knows nothing about Mac app
@@ -35,6 +92,9 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
     private let motorOutcomeObserver: @Sendable (ToolCausalBoundary.MotorReference) async -> Void
     private let enforceAutonomySecurity: Bool
     private let includeAppOwnedTools: Bool
+    /// Off-dispatch-path, order-preserving delivery for context prewarm hints.
+    /// One chain per dispatcher instance — see `schedulePrewarmAfterToolResult`.
+    private let prewarmRelay = SerialDetachedRelay(label: "AppChatToolDispatcher.prewarm")
 
     static func defaultReflexReviewerIdentity(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
@@ -143,7 +203,12 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             throw error
         }
         let enriched = await resultByAddingOrganismPosture(result, tool: tool, surface: surface)
-        await prewarmAfterToolResult(tool: tool, input: canonicalInput, result: enriched, surface: surface)
+        schedulePrewarmAfterToolResult(
+            tool: tool,
+            input: canonicalInput,
+            result: enriched,
+            surface: surface
+        )
         await observeMotorOutcomeIfNeeded(tool: tool, result: enriched)
         return enriched
     }
@@ -155,12 +220,54 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         await motorOutcomeObserver(reference)
     }
 
-    private func prewarmAfterToolResult(
+    /// Hand the prewarm hints for a settled tool result to the off-path relay.
+    ///
+    /// Deliberately NOT `async`: nothing on the current turn reads the prewarm
+    /// result (`NativeContextFlowRuntime.prewarm` discards the receipt), but
+    /// the work itself lowercases every atom body in the active generation on
+    /// the `ContextFlowCoordinator` actor — the same actor the NEXT turn's
+    /// `prepareTurn` has to enter. Awaiting it here charged that scan to
+    /// user-visible tool latency, once per tool call.
+    ///
+    /// The hints themselves are computed synchronously and by value, so the
+    /// planner still sees byte-identical `(kind, id, terms)` for the exact
+    /// result this call returned — a later mutation of anything can't drift
+    /// them. Only the delivery moves; ordering is preserved by the relay.
+    private func schedulePrewarmAfterToolResult(
         tool: String,
         input: [String: JSONValue],
         result: JSONValue,
         surface: String
-    ) async {
+    ) {
+        let hints = Self.prewarmHints(
+            tool: tool,
+            input: input,
+            result: result,
+            surface: surface
+        )
+        guard !hints.isEmpty else { return }
+        let prewarm = self.contextPrewarm
+        prewarmRelay.enqueue {
+            for hint in hints {
+                await prewarm(hint.kind, hint.id, hint.terms)
+            }
+        }
+    }
+
+    struct ContextPrewarmHint: Sendable {
+        var kind: ContextPrewarmHintKind
+        var id: String
+        var terms: [String]
+    }
+
+    /// Pure function of the settled tool call — same inputs, same hints, in the
+    /// same order as the old inline `await` pair emitted them.
+    static func prewarmHints(
+        tool: String,
+        input: [String: JSONValue],
+        result: JSONValue,
+        surface: String
+    ) -> [ContextPrewarmHint] {
         let canonical = Self.canonicalAppToolName(tool) ?? tool
         let terms = [canonical, surface]
             + input.keys.sorted()
@@ -177,10 +284,17 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             kind = .toolResult
             id = canonical
         }
-        await contextPrewarm(kind, id, terms)
+        var hints = [ContextPrewarmHint(kind: kind, id: id, terms: terms)]
         if case .object(let object) = result, object["organism_posture"] != nil {
-            await contextPrewarm(.organism, "tool-posture", terms)
+            hints.append(ContextPrewarmHint(kind: .organism, id: "tool-posture", terms: terms))
         }
+        return hints
+    }
+
+    /// Wait for every prewarm hint enqueued so far to reach the coordinator.
+    /// Tests and shutdown only — the dispatch path must never call this.
+    func drainPendingContextPrewarm() async {
+        await prewarmRelay.drain()
     }
 
     private static let fileContextTools: Set<String> = [

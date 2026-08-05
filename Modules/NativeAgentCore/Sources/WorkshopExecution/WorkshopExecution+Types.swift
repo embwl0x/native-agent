@@ -22,23 +22,23 @@ public enum WorkshopExecutionError: Error, LocalizedError, Equatable {
     // The associated value is that exact `detail` string so the seam can
     // reconstruct the same envelope.
     //
-    // `.missionsBusy` — parity for MissionsBusyError,
+    // `.workshopExecutionsBusy` — parity for MissionsBusyError,
     // mapped by the daemon to HTTP 503 + MissionsBusyError.to_dict():
     //   {"ok": false, "error": "missions_busy", "retryable": true, "detail": ...}
     // The associated value is the same `detail` message string.
     case forbidden(String)
     case workshopExecutionsBusy(String)
     // EXECUTOR GATE (2026-06-10): submit refuses while no Swift executor
-    // exists (queued missions could never run). Distinct from `.unavailable`
+    // exists (queued executions could never run). Distinct from `.unavailable`
     // (start()'s generic shape) so consumers can render the actionable
-    // message instead of a bare "missions unavailable".
+    // message instead of a bare "executions unavailable".
     case executorUnavailable(String)
     // STALE APPROVAL (2026-06-10, gpt-5.5 executor-port blocker #3): a
-    // resume was requested for a mission that is no longer
+    // resume was requested for an execution that is no longer
     // blocked_on_approval (cancelled/failed/completed in the meantime).
     // The step was NOT executed. Distinct from `.invalidRequest` so the
     // approval-resolution caller can annotate the approval record honestly
-    // ("mission no longer blocked — not executed") instead of reporting a
+    // ("execution no longer blocked — not executed") instead of reporting a
     // generic failure + claim-clear.
     case staleApproval(String)
 
@@ -56,7 +56,7 @@ public enum WorkshopExecutionError: Error, LocalizedError, Equatable {
         }
     }
 
-    /// Parity error code for `.forbidden` / `.missionsBusy` — the `error`
+    /// Parity error code for `.forbidden` / `.workshopExecutionsBusy` — the `error`
     /// field the daemon route puts in the JSON envelope. nil for the other
     /// cases (those map to 400/500/etc., not a single stable code).
     public var parityErrorCode: String? {
@@ -70,7 +70,7 @@ public enum WorkshopExecutionError: Error, LocalizedError, Equatable {
 
 // MARK: - Value types
 
-/// Caller-facing mission spec. Matches MissionRunner.submit() arg surface
+/// Caller-facing execution spec. Matches MissionRunner.submit() arg surface
 /// at the retired daemon: (title, objective, trigger_source,
 /// trust_required).
 public struct WorkshopExecutionSpec: Codable, Sendable, Equatable {
@@ -207,8 +207,8 @@ public struct WorkshopVerificationRecord: Codable, Sendable, Equatable {
     }
 }
 
-/// Persisted mission record. Field order + names match the Python @dataclass
-/// Mission so asdict() output is shape-identical.
+/// Persisted execution record. Field order + names match the Python @dataclass
+/// Execution so asdict() output is shape-identical.
 public struct WorkshopExecutionRecord: Codable, Sendable, Equatable {
     public var id: String
     /// Authoritative Workshop/Desk identity. The execution id remains an
@@ -275,7 +275,7 @@ public struct WorkshopExecutionRecord: Codable, Sendable, Equatable {
 }
 
 /// Envelope returned by submit(). Matches daemon's `MissionRunner.submit()`
-/// return shape (a Mission record), but pulled to the fields the trigger
+/// return shape (a Execution record), but pulled to the fields the trigger
 /// scheduler fire_now path needs ({status, mission_id}).
 public struct WorkshopExecutionEnqueueResult: Codable, Sendable, Equatable {
     public var status: String            // "queued" — terminal status of submit (NOT "fired")
@@ -327,7 +327,8 @@ public protocol WorkshopPlannerLLM: Sendable {
     func availableConnectorActions() async -> [JSONValue]
 
     /// Run codex with the assembled prompt; return (model, raw output).
-    /// `surface` is "missions" so the daemon's per-surface provider routing
+    /// `surface` is "workshop" (P2-3; "missions" before 0.3.8 and still
+    /// accepted) so the per-surface provider routing
     /// applies. Any error → caller treats it as a planner failure and falls
     /// back to the stub.
     func runCodex(prompt: String, surface: String, timeoutSeconds: Int) async throws -> (model: String, output: String)
@@ -489,17 +490,17 @@ public protocol WorkshopRunnerClient: Sendable {
     /// mission.json. Returns the persisted record.
     func submit(spec: WorkshopExecutionSpec) async throws -> WorkshopExecutionEnqueueResult
 
-    /// Kick the executor for an already-enqueued mission. SwiftNative fails
+    /// Kick the executor for an already-enqueued execution. SwiftNative fails
     /// closed until the executor loop is ported.
     func start(executionId: String) async throws -> WorkshopExecutionStartResult
 
-    /// Cancel a queued/running mission — the mission-lifecycle WRITE for
+    /// Cancel a queued/running execution — the execution-lifecycle WRITE for
     /// POST /v1/missions/<id>/cancel. Mirrors MissionRunner.cancel
     ///: idempotent (already-cancelled → no-op,
     /// returns the unchanged record), sets status="cancelled", persists
     /// mission.json, appends a `cancelled` timeline event. Returns the
     /// post-cancel record. Throws .invalidRequest("Workshop execution not found: <id>")
-    /// when the mission directory has no parseable mission.json — matching
+    /// when the execution directory has no parseable mission.json — matching
     /// Python's `ValueError(f"Workshop execution not found: {mission_id}")`.
     ///
     /// NOTE (retirement_path / KEEP reason): the Python handler ALSO runs two
@@ -515,10 +516,10 @@ public protocol WorkshopRunnerClient: Sendable {
     /// In-place field mutation for the queue-bridge half of POST
     /// /v1/missions/update. Mirrors the `_missions_allowed()` queue-bridge
     /// branch of Runtime.update_mission:
-    /// applies title/objective/status/result patches to the queue mission's
+    /// applies title/objective/status/result patches to the queue execution's
     /// mission.json under flock, clears current_step_id on a terminal status,
     /// bumps updated_at, and returns the post-patch record. Returns nil when
-    /// the id is NOT a queue mission; callers should surface that historical
+    /// the id is NOT a queue execution; callers should surface that historical
     /// missions.jsonl rows are not handled by the queue bridge.
     func updateWorkshopExecution(_ patch: WorkshopExecutionUpdate) async throws -> WorkshopExecutionRecord?
 }
@@ -594,7 +595,7 @@ public struct WorkshopExecutionUpdate: Sendable, Equatable {
         if resultPresent {
             // Python `summary or result` — first truthy wins; if neither is
             // truthy, the body contribution is "" (qm.result fallback is
-            // applied in updateMission against the persisted record).
+            // applied in updateWorkshopExecution against the persisted record).
             if Self.pyTruthy(body["summary"]) {
                 resultVal = str("summary") ?? ""
             } else if Self.pyTruthy(body["result"]) {

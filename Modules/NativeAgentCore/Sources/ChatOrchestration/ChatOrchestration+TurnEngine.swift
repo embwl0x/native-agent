@@ -532,8 +532,10 @@ public actor SwiftNativeTurnEngine {
 
     func checkedActiveProviderID(for surface: String) async throws -> String? {
         let normalized = surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let routingSurface = normalized == "workshop" ? "missions" : normalized
-        return try await router.checkedRoutingSnapshot().activeProviders[routingSurface]
+        let routingSurface = canonicalRoutingSurface(normalized)
+        return ProviderRoutingSurfaceLookup.value(
+            try await router.checkedRoutingSnapshot().activeProviders, routingSurface
+        )
     }
 
     func checkedRouteAdmission(
@@ -542,9 +544,10 @@ public actor SwiftNativeTurnEngine {
         requestedReasoningEffort: String? = nil
     ) async throws -> TurnRouteAdmission {
         let normalized = surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let routingSurface = normalized == "workshop" ? "missions" : normalized
+        let routingSurface = canonicalRoutingSurface(normalized)
         let snapshot = try await router.checkedRoutingSnapshot()
-        let preference = snapshot.preferences[routingSurface] ?? snapshot.preferences["chat"]
+        let preference = ProviderRoutingSurfaceLookup.value(snapshot.preferences, routingSurface)
+            ?? snapshot.preferences["chat"]
         let configuredModel = preference?.model
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let requested = requestedModel?
@@ -554,7 +557,7 @@ public actor SwiftNativeTurnEngine {
         // active transport, the request-scoped model remains a supported
         // override (Mac/test callers rely on this API contract).
         let admittedModel: String
-        if snapshot.activeProviders[routingSurface] != nil {
+        if ProviderRoutingSurfaceLookup.value(snapshot.activeProviders, routingSurface) != nil {
             admittedModel = configuredModel.isEmpty ? PRIMARY_MODEL : configuredModel
         } else if !requested.isEmpty {
             admittedModel = requested
@@ -569,7 +572,7 @@ public actor SwiftNativeTurnEngine {
             reasoningEffort: requestedEffort.isEmpty
                 ? (preference?.reasoningEffort ?? DEFAULT_REASONING_EFFORT)
                 : requestedEffort,
-            providerId: snapshot.activeProviders[routingSurface]
+            providerId: ProviderRoutingSurfaceLookup.value(snapshot.activeProviders, routingSurface)
                 ?? router.inferProviderForModel(admittedModel),
             serviceTier: preference?.serviceTier ?? "default"
         )
@@ -620,6 +623,12 @@ public actor SwiftNativeTurnEngine {
         sessionID: String? = nil,
         recentTurns: [String] = []
     ) async throws -> TurnContext {
+        // P2-3, one bridge for the whole turn: fold the surface ONCE here, so
+        // every downstream comparison (routing, ContextSurface, autonomy,
+        // telemetry, the surface handed to the provider) sees `workshop` and
+        // nothing has to know two spellings exist. Only the Workshop spelling
+        // is rewritten; other surfaces pass through byte-identical.
+        let surface = WorkshopSurfaceVocabulary.foldLegacySpelling(surface)
         var trace = ContextStageTrace()
         if userMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && imageBlocks.isEmpty
@@ -639,12 +648,19 @@ public actor SwiftNativeTurnEngine {
         let attentionStartNs = DispatchTime.now().uptimeNanoseconds
         let attention = await resolvedAttentionInputs(now: clock(), trace: &trace)
         trace.record("contextFlow.attention", since: attentionStartNs)
-        // M9 (2026-07-11): on the `.missions` surface, ContextFlow reuses
-        // `activeTask` as the mission prewarm-cache id (ContextFlowCoordinator
+        // M9 (2026-07-11): on the Workshop surface, ContextFlow reuses
+        // `activeTask` as the execution prewarm-cache id (ContextFlowCoordinator
         // prewarmScopes). Her pursuit intent now populates activeTask/goal, so
         // it would collide there — suppress it on that ONE surface. Every other
-        // surface (chat/telegram/bridge/workshop) keeps the pursuit intent,
-        // which is the whole point: her active pursuit colors her context.
+        // surface (chat/telegram/bridge) keeps the pursuit intent, which is the
+        // whole point: her active pursuit colors her context.
+        //
+        // P2-3: `missions` and `workshop` were two DISTINCT ContextSurfaces
+        // until 2026-08-05, so the same surface suppressed or kept pursuit
+        // intent depending only on how the caller spelled it — the prewarm
+        // collision was live for anyone who wrote `workshop`. They are one
+        // surface now, and the suppression follows the surface, not the
+        // spelling.
         let suppressPursuitIntent = ContextSurface(rawValue: surface) == .workshop
         let readyQueryEmbedding = queryEmbeddingTicket?.valueIfReady
         trace.setFlag("contextFlow.semanticQueryReady", readyQueryEmbedding != nil)
@@ -719,7 +735,7 @@ public actor SwiftNativeTurnEngine {
         //    its existing checked reread immediately before transport, so
         //    corrupt/revoked authority still fails closed without allowing a
         //    newer valid generation to splice into this turn.
-        let routingSurface = surface == "workshop" ? "missions" : surface
+        let routingSurface = canonicalRoutingSurface(surface)
         let boundModel = LLMCallContext.admittedModel?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let boundEffort = LLMCallContext.reasoningEffort?
@@ -752,10 +768,13 @@ public actor SwiftNativeTurnEngine {
             let routingSnapshot = try await router.checkedRoutingSnapshot()
             trace.record("provider.preferences", since: prefsStartNs)
             prefs = routingSnapshot.preferences
-            let pick = prefs[routingSurface] ?? prefs["chat"]
+            // Bridged, not subscripted (P2-3): a snapshot still keyed
+            // `missions` must not fall through to the CHAT model here.
+            let pick = ProviderRoutingSurfaceLookup.value(prefs, routingSurface) ?? prefs["chat"]
             modelId = pick?.model ?? PRIMARY_MODEL
             effort = pick?.reasoningEffort ?? DEFAULT_REASONING_EFFORT
-            admittedProvider = routingSnapshot.activeProviders[routingSurface]
+            admittedProvider = ProviderRoutingSurfaceLookup
+                .value(routingSnapshot.activeProviders, routingSurface)
                 ?? router.inferProviderForModel(modelId)
             admittedServiceTier = pick?.serviceTier
             if includeClockContext {

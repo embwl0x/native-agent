@@ -55,10 +55,14 @@ extension SwiftNativeSecurityCenter {
         return true
     }
 
+    /// P2-3: `workshop` is the canonical Workshop surface; `mission`/`missions`
+    /// stay for turns that still arrive on the 0.3.x spelling. Dropping either
+    /// makes full-mac yolo quietly stop elevating Workshop builder steps.
     static let fullMacYoloLocalSurfaces: Set<String> = [
         "chat",
         "codex-bridge",
         "claude-bridge",
+        "workshop",
         "mission",
         "missions",
     ]

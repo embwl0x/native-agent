@@ -69,6 +69,10 @@ private func makeHermeticClient(
     receiptIDFactory: @escaping @Sendable () -> String = { UUID().uuidString.lowercased() }
 ) -> SwiftNativeResearchClient {
     SwiftNativeResearchClient(
+        // Hermetic: `dataRoot:` defaults to PersistenceCore.defaultDataRoot() —
+        // the LIVE data root under `swift test`. Pin it to this helper's temp
+        // root so no unoverridden path can resolve against live state.
+        dataRoot: tmp,
         persistence: persistence,
         http: http,
         docker: docker,

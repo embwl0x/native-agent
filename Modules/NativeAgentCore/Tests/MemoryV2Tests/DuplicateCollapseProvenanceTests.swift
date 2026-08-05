@@ -8,7 +8,7 @@ import PersistenceCore
 //
 // `store()` collapses a byte-identical write onto the existing row and bumps
 // `recall_count` — deliberate, and kept: for a lane that writes one prose row
-// per event (Workshop missions), a repeat that reads the same is EVIDENCE, not
+// per event (Workshop executions), a repeat that reads the same is EVIDENCE, not
 // clutter.
 //
 // The defect was what the collapse threw away. It patched `recall_count` and
@@ -39,8 +39,8 @@ struct DuplicateCollapseProvenanceTests {
         )
     }
 
-    /// The mission-memory metadata shape: identity fields plus policy fields.
-    private func missionMetadata(
+    /// The execution-memory metadata shape: identity fields plus policy fields.
+    private func executionMetadata(
         executionID: String,
         status: String = "completed",
         observedAt: String
@@ -55,7 +55,7 @@ struct DuplicateCollapseProvenanceTests {
     }
 
     private let narrative = """
-        Workshop mission "Sweep the stale release artifacts" completed. \
+        Workshop execution "Sweep the stale release artifacts" completed. \
         2 of 2 planned steps succeeded. It was started by the nightly schedule.
         """
 
@@ -78,13 +78,13 @@ struct DuplicateCollapseProvenanceTests {
 
         let first = try await memory.store(
             content: narrative,
-            source: "workshop:mission-alpha",
-            metadata: missionMetadata(executionID: "mission-alpha", observedAt: "2026-08-02T10:00:00Z")
+            source: "workshop:wsx-alpha",
+            metadata: executionMetadata(executionID: "wsx-alpha", observedAt: "2026-08-02T10:00:00Z")
         )
         let second = try await memory.store(
             content: narrative,
-            source: "workshop:mission-beta",
-            metadata: missionMetadata(executionID: "mission-beta", observedAt: "2026-08-09T11:30:00Z")
+            source: "workshop:wsx-beta",
+            metadata: executionMetadata(executionID: "wsx-beta", observedAt: "2026-08-09T11:30:00Z")
         )
 
         // The collapse itself is intact: same row, counted.
@@ -96,7 +96,7 @@ struct DuplicateCollapseProvenanceTests {
         #expect(meta["recall_count"] == .int(1))
 
         // …and the second run is no longer anonymous.
-        #expect(strings(meta["source_history"]) == ["workshop:mission-alpha", "workshop:mission-beta"])
+        #expect(strings(meta["source_history"]) == ["workshop:wsx-alpha", "workshop:wsx-beta"])
         let occurrences: [JSONValue] = {
             if case .array(let arr)? = meta["duplicate_occurrences"] { return arr }
             return []
@@ -106,12 +106,12 @@ struct DuplicateCollapseProvenanceTests {
             Issue.record("no occurrence recorded for the second run")
             return
         }
-        #expect(occurrence["workshop_execution_id"] == .string("mission-beta"))
-        #expect(occurrence["source"] == .string("workshop:mission-beta"))
+        #expect(occurrence["workshop_execution_id"] == .string("wsx-beta"))
+        #expect(occurrence["source"] == .string("workshop:wsx-beta"))
         // Observation time moved to the LATER run — this is when it was last true.
         #expect(second.observedAt == "2026-08-09T11:30:00Z")
         // The row still names run #1 as its origin.
-        #expect(second.sourceRunId == "workshop:mission-alpha")
+        #expect(second.sourceRunId == "workshop:wsx-alpha")
     }
 
     /// The same claim through the in-memory fixture, which now honours the same
@@ -120,14 +120,14 @@ struct DuplicateCollapseProvenanceTests {
         let memory = SwiftNativeMemoryV2(
             embedder: MockEmbeddingProvider(), storage: InMemoryMemoryStorage())
         _ = try await memory.store(
-            content: narrative, source: "workshop:mission-alpha",
-            metadata: missionMetadata(executionID: "mission-alpha", observedAt: "2026-08-02T10:00:00Z"))
+            content: narrative, source: "workshop:wsx-alpha",
+            metadata: executionMetadata(executionID: "wsx-alpha", observedAt: "2026-08-02T10:00:00Z"))
         let second = try await memory.store(
-            content: narrative, source: "workshop:mission-beta",
-            metadata: missionMetadata(executionID: "mission-beta", observedAt: "2026-08-09T11:30:00Z"))
+            content: narrative, source: "workshop:wsx-beta",
+            metadata: executionMetadata(executionID: "wsx-beta", observedAt: "2026-08-09T11:30:00Z"))
 
         let meta = extras(second)
-        #expect(strings(meta["source_history"]) == ["workshop:mission-alpha", "workshop:mission-beta"])
+        #expect(strings(meta["source_history"]) == ["workshop:wsx-alpha", "workshop:wsx-beta"])
         #expect(meta["recall_count"] == .int(1))
     }
 
@@ -143,9 +143,9 @@ struct DuplicateCollapseProvenanceTests {
         for index in 0..<runs {
             last = try await memory.store(
                 content: narrative,
-                source: "workshop:mission-\(index)",
-                metadata: missionMetadata(
-                    executionID: "mission-\(index)",
+                source: "workshop:execution-\(index)",
+                metadata: executionMetadata(
+                    executionID: "execution-\(index)",
                     observedAt: String(format: "2026-08-%02dT10:00:00Z", (index % 27) + 1)
                 )
             )
@@ -159,7 +159,7 @@ struct DuplicateCollapseProvenanceTests {
             Issue.record("occurrences missing")
         }
         // The newest runs are the ones kept.
-        #expect(strings(meta["source_history"]).last == "workshop:mission-\(runs - 1)")
+        #expect(strings(meta["source_history"]).last == "workshop:execution-\(runs - 1)")
         #expect(meta["recall_count"] == .int(Int64(runs - 1)), "every repeat is still counted")
     }
 
@@ -170,15 +170,15 @@ struct DuplicateCollapseProvenanceTests {
         let root = try makeTempRoot("retry")
         defer { try? FileManager.default.removeItem(at: root) }
         let memory = try sqliteMemory(root: root)
-        let meta = missionMetadata(executionID: "mission-alpha", observedAt: "2026-08-02T10:00:00Z")
+        let meta = executionMetadata(executionID: "wsx-alpha", observedAt: "2026-08-02T10:00:00Z")
 
-        _ = try await memory.store(content: narrative, source: "workshop:mission-alpha", metadata: meta)
-        _ = try await memory.store(content: narrative, source: "workshop:mission-alpha", metadata: meta)
+        _ = try await memory.store(content: narrative, source: "workshop:wsx-alpha", metadata: meta)
+        _ = try await memory.store(content: narrative, source: "workshop:wsx-alpha", metadata: meta)
         let third = try await memory.store(
-            content: narrative, source: "workshop:mission-alpha", metadata: meta)
+            content: narrative, source: "workshop:wsx-alpha", metadata: meta)
 
         let extrasThird = extras(third)
-        #expect(strings(extrasThird["source_history"]) == ["workshop:mission-alpha"])
+        #expect(strings(extrasThird["source_history"]) == ["workshop:wsx-alpha"])
         if case .array(let occurrences)? = extrasThird["duplicate_occurrences"] {
             #expect(occurrences.count == 0 || occurrences.count == 1,
                     "a retry of the same run adds at most one identity entry")
@@ -196,14 +196,14 @@ struct DuplicateCollapseProvenanceTests {
         let memory = try sqliteMemory(root: root)
 
         _ = try await memory.store(
-            content: narrative, source: "workshop:mission-new",
-            metadata: missionMetadata(executionID: "mission-new", observedAt: "2026-08-09T11:30:00Z"))
+            content: narrative, source: "workshop:execution-new",
+            metadata: executionMetadata(executionID: "execution-new", observedAt: "2026-08-09T11:30:00Z"))
         let older = try await memory.store(
-            content: narrative, source: "workshop:mission-old",
-            metadata: missionMetadata(executionID: "mission-old", observedAt: "2026-07-01T08:00:00Z"))
+            content: narrative, source: "workshop:wsx-old",
+            metadata: executionMetadata(executionID: "wsx-old", observedAt: "2026-07-01T08:00:00Z"))
 
         #expect(older.observedAt == "2026-08-09T11:30:00Z")
         // …but the older run is still traceable.
-        #expect(strings(extras(older)["source_history"]).contains("workshop:mission-old"))
+        #expect(strings(extras(older)["source_history"]).contains("workshop:wsx-old"))
     }
 }

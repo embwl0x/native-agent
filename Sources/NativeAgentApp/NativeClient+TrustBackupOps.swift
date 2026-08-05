@@ -77,7 +77,7 @@ extension NativeClient {
             }
             body["trainingPolicy"] = training
         }
-        // PATCH-2026-05-07: missions-b Forward mission policy toggles when set.
+        // PATCH-2026-05-07: executions-b Forward execution policy toggles when set.
         if workshopExecutionEnabled != nil || workshopExecutionShowTimeline != nil {
             var mp: [String: Any] = [:]
             if let v = workshopExecutionEnabled { mp["enabled"] = v }

@@ -13,13 +13,13 @@ import WorkshopExecution
 // the retired daemon paired with PersistenceCore+FileLock.swift).
 //
 // Wave 12 (2026-05-31) NARROWED the previously-permanent `/fire_now`
-// carve-out — but kept it SPLIT between the inbox and missions sides.
-// Wave 21 (2026-06-01) closes the mission side of the carve once
+// carve-out — but kept it SPLIT between the inbox and executions sides.
+// Wave 21 (2026-06-01) closes the execution side of the carve once
 // SwiftNativeWorkshopRunner landed:
 //
 //   - Inbox fire_now with `stub=true` is now FULLY Swift-native. The five
 //     CANONICAL trigger kinds (file_watch, idle, time/morning_brief,
-//     mission_complete/mission_followup, session_pattern/stuck_pattern)
+//     execution_complete/execution_followup, session_pattern/stuck_pattern)
 //     each have their stub branch ported byte-for-byte from
 //     proactive_triggers.py `build_inbox_item(is_stub=True)`. A5.2
 //     (2026-07-24): the built card lands in `notifications/inbox.jsonl`
@@ -28,12 +28,12 @@ import WorkshopExecution
 //     Unknown kinds
 //     return `not_found` instead of falling through to a generic stub.
 //   - Inbox fire_now with `stub=false` is not yet Swift-native. The non-stub
-//     branches invoke codex / connector actions / mission-queue scans /
+//     branches invoke codex / connector actions / execution-queue scans /
 //     personality_runtime reads that are still being ported, so production
 //     returns an explicit error envelope.
 //   - Workshop fire_now is Swift-native. SwiftNativeTriggerScheduler resolves the
-//     mission trigger row from
-//     <root>/missions/triggers.json, builds the mission spec via the
+//     execution trigger row from
+//     <root>/missions/triggers.json, builds the execution spec via the
 //     ProactiveTrigger.build_mission() shape (title/objective/trigger_source/
 //     trust_required — the retired daemon), and calls
 //     SwiftNativeWorkshopRunner.submit() which writes timeline.jsonl FIRST
@@ -97,7 +97,7 @@ public struct TriggerConfig: Sendable, Equatable {
     public var config: JSONValue?
 
     /// Bag of unknown / non-typed top-level keys the daemon writes
-    /// (e.g. `objective` / `title` / `trust_required` from missions triggers,
+    /// (e.g. `objective` / `title` / `trust_required` from executions triggers,
     /// `_legacy_morning_brief_migrated` from the inbox scheduler).
     /// Lossless on round-trip.
     public var extras: JSONValue?
@@ -301,15 +301,15 @@ public protocol TriggerSchedulerClient: Sendable {
 ///
 /// SCOPE NARROWING (WAVE 12 + WAVE 21) — Swift impl now covers fire_now end-to-end:
 ///   - fireInboxTrigger(isStub: true)  — FULLY native. Builds the per-kind
-///     stub InboxItem (file_watch / idle / morning_brief / mission_followup /
+///     stub InboxItem (file_watch / idle / morning_brief / execution_followup /
 ///     stuck_pattern) byte-for-byte against proactive_triggers.py, dedups it
 ///     via ProactiveInboxStore against the live inbox, and lands the card in
 ///     notifications/inbox.jsonl through the app-side mirror seam (A5.2).
 ///   - fireInboxTrigger(isStub: false) — explicit unsupported envelope unless
 ///     a caller injects a compatibility fallback for tests.
-///     Non-stub branches invoke codex / connectors / mission-queue scans /
+///     Non-stub branches invoke codex / connectors / execution-queue scans /
 ///     personality_runtime reads — not Swift-native.
-///   - fireMissionTrigger(name:) — native mission enqueue through
+///   - fireMissionTrigger(name:) — native execution enqueue through
 ///     SwiftNativeWorkshopRunner.
 ///
 /// STILL CARVED — Swift impl deliberately does NOT touch:
@@ -321,7 +321,7 @@ public protocol TriggerSchedulerClient: Sendable {
 ///
 /// Persistence file paths (must stay byte-equivalent to daemon):
 ///   - Inbox:    <root>/inbox/trigger_config.json
-///   - Missions: <root>/missions/triggers.json
+///   - Executions: <root>/missions/triggers.json
 ///
 /// Both are JSON arrays of trigger dicts. Atomic write + cross-process flock
 /// follow the ToolRegistry pattern so the daemon's writes can't race with the
@@ -345,7 +345,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     let worklogPath: URL?
     private var mutationTail: Task<Void, Never>? = nil
 
-    /// `missionRunner` is the wave-21 mission-fire seam. Defaults to a
+    /// `workshopRunner` is the wave-21 execution-fire seam. Defaults to a
     /// SwiftNativeWorkshopRunner with the same `root`/`persistence`/`now`/
     /// `uuid` injection seams so persistence paths and timestamps line up
     /// with the trigger-scheduler's own writes. Tests pass a stub.
@@ -396,7 +396,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     // touches the daemon-shaped config array. Persisting them is what stops a
     // restart from re-firing a storm: after a crash+relaunch the scheduler
     // reads last_fired_at and sees a time trigger already fired today.
-    // Inbox and mission trigger names can collide ("morning_brief" exists in
+    // Inbox and execution trigger names can collide ("morning_brief" exists in
     // both surfaces), so each surface gets its own state file.
     public nonisolated var inboxStatePath: URL {
         root
@@ -425,7 +425,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
 
     private static let logger = Logger(subsystem: "com.nativeagent.core", category: "trigger-scheduler")
 
-    /// Test-only seam: returns the injected mission runner's planner type
+    /// Test-only seam: returns the injected execution runner's planner type
     /// name when it's a `SwiftNativeWorkshopRunner`, else nil. Lets factory-
     /// level tests assert that the PRODUCTION trigger-factory wiring
     /// (`makeTriggerScheduler` → `makeWorkshopRunner`) hands in
@@ -461,7 +461,18 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         } else {
             items = defaultValue
         }
-        return items.compactMap(TriggerConfig.init(json:))
+        // P2-4 read seam. `inbox/trigger_config.json` on a 0.3.x install still
+        // carries `{"name":"mission_followup","kind":"mission_complete"}`. Fold
+        // both fields HERE — the single point where the file becomes
+        // TriggerConfig values — so every downstream switch, filter, and label
+        // sees one vocabulary. The file itself is never rewritten; the mutation
+        // paths below match canonically and preserve each row's stored name.
+        return items.compactMap(TriggerConfig.init(json:)).map { cfg in
+            var canonical = cfg
+            canonical.name = ExecutionEventVocabulary.canonicalKind(cfg.name)
+            canonical.kind = cfg.kind.map(ExecutionEventVocabulary.canonicalKind)
+            return canonical
+        }
     }
 
     // MARK: enable / disable — inbox
@@ -524,7 +535,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         }
     }
 
-    /// Mirrors daemon proactive_triggers.set_enabled + missions.set_enabled:
+    /// Mirrors daemon proactive_triggers.set_enabled + executions.set_enabled:
     ///   - load list (with defaults if missing)
     ///   - flip enabled on matching name; not_found if no match
     ///   - persist + return status envelope
@@ -549,7 +560,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         for (idx, item) in items.enumerated() {
             guard case .object(var obj) = item,
                   case .string(let nm) = obj["name"] ?? .null,
-                  nm == name else { continue }
+                  ExecutionEventVocabulary.matches(nm, name) else { continue }
             obj["enabled"] = .bool(enabled)
             items[idx] = .object(obj)
             found = true
@@ -593,7 +604,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
                 for (idx, item) in items.enumerated() {
                     guard case .object(var obj) = item,
                           case .string(let nm) = obj["name"] ?? .null,
-                          nm == name else { continue }
+                          ExecutionEventVocabulary.matches(nm, name) else { continue }
                     var existing: [String: JSONValue] = [:]
                     if case .object(let cur) = obj["config"] ?? .null { existing = cur }
                     // Python: existing.update(new_config) — shallow merge.
@@ -647,7 +658,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
             return TriggerFireResult(status: "error", name: name, stub: isStub,
                                      error: String(describing: error))
         }
-        guard let row = configs.first(where: { $0.name == name }) else {
+        guard let row = configs.first(where: { ExecutionEventVocabulary.matches($0.name, name) }) else {
             return TriggerFireResult(status: "not_found", name: name, stub: isStub)
         }
 
@@ -665,8 +676,14 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         // Canonical-kind guard: unknown kinds return not_found (matches Python
         // which would have no per-kind trigger class to fire). Don't fall
         // through to a generic stub.
-        let canonicalKinds: Set<String> = ["file_watch", "idle", "time", "mission_complete", "session_pattern"]
-        guard let rowKind = row.kind, canonicalKinds.contains(rowKind) else {
+        let canonicalKinds: Set<String> = [
+            "file_watch", "idle", "time", WorkshopCompletionTrigger.canonicalKind, "session_pattern",
+        ]
+        // `row.kind` already arrives canonical (`_readList` folds it), but fold
+        // again so a row handed in by a caller that bypassed the list path
+        // still matches. P2-4: 0.3.x configs say `mission_complete`.
+        guard let rowKind = row.kind.map(ExecutionEventVocabulary.canonicalKind),
+              canonicalKinds.contains(rowKind) else {
             return TriggerFireResult(status: "not_found", name: name, stub: true)
         }
 
@@ -853,8 +870,8 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         }
     }
 
-    /// Wave 21: Swift-native mission fire. Resolves the trigger row, builds the
-    /// mission spec via the ProactiveTrigger.build_mission() shape (missions.py
+    /// Wave 21: Swift-native execution fire. Resolves the trigger row, builds the
+    /// execution spec via the ProactiveTrigger.build_mission() shape (missions.py
     /// L1821-L1827 — title/objective/trigger_source/trust_required), and calls
     /// SwiftNativeWorkshopRunner.submit(). Mirrors the Python TriggerScheduler.fire_now
     /// failure envelopes: not_found, missing_objective, and any WorkshopExecutionError
@@ -874,11 +891,11 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
             return TriggerFireResult(status: "error", name: name,
                                      error: String(describing: error))
         }
-        guard let row = configs.first(where: { $0.name == name }) else {
+        guard let row = configs.first(where: { ExecutionEventVocabulary.matches($0.name, name) }) else {
             return TriggerFireResult(status: "not_found", name: name)
         }
 
-        // Build the mission spec from the row, mirroring
+        // Build the execution spec from the row, mirroring
         // ProactiveTrigger.build_mission. Extras
         // carry title/objective/trust_required as top-level keys on the row.
         // FIX #5 (wave 21 review): mirror Python defaults exactly.
@@ -940,7 +957,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     /// actually fired (status == "fired"). Mirrors what the daemon's
     /// `_proactive_triggers_loop` does on each periodic tick: enumerate, gate
     /// on `enabled`, and dispatch. Disabled triggers, unknown kinds, and
-    /// missing-objective mission triggers are skipped without being reported as
+    /// missing-objective execution triggers are skipped without being reported as
     /// fired. Inbox triggers fire as stubs (the only fully Swift-native path).
     /// Errors from a single trigger do not block evaluation of the others.
     /// Names of the triggers this tick fired. Thin wrapper over
@@ -963,7 +980,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         // periodic path honestly: the tick fires ONLY triggers whose per-kind
         // condition approves (`scheduledInstantIfDue`). Today that is the `time`
         // kind (hour/minute reached + not-already-fired-for-this-occurrence).
-        // idle / file_watch / mission_complete / session_pattern stay dark —
+        // idle / file_watch / execution_complete / session_pattern stay dark —
         // see the note on `scheduledInstantIfDue` for why each is not yet a
         // self-firing condition.
         //
@@ -1152,7 +1169,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     ///
     ///   - `time` — LIT. Eligible when the local clock has reached the
     ///     configured hour:minute; returns that scheduled instant. Powers the
-    ///     daily mission `morning_brief` enqueue and the daily inbox brief. A
+    ///     daily execution `morning_brief` enqueue and the daily inbox brief. A
     ///     missing / out-of-range / fractional hour makes the trigger DORMANT
     ///     (returns nil), never a crash.
     ///
@@ -1176,9 +1193,9 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     ///     fireInboxTrigger isStub:false). Self-firing a stub on every save is
     ///     noise, not the advertised capability. Light this once the non-stub
     ///     diff path lands.
-    ///   - `mission_complete` — needs to detect an ACTUAL newly-completed
-    ///     mission; the config is empty and no completion cursor is tracked
-    ///     here, and the fire path is a placeholder "Stub Mission".
+    ///   - `execution_complete` — needs to detect an ACTUAL newly-completed
+    ///     execution; the config is empty and no completion cursor is tracked
+    ///     here, and the fire path is a placeholder "Stub Execution".
     ///   - `session_pattern` — needs live conversation-register state
     ///     (`min_turns_in_register`) that the scheduler cannot see.
     ///
@@ -1472,7 +1489,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     ///
     /// `isPlaceholder` is the honest answer to "is this content fabricated?":
     ///   - `time` / `idle` → REAL content from `TriggerContentBuilder` (desk,
-    ///     worklog, missions, inbox, last session). `isPlaceholder == false`.
+    ///     worklog, executions, inbox, last session). `isPlaceholder == false`.
     ///   - the other three → still placeholders, each with an explicit marker
     ///     naming the signal that is missing. `isPlaceholder == true`.
     ///
@@ -1546,12 +1563,12 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
             summary = built.summary
             detail = built.detail
             isPlaceholder = false
-        case "mission_complete":
+        case WorkshopCompletionTrigger.canonicalKind:
             // stub: not yet ported — real content needs a COMPLETION CURSOR
-            // (which mission newly finished since the last fire). The scheduler
-            // tracks no such cursor, so it cannot name the mission. Declared,
+            // (which execution newly finished since the last fire). The scheduler
+            // tracks no such cursor, so it cannot name the execution. Declared,
             // not silent.
-            source = "mission_complete:stub"
+            source = "\(WorkshopCompletionTrigger.canonicalKind):stub"
             severity = "actionable"
             title = "Workshop complete: Stub task"
             summary = "Stub: Workshop task completed. Want to see results?"
@@ -1673,8 +1690,8 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
             "description": .string("Daily morning brief at configured hour."),
         ]),
         .object([
-            "name": .string("mission_followup"),
-            "kind": .string("mission_complete"),
+            "name": .string(WorkshopCompletionTrigger.canonicalName),
+            "kind": .string(WorkshopCompletionTrigger.canonicalKind),
             "enabled": .bool(true),
             "config": .object([:]),
             "description": .string("Notify when a Workshop task completes."),
@@ -1817,7 +1834,8 @@ public actor ProactiveInboxStore {
         let s = source.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return s == "idle_checkin"
             || s.hasPrefix("trigger:")
-            || s.hasPrefix("mission_complete:")
+            || s.hasPrefix("\(WorkshopCompletionTrigger.canonicalKind):")
+            || s.hasPrefix("\(WorkshopCompletionTrigger.legacyKind):")
             || s.hasPrefix("proactive_autonomy:")
     }
 
@@ -1879,14 +1897,14 @@ public actor ProactiveInboxStore {
 
 /// Returns SwiftNative. The daemon route is retired for production runtime.
 ///
-/// Wave 24-amendment (2026-06-01): when `.missions` is ON we MUST inject a
-/// mission runner whose planner is `HTTPCodexMissionPlannerLLM` (the
+/// Wave 24-amendment (2026-06-01): when `.executions` is ON we MUST inject a
+/// execution runner whose planner is `HTTPCodexMissionPlannerLLM` (the
 /// production planner that actually drives an LLM). The default
 /// `SwiftNativeWorkshopRunner.init` planner is `StubWorkshopPlannerLLM`, which
 /// would silently ship 2-step stub plans for every fired trigger — the bug
 /// that wave 24's retirement assumed away. We thread the runner through
 /// `makeWorkshopRunner(runtime:)` so the factory wiring + the standalone
-/// mission-runner factory share one source of truth.
+/// execution-runner factory share one source of truth.
 ///
 /// `notifier` is nil by default: the list / enable / disable / configure call
 /// sites never fire, so they must never carry a push sender. ONLY the two fire

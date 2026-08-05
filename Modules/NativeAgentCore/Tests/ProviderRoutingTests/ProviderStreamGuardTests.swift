@@ -167,7 +167,8 @@ import PersistenceCore
             codex: codex,
             anthropic: GuardedAdapter(streamFactory: { cleanStream(["anthropic"]) }),
             openAI: GuardedAdapter(streamFactory: { cleanStream(["openai"]) }),
-            streamGuardConfig: ProviderStreamGuardConfig(idleTimeout: 0.05, wallTimeout: 10)
+            streamGuardConfig: ProviderStreamGuardConfig(idleTimeout: 0.05, wallTimeout: 10),
+            moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
         )
 
         var chunks: [String] = []
@@ -200,7 +201,8 @@ import PersistenceCore
             codex: codex,
             anthropic: GuardedAdapter(streamFactory: { cleanStream(["anthropic"]) }),
             openAI: GuardedAdapter(streamFactory: { cleanStream(["openai"]) }),
-            streamGuardConfig: ProviderStreamGuardConfig(idleTimeout: 0.05, wallTimeout: 10)
+            streamGuardConfig: ProviderStreamGuardConfig(idleTimeout: 0.05, wallTimeout: 10),
+            moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
         )
 
         var events: [LLMMessageStreamEvent] = []

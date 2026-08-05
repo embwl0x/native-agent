@@ -164,7 +164,7 @@ struct SemanticAppraisalTests {
         let clock = Clock(Date(timeIntervalSince1970: 1_000_000))
         let s = makeSubstrate(clock)
         let post = CognitiveAffectState()
-        let big = event(.workshopExecutionCompleted, "Mission complete: the release shipped.", importance: 1, at: clock.now())
+        let big = event(.workshopExecutionCompleted, "Execution complete: the release shipped.", importance: 1, at: clock.now())
         let small = event(.toolSucceeded, "ls finished.", importance: 0.1, at: clock.now())
         let aBig = await s.semanticAppraisal(for: big, post: post)
         let aSmall = await s.semanticAppraisal(for: small, post: post)

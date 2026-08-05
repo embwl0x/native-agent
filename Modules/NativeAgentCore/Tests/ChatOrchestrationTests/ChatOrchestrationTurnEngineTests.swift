@@ -97,12 +97,12 @@ private final class ConflictingGenerationRouting: ProviderRoutingProtocol, @unch
                 ),
                 "missions": SurfacePreference(
                     surface: "missions",
-                    model: "mission-model",
+                    model: "execution-model",
                     reasoningEffort: "high",
                     serviceTier: "priority"
                 ),
             ],
-            activeProviders: ["chat": "chat-provider", "missions": "mission-provider"],
+            activeProviders: ["chat": "chat-provider", "missions": "execution-provider"],
             pinnedModels: [:]
         )
     }
@@ -284,7 +284,7 @@ private func makeEngine(
 @Test
 func turnEngine_executeTurn_calls_llm_once() async throws {
     let dir = try makeTempDir("llm-once")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let llm = MockLLMClient(scriptedResponses: ["hello world"])
     let engine = makeEngine(persona: persona, llm: llm)
     _ = try await engine.executeTurn(userMessage: "hi", sessionId: nil)
@@ -294,7 +294,7 @@ func turnEngine_executeTurn_calls_llm_once() async throws {
 @Test
 func turnEngine_executeTurn_resolves_model_via_router() async throws {
     let dir = try makeTempDir("model-resolve")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let llm = MockLLMClient(scriptedResponses: ["ok"])
     let engine = makeEngine(
         persona: persona,
@@ -314,7 +314,7 @@ func turnEngine_executeTurn_loads_persona_docs() async throws {
                   "I am the soul of the agent.")
     try writeFile(dir.appendingPathComponent("VOICE.md"),
                   "Dry, sharp, fast.")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let llm = MockLLMClient(scriptedResponses: ["ok"])
     let engine = makeEngine(persona: persona, llm: llm)
     let ctx = try await engine.buildTurnContext(surface: "chat", userMessage: "hi")
@@ -325,7 +325,7 @@ func turnEngine_executeTurn_loads_persona_docs() async throws {
 @Test
 func turnEngine_executeTurn_recalls_memory_when_memory_configured() async throws {
     let dir = try makeTempDir("recall")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let storeURL = dir.appendingPathComponent("emb.jsonl")
     let store = JSONLEmbeddingStore(path: storeURL)
     let embedder = MockEmbeddingProvider(dimensions: 64)
@@ -347,7 +347,7 @@ func turnEngine_executeTurn_recalls_memory_when_memory_configured() async throws
 @Test
 func turnEngine_executeTurn_skips_memory_when_memory_nil() async throws {
     let dir = try makeTempDir("nomem")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let llm = MockLLMClient(scriptedResponses: ["ok"])
     let engine = makeEngine(persona: persona, memory: nil, llm: llm)
     let result = try await engine.executeTurn(userMessage: "anything", sessionId: nil)
@@ -381,7 +381,7 @@ func turnEngine_fallbackRecallCarriesResolvedPersonaAndSurface() async throws {
 @Test
 func turnEngine_executeTurn_returns_modelUsed_matches_resolved() async throws {
     let dir = try makeTempDir("model-match")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let llm = MockLLMClient(scriptedResponses: ["ok"])
     let prefs: [String: SurfacePreference] = [
         "chat": SurfacePreference(surface: "chat", model: "match-me-A", reasoningEffort: "high"),
@@ -397,7 +397,7 @@ func turnEngine_executeTurn_returns_modelUsed_matches_resolved() async throws {
 @Test
 func turnEngine_executeTurn_returns_elapsedMs_nonneg() async throws {
     let dir = try makeTempDir("elapsed")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let llm = MockLLMClient(scriptedResponses: ["ok"])
     let engine = makeEngine(persona: persona, llm: llm)
     let r = try await engine.executeTurn(userMessage: "x")
@@ -408,7 +408,7 @@ func turnEngine_executeTurn_returns_elapsedMs_nonneg() async throws {
 func turnEngine_buildTurnContext_includes_systemPrompt_with_persona() async throws {
     let dir = try makeTempDir("sysprompt")
     try writeFile(dir.appendingPathComponent("SOUL.md"), "marker-content-soul")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let llm = MockLLMClient(scriptedResponses: ["ok"])
     let engine = makeEngine(persona: persona, llm: llm)
     let ctx = try await engine.buildTurnContext(surface: "chat", userMessage: "hi")
@@ -419,7 +419,7 @@ func turnEngine_buildTurnContext_includes_systemPrompt_with_persona() async thro
 @Test
 func turnEngine_buildTurnContext_userMessage_in_context() async throws {
     let dir = try makeTempDir("userMsg")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let llm = MockLLMClient(scriptedResponses: ["ok"])
     let engine = makeEngine(persona: persona, llm: llm)
     let ctx = try await engine.buildTurnContext(surface: "chat", userMessage: "unique-marker-XYZ")
@@ -451,7 +451,7 @@ func turnEngine_buildTurnContext_appends_clock_context_to_dynamic_segment() asyn
     )))
     let dir = try makeTempDir("clockctx")
     try writeFile(dir.appendingPathComponent("SOUL.md"), "CLOCK-STABLE-PERSONA")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let llm = MockLLMClient(scriptedResponses: ["ok"])
     let engine = makeEngine(persona: persona, llm: llm, clock: { now })
 
@@ -474,7 +474,7 @@ func turnEngine_buildTurnContext_appends_runtime_context_to_dynamic_segment() as
     )))
     let dir = try makeTempDir("runtimectx")
     try writeFile(dir.appendingPathComponent("SOUL.md"), "RUNTIME-STABLE-PERSONA")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let llm = MockLLMClient(scriptedResponses: ["ok"])
     let engine = makeEngine(
         persona: persona,
@@ -507,7 +507,7 @@ func turnEngine_buildTurnContext_emits_metadata_only_context_summary() async thr
     TurnTracePersistLane.installTestRootOverrideIfUnset(traceRoot)
     let dir = try makeTempDir("context-summary")
     try writeFile(dir.appendingPathComponent("SOUL.md"), "SECRET-PERSONA-CONTENT")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let schema = LLMToolSchema(
         name: "secret_schema_tool",
         description: "SECRET-SCHEMA-DESCRIPTION",
@@ -562,7 +562,7 @@ func turnEngine_buildTurnContext_emits_metadata_only_context_summary() async thr
 func turnEngine_buildTurnContext_uses_one_active_provider_snapshot_for_runtime() async throws {
     let dir = try makeTempDir("provider-snapshot")
     try writeFile(dir.appendingPathComponent("SOUL.md"), "PROVIDER-SNAPSHOT-PERSONA")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let router = StubRouting(
         prefs: [
             "chat": SurfacePreference(surface: "chat", model: "gpt-5.5", reasoningEffort: "high"),
@@ -589,11 +589,14 @@ func turnEngine_buildTurnContext_uses_one_active_provider_snapshot_for_runtime()
 }
 
 @Test
-func turnEngine_usesOneCheckedGenerationAndMapsWorkshopToMissions() async throws {
+func turnEngine_usesOneCheckedGenerationAndFoldsTheWorkshopSurface() async throws {
+    // Mismatched pair (P2-3): the router fake below is keyed with the 0.3.x
+    // `missions` while the turn asks for the canonical `workshop`. Falling
+    // through to the chat preference here is the silent wrong-model bug.
     let dir = try makeTempDir("checked-provider-generation")
     let router = ConflictingGenerationRouting()
     let engine = SwiftNativeTurnEngine(
-        persona: SwiftNativePersonaEngine(root: dir),
+        persona: hermeticPersona(root: dir),
         memory: nil,
         router: router,
         trust: hermeticTrust(),
@@ -603,12 +606,12 @@ func turnEngine_usesOneCheckedGenerationAndMapsWorkshopToMissions() async throws
 
     let context = try await engine.buildTurnContext(
         surface: "workshop",
-        userMessage: "use the bounded mission route"
+        userMessage: "use the bounded execution route"
     )
 
-    #expect(context.modelId == "mission-model")
+    #expect(context.modelId == "execution-model")
     #expect(context.reasoningEffort == "high")
-    #expect(context.providerId == "mission-provider")
+    #expect(context.providerId == "execution-provider")
     #expect(context.serviceTier == "priority")
     #expect(router.counts.checked == 1)
     #expect(router.counts.preferences == 0)
@@ -618,7 +621,7 @@ func turnEngine_usesOneCheckedGenerationAndMapsWorkshopToMissions() async throws
 @Test
 func turnEngine_buildTurnContext_snapshots_tool_catalog_and_schemas_once() async throws {
     let dir = try makeTempDir("tool-snapshot")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let schema = LLMToolSchema(
         name: "alpha",
         description: "Alpha tool",
@@ -644,7 +647,7 @@ func turnEngine_executeTurn_documents_carve_no_tool_loop() async throws {
     // Even with tools available, Phase B does a single LLM call and no
     // dispatch loop — toolDispatches must be empty.
     let dir = try makeTempDir("nolopp")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let llm = MockLLMClient(scriptedResponses: ["I would call tool X here"])
     let tools = MockToolDispatchClient(scripted: [
         "alpha": .string("ok"),
@@ -683,7 +686,7 @@ func turnEngine_executeTurn_surfaces_persona_load_error_before_memory_recall() a
 @Test
 func turnEngine_executeTurn_rejects_empty_message() async throws {
     let dir = try makeTempDir("empty")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let llm = MockLLMClient(scriptedResponses: ["ok"])
     let spy = SpyMemoryRecaller()
     let engine = makeEngine(persona: persona, memory: spy, llm: llm)
@@ -700,7 +703,7 @@ func turnEngine_executeTurn_rejects_empty_message() async throws {
 @Test
 func turnEngine_buildTurnContext_empty_throws_emptyMessage() async throws {
     let dir = try makeTempDir("bctx-empty")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let llm = MockLLMClient(scriptedResponses: ["ok"])
     let spy = SpyMemoryRecaller()
     let engine = makeEngine(persona: persona, memory: spy, llm: llm)
@@ -717,7 +720,7 @@ func turnEngine_buildTurnContext_empty_throws_emptyMessage() async throws {
 @Test
 func turnEngine_buildTurnContext_whitespace_throws_emptyMessage() async throws {
     let dir = try makeTempDir("bctx-ws")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let llm = MockLLMClient(scriptedResponses: ["ok"])
     let spy = SpyMemoryRecaller()
     let engine = makeEngine(persona: persona, memory: spy, llm: llm)
@@ -734,7 +737,7 @@ func turnEngine_buildTurnContext_whitespace_throws_emptyMessage() async throws {
 @Test
 func turnEngine_executeTurn_rejects_whitespace_message() async throws {
     let dir = try makeTempDir("ws")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let llm = MockLLMClient(scriptedResponses: ["ok"])
     let spy = SpyMemoryRecaller()
     let engine = makeEngine(persona: persona, memory: spy, llm: llm)
@@ -751,7 +754,7 @@ func turnEngine_executeTurn_rejects_whitespace_message() async throws {
 @Test
 func turnEngine_executeTurn_elapsedMs_monotonic_even_when_injected_clock_goes_backwards() async throws {
     let dir = try makeTempDir("monoclock")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let llm = MockLLMClient(scriptedResponses: ["ok"])
     let counter = NSLock()
     nonisolated(unsafe) var step: Int = 0

@@ -12,7 +12,8 @@ import Foundation
 //
 // TOP-LEVEL ITEM (alias order)
 //   `<alias> <token2> <project> · <title>[ · <summary>][ · <now|next child>]`
-//   `[ · refs:N][ · stale:<dur>][ · archives in <dur>][ · <level>/event]`
+//   `[ · refs:N][ · ⚑ drift:<kind>][ · stale:<dur>][ · archives in <dur>]`
+//   `[ · <level>/event]`
 //   • token2 = the STATUS, except when status is the neutral default `.watch`,
 //     where the KIND renders instead (reconciles the build plan's literal
 //     `<status>` with its ground-truth sample, where a freshly-created plan/gh
@@ -22,8 +23,9 @@ import Foundation
 //     a `next` child) collapses inline as `<status> <title>`.
 //   • children LIST (indented two spaces) renders only when the item has ≥2
 //     children; a single child stays collapsed in the highlight.
-//   • one optional note line renders only for a high-signal item (status blocked
-//     or flag) with a latest note: `  note: <text>`.
+//   • one optional note line renders for a high-signal item (status blocked or
+//     flag) with a latest note, or for ANY item whose latest note is a drift
+//     flag: `  note: <text>`.
 //
 // CAPS: ≤25 top-level live items; among TERMINAL (done + canceled) show ≤3
 // most-recent; refs
@@ -188,6 +190,9 @@ public enum DeskProjection {
         if item.refs.count >= 3 {
             segs.append("refs:\(item.refs.count)")
         }
+        if let drift = driftSegment(item) {
+            segs.append(drift)
+        }
         if let stale = staleSegment(item, now: now) {
             segs.append(stale)
         }
@@ -216,9 +221,33 @@ public enum DeskProjection {
         return nil
     }
 
-    /// One high-signal note line, only for a blocked/flagged item with a note.
+    /// `⚑ drift:<kind>` when the LAST thing that happened to this item was the
+    /// observation lane noticing reality disagreed with the board.
+    ///
+    /// DERIVED from the note trail, never a stored flag — which is the whole
+    /// reason Wave 5 writes drift as a marker-prefixed note instead of a state
+    /// field. Any newer note (a receipt, a human note, the next drift) replaces
+    /// this segment, so there is no bit that can stay stuck ON after reality
+    /// moves back. `hasPrefix`, not `contains`: a note quoting the marker inside
+    /// its own text must not be able to fake a flag.
+    static func driftSegment(_ item: DeskItem) -> String? {
+        // Strict parse (exact `⚑ drift[` + a kind that is a real DeskDriftKind),
+        // so human prose that merely opens with the marker cannot render a
+        // fabricated kind. The kind alone is what fits the compact line; the
+        // phrase and evidence live in the note line below it.
+        guard let last = item.notes.last,
+              let kind = DeskObservationEvaluator.driftKind(inNote: last.text) else { return nil }
+        return "\(DeskObservationEvaluator.driftMarker):\(kind.rawValue)"
+    }
+
+    /// One high-signal note line: a blocked/flagged item's latest note, or — for
+    /// an item of ANY status — a drift flag the desk just raised. Drift is the
+    /// desk contradicting itself out loud; hiding it behind a status filter would
+    /// make the loudest thing it can say the quietest thing it renders.
     static func noteLine(_ item: DeskItem) -> String? {
-        guard item.status == .blocked || item.status == .flag, let last = item.notes.last else { return nil }
+        guard let last = item.notes.last else { return nil }
+        let isDrift = DeskObservationEvaluator.driftKind(inNote: last.text) != nil
+        guard item.status == .blocked || item.status == .flag || isDrift else { return nil }
         return "  note: \(last.text)"
     }
 

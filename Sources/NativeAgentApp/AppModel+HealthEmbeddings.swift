@@ -113,20 +113,46 @@ extension AppModel {
     @MainActor
     func loadWhatsRunning() async {
         // Fix 10: catch and log instead of silently swallowing
-        do {
-            whatsRunning = try await client.getWhatsRunning()
-            whatsRunningRefreshStatus = Self.nextRefreshStatus(
+        // Render-cost audit F14 (wave 2). This is the 10 s `chat-whats-running`
+        // poll (`ChatRuntimeStatusChrome.swift:70-77`), so on an idle system it
+        // fires 6×/min with a byte-identical answer. Both writes were
+        // unconditional and Observation fires on *write*, not on *change*, so
+        // every tick redrew `WhatsRunningPanel`.
+        //
+        // The status goes through `staleFlagOnlyStatusToStore` — valid here
+        // because the ONLY reader is `WhatsRunningPresentation.make`
+        // (`ChatRuntimeStatusChrome.swift:241-271`) and it projects exactly
+        // three things: `status == nil`, `status?.isStale`, and
+        // `status?.lastSuccessAt != nil`. The helper stores the first-ever
+        // status (so nil-ness is preserved) and stores whenever
+        // `failedEndpoints` differs (so `isStale` and the success→failure and
+        // failure→success transitions are preserved); the only skipped case is
+        // "same failure set as last time", where carrying the previous
+        // timestamps forward leaves `lastSuccessAt`'s nil-ness identical to
+        // what `nextRefreshStatus` would have produced. Nothing renders the
+        // timestamps themselves.
+        //
+        // The snapshot itself is equality-gated separately: `WhatsRunning` is
+        // `Hashable` (Models/ConfigProviderDoctorModels.swift:828). Gating the
+        // status alone would have bought nothing — `WhatsRunningPanel` reads
+        // `appModel.whatsRunning` directly, so the snapshot write is the one
+        // that was actually redrawing it.
+        func storeStatus(failedEndpoints: [String]) {
+            if let next = Self.staleFlagOnlyStatusToStore(
                 previous: whatsRunningRefreshStatus,
-                failedEndpoints: [],
+                failedEndpoints: failedEndpoints,
                 at: Date()
-            )
+            ) {
+                whatsRunningRefreshStatus = next
+            }
+        }
+        do {
+            let fetched = try await client.getWhatsRunning()
+            if whatsRunning != fetched { whatsRunning = fetched }
+            storeStatus(failedEndpoints: [])
         } catch {
             print("[NativeAgent] loadWhatsRunning failed: \(error)")
-            whatsRunningRefreshStatus = Self.nextRefreshStatus(
-                previous: whatsRunningRefreshStatus,
-                failedEndpoints: ["running work"],
-                at: Date()
-            )
+            storeStatus(failedEndpoints: ["running work"])
         }
     }
 

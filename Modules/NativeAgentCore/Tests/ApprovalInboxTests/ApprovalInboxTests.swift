@@ -614,3 +614,52 @@ private func writeSeed(
     ]))
     #expect(fallback.payloadPreview.contains("\"k\""))
 }
+
+// MARK: - P2-4: the `mission.step` -> `execution.step` action seam
+//
+// approvals.jsonl is a historical record and is never rewritten, so a blocked
+// step staged before the 0.3.8 upgrade keeps its `mission.step` action forever
+// while the executor that resumes it now filters on `execution.step`. Both
+// cases below pair a record in one vocabulary with a filter in the other; a
+// same-spelling test cannot tell a working bridge from a missing one.
+
+@Test func actionFilterMatchesALegacyRecordWithTheCanonicalFilter() async throws {
+    let root = try makeTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let inbox = SwiftNativeApprovalInbox(root: root)
+    try await writeSeed([
+        seedRecord(id: "old", action: "mission.step", createdAt: "2026-05-30T05:00:00+00:00"),
+        seedRecord(id: "other", action: "rem.proposal", createdAt: "2026-05-30T06:00:00+00:00"),
+    ], to: inbox)
+    let matched = try await inbox.list(
+        filter: ApprovalFilter(status: "pending", action: "execution.step")
+    )
+    #expect(matched.map(\.id) == ["old"])
+}
+
+@Test func actionFilterMatchesACanonicalRecordWithTheLegacyFilter() async throws {
+    let root = try makeTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let inbox = SwiftNativeApprovalInbox(root: root)
+    try await writeSeed([
+        seedRecord(id: "new", action: "execution.step", createdAt: "2026-05-30T05:00:00+00:00"),
+        seedRecord(id: "other", action: "memory.repair", createdAt: "2026-05-30T06:00:00+00:00"),
+    ], to: inbox)
+    let matched = try await inbox.list(
+        filter: ApprovalFilter(status: "pending", action: "mission.step")
+    )
+    #expect(matched.map(\.id) == ["new"])
+}
+
+@Test func actionFilterStillDiscriminatesUnrelatedActions() async throws {
+    // The fold must not have turned the action filter into a pass-through.
+    let root = try makeTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let inbox = SwiftNativeApprovalInbox(root: root)
+    try await writeSeed([
+        seedRecord(id: "step", action: "mission.step", createdAt: "2026-05-30T05:00:00+00:00"),
+        seedRecord(id: "rem", action: "rem.proposal", createdAt: "2026-05-30T06:00:00+00:00"),
+    ], to: inbox)
+    let matched = try await inbox.list(filter: ApprovalFilter(action: "rem.proposal"))
+    #expect(matched.map(\.id) == ["rem"])
+}

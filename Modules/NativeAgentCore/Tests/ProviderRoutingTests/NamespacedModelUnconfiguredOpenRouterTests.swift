@@ -123,7 +123,8 @@ struct NamespacedModelUnconfiguredOpenRouterTests {
             codex: codex,
             anthropic: UnreachableAdapter("anthropic"),
             openAI: UnreachableAdapter("openai"),
-            openRouter: nil
+            openRouter: nil,
+            moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
         )
     }
 
@@ -214,7 +215,8 @@ struct NamespacedModelUnconfiguredOpenRouterTests {
             codex: codex,
             anthropic: UnreachableAdapter("anthropic"),
             openAI: UnreachableAdapter("openai"),
-            openRouter: openRouter
+            openRouter: openRouter,
+            moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
         )
         let reply = try await client.complete(
             prompt: "hi", system: nil, model: Self.namespacedModel,

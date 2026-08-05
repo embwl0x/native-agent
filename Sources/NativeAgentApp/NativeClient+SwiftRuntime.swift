@@ -929,8 +929,8 @@ extension NativeClient {
     // MARK: - TriggerScheduler routes (gate: .triggerScheduler)
     //
     // SUBSYSTEM #17 cluster C3 (2026-05-31). Covers list / enable / disable
-    // / configure for BOTH schedules (proactive inbox + missions). fire_now is
-    // native for supported inbox/mission cases and fails closed otherwise.
+    // / configure for BOTH schedules (proactive inbox + executions). fire_now is
+    // native for supported inbox/execution cases and fails closed otherwise.
 
     /// Adapt Core TriggerConfig → app-side InboxTriggerConfig by JSON
     /// round-trip. Core writes the same daemon-byte shape, so InboxTriggerConfig's

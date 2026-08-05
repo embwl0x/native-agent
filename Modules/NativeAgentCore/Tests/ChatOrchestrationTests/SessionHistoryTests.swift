@@ -283,7 +283,7 @@ private func makeEngine2(
     memory: (any MemoryRecalling)? = nil
 ) -> SwiftNativeTurnEngine {
     SwiftNativeTurnEngine(
-        persona: SwiftNativePersonaEngine(root: personaRoot),
+        persona: hermeticPersona(root: personaRoot),
         memory: memory,
         router: StubRouting2(prefs: [
             "chat": SurfacePreference(surface: "chat", model: "gpt-5.5", reasoningEffort: "high"),
@@ -621,7 +621,7 @@ func buildTurnContextWithHistory_caching_contract_stable_segments_before_dynamic
     ])
 
     let engine = SwiftNativeTurnEngine(
-        persona: SwiftNativePersonaEngine(root: personaDir),
+        persona: hermeticPersona(root: personaDir),
         memory: recall,
         router: StubRouting2(prefs: [
             "chat": SurfacePreference(surface: "chat", model: "gpt-5.5", reasoningEffort: "high"),
@@ -686,7 +686,7 @@ func buildTurnContextWithHistory_populates_systemSegments_stable_personaPins_dyn
         MemoryRecallHit(score: 0.9, preview: "RECALL-MARKER-CONTEXTUAL"),
     ])
     let engine = SwiftNativeTurnEngine(
-        persona: SwiftNativePersonaEngine(root: personaDir),
+        persona: hermeticPersona(root: personaDir),
         memory: recall,
         router: StubRouting2(prefs: [
             "chat": SurfacePreference(surface: "chat", model: "gpt-5.5", reasoningEffort: "high"),
@@ -739,7 +739,7 @@ func buildTurnContextWithHistory_appends_clock_context_after_history_tail() asyn
         year: 2026, month: 6, day: 17, hour: 11, minute: 31
     )))
     let engine = SwiftNativeTurnEngine(
-        persona: SwiftNativePersonaEngine(root: personaDir),
+        persona: hermeticPersona(root: personaDir),
         memory: nil,
         router: StubRouting2(prefs: [
             "chat": SurfacePreference(surface: "chat", model: "gpt-5.5", reasoningEffort: "high"),
@@ -782,7 +782,7 @@ func buildTurnContext_noHistory_segments_invariant_holds() async throws {
         MemoryRecallHit(score: 0.8, preview: "RECALL-ONLY-DYNAMIC"),
     ])
     let engine = SwiftNativeTurnEngine(
-        persona: SwiftNativePersonaEngine(root: personaDir),
+        persona: hermeticPersona(root: personaDir),
         memory: recall,
         router: StubRouting2(prefs: [
             "chat": SurfacePreference(surface: "chat", model: "gpt-5.5", reasoningEffort: "high"),

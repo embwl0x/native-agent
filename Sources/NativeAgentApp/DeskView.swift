@@ -11,7 +11,7 @@ import WorkshopExecution
 // maintains.
 //
 // Sectioned bench (User, 2026-07-11: "it just shows up like her regular desk did
-// — make it into sections"). The Workshop absorbed Missions, so this surface
+// — make it into sections"). The Workshop absorbed Executions, so this surface
 // now tells the bench's story top-to-bottom by urgency and ownership:
 //   1. Waiting on you    — approval-blocked executions + blocked/flagged items
 //   2. On the bench      — queued/running Workshop executions

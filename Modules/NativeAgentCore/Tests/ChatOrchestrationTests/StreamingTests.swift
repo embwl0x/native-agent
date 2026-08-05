@@ -126,7 +126,7 @@ func mockStreamingLLMClient_yields_error_when_scripted_to_throw() async throws {
 @Test
 func streamTurn_yields_deltas_in_order() async throws {
     let dir = try makeTempDir("delta-order")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let engine = makeEngine(persona: persona)
     let streamer = MockStreamingLLMClient(chunks: ["Hel", "lo, ", "world"])
     let (events, thrown) = await collect(engine.streamTurn(
@@ -139,7 +139,7 @@ func streamTurn_yields_deltas_in_order() async throws {
 @Test
 func streamTurn_yields_final_with_accumulated_reply() async throws {
     let dir = try makeTempDir("accum")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let engine = makeEngine(persona: persona)
     let streamer = MockStreamingLLMClient(chunks: ["one ", "two ", "three"])
     let (events, _) = await collect(engine.streamTurn(
@@ -154,7 +154,7 @@ func streamTurn_yields_final_with_accumulated_reply() async throws {
 @Test
 func streamTurn_cleanEmptyEOF_isAnErrorNotASuccessfulBlankReply() async throws {
     let dir = try makeTempDir("empty-provider-stream")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let engine = makeEngine(persona: persona)
     let streamer = MockStreamingLLMClient(chunks: [])
     let (events, thrown) = await collect(engine.streamTurn(
@@ -225,7 +225,7 @@ func streamTurn_persona_load_failure_yields_error_event() async throws {
 @Test
 func streamTurn_empty_message_yields_error_event() async throws {
     let dir = try makeTempDir("empty")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let engine = makeEngine(persona: persona)
     let streamer = MockStreamingLLMClient(chunks: ["never"])
     let (events, thrown) = await collect(engine.streamTurn(
@@ -242,7 +242,7 @@ func streamTurn_empty_message_yields_error_event() async throws {
 @Test
 func streamTurn_propagates_upstream_LLM_throw_as_error_event() async throws {
     let dir = try makeTempDir("llm-throw")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let engine = makeEngine(persona: persona)
     let streamer = MockStreamingLLMClient(chunks: ["partial-1", "partial-2", "wont-arrive"], errorAfter: 2)
     let (events, thrown) = await collect(engine.streamTurn(
@@ -257,7 +257,7 @@ func streamTurn_propagates_upstream_LLM_throw_as_error_event() async throws {
 @Test
 func streamTurn_no_tool_dispatch_in_phase_B() async throws {
     let dir = try makeTempDir("no-tool")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let engine = makeEngine(persona: persona)
     let streamer = MockStreamingLLMClient(chunks: [
         "I will call <tool_use ",
@@ -277,7 +277,7 @@ func streamTurn_no_tool_dispatch_in_phase_B() async throws {
 @Test
 func streamTurn_final_TurnEngineResult_includes_modelUsed_and_elapsedMs() async throws {
     let dir = try makeTempDir("final-fields")
-    let persona = SwiftNativePersonaEngine(root: dir)
+    let persona = hermeticPersona(root: dir)
     let engine = makeEngine(
         persona: persona,
         routerPrefs: [

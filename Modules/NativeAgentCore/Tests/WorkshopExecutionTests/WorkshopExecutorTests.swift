@@ -7,7 +7,7 @@ import PersistenceCore
 // MISSIONS EXECUTOR PORT (2026-06-10) — tests for WorkshopExecution+Executor.swift.
 //
 // FIXTURES: the three "golden" plans + expected timeline event sequences are
-// extracted VERBATIM from real daemon-era COMPLETED missions in the reaped
+// extracted VERBATIM from real daemon-era COMPLETED executions in the reaped
 // queue backup `data/workshop/executions.bak.pre-reap-20260610T045233/`:
 //   - 36dccb68-f6f7-4681-95d0-65e697e6ebbb  "Read-only retry"
 //       plan: local_files.search (tool) + chat.synthesize (llm)
@@ -220,7 +220,7 @@ private let fixtureEventsStubShape = [
 
 /// 0d15ac14-d89a-489e-b4b4-8a3bac2259c9 — single synthesize step.
 private let fixturePlanSingleStep = """
-[{"id": "step-1", "description": "Clarify the mission objective because the provided title and objective are placeholders.", "tool_or_action": "chat.synthesize", "args": {"prompt": "Ask the user to provide the real mission title, objective, constraints, and preferred output format."}, "autonomy": "auto"}]
+[{"id": "step-1", "description": "Clarify the execution objective because the provided title and objective are placeholders.", "tool_or_action": "chat.synthesize", "args": {"prompt": "Ask the user to provide the real execution title, objective, constraints, and preferred output format."}, "autonomy": "auto"}]
 """
 private let fixtureEventsSingleStep = [
     "enqueued",
@@ -411,7 +411,7 @@ struct WorkshopExecutorFixtureReplaySuite {
         )
         let executor = WorkshopExecutorLoop(
             root: root,
-            tooledLLMStep: { _ in ("gpt-5.5", "Please provide the real mission objective.") },
+            tooledLLMStep: { _ in ("gpt-5.5", "Please provide the real execution objective.") },
             cancellationPollInterval: 0.02
         )
         await executor.drainOnce()
@@ -419,7 +419,7 @@ struct WorkshopExecutorFixtureReplaySuite {
         #expect(events == fixtureEventsSingleStep)
         let final = await readWorkshopExecution(root: root, id: id)
         #expect(final?.status == "completed")
-        #expect(final?.result == .string("Please provide the real mission objective."))
+        #expect(final?.result == .string("Please provide the real execution objective."))
     }
 
     /// The report/llm step must see PRIOR step outputs in its prompt (the
@@ -556,7 +556,7 @@ struct WorkshopExecutorFixtureReplaySuite {
 
 // MARK: - Synthesize quality: tooled turn + output validation (2026-06-11)
 //
-// Mission 752636c5 (found live by Agent): a `chat.synthesize` step ran a bare
+// Execution 752636c5 (found live by Agent): a `chat.synthesize` step ran a bare
 // LLM call with NO tool access and NO output validation, so the model's
 // refusal ("I can't access your filesystem, here's some jq") scored
 // `succeeded`. These tests pin both halves of the fix.
@@ -778,7 +778,7 @@ struct ValidateSynthesizeOutputSuite {
     @Test func clarificationRequestIsNotARefusal() {
         // The daemon-era fixture shape — a legit ask, not a refusal.
         #expect(WorkshopExecutorLoop.validateSynthesizeOutput(
-            "Please provide the real mission objective.") == .ok)
+            "Please provide the real execution objective.") == .ok)
     }
 
     @Test func emptyAndWhitespaceAreEmpty() {
@@ -788,7 +788,7 @@ struct ValidateSynthesizeOutputSuite {
 
     @Test func ordinarySynthesisIsOk() {
         #expect(WorkshopExecutorLoop.validateSynthesizeOutput(
-            "the user shipped the missions executor and verified it end to end.") == .ok)
+            "the user shipped the executions executor and verified it end to end.") == .ok)
     }
 }
 
@@ -800,7 +800,7 @@ struct WorkshopExecutorClaimSuite {
     @Test func twoConcurrentExecutorsExactlyOneClaims() async throws {
         let root = try makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
-        let id = "race-mission"
+        let id = "race-execution"
         try await seedWorkshopExecution(
             root: root, id: id, title: "race", objective: "race",
             planJSON: fixturePlanSingleStep
@@ -910,7 +910,7 @@ struct WorkshopExecutorFailureSuite {
     @Test func stepFailureFailsWorkshopExecutionWithHonestError() async throws {
         let root = try makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
-        let id = "fail-mission"
+        let id = "fail-execution"
         try await seedWorkshopExecution(
             root: root, id: id, title: "f", objective: "f",
             planJSON: fixturePlanReadOnlyRetry  // tool step first
@@ -992,7 +992,7 @@ struct WorkshopExecutorApprovalSuite {
     @Test func trustRequiredWorkshopExecutionStagesApprovalAndBlocks() async throws {
         let root = try makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
-        let id = "approval-mission"
+        let id = "approval-execution"
         try await seedWorkshopExecution(
             root: root, id: id, title: "a", objective: "a",
             planJSON: twoStepPlan, trustRequired: "send_approval"
@@ -1038,9 +1038,9 @@ struct WorkshopExecutorApprovalSuite {
     }
 
     /// HARDENING (2026-06-15, re-applies a reverted gpt-5.5 HIGH): a non-yolo
-    /// mission's planner cannot DOWNGRADE a send-tier tool's approval by marking
+    /// execution's planner cannot DOWNGRADE a send-tier tool's approval by marking
     /// it autonomy=auto. email.send (intrinsic send_approval) must gate even
-    /// though the plan says "auto" and the mission's own trustRequired is "none".
+    /// though the plan says "auto" and the execution's own trustRequired is "none".
     @Test func nonYoloPlannerCannotDowngradeSendTierTool() async throws {
         let root = try makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1115,7 +1115,7 @@ struct WorkshopExecutorApprovalSuite {
     @Test func resumeApprovedExecutesStepThenContinuesToCompletion() async throws {
         let root = try makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
-        let id = "resume-mission"
+        let id = "resume-execution"
         try await seedWorkshopExecution(
             root: root, id: id, title: "r", objective: "r",
             planJSON: twoStepPlan, trustRequired: "send_approval"
@@ -1141,7 +1141,7 @@ struct WorkshopExecutorApprovalSuite {
 
         // Approve → the step must actually EXECUTE (W6: never
         // mark-without-executing), then the remaining plan runs. Note:
-        // step-2 is approval-gated too on a send_approval mission, so the
+        // step-2 is approval-gated too on a send_approval execution, so the
         // post-resume continuation BLOCKS on step-2 — assert the re-stage.
         let afterResume = try await executor.resumeAfterApproval(
             executionId: id, stepId: "step-1", approved: true, approvalId: "approval-xyz"
@@ -1177,7 +1177,7 @@ struct WorkshopExecutorApprovalSuite {
     @Test func resumeRejectedMarksStepRejectedAndFailsWorkshopExecution() async throws {
         let root = try makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
-        let id = "reject-mission"
+        let id = "reject-execution"
         try await seedWorkshopExecution(
             root: root, id: id, title: "r", objective: "r",
             planJSON: twoStepPlan, trustRequired: "send_approval"
@@ -1217,7 +1217,7 @@ struct WorkshopExecutorApprovalSuite {
     @Test func resumeWithMismatchedApprovalIdThrows() async throws {
         let root = try makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
-        let id = "mismatch-mission"
+        let id = "mismatch-execution"
         try await seedWorkshopExecution(
             root: root, id: id, title: "m", objective: "m",
             planJSON: twoStepPlan, trustRequired: "send_approval"
@@ -1274,7 +1274,7 @@ struct WorkshopExecutorCancelSuite {
     func cancelMidRunStopsInFlightStepTask() async throws {
         let root = try makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
-        let id = "cancel-mission"
+        let id = "cancel-execution"
         try await seedWorkshopExecution(
             root: root, id: id, title: "c", objective: "c",
             planJSON: fixturePlanStubShape  // 2 llm steps
@@ -1511,7 +1511,7 @@ struct WorkshopExecutorCancelCASSuite {
     }
 }
 
-// MARK: - Stale approval on a no-longer-blocked mission (gpt-5.5 blocker #3)
+// MARK: - Stale approval on a no-longer-blocked execution (gpt-5.5 blocker #3)
 
 @Suite("WorkshopExecutorLoop: stale approval cards")
 struct WorkshopExecutorStaleApprovalSuite {
@@ -1601,7 +1601,7 @@ struct WorkshopExecutorStaleApprovalSuite {
     }
 }
 
-// MARK: - Cross-mission slot atomicity (gpt-5.5 blocker #4)
+// MARK: - Cross-execution slot atomicity (gpt-5.5 blocker #4)
 
 /// Tracks the maximum number of concurrently running step closures.
 private actor ConcurrencyGauge {
@@ -1706,7 +1706,7 @@ struct WorkshopExecutorReceiptSanitizationSuite {
     @Test func traversalStepIdCannotEscapeReceiptsDir() async throws {
         let root = try makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
-        let id = "traversal-mission"
+        let id = "traversal-execution"
         try await seedWorkshopExecution(
             root: root, id: id, title: "t", objective: "t",
             planJSON: """
@@ -1776,9 +1776,9 @@ struct WorkshopPolicyAllowsSuite {
 // MARK: - Hard step deadline (unattended-hang backstop, 2026-06-15)
 //
 // TRUST log #1: a wedged tool (dead network, an MCP server that never answers)
-// in an UNATTENDED mission reaches no cancel() and used to hang the step
-// forever — and because drainOnce awaits each mission and slots are capped,
-// enough hung steps starve ALL mission throughput until restart. The hard
+// in an UNATTENDED execution reaches no cancel() and used to hang the step
+// forever — and because drainOnce awaits each execution and slots are capped,
+// enough hung steps starve ALL execution throughput until restart. The hard
 // per-step deadline (raceWithCancellationWatch) auto-fails the step instead.
 
 @Suite("WorkshopExecutorLoop: hard step deadline")
@@ -1786,7 +1786,7 @@ struct WorkshopExecutorStepDeadlineSuite {
 
     /// THE freeze fix: a cooperative tool that hangs far past the per-step
     /// deadline, with NO cancellation (no human in the loop). The deadline must
-    /// auto-FAIL the step + mission promptly, not hang. .timeLimit guards
+    /// auto-FAIL the step + execution promptly, not hang. .timeLimit guards
     /// against a regression that reintroduces the hang.
     @Test(.timeLimit(.minutes(1)))
     func hungStepHitsDeadlineAndFailsWorkshopExecutionUnattended() async throws {
@@ -2002,7 +2002,7 @@ struct WorkshopExecutorPassCancellationSuite {
 
 // MARK: - Startup orphan reclaim (crash/restart slot-leak fix, 2026-06-15)
 //
-// TRUST log #2: a mission left "running" by a crash is never re-claimed (claim
+// TRUST log #2: an execution left "running" by a crash is never re-claimed (claim
 // requires "queued") yet still counts against maxActive — a silent slot leak
 // that degrades throughput across restarts. Parent/pass cancellation requeues
 // its live claim in-process; the first drain after launch fails only true
@@ -2083,13 +2083,13 @@ struct WorkshopExecutorOrphanReclaimSuite {
         #expect(m?.status == "running")
     }
 
-    /// gpt-5.5 BLOCKING regression: a mission STARTED via start() (the UI path,
+    /// gpt-5.5 BLOCKING regression: an execution STARTED via start() (the UI path,
     /// before the first background drain) must NOT be reclaimed as an orphan by
     /// that drain. The shared reconcile barrier makes start() run the reclaim
-    /// FIRST (seeing the mission still "queued" — no orphan) before claiming it,
+    /// FIRST (seeing the execution still "queued" — no orphan) before claiming it,
     /// so the later drain finds the reclaim already done and leaves the live
-    /// mission alone. With the old bare-bool guard this test FAILS (the drain
-    /// reclaims the live mission to failed/interrupted_by_restart).
+    /// execution alone. With the old bare-bool guard this test FAILS (the drain
+    /// reclaims the live execution to failed/interrupted_by_restart).
     @Test(.timeLimit(.minutes(1)))
     func workshopExecutionStartedViaStartIsNotReclaimedByConcurrentDrain() async throws {
         let root = try makeTempRoot()
@@ -2132,10 +2132,10 @@ struct WorkshopExecutorOrphanReclaimSuite {
     /// gpt-5.5 re-review BLOCKING regression: the startup orphan-reclaim barrier
     /// is memoized PER DATA-ROOT, not per instance. The app can run TWO executor
     /// instances on one root (the background drain via WorkshopExecutorRef.shared
-    /// AND a cold-start fallback in applyResolvedMissionStep). Instance A flips a
-    /// mission to "running"; a SEPARATE instance B's first drain must NOT reclaim
+    /// AND a cold-start fallback in applyResolvedWorkshopStep). Instance A flips a
+    /// execution to "running"; a SEPARATE instance B's first drain must NOT reclaim
     /// it as a crash orphan — both share the one per-root reclaim. With the old
-    /// per-instance guard B runs its OWN reclaim and fails A's live mission.
+    /// per-instance guard B runs its OWN reclaim and fails A's live execution.
     @Test(.timeLimit(.minutes(1)))
     func liveWorkshopExecutionOnOneInstanceNotReclaimedByAnotherInstanceSameRoot() async throws {
         let root = try makeTempRoot()
@@ -2186,7 +2186,7 @@ struct WorkshopExecutorOrphanReclaimSuite {
 
 // MARK: - Approval-wait timeout (reconcileTimedOutApprovals)
 
-/// The "no human is coming" stall fix: a mission blocked_on_approval past the
+/// The "no human is coming" stall fix: an execution blocked_on_approval past the
 /// configured deadline is auto-failed, and the sweep is race-safe against a
 /// concurrent resume (resume CAS-claims blocked_on_approval → running BEFORE
 /// it executes the step, so the two are mutually exclusive).

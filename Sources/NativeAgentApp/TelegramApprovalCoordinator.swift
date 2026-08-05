@@ -94,8 +94,50 @@ actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHandling 
         return approval.id
     }
 
+    /// Missed-event repair only. The kqueue watcher below is the reaction path;
+    /// this interval bounds how long a resolution could hide behind an edge the
+    /// watcher never saw (a filesystem that dropped it, an armed-on-parent
+    /// window). It is not the reaction latency.
+    static let resolutionRepairPollSeconds: TimeInterval = 15
+
+    /// PERF (wave 2): this used to re-read the approvals inbox once per second
+    /// for the entire time a human was looking at a Telegram approval prompt —
+    /// and `inbox.get(id)` is not cheap: it takes the approvals flock, parses
+    /// and validates the whole 300-row `requests.json`, and sorts it, just to
+    /// pull one record out. A 60-second think meant 60 of those.
+    ///
+    /// It now waits on a `FileChangeWatcher` over the approvals file, with the
+    /// repair poll above as the only remaining timer. Reaction is STRICTLY
+    /// FASTER, never slower: the resolver writes `requests.json`, the kqueue
+    /// edge lands in milliseconds, and the loop re-reads immediately — where
+    /// before it waited out the remainder of a 1s tick.
+    ///
+    /// No missed-event window at the seam: the watcher is armed BEFORE the
+    /// first read, and the stream's buffer is unbounded, so an edge that lands
+    /// while a read is in flight is delivered to the very next `next()` rather
+    /// than being dropped.
     func awaitResolution(id: String) async throws -> ApprovalDecision {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
+        let approvalsPath = await inbox.approvalsPath
+
+        let (wakes, wake) = AsyncStream<Void>.makeStream()
+        let watcher = FileChangeWatcher(paths: [approvalsPath]) { _ in
+            wake.yield(())
+        }
+        let repairTicker = Task { [interval = Self.resolutionRepairPollSeconds] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+                guard !Task.isCancelled else { break }
+                wake.yield(())
+            }
+        }
+        defer {
+            repairTicker.cancel()
+            watcher.cancel()
+            wake.finish()
+        }
+
+        var edges = wakes.makeAsyncIterator()
         while !Task.isCancelled {
             let record = try await inbox.get(id)
             if record.status == "resolved" {
@@ -106,7 +148,8 @@ actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHandling 
                 default: return .denied
                 }
             }
-            try await Task.sleep(nanoseconds: 1_000_000_000)
+            // Returns nil when this task is cancelled, which exits the loop.
+            guard await edges.next() != nil else { break }
         }
         throw CancellationError()
     }

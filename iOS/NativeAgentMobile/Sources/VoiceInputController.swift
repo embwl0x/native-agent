@@ -2,30 +2,45 @@
 // Uses SFSpeechRecognizer + AVAudioEngine, mirroring the Mac pattern but
 // touch-driven rather than hotkey-driven.
 import Foundation
+import Observation
 import UIKit
 import Speech
 import AVFoundation
 
+// PERF-2026-08-05: was `ObservableObject` with 8 `@Published` properties, injected
+// at the app root via `.environmentObject` and subscribed by the 1454-line ChatView.
+// `objectWillChange` is whole-object, so the ~45Hz `audioLevel` write from the
+// installTap audio callback invalidated the ENTIRE chat screen while the mic was
+// live — driven by a property no view reads. `@Observable` is field-granular: a
+// view only re-renders for the exact properties its body touched. This matches the
+// Mac controller (Sources/NativeAgentApp/VoiceInputController.swift), which has
+// always been `@Observable`.
 @MainActor
-final class VoiceInputController: ObservableObject {
-    @Published var isListening = false
-    @Published var isStarting = false
-    @Published var transcript = ""         // live partial transcript
-    @Published var lastFinalTranscript = "" // populated when user releases
-    @Published var error: String?
-    @Published var statusText: String?
-    @Published var audioLevel: Double = 0
-    @Published var hasReceivedAudio = false
+@Observable
+final class VoiceInputController {
+    var isListening = false
+    var isStarting = false
+    var transcript = ""         // live partial transcript
+    var lastFinalTranscript = "" // populated when user releases
+    var error: String?
+    var statusText: String?
+    /// Written ~45Hz from the audio tap. No view reads it today (no level meter /
+    /// waveform exists on iOS). Left observation-tracked deliberately: under
+    /// `@Observable` an unread property costs nothing, and if a meter is ever
+    /// added only that leaf view will re-render. Do NOT read this from a
+    /// container view — read it from the smallest possible leaf.
+    var audioLevel: Double = 0
+    var hasReceivedAudio = false
 
-    private var recognizer: SFSpeechRecognizer?
-    private var audioEngine = AVAudioEngine()
-    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
-    private var recognitionTask: SFSpeechRecognitionTask?
-    private var tapInstalled = false
-    private var desiredListening = false
-    private var startGeneration = 0
-    private var waitingForFinalAfterStop = false
-    private var hasStartedAudioSession = false
+    @ObservationIgnored private var recognizer: SFSpeechRecognizer?
+    @ObservationIgnored private var audioEngine = AVAudioEngine()
+    @ObservationIgnored private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
+    @ObservationIgnored private var recognitionTask: SFSpeechRecognitionTask?
+    @ObservationIgnored private var tapInstalled = false
+    @ObservationIgnored private var desiredListening = false
+    @ObservationIgnored private var startGeneration = 0
+    @ObservationIgnored private var waitingForFinalAfterStop = false
+    @ObservationIgnored private var hasStartedAudioSession = false
 
     init() {
         recognizer = SFSpeechRecognizer(locale: Locale.current)
@@ -148,8 +163,15 @@ final class VoiceInputController: ObservableObject {
                 guard let self, self.desiredListening || self.waitingForFinalAfterStop else { return }
                 self.audioLevel = normalized
                 if rms > 0.002 {
-                    self.hasReceivedAudio = true
-                    if self.transcript.isEmpty {
+                    // PERF-2026-08-05: `@Observable` setters fire a mutation
+                    // unconditionally, including for same-value writes. These two
+                    // used to be re-assigned every buffer (~45Hz); `statusText` IS
+                    // read by ChatView, so the redundant writes would have kept a
+                    // slice of the storm alive. Same final values, one write each.
+                    if !self.hasReceivedAudio {
+                        self.hasReceivedAudio = true
+                    }
+                    if self.transcript.isEmpty, self.statusText != "Hearing you..." {
                         self.statusText = "Hearing you..."
                     }
                 }

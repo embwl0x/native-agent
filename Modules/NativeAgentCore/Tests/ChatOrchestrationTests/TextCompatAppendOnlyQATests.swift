@@ -182,7 +182,7 @@ private final class DualTransportScriptedLLM: StreamingLLMClient, MessagesStream
 
 private func makeQAEngine(root: URL, llm: any LLMClient, tools: any ToolDispatchClient) -> SwiftNativeTurnEngine {
     SwiftNativeTurnEngine(
-        persona: SwiftNativePersonaEngine(root: root),
+        persona: hermeticPersona(root: root),
         memory: nil,
         router: StubRoutingQA(),
         trust: hermeticTrust(),

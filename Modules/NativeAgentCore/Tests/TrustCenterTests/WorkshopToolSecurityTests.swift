@@ -14,7 +14,7 @@ import PersistenceCore
 
 private func hermeticCenter() throws -> (SwiftNativeSecurityCenter, URL) {
     let root = FileManager.default.temporaryDirectory
-        .appendingPathComponent("MissionToolSecurity-\(UUID().uuidString)")
+        .appendingPathComponent("WorkshopToolSecurity-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     return (SwiftNativeSecurityCenter(dataRoot: root), root)
 }

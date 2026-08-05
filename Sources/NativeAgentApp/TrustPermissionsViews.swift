@@ -305,7 +305,7 @@ struct TrainingPermissionsView: View {
     }
 }
 
-// PATCH-2026-05-07: missions-b Permissions panel for autonomous missions
+// PATCH-2026-05-07: executions-b Permissions panel for autonomous executions
 struct WorkshopPermissionsView: View {
     @Environment(AppModel.self) private var appModel
     @State private var draftPolicy = TrustWorkshopPolicy()

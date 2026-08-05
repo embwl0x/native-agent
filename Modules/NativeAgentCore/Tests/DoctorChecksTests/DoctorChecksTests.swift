@@ -281,7 +281,7 @@ private struct InternallyFailingCheck: DoctorCheck {
     defer { try? FileManager.default.removeItem(at: root) }
     try Data("you are SOUL".utf8).write(to: root.appendingPathComponent("SOUL.md"))
     try Data("user".utf8).write(to: root.appendingPathComponent("USER.md"))
-    let engine = SwiftNativePersonaEngine(root: root)
+    let engine = hermeticPersona(root: root)
     let check = PersonaEngineCheck(engineProvider: { engine })
     let result = await check.run()
     #expect(result.status == "ok")
@@ -296,7 +296,7 @@ private struct InternallyFailingCheck: DoctorCheck {
     defer { try? FileManager.default.removeItem(at: root) }
     // Persona dir exists with non-SOUL docs only.
     try Data("user".utf8).write(to: root.appendingPathComponent("USER.md"))
-    let engine = SwiftNativePersonaEngine(root: root)
+    let engine = hermeticPersona(root: root)
     let check = PersonaEngineCheck(engineProvider: { engine })
     let result = await check.run()
     #expect(result.status == "fail")
@@ -307,7 +307,7 @@ private struct InternallyFailingCheck: DoctorCheck {
 @Test func personaEngineCheck_repair_seeds_missing_docs() async throws {
     let root = tempDir()
     defer { try? FileManager.default.removeItem(at: root) }
-    let engine = SwiftNativePersonaEngine(root: root)
+    let engine = hermeticPersona(root: root)
     let check = PersonaEngineCheck(engineProvider: { engine })
     let result = await check.run(repair: true)
     #expect(result.status == "ok")
@@ -323,7 +323,7 @@ private struct InternallyFailingCheck: DoctorCheck {
     let root = tempDir()
     defer { try? FileManager.default.removeItem(at: root) }
     try Data("you are SOUL".utf8).write(to: root.appendingPathComponent("SOUL.md"))
-    let engine = SwiftNativePersonaEngine(root: root)
+    let engine = hermeticPersona(root: root)
     let check = PersonaEngineCheck(engineProvider: { engine })
     let result = await check.run()
     #expect(result.status == "ok")

@@ -1,7 +1,7 @@
 import Foundation
 import PersistenceCore   // SwiftNativePersistenceCore + readJSONL (timeline scan)
 
-// MARK: - Mission outcome scoreboard (MEASURE leg of the north-star, 2026-06-15)
+// MARK: - Execution outcome scoreboard (MEASURE leg of the north-star, 2026-06-15)
 //
 // The north star is "Agent runs a real multi-step job unattended and gets
 // MEASURABLY better week over week." Nothing in the system produced that
@@ -11,9 +11,9 @@ import PersistenceCore   // SwiftNativePersistenceCore + readJSONL (timeline sca
 // "her completion rate went up" or "she's solving jobs in fewer steps."
 //
 // This is that scoreboard, built the simplest way that produces the number: a
-// PURE READ-SIDE aggregator over the mission records ALREADY persisted to
+// PURE READ-SIDE aggregator over the execution records ALREADY persisted to
 // mission.json (read via SwiftNativeWorkshopRunner.listAll()). Completed
-// missions persist (only the submit-error path deletes a mission dir; there is
+// executions persist (only the submit-error path deletes an execution dir; there is
 // no terminal cleanup), so the full history is on disk. Zero write-path, zero
 // executor change, zero per-turn latency — it just reads what's there and
 // buckets it by ISO week.
@@ -44,7 +44,7 @@ public struct WorkshopOutcomeSample: Sendable, Equatable {
     /// (the golden-eval jobs) from organic user Workshop executions for a clean
     /// week-over-week signal.
     public var triggerSource: String
-    /// The planner FAILED for this mission (threw / returned non-JSON / 0 valid
+    /// The planner FAILED for this execution (threw / returned non-JSON / 0 valid
     /// steps) and fell back to a deterministic stub plan — a PLAN-QUALITY signal.
     /// Derived from the `planner_fallback` timeline event (`fromStub` isn't on
     /// WorkshopExecutionRecord). NOTE (gpt-5.5): this is the planner-FAILURE rate, NOT
@@ -75,11 +75,11 @@ public struct WorkshopOutcomeSample: Sendable, Equatable {
     public var isCompleted: Bool { WorkshopOutcomeScoreboard.completedStatuses.contains(status.lowercased()) }
 
     /// Wall time from creation to the LAST mission.json write (createdAt →
-    /// updatedAt). For the common case (a mission not edited after it finishes)
+    /// updatedAt). For the common case (an execution not edited after it finishes)
     /// the last write IS the terminal transition, so this ≈ end-to-end
-    /// execution time. CAVEAT (gpt-5.5 review): `updateMission` bumps
+    /// execution time. CAVEAT (gpt-5.5 review): `updateWorkshopExecution` bumps
     /// `updatedAt` on ANY later patch with no terminal-status guard, so a
-    /// mission edited post-terminal would overstate this — it's an UPPER BOUND
+    /// execution edited post-terminal would overstate this — it's an UPPER BOUND
     /// on execution time, a useful trend signal, not an exact duration. Exact
     /// terminal duration needs a dedicated terminal timestamp / timeline parse
     /// (v2). Clamped at 0 (a clock skew / out-of-order write can't go negative).
@@ -208,7 +208,7 @@ public enum WorkshopOutcomeScoreboard {
         }
     }
 
-    /// Parse a mission ISO timestamp. Swift-written records use
+    /// Parse an execution ISO timestamp. Swift-written records use
     /// `[.withInternetDateTime, .withFractionalSeconds]` with a `+00:00`
     /// offset (WorkshopExecution.isoTimestamp). But DAEMON-ERA records on disk carry
     /// MICROSECOND fractions (`2026-05-07T10:12:54.380610+00:00`), and
@@ -292,8 +292,8 @@ public enum WorkshopOutcomeScoreboard {
     }
 }
 
-/// Fixed, READ-ONLY "golden" missions — the CONTROLLED cohort for MEASURE v2
-/// (north-star). Organic single-user mission volume is too sparse for a stable
+/// Fixed, READ-ONLY "golden" executions — the CONTROLLED cohort for MEASURE v2
+/// (north-star). Organic single-user execution volume is too sparse for a stable
 /// week-over-week trend; submitting the SAME jobs on a cadence gives the
 /// scoreboard comparable data points. They exercise the real plan→step path
 /// (planner + recall + synthesis) with innocuous, side-effect-free objectives,
