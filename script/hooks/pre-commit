@@ -22,3 +22,33 @@ if ! gitleaks git --staged --no-banner --redact -c "$ROOT/.gitleaks.toml"; then
   echo "[pre-commit] Fix it, or if it is a verified false positive: git commit --no-verify" >&2
   exit 1
 fi
+
+# Release-gate drift guard (2026-08-06, "how did you miss all that"): six
+# waves added production timers/resources without updating the ship-time
+# inventories, and all of it failed at once at the 0.3.8 cut. When a staged
+# Swift change touches a sleep/timer primitive, the timer inventory must
+# classify it NOW, not on release day. Cheap (<5s). Bypass: --no-verify.
+if git diff --cached --name-only | grep -qE '\.swift$'; then
+  if git diff --cached -U0 -- '*.swift' | grep -qE '^\+.*((Task|Thread)\.sleep|usleep\(|timeoutNanoseconds)'; then
+    echo "[pre-commit] staged timer/sleep change — running timer inventory check..."
+    swift "$ROOT/script/check_timer_inventory.swift" || {
+      echo "[pre-commit] BLOCKED: classify the new timer in script/timer_inventory.tsv (see check output)." >&2
+      exit 1
+    }
+  fi
+fi
+
+# Release-gate drift guard (2026-08-06, "how did you miss all that"): six
+# waves added production timers/resources without updating the ship-time
+# inventories, and all of it failed at once at the 0.3.8 cut. When a staged
+# Swift change touches a sleep/timer primitive, the timer inventory must
+# classify it NOW, not on release day. Cheap (<5s). Bypass: --no-verify.
+if git diff --cached --name-only | grep -qE '\.swift$'; then
+  if git diff --cached -U0 -- '*.swift' | grep -qE '^\+.*((Task|Thread)\.sleep|usleep\(|timeoutNanoseconds)'; then
+    echo "[pre-commit] staged timer/sleep change — running timer inventory check..."
+    swift "$ROOT/script/check_timer_inventory.swift" || {
+      echo "[pre-commit] BLOCKED: classify the new timer in script/timer_inventory.tsv (see check output)." >&2
+      exit 1
+    }
+  fi
+fi
