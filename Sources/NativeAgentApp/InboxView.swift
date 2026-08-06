@@ -30,6 +30,14 @@ struct InboxItemRecord: Identifiable, Codable, Hashable {
         case actions, status, read_at
     }
 
+    /// Wave 4 (phase A) read-both: accept the FUTURE `related_execution_id`
+    /// spelling as well as the on-wire `related_mission_id` above. Decode-only —
+    /// `encode(to:)` below still writes `related_mission_id`, so the inbox
+    /// snapshot a 0.3.7 iOS install reads is byte-identical.
+    private enum FutureCodingKeys: String, CodingKey {
+        case related_execution_id
+    }
+
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(String.self, forKey: .id)
@@ -39,7 +47,15 @@ struct InboxItemRecord: Identifiable, Codable, Hashable {
         title = (try? c.decode(String.self, forKey: .title)) ?? ""
         summary = (try? c.decode(String.self, forKey: .summary)) ?? ""
         detail = try? c.decodeIfPresent(String.self, forKey: .detail)
-        relatedWorkshopExecutionId = try? c.decodeIfPresent(String.self, forKey: .relatedWorkshopExecutionId)
+        let futureRelatedExecutionId: String? = {
+            guard let future = try? decoder.container(keyedBy: FutureCodingKeys.self) else {
+                return nil
+            }
+            return try? future.decodeIfPresent(String.self, forKey: .related_execution_id)
+        }()
+        relatedWorkshopExecutionId = futureRelatedExecutionId
+            ?? (try? c.decodeIfPresent(String.self, forKey: .relatedWorkshopExecutionId))
+            ?? nil
         related_approval_id = try? c.decodeIfPresent(String.self, forKey: .related_approval_id)
         related_paths = try? c.decodeIfPresent([String].self, forKey: .related_paths)
         related_groups = try? c.decodeIfPresent([InboxRelatedGroup].self, forKey: .related_groups)

@@ -187,7 +187,7 @@ struct TaskLedgerCLI {
 
     static func actor(_ raw: String?) -> TaskLedgerActor? {
         guard let raw else { return nil }
-        return TaskLedgerActor(rawValue: raw)
+        return TaskLedgerActor(wire: raw)
     }
 
     static func kindList() -> String {

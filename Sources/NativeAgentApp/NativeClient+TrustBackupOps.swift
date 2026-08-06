@@ -82,7 +82,12 @@ extension NativeClient {
             var mp: [String: Any] = [:]
             if let v = workshopExecutionEnabled { mp["enabled"] = v }
             if let v = workshopExecutionShowTimeline { mp["showTimeline"] = v }
-            body["missionPolicy"] = mp
+            // Wave 4 phase A: STILL the old key. The trust-write chokepoint
+            // accepts `workshopPolicy` on the way in
+            // (WorkshopPolicyBlockVocabulary.foldToWireKey in updateTrust), but
+            // this writer keeps emitting `missionPolicy` so `trust/policy.json`
+            // and every snapshot a 0.3.7 iOS install decodes stay byte-identical.
+            body[WorkshopPolicyBlockVocabulary.wireKey] = mp
         }
         return try await postTrustWrite(body: body)
     }
@@ -110,13 +115,21 @@ extension NativeClient {
         let patch = JSONValue(fromFoundation: body)
         let defaults = SwiftNativeTrustCenter(dataRoot: root).defaultTrustPolicy()
         try await persistence.withFileLock(path) {
-            let current = try SwiftNativeTrustCenter.loadRawPolicyChecked(at: path)
+            // Wave 4 read-both (phase A): fold the future `workshopPolicy`
+            // spelling onto the wire key on BOTH sides of the merge — this is
+            // the app-side trust-write chokepoint, and without the fold a
+            // caller patch (or stray on-disk state) could persist the future
+            // key, which every 0.3.7 reader silently ignores (review
+            // 2026-08-06 blocking #1). Same contract as updateTrust.
+            let current = WorkshopPolicyBlockVocabulary.foldToWireKey(
+                try SwiftNativeTrustCenter.loadRawPolicyChecked(at: path))
             try SwiftNativeTrustCenter.validateKnownAuthorityPolicyTypes(
                 current,
                 against: defaults
             )
             var patchDict: [String: JSONValue] = [:]
             if case .object(let p) = patch { patchDict = p }
+            patchDict = WorkshopPolicyBlockVocabulary.foldToWireKey(patchDict)
             // Review blocker fix (2026-06-10): the Full Mac duration picker's
             // >24h expiry derives HERE, from the on-disk confirmedAt read
             // under THIS lock — never from a stamp the caller read earlier
@@ -603,6 +616,13 @@ extension NativeClient {
     static func restoreLegacyFlatBackup(backupDir: URL, destinationRoot: URL) throws -> [String] {
         let mapping: [(String, String)] = [
             ("trust.json", "trust/policy.json"),
+            // De-mission P2-7: the launch-time `data/missions` absorption in
+            // WorkshopStorageMigrator is GONE, so this mapping is the only
+            // remaining consumer of the Python-era `missions.json` filename.
+            // It must stay: restoring a Python-era flat backup has to land the
+            // file at workshop/legacy_executions.json, where the live readers
+            // (Runner.listAll, TriggerContent, SessionDigestProvider) look —
+            // nothing else will relocate it afterwards.
             ("missions.json", "workshop/legacy_executions.json"),
             ("chat_sessions.json", "chat/sessions.json"),
             ("improvements.json", "improvements/runs.json"),
@@ -643,7 +663,10 @@ extension NativeClient {
             source = backupDir.appendingPathComponent("trust.json")
         }
         guard FileManager.default.fileExists(atPath: source.path) else { return }
-        let policy = try SwiftNativeTrustCenter.loadRawPolicyChecked(at: source)
+        // Fold before validation for the same reason as loadTrustPolicyChecked:
+        // a future-spelled block must face the same nested type checks.
+        let policy = WorkshopPolicyBlockVocabulary.foldToWireKey(
+            try SwiftNativeTrustCenter.loadRawPolicyChecked(at: source))
         let defaults = SwiftNativeTrustCenter(dataRoot: dataDir).defaultTrustPolicy()
         try SwiftNativeTrustCenter.validateKnownAuthorityPolicyTypes(
             policy,

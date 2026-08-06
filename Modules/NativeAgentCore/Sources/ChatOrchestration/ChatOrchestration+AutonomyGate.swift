@@ -212,7 +212,12 @@ extension SwiftNativeTrustCenter: OriginAwareAutonomyResolver {
         switch surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "chat", "codex-bridge", "claude-bridge":
             return true
-        case "workshop", "mission", "missions":
+        // Wave 5b: the three Workshop spellings now come from
+        // `WorkshopSurfaceVocabulary.gateSpellings` instead of being open-coded.
+        // Identical membership ("workshop"/"missions"/"mission"), identical
+        // result — the surface is already trimmed+lowercased by the switch
+        // subject, and `isWorkshopGateSurface` trims+lowercases again.
+        case let s where WorkshopSurfaceVocabulary.isWorkshopGateSurface(s):
             // Executions run LOCALLY on the Mac and only when the execution
             // executor's own gate is on (enableAutonomy + missionPolicy via
             // workshopExecutorGate), AND builder elevation here is already
@@ -231,8 +236,11 @@ extension SwiftNativeTrustCenter: OriginAwareAutonomyResolver {
 
     private nonisolated static func isInteractiveChatSurface(_ surface: String) -> Bool {
         switch surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "", "chat", "codex-bridge", "claude-bridge", "workshop", "mission", "missions",
+        case "", "chat", "codex-bridge", "claude-bridge",
              "telegram", "slack", "ios", "icloud", "iphone", "ipad", "mobile", "watch", "remote":
+            return true
+        // Wave 5b: Workshop spellings via the vocabulary (same three strings).
+        case let s where WorkshopSurfaceVocabulary.isWorkshopGateSurface(s):
             return true
         default:
             return false

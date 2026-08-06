@@ -117,6 +117,26 @@ extension AppModel {
         }
         let generation = (chatTaskGenerations[sessionId] ?? 0) + 1
         chatTaskGenerations[sessionId] = generation
+        // Sweep R4 C7: synthetic error bubbles are in-memory only — they were
+        // never written to chat/messages/<sid>.jsonl. Passing one as the
+        // replacement target makes the persistence layer throw ("regenerate
+        // replacement target must identify exactly one persisted message"), so
+        // now that these bubbles DO render Try again, the retry has to re-send
+        // as a fresh turn and simply drop the local notice instead.
+        let isSyntheticNotice = message.id.hasPrefix(Self.syntheticErrorIDPrefix)
+        // Whether the FAILED turn persisted the user's row decides the
+        // re-send shape: the no-provider guard bails before client.chat, so
+        // its bubble carries userRowPersisted=false and the retry must let
+        // the fresh turn append the user message — suppressing it there
+        // would drop the user's message from the persisted thread entirely
+        // (gpt-5.5 review 2026-08-06, blocking). Stream/catch bubbles ran a
+        // real turn, which appends the user row before the provider call.
+        let suppressUserRow = isSyntheticNotice
+            ? (message.metadata?.syntheticUserRowPersisted ?? true)
+            : true
+        if isSyntheticNotice {
+            removeChatMessage(id: message.id, from: sessionId)
+        }
         let task = Task { @MainActor in
             do {
                 busySessions.insert(sessionId)
@@ -127,8 +147,8 @@ extension AppModel {
                     model: chatModel,
                     reasoningEffort: chatReasoningEffort,
                     fileAccess: chatFileAccess,
-                    suppressUserAppend: true,
-                    replacementAssistantMessageId: message.id
+                    suppressUserAppend: suppressUserRow,
+                    replacementAssistantMessageId: isSyntheticNotice ? nil : message.id
                 )
                 if Task.isCancelled { return }
                 if activeChatSessionId == sessionId {
@@ -653,15 +673,19 @@ extension AppModel {
             appendChatMessage(typedBubble, to: requestSessionId)
             // Tag the guidance with the synthetic-error prefix so the session
             // reload-preservation path keeps it when the user navigates to
-            // Settings → Providers and back (gpt-5.5 review 2026-07-04).
+            // the Providers tab and back (gpt-5.5 review 2026-07-04).
             let guidanceBubble = ChatMessage(
                 id: Self.syntheticErrorIDPrefix + UUID().uuidString,
                 sessionId: requestSessionId,
                 role: "assistant",
-                content: guidance
+                content: guidance,
+                // Sweep R4 C7: without metadata.error the retry gate is false and
+                // the bubble renders with no way to re-send once a provider is
+                // connected. Stamp it so "Try again" is there when it will work.
+                metadata: .syntheticError("no_provider_connected", userRowPersisted: false)
             )
             appendChatMessage(guidanceBubble, to: requestSessionId)
-            statusText = "No AI provider connected — connect one in Settings → Providers."
+            statusText = "No AI provider connected — connect one in the Providers tab in the sidebar."
             return
         }
         // PATCH-2026-05-13: parallel-sessions — track the bubble id, the
@@ -917,7 +941,12 @@ extension AppModel {
                         id: Self.syntheticErrorIDPrefix + UUID().uuidString,
                         sessionId: requestSessionId,
                         role: "assistant",
-                        content: errorText
+                        content: errorText,
+                        // Sweep R4 C7: this is THE bubble whose text says "Use
+                        // Try again to retry" — messageNeedsRetry requires
+                        // metadata.error, so without this stamp the copy named
+                        // an affordance that never rendered.
+                        metadata: .syntheticError("stream_produced_no_content")
                     )
                     appendChatMessage(errorBubble, to: requestSessionId)
                 }
@@ -975,7 +1004,17 @@ extension AppModel {
                 // Carry sessionId (mirrors the no-content bubble above) so the
                 // row is correctly attributed to its session for any code that
                 // keys off msg.sessionId (e.g. detached-panel regeneration).
-                let errorBubble = ChatMessage(id: Self.syntheticErrorIDPrefix + UUID().uuidString, sessionId: requestSessionId, role: "assistant", content: errorText)
+                // Sweep R4 C7: stamp metadata.error (the raw, un-normalized
+                // failure) so the normalized bubble text — which ends in "Use
+                // Try again to retry" on every arm — actually renders the
+                // Try again button.
+                let errorBubble = ChatMessage(
+                    id: Self.syntheticErrorIDPrefix + UUID().uuidString,
+                    sessionId: requestSessionId,
+                    role: "assistant",
+                    content: errorText,
+                    metadata: .syntheticError(error.localizedDescription)
+                )
                 appendChatMessage(errorBubble, to: requestSessionId)
             }
             chatSessions = (try? await client.getChatSessions()) ?? chatSessions
@@ -1015,6 +1054,7 @@ extension AppModel {
     /// Match order: (1) the ProviderStreamGuard's OWN stable in-repo timeout
     /// strings (they flow through `LLMError.transient` -> "llm: transient: …"
     /// unchanged); (2) URLError categories / adapter transport strings; (3)
+    /// provider transient (busy/rate-limited) and explicit auth failures; (4)
     /// default — preserve today's "Chat error: <desc>" so nothing regresses and
     /// unmatched provider text still reads.
     private func normalizeStreamErrorForChat(_ error: Error) -> String {
@@ -1058,6 +1098,20 @@ extension AppModel {
         }
         if d.contains("stream truncated") {
             return "The reply was cut off. Use Try again to retry."
+        }
+        // (3b) Auth — sweep R4 C15. 401/unauthorized is the most common
+        // self-inflicted failure (expired or mistyped key) and previously fell
+        // through to the raw provider string. This arm is deliberately NARROW —
+        // an explicit 401/invalid-key signal only — so the reasoning above
+        // still holds: a bare "provider error" must NOT be dressed up as an
+        // auth problem, it still falls through raw. A bare "unauthorized"
+        // matcher was dropped (review 2026-08-06): provider errors echoing
+        // tool/request content ("unauthorized file path") would misroute the
+        // user to their API keys; real 401s carry the status code.
+        if d.contains("status 401") || d.contains("code=401")
+            || d.contains("invalid_api_key") || d.contains("invalid api key")
+            || d.contains("authentication_error") || d.contains("invalid x-api-key") {
+            return "The provider rejected the credentials for this model — the API key or sign-in looks expired or wrong. Update the key in the Providers tab in the sidebar, then use Try again to retry."
         }
         // (4) Default — unchanged behavior so nothing regresses.
         return "Chat error: \(raw)"

@@ -23,13 +23,24 @@ struct LoopHealthObservation: Equatable, Sendable {
     let nextRun: Date?
     let lastError: String?
     let running: Bool
+    /// Sweep R4 item 3: event-listener liveness. nil for loops with no event
+    /// lane at all — which is NOT the same as a loop whose listener is down.
+    let eventListener: LoopEventListenerHealth?
 
-    init(loopId: String, lastRun: Date?, nextRun: Date?, lastError: String?, running: Bool) {
+    init(
+        loopId: String,
+        lastRun: Date?,
+        nextRun: Date?,
+        lastError: String?,
+        running: Bool,
+        eventListener: LoopEventListenerHealth? = nil
+    ) {
         self.loopId = loopId
         self.lastRun = lastRun
         self.nextRun = nextRun
         self.lastError = lastError
         self.running = running
+        self.eventListener = eventListener
     }
 
     init(status: LoopStatus) {
@@ -38,7 +49,8 @@ struct LoopHealthObservation: Equatable, Sendable {
             lastRun: status.lastRun,
             nextRun: status.nextRun,
             lastError: status.lastError,
-            running: status.running
+            running: status.running,
+            eventListener: status.eventListener
         )
     }
 }
@@ -102,37 +114,86 @@ enum DoctorLoopHealth {
         now: Date
     ) -> [LoopHealthVerdict] {
         observations.map { observation in
-            guard let lastError = observation.lastError else {
-                // LOOPS-3: "no error recorded" is NOT the same as "healthy".
-                // A loop whose scheduler task is not active, or that is
-                // scheduled for a time long past, has produced no error
-                // precisely because it never ran. Those are the states this
-                // rule used to report green.
-                return scheduleVerdict(for: observation, now: now)
-            }
-            let window = graceWindow(for: observation)
-            let cutoff = now.addingTimeInterval(-window)
-            let recentFailures = (recentFailureDates[observation.loopId] ?? [])
-                .filter { $0 >= cutoff && $0 <= now }
-                .count
-            let age = observation.lastRun.map { describeAge(now.timeIntervalSince($0)) } ?? "unknown"
-            if recentFailures >= persistentFailureThreshold {
-                return LoopHealthVerdict(
-                    loopId: observation.loopId,
-                    level: .fail,
-                    detail: "Failing persistently (\(recentFailures) failures in \(describeAge(window))): \(lastError). Last tick \(age) ago."
-                )
-            }
-            return LoopHealthVerdict(
-                loopId: observation.loopId,
-                level: .warn,
-                detail: "Last tick failed: \(lastError). Last tick \(age) ago."
-            )
+            merge(baseVerdict(for: observation, recentFailureDates: recentFailureDates, now: now),
+                  with: eventListenerVerdict(for: observation, now: now))
         }
         .sorted { lhs, rhs in
             if lhs.level != rhs.level { return rank(lhs.level) < rank(rhs.level) }
             return lhs.loopId < rhs.loopId
         }
+    }
+
+    /// Consecutive stream-ends (with no event in between) that turn a listener
+    /// from "restarting, may recover" into "this source is gone". Matched to
+    /// the 1s/5s/30s restart backoff: by the third end the loop has been
+    /// event-blind for over half a minute and is retrying at the ceiling.
+    static let eventListenerFailureThreshold = 3
+
+    /// Verdict contribution from the EVENT lane. nil when the loop has no event
+    /// listener, or when the listener is alive and has not been flapping.
+    static func eventListenerVerdict(
+        for observation: LoopHealthObservation,
+        now: Date
+    ) -> (level: LoopHealthLevel, detail: String)? {
+        guard let listener = observation.eventListener else { return nil }
+        if listener.active, listener.consecutiveEnds == 0 { return nil }
+        let endedPhrase = listener.lastEndedAt
+            .map { "last ended \(describeAge(now.timeIntervalSince($0))) ago" }
+            ?? "never started"
+        let restarts = listener.restartCount == 1 ? "1 restart" : "\(listener.restartCount) restarts"
+        let detail = "Event listener \(listener.active ? "restarted but not yet delivering" : "is down")"
+            + " (\(listener.consecutiveEnds) consecutive stream end(s), \(restarts), \(endedPhrase))."
+            + (listener.lastError.map { " \($0)" } ?? "")
+        let level: LoopHealthLevel = listener.consecutiveEnds >= eventListenerFailureThreshold
+            ? .fail
+            : .warn
+        return (level, detail)
+    }
+
+    private static func merge(
+        _ base: LoopHealthVerdict,
+        with listener: (level: LoopHealthLevel, detail: String)?
+    ) -> LoopHealthVerdict {
+        guard let listener else { return base }
+        let level = rank(listener.level) < rank(base.level) ? listener.level : base.level
+        return LoopHealthVerdict(
+            loopId: base.loopId,
+            level: level,
+            detail: "\(base.detail) \(listener.detail)"
+        )
+    }
+
+    private static func baseVerdict(
+        for observation: LoopHealthObservation,
+        recentFailureDates: [String: [Date]],
+        now: Date
+    ) -> LoopHealthVerdict {
+        guard let lastError = observation.lastError else {
+            // LOOPS-3: "no error recorded" is NOT the same as "healthy".
+            // A loop whose scheduler task is not active, or that is
+            // scheduled for a time long past, has produced no error
+            // precisely because it never ran. Those are the states this
+            // rule used to report green.
+            return scheduleVerdict(for: observation, now: now)
+        }
+        let window = graceWindow(for: observation)
+        let cutoff = now.addingTimeInterval(-window)
+        let recentFailures = (recentFailureDates[observation.loopId] ?? [])
+            .filter { $0 >= cutoff && $0 <= now }
+            .count
+        let age = observation.lastRun.map { describeAge(now.timeIntervalSince($0)) } ?? "unknown"
+        if recentFailures >= persistentFailureThreshold {
+            return LoopHealthVerdict(
+                loopId: observation.loopId,
+                level: .fail,
+                detail: "Failing persistently (\(recentFailures) failures in \(describeAge(window))): \(lastError). Last tick \(age) ago."
+            )
+        }
+        return LoopHealthVerdict(
+            loopId: observation.loopId,
+            level: .warn,
+            detail: "Last tick failed: \(lastError). Last tick \(age) ago."
+        )
     }
 
     /// Verdict for a loop with no recorded error: judge whether it is actually

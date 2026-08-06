@@ -169,7 +169,7 @@ struct WorkshopExecutionChatToolDispatchTests {
 
         // The runner wrote the queue under <dataRoot>/workshop/executions/<id>/.
         let executionRecordJSON = root
-            .appendingPathComponent("workshop/executions/\(executionId)/mission.json")
+            .appendingPathComponent("workshop/executions/\(executionId)/execution.json")
         #expect(FileManager.default.fileExists(atPath: executionRecordJSON.path))
 
         // workshop_status (no id) lists it as active.

@@ -1,6 +1,12 @@
 import Foundation
 
-/// Durable receipt for the one-way Workshop storage absorption.
+/// Durable receipt for Workshop storage repair passes.
+///
+/// The shape is FROZEN: receipts written by earlier builds (including the
+/// retired `missions/` absorption) live on disk under
+/// `workshop/migrations/` and are decoded with these exact keys. Fields the
+/// surviving passes never populate stay present and empty rather than being
+/// removed.
 public struct WorkshopStorageMigrationReport: Codable, Equatable, Sendable {
     public let version: Int
     public let didMigrate: Bool
@@ -12,62 +18,69 @@ public struct WorkshopStorageMigrationReport: Codable, Equatable, Sendable {
     public let conflictsPreservedInArchive: [String]
 }
 
-/// Moves legacy execution state under Workshop ownership before any scheduler
-/// or executor starts. The migration is merge-safe: existing Workshop state
-/// wins, byte-identical duplicates are removed, and differing legacy files are
-/// retained in the archived source tree for manual recovery.
+/// Repairs Workshop-owned execution storage in place before any scheduler or
+/// executor starts.
+///
+/// Two marker-gated passes remain, each running at most once per version:
+/// the P2-1 record rename (`mission.json` → `execution.json`) and the A5.3
+/// execution-pointer normalization. Both are idempotent and non-destructive.
+///
+/// De-mission P2-7: the Python-era `data/missions` absorption path is GONE.
+/// It last had anything to absorb in July 2026 (receipts in
+/// `workshop/migrations/`), every public release shipped Workshop-era
+/// storage, and the branch was pure dead weight carrying a recursive
+/// merge + tree-archive. A dataRoot that still contains `missions/` is now
+/// simply IGNORED — nothing is read, moved, merged, or archived out of it.
+/// The only remaining consumer of the legacy `missions.json` filename is the
+/// backup-restore mapping in `NativeClient+TrustBackupOps.swift`, which lands
+/// it at `workshop/legacy_executions.json` where the live readers look.
 public enum WorkshopStorageMigrator {
     public static func migrateIfNeeded(
         dataRoot: URL,
         now: Date = Date(),
         fileManager: FileManager = .default
     ) throws -> WorkshopStorageMigrationReport {
-        let legacyRoot = dataRoot.appendingPathComponent("missions", isDirectory: true)
         let workshopRoot = dataRoot.appendingPathComponent("workshop", isDirectory: true)
         let executionsRoot = workshopRoot.appendingPathComponent("executions", isDirectory: true)
-        guard fileManager.fileExists(atPath: legacyRoot.path) else {
-            // A5.3 (W5#P1-3): `normalizeExecutionPointers` used to re-enumerate
-            // every execution dir and re-read every mission.json on EVERY
-            // launch — an O(all-executions) scan on the main thread. Once a full
-            // pass has run for the current canonical format, a version-stamped
-            // done-marker lets subsequent launches skip the rescan entirely.
-            // Live code writes new executions with a canonical receipts_dir, so
-            // they never need this legacy repair; bump
-            // `pointerNormalizationVersion` if the canonical format changes and
-            // the stale marker is ignored so exactly one rescan re-runs.
-            if pointerNormalizationCompleted(workshopRoot: workshopRoot, fileManager: fileManager) {
-                return WorkshopStorageMigrationReport(
-                    version: 1,
-                    didMigrate: false,
-                    createdAt: iso8601(now),
-                    archiveRelativePath: nil,
-                    receiptRelativePath: nil,
-                    moved: [],
-                    deduplicated: [],
-                    conflictsPreservedInArchive: []
-                )
-            }
-            let normalized = try normalizeExecutionPointers(
+
+        var moved: [String] = []
+        var conflicts: [String] = []
+
+        // P2-1: gated by its OWN marker, not the pointer-normalization one, so
+        // an install that already stamped pointer normalization still gets
+        // renamed exactly once.
+        let renamed = renameExecutionRecordsIfNeeded(
+            workshopRoot: workshopRoot,
+            executionsRoot: executionsRoot,
+            dataRoot: dataRoot,
+            now: now,
+            fileManager: fileManager
+        )
+        moved.append(contentsOf: renamed.renamed)
+        conflicts.append(contentsOf: renamed.conflicts)
+
+        // A5.3 (W5#P1-3): `normalizeExecutionPointers` used to re-enumerate
+        // every execution dir and re-read every record on EVERY launch — an
+        // O(all-executions) scan on the main thread. Once a full pass has run
+        // for the current canonical format, a version-stamped done-marker lets
+        // subsequent launches skip the rescan entirely. Live code writes new
+        // executions with a canonical receipts_dir, so they never need this
+        // legacy repair; bump `pointerNormalizationVersion` if the canonical
+        // format changes and the stale marker is ignored so exactly one rescan
+        // re-runs.
+        if !pointerNormalizationCompleted(workshopRoot: workshopRoot, fileManager: fileManager) {
+            moved.append(contentsOf: try normalizeExecutionPointers(
                 executionsRoot: executionsRoot,
                 dataRoot: dataRoot,
                 fileManager: fileManager
-            )
+            ))
             // Stamp only after the full pass completed — a crash before this
             // leaves the marker absent so the next launch safely re-runs.
             markPointerNormalizationCompleted(
                 workshopRoot: workshopRoot, now: now, fileManager: fileManager)
-            if !normalized.isEmpty {
-                return try writeReport(
-                    dataRoot: dataRoot,
-                    workshopRoot: workshopRoot,
-                    now: now,
-                    archive: nil,
-                    moved: normalized,
-                    deduplicated: [],
-                    conflicts: [],
-                    fileManager: fileManager
-                )
-            }
+        }
+
+        guard !moved.isEmpty || !conflicts.isEmpty else {
             return WorkshopStorageMigrationReport(
                 version: 1,
                 didMigrate: false,
@@ -79,97 +92,11 @@ public enum WorkshopStorageMigrator {
                 conflictsPreservedInArchive: []
             )
         }
-
-        try fileManager.createDirectory(at: workshopRoot, withIntermediateDirectories: true)
-
-        var moved: [String] = []
-        var deduplicated: [String] = []
-        var conflicts: [String] = []
-
-        try merge(
-            source: legacyRoot.appendingPathComponent("queue", isDirectory: true),
-            destination: executionsRoot,
-            dataRoot: dataRoot,
-            fileManager: fileManager,
-            moved: &moved,
-            deduplicated: &deduplicated,
-            conflicts: &conflicts
-        )
-        try merge(
-            source: legacyRoot.appendingPathComponent("missions.json"),
-            destination: workshopRoot.appendingPathComponent("legacy_executions.json"),
-            dataRoot: dataRoot,
-            fileManager: fileManager,
-            moved: &moved,
-            deduplicated: &deduplicated,
-            conflicts: &conflicts
-        )
-        try merge(
-            source: legacyRoot.appendingPathComponent("triggers.json"),
-            destination: workshopRoot.appendingPathComponent("triggers.json"),
-            dataRoot: dataRoot,
-            fileManager: fileManager,
-            moved: &moved,
-            deduplicated: &deduplicated,
-            conflicts: &conflicts
-        )
-        try merge(
-            source: legacyRoot.appendingPathComponent("trigger_state.json"),
-            destination: workshopRoot.appendingPathComponent("trigger_state.json"),
-            dataRoot: dataRoot,
-            fileManager: fileManager,
-            moved: &moved,
-            deduplicated: &deduplicated,
-            conflicts: &conflicts
-        )
-
-        // Early checkpoint builds stored these files at missions/<execution-id>/
-        // instead of inside the queue directory. Fold only recognizable
-        // execution-state directories into the canonical location; backups and
-        // unknown artifacts remain in the archive.
-        let topLevel = try fileManager.contentsOfDirectory(
-            at: legacyRoot,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        )
-        for candidate in topLevel where isExecutionStateDirectory(candidate, fileManager: fileManager) {
-            try merge(
-                source: candidate,
-                destination: executionsRoot.appendingPathComponent(candidate.lastPathComponent, isDirectory: true),
-                dataRoot: dataRoot,
-                fileManager: fileManager,
-                moved: &moved,
-                deduplicated: &deduplicated,
-                conflicts: &conflicts
-            )
-        }
-        moved.append(contentsOf: try normalizeExecutionPointers(
-            executionsRoot: executionsRoot,
-            dataRoot: dataRoot,
-            fileManager: fileManager
-        ))
-        // The heavy migration just normalized every pointer; stamp the marker
-        // so the next launch (missions/ now archived) takes the fast path
-        // instead of rescanning (A5.3).
-        markPointerNormalizationCompleted(
-            workshopRoot: workshopRoot, now: now, fileManager: fileManager)
-
-        let archiveRoot = dataRoot.appendingPathComponent("archive", isDirectory: true)
-        try fileManager.createDirectory(at: archiveRoot, withIntermediateDirectories: true)
-        let archive = availableArchiveURL(
-            archiveRoot: archiveRoot,
-            timestamp: filenameTimestamp(now),
-            fileManager: fileManager
-        )
-        try fileManager.moveItem(at: legacyRoot, to: archive)
-
         return try writeReport(
             dataRoot: dataRoot,
             workshopRoot: workshopRoot,
             now: now,
-            archive: archive,
             moved: moved,
-            deduplicated: deduplicated,
             conflicts: conflicts,
             fileManager: fileManager
         )
@@ -210,6 +137,108 @@ public enum WorkshopStorageMigrator {
         try? Data(iso8601(now).utf8).write(to: marker, options: .atomic)
     }
 
+    // MARK: - P2-1 record rename (mission.json -> execution.json)
+
+    /// Canonical format version for the per-execution record rename pass. Bump
+    /// to force exactly one fresh pass (the existing marker is then ignored).
+    static let recordRenameVersion = 1
+
+    static func recordRenameMarkerURL(workshopRoot: URL) -> URL {
+        workshopRoot
+            .appendingPathComponent("migrations", isDirectory: true)
+            .appendingPathComponent("record_rename_v\(recordRenameVersion).done")
+    }
+
+    /// True once a full record-rename pass has been stamped for the current
+    /// `recordRenameVersion`.
+    static func recordRenameCompleted(
+        workshopRoot: URL,
+        fileManager: FileManager
+    ) -> Bool {
+        fileManager.fileExists(atPath: recordRenameMarkerURL(workshopRoot: workshopRoot).path)
+    }
+
+    /// One-time pass renaming `<execution>/mission.json` → `execution.json`.
+    ///
+    /// Runs at most once per `recordRenameVersion` (done-marker, same shape as
+    /// `pointerNormalizationVersion`) and is stamped only AFTER the full pass
+    /// completes, so a crash mid-pass leaves the marker absent and the next
+    /// launch safely re-runs. Re-running is harmless: an already-renamed
+    /// directory has no legacy file left to move. Directories the pass never
+    /// reaches still work — every reader goes through
+    /// `ExecutionRecordFile.resolve`, which falls back to the legacy name.
+    ///
+    /// CONFLICT (both names present): the canonical file is authoritative and
+    /// is left untouched; the legacy file is preserved beside it as
+    /// `mission.json.premigration-conflict` rather than deleted, and reported.
+    /// Nothing is ever destroyed on this path.
+    ///
+    /// ORPHAN LOCKS: `withFileLock` derives its sidecar as `<target>.lock`
+    /// (PersistenceCore+FileLock.swift), so a renamed record leaves a
+    /// `mission.json.lock` nobody will ever open again. It is removed ONLY for
+    /// directories whose record actually moved. Removing it cannot race a live
+    /// holder: `migrateIfNeeded` runs synchronously inside
+    /// `applicationDidFinishLaunching`, strictly before any scheduler,
+    /// executor or runner exists in this process — so in-process there is no
+    /// holder at all, and the acquire-then-validate-inode logic in
+    /// `withFileLock` makes lock-file unlinking safe regardless.
+    static func renameExecutionRecordsIfNeeded(
+        workshopRoot: URL,
+        executionsRoot: URL,
+        dataRoot: URL,
+        now: Date,
+        fileManager: FileManager
+    ) -> (renamed: [String], conflicts: [String]) {
+        guard !recordRenameCompleted(workshopRoot: workshopRoot, fileManager: fileManager) else {
+            return ([], [])
+        }
+        var renamed: [String] = []
+        var conflicts: [String] = []
+        if let executions = try? fileManager.contentsOfDirectory(
+            at: executionsRoot,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            for execution in executions {
+                var isDirectory: ObjCBool = false
+                guard fileManager.fileExists(atPath: execution.path, isDirectory: &isDirectory),
+                      isDirectory.boolValue else { continue }
+                let legacy = ExecutionRecordFile.legacyPath(in: execution)
+                guard fileManager.fileExists(atPath: legacy.path) else { continue }
+                let canonical = ExecutionRecordFile.canonicalPath(in: execution)
+                // Label off the DIRECTORY, which exists on both sides of the
+                // move. `relativePath` standardizes, and `standardizedFileURL`
+                // only resolves symlinks (`/var` → `/private/var`) for paths
+                // that exist — so labelling a file that is about to be created,
+                // or one that was just moved away, silently degrades to a bare
+                // filename and the receipt loses which execution it named.
+                let dirLabel = relativePath(execution, under: dataRoot)
+                let legacyLabel = "\(dirLabel)/\(ExecutionRecordFile.legacyName)"
+                let canonicalLabel = "\(dirLabel)/\(ExecutionRecordFile.canonicalName)"
+                if fileManager.fileExists(atPath: canonical.path) {
+                    let aside = execution.appendingPathComponent(
+                        "\(ExecutionRecordFile.legacyName).premigration-conflict")
+                    guard (try? fileManager.moveItem(at: legacy, to: aside)) != nil else { continue }
+                    conflicts.append(legacyLabel)
+                    continue
+                }
+                guard (try? fileManager.moveItem(at: legacy, to: canonical)) != nil else { continue }
+                renamed.append("\(legacyLabel) -> \(canonicalLabel)")
+                // Only now is the legacy lock provably orphaned.
+                let orphanLock = URL(fileURLWithPath: legacy.path + ".lock")
+                try? fileManager.removeItem(at: orphanLock)
+            }
+        }
+        // Stamp AFTER the full pass — a crash before this leaves the marker
+        // absent so the next launch safely re-runs (same crash-safety contract
+        // as the A5.3 pointer-normalization marker).
+        let marker = recordRenameMarkerURL(workshopRoot: workshopRoot)
+        try? fileManager.createDirectory(
+            at: marker.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? Data(iso8601(now).utf8).write(to: marker, options: .atomic)
+        return (renamed, conflicts)
+    }
+
     /// Migrated records may retain the old absolute receipts directory even
     /// after their execution folder moves. Repair that pointer in-place so
     /// status/detail consumers never advertise or follow the retired root.
@@ -228,7 +257,7 @@ public enum WorkshopStorageMigrator {
             var isDirectory: ObjCBool = false
             guard fileManager.fileExists(atPath: execution.path, isDirectory: &isDirectory),
                   isDirectory.boolValue else { continue }
-            let record = execution.appendingPathComponent("mission.json")
+            let record = ExecutionRecordFile.resolve(in: execution, fileManager: fileManager)
             guard fileManager.fileExists(atPath: record.path),
                   let data = try? Data(contentsOf: record),
                   var object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -246,13 +275,17 @@ public enum WorkshopStorageMigrator {
         return repaired
     }
 
+    /// Writes the durable receipt for a pass that changed something.
+    ///
+    /// `archiveRelativePath` and `deduplicated` are permanently nil/empty:
+    /// both only ever described the retired `missions/` absorption. The fields
+    /// (and the `missions_absorption_v1_` receipt filename) stay as-is because
+    /// receipts already on disk decode through this exact shape.
     private static func writeReport(
         dataRoot: URL,
         workshopRoot: URL,
         now: Date,
-        archive: URL?,
         moved: [String],
-        deduplicated: [String],
         conflicts: [String],
         fileManager: FileManager
     ) throws -> WorkshopStorageMigrationReport {
@@ -265,105 +298,16 @@ public enum WorkshopStorageMigrator {
             version: 1,
             didMigrate: true,
             createdAt: iso8601(now),
-            archiveRelativePath: archive.map { relativePath($0, under: dataRoot) },
+            archiveRelativePath: nil,
             receiptRelativePath: relativePath(receipt, under: dataRoot),
             moved: moved.sorted(),
-            deduplicated: deduplicated.sorted(),
+            deduplicated: [],
             conflictsPreservedInArchive: conflicts.sorted()
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try encoder.encode(report).write(to: receipt, options: .atomic)
         return report
-    }
-
-    private static func merge(
-        source: URL,
-        destination: URL,
-        dataRoot: URL,
-        fileManager: FileManager,
-        moved: inout [String],
-        deduplicated: inout [String],
-        conflicts: inout [String]
-    ) throws {
-        var sourceIsDirectory: ObjCBool = false
-        guard fileManager.fileExists(atPath: source.path, isDirectory: &sourceIsDirectory) else { return }
-
-        var destinationIsDirectory: ObjCBool = false
-        let destinationExists = fileManager.fileExists(
-            atPath: destination.path,
-            isDirectory: &destinationIsDirectory
-        )
-        if !destinationExists {
-            let sourceRelativePath = relativePath(source, under: dataRoot)
-            let destinationRelativePath = relativePath(destination, under: dataRoot)
-            try fileManager.createDirectory(
-                at: destination.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            try fileManager.moveItem(at: source, to: destination)
-            moved.append("\(sourceRelativePath) -> \(destinationRelativePath)")
-            return
-        }
-
-        if sourceIsDirectory.boolValue, destinationIsDirectory.boolValue {
-            for child in try fileManager.contentsOfDirectory(
-                at: source,
-                includingPropertiesForKeys: [.isDirectoryKey],
-                options: []
-            ) {
-                try merge(
-                    source: child,
-                    destination: destination.appendingPathComponent(child.lastPathComponent),
-                    dataRoot: dataRoot,
-                    fileManager: fileManager,
-                    moved: &moved,
-                    deduplicated: &deduplicated,
-                    conflicts: &conflicts
-                )
-            }
-            if (try fileManager.contentsOfDirectory(atPath: source.path)).isEmpty {
-                try fileManager.removeItem(at: source)
-            }
-            return
-        }
-
-        if !sourceIsDirectory.boolValue, !destinationIsDirectory.boolValue,
-           try Data(contentsOf: source) == Data(contentsOf: destination) {
-            let sourceRelativePath = relativePath(source, under: dataRoot)
-            try fileManager.removeItem(at: source)
-            deduplicated.append(sourceRelativePath)
-            return
-        }
-
-        conflicts.append(relativePath(source, under: dataRoot))
-    }
-
-    private static func isExecutionStateDirectory(_ url: URL, fileManager: FileManager) -> Bool {
-        var isDirectory: ObjCBool = false
-        guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory),
-              isDirectory.boolValue,
-              url.lastPathComponent != "queue",
-              !url.lastPathComponent.hasPrefix("queue.bak") else { return false }
-        let recognized = ["checkpoints.jsonl", "escalations.jsonl", "mission.json", "timeline.jsonl"]
-        return recognized.contains {
-            fileManager.fileExists(atPath: url.appendingPathComponent($0).path)
-        }
-    }
-
-    private static func availableArchiveURL(
-        archiveRoot: URL,
-        timestamp: String,
-        fileManager: FileManager
-    ) -> URL {
-        let base = "executions-pre-workshop-\(timestamp)"
-        var candidate = archiveRoot.appendingPathComponent(base, isDirectory: true)
-        var suffix = 2
-        while fileManager.fileExists(atPath: candidate.path) {
-            candidate = archiveRoot.appendingPathComponent("\(base)-\(suffix)", isDirectory: true)
-            suffix += 1
-        }
-        return candidate
     }
 
     private static func relativePath(_ url: URL, under root: URL) -> String {

@@ -856,7 +856,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
             "title": .string(title),
             "detail": .string(detail),
             "status": .string(status),
-            "missionId": .null,
+            "executionId": .null,
             "payload": .object(payload),
             "createdAt": .string(Self.isoTimestamp(now())),
         ])

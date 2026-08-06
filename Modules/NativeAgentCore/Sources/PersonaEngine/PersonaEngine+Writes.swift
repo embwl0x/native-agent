@@ -502,7 +502,7 @@ extension SwiftNativePersonaEngine {
             "title": .string("\(docId).md updated"),
             "detail": .string("Personality document saved"),
             "status": .string("ok"),
-            "missionId": .null,
+            "executionId": .null,
             "payload": .object([:]),
             "createdAt": .string(Self.nowISOPython()),
         ])

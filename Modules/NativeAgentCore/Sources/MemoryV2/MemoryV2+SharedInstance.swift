@@ -24,7 +24,7 @@ import PersistenceCore
 
 // MARK: - MemoryStorageBridge — MemoryStorage actor → MemoryStorageProtocol
 
-public actor MemoryStorageBridge: HybridMemoryStorageProtocol {
+public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStorageProtocol {
     private let storage: MemoryStorage
 
     public init(storage: MemoryStorage) {
@@ -229,6 +229,21 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol {
         let hits = try await storage.recall(
             embedding: embedding,
             embeddingEpoch: embeddingEpoch,
+            queryText: queryText,
+            topK: topK,
+            persona: persona
+        )
+        return hits.map { ScoredMemoryRecord(record: Self.toMemoryRecord($0.memory), score: $0.similarity) }
+    }
+
+    /// Sweep R4 A5: lexical-only lane used when no usable query embedding
+    /// exists (cold embedder on the first turn after launch).
+    public func recallByKeyword(
+        queryText: String,
+        topK: Int,
+        persona: String?
+    ) async throws -> [ScoredMemoryRecord] {
+        let hits = try await storage.recallByKeyword(
             queryText: queryText,
             topK: topK,
             persona: persona

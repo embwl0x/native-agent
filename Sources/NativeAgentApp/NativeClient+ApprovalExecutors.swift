@@ -766,14 +766,22 @@ extension NativeClient {
         guard ExecutionEventVocabulary.matches(rec.action, WorkshopStepApprovalAction.canonical),
               rec.status == "resolved",
               let decision = rec.decision else { return }
+        // P2-2 de-mission: the stager writes "execution_id"; this reader
+        // resolves through the shared vocabulary (canonical first, legacy
+        // fallback). The fallback is PERMANENT — an approval staged by an older
+        // binary and resolved by this one must still execute, and
+        // requests.json is never rewritten.
         guard case .object(let payload) = rec.payload,
-              case .string(let executionId)? = payload["mission_id"], !executionId.isEmpty,
+              let executionId = WorkshopStepApprovalPayload.executionId({ key in
+                  if case .string(let s)? = payload[key] { return s }
+                  return nil
+              }),
               case .string(let stepId)? = payload["step_id"], !stepId.isEmpty else {
-            NSLog("[workshopStep] missing mission_id/step_id on approval \(rec.id)")
+            NSLog("[workshopStep] missing execution_id/step_id on approval \(rec.id)")
             try? await Self.annotateApprovalExecution(
                 id: rec.id,
-                executedAction: .object(["error": .string("missing mission_id/step_id")]),
-                detail: "Workshop step \(decision) FAILED: payload carries no mission_id/step_id")
+                executedAction: .object(["error": .string("missing execution_id/step_id")]),
+                detail: "Workshop step \(decision) FAILED: payload carries no execution_id/step_id")
             return
         }
         // Prefer the SAME executor INSTANCE the background drain loop uses
@@ -791,6 +799,23 @@ extension NativeClient {
         // closures the drain uses.
         let executor = WorkshopExecutorRef.shared.current()
             ?? BackgroundLoopsAssembly.makeWorkshopExecutor()
+        // FROZEN WIRE — deliberate keep, do NOT de-mission these (P2-8 owns any
+        // future move).
+        //
+        // The five `"missionId"` keys and the three `mission_step_*` `op`
+        // labels below are PERSISTED AUDIT ANNOTATIONS: they are written into
+        // the approval record's `executedAction` and land in
+        // `workflows/approvals/requests.json`, which is append-and-amend and is
+        // never rewritten. A rename here does not migrate the ~thousands of
+        // rows already on disk — it forks the audit vocabulary so a single
+        // query can no longer answer "what happened to this approval", which is
+        // the entire point of the annotation. `missionStatus` is in the same
+        // class.
+        //
+        // These are ANNOTATIONS, not a read seam: nothing branches on them, so
+        // there is no fallback to widen and no correctness risk in leaving them
+        // alone. When P2-8 schedules the move it takes the reader, the writer,
+        // and a fixture of live rows together.
         do {
             switch decision {
             case "approved":
@@ -864,15 +889,15 @@ extension NativeClient {
         }
     }
 
-    /// Clear the approval_id stamp on a blocked step record (mission.json,
+    /// Clear the approval_id stamp on a blocked step record (execution.json,
     /// whole RMW under the cross-process flock) so a future stage isn't
     /// rejected by the resume guard's approval_id mismatch check.
     private static func clearWorkshopStepApprovalClaim(executionId: String, stepId: String) async {
-        let path = PersistenceCore.defaultDataRoot()
-            .appendingPathComponent("workshop", isDirectory: true)
-            .appendingPathComponent("executions", isDirectory: true)
-            .appendingPathComponent(executionId, isDirectory: true)
-            .appendingPathComponent("mission.json")
+        let path = ExecutionRecordFile.resolve(
+            in: PersistenceCore.defaultDataRoot()
+                .appendingPathComponent("workshop", isDirectory: true)
+                .appendingPathComponent("executions", isDirectory: true)
+                .appendingPathComponent(executionId, isDirectory: true))
         let persistence = SwiftNativePersistenceCore()
         do {
             try await persistence.withFileLock(path) {

@@ -963,7 +963,7 @@ struct SkillActivityEmitter: Sendable {
             "title": .string(NativeAgentSecretRedactor.redactText(title)),
             "detail": .string(NativeAgentSecretRedactor.redactText(detail)),
             "status": .string(status),
-            "missionId": .null,
+            "executionId": .null,
             "payload": NativeAgentSecretRedactor.redactValue(payload),
             "createdAt": .string(SkillMutation.nowISO(now)),
         ])

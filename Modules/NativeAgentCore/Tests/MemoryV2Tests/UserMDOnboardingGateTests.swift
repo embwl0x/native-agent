@@ -62,7 +62,11 @@ struct UserMDOnboardingGateTests {
         defer { try? FileManager.default.removeItem(at: root) }
         let personaRoot = root.appendingPathComponent("persona", isDirectory: true)
         let store = try MemoryStorage(dataRoot: root)
-        _ = try await store.insertMemory(StoredMemory(content: "the user prefers Opus 4.8", source: "chat"))
+        _ = try await store.insertMemory(StoredMemory(
+            content: "the user prefers Opus 4.8",
+            source: "chat",
+            metadata: .object(["kind": .string("preference")])
+        ))
         let gen = UserMDGenerator(storage: store, dataRoot: root, personaRoot: personaRoot)
 
         try Data("completed_at=x\n".utf8).write(to: root.appendingPathComponent(".onboarded"))

@@ -52,6 +52,10 @@ final class MacSyncEngine: ObservableObject {
     // fix-R9-9 Maintain insertion order so oldest are evicted first (not random).
     var processedMsgIds: Set<String> = []
     var processedMsgIdsOrdered: [String] = []
+    /// Sweep R4 item 1: the last `loadProcessedIds()` found the file present but
+    /// unreadable, so the in-memory window may be missing ids that really were
+    /// processed. Distinct from "no file yet", which is ordinary genesis.
+    var processedIdsUnreadable = false
 
     // F7 P0 #3: in-flight chat stream tasks keyed by sessionID, registered by
     // forwardToSwiftRuntime and cancelled by the iOS "cancelChat" inbox action. The

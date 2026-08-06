@@ -50,6 +50,16 @@ struct TrustCenterView: View {
                 // feature permissions share a two-column grid; power-user
                 // panels (boundaries, privacy map, simulator, backups)
                 // collapsed by default.
+                //
+                // Sweep R4 C10 (2026-08-06): the summary is BACK, but derived.
+                // The 2026-07-22 deletion was right about the old panel — five
+                // hand-written tiles restating controls below them, which is a
+                // trust claim that goes stale silently. TrustGuardrailSummary
+                // is a pure function of `appModel.trustPolicy` plus the access
+                // mode this page already resolved, so it cannot drift from the
+                // switches underneath it. Read-only: it renders no controls.
+                TrustGuardrailSummaryPanel(accessMode: agentAccessMode)
+
                 NativeSecurityCenterPanel()
 
                 accessAndPolicyPanel
@@ -73,7 +83,10 @@ struct TrustCenterView: View {
                         featureGroup(title: "Multimodal", systemImage: "sparkles", tint: .blue) {
                             MultimodalPermissionsView()
                         }
-                        featureGroup(title: "Autonomous Training", systemImage: "brain", tint: .purple) {
+                        // Sweep R4 C9 — COPY ONLY. The card's own controls now
+                        // read "practice runs" / "automatic review"; the title
+                        // matched neither.
+                        featureGroup(title: "Self-Improvement", systemImage: "brain", tint: .purple) {
                             TrainingPermissionsView()
                         }
                         featureGroup(title: "Workshop Autonomy", systemImage: "hammer.circle", tint: .cyan) {
@@ -248,7 +261,25 @@ struct TrustCenterView: View {
                             cancelPendingFullMacPolicy()
                         }
                     } message: {
-                        Text("The agent will be able to read and modify files outside workspaces across app surfaces. Shell, system control, and file move/trash still require Developer Mode.")
+                        // Sweep R4 C4 — DISCLOSURE ONLY. confirmPendingFullMacPolicy()
+                        // also sets requireBackups=false and outsideDefault=allow;
+                        // the alert named neither, so this grant silently turned OFF
+                        // the "Backup before workspace writes" toggle shown on this
+                        // same page. What the action does is unchanged; every field
+                        // it changes is now stated here.
+                        Text("""
+                        The agent will be able to read and modify files outside workspaces across app surfaces. Shell, system control, and file move/trash still require Developer Mode.
+
+                        Enabling it also changes these settings for you:
+                        • File access is set to Full.
+                        • Workspace actions run autonomously (no per-action approval).
+                        • Access outside the workspace is allowed by default.
+                        • Pre-write backups are turned OFF — "Backup before workspace writes" on this page will switch off.
+
+                        Full Mac does not bypass macOS itself. Documents, Desktop, Downloads, and other protected folders still need their own approval in System Settings → Privacy & Security → Files and Folders (or Full Disk Access) before anything can read them.
+
+                        You can turn any of these back on here afterwards.
+                        """)
                     }
                     Button("Create Backup", systemImage: "externaldrive.badge.timemachine") {
                         Task { await appModel.createBackup(reason: "manual Trust Center backup") }

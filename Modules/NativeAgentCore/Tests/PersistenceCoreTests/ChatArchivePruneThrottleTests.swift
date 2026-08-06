@@ -19,8 +19,10 @@ struct ChatArchivePruneThrottleTests {
     private func tempRoot() throws -> URL {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("ChatArchivePrune-\(UUID().uuidString)", isDirectory: true)
+        // No throttle reset: the root is a fresh UUID this process has never
+        // pruned, so first-pass semantics hold by construction — and a global
+        // reset here wiped OTHER suites' live marks under parallel execution.
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        ChatSessionRetention._resetArchivePruneThrottleForTesting()
         return root
     }
 
@@ -98,12 +100,16 @@ struct ChatArchivePruneThrottleTests {
     @Test func aSecondPassWithinTheIntervalOnAnUnchangedTierSkips() async throws {
         let root = try tempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
-        let now = Date()
+        // A year in the future, so under evict-oldest this root's mark is
+        // never the stalest while other suites' real-time roots churn the
+        // bounded mark map in parallel — the run-count assertions below are
+        // only deterministic if OUR mark survives the whole test.
+        let now = Date().addingTimeInterval(365 * 24 * 60 * 60)
         try writeEmptySessionsIndex(root)
         try makeArchivedTranscript(root, name: "fresh", ageDays: 1, now: now)
         _ = try ChatSessionRetention.enforce(dataRoot: root, now: now)
 
-        let afterFirst = ChatSessionRetention._archivePruneRunCountForTesting()
+        let afterFirst = ChatSessionRetention._archivePruneRunCountForTesting(dataRoot: root)
         #expect(afterFirst == 1)
 
         // Four more appends' worth of enforce passes, all inside the interval
@@ -115,7 +121,7 @@ struct ChatArchivePruneThrottleTests {
             )
         }
         #expect(
-            ChatSessionRetention._archivePruneRunCountForTesting() == afterFirst,
+            ChatSessionRetention._archivePruneRunCountForTesting(dataRoot: root) == afterFirst,
             "an unchanged tier inside the interval must not be re-scanned"
         )
 
@@ -125,7 +131,7 @@ struct ChatArchivePruneThrottleTests {
             dataRoot: root,
             now: now.addingTimeInterval(ChatSessionRetention.pruneMinIntervalSeconds + 60)
         )
-        #expect(ChatSessionRetention._archivePruneRunCountForTesting() == afterFirst + 1)
+        #expect(ChatSessionRetention._archivePruneRunCountForTesting(dataRoot: root) == afterFirst + 1)
     }
 
     // A CHANGED tier prunes immediately, interval or not: an archival that just

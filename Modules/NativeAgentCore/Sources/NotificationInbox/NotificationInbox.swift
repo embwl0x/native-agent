@@ -60,6 +60,7 @@
 // NativeAgent processes before writing — see SwiftNativeNotificationInbox.markStatus.
 
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 
 // MARK: - InboxStatus
@@ -149,7 +150,13 @@ public struct NotificationInboxItem: Sendable, Equatable {
             // through; a non-string would be carried verbatim, but the wire
             // contract is string|null so we surface string|nil).
             detail: d["detail"].optString,
-            relatedWorkshopExecutionId: d["related_mission_id"].optString,
+            // Wave 4 (phase A) read-both: the FUTURE `related_execution_id`
+            // spelling wins when it carries a string, otherwise the on-wire
+            // `related_mission_id`. Every writer (including `toJSONValue`
+            // below) still emits the old key, so a row written by this build is
+            // byte-identical to a 0.3.7 row.
+            relatedWorkshopExecutionId: d[InboxExecutionLinkVocabulary.futureKey].optString
+                ?? d[InboxExecutionLinkVocabulary.wireKey].optString,
             relatedApprovalId: d["related_approval_id"].optString,
             // Python: `list(d["related_paths"]) if isinstance(list) else None`.
             // The daemon stores related_paths as a list of strings; coerce each
@@ -189,7 +196,9 @@ public struct NotificationInboxItem: Sendable, Equatable {
             "title": .string(title),
             "summary": .string(summary),
             "detail": detail.map { JSONValue.string($0) } ?? .null,
-            "related_mission_id": relatedWorkshopExecutionId.map { JSONValue.string($0) } ?? .null,
+            // Wave 4 phase A: STILL the old key (see `fromLine` above).
+            InboxExecutionLinkVocabulary.wireKey:
+                relatedWorkshopExecutionId.map { JSONValue.string($0) } ?? .null,
             "related_approval_id": relatedApprovalId.map { JSONValue.string($0) } ?? .null,
             "related_paths": relatedPaths.map { JSONValue.array($0.map { JSONValue.string($0) }) } ?? .null,
             "related_groups": relatedGroups.map { JSONValue.array($0) } ?? .null,

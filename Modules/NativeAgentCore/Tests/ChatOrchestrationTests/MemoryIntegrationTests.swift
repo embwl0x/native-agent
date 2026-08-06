@@ -123,9 +123,11 @@ func chatClient_recalled_memories_are_in_system_prompt() async throws {
     #expect(resp.output == "ok")
 
     let sys = llm.systems.first.flatMap { $0 } ?? ""
-    // The system prompt must include the renderSystemPrompt "Recent memory:" header
-    // and at least one of the seeded memory previews.
-    #expect(sys.contains("Recent memory:"))
+    // The system prompt must include the renderSystemPrompt memory header
+    // (sweep R4 A4 renamed it "Recent memory:" → "Relevant memory:", since the
+    // rows are relevance-ranked) and at least one of the seeded memories.
+    #expect(sys.contains("Relevant memory:"))
+    #expect(!sys.contains("Recent memory:"))
     let anyPreviewPresent =
         sys.contains("MEMORY_TOKEN_ONE") ||
         sys.contains("MEMORY_TOKEN_TWO") ||

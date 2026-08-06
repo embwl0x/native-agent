@@ -443,8 +443,9 @@ public actor WorkshopExecutorLoop {
     nonisolated func workshopExecutionDir(_ id: String) -> URL {
         executionRecordsRoot.appendingPathComponent(id, isDirectory: true)
     }
+    /// Resolved record path — see `SwiftNativeWorkshopRunner.executionRecordPath`.
     nonisolated func executionRecordPath(_ id: String) -> URL {
-        workshopExecutionDir(id).appendingPathComponent("mission.json")
+        ExecutionRecordFile.resolve(in: workshopExecutionDir(id))
     }
     nonisolated func timelinePath(_ id: String) -> URL {
         workshopExecutionDir(id).appendingPathComponent("timeline.jsonl")
@@ -1505,6 +1506,17 @@ public actor WorkshopExecutorLoop {
         executionId: String,
         _ op: @escaping @Sendable () async throws -> T
     ) async throws -> T {
+        // RESOLVED ONCE, AT ARM TIME (P2-1). The kqueue target is the record
+        // name that exists NOW — canonical, or a legacy `mission.json` the
+        // rename pass hasn't reached. It cannot be renamed out from under the
+        // watcher mid-run: WorkshopStorageMigrator runs synchronously in
+        // applicationDidFinishLaunching, before any executor exists, so no
+        // rename ever races a live step. Watching BOTH names instead would
+        // double the fd cost per in-flight step to defend against a window
+        // that cannot open; and it would not even help, since a rename of the
+        // watched file is itself a vnode event that FileChangeWatcher re-arms
+        // on. If the file is absent entirely, FileChangeWatcher falls back to
+        // the parent directory, so first-creation still wakes the observer.
         let executionRecordJSON = executionRecordPath(executionId)
         let deadlineNanos = stepTimeoutNanos
         let persistence = self.persistence
@@ -1930,7 +1942,7 @@ public actor WorkshopExecutorLoop {
         var reconciled = 0
         for entry in recent {
             let raw = await persistence.readJSON(
-                entry.url.appendingPathComponent("mission.json"), defaultValue: .null
+                ExecutionRecordFile.resolve(in: entry.url), defaultValue: .null
             )
             guard case .object(let object) = raw,
                   case .string(let id)? = object["id"], !id.isEmpty else { continue }
@@ -1965,7 +1977,8 @@ public actor WorkshopExecutorLoop {
         for sub in entries {
             let isDir = (try? sub.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
             guard isDir else { continue }
-            let raw = await persistence.readJSON(sub.appendingPathComponent("mission.json"), defaultValue: .null)
+            let raw = await persistence.readJSON(
+                ExecutionRecordFile.resolve(in: sub, fileManager: fm), defaultValue: .null)
             guard case .object(let obj) = raw, case .string(let gotId)? = obj["id"], !gotId.isEmpty else { continue }
             out.append(SwiftNativeWorkshopRunner.recordFromJSON(obj))
         }

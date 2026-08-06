@@ -234,9 +234,17 @@ extension BackgroundLoopsAssembly {
                     "WorkshopStepStager: dedupe list failed for \(req.executionId)/\(req.stepId): \(error)\n".utf8))
                 return nil
             }
+            // P2-2 de-mission: the stager now WRITES "execution_id" (below).
+            // This dedupe read resolves through the shared vocabulary so a
+            // pending approval staged by an older binary still matches —
+            // without the fallback it would miss and the stager would append a
+            // duplicate approval for the same step.
             if let existing = pending.first(where: { rec in
                 guard case .object(let p) = rec.payload,
-                      case .string(let mid)? = p["mission_id"],
+                      let mid = WorkshopStepApprovalPayload.executionId({ key in
+                          if case .string(let s)? = p[key] { return s }
+                          return nil
+                      }),
                       case .string(let sid)? = p["step_id"] else { return false }
                 return mid == req.executionId && sid == req.stepId
             }) {
@@ -255,9 +263,14 @@ extension BackgroundLoopsAssembly {
                 "action": .string(WorkshopStepApprovalAction.canonical),
                 "risk": .string("medium"),
                 "reason": .string(req.reason),
+                // Sweep R4 B2: ApprovalInbox fails CLOSED on an undeclared
+                // `remoteResolvable`. A workshop step parks the execution until
+                // User answers, and answering from the phone was already
+                // supported — declare it explicitly to preserve that.
+                "remoteResolvable": .bool(true),
                 "payload": .object([
                     "kind": .string(WorkshopStepApprovalAction.canonical),
-                    "mission_id": .string(req.executionId),
+                    WorkshopStepApprovalPayload.canonicalExecutionIdKey: .string(req.executionId),
                     "step_id": .string(req.stepId),
                     "tool": .string(req.tool),
                     "args": req.args,
@@ -305,7 +318,9 @@ extension BackgroundLoopsAssembly {
             "related_mission_id": .string(req.executionId),
             "related_approval_id": .string(approvalId),
             "related_paths": .array([
-                .string(dataRoot.appendingPathComponent("workshop/executions/\(req.executionId)/mission.json").path),
+                .string(ExecutionRecordFile.resolve(
+                    in: dataRoot.appendingPathComponent(
+                        "workshop/executions/\(req.executionId)", isDirectory: true)).path),
             ]),
             "related_groups": .array([]),
             "actions": .array([

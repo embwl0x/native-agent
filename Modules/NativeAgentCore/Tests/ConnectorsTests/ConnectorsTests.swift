@@ -265,7 +265,7 @@ private func intField(_ v: JSONValue, _ path: [String]) -> Int64? {
     #expect(stringField(ev, "detail") == "alpha")  // query, lowercased upstream
     #expect(stringField(ev, "status") == "ok")
     // missionId is JSON null.
-    if case .object(let o) = ev { #expect(o["missionId"] == .null) }
+    if case .object(let o) = ev { #expect(o["executionId"] == .null) }
     #expect(intField(ev, ["payload", "resultCount"]) == 2)
     // createdAt is ISO-8601 UTC with +00:00 offset.
     #expect(stringField(ev, "createdAt")?.hasSuffix("+00:00") == true)

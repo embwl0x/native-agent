@@ -257,6 +257,19 @@ public protocol HybridMemoryStorageProtocol: MemoryStorageProtocol {
     ) async throws -> [ScoredMemoryRecord]
 }
 
+/// Optional storage capability: lexical-only recall for when no usable query
+/// embedding exists. Kept OFF `MemoryStorageProtocol` (like
+/// `HybridMemoryStorageProtocol`) so lightweight fixtures are unaffected —
+/// a storage that does not implement it simply has no fallback, which is the
+/// pre-sweep behavior.
+public protocol KeywordRecallStorageProtocol: MemoryStorageProtocol {
+    func recallByKeyword(
+        queryText: String,
+        topK: Int,
+        persona: String?
+    ) async throws -> [ScoredMemoryRecord]
+}
+
 public extension MemoryStorageProtocol {
     func insert(
         record: MemoryRecord,
@@ -374,8 +387,28 @@ extension SwiftNativeMemoryV2 {
     public func recall(_ query: MemoryV2RecallRequest) async throws -> MemoryV2RecallResponse {
         guard !query.text.isEmpty else { throw MemoryV2Error.invalidQuery }
         guard let storage else { throw MemoryV2Error.storageUnavailable }
-        let queryEmbedding = try await embedOneWithEpoch(query.text)
-        let qvec = queryEmbedding.vector
+        // Sweep R4 A5: a cold/failed embedder used to THROW out of here, so the
+        // caller's whole recall lane collapsed to zero hits on the first message
+        // after launch. Catch it and degrade to the lexical lane instead. A
+        // genuinely unwired embedder (storageUnavailable) still propagates —
+        // that is a configuration fault, not a warm-up race.
+        var queryEmbedding: (vector: [Float], epoch: MemoryEmbeddingEpoch)?
+        var embedFailure: Error?
+        do {
+            queryEmbedding = try await embedOneWithEpoch(query.text)
+        } catch MemoryV2Error.storageUnavailable {
+            throw MemoryV2Error.storageUnavailable
+        } catch let error where memoryV2IsColdEmbedderFailure(error) {
+            embedFailure = error
+            queryEmbedding = nil
+        }
+        // Any OTHER embedding error — dimension mismatch, model corruption,
+        // the runtime's "model unavailable, reinstall" load failure —
+        // RETHROWS. Downgrading those to lexical recall would silently mask
+        // a broken dense lane behind plausible keyword hits (gpt-5.5 review
+        // 2026-08-06, blocking #2; fail-loud doctrine). Only the warm-up
+        // race gets the graceful path.
+        let qvec = queryEmbedding?.vector ?? []
         let topK = max(1, query.topK)
         // Disclosure filtering happens before results leave MemoryV2. Fetch a
         // bounded wider candidate window so private/disallowed high scorers do
@@ -386,21 +419,45 @@ extension SwiftNativeMemoryV2 {
             ? min(memoryStoredRowCap, max(topK, topK * 8))
             : topK
         let scored: [ScoredMemoryRecord]
-        if let hybrid = storage as? any HybridMemoryStorageProtocol {
-            scored = try await hybrid.recall(
-                embedding: qvec,
-                embeddingEpoch: queryEmbedding.epoch,
+        var usedKeywordFallback = false
+        // A vector of all zeros is what a not-yet-warm embedder returns; it has
+        // no direction, so cosine recall would return [] just as surely as a
+        // thrown error would.
+        let hasUsableVector = !qvec.isEmpty && qvec.contains { $0 != 0 && $0.isFinite }
+        if let queryEmbedding, hasUsableVector {
+            if let hybrid = storage as? any HybridMemoryStorageProtocol {
+                scored = try await hybrid.recall(
+                    embedding: qvec,
+                    embeddingEpoch: queryEmbedding.epoch,
+                    queryText: query.text,
+                    topK: storageTopK,
+                    persona: query.persona
+                )
+            } else {
+                scored = try await storage.recall(
+                    embedding: qvec,
+                    embeddingEpoch: queryEmbedding.epoch,
+                    topK: storageTopK,
+                    persona: query.persona
+                )
+            }
+        } else if let keywordStorage = storage as? any KeywordRecallStorageProtocol {
+            usedKeywordFallback = true
+            FileHandle.standardError.write(Data(
+                ("MemoryV2: query embedding unavailable"
+                 + (embedFailure.map { " (\($0))" } ?? "")
+                 + " — falling back to keyword recall\n").utf8
+            ))
+            scored = try await keywordStorage.recallByKeyword(
                 queryText: query.text,
                 topK: storageTopK,
                 persona: query.persona
             )
+        } else if let embedFailure {
+            // No embedding AND no lexical lane: nothing honest to return.
+            throw embedFailure
         } else {
-            scored = try await storage.recall(
-                embedding: qvec,
-                embeddingEpoch: queryEmbedding.epoch,
-                topK: storageTopK,
-                persona: query.persona
-            )
+            scored = []
         }
         let disclosed = scored.filter { scoredRecord in
             guard let classification = MemoryRecordDisclosurePolicy.classify(scoredRecord.record) else {
@@ -415,7 +472,11 @@ extension SwiftNativeMemoryV2 {
         // whole recall lane silently returns nothing. Only fires on the zero-hit
         // path, at most once per (persona, surface), and only after proving the
         // persona filter — not disclosure, not an empty store — is to blame.
-        if query.persona != nil, sorted.isEmpty {
+        // Not on the keyword-fallback path: that diagnostic probes the DENSE
+        // lane, and a cold-embedder turn is not evidence of a persona-id
+        // mismatch. It would fire a false alarm on every first-turn recall.
+        if query.persona != nil, sorted.isEmpty, !usedKeywordFallback,
+           let queryEmbedding {
             await reportPersonaRecallStarvation(
                 query: query,
                 personaFilteredCandidateCount: scored.count,
@@ -456,6 +517,18 @@ extension SwiftNativeMemoryV2 {
                 sr.record.text,
                 kind: sr.record.memoryKind
             )
+            // Sweep R4 A4: the prompt renderer stamps a compact
+            // `[YYYY-MM-DD, kind]` provenance marker on each recalled row so the
+            // model can tell a stale fact from a fresh correction. `ts` was
+            // already carried; the kind rides in the free-form `extras` bag
+            // (documented as the landing spot for extra keys) rather than a new
+            // struct field, so the hit shape is unchanged.
+            var extras: [String: JSONValue] = ["id": .string(sr.record.id)]
+            if let kind = sr.record.memoryKind?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !kind.isEmpty {
+                extras["kind"] = .string(kind)
+            }
             return MemoryRecallHit(
                 score: sr.score,
                 sessionId: sr.record.sourceRunId,
@@ -463,9 +536,9 @@ extension SwiftNativeMemoryV2 {
                 ts: sr.record.createdAt,
                 preview: MemoryTextClip.sentenceClip(displayText, cap: memoryRecallPreviewCap),
                 content: MemoryTextClip.sentenceClip(displayText, cap: memoryRecallContentCap),
-                source: "swift-native",
+                source: usedKeywordFallback ? "swift-native-keyword-fallback" : "swift-native",
                 rankingSignals: nil,
-                extras: .object(["id": .string(sr.record.id)])
+                extras: .object(extras)
             )
         }
         return MemoryV2RecallResponse(
@@ -1173,4 +1246,20 @@ public actor InMemoryMemoryStorage: MemoryStorageProtocol {
         let d = sqrtf(na) * sqrtf(nb)
         return d > 0 ? dot / d : 0
     }
+}
+
+/// The warm-up-race failure class that may degrade to keyword recall: a
+/// cancelled in-flight predict (transient by the runtime's own
+/// classification — it deliberately does NOT evict the model on these) or an
+/// empty batch from a provider that hasn't produced vectors yet. Everything
+/// else — the runtime's "model unavailable, reinstall" load error, dimension
+/// mismatches, provider faults — is a broken dense lane and must propagate
+/// loudly, not hide behind lexical hits.
+func memoryV2IsColdEmbedderFailure(_ error: Error) -> Bool {
+    if error is CancellationError { return true }
+    if case MemoryV2Error.underlying(let message) = error,
+       message.contains("no vectors") {
+        return true
+    }
+    return false
 }

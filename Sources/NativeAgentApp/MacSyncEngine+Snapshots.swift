@@ -156,6 +156,16 @@ extension MacSyncEngine {
                 snapshotFetchFailures.append("\(label): \(error.localizedDescription)")
                 NSLog("[MacSyncEngine] snapshot fetch failed for %@ — keeping last good file: %@", label, "\(error)")
             }
+            // Sweep R4 item 2: groups the native helpers could not build. Same
+            // publish behavior as before (keep last good), but the group is now
+            // NAMED — in syncError and in the durable skip file Doctor reads —
+            // so "iPhone is showing stale approvals" stops being invisible.
+            var skippedSnapshotGroups: [String: String] = [:]
+            func recordGroupSkip(_ label: String, _ reason: String) {
+                skippedSnapshotGroups[label] = reason
+                snapshotFetchFailures.append("\(label): \(reason)")
+                NSLog("[MacSyncEngine] snapshot group %@ SKIPPED — keeping last good file: %@", label, reason)
+            }
 
             var executions: [WorkshopExecutionRecord]?
             do { executions = try await executionsTask } catch { recordFetchFailure("missions", error) }
@@ -228,6 +238,14 @@ extension MacSyncEngine {
                 await writeData(data, to: filename)
             }
 
+            /// Publish when the group built; NAME it when it was skipped.
+            func publish(_ build: SnapshotGroupBuild, as label: String, to filename: String) async {
+                switch build {
+                case .built(let data): await writeData(data, to: filename)
+                case .skipped(let reason): recordGroupSkip(label, reason)
+                }
+            }
+
             if let executions {
                 await write(executions, to: "workshop_tasks.json")
                 try? FileManager.default.removeItem(
@@ -259,8 +277,8 @@ extension MacSyncEngine {
                     return nil
                 }
             }()
-            async let approvalsData: Data? = self.nativeApprovalsSnapshotData(api: api)
-            async let inboxData: Data? = self.nativeInboxSnapshotData(api: api)
+            async let approvalsData: SnapshotGroupBuild = self.nativeApprovalsSnapshotData(api: api)
+            async let inboxData: SnapshotGroupBuild = self.nativeInboxSnapshotData(api: api)
             // The command palette is unconditionally Swift-native and reads
             // its live persona, approval, and autonomy context directly from
             // canonical local owners without an HTTP round-trip.
@@ -272,8 +290,8 @@ extension MacSyncEngine {
             )
             if let trustRaw { await writeData(trustRaw, to: "trust_policy.json") }
             if let personalityProfile { await write(personalityProfile, to: "personality.json") }
-            if let approvalsRaw { await writeData(approvalsRaw, to: "approvals.json") }
-            if let inboxRaw { await writeData(inboxRaw, to: "inbox.json") }
+            await publish(approvalsRaw, as: "approvals", to: "approvals.json")
+            await publish(inboxRaw, as: "inbox", to: "inbox.json")
             if includeHeavySnapshots {
                 // Turn Inspector W4: per-turn summaries for the iOS read-only
                 // inspector (content-free; size-budgeted). Off-main read of the
@@ -286,7 +304,7 @@ extension MacSyncEngine {
                 // them, so the honest state is no file at all. runs.json is
                 // real now: AdvancedView's runs list had shipped UI waiting on
                 // a snapshot nobody wrote (newest 50, nil-skip on failure).
-                async let knowledgeGraphData: Data? = self.nativeKnowledgeGraphSnapshotData()
+                async let knowledgeGraphData: SnapshotGroupBuild = self.nativeKnowledgeGraphSnapshotData()
                 async let runsFetch: [RunRecord]? = {
                     // Strict read: nil = ledger exists but unreadable/corrupt →
                     // skip the write, keep last-good (review MED #1, 2026-07-02).
@@ -304,7 +322,7 @@ extension MacSyncEngine {
                 )
                 if let turnSummariesRaw { await writeData(turnSummariesRaw, to: "turn_summaries.json") }
                 if let commandPaletteRaw { await writeData(commandPaletteRaw, to: "command_palette.json") }
-                if let knowledgeGraphRaw { await writeData(knowledgeGraphRaw, to: "knowledge_graph.json") }
+                await publish(knowledgeGraphRaw, as: "knowledge_graph", to: "knowledge_graph.json")
                 if let runsAll {
                     // Byte-budget the snapshot copy (review MED #2): prompt/
                     // output/error are unbounded on disk; 50 uncapped worker
@@ -386,17 +404,38 @@ extension MacSyncEngine {
             // reasoningEffort } } — flat-string variants are tolerated by
             // the iOS reader for back-compat.
             if includeHeavySnapshots {
-                if let modelPrefsData = await self.modelPreferencesSnapshotData(api: api) {
-                    await writeData(modelPrefsData, to: "model_preferences.json")
-                }
+                await publish(
+                    await self.modelPreferencesSnapshotData(api: api),
+                    as: "model_preferences",
+                    to: "model_preferences.json"
+                )
             }
 
             lastSnapshotAt = Date()
             // fix-2026-06-10 sync-audit #1: surface skipped-fetch errors instead
             // of clearing them — the snapshot files themselves kept last-good data.
-            syncError = snapshotFetchFailures.isEmpty
-                ? nil
-                : "Snapshot fetch failed (kept last good files): \(snapshotFetchFailures.joined(separator: "; "))"
+            // Sweep R4 item 2: lead with the SKIPPED GROUP NAMES, because that
+            // is what tells the owner which iPhone surface is stale.
+            if snapshotFetchFailures.isEmpty {
+                syncError = nil
+            } else {
+                let staleGroups = skippedSnapshotGroups.keys.sorted()
+                let prefix = staleGroups.isEmpty
+                    ? "Snapshot fetch failed (kept last good files)"
+                    : "iPhone is showing STALE \(staleGroups.joined(separator: ", ")) (kept last good files)"
+                syncError = "\(prefix): \(snapshotFetchFailures.joined(separator: "; "))"
+            }
+            // Durable so Doctor can report it later, from a different process,
+            // without depending on this @Published in-memory string.
+            // NativeAgentPaths.dataRoot, not PersistenceCore.defaultDataRoot():
+            // every other piece of MacSyncEngine's local bookkeeping (processed
+            // ids, completion markers) resolves through NativeAgentPaths, and
+            // two resolvers for one subsystem is how state ends up split across
+            // two roots.
+            Self.persistSnapshotSkipState(
+                skippedSnapshotGroups,
+                dataRoot: NativeAgentPaths.dataRoot
+            )
 
             // Notify iOS via KVS only when content changed; unchanged digest
             // ticks should not wake the phone into another full snapshot read.
@@ -528,33 +567,51 @@ extension MacSyncEngine {
 
 
     // Swift-native cutover: native snapshot helpers replacing /v1/approvals, /v1/inbox,
-    // and /v1/knowledge_graph reads. Each returns nil only on a hard typed-call
-    // failure; the writeSnapshots loop then skips that file (best-effort).
-    private func nativeApprovalsSnapshotData(api: NativeClient) async -> Data? {
-        guard let approvals = try? await api.getApprovals() else { return nil }
+    // and /v1/knowledge_graph reads.
+    //
+    // Sweep R4 item 2: these used to return `Data?`, and the writeSnapshots loop
+    // read nil as "skip this file, best-effort". Nil-skip is still the RIGHT
+    // publish behavior — the phone keeps the last good file instead of being
+    // handed fabricated empty state — but it was silent: the Mac published
+    // every other group and nothing said the phone was now holding stale
+    // approvals or an out-of-date model choice. The typed result carries the
+    // REASON out so the same pass that keeps last-good also says which group
+    // went stale and why.
+    private func nativeApprovalsSnapshotData(api: NativeClient) async -> SnapshotGroupBuild {
+        let approvals: [ApprovalRequest]
+        do { approvals = try await api.getApprovals() } catch {
+            return .skipped("approval store unreadable: \(error.localizedDescription)")
+        }
         let enc = JSONEncoder()
         enc.dateEncodingStrategy = .iso8601
         enc.outputFormatting = .sortedKeys
-        return try? enc.encode(approvals)
+        do { return .built(try enc.encode(approvals)) } catch {
+            return .skipped("approvals could not be encoded: \(error.localizedDescription)")
+        }
     }
 
-    private func nativeInboxSnapshotData(api: NativeClient) async -> Data? {
-        guard let items = try? await api.getInboxItems() else { return nil }
+    private func nativeInboxSnapshotData(api: NativeClient) async -> SnapshotGroupBuild {
+        let items: [InboxItemRecord]
+        do { items = try await api.getInboxItems() } catch {
+            return .skipped("inbox unreadable: \(error.localizedDescription)")
+        }
         let enc = JSONEncoder()
         enc.dateEncodingStrategy = .iso8601
         enc.outputFormatting = .sortedKeys
-        return try? enc.encode(items)
+        do { return .built(try enc.encode(items)) } catch {
+            return .skipped("inbox could not be encoded: \(error.localizedDescription)")
+        }
     }
 
-    private func nativeKnowledgeGraphSnapshotData() async -> Data? {
+    private func nativeKnowledgeGraphSnapshotData() async -> SnapshotGroupBuild {
         do {
-            return try await NativeClient.canonicalKnowledgeGraphSnapshotData()
+            return .built(try await NativeClient.canonicalKnowledgeGraphSnapshotData())
         } catch {
             NSLog(
                 "[MacSyncEngine] canonical knowledge graph unreadable — keeping last good snapshot: %@",
                 String(describing: error)
             )
-            return nil
+            return .skipped("knowledge graph unreadable: \(error.localizedDescription)")
         }
     }
 
@@ -651,8 +708,11 @@ extension MacSyncEngine {
     /// honor. Returns nil only when the picker call itself throws — a stub
     /// `{}` would silently let iOS overwrite the Mac with empty state, so
     /// nil-skip is safer.
-    private func modelPreferencesSnapshotData(api: NativeClient) async -> Data? {
-        guard let prefs = try? await api.getModelPreferences() else { return nil }
+    private func modelPreferencesSnapshotData(api: NativeClient) async -> SnapshotGroupBuild {
+        let prefs: SurfaceModelPreferencesResponse
+        do { prefs = try await api.getModelPreferences() } catch {
+            return .skipped("model preferences unreadable: \(error.localizedDescription)")
+        }
         var out: [String: [String: String]] = [:]
         for entry in prefs.preferences {
             let surface = entry.surface
@@ -668,6 +728,58 @@ extension MacSyncEngine {
         }
         let enc = JSONEncoder()
         enc.outputFormatting = .sortedKeys
-        return try? enc.encode(out)
+        do { return .built(try enc.encode(out)) } catch {
+            return .skipped("model preferences could not be encoded: \(error.localizedDescription)")
+        }
+    }
+}
+
+extension MacSyncEngine {
+    /// Durable record of which snapshot groups the last pass could not build.
+    /// Written on EVERY pass — including the clean one, which removes the file —
+    /// so Doctor never reports a skip the next pass already recovered from.
+    nonisolated static func persistSnapshotSkipState(
+        _ skips: [String: String],
+        dataRoot: URL
+    ) {
+        let url = ICloudSyncStatePaths.snapshotSkips(dataRoot: dataRoot)
+        guard !skips.isEmpty else {
+            try? FileManager.default.removeItem(at: url)
+            return
+        }
+        var payload = skips
+        payload["_observedAt"] = ISO8601DateFormatter().string(from: Date())
+        do {
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
+            try encoder.encode(payload).write(to: url, options: .atomic)
+        } catch {
+            NSLog("[MacSyncEngine] could not record snapshot skip state: %@", error.localizedDescription)
+        }
+    }
+}
+
+/// Sweep R4 item 2: the outcome of building ONE iOS snapshot group.
+///
+/// `.skipped` keeps the publish behavior identical to the old `nil` — the file
+/// is not rewritten, so the phone keeps the last good copy — while carrying the
+/// reason out so the pass can name the stale group in `syncError` and in the
+/// durable state Doctor reads.
+enum SnapshotGroupBuild {
+    case built(Data)
+    case skipped(String)
+
+    var data: Data? {
+        if case .built(let data) = self { return data }
+        return nil
+    }
+
+    var skipReason: String? {
+        if case .skipped(let reason) = self { return reason }
+        return nil
     }
 }

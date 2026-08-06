@@ -30,7 +30,11 @@ struct U5WGMiscTests {
         defer { try? FileManager.default.removeItem(at: root) }
         let persona = MemoryV2Defaults.personaID
 
-        _ = try await store.insertMemory(StoredMemory(content: "first fact", source: "chat"))
+        _ = try await store.insertMemory(StoredMemory(
+            content: "first fact",
+            source: "chat",
+            metadata: .object(["kind": .string("user_fact")])
+        ))
         // Pin analytic time so saturation elsewhere in the full Core suite
         // cannot spend the entire 400 ms debounce window between the explicit
         // regeneration and the in-window poke. The trailing task still waits
@@ -47,7 +51,11 @@ struct U5WGMiscTests {
         #expect(try String(contentsOf: url, encoding: .utf8).contains("first fact"))
 
         // New fact + an in-window poke: must be debounced (nil) ...
-        _ = try await store.insertMemory(StoredMemory(content: "trailing fact", source: "chat"))
+        _ = try await store.insertMemory(StoredMemory(
+            content: "trailing fact",
+            source: "chat",
+            metadata: .object(["kind": .string("user_fact")])
+        ))
         let immediate = try await gen.requestRegeneration(persona: persona)
         #expect(immediate == nil, "poke inside the window must be debounced")
         // ... but NOT dropped: the trailing edge regenerates at window close.

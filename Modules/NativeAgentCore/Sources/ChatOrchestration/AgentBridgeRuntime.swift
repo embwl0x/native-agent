@@ -75,6 +75,21 @@ public enum AgentBridgeRuntime {
         ], fileManager: fileManager)
     }
 
+    public static func ompHelperURL(
+        override: URL? = nil,
+        repoRoot: URL,
+        bundleResourceRoot: URL? = Bundle.main.resourceURL,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        fileManager: FileManager = .default
+    ) -> URL? {
+        firstReadableRegularFile([
+            override,
+            environment["NATIVE_AGENT_OMP_WAKEUP_HELPER"].map(URL.init(fileURLWithPath:)),
+            repoRoot.appendingPathComponent("script/omp_thread_wakeup.js"),
+            bundledHelper(named: "omp_thread_wakeup.js", resourceRoot: bundleResourceRoot),
+        ], fileManager: fileManager)
+    }
+
     public static func executableURL(
         named name: String,
         environment: [String: String] = ProcessInfo.processInfo.environment,
@@ -84,6 +99,7 @@ public enum AgentBridgeRuntime {
         let override: String? = switch name {
         case "codex": environment["NATIVE_AGENT_CODEX_BIN"] ?? environment["CODEX_BIN"]
         case "claude": environment["NATIVE_AGENT_CLAUDE_WAKE_CLAUDE_BIN"]
+        case "omp": environment["NATIVE_AGENT_OMP_WAKE_BIN"] ?? environment["OMP_BIN"]
         case "node": environment["NATIVE_AGENT_BRIDGE_NODE_BIN"]
         default: nil
         }

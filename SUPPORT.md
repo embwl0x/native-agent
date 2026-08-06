@@ -42,7 +42,7 @@ switching to another runtime.
 1. Download the current notarized disk image from the official product page.
 2. Open the disk image and drag NativeAgent into Applications.
 3. Launch NativeAgent from Applications and complete onboarding.
-4. Connect a supported provider in **Settings → Providers**.
+4. Connect a supported provider in the **Providers** tab in the sidebar.
 5. Grant only the Mac Integration permissions the user intends to use.
 
 If macOS blocks the app, confirm the file came from the official download page
@@ -101,7 +101,7 @@ is still pending.
 
 ### A provider or connector does not work
 
-- Reopen **Settings → Providers** or **Connectors** on the Mac.
+- Reopen the **Providers** or **Connectors** tab in the sidebar on the Mac.
 - Confirm the credential belongs to the selected provider and has the required
   scope.
 - Review the provider's service status and account limits.

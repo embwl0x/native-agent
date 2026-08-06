@@ -903,7 +903,7 @@ extension NativeClient {
                     }()
                     func rowKey(_ v: JSONValue) -> String? {
                         guard case .object(let obj) = v else { return nil }
-                        let m: String? = { if case .string(let s) = obj["missionId"] ?? obj["mission_id"] ?? .null { return s }; return nil }()
+                        let m: String? = { if case .string(let s) = obj["executionId"] ?? obj["execution_id"] ?? obj["missionId"] ?? obj["mission_id"] ?? .null { return s }; return nil }()
                         let s: String? = { if case .string(let s) = obj["stepId"] ?? obj["step_id"] ?? obj["id"] ?? .null { return s }; return nil }()
                         guard let m = m, let s = s else { return nil }
                         return "\(m)#\(s)"
@@ -930,7 +930,7 @@ extension NativeClient {
             var matched = false
             for i in rows.indices {
                 guard case .object(var obj) = rows[i] else { continue }
-                let rowWorkshopExecution: String? = { if case .string(let s) = obj["missionId"] ?? obj["mission_id"] ?? .null { return s }; return nil }()
+                let rowWorkshopExecution: String? = { if case .string(let s) = obj["executionId"] ?? obj["execution_id"] ?? obj["missionId"] ?? obj["mission_id"] ?? .null { return s }; return nil }()
                 let rowStep: String? = { if case .string(let s) = obj["stepId"] ?? obj["step_id"] ?? obj["id"] ?? .null { return s }; return nil }()
                 if rowWorkshopExecution == executionId && rowStep == stepId {
                     obj["status"] = .string("approved")
@@ -942,7 +942,7 @@ extension NativeClient {
             }
             if !matched {
                 rows.append(.object([
-                    "missionId": .string(executionId),
+                    "executionId": .string(executionId),
                     "stepId": .string(stepId),
                     "status": .string("approved"),
                     "decision": .string("approved"),
@@ -977,7 +977,7 @@ extension NativeClient {
             var matched = false
             for i in rows.indices {
                 guard case .object(var obj) = rows[i] else { continue }
-                let rowWorkshopExecution: String? = { if case .string(let s) = obj["missionId"] ?? obj["mission_id"] ?? .null { return s }; return nil }()
+                let rowWorkshopExecution: String? = { if case .string(let s) = obj["executionId"] ?? obj["execution_id"] ?? obj["missionId"] ?? obj["mission_id"] ?? .null { return s }; return nil }()
                 let rowStep: String? = { if case .string(let s) = obj["stepId"] ?? obj["step_id"] ?? obj["id"] ?? .null { return s }; return nil }()
                 if rowWorkshopExecution == executionId && rowStep == stepId {
                     obj["status"] = .string("rejected")
@@ -990,7 +990,7 @@ extension NativeClient {
             }
             if !matched {
                 rows.append(.object([
-                    "missionId": .string(executionId),
+                    "executionId": .string(executionId),
                     "stepId": .string(stepId),
                     "status": .string("rejected"),
                     "decision": .string("rejected"),

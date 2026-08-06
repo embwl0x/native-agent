@@ -548,10 +548,12 @@ struct WorkshopExecutionMemoryTests {
         // The execution really did finish.
         let persistence = SwiftNativePersistenceCore()
         let raw = await persistence.readJSON(
-            root.appendingPathComponent("workshop/executions/\(id)/mission.json"), defaultValue: .null
+            ExecutionRecordFile.resolve(
+                in: root.appendingPathComponent("workshop/executions/\(id)", isDirectory: true)),
+            defaultValue: .null
         )
         guard case .object(let object) = raw else {
-            Issue.record("mission.json missing")
+            Issue.record("execution record missing")
             return
         }
         #expect(object["status"] == .string("completed"))
@@ -611,10 +613,12 @@ struct WorkshopExecutionMemoryTests {
 
         let persistence = SwiftNativePersistenceCore()
         let raw = await persistence.readJSON(
-            root.appendingPathComponent("workshop/executions/\(id)/mission.json"), defaultValue: .null
+            ExecutionRecordFile.resolve(
+                in: root.appendingPathComponent("workshop/executions/\(id)", isDirectory: true)),
+            defaultValue: .null
         )
         guard case .object(let object) = raw else {
-            Issue.record("mission.json missing")
+            Issue.record("execution record missing")
             return
         }
         #expect(object["status"] == .string("failed"))
@@ -673,10 +677,12 @@ struct WorkshopExecutionMemoryTests {
         // The execution really did reach terminal…
         let persistence = SwiftNativePersistenceCore()
         let raw = await persistence.readJSON(
-            root.appendingPathComponent("workshop/executions/\(id)/mission.json"), defaultValue: .null
+            ExecutionRecordFile.resolve(
+                in: root.appendingPathComponent("workshop/executions/\(id)", isDirectory: true)),
+            defaultValue: .null
         )
         guard case .object(let object) = raw else {
-            Issue.record("mission.json missing")
+            Issue.record("execution record missing")
             return
         }
         #expect(object["status"] == .string("completed"))
@@ -916,10 +922,12 @@ struct WorkshopExecutionMemoryTests {
         await executor.drainOnce()
         let persistence = SwiftNativePersistenceCore()
         let raw = await persistence.readJSON(
-            root.appendingPathComponent("workshop/executions/\(id)/mission.json"), defaultValue: .null
+            ExecutionRecordFile.resolve(
+                in: root.appendingPathComponent("workshop/executions/\(id)", isDirectory: true)),
+            defaultValue: .null
         )
         guard case .object(let object) = raw else {
-            Issue.record("mission.json missing")
+            Issue.record("execution record missing")
             return
         }
         #expect(object["status"] == .string("completed"))
@@ -963,7 +971,7 @@ private func seedExecutionMemoryExecution(
         result: .null,
         rerunCount: 0
     )
-    try await persistence.writeJSON(record.toJSON(), to: dir.appendingPathComponent("mission.json"))
+    try await persistence.writeJSON(record.toJSON(), to: ExecutionRecordFile.canonicalPath(in: dir))
     try await persistence.appendJSONL(
         .object([
             "event": .string("enqueued"),

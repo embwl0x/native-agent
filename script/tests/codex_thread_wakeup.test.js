@@ -259,19 +259,21 @@ test("reply wait timeouts remain pending while the rollout keeps moving", async 
   let waits = 0;
   let snapshots = 0;
   let probeCalls = 0;
+  const clock = 10_000_000;
   const execution = await wakeup.waitForDurableTerminalExecution({
     threadId: "thread-pending",
     turnId: "turn-pending",
   }, {}, async () => { timeouts += 1; }, {
+    now: () => clock,
+    // A session file written moments ago is legitimate long work: idle time
+    // stays under the threshold and the liveness probe must never fire.
+    rolloutStallSnapshot: () => {
+      snapshots += 1;
+      return { path: "/tmp/rollout.jsonl", ino: 1, size: snapshots, mtimeMs: clock - 1000 };
+    },
     waitForTurnResult: async () => {
       waits += 1;
       return results.shift();
-    },
-    // A growing session file is legitimate long work: the stall count must
-    // reset every window and the liveness probe must never fire.
-    rolloutStallSnapshot: () => {
-      snapshots += 1;
-      return { path: "/tmp/rollout.jsonl", ino: 1, size: snapshots, mtimeMs: snapshots };
     },
     probeTurnLiveness: async () => {
       probeCalls += 1;
@@ -286,71 +288,187 @@ test("reply wait timeouts remain pending while the rollout keeps moving", async 
 });
 
 // ------------------------------------------- stalled turns (task #46, 2026-07-30)
+// Re-cut 2026-08-05 onto MEASURED idle time (stallIdleMs) so a dead turn settles
+// ~15 min after its last rollout byte instead of ~2h of wait windows.
 
-test("a dead app-server with a stagnant rollout stalls after one full window", async () => {
+test("a dead app-server stalls one idle window after the last rollout byte", async () => {
   let timeouts = 0;
   let waits = 0;
-  const job = { threadId: "thread-stall", turnId: "turn-stall" };
-  const execution = await wakeup.waitForDurableTerminalExecution(job, {}, async () => { timeouts += 1; }, {
-    waitForTurnResult: async () => {
-      waits += 1;
-      return { status: "timeout", waitSource: "exact_timeout" };
-    },
-    rolloutStallSnapshot: () => ({ path: "/tmp/rollout.jsonl", ino: 7, size: 100, mtimeMs: 5 }),
-    probeTurnLiveness: async () => ({ serverReachable: false, turnFound: false, turnClaimsInProgress: false }),
-  });
-
-  // Window 1 establishes the baseline; window 2 proves stagnation and the
-  // dead probe converts it to a terminal stalled verdict.
-  assert.equal(waits, 2);
-  assert.equal(timeouts, 1);
-  assert.equal(execution.turnResult.status, "stalled");
-  assert.equal(execution.turnResult.stallEvidence.serverReachable, false);
-  assert.equal(execution.turnResult.stallEvidence.stagnantWindows, 1);
-  // No rollout content was scanned (path is fake), so work state is unknown.
-  assert.equal(execution.turnResult.noWorkObserved, null);
-});
-
-test("an inProgress-claiming turn needs stallWedgedWindows stagnant windows (configurable)", async () => {
-  let waits = 0;
   let probeCalls = 0;
-  const job = { threadId: "thread-wedged", turnId: "turn-wedged" };
+  const clock = 10_000_000;
+  const job = { threadId: "thread-stall", turnId: "turn-stall" };
   const execution = await wakeup.waitForDurableTerminalExecution(
-    job, { stallWedgedWindows: 2 }, async () => {}, {
+    job, { stallProbeConfirmDelayMs: 1 }, async () => { timeouts += 1; }, {
+      now: () => clock,
       waitForTurnResult: async () => {
         waits += 1;
         return { status: "timeout", waitSource: "exact_timeout" };
       },
-      rolloutStallSnapshot: () => ({ path: "/tmp/rollout.jsonl", ino: 7, size: 100, mtimeMs: 5 }),
+      // 16 minutes idle: past the 15-minute default.
+      rolloutStallSnapshot: () => ({
+        path: "/tmp/rollout.jsonl", ino: 7, size: 100, mtimeMs: clock - 16 * 60 * 1000,
+      }),
+      probeTurnLiveness: async () => {
+        probeCalls += 1;
+        return { serverReachable: false, turnFound: false, turnClaimsInProgress: false };
+      },
+    });
+
+  // Measured idle needs no baseline window: the verdict lands on window 1.
+  assert.equal(waits, 1);
+  assert.equal(timeouts, 0);
+  // Probe + confirmation probe -- one reading may never settle a turn.
+  assert.equal(probeCalls, 2);
+  assert.equal(execution.turnResult.status, "stalled");
+  assert.equal(execution.turnResult.stallEvidence.serverReachable, false);
+  assert.equal(execution.turnResult.stallEvidence.idleMs, 16 * 60 * 1000);
+  assert.equal(execution.turnResult.stallEvidence.idleThresholdMs, 15 * 60 * 1000);
+  assert.equal(
+    execution.turnResult.stallEvidence.lastActivityAt,
+    new Date(clock - 16 * 60 * 1000).toISOString()
+  );
+  // No rollout content was scanned (path is fake), so work state is unknown.
+  assert.equal(execution.turnResult.noWorkObserved, null);
+});
+
+test("a rollout idle less than stallIdleMs never probes liveness", async () => {
+  const results = [
+    { status: "timeout", waitSource: "exact_timeout" },
+    { status: "completed", message: "done" },
+  ];
+  let probeCalls = 0;
+  const clock = 10_000_000;
+  const execution = await wakeup.waitForDurableTerminalExecution(
+    { threadId: "thread-fresh", turnId: "turn-fresh" }, {}, async () => {}, {
+      now: () => clock,
+      waitForTurnResult: async () => results.shift(),
+      rolloutStallSnapshot: () => ({
+        path: "/tmp/rollout.jsonl", ino: 7, size: 100, mtimeMs: clock - 14 * 60 * 1000,
+      }),
+      probeTurnLiveness: async () => {
+        probeCalls += 1;
+        return { serverReachable: false, turnFound: false, turnClaimsInProgress: false };
+      },
+    });
+  assert.equal(probeCalls, 0);
+  assert.equal(execution.turnResult.status, "completed");
+});
+
+test("stallIdleMs is a knob", async () => {
+  let waits = 0;
+  const clock = 10_000_000;
+  const execution = await wakeup.waitForDurableTerminalExecution(
+    { threadId: "thread-knob", turnId: "turn-knob" },
+    { stallIdleMs: 60 * 1000, stallProbeConfirmDelayMs: 1 },
+    async () => {},
+    {
+      now: () => clock,
+      waitForTurnResult: async () => {
+        waits += 1;
+        return { status: "timeout", waitSource: "exact_timeout" };
+      },
+      // Only 2 minutes idle: under the default, over the configured knob.
+      rolloutStallSnapshot: () => ({
+        path: "/tmp/rollout.jsonl", ino: 7, size: 100, mtimeMs: clock - 2 * 60 * 1000,
+      }),
+      probeTurnLiveness: async () => ({
+        serverReachable: true, turnFound: false, turnClaimsInProgress: false,
+      }),
+    });
+  assert.equal(waits, 1);
+  assert.equal(execution.turnResult.status, "stalled");
+  assert.equal(execution.turnResult.stallEvidence.idleThresholdMs, 60 * 1000);
+});
+
+test("a transient probe failure alone never settles a turn as stalled", async () => {
+  // Regression for the 2026-07-31 audit trap, now that measured idle can reach
+  // a verdict in ONE window: one unreachable reading followed by a healthy
+  // confirmation must keep waiting, not settle.
+  const results = [
+    { status: "timeout", waitSource: "exact_timeout" },
+    { status: "completed", message: "done after a blip" },
+  ];
+  const probeResults = [
+    { serverReachable: false, turnFound: false, turnClaimsInProgress: false },
+    { serverReachable: true, turnFound: true, turnClaimsInProgress: true },
+  ];
+  let probeCalls = 0;
+  const clock = 10_000_000;
+  const execution = await wakeup.waitForDurableTerminalExecution(
+    { threadId: "thread-blip", turnId: "turn-blip" },
+    { stallProbeConfirmDelayMs: 1 },
+    async () => {},
+    {
+      now: () => clock,
+      waitForTurnResult: async () => results.shift(),
+      rolloutStallSnapshot: () => ({
+        path: "/tmp/rollout.jsonl", ino: 7, size: 100, mtimeMs: clock - 30 * 60 * 1000,
+      }),
+      probeTurnLiveness: async () => {
+        probeCalls += 1;
+        return probeResults.shift() || { serverReachable: true, turnFound: true, turnClaimsInProgress: true };
+      },
+    });
+  assert.equal(probeCalls, 2);
+  assert.equal(execution.turnResult.status, "completed");
+});
+
+test("an inProgress-claiming turn needs stallWedgedIdleMs, not stallIdleMs (configurable)", async () => {
+  let waits = 0;
+  let probeCalls = 0;
+  const clock = 10_000_000;
+  const results = [
+    // 20 min idle: past stallIdleMs, under the 45-min wedged knob -> keep waiting.
+    20 * 60 * 1000,
+    // 50 min idle: past the wedged knob -> verdict.
+    50 * 60 * 1000,
+  ];
+  let idle = 0;
+  const execution = await wakeup.waitForDurableTerminalExecution(
+    { threadId: "thread-wedged", turnId: "turn-wedged" },
+    { stallWedgedIdleMs: 45 * 60 * 1000 },
+    async () => {},
+    {
+      now: () => clock,
+      waitForTurnResult: async () => {
+        idle = results[Math.min(waits, results.length - 1)];
+        waits += 1;
+        return { status: "timeout", waitSource: "exact_timeout" };
+      },
+      rolloutStallSnapshot: () => ({
+        path: "/tmp/rollout.jsonl", ino: 7, size: 100, mtimeMs: clock - idle,
+      }),
       probeTurnLiveness: async () => {
         probeCalls += 1;
         return { serverReachable: true, turnFound: true, turnClaimsInProgress: true };
       },
     });
 
-  // baseline, stagnant=1 (inProgress -> benefit of the doubt), stagnant=2 ->
-  // wedged verdict at the configured floor.
-  assert.equal(waits, 3);
+  assert.equal(waits, 2);
   assert.equal(probeCalls, 2);
   assert.equal(execution.turnResult.status, "stalled");
   assert.equal(execution.turnResult.stallEvidence.turnClaimsInProgress, true);
-  assert.equal(execution.turnResult.stallEvidence.stagnantWindows, 2);
+  assert.equal(execution.turnResult.stallEvidence.idleThresholdMs, 45 * 60 * 1000);
 });
 
 test("the default wedged threshold tolerates a long silent single-tool call", async () => {
   // A multi-hour build writes zero rollout bytes while the server honestly
-  // reports inProgress. With the default threshold (4), two stagnant windows
-  // must NOT produce a stall; the turn completes when the tool returns.
+  // reports inProgress. Two hours of silence -- well past stallIdleMs -- must
+  // NOT stall under the 4h default; the turn completes when the tool returns.
   const results = [
     { status: "timeout", waitSource: "exact_timeout" },
     { status: "timeout", waitSource: "exact_timeout" },
     { status: "timeout", waitSource: "exact_timeout" },
     { status: "completed", message: "build done" },
   ];
+  const clock = 100_000_000;
   const execution = await wakeup.waitForDurableTerminalExecution(
     { threadId: "thread-build", turnId: "turn-build" }, {}, async () => {}, {
+      now: () => clock,
       waitForTurnResult: async () => results.shift(),
-      rolloutStallSnapshot: () => ({ path: "/tmp/rollout.jsonl", ino: 7, size: 100, mtimeMs: 5 }),
+      rolloutStallSnapshot: () => ({
+        path: "/tmp/rollout.jsonl", ino: 7, size: 100, mtimeMs: clock - 2 * 60 * 60 * 1000,
+      }),
       probeTurnLiveness: async () => ({ serverReachable: true, turnFound: true, turnClaimsInProgress: true }),
     });
   assert.equal(execution.turnResult.status, "completed");
@@ -358,13 +476,17 @@ test("the default wedged threshold tolerates a long silent single-tool call", as
 
 test("an undiscoverable rollout never stalls on the first window", async () => {
   // Pin-the-subject regression (2026-07-31 audit): "can't find the rollout"
-  // is not "the turn is dead". Window 1 with a null snapshot only sets the
+  // is not "the turn is dead". With no file there is no mtime to measure, so
+  // the window-counting baseline still governs: window 1 only sets the
   // baseline even when the liveness probe reports the server unreachable;
   // window 2 (null==null stagnation) may then reach the verdict.
   let waits = 0;
   let probeCalls = 0;
   const execution = await wakeup.waitForDurableTerminalExecution(
-    { threadId: "thread-lost", turnId: "turn-lost" }, {}, async () => {}, {
+    { threadId: "thread-lost", turnId: "turn-lost" },
+    { stallProbeConfirmDelayMs: 1 },
+    async () => {},
+    {
       waitForTurnResult: async () => {
         waits += 1;
         return { status: "timeout", waitSource: "exact_timeout" };
@@ -377,16 +499,19 @@ test("an undiscoverable rollout never stalls on the first window", async () => {
     });
   assert.equal(execution.turnResult.status, "stalled");
   assert.equal(waits, 2);
-  assert.equal(probeCalls, 1);
+  // One judging probe plus its confirmation.
+  assert.equal(probeCalls, 2);
   assert.equal(execution.turnResult.stallEvidence.stagnantWindows, 1);
   assert.equal(execution.turnResult.stallEvidence.rolloutPath, null);
+  assert.equal(execution.turnResult.stallEvidence.idleMs, null);
+  assert.equal(execution.turnResult.stallEvidence.lastActivityAt, null);
 });
 
-test("a flaky thread/read (reachable-but-unconfirmed) never stalls in one window", async () => {
+test("a flaky thread/read (reachable-but-unconfirmed) never stalls on the idle knob", async () => {
   // The probe's catch shape for a reachable server whose thread/read failed:
-  // found + inProgress. One stagnant window must keep waiting; only the
-  // two-window wedged path may conclude. Regression for the gpt-5.5 review
-  // BLOCKING where turnFound:false here fed the one-window dead-liveness arm.
+  // found + inProgress. Idle past stallIdleMs must keep waiting; only the
+  // wedged threshold may conclude. Regression for the gpt-5.5 review BLOCKING
+  // where turnFound:false here fed the dead-liveness arm.
   const flakyProbeShape = { serverReachable: true, turnFound: true, turnClaimsInProgress: true };
   const results = [
     { status: "timeout", waitSource: "exact_timeout" },
@@ -394,19 +519,21 @@ test("a flaky thread/read (reachable-but-unconfirmed) never stalls in one window
     { status: "completed", message: "done late but done" },
   ];
   let probeCalls = 0;
+  const clock = 10_000_000;
   const execution = await wakeup.waitForDurableTerminalExecution(
     { threadId: "thread-flaky", turnId: "turn-flaky" }, {}, async () => {}, {
+      now: () => clock,
       waitForTurnResult: async () => results.shift(),
-      rolloutStallSnapshot: () => ({ path: "/tmp/rollout.jsonl", ino: 9, size: 10, mtimeMs: 1 }),
+      rolloutStallSnapshot: () => ({
+        path: "/tmp/rollout.jsonl", ino: 9, size: 10, mtimeMs: clock - 30 * 60 * 1000,
+      }),
       probeTurnLiveness: async () => {
         probeCalls += 1;
         return flakyProbeShape;
       },
     });
 
-  // baseline window, then ONE stagnant window probed as unconfirmed -> keep
-  // waiting -> the turn completes on the next wait.
-  assert.equal(probeCalls, 1);
+  assert.equal(probeCalls, 2);
   assert.equal(execution.turnResult.status, "completed");
 });
 
@@ -440,6 +567,156 @@ test("a stalled verdict reads observed activity from the real rollout for resend
     });
   assert.equal(idle.turnResult.status, "stalled");
   assert.equal(idle.turnResult.noWorkObserved, true);
+});
+
+test("a shortened judging window actually reaches the event waiter deadline", async () => {
+  // The stall tests all stub waitForTurnResult, so none of them would catch
+  // options.windowMs failing to thread through to the real waiter -- which
+  // would silently restore the 1h judging cadence this fix exists to shorten.
+  const started = Date.now();
+  const result = await wakeup.waitForTurnResultEventFirst(
+    "thread-nonexistent", "turn-nonexistent", {}, null, 600
+  );
+  const elapsed = Date.now() - started;
+  assert.equal(result.status, "timeout");
+  assert.equal(result.waitSource, "exact_timeout");
+  // Default replyWaitTimeoutMs is 1h; anything near it means the arg was dropped.
+  assert.ok(elapsed < 10_000, `window override ignored: waited ${elapsed}ms`);
+});
+
+// --------------------------- connector schema diagnostics (2026-08-05 incident)
+// Verbatim payload from rollout 019fd2e5-0a92-7640-a965-8dbdf55f730b: the
+// GitHub connector rejected Codex's repository_full_name after a workspace-admin
+// constraint change. It arrives as an MCP *success* (result.Ok) whose text is
+// the failure, so nothing upstream classified it and Codex ground away until the
+// harness killed the turn. These tests fail on the pre-fix code.
+const CONNECTOR_FAILURE_TEXT = "Parameters failed connector schema validation: "
+  + "owner [required]: Missing required property (does not match constraints configured by your "
+  + "ChatGPT workspace admin. If the issue persists, instruct the user to contact their workspace admin.); "
+  + "repo_name [required]: Missing required property (does not match constraints configured by your "
+  + "ChatGPT workspace admin. If the issue persists, instruct the user to contact their workspace admin.); "
+  + "1 additional validation error(s)";
+
+test("a connector schema failure in mcp_tool_call_end is classified with its properties", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-connector-"));
+  const rollout = path.join(dir, "rollout.jsonl");
+  fs.writeFileSync(rollout, [
+    JSON.stringify({ type: "event_msg", payload: { type: "task_started", turn_id: "turn-conn" } }),
+    JSON.stringify({
+      type: "event_msg",
+      payload: {
+        type: "mcp_tool_call_end",
+        invocation: {
+          server: "codex_apps",
+          tool: "github.search_branches",
+          arguments: { repository_full_name: "NousResearch/hermes-agent" },
+        },
+        result: { Ok: { content: [{ type: "text", text: CONNECTOR_FAILURE_TEXT }] } },
+      },
+    }),
+    JSON.stringify({ type: "event_msg", payload: { type: "task_complete", turn_id: "turn-conn", last_agent_message: "gave up" } }),
+  ].join("\n") + "\n");
+
+  const result = wakeup.extractTurnResultFromRollout(rollout, "turn-conn");
+  assert.equal(result.connectorDiagnostics.diagnostic, "connector_schema_mismatch");
+  assert.deepEqual(result.connectorDiagnostics.properties, ["owner", "repo_name"]);
+  assert.equal(result.connectorDiagnostics.occurrences, 1);
+  assert.match(result.connectorDiagnostics.detail, /failed connector schema validation/);
+});
+
+test("an exec-wrapped connector failure in a tool call output is also classified", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-connector-exec-"));
+  const rollout = path.join(dir, "rollout.jsonl");
+  fs.writeFileSync(rollout, [
+    JSON.stringify({ type: "event_msg", payload: { type: "task_started", turn_id: "turn-exec" } }),
+    JSON.stringify({
+      type: "response_item",
+      payload: {
+        type: "custom_tool_call_output",
+        call_id: "call_x",
+        output: [{ type: "input_text", text: CONNECTOR_FAILURE_TEXT }],
+      },
+    }),
+  ].join("\n") + "\n");
+
+  const scanned = wakeup.extractTurnResultFromRollout(rollout, "turn-exec", { includeNonTerminal: true });
+  assert.equal(scanned.status, "in_flight");
+  assert.equal(scanned.connectorDiagnostics.diagnostic, "connector_schema_mismatch");
+  assert.deepEqual(scanned.connectorDiagnostics.properties, ["owner", "repo_name"]);
+  // A connector reply is not a tool CALL: the resend-safety count must not move.
+  assert.equal(scanned.toolActivityCount, 0);
+});
+
+test("a connector failure is found even when the turn's task_started is missing", () => {
+  // Rotated/truncated rollout: no task_started for this turn, so ambient
+  // attribution never arms. An explicitly turn-stamped row must still be read.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-connector-rotated-"));
+  const rollout = path.join(dir, "rollout.jsonl");
+  fs.writeFileSync(rollout, [
+    JSON.stringify({
+      type: "event_msg",
+      payload: {
+        type: "mcp_tool_call_end",
+        turn_id: "turn-rotated",
+        result: { Ok: { content: [{ type: "text", text: CONNECTOR_FAILURE_TEXT }] } },
+      },
+    }),
+    JSON.stringify({ type: "event_msg", payload: { type: "task_complete", turn_id: "turn-rotated", last_agent_message: "" } }),
+  ].join("\n") + "\n");
+
+  const result = wakeup.extractTurnResultFromRollout(rollout, "turn-rotated");
+  assert.equal(result.status, "completed_without_reply");
+  assert.equal(result.connectorDiagnostics.diagnostic, "connector_schema_mismatch");
+  assert.deepEqual(result.connectorDiagnostics.properties, ["owner", "repo_name"]);
+});
+
+test("a healthy rollout carries no connector diagnostic", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-connector-clean-"));
+  const rollout = path.join(dir, "rollout.jsonl");
+  fs.writeFileSync(rollout, [
+    JSON.stringify({ type: "event_msg", payload: { type: "task_started", turn_id: "turn-ok" } }),
+    JSON.stringify({
+      type: "event_msg",
+      payload: {
+        type: "mcp_tool_call_end",
+        result: { Ok: { content: [{ type: "text", text: "Action completed." }] } },
+      },
+    }),
+    JSON.stringify({ type: "event_msg", payload: { type: "task_complete", turn_id: "turn-ok", last_agent_message: "done" } }),
+  ].join("\n") + "\n");
+  const result = wakeup.extractTurnResultFromRollout(rollout, "turn-ok");
+  assert.equal(result.status, "completed");
+  assert.equal(result.connectorDiagnostics, null);
+});
+
+test("a stalled turn surfaces the connector diagnostic and last-activity time to Agent", () => {
+  const text = wakeup.formatCodexReplyForNativeAgent({
+    entries: [entry({ messageId: "m-conn", text: "rebase PR 64288", topic: "hermes" })],
+    turnId: "turn-conn",
+  }, {
+    status: "stalled",
+    completedAt: "2026-08-05T17:27:25.000Z",
+    stallEvidence: {
+      serverReachable: true,
+      turnFound: false,
+      turnClaimsInProgress: false,
+      stagnantWindows: 0,
+      idleMs: 15 * 60 * 1000,
+      lastActivityAt: "2026-08-05T17:12:25.974Z",
+    },
+    connectorDiagnostics: {
+      diagnostic: "connector_schema_mismatch",
+      occurrences: 3,
+      properties: ["owner", "repo_name"],
+      detail: CONNECTOR_FAILURE_TEXT,
+    },
+  });
+  assert.match(text, /Codex turn stalled\./);
+  assert.match(text, /unchanged since 2026-08-05T17:12:25\.974Z/);
+  assert.match(text, /15 min idle/);
+  assert.match(text, /connector_schema_mismatch/);
+  assert.match(text, /owner, repo_name/);
+  assert.match(text, /not a Codex reasoning failure/);
 });
 
 test("extractTurnResultFromRollout stays null without the includeNonTerminal flag", () => {

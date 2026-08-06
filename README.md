@@ -153,7 +153,7 @@ ignored by Git and must never be committed.
 After launch:
 
 1. Complete onboarding.
-2. Open Settings → Providers and connect ChatGPT, Anthropic, xAI, OpenAI, Moonshot, or
+2. Open the Providers tab in the sidebar and connect ChatGPT, Anthropic, xAI, OpenAI, Moonshot, or
    another supported route.
 3. Select a provider, model, Think level, and Fast mode per surface.
 4. Start the conversation yourself. Development and personal installs never

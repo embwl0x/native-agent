@@ -421,12 +421,19 @@ private struct LaneTestError: Error, CustomStringConvertible {
 
 // MARK: - BLOCKING 1: the probe is TRI-state (missing / unreadable / readable)
 
-private func makeExecutionDir(_ root: URL, _ id: String, mission: Bool) throws {
+/// `legacyRecordName: true` seeds the pre-P2-1 `mission.json` — an execution
+/// directory the rename pass never reached. The probe must count it as a record
+/// exactly like a canonical one; a canonical-only probe would render a real
+/// bench as empty.
+private func makeExecutionDir(
+    _ root: URL, _ id: String, mission: Bool, legacyRecordName: Bool = false
+) throws {
     let dir = root.appendingPathComponent(id, isDirectory: true)
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     if mission {
         try Data(#"{"id":"\#(id)"}"#.utf8)
-            .write(to: dir.appendingPathComponent("mission.json"))
+            .write(to: dir.appendingPathComponent(
+                legacyRecordName ? "mission.json" : "execution.json"))
     }
 }
 
@@ -467,9 +474,9 @@ private func makeExecutionDir(_ root: URL, _ id: String, mission: Bool) throws {
 }
 
 /// State 3 — readable: count only dirs that actually HOLD a record. The runner
-/// writes `<root>/<id>/mission.json`; a reservation or cancelled dir cleanly
-/// has none, and counting those (BLOCKING 1(b)) put a bogus "unavailable"
-/// banner over a healthy empty bench.
+/// writes `<root>/<id>/execution.json` (or a not-yet-renamed `mission.json`);
+/// a reservation or cancelled dir cleanly has none, and counting those
+/// (BLOCKING 1(b)) put a bogus "unavailable" banner over a healthy empty bench.
 @Test func executionProbeCountsOnlyDirsHoldingARecord() throws {
     let fm = FileManager.default
     let root = fm.temporaryDirectory
@@ -480,8 +487,10 @@ private func makeExecutionDir(_ root: URL, _ id: String, mission: Bool) throws {
     #expect(DeskView.probeExecutionRecords(root) == .records(0))
 
     try makeExecutionDir(root, "e1", mission: true)
-    try makeExecutionDir(root, "e2", mission: true)
-    // In-flight admission reservation: dir + .reserved, mission.json not landed.
+    // e2 is UNMIGRATED (legacy mission.json). It must still count as a record —
+    // a canonical-only probe would report a real bench as half empty (P2-1).
+    try makeExecutionDir(root, "e2", mission: true, legacyRecordName: true)
+    // In-flight admission reservation: dir + .reserved, no record landed.
     try makeExecutionDir(root, "e3-reserved", mission: false)
     try Data("".utf8).write(
         to: root.appendingPathComponent("e3-reserved/.reserved"))

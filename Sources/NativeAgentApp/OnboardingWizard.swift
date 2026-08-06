@@ -97,6 +97,10 @@ final class OnboardingWizardState {
     /// surface then shows an honest "connect a provider" prompt.
     var providerConnected: Bool = false
     var connectedProviderLabel: String?
+    /// Bumped by the nav bar's prominent "Connect a provider" action so the
+    /// provider step scrolls back to the sign-in panel (sweep R4 C2). A counter
+    /// rather than a Bool so repeated taps each re-scroll.
+    var connectPromptTick: Int = 0
     // Blank by default — never pre-fill from the macOS account name
     // (NSFullUserName): a public user's Mac account isn't their answer to
     // "your name," and it leaked the host account into onboarding (User, 2026-07-05).
@@ -559,7 +563,7 @@ private struct AbilityOverviewTile: View {
 
 /// Fresh-install blocker fix: onboarding used to jump from persona straight to
 /// "ready to chat" with NO provider connected, so a stranger's first message
-/// died. This step MIRRORS the working Settings → Providers surface (User,
+/// died. This step MIRRORS the working Providers tab surface (User,
 /// 2026-07-04: "we dont have to have a preferred one, just show all the options
 /// we have — you have the working app to go off of") — the SAME OAuth buttons,
 /// setup-token input, and per-provider config sheet, so every provider (ChatGPT
@@ -575,7 +579,19 @@ private struct ProviderConnectStep: View {
     @State private var isLoading = false
     @State private var configureSheet: ProviderInfo? = nil
 
+    /// Scroll target for the nav bar's "Connect a provider" action (sweep R4 C2).
+    private static let signInAnchor = "onboarding-provider-signin"
+
     var body: some View {
+        ScrollViewReader { proxy in
+            scrollBody
+                .onChange(of: state.connectPromptTick) {
+                    withAnimation { proxy.scrollTo(Self.signInAnchor, anchor: .top) }
+                }
+        }
+    }
+
+    private var scrollBody: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: NativeAgentSpacing.lg) {
                 VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
@@ -589,7 +605,7 @@ private struct ProviderConnectStep: View {
                 }
 
                 // Sign in with a subscription account (same OAuth buttons as
-                // Settings → Providers).
+                // the Providers tab).
                 NativePanel {
                     VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
                         Text("Sign in with your account")
@@ -609,10 +625,11 @@ private struct ProviderConnectStep: View {
                         OAuthSignInButton(provider: .xai) { Task { await reload(connectedId: "xai_oauth_direct") } }
                     }
                 }
+                .id(Self.signInAnchor)
 
                 // Full provider list — API keys (OpenAI, OpenRouter, Anthropic,
                 // …) and per-provider config, reusing the SAME row + sheet as the
-                // Settings → Providers panel.
+                // Providers tab panel.
                 NativePanel {
                     VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
                         HStack {
@@ -636,7 +653,7 @@ private struct ProviderConnectStep: View {
                         .font(NativeAgentFont.label)
                         .foregroundStyle(.green)
                 } else {
-                    Text("You can skip this and connect later in Settings → Providers — but chat won't work until a provider is connected.")
+                    Text("You can skip this and connect later in the Providers tab in the sidebar — but chat won't work until a provider is connected.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -781,7 +798,7 @@ private struct DoneStep: View {
                     .font(NativeAgentFont.title)
                     .foregroundStyle(.secondary)
             } else {
-                Text("One more step: connect an AI provider in Settings → Providers, then say hello in Chat.")
+                Text("One more step: connect an AI provider in the Providers tab in the sidebar, then say hello in Chat.")
                     .font(NativeAgentFont.title)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -832,10 +849,19 @@ private struct OnboardingNavBar: View {
     var continueLabel: String {
         switch state.step {
         case .confirm: return "Build"
-        case .provider: return state.providerConnected ? "Continue" : "Skip for now"
         case .identity: return "Continue"
         default: return "Continue"
         }
+    }
+
+    /// Sweep R4 C2: on the provider step with nothing connected, the big blue
+    /// button used to read "Skip for now" — the app advertised skipping the one
+    /// load-bearing step. Skipping is still allowed and unblocked (deliberate,
+    /// User 2026-07-04) but it is now a plain tertiary link UNDER the prominent
+    /// "Connect a provider" action, which scrolls the step back to the sign-in
+    /// panel. Once connected, the prominent button is "Continue" as before.
+    private var isUnconnectedProviderStep: Bool {
+        state.step == .provider && !state.providerConnected
     }
 
     var body: some View {
@@ -851,12 +877,30 @@ private struct OnboardingNavBar: View {
 
             Spacer()
 
-            Button(continueLabel) {
-                onContinue()
+            if isUnconnectedProviderStep {
+                VStack(alignment: .trailing, spacing: NativeAgentSpacing.xs) {
+                    Button("Connect a provider") {
+                        state.connectPromptTick += 1
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+
+                    Button("Skip for now") {
+                        onContinue()
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .font(NativeAgentFont.label)
+                    .help("Finish setup without a provider — chat won't work until one is connected.")
+                }
+            } else {
+                Button(continueLabel) {
+                    onContinue()
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .disabled(!state.canContinue)
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
-            .disabled(!state.canContinue)
         }
         .padding(.horizontal, NativeAgentSpacing.xl)
     }

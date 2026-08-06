@@ -1433,6 +1433,24 @@ extension SwiftToolDispatcher {
                 )
             ),
             requestedSchema(
+                name: "omp_message",
+                description: "Send an asynchronous task to the local OMP CLI harness (Kimi K3). The message is durably queued under ~/.config/omp-bridge/, a per-topic OMP session is started or resumed, and the final reply or honest failure/timeout receipt returns to this Agent session as an '[omp-wake] Automated completion event.",
+                parametersJSON: params(
+                    properties: [
+                        ("text", strSchema("The complete task or question for OMP.")),
+                        ("priority", obj([
+                            ("type", .string("string")),
+                            ("enum", .array([.string("info"), .string("important"), .string("urgent")])),
+                            ("description", .string("Receipt prominence.")),
+                        ])),
+                        ("topic", strSchema("Short stable topic tag. Reusing it resumes the same OMP session.")),
+                        ("working_directory", strSchema("Optional existing absolute project directory. External paths require Full Mac YOLO with outside-workspace access allowed.")),
+                        ("timeout_seconds", intSchema("OMP wall-clock guard, clamped 60-3600 seconds. Default 900.")),
+                    ],
+                    required: ["text"]
+                )
+            ),
+            requestedSchema(
                 name: "invoke_codex",
                 description: "Invoke Codex as a blocking subprocess for a focused real-time question or short inspection. Use codex_message for builds, refactors, test suites, or anything likely to take more than a few minutes so the current chat stays responsive. Writes an audit envelope under data/from_codex/.",
                 parametersJSON: params(

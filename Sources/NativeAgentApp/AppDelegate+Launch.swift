@@ -31,12 +31,13 @@ extension AppDelegate {
                 dataRoot: NativeAgentPaths.dataRoot
             )
             if report.didMigrate {
+                // P2-7: the legacy missions/ absorption is deleted; the only
+                // passes that can report didMigrate now are the execution.json
+                // record rename and receipts_dir pointer repair.
                 NSLog(
-                    "[workshop-migration] absorbed legacy Executions storage: moved=%d deduplicated=%d conflicts=%d archive=%@ receipt=%@",
+                    "[workshop-migration] normalized execution records: changed=%d conflicts=%d receipt=%@",
                     report.moved.count,
-                    report.deduplicated.count,
                     report.conflictsPreservedInArchive.count,
-                    report.archiveRelativePath ?? "none",
                     report.receiptRelativePath ?? "none"
                 )
             }

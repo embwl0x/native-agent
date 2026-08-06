@@ -370,6 +370,14 @@ extension SwiftNativeChatOrchestrationClient {
         // that rewrite would be silently dropped by the atomic rename.
         do {
             try await persistence.withFileLock(path) {
+                // FAST PATH, deliberately (sweep R4 item 4). This row is a
+                // STREAMING PARTIAL: superseded by the terminal assistant row
+                // the moment the turn finishes, and written often enough that a
+                // per-row F_FULLFSYNC would be felt on every turn. Losing the
+                // newest partial to a power cut costs a fragment of a reply
+                // that never committed; losing a user row or a tool receipt
+                // costs a turn that did. Those go durable — see appendMessage
+                // and appendToolMessage below.
                 try await persistence.appendJSONL(record, to: path)
             }
         } catch {
@@ -440,7 +448,13 @@ extension SwiftNativeChatOrchestrationClient {
         // @Sendable closure cannot capture the mutable `record`.)
         let toolRow: JSONValue = .object(record)
         try await persistence.withFileLock(path) {
-            try await persistence.appendJSONL(toolRow, to: path)
+            // DURABLE (sweep R4 item 4). A tool receipt is the transcript's
+            // only record that an EXTERNAL EFFECT happened — a file written, a
+            // message sent, a command run. If a power cut drops it, the effect
+            // still happened in the world but the conversation no longer says
+            // so, and the next turn can redo it. That asymmetry is what buys
+            // the flush; partial rows (above) have no such counterpart.
+            try await persistence.appendJSONLDurable(toolRow, to: path)
         }
         await observeCognitiveTool(
             sessionId: sessionId,
@@ -731,8 +745,20 @@ extension SwiftNativeChatOrchestrationClient {
                     at: path,
                     recount: Self.countJSONLLines(at:)
                 )
-                try await persistence.appendJSONL(messageRow, to: path)
-                // `appendJSONL` writes exactly one serialized line plus "\n".
+                // DURABLE (sweep R4 item 4). Every row that reaches this
+                // function is a COMMITTED turn boundary: `role` is "user" at
+                // three call sites and "assistant" at four, and the assistant
+                // ones are terminal completions or the terminal failure row —
+                // streaming partials never come here (persistPartialIfNeeded
+                // owns those and stays on the fast path). A user row lost to
+                // power loss is a question the user watched land and then
+                // vanish; a terminal assistant row lost is the answer to it.
+                // Cost is one F_FULLFSYNC per committed turn boundary (~2 per
+                // turn), which is the budget PersistenceCore's own note on
+                // appendJSONLDurable reserves for "feeds that ARE the state of
+                // record".
+                try await persistence.appendJSONLDurable(messageRow, to: path)
+                // `appendJSONLDurable` writes exactly one serialized line plus "\n".
                 ChatTranscriptLineCountCache.shared.record(count: priorCount + 1, at: path)
                 return nil
             }
@@ -808,7 +834,13 @@ extension SwiftNativeChatOrchestrationClient {
             at: path.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        try payload.write(to: path, options: .atomic)
+        // Durable replacement, not bare .atomic: this writer's one production
+        // caller swaps a terminal assistant row in place (regenerate). Losing
+        // that rewrite to power loss while the session index already durably
+        // recorded it would roll the transcript back behind its own index
+        // (gpt-5.5 review 2026-08-06, blocking #2). Same temp-fsync + rename
+        // + parent-dir-fsync contract as every other state-of-record write.
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(payload, to: path)
         _ = chmod(path.path, 0o600)
     }
 
@@ -1303,7 +1335,13 @@ extension SwiftNativeChatOrchestrationClient {
                 remaining.insert(updated, at: 0)
             }
             let out = try ChatSessionIndexFile.serializedData(for: remaining)
-            try out.write(to: sessionsPath, options: .atomic)
+            // Sweep R4 item 5: was `out.write(to:options:.atomic)`. Atomic
+            // replacement survives an app crash, but not power loss — the temp
+            // file's bytes and the rename both sit unflushed. The transcript
+            // rows this index describes are now durable (item 4), so the index
+            // must be too, or a power cut leaves messages on disk that the
+            // sidebar no longer lists. Same bytes, same lock, durable tail.
+            try await persistence.writeDataAtomicDurable(out, to: sessionsPath)
             // Retention stays here, inside the lock and on every message, and
             // the perf audit's proposal to move or debounce it is REJECTED.
             // Two independent reasons:

@@ -305,11 +305,12 @@ struct SubmitSuite {
         _ = try await runner.submit(spec: WorkshopExecutionSpec(title: "T", objective: "O"))
         let calls = await recorder.snapshot()
         let appendIdx = calls.firstIndex(where: { $0.hasPrefix("appendJSONL:timeline.jsonl") })
-        let writeIdx = calls.firstIndex(where: { $0.hasPrefix("writeJSON:mission.json") })
+        // New submits write the canonical record name (P2-1).
+        let writeIdx = calls.firstIndex(where: { $0.hasPrefix("writeJSON:execution.json") })
         #expect(appendIdx != nil)
         #expect(writeIdx != nil)
         if let a = appendIdx, let w = writeIdx {
-            #expect(a < w, "timeline.jsonl must be appended BEFORE mission.json is written (wave-12 finding #4)")
+            #expect(a < w, "timeline.jsonl must be appended BEFORE execution.json is written (wave-12 finding #4)")
         }
     }
 
@@ -334,7 +335,8 @@ struct SubmitSuite {
         let path = runner.executionRecordPath(result.executionId)
         let data = try Data(contentsOf: path)
         let parsed = try JSONValue.parse(data)
-        guard case .object(let o) = parsed else { Issue.record("mission.json not object"); return }
+        #expect(path.lastPathComponent == "execution.json", "new submits write the canonical record name")
+        guard case .object(let o) = parsed else { Issue.record("execution record not object"); return }
         #expect(str(o["status"]) == "queued")
         #expect(str(o["trigger_source"]) == "trigger:morning_brief")
         #expect(str(o["trust_required"]) == "draft_auto")
@@ -1151,9 +1153,8 @@ struct HTTPCodexPlannerLLMSuite {
         if FileManager.default.fileExists(atPath: queueDir.path) {
             let entries = (try? FileManager.default.contentsOfDirectory(at: queueDir, includingPropertiesForKeys: nil)) ?? []
             for entry in entries {
-                let executionRecordJSON = entry.appendingPathComponent("mission.json")
-                #expect(!FileManager.default.fileExists(atPath: executionRecordJSON.path),
-                        "mission.json must not be written on cancelled submit (found at \(executionRecordJSON.path))")
+                #expect(!ExecutionRecordFile.exists(in: entry),
+                        "no execution record (under EITHER name) may be written on cancelled submit (found one in \(entry.path))")
             }
         }
     }
@@ -1197,13 +1198,12 @@ struct HTTPCodexPlannerLLMSuite {
         if FileManager.default.fileExists(atPath: queue.path),
            let entries = try? FileManager.default.contentsOfDirectory(at: queue, includingPropertiesForKeys: nil) {
             for entry in entries {
-                let mj = entry.appendingPathComponent("mission.json")
-                if FileManager.default.fileExists(atPath: mj.path) {
-                    leaked.append(mj)
+                if ExecutionRecordFile.exists(in: entry) {
+                    leaked.append(ExecutionRecordFile.resolve(in: entry))
                 }
             }
         }
-        #expect(leaked.isEmpty, "cancelled submit leaked mission.json: \(leaked)")
+        #expect(leaked.isEmpty, "cancelled submit leaked an execution record: \(leaked)")
     }
 
     @Test func runCodexCancelDuringRouterErrorPropagatesCancellation() async throws {
@@ -2253,10 +2253,10 @@ struct WorkshopExecutionWriteParityGateTests {
         #expect(str(ev["kind"]) == "mission")
         #expect(str(ev["detail"]) == "MyTitle")
         #expect(str(ev["status"]) == "ok")
-        #expect(str(ev["missionId"]) == result.executionId)
+        #expect(str(ev["executionId"]) == result.executionId)
         // payload.missionId mirrors the daemon.
         guard case .object(let payload)? = ev["payload"] else { Issue.record("payload missing"); return }
-        #expect(str(payload["missionId"]) == result.executionId)
+        #expect(str(payload["executionId"]) == result.executionId)
         // createdAt is an ISO timestamp.
         #expect(str(ev["createdAt"]) == SwiftNativeWorkshopRunner.isoTimestamp(fixedNow()()))
     }
@@ -2275,7 +2275,7 @@ struct WorkshopExecutionWriteParityGateTests {
         #expect(str(ev["kind"]) == "mission")
         #expect(str(ev["detail"]) == "title-m1")
         #expect(str(ev["status"]) == "ok")   // "completed" is not failed/blocked
-        #expect(str(ev["missionId"]) == "m1")
+        #expect(str(ev["executionId"]) == "m1")
         guard case .object(let payload)? = ev["payload"] else { Issue.record("payload missing"); return }
         #expect(str(payload["status"]) == "completed")
         // queue Execution has no phase → null (documented §6.240).
@@ -2414,7 +2414,7 @@ struct ExecutorGateSuite {
         let runner = SwiftNativeWorkshopRunner(root: tmp, planner: recorder)
         let result = try await runner.submit(spec: WorkshopExecutionSpec(title: "T", objective: "O"))
         #expect(result.status == "queued")
-        let executionRecordJSON = tmp.appendingPathComponent("workshop/executions/\(result.executionId)/mission.json")
+        let executionRecordJSON = tmp.appendingPathComponent("workshop/executions/\(result.executionId)/execution.json")
         #expect(FileManager.default.fileExists(atPath: executionRecordJSON.path))
     }
 

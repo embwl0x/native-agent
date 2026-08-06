@@ -11,7 +11,10 @@ extension SwiftNativeTrustCenter {
         policy["autonomyDefault"] = .string("supervised")
         policy["updatedAt"] = .string(Self.isoTimestamp(clock()))
         policy["appDataRoot"] = .string(dataRoot.path)
-        policy["missionPolicy"] = .object([
+        // Wave 4 phase A: STILL the old key. Readers accept `workshopPolicy`
+        // too (WorkshopPolicyBlockVocabulary), but every writer keeps emitting
+        // `missionPolicy` so a 0.3.7 iOS install decodes this byte-for-byte.
+        policy[WorkshopPolicyBlockVocabulary.wireKey] = .object([
             "allowBackgroundMissions": .bool(true),
             "requireReceipts": .bool(true),
             "autoCreateMissionFromChat": .bool(false),
@@ -326,6 +329,7 @@ extension SwiftNativeTrustCenter {
         // sends; they write local inbox rows and optional local notifications.
         "claude_message": .string("auto"),
         "codex_message": .string("auto"),
+        "omp_message": .string("auto"),
         // the user intent, 2026-06-08: these are Agent's easy workspace helpers.
         // They are always-on chat tools and default to auto so she can stay in
         // workspace mode and delegate focused work without an approval detour.
@@ -454,6 +458,7 @@ extension SwiftNativeTrustCenter {
         "full_mac_list_dir": .string("auto"),
         "claude_message": .string("auto"),
         "codex_message": .string("auto"),
+        "omp_message": .string("auto"),
         // App lifecycle tools: backfilled into saved policies at load time as
         // `confirm` (user-gated approval). A live policy.json entry (e.g. the user
         // promoting to auto) always wins over this default.

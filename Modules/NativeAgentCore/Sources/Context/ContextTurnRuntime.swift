@@ -2,10 +2,12 @@ import Foundation
 
 /// One-shot, RAM-only handoff for an optional query embedding. Producers can
 /// start the existing embedder alongside other turn preparation; consumers
-/// take the vector only when it is already available and never wait for it.
+/// either take the vector when it is already available (`valueIfReady`) or wait
+/// a BOUNDED interval for it (`value(waitingUpTo:)`) — never indefinitely.
 public final class ContextQueryEmbeddingTicket: @unchecked Sendable {
     private let lock = NSLock()
     private var value: ContextQueryEmbeddingValue?
+    private var waiters: [UUID: CheckedContinuation<ContextQueryEmbeddingValue?, Never>] = [:]
 
     public init() {}
 
@@ -15,17 +17,100 @@ public final class ContextQueryEmbeddingTicket: @unchecked Sendable {
 
     public var valueIfReady: ContextQueryEmbeddingValue? { lock.withLock { value } }
 
+    /// Sweep R4 A5: the vector, waiting up to `timeoutNanoseconds` for a cold
+    /// embedder to warm. Returns nil on timeout — the caller then proceeds
+    /// exactly as the old never-wait behavior did, so a permanently cold or
+    /// unwired embedder can add at most this bounded delay and can NEVER hang
+    /// the turn. Continuation-based, so a vector that lands early resumes
+    /// immediately rather than sitting out the full interval.
+    public func value(
+        waitingUpTo timeoutNanoseconds: UInt64
+    ) async -> ContextQueryEmbeddingValue? {
+        if let ready = valueIfReady { return ready }
+        guard timeoutNanoseconds > 0 else { return nil }
+        let id = UUID()
+        // The timeout must not be armed until the waiter is REGISTERED: a
+        // timeout that fires before `waiters[id]` exists removes nothing, and
+        // the continuation then parks with no one left to resume it — an
+        // unbounded hang, the exact failure this API exists to prevent
+        // (gpt-5.5 review 2026-08-06, blocking #1). The continuation closure
+        // runs synchronously before suspension, so arming inside it — after
+        // the lock — closes the window.
+        let timeoutHolder = TaskHolder()
+        defer { timeoutHolder.cancel() }
+        return await withCheckedContinuation {
+            (continuation: CheckedContinuation<ContextQueryEmbeddingValue?, Never>) in
+            // Re-check UNDER the lock: `publish` may have landed between the
+            // fast path above and here, and a continuation parked after the
+            // one-shot publish would only ever be resumed by the timeout.
+            var immediate: ContextQueryEmbeddingValue?
+            var alreadyResolved = false
+            lock.withLock {
+                if let ready = value {
+                    immediate = ready
+                    alreadyResolved = true
+                } else {
+                    waiters[id] = continuation
+                }
+            }
+            if alreadyResolved {
+                continuation.resume(returning: immediate)
+            } else {
+                timeoutHolder.store(Task { [weak self] in
+                    try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                    self?.resumeWaiter(id)
+                })
+            }
+        }
+    }
+
+    /// Tiny lock-guarded holder so the timeout task can be armed inside the
+    /// continuation closure yet cancelled by the caller's `defer`.
+    private final class TaskHolder: @unchecked Sendable {
+        private let holderLock = NSLock()
+        private var task: Task<Void, Never>?
+        func store(_ t: Task<Void, Never>) {
+            holderLock.lock(); defer { holderLock.unlock() }
+            task = t
+        }
+        func cancel() {
+            holderLock.lock(); defer { holderLock.unlock() }
+            task?.cancel()
+        }
+    }
+
+    /// Resume ONE waiter with whatever the ticket holds now (nil on timeout).
+    /// Removing from the dictionary under the lock is what makes resume
+    /// exactly-once across the publish/timeout race.
+    private func resumeWaiter(_ id: UUID) {
+        var continuation: CheckedContinuation<ContextQueryEmbeddingValue?, Never>?
+        var current: ContextQueryEmbeddingValue?
+        lock.withLock {
+            continuation = waiters.removeValue(forKey: id)
+            current = value
+        }
+        continuation?.resume(returning: current)
+    }
+
     public func publish(_ embedding: [Float], modelFingerprint: String = "legacy-unverified") {
         guard !embedding.isEmpty, embedding.allSatisfy(\.isFinite) else { return }
         let fingerprint = modelFingerprint.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !fingerprint.isEmpty else { return }
+        var resolved: ContextQueryEmbeddingValue?
+        var pending: [CheckedContinuation<ContextQueryEmbeddingValue?, Never>] = []
         lock.withLock {
             guard value == nil else { return }
-            value = ContextQueryEmbeddingValue(
+            let published = ContextQueryEmbeddingValue(
                 values: embedding,
                 modelFingerprint: fingerprint
             )
+            value = published
+            resolved = published
+            pending = Array(waiters.values)
+            waiters.removeAll()
         }
+        // Resume OUTSIDE the lock: a continuation can resume its task inline.
+        for continuation in pending { continuation.resume(returning: resolved) }
     }
 }
 

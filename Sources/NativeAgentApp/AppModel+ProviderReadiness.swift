@@ -32,7 +32,7 @@ extension AppModel {
         return """
         No AI provider is connected yet, so I can't reply.
 
-        Open Settings → Providers to connect one. The quickest is pasting an \
+        Open the Providers tab in the sidebar to connect one. The quickest is pasting an \
         Anthropic setup-token (no API key or command-line tools needed) — \
         you can get one at console.anthropic.com.
         """

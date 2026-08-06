@@ -185,7 +185,12 @@ extension SwiftNativeTurnEngine {
         payload["toolNames"] = .array(toolNames.map { .string($0) })
 
         if !context.recalled.isEmpty {
-            payload["recalled"] = .array(context.recalled.prefix(5).map { hit in
+            // Sweep R4 W3: recall breadth is window-dependent now (5 → 10 on
+            // wide windows). A hardcoded 5 here would silently under-report the
+            // rows a large-window turn actually served, which is the exact
+            // "consumer assumes k=5" residue this wave has to close.
+            payload["recalled"] = .array(context.recalled
+                .prefix(ContextBudgetPolicy.wideRecallRowLimit).map { hit in
                 var row: [String: JSONValue] = [
                     "preview": .array(snapshotPreview(hit.preview, maxCharacters: 1_200).chunks),
                 ]

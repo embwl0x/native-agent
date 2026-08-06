@@ -5,6 +5,7 @@ import MemoryV2
 import NativeAgentCore
 import PersonaEngine
 import PersistenceCore
+import WorkshopExecution
 
 private struct NativeContextEmbeddingProvider: ContextMarkdownEmbeddingProvider {
     let memory: SwiftNativeMemoryV2
@@ -740,7 +741,18 @@ actor NativeContextFlowRuntime: ContextTurnPreparing {
                     forKeys: [.isDirectoryKey]
                 ).isDirectory) ?? false
                 if isDirectory {
-                    paths.append(directory.appendingPathComponent("mission.json"))
+                    // RESOLVED AT ARM TIME (P2-1): watch the record name this
+                    // directory actually has right now — `execution.json`, or a
+                    // legacy `mission.json` the rename pass hasn't reached.
+                    // Watching both names would double the kqueue fd count
+                    // across EVERY execution directory to cover a rename that
+                    // cannot happen while this runtime is armed: the migrator
+                    // renames only in applicationDidFinishLaunching, before
+                    // this runtime starts. For a directory with neither file,
+                    // resolve() yields the canonical name and
+                    // FileChangeWatcher falls back to the directory itself, so
+                    // first creation still wakes us.
+                    paths.append(ExecutionRecordFile.resolve(in: directory))
                 }
             }
         }

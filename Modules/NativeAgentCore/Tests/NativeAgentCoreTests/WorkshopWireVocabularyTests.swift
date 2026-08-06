@@ -234,9 +234,15 @@ struct WorkshopSurfaceLiteralGuardTests {
         for site in sites {
             let src = try coreSource(site)
             guard src.contains("\"missions\"") else { continue }
+            // A site satisfies the invariant either by naming both spellings
+            // itself, or by routing through WorkshopSurfaceVocabulary — whose
+            // own tests pin that both spellings are members. (Wave 5b moved
+            // the gate sites onto the vocabulary; a remaining "missions" in a
+            // doc comment must not re-fail this guard.)
             #expect(
-                src.contains("\"workshop\""),
-                "\(site) still switches on \"missions\" without \"workshop\" — the canonical Workshop surface misses that case"
+                src.contains("\"workshop\"")
+                    || src.contains("WorkshopSurfaceVocabulary"),
+                "\(site) still switches on \"missions\" without \"workshop\" or the vocabulary — the canonical Workshop surface misses that case"
             )
         }
     }

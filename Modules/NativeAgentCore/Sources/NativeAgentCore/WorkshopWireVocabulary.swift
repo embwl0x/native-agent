@@ -56,6 +56,27 @@ public enum WorkshopSurfaceVocabulary {
         canonicalSurface(value) == canonical
     }
 
+    /// Every spelling that has ever named the Workshop surface in a GATE
+    /// allowlist, canonical first.
+    ///
+    /// Wider than `bothSpellings` by the SINGULAR `mission`: the autonomy /
+    /// full-mac / tool-loop gates were open-coded as
+    /// `case "workshop", "mission", "missions"` and a turn can still arrive on
+    /// either 0.3.x spelling. `canonicalSurface` deliberately does NOT fold
+    /// `mission` — it is not a config-map key and folding it there would change
+    /// routing/`active.json` lookups that never wrote it. Gates are the only
+    /// lane that accepted the singular, so the extra spelling lives here.
+    public static let gateSpellings: [String] = [canonical, legacy, "mission"]
+
+    /// True when `value` names the Workshop surface in ANY gate spelling
+    /// (canonical, legacy plural, legacy singular). Behavior-identical
+    /// replacement for the open-coded `case "workshop", "mission", "missions"`.
+    public static func isWorkshopGateSurface(_ value: String) -> Bool {
+        gateSpellings.contains(
+            value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        )
+    }
+
     /// Fold a surface-keyed config map (`surfaces.json`, `active.json`) onto
     /// the canonical vocabulary at the READ seam. When a file carries both
     /// spellings — possible only if an older build wrote `missions` after a
@@ -132,6 +153,35 @@ public enum WorkshopStepApprovalAction {
     public static let legacy = "mission.step"
 }
 
+/// P2-2: the execution-id key inside a Workshop-step approval `payload`.
+///
+/// The stager WRITES `canonicalExecutionIdKey` only. Readers resolve through
+/// `executionId(_:)`, which walks `executionIdKeys` canonical-first and falls
+/// back to the legacy spelling. The fallback is PERMANENT: approvals staged by
+/// a 0.3.x binary live in `workflows/approvals/requests.json` (7 such rows on
+/// the live install), that file is never rewritten, and a miss here is not an
+/// error — it is a silently dead approval lane (a duplicate card from the
+/// stager, or a resolved step that never executes).
+///
+/// Kept free of `JSONValue` so it can live beside the rest of the wire
+/// vocabulary in dependency-free `NativeAgentCore`; callers pass a lookup that
+/// unwraps their own representation.
+public enum WorkshopStepApprovalPayload {
+    /// The only key any writer may emit.
+    public static let canonicalExecutionIdKey = "execution_id"
+    /// Accepted keys, in resolution order: canonical first, legacy fallback.
+    public static let executionIdKeys = [canonicalExecutionIdKey, "mission_id"]
+
+    /// First non-empty value among `executionIdKeys`, or nil when the payload
+    /// carries neither key (absent is not a crash — the caller reports it).
+    public static func executionId(_ lookup: (String) -> String?) -> String? {
+        for key in executionIdKeys {
+            if let value = lookup(key), !value.isEmpty { return value }
+        }
+        return nil
+    }
+}
+
 /// The TriggerScheduler trigger that fires when a Workshop execution finishes:
 /// row `name` + row `kind` + the `<kind>:<id>` inbox-card source prefix.
 public enum WorkshopCompletionTrigger {
@@ -139,6 +189,110 @@ public enum WorkshopCompletionTrigger {
     public static let legacyName = "mission_followup"
     public static let canonicalKind = "execution_complete"
     public static let legacyKind = "mission_complete"
+}
+
+// MARK: - Wave 4: cross-device keys, READ-BOTH ONLY (phase A)
+
+// The three keys below travel BETWEEN the Mac and a 0.3.7 iOS install. Phase A
+// widens the readers ONLY: every writer on both ends keeps emitting the legacy
+// spelling, so the wire stays byte-identical in both directions while old and
+// new builds are in the field at the same time. Phase B (a later wave, gated on
+// the iOS floor) flips the writers.
+//
+// Anything here with `wireKey` in the name is what is still WRITTEN. `futureKey`
+// is accepted on read and emitted by nobody yet — if you find yourself writing a
+// `futureKey`, you are in the wrong phase.
+
+/// The Workshop policy block inside `trust/policy.json` and the iOS/Mac
+/// `TrustPolicy` model: `missionPolicy` on the wire, `workshopPolicy` later.
+public enum WorkshopPolicyBlockVocabulary {
+    /// Still written by every writer (defaults, fail-closed, trust patches).
+    public static let wireKey = "missionPolicy"
+    /// Accepted on read; emitted by nobody in phase A.
+    public static let futureKey = "workshopPolicy"
+    /// Both spellings, future first — matching decoder resolution order.
+    public static let bothSpellings: [String] = [futureKey, wireKey]
+
+    /// Read the policy block under either spelling, future-first.
+    public static func block<V>(_ policy: [String: V]) -> V? {
+        policy[futureKey] ?? policy[wireKey]
+    }
+
+    /// Fold a future-spelled block onto the WIRE key at the read seam, so every
+    /// downstream merge/gate keeps reading exactly one key. Future wins when
+    /// both are present, matching `block(_:)` and the Codable decoders.
+    public static func foldToWireKey<V>(_ policy: [String: V]) -> [String: V] {
+        guard let future = policy[futureKey] else { return policy }
+        var out = policy
+        out.removeValue(forKey: futureKey)
+        out[wireKey] = future
+        return out
+    }
+}
+
+/// The inbox card's linked-execution field in `items.jsonl` and the iCloud
+/// inbox snapshot both devices decode.
+public enum InboxExecutionLinkVocabulary {
+    /// Still written by every writer (card emitters, `toJSONValue`, encoders).
+    public static let wireKey = "related_mission_id"
+    /// Accepted on read; emitted by nobody in phase A.
+    public static let futureKey = "related_execution_id"
+    public static let bothSpellings: [String] = [futureKey, wireKey]
+}
+
+/// The execution id inside an `InboxAction` payload (iOS -> Mac approve/reject).
+/// RAW string keys on both ends — no Codable, no CodingKeys.
+public enum InboxActionExecutionIdVocabulary {
+    /// Still written by the iOS sender and the Mac's submit response.
+    public static let wireKey = "missionId"
+    /// Accepted on read; emitted by nobody in phase A.
+    public static let futureKey = "executionId"
+    public static let bothSpellings: [String] = [futureKey, wireKey]
+
+    /// First non-empty value among `bothSpellings`, future-first.
+    public static func executionId(_ payload: [String: String]) -> String? {
+        for key in bothSpellings {
+            if let value = payload[key], !value.isEmpty { return value }
+        }
+        return nil
+    }
+}
+
+/// P2-6 residue: the notification action identifier for "open the execution".
+/// Wave 5 flips the EMITTER to the canonical spelling; readers accept both
+/// because a 0.3.x payload (or a notification already queued in Notification
+/// Center) still carries the legacy id.
+public enum WorkshopOpenNotificationAction {
+    public static let canonical = "open_execution"
+    public static let legacy = "open_mission"
+    public static let bothSpellings: [String] = [canonical, legacy]
+
+    /// True when `value` is the open-execution action in EITHER spelling.
+    public static func matches(_ value: String) -> Bool {
+        bothSpellings.contains(value.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+}
+
+/// P2-6 residue: the Apple Shortcuts connector's "start an execution" action
+/// name. `data/connectors/registry.json` is LIVE persisted data carrying
+/// `start_mission`; nothing rewrites it, so any reader that matches this action
+/// must accept both spellings.
+public enum WorkshopStartConnectorAction {
+    public static let canonical = "start_execution"
+    public static let legacy = "start_mission"
+    public static let bothSpellings: [String] = [canonical, legacy]
+
+    /// Fold either spelling onto the canonical one; every other action name
+    /// passes through with only whitespace trimmed (these are wire tokens).
+    public static func canonicalAction(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed == legacy ? canonical : trimmed
+    }
+
+    /// Equality that tolerates either side being written in either vocabulary.
+    public static func matches(_ lhs: String, _ rhs: String) -> Bool {
+        canonicalAction(lhs) == canonicalAction(rhs)
+    }
 }
 
 // MARK: - P2-5: environment variable vocabulary

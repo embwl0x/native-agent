@@ -288,12 +288,38 @@ extension MacSyncEngine {
                 ? "failed"
                 : (responseStatus == "pending_approval" ? "pending_approval" : "completed")
             await writeTransaction(id: transactionId, action: action.action, state: completedState, attempts: 1, error: response["message"], response: response)
+            // Sweep R4 item 1: the action has now RUN and its response has
+            // landed, so from here on the only correct outcome is "never
+            // dispatch this again". Both bookkeeping steps used to be `try?`:
+            // a disk-full or permission failure after execution left the
+            // pending file in place with no processed id, and the next sweep
+            // (or the next launch) re-ran the remote Mac action. Both steps are
+            // now CHECKED, and if either fails we write a durable local marker
+            // that loadProcessedIds() reads back as "already processed".
             recordProcessed(action.msgId)
-            saveProcessedIds()
+            let processedSaved = saveProcessedIds()
             let archiveURL = inboxDir.appendingPathComponent("processed_\(fileURL.lastPathComponent).done")
-            await Task.detached(priority: .utility) { [pendingURL, archiveURL] in
-                try? FileManager.default.moveItem(at: pendingURL, to: archiveURL)
+            let archiveError = await Task.detached(priority: .utility) { [pendingURL, archiveURL] () -> String? in
+                do { try FileManager.default.moveItem(at: pendingURL, to: archiveURL); return nil }
+                catch { return error.localizedDescription }
             }.value
+            let commit = Self.commitCompletionBookkeeping(
+                dataRoot: NativeAgentPaths.dataRoot,
+                msgId: action.msgId,
+                processedSaved: processedSaved,
+                archiveError: archiveError
+            )
+            if !commit.clean {
+                syncError = commit.syncError
+                await writeTransaction(
+                    id: transactionId,
+                    action: action.action,
+                    state: commit.transactionState ?? "completed_unarchived",
+                    attempts: 1,
+                    error: commit.syncError,
+                    response: response
+                )
+            }
 
             // KVS notification to iOS
             let msgId = action.msgId
@@ -459,8 +485,18 @@ extension MacSyncEngine {
             syncError = "Could not persist CloudKit response for \(action.msgId); action will not be acknowledged."
             return false
         }
+        // Sweep R4 item 1 (CloudKit lane, same hazard as the Drive lane above):
+        // the action has already executed. If the id window cannot be persisted
+        // the in-process guard at the top of this function still holds, but a
+        // restart would lose it — so leave the durable marker instead.
         recordProcessed(action.msgId)
-        saveProcessedIds()
+        let commit = Self.commitCompletionBookkeeping(
+            dataRoot: NativeAgentPaths.dataRoot,
+            msgId: action.msgId,
+            processedSaved: saveProcessedIds(),
+            archiveError: nil  // CloudKit lane has no pending file to archive.
+        )
+        if !commit.clean { syncError = commit.syncError }
 
         do {
             try await iCloudBridge.shared.sendCloudKitActionResponse(

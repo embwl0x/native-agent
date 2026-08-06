@@ -943,7 +943,14 @@ extension SwiftNativeChatOrchestrationClient {
             userMessage: userMessage,
             sessionId: sessionId,
             mode: .inject,
-            maximumCharacters: 4_000,
+            // Sweep R4 W3: window-aware, floored at the former 4,000 literal.
+            // The substrate additionally clamps with its own configured
+            // `maximumCapsuleCharacters`, so this can only ever RAISE the
+            // request's own ceiling, never the substrate's.
+            maximumCharacters: ContextBudgetPolicy.resolve(
+                model: LLMCallContext.admittedModel,
+                surface: surface
+            ).capsuleChars,
             allowNonLiveProjection: Self.shouldProjectCognitiveStateForTrustedBridgeEnvelope(
                 userMessage
             )

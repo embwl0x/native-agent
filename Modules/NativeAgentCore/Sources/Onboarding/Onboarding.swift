@@ -1323,9 +1323,11 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
     /// USER.md has two writers with opposite meanings. Onboarding writes it
     /// once from a persona template (prose about the user). `UserMDGenerator`
     /// then OWNS it: every regeneration replaces the whole file with an
-    /// `<!-- USER_MD_AUTOGEN_START -->…END` body (a heading plus one bullet per
-    /// active memory), preserving only a `<!-- USER_PREAMBLE_START -->…END`
-    /// region if one is already there.
+    /// `<!-- USER_MD_AUTOGEN_START -->…END` body (a heading plus one bullet
+    /// per active, recall-eligible, durable memory whose kind is in the
+    /// person-kind allowlist — see `userIdentityKinds` in
+    /// MemoryV2+UserMDGen.swift), preserving only a
+    /// `<!-- USER_PREAMBLE_START -->…END` region if one is already there.
     ///
     /// So the only thing USER.md's content can prove is which of those two
     /// wrote it last — never that onboarding completed. See the `startOnboarding`

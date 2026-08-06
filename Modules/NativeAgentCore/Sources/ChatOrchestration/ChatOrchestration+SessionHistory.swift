@@ -758,15 +758,33 @@ extension SwiftNativeTurnEngine {
                 provider: sessionDigest ?? SessionDigestProvider(dataRoot: historyReader.dataRoot)
             )
         }
+        // Sweep R4 W3: the ONLY production caller of the history renderer, and
+        // the first place in prompt assembly where the admitted model for this
+        // turn is known (`buildTurnContext` resolved it above). That makes this
+        // the interception point for window-aware budgets — everything the
+        // renderer sizes flows from `ContextBudgetPolicy.resolve`. An unknown
+        // or unresolvable model yields nil and the floor regime, i.e. exactly
+        // the pre-policy budgets.
+        let historyWindowTokens = ContextBudgetPolicy.windowTokens(forModel: base.modelId)
+        let historyBudget = ContextBudgetPolicy.resolve(
+            windowTokens: historyWindowTokens,
+            surface: surface
+        )
         let renderedHistory = await trace.measure("history.render") {
             SessionHistoryPromptRenderer.renderDetailed(
                 messages: prior,
                 middleCandidates: middleCandidates,
                 userMessage: userMessage,
                 surface: surface,
-                historyLimit: historyLimit
+                historyLimit: historyLimit,
+                windowTokens: historyWindowTokens
             )
         }
+        trace.setCount("budget.windowTokens", historyWindowTokens ?? 0)
+        trace.setFlag("budget.derived", historyBudget.isDerived)
+        trace.setCount("budget.historyChars", historyBudget.historyChars)
+        trace.setCount("budget.memoryBlockChars", historyBudget.memoryBlockChars)
+        trace.setCount("budget.recallRowLimit", historyBudget.recallRowLimit)
         let historyBlock = renderedHistory.historyBlock
         trace.setCount("history.prompt.sourceBytes", priorStats.sourceBytes)
         trace.setCount("history.prompt.bytesRead", priorStats.bytesRead)
@@ -1032,23 +1050,50 @@ extension SwiftNativeTurnEngine {
 // toolSummary 180-char cap (SkillBodyElisionTests).
 enum SessionHistoryPromptRenderer {
     static let recallQueryCharCap = 1_200
-    /// No rendered history item can contribute more than 2,200 characters.
+    /// No ORDINARY rendered history item can contribute more than 3,200
+    /// characters (the largest user/assistant/continuity cap; the compaction
+    /// summary is the one exception and uses the larger window below).
     /// Redacting/normalizing tens of thousands of characters that will be
     /// discarded immediately is pure hot-path waste, especially for legacy
     /// tool receipts. Keep ample look-ahead for whitespace collapsing and
     /// secret matching while bounding that work.
     private static let normalizationInputCharacterCap = 8_000
 
-    private struct Budget {
-        let historyChars: Int
-        let userCap: Int
-        let assistantCap: Int
-        let systemCap: Int
-        let toolCap: Int
-        let continuityCap: Int
-        let relevantChars: Int
-        let relevantItemCap: Int
-    }
+    /// Compaction summaries are the ONE row class whose render cap now exceeds
+    /// the ordinary normalization window (sweep R4 A3 raised it to the
+    /// distiller's 12,000-char maximum). Normalizing them through the 8,000
+    /// window would silently re-impose the old truncation one layer earlier, so
+    /// they get a window sized above their cap with headroom for whitespace
+    /// collapsing. Applies to exactly one row per session — no hot-path cost
+    /// for ordinary user/assistant content.
+    private static let compactionNormalizationInputCharacterCap =
+        ChatCompactionDistiller.maxSummaryChars + 4_000
+
+    /// Sweep R4 W3: the budget table moved out of this file wholesale. Every
+    /// field below is now produced by `ContextBudgetPolicy.resolve(...)` as a
+    /// function of the model's context window, with the former literals as the
+    /// floor. The field names are unchanged, so every render site below reads
+    /// exactly as it did.
+    ///
+    /// Retained doc for `compactionSummaryCap` (sweep R4 A3): the LLM-written
+    /// most expensive artifact in the system (ChatCompactionDistiller writes
+    /// up to `ChatCompactionDistiller.maxSummaryCharacters`), and it was
+    /// being rendered through `systemCap` = 1,200 — ~10% of what was
+    /// written, head-truncated, so the sections the distiller prompt lists
+    /// LAST (open threads, corrections) were exactly the ones cut. It gets
+    /// its own cap now, sized to the distiller max on the roomy surfaces and
+    /// scaled down where `historyChars` cannot afford it.
+    ///
+    /// TOTAL-BUDGET BOUND (unchanged by this cap): `capForRole` bounds ONE
+    /// rendered row. What bounds the aggregate is `budget.historyChars` in
+    /// `conversationHistory` — the running `used` total gates every row
+    /// after the first. Raising a per-row cap therefore cannot grow the
+    /// history block; it only changes how that fixed budget is spent. The
+    /// other `capForRole` consumer, `relevantEarlierSessionSnippets`,
+    /// additionally clamps with `min(capForRole, budget.relevantItemCap)`
+    /// and its own `budget.relevantChars` total, so a compaction row
+    /// surfacing there still renders at `relevantItemCap` (≤650).
+    private typealias Budget = ContextBudgetPolicy.Resolved
 
     private struct Renderable {
         let role: String
@@ -1067,23 +1112,29 @@ enum SessionHistoryPromptRenderer {
         middleCandidates: [ChatMessage] = [],
         userMessage: String = "",
         surface: String,
-        historyLimit: Int
+        historyLimit: Int,
+        windowTokens: Int? = nil
     ) -> String? {
         renderDetailed(
             messages: messages,
             middleCandidates: middleCandidates,
             userMessage: userMessage,
             surface: surface,
-            historyLimit: historyLimit
+            historyLimit: historyLimit,
+            windowTokens: windowTokens
         ).historyBlock
     }
 
+    /// `windowTokens` is the model's context window for THIS turn (nil when the
+    /// model is unknown or the caller has none). It selects the budget regime;
+    /// see `ContextBudgetPolicy`.
     static func renderDetailed(
         messages: [ChatMessage],
         middleCandidates: [ChatMessage] = [],
         userMessage: String = "",
         surface: String,
-        historyLimit: Int
+        historyLimit: Int,
+        windowTokens: Int? = nil
     ) -> RenderResult {
         let cappedLimit = max(0, historyLimit)
         guard cappedLimit > 0 else { return RenderResult(historyBlock: nil) }
@@ -1091,7 +1142,7 @@ enum SessionHistoryPromptRenderer {
         let renderables = messages.compactMap(renderable)
         guard !renderables.isEmpty else { return RenderResult(historyBlock: nil) }
 
-        let budget = budget(for: surface)
+        let budget = budget(for: surface, windowTokens: windowTokens)
         var sections: [String] = []
         if cappedLimit >= 6,
            let continuity = continuityState(
@@ -1106,7 +1157,8 @@ enum SessionHistoryPromptRenderer {
             promptRenderables: renderables,
             candidates: candidateRenderables,
             historyLimit: cappedLimit,
-            surface: surface
+            surface: surface,
+            windowTokens: windowTokens
         )
         if let middle = middleSnippet {
             sections.append(middle)
@@ -1183,64 +1235,25 @@ enum SessionHistoryPromptRenderer {
         promptMessages: [ChatMessage],
         candidates: [ChatMessage],
         historyLimit: Int,
-        surface: String
+        surface: String,
+        windowTokens: Int? = nil
     ) -> String? {
         middleSnippetText(
             userMessage: userMessage,
             promptRenderables: promptMessages.compactMap(renderable),
             candidates: candidates.compactMap(renderable),
             historyLimit: max(0, historyLimit),
-            surface: surface
+            surface: surface,
+            windowTokens: windowTokens
         )
     }
 
-    private static func budget(for surface: String) -> Budget {
-        switch surface.lowercased() {
-        case "telegram":
-            return Budget(
-                historyChars: 9_000,
-                userCap: 900,
-                assistantCap: 1_100,
-                systemCap: 700,
-                toolCap: 220,
-                continuityCap: 2_200,
-                relevantChars: 1_600,
-                relevantItemCap: 420
-            )
-        case "ios", "mobile", "iphone", "icloud":
-            return Budget(
-                historyChars: 13_000,
-                userCap: 1_100,
-                assistantCap: 1_400,
-                systemCap: 900,
-                toolCap: 260,
-                continuityCap: 2_600,
-                relevantChars: 2_000,
-                relevantItemCap: 520
-            )
-        case "chat", "mac", "default":
-            return Budget(
-                historyChars: 22_000,
-                userCap: 1_800,
-                assistantCap: 2_200,
-                systemCap: 1_200,
-                toolCap: 320,
-                continuityCap: 3_200,
-                relevantChars: 2_400,
-                relevantItemCap: 650
-            )
-        default:
-            return Budget(
-                historyChars: 11_000,
-                userCap: 1_000,
-                assistantCap: 1_200,
-                systemCap: 800,
-                toolCap: 240,
-                continuityCap: 2_200,
-                relevantChars: 1_700,
-                relevantItemCap: 460
-            )
-        }
+    /// Sweep R4 W3: the surface table now lives in `ContextBudgetPolicy` and is
+    /// a function of the model's context window. `windowTokens == nil` — every
+    /// legacy caller, and any turn whose model could not be resolved — returns
+    /// the pre-policy literals byte-identically.
+    private static func budget(for surface: String, windowTokens: Int?) -> Budget {
+        ContextBudgetPolicy.resolve(windowTokens: windowTokens, surface: surface)
     }
 
     private static func middleSnippetText(
@@ -1248,14 +1261,15 @@ enum SessionHistoryPromptRenderer {
         promptRenderables: [Renderable],
         candidates: [Renderable],
         historyLimit: Int,
-        surface: String
+        surface: String,
+        windowTokens: Int?
     ) -> String? {
         relevantEarlierSessionSnippets(
             userMessage: userMessage,
             promptRenderables: promptRenderables,
             candidates: candidates,
             historyLimit: historyLimit,
-            budget: budget(for: surface)
+            budget: budget(for: surface, windowTokens: windowTokens)
         )
     }
 
@@ -1273,6 +1287,11 @@ enum SessionHistoryPromptRenderer {
         var content: String
         if isTool {
             content = toolSummary(content: message.content, metadata: metadata)
+        } else if isCompactionSummary {
+            content = normalize(
+                message.content,
+                inputCap: compactionNormalizationInputCharacterCap
+            )
         } else {
             content = normalize(message.content)
         }
@@ -1491,22 +1510,45 @@ enum SessionHistoryPromptRenderer {
         let tail = Array(messages.suffix(limit))
         guard !tail.isEmpty else { return nil }
 
-        var reversedLines: [String] = []
+        func renderedLine(_ msg: Renderable) -> String {
+            "[\(msg.role)] \(cap(msg.content, capForRole(msg, budget: budget)))"
+        }
+
+        var admitted: [(index: Int, line: String)] = []
         var used = 0
         var omitted = messages.count > tail.count
-        for msg in tail.reversed() {
-            let capValue = capForRole(msg, budget: budget)
-            let line = "[\(msg.role)] \(cap(msg.content, capValue))"
+
+        // Sweep R4 A3: the compaction recollection is the ONLY surviving record
+        // of every turn that was elided — and it is by construction one of the
+        // OLDEST rows in the tail. The fill below runs newest-first, so now that
+        // this row can legitimately be several thousand characters, ordinary
+        // recent chatter would crowd out the exact artifact compaction paid an
+        // LLM call to produce. It gets first claim on `historyChars`; the
+        // aggregate bound itself is unchanged.
+        let reservedIndex = tail.indices.last { tail[$0].isCompactionSummary }
+        if let reservedIndex {
+            let line = renderedLine(tail[reservedIndex])
+            admitted.append((reservedIndex, line))
+            used = line.count + 1
+        }
+
+        // Unchanged fill semantics for every other row: newest-first, and the
+        // newest row is admitted even if it alone exceeds the budget.
+        var admittedFromStream = false
+        for idx in tail.indices.reversed() {
+            if idx == reservedIndex { continue }
+            let line = renderedLine(tail[idx])
             let projected = used + line.count + 1
-            if !reversedLines.isEmpty && projected > budget.historyChars {
+            if admittedFromStream && projected > budget.historyChars {
                 omitted = true
                 continue
             }
-            reversedLines.append(line)
+            admitted.append((idx, line))
             used = projected
+            admittedFromStream = true
         }
 
-        let lines = reversedLines.reversed()
+        let lines = admitted.sorted { $0.index < $1.index }.map(\.line)
         guard !lines.isEmpty else { return nil }
 
         var out: [String] = ["Conversation history:"]
@@ -1534,8 +1576,14 @@ enum SessionHistoryPromptRenderer {
     }
 
     private static func capForRole(_ message: Renderable, budget: Budget) -> Int {
-        if message.isTool { return budget.toolCap }
-        if message.isCompactionSummary { return budget.systemCap }
+        // Sweep R4 #6: `toolSummary` already projected this row head+tail. A
+        // row cap BELOW that projection's length would head-truncate it and
+        // throw the tail (the part that carries the failure) away again — the
+        // exact bug being fixed. Floor the tool row cap at the projection's
+        // worst case so the two layers cannot fight.
+        if message.isTool { return max(budget.toolCap, toolRowMinimumCap) }
+        // Sweep R4 A3: routed to its OWN cap, not the generic system cap.
+        if message.isCompactionSummary { return budget.compactionSummaryCap }
         switch message.role {
         case "user": return budget.userCap
         case "assistant": return budget.assistantCap
@@ -1572,15 +1620,58 @@ enum SessionHistoryPromptRenderer {
                 : "read_skill \(ok): \(skillName) (body elided — re-read if needed)"
         }
         let rawResult = string(metadata?["resultSummary"]) ?? ""
-        // The rendered tool receipt is capped to 180 characters below. A
-        // 512-character redaction window is enough to produce that preview
-        // without rescanning legacy 50-60 KB tool_catalog payloads.
-        let resultInput = rawResult.count > 512 ? String(rawResult.prefix(512)) : rawResult
-        let result = normalize(resultInput)
+        let result = toolResultProjection(rawResult)
         if result.isEmpty {
             return "\(name) \(ok)"
         }
-        return "\(name) \(ok): \(cap(result, 180))"
+        return "\(name) \(ok): \(result)"
+    }
+
+    // MARK: - Cross-turn tool-result projection (sweep R4, finding #6)
+
+    /// Floor for the per-row cap applied to tool rows, sized so the head+tail
+    /// projection below (plus a long tool name and the "ok: " lead-in) always
+    /// survives `capForRole` intact.
+    static let toolRowMinimumCap = 360
+
+    /// Characters of the ORIGINAL kept from the head of a prior-turn tool result.
+    static let toolResultHeadChars = 110
+    /// Characters of the ORIGINAL kept from the tail. Tool FAILURES put the
+    /// lines that matter (compiler errors, "N tests failed", exit status) at the
+    /// END — the old head-only `cap(result, 180)` dropped every one of them and
+    /// left a bare "..." that did not even say something had been cut.
+    static let toolResultTailChars = 50
+    /// Bound on how much raw text is normalized/redacted per end. Legacy
+    /// 50–60 KB tool_catalog receipts must not be rescanned in full to produce
+    /// a ~180-char preview.
+    private static let toolResultRedactionWindow = 512
+
+    /// Head+tail-preserving projection of a prior-turn tool result, mirroring
+    /// the in-turn reference implementations (`ProviderToolResultProjection`
+    /// preview_head/preview_tail and `SubprocessSupport.headTailPreserve`):
+    /// both ends survive and the elision is stated explicitly with a character
+    /// count instead of a bare "...". Short results pass through untouched.
+    static func toolResultProjection(_ raw: String) -> String {
+        let keep = toolResultHeadChars + toolResultTailChars
+        if raw.count <= toolResultRedactionWindow {
+            let normalized = normalize(raw)
+            guard normalized.count > keep else { return normalized }
+            return String(normalized.prefix(toolResultHeadChars))
+                + toolResultElisionMarker(normalized.count - keep)
+                + String(normalized.suffix(toolResultTailChars))
+        }
+        // Too large to normalize whole: redact a bounded window at each end.
+        let head = normalize(String(raw.prefix(toolResultRedactionWindow)))
+        let tail = normalize(String(raw.suffix(toolResultRedactionWindow)))
+        guard head.count > keep || !tail.isEmpty else { return head }
+        let kept = min(head.count, toolResultHeadChars) + min(tail.count, toolResultTailChars)
+        return String(head.prefix(toolResultHeadChars))
+            + toolResultElisionMarker(max(0, raw.count - kept))
+            + String(tail.suffix(toolResultTailChars))
+    }
+
+    private static func toolResultElisionMarker(_ elided: Int) -> String {
+        " [… \(elided) chars elided …] "
     }
 
     /// Pull the `name` argument out of a persisted read_skill inputJSON blob.
@@ -1664,9 +1755,12 @@ enum SessionHistoryPromptRenderer {
         "where", "with", "would", "yeah", "you", "your",
     ]
 
-    private static func normalize(_ text: String) -> String {
-        let bounded = text.count > normalizationInputCharacterCap
-            ? String(text.prefix(normalizationInputCharacterCap))
+    private static func normalize(
+        _ text: String,
+        inputCap: Int = normalizationInputCharacterCap
+    ) -> String {
+        let bounded = text.count > inputCap
+            ? String(text.prefix(inputCap))
             : text
         return ChatSecretRedactor.redactText(bounded)
             .replacingOccurrences(of: "\r", with: "\n")

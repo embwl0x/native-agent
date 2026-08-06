@@ -467,7 +467,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         }
 
         switch path {
-        case "/claude/state", "/codex/state":
+        case "/claude/state", "/codex/state", "/omp/state":
             guard method == "GET" else {
                 writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
                 return
@@ -485,6 +485,12 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                 return
             }
             handleMessage(conn: conn, body: body, defaultSender: "codex")
+        case "/omp/message":
+            guard method == "POST" else {
+                writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
+                return
+            }
+            handleMessage(conn: conn, body: body, defaultSender: "omp")
         case "/claude/tool":
             guard method == "POST" else {
                 writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])

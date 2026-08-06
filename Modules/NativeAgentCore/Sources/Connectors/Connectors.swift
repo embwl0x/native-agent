@@ -213,7 +213,7 @@ public final class SwiftNativeConnectorsClient: ConnectorsClient {
             "title": .string(SecretRedactor.redactText("Workspace search")),
             "detail": .string(SecretRedactor.redactText(query)),
             "status": .string("ok"),
-            "missionId": .null,
+            "executionId": .null,
             "payload": SecretRedactor.redactValue(.object([
                 "resultCount": .int(Int64(resultCount)),
             ])),

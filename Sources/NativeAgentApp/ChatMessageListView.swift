@@ -153,10 +153,24 @@ struct ChatMessageListView: View {
     // bubble takes the plain-Text branch (isLastAssistant) instead of pushing
     // transient growing prefixes through ChatMarkdownCache.
     var sessionId: String = ""
+    /// True while THIS session is streaming a turn. Sweep R4 C16: detached
+    /// panels never passed it, so `ToolCallGroup(isLive:)` defaulted to false
+    /// and a tool call that was still running rendered as a finished, static
+    /// "N tools used" summary. Callers that genuinely have no live state (the
+    /// default) keep the old behaviour.
+    var isStreaming: Bool = false
 
     var body: some View {
         let lastAssistantId = messages.last(where: { $0.role == "assistant" })?.id
-        ForEach(MessageGrouper.groups(for: messages, sessionId: sessionId)) { group in
+        let groups = MessageGrouper.groups(for: messages, sessionId: sessionId)
+        // Same rule as the main window (ChatView): the live flip-box is the LAST
+        // tool group while the session is still working and the reply text has
+        // not started arriving yet.
+        let liveAssistantStarted = messages.last?.role == "assistant"
+            && messages.last?.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        let liveToolGroupId = (isStreaming && !liveAssistantStarted)
+            ? groups.last(where: { $0.isToolGroup })?.id : nil
+        ForEach(groups) { group in
             if group.isToolGroup {
                 if group.messages.count == 1 {
                     let msg = group.messages[0]
@@ -167,7 +181,10 @@ struct ChatMessageListView: View {
                         ToolPillView(message: msg)
                     }
                 } else {
-                    ToolCallGroup(messages: group.messages)
+                    ToolCallGroup(
+                        messages: group.messages,
+                        isLive: liveToolGroupId != nil && group.id == liveToolGroupId
+                    )
                 }
             } else {
                 let msg = group.messages[0]
@@ -878,11 +895,14 @@ struct MessageBubble: View {
                 VStack(alignment: isUser ? .trailing : .leading, spacing: NativeAgentSpacing.sm) {
                     if !trimmedContent.isEmpty {
                         renderedMessageText
-                    } else if localImageAttachments.isEmpty {
+                    } else if localImageAttachments.isEmpty && nonImageAttachments.isEmpty {
                         Text(" ")
                     }
                     ForEach(localImageAttachments, id: \.id) { attachment in
                         MessageLocalImageAttachmentView(attachment: attachment)
+                    }
+                    ForEach(nonImageAttachments, id: \.id) { attachment in
+                        MessageAttachmentChipView(attachment: attachment)
                     }
                 }
                     .font(NativeAgentFont.body)
@@ -1127,6 +1147,18 @@ struct MessageBubble: View {
         }
     }
 
+    /// Sweep R4 C14: everything the image branch above filters OUT used to
+    /// render NOTHING — attach a PDF and the bubble was blank. These get a
+    /// compact chip so the transcript still shows what was sent. Deliberately
+    /// includes image-typed rows with no local path: the bytes are gone, but
+    /// the fact that an image was attached is not.
+    private var nonImageAttachments: [PersistedAttachment] {
+        (message.metadata?.attachments ?? []).filter { attachment in
+            !(attachment.type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "image"
+                && (attachment.path?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false))
+        }
+    }
+
     private func postFeedback(messageId: String, rating: String) {
         // appModel.recordMessageFeedback doesn't exist yet — POST to context feedback,
         // otherwise no-op with a toast so the UI still works.
@@ -1159,6 +1191,74 @@ struct MessageBubble: View {
             return [model, effort, access].compactMap { $0 }.joined(separator: " / ")
         }
         return model ?? effort
+    }
+}
+
+/// Sweep R4 C14: compact chip for an attachment the bubble cannot render inline
+/// (PDF, CSV, any non-image file). Before this, those rows rendered nothing at
+/// all — the transcript silently lost the fact that a file was sent.
+private struct MessageAttachmentChipView: View {
+    let attachment: PersistedAttachment
+
+    private var displayName: String {
+        let name = attachment.name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !name.isEmpty { return name }
+        let path = attachment.path?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !path.isEmpty { return (path as NSString).lastPathComponent }
+        return "Attachment"
+    }
+
+    private var sizeText: String? {
+        guard attachment.byteSize > 0 else { return nil }
+        return ByteCountFormatter.string(fromByteCount: attachment.byteSize, countStyle: .file)
+    }
+
+    private var symbol: String {
+        let mime = attachment.mime.lowercased()
+        if mime.hasPrefix("image/") { return "photo" }
+        if mime.contains("pdf") { return "doc.richtext" }
+        if mime.hasPrefix("audio/") { return "waveform" }
+        if mime.hasPrefix("video/") { return "film" }
+        if mime.hasPrefix("text/") || mime.contains("json") || mime.contains("csv") { return "doc.plaintext" }
+        return "doc"
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: symbol)
+                .font(NativeAgentFont.label)
+                .foregroundStyle(.secondary)
+            Text(displayName)
+                .font(NativeAgentFont.label)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            if let sizeText {
+                Text(sizeText)
+                    .font(NativeAgentFont.tag)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background {
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(Color.secondary.opacity(0.10))
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.8)
+        }
+        .help(attachment.path ?? displayName)
+        .contextMenu {
+            if let path = attachment.path?.trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty {
+                Button {
+                    ChatClipboard.copy(path)
+                } label: { Label("Copy file path", systemImage: "doc.on.doc") }
+                Button {
+                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+                } label: { Label("Show in Finder", systemImage: "folder") }
+            }
+        }
     }
 }
 

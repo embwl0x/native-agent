@@ -646,7 +646,9 @@ func buildTurnContextWithHistory_caching_contract_stable_segments_before_dynamic
     guard let persona = sp.range(of: "PERSONA-MARKER-STABLE"),
           let pins = sp.range(of: "# Pinned facts (REM-approved overrides)"),
           let pinText = sp.range(of: "PIN-MARKER-SEMISTABLE"),
-          let recallHeader = sp.range(of: "Recent memory:"),
+          // Sweep R4 A4: header renamed — these rows are relevance-ranked,
+          // not recency-ranked, and "Recent memory:" taught the model wrong.
+          let recallHeader = sp.range(of: "Relevant memory:"),
           let recallText = sp.range(of: "RECALL-MARKER-CONTEXTUAL"),
           let continuity = sp.range(of: "SESSION_CONTINUITY_STATE:"),
           let history = sp.range(of: "Conversation history:") else {

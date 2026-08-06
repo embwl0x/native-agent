@@ -4,80 +4,60 @@ import Testing
 
 @Suite("Workshop storage migration")
 struct WorkshopStorageMigratorTests {
-    @Test("moves live state, preserves backups, and writes a receipt")
-    func movesStateAndArchivesLegacyTree() throws {
+    // De-mission P2-7: the `data/missions` absorption branch is DELETED. A
+    // dataRoot that still carries one is now IGNORED — not read, not merged,
+    // not archived. That is the honest behavior for a hypothetical unmigrated
+    // install, and it is what this asserts: the tree survives byte-for-byte
+    // and the Workshop side gains nothing from it.
+    @Test("a legacy missions/ tree is ignored, not absorbed")
+    func legacyMissionsTreeIsIgnored() throws {
         let root = try temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let legacy = root.appendingPathComponent("missions", isDirectory: true)
         try write("old-record", to: legacy.appendingPathComponent("queue/wsx-1/mission.json"))
         try write("old-trigger", to: legacy.appendingPathComponent("triggers.json"))
         try write("old-flat", to: legacy.appendingPathComponent("missions.json"))
-        try write("backup", to: legacy.appendingPathComponent("queue.bak.pre-reap/wsx-old/mission.json"))
-
-        let stamp = Date(timeIntervalSince1970: 1_700_000_000)
-        let report = try WorkshopStorageMigrator.migrateIfNeeded(dataRoot: root, now: stamp)
-
-        #expect(report.didMigrate)
-        #expect(!FileManager.default.fileExists(atPath: legacy.path))
-        #expect(try read(root.appendingPathComponent("workshop/executions/wsx-1/mission.json")) == "old-record")
-        #expect(try read(root.appendingPathComponent("workshop/triggers.json")) == "old-trigger")
-        #expect(try read(root.appendingPathComponent("workshop/legacy_executions.json")) == "old-flat")
-        let archive = try #require(report.archiveRelativePath)
-        #expect(try read(root.appendingPathComponent(archive).appendingPathComponent("queue.bak.pre-reap/wsx-old/mission.json")) == "backup")
-        let receipt = try #require(report.receiptRelativePath)
-        #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent(receipt).path))
-    }
-
-    @Test("canonical Workshop state wins and conflicting legacy bytes remain archived")
-    func mergesWithoutOverwritingCanonicalState() throws {
-        let root = try temporaryRoot()
-        defer { try? FileManager.default.removeItem(at: root) }
-        try write("canonical", to: root.appendingPathComponent("workshop/executions/shared/mission.json"))
-        try write("legacy", to: root.appendingPathComponent("missions/queue/shared/mission.json"))
-        try write("same", to: root.appendingPathComponent("workshop/executions/shared/timeline.jsonl"))
-        try write("same", to: root.appendingPathComponent("missions/queue/shared/timeline.jsonl"))
+        try write("checkpoint", to: legacy.appendingPathComponent("execution-2/checkpoints.jsonl"))
 
         let report = try WorkshopStorageMigrator.migrateIfNeeded(
             dataRoot: root,
-            now: Date(timeIntervalSince1970: 1_700_000_001)
+            now: Date(timeIntervalSince1970: 1_700_000_000)
         )
 
-        #expect(try read(root.appendingPathComponent("workshop/executions/shared/mission.json")) == "canonical")
-        #expect(report.conflictsPreservedInArchive.contains("missions/queue/shared/mission.json"))
-        #expect(report.deduplicated.contains("missions/queue/shared/timeline.jsonl"))
-        let archive = try #require(report.archiveRelativePath)
-        #expect(try read(root.appendingPathComponent(archive).appendingPathComponent("queue/shared/mission.json")) == "legacy")
-    }
+        // No crash, no migration, no receipt, no archive.
+        #expect(!report.didMigrate)
+        #expect(report.moved.isEmpty)
+        #expect(report.deduplicated.isEmpty)
+        #expect(report.conflictsPreservedInArchive.isEmpty)
+        #expect(report.archiveRelativePath == nil)
+        #expect(report.receiptRelativePath == nil)
+        #expect(!FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("archive", isDirectory: true).path))
 
-    @Test("a later launch is a no-op after the legacy root is archived")
-    func idempotentAfterMigration() throws {
-        let root = try temporaryRoot()
-        defer { try? FileManager.default.removeItem(at: root) }
-        try write("[]", to: root.appendingPathComponent("missions/triggers.json"))
+        // The legacy tree is untouched, in place, with its original bytes.
+        #expect(try read(legacy.appendingPathComponent("queue/wsx-1/mission.json")) == "old-record")
+        #expect(try read(legacy.appendingPathComponent("triggers.json")) == "old-trigger")
+        #expect(try read(legacy.appendingPathComponent("missions.json")) == "old-flat")
+        #expect(try read(legacy.appendingPathComponent("execution-2/checkpoints.jsonl")) == "checkpoint")
 
-        _ = try WorkshopStorageMigrator.migrateIfNeeded(dataRoot: root)
-        let second = try WorkshopStorageMigrator.migrateIfNeeded(dataRoot: root)
-
-        #expect(!second.didMigrate)
-        #expect(second.moved.isEmpty)
-    }
-
-    @Test("early checkpoint directories join their canonical execution")
-    func migratesEarlyCheckpointLayout() throws {
-        let root = try temporaryRoot()
-        defer { try? FileManager.default.removeItem(at: root) }
-        try write("checkpoint", to: root.appendingPathComponent("missions/execution-2/checkpoints.jsonl"))
-
-        _ = try WorkshopStorageMigrator.migrateIfNeeded(dataRoot: root)
-
-        #expect(try read(root.appendingPathComponent("workshop/executions/execution-2/checkpoints.jsonl")) == "checkpoint")
+        // And nothing of it landed on the Workshop side.
+        for absorbed in [
+            "workshop/executions/wsx-1/execution.json",
+            "workshop/executions/wsx-1/mission.json",
+            "workshop/executions/execution-2/checkpoints.jsonl",
+            "workshop/triggers.json",
+            "workshop/legacy_executions.json",
+        ] {
+            #expect(!FileManager.default.fileExists(
+                atPath: root.appendingPathComponent(absorbed).path), "absorbed \(absorbed)")
+        }
     }
 
     @Test("repairs migrated absolute receipts paths even after the legacy root is gone")
     func repairsStaleReceiptsDirectory() throws {
         let root = try temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
-        let record = root.appendingPathComponent("workshop/executions/execution-3/mission.json")
+        let record = root.appendingPathComponent("workshop/executions/execution-3/execution.json")
         let stale = root.appendingPathComponent("missions/queue/execution-3/receipts").path
         try write(#"{"id":"execution-3","receipts_dir":"\#(stale)"}"#, to: record)
 
@@ -110,7 +90,7 @@ struct WorkshopStorageMigratorTests {
     func doneMarkerSkipsRescan() throws {
         let root = try temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
-        let record = root.appendingPathComponent("workshop/executions/execution-9/mission.json")
+        let record = root.appendingPathComponent("workshop/executions/execution-9/execution.json")
         let stale = root.appendingPathComponent("missions/queue/execution-9/receipts").path
 
         // First launch: no marker → repair runs, marker gets stamped.

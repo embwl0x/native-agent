@@ -250,6 +250,9 @@ struct ApprovalsView: View {
             .animation(AppMotion.snappy, value: store.bannerWarning)
         }
         .navigationTitle("Approvals")
+        // Sweep R4 C11.3: an approval decision made against a stale snapshot is
+        // exactly the case where a silent sync failure hurts most.
+        .macSyncErrorBanner()
         .toolbar {
             ToolbarItem(placement: .navigationBarTrailing) {
                 if store.isLoading {

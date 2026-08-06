@@ -654,17 +654,17 @@ struct FireCarveSuite {
         #expect(deskItem.project == "Scheduled Workshop")
         #expect(deskItem.status == .now)
         if let id = result.executionId {
-            // Native path writes <root>/workshop/executions/<id>/mission.json
+            // Native path writes <root>/workshop/executions/<id>/execution.json
             // and timeline.jsonl (timeline FIRST per wave-21 ordering fix).
             let workshopExecutionDir = root
                 .appendingPathComponent("workshop", isDirectory: true)
                 .appendingPathComponent("executions", isDirectory: true)
                 .appendingPathComponent(id, isDirectory: true)
-            #expect(FileManager.default.fileExists(atPath: workshopExecutionDir.appendingPathComponent("mission.json").path))
+            #expect(FileManager.default.fileExists(atPath: workshopExecutionDir.appendingPathComponent("execution.json").path))
             #expect(FileManager.default.fileExists(atPath: workshopExecutionDir.appendingPathComponent("timeline.jsonl").path))
-            let workshopExecutionData = try Data(contentsOf: workshopExecutionDir.appendingPathComponent("mission.json"))
+            let workshopExecutionData = try Data(contentsOf: workshopExecutionDir.appendingPathComponent("execution.json"))
             guard case .object(let workshopExecutionObject) = try JSONValue.parse(workshopExecutionData) else {
-                Issue.record("mission.json is not an object"); return
+                Issue.record("execution.json is not an object"); return
             }
             #expect(workshopExecutionObject["desk_handle"] == .string(deskHandle))
         }
@@ -699,7 +699,7 @@ struct FireCarveSuite {
             .appendingPathComponent("workshop", isDirectory: true)
             .appendingPathComponent("executions", isDirectory: true)
             .appendingPathComponent(executionId, isDirectory: true)
-        #expect(FileManager.default.fileExists(atPath: workshopExecutionDir.appendingPathComponent("mission.json").path))
+        #expect(FileManager.default.fileExists(atPath: workshopExecutionDir.appendingPathComponent("execution.json").path))
         #expect(FileManager.default.fileExists(atPath: workshopExecutionDir.appendingPathComponent("timeline.jsonl").path))
     }
 
@@ -1088,7 +1088,7 @@ struct Wave21ReviewFixSuite {
             .appendingPathComponent("executions", isDirectory: true)
         if FileManager.default.fileExists(atPath: queueDir.path) {
             let children = (try? FileManager.default.contentsOfDirectory(at: queueDir, includingPropertiesForKeys: nil)) ?? []
-            #expect(!children.isEmpty, "native enqueue should have written mission.json")
+            #expect(!children.isEmpty, "native enqueue should have written execution.json")
         }
     }
 
@@ -1125,7 +1125,7 @@ struct Wave21ReviewFixSuite {
     }
 
     /// Companion to FIX #5: title defaults to "" but submit still proceeds
-    /// when objective is present. The native enqueue writes mission.json
+    /// when objective is present. The native enqueue writes execution.json
     /// with an empty title (not row.name).
     @Test func fireWorkshopExecutionMissingTitleEmptyTitlePersistedWhenObjectivePresent() async throws {
         let root = try makeTempRoot()
@@ -1147,10 +1147,10 @@ struct Wave21ReviewFixSuite {
             .appendingPathComponent("workshop", isDirectory: true)
             .appendingPathComponent("executions", isDirectory: true)
             .appendingPathComponent(id, isDirectory: true)
-            .appendingPathComponent("mission.json")
+            .appendingPathComponent("execution.json")
         let data = try Data(contentsOf: mj)
         guard case .object(let o) = try JSONValue.parse(data) else {
-            Issue.record("mission.json not object"); return
+            Issue.record("execution.json not object"); return
         }
         #expect(str(o["title"]) == "")
         #expect(str(o["objective"]) == "Do the thing")

@@ -211,7 +211,7 @@ public struct ProactiveOutcomeLedger: Sendable {
             "title": .string("Proactive outcome recorded"),
             "detail": recObj["outcome"] ?? .string("observed"),
             "status": .string("ok"),
-            "missionId": .null,
+            "executionId": .null,
             "payload": record,
             "createdAt": .string(now),
         ])

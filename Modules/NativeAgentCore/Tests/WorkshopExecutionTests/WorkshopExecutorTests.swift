@@ -27,8 +27,11 @@ private func makeTempRoot() throws -> URL {
     return dir
 }
 
-/// Seed a Workshop execution dir the way submit() leaves it: mission.json (status
-/// queued by default) + the `enqueued` timeline event + receipts/.
+/// Seed a Workshop execution dir the way submit() leaves it: execution.json
+/// (status queued by default) + the `enqueued` timeline event + receipts/.
+///
+/// `legacyRecordName: true` seeds the pre-P2-1 `mission.json` instead, for the
+/// dual-read path (a directory the rename pass never reached).
 @discardableResult
 private func seedWorkshopExecution(
     root: URL,
@@ -38,7 +41,8 @@ private func seedWorkshopExecution(
     planJSON: String,
     trustRequired: String = "none",
     status: String = "queued",
-    stepsCompleted: [JSONValue] = []
+    stepsCompleted: [JSONValue] = [],
+    legacyRecordName: Bool = false
 ) async throws -> WorkshopExecutionRecord {
     let persistence = SwiftNativePersistenceCore()
     let dir = root.appendingPathComponent("workshop/executions/\(id)", isDirectory: true)
@@ -63,7 +67,11 @@ private func seedWorkshopExecution(
         result: .null,
         rerunCount: 0
     )
-    try await persistence.writeJSON(record.toJSON(), to: dir.appendingPathComponent("mission.json"))
+    try await persistence.writeJSON(
+        record.toJSON(),
+        to: legacyRecordName
+            ? ExecutionRecordFile.legacyPath(in: dir)
+            : ExecutionRecordFile.canonicalPath(in: dir))
     try await persistence.appendJSONL(
         .object([
             "event": .string("enqueued"),
@@ -127,7 +135,8 @@ private func rawTimelineHas(root: URL, id: String, event: String, reason: String
 private func readWorkshopExecution(root: URL, id: String) async -> WorkshopExecutionRecord? {
     let persistence = SwiftNativePersistenceCore()
     let raw = await persistence.readJSON(
-        root.appendingPathComponent("workshop/executions/\(id)/mission.json"),
+        ExecutionRecordFile.resolve(
+            in: root.appendingPathComponent("workshop/executions/\(id)", isDirectory: true)),
         defaultValue: .null
     )
     guard case .object(let obj) = raw else { return nil }
@@ -870,7 +879,8 @@ struct WorkshopExecutorClaimSuite {
 
         // Free the slot → next drain claims and runs it.
         let persistence = SwiftNativePersistenceCore()
-        let aPath = root.appendingPathComponent("workshop/executions/running-a/mission.json")
+        let aPath = ExecutionRecordFile.resolve(
+            in: root.appendingPathComponent("workshop/executions/running-a", isDirectory: true))
         let rawA = await persistence.readJSON(aPath, defaultValue: .null)
         if case .object(var o) = rawA {
             o["status"] = .string("completed")

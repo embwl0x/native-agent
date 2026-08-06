@@ -402,6 +402,8 @@ extension SwiftToolDispatcher {
             // inbox shape as claude_message, plus a best-effort local Mac
             // notification when the app-side integration bridge is wired.
             return try await runCodexMessage(input: input, surface: surface)
+        case "omp_message":
+            return try await runOMPMessage(input: input, surface: surface)
         case "invoke_claude":
             // 2026-06-08 her→me REAL-TIME invocation channel. Spawns
             // `claude -p "<context+question>"` as a subprocess, blocks

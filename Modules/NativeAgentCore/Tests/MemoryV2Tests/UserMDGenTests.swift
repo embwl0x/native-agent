@@ -22,17 +22,25 @@ struct UserMDGenTests {
         defer { try? FileManager.default.removeItem(at: root) }
         let persona = MemoryV2Defaults.personaID
 
-        _ = try await store.insertMemory(StoredMemory(content: "the user prefers Opus 4.8", source: "chat"))
-        _ = try await store.insertMemory(StoredMemory(content: "Agent uses dry voice", source: "dream"))
+        _ = try await store.insertMemory(StoredMemory(
+            content: "the user prefers Opus 4.8",
+            source: "chat",
+            metadata: .object(["kind": .string("preference")])
+        ))
+        _ = try await store.insertMemory(StoredMemory(
+            content: "Agent uses dry voice",
+            source: "dream",
+            metadata: .object(["kind": .string("relationship")])
+        ))
         _ = try await store.insertMemory(StoredMemory(
             content: "2026-06-10: Worklog discipline",
             source: "chat",
-            metadata: .object(["kind": .string("fact")])
+            metadata: .object(["kind": .string("user_fact")])
         ))
         _ = try await store.insertMemory(StoredMemory(
             content: "2026-06-11: Claude restored commit_memory",
             source: "chat",
-            metadata: .object(["kind": .string("milestone")])
+            metadata: .object(["kind": .string("moment")])
         ))
 
         let personaRoot = root.appendingPathComponent("persona", isDirectory: true)
@@ -47,7 +55,10 @@ struct UserMDGenTests {
         #expect(text.contains("the user prefers Opus 4.8"))
         #expect(text.contains("Agent uses dry voice"))
         #expect(text.contains("- Worklog discipline\n"))
-        #expect(text.contains("- 2026-06-11: Claude restored commit_memory\n"))
+        // Date prefixes strip for every rendered person-kind — the doc's own
+        // rule is "no per-fact timestamps".
+        #expect(text.contains("- Claude restored commit_memory\n"))
+        #expect(!text.contains("- 2026-06-11:"))
         // Flat list: no provenance headers, no per-fact timestamps.
         #expect(!text.contains("## From"))
         #expect(!text.contains("- 2026-06-10: Worklog discipline"))
@@ -95,7 +106,11 @@ struct UserMDGenTests {
         let customDisplayName = "Renamed Agent"
         let canonicalFact = "canonical memory survives a renamed agent"
         let legacyFact = "legacy display-name partition must not select USER.md"
-        _ = try await store.insertMemory(StoredMemory(content: canonicalFact, source: "chat"))
+        _ = try await store.insertMemory(StoredMemory(
+            content: canonicalFact,
+            source: "chat",
+            metadata: .object(["kind": .string("user_fact")])
+        ))
         _ = try await store.insertMemory(StoredMemory(
             content: legacyFact,
             personaId: customDisplayName,
@@ -124,7 +139,11 @@ struct UserMDGenTests {
         ]
         let legacyFact = "legacy-only fact must not replace canonical USER.md"
         for fact in canonicalFacts {
-            _ = try await store.insertMemory(StoredMemory(content: fact, source: "chat"))
+            _ = try await store.insertMemory(StoredMemory(
+                content: fact,
+                source: "chat",
+                metadata: .object(["kind": .string("user_fact")])
+            ))
         }
         _ = try await store.insertMemory(StoredMemory(
             content: legacyFact,
@@ -189,7 +208,11 @@ struct UserMDGenTests {
         let gen = UserMDGenerator(storage: store, dataRoot: root, personaRoot: personaRoot, debounceInterval: 0)
         await store.attachUserMDGenerator(gen)
 
-        _ = try await store.insertMemory(StoredMemory(content: "via insert", source: "chat"))
+        _ = try await store.insertMemory(StoredMemory(
+            content: "via insert",
+            source: "chat",
+            metadata: .object(["kind": .string("user_fact")])
+        ))
 
         let target = gen.userMDPath(persona: MemoryV2Defaults.personaID)
         let deadline = Date().addingTimeInterval(10)
@@ -205,6 +228,94 @@ struct UserMDGenTests {
     /// projection for precoverage. A row the projection refuses must not be
     /// rendered here: it would both re-state a superseded fact to the model and
     /// break the all-or-nothing precoverage join for the whole document.
+    @Test func workshopExecutionOutcomesNeverLandInTheIdentityDoc() async throws {
+        // User 2026-08-06: USER.md filled with "Workshop execution X completed"
+        // rows — E-2\'s agent-work journal flooding the doc about WHO USER IS.
+        // Provenance gate: workshop-sourced rows stay in memory (capability
+        // intact) and never render here. Mutation teeth: drop the
+        // "workshop:" prefix guard in userMDBody and this fails.
+        let store = try MemoryStorage()
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        _ = try await store.insertMemory(StoredMemory(
+            content: "User prefers answer-first summaries with the detail after.",
+            source: "chat",
+            metadata: .object(["kind": .string("preference")])
+        ))
+        _ = try await store.insertMemory(StoredMemory(
+            content: "Workshop execution \"Build proof\" completed. 2 of 2 planned steps succeeded.",
+            source: "workshop:49a42b4e",
+            metadata: .object(["kind": .string("execution_outcome")])
+        ))
+
+        let personaRoot = root.appendingPathComponent("persona", isDirectory: true)
+        let gen = UserMDGenerator(storage: store, dataRoot: root, personaRoot: personaRoot)
+        let text = try String(
+            contentsOf: try await gen.regenerate(persona: MemoryV2Defaults.personaID),
+            encoding: .utf8
+        )
+
+        #expect(text.contains("answer-first summaries"))
+        #expect(!text.contains("Workshop execution"),
+            "agent work journal leaked into the user identity doc")
+    }
+
+    /// User 2026-08-06 round 2: after the workshop gate, USER.md was STILL
+    /// ~80% agent operational logs ("nothing about me on there") — wake-path
+    /// forensics, Codex bridge debugging, build decisions, all committed via
+    /// chat with ops kinds. The identity doc renders ONLY person-kinds
+    /// (userIdentityKinds); everything else stays recallable but off the doc.
+    /// Fail-closed: nil and unknown kinds are excluded too.
+    @Test func identityDocRendersOnlyPersonKinds() async throws {
+        let store = try MemoryStorage()
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let renders: [(String, String)] = [
+            ("user_fact", "User's heart semantics: the purple heart is Agent's signature."),
+            ("preference", "User wants answer-first ordering in every report."),
+            ("relationship", "User told Agent about dreaming of an office briefing."),
+            ("attribute", "user's dyslexia is a bitch sometimes."),
+        ]
+        let excluded: [(String?, String)] = [
+            ("decision", "CONFIRMED ROOT CAUSE: the claude-bridge deliveryLost false-negative is a self-deadlock."),
+            ("operational", "Workshop execution proof run completed with 2 of 2 steps."),
+            ("correction", "WITHDRAWN: my wake-path finding was wrong on re-read."),
+            ("fact", "Marathon 30-call battery completed, tag MARATHON-T3."),
+            ("episodic", "Mid-flight snapshot scored as terminal; third instance this week."),
+            (nil, "a row with no kind at all must not ride the identity doc."),
+        ]
+        for (kind, content) in renders {
+            _ = try await store.insertMemory(StoredMemory(
+                content: content,
+                source: "chat.commit_memory",
+                metadata: .object(["kind": .string(kind)])
+            ))
+        }
+        for (kind, content) in excluded {
+            _ = try await store.insertMemory(StoredMemory(
+                content: content,
+                source: "chat.commit_memory",
+                metadata: kind.map { .object(["kind": .string($0)]) }
+            ))
+        }
+
+        let personaRoot = root.appendingPathComponent("persona", isDirectory: true)
+        let gen = UserMDGenerator(storage: store, dataRoot: root, personaRoot: personaRoot)
+        let text = try String(
+            contentsOf: try await gen.regenerate(persona: MemoryV2Defaults.personaID),
+            encoding: .utf8
+        )
+
+        for (_, content) in renders {
+            #expect(text.contains(content), "person-kind row missing from identity doc")
+        }
+        for (_, content) in excluded {
+            #expect(!text.contains(content), "agent-ops row leaked into the identity doc")
+        }
+    }
+
     @Test func skipsRowsTheContextProjectionRefuses() async throws {
         let store = try MemoryStorage()
         let root = tmpRoot()
@@ -212,7 +323,8 @@ struct UserMDGenTests {
 
         _ = try await store.insertMemory(StoredMemory(
             content: "User's sleep schedule is 19:00-03:00 — an early-bird pattern.",
-            source: "chat"
+            source: "chat",
+            metadata: .object(["kind": .string("user_fact")])
         ))
         // Superseded half of a corrected pair: still `active`, but
         // recall-INELIGIBLE everywhere else in the system.

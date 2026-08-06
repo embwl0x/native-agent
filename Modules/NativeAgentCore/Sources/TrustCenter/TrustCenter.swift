@@ -58,8 +58,20 @@ public actor SwiftNativeTrustCenter: TrustCenterProtocol {
         let path = trustPolicyPath
         let defaults = defaultTrustPolicy()
         try await persistence.withFileLock(path) {
-            let current = try Self.loadRawPolicyChecked(at: path)
+            // Wave 4 read-both (phase A): BOTH the caller's patch and the
+            // current on-disk object may carry the future `workshopPolicy`
+            // spelling (the patch from a future caller; the disk from a write
+            // that slipped through before the fold existed). Fold BOTH onto
+            // the WIRE key before validation and merge, so every write leaves
+            // the file with exactly one spelling — the old one — and a
+            // stray future key is normalized away instead of rewritten
+            // forever. Folding current BEFORE type validation also gives a
+            // future-spelled block the same nested type checks the legacy
+            // spelling gets (review 2026-08-06 blocking #2/#3).
+            let current = WorkshopPolicyBlockVocabulary.foldToWireKey(
+                try Self.loadRawPolicyChecked(at: path))
             try Self.validateKnownAuthorityPolicyTypes(current, against: defaults)
+            let patch = WorkshopPolicyBlockVocabulary.foldToWireKey(patch)
             let merged = Self.deepMerge(current, patch)
             try Self.validateAuthorityPolicyShape(merged)
             try Self.validateKnownAuthorityPolicyTypes(merged, against: defaults)

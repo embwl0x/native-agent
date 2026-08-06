@@ -85,7 +85,9 @@ private func aval(_ env: JSONValue, _ key: String) -> [JSONValue]? {
 
 // The fixed actionCategories literal must match the daemon exactly:
 //   approval (approve/deny, medium), doctor (open_doctor/repair_safe, low),
-//   execution (open_mission, low).
+//   execution (open_execution, low — Wave 5 P2-6 flipped this emitter from
+//   the legacy "open_mission"; the category `id` is a separate token and did
+//   NOT move).
 @Test func notificationStatus_actionCategoriesAreFixedLiteral() async throws {
     let fix = try StatusFixture()
     defer { fix.cleanup() }
@@ -110,8 +112,17 @@ private func aval(_ env: JSONValue, _ key: String) -> [JSONValue]? {
     #expect(parsed[1].actions == ["open_doctor", "repair_safe"])
     #expect(parsed[1].risk == "low")
     #expect(parsed[2].id == "mission")
-    #expect(parsed[2].actions == ["open_mission"])
+    // Wave 5 (P2-6): the EMITTER is canonical now.
+    #expect(parsed[2].actions == [WorkshopOpenNotificationAction.canonical])
+    #expect(parsed[2].actions == ["open_execution"])
     #expect(parsed[2].risk == "low")
+    // ...and the legacy id is still ACCEPTED by any reader that routes through
+    // the vocabulary, so a 0.3.x payload (or a notification already sitting in
+    // Notification Center) does not become unroutable.
+    #expect(WorkshopOpenNotificationAction.matches("open_mission"))
+    #expect(WorkshopOpenNotificationAction.matches(parsed[2].actions[0]))
+    // Negative control: an unrelated action id must NOT match.
+    #expect(!WorkshopOpenNotificationAction.matches("open_doctor"))
 }
 
 // MARK: - receipts: last 20, newest-first (matches reversed(tail_jsonl(.., 20)))

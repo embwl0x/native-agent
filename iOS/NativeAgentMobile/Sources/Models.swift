@@ -360,6 +360,41 @@ struct TrustPolicy: Codable, Hashable, Sendable {
         case toolPolicy, filePolicy, connectorPolicy, providerPolicy, trainingPolicy, updatedAt, macControlPolicy
     }
 
+}
+
+/// Wave 4 (phase A) read-both: accept the FUTURE `workshopPolicy` spelling as
+/// well as the on-wire `missionPolicy`. Decode-only — `encode(to:)` stays the
+/// synthesized one, so this build keeps writing `missionPolicy` and a 0.3.7
+/// Mac decodes iOS snapshots byte-for-byte. Declared in an EXTENSION so the
+/// synthesized memberwise initializer survives (an init in the struct body
+/// suppresses it).
+extension TrustPolicy {
+    private enum FutureCodingKeys: String, CodingKey {
+        case workshopPolicy
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        permissionLevel = try c.decodeIfPresent(String.self, forKey: .permissionLevel)
+        autonomyDefault = try c.decodeIfPresent(String.self, forKey: .autonomyDefault)
+        requireBackups = try c.decodeIfPresent(Bool.self, forKey: .requireBackups)
+        outsideDefault = try c.decodeIfPresent(String.self, forKey: .outsideDefault)
+        developerMode = try c.decodeIfPresent(Bool.self, forKey: .developerMode)
+        // Future spelling first, on-wire spelling as the fallback. A PRESENT
+        // but malformed future block throws, exactly like the legacy key —
+        // the future spelling must never be the more forgiving one.
+        let future = try decoder.container(keyedBy: FutureCodingKeys.self)
+        workshopPolicy = try future.decodeIfPresent(TrustWorkshopPolicy.self, forKey: .workshopPolicy)
+            ?? c.decodeIfPresent(TrustWorkshopPolicy.self, forKey: .workshopPolicy)
+        toolPolicy = try c.decodeIfPresent(TrustToolPolicy.self, forKey: .toolPolicy)
+        filePolicy = try c.decodeIfPresent(TrustFilePolicy.self, forKey: .filePolicy)
+        connectorPolicy = try c.decodeIfPresent(TrustConnectorPolicy.self, forKey: .connectorPolicy)
+        providerPolicy = try c.decodeIfPresent(TrustProviderPolicy.self, forKey: .providerPolicy)
+        trainingPolicy = try c.decodeIfPresent(TrustTrainingPolicy.self, forKey: .trainingPolicy)
+        updatedAt = try c.decodeIfPresent(String.self, forKey: .updatedAt)
+        macControlPolicy = try c.decodeIfPresent(TrustMacControlPolicy.self, forKey: .macControlPolicy)
+    }
+
     var effectiveRequireBackups: Bool? {
         requireBackups ?? filePolicy?.requireBackupBeforeWrite
     }

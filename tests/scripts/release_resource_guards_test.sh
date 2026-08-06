@@ -57,6 +57,10 @@ clone_tree "$SOURCE_RESOURCES" "$staged_root/$EXPECTED_BUNDLE"
 mkdir -p "$staged_root/$APP_RESOURCE_BUNDLE"
 cp "$ROOT/script/codex_thread_wakeup.js" "$staged_root/$APP_RESOURCE_BUNDLE/"
 cp "$ROOT/script/claude_thread_wakeup.js" "$staged_root/$APP_RESOURCE_BUNDLE/"
+# The verifier requires all THREE bridge helpers (codex/claude/omp) since the
+# builder bridges started shipping in the public app; the happy-path stage
+# must include omp or this test fails the whole release gate.
+cp "$ROOT/script/omp_thread_wakeup.js" "$staged_root/$APP_RESOURCE_BUNDLE/"
 expect_success \
   "complete resources in expected SwiftPM bundle" \
   "$VERIFIER" --verify-resource-bundle "$staged_root"

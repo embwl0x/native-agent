@@ -70,6 +70,8 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
     let codexMessageWakeupOverride: (@Sendable ([String: JSONValue]) async -> JSONValue)?
     let claudeMessageWakeupHelperOverride: URL?
     let claudeMessageWakeupOverride: (@Sendable ([String: JSONValue]) async -> JSONValue)?
+    let ompMessageWakeupHelperOverride: URL?
+    let ompMessageWakeupOverride: (@Sendable ([String: JSONValue]) async -> JSONValue)?
     private let builtInSchemaCacheLock = NSLock()
     private var builtInSchemaCache: [BuiltInSchemaCacheKey: [LLMToolSchema]] = [:]
 
@@ -119,7 +121,9 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
         codexMessageWakeupHelperOverride: URL? = nil,
         codexMessageWakeupOverride: (@Sendable ([String: JSONValue]) async -> JSONValue)? = nil,
         claudeMessageWakeupHelperOverride: URL? = nil,
-        claudeMessageWakeupOverride: (@Sendable ([String: JSONValue]) async -> JSONValue)? = nil
+        claudeMessageWakeupOverride: (@Sendable ([String: JSONValue]) async -> JSONValue)? = nil,
+        ompMessageWakeupHelperOverride: URL? = nil,
+        ompMessageWakeupOverride: (@Sendable ([String: JSONValue]) async -> JSONValue)? = nil
     ) {
         self.dataRoot = dataRoot
         self.activeToolsStore = activeToolsStore
@@ -142,6 +146,8 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
         self.codexMessageWakeupOverride = codexMessageWakeupOverride
         self.claudeMessageWakeupHelperOverride = claudeMessageWakeupHelperOverride
         self.claudeMessageWakeupOverride = claudeMessageWakeupOverride
+        self.ompMessageWakeupHelperOverride = ompMessageWakeupHelperOverride
+        self.ompMessageWakeupOverride = ompMessageWakeupOverride
     }
 
     private static func makeMemoryOwner(dataRoot: URL) -> SwiftNativeMemoryV2 {

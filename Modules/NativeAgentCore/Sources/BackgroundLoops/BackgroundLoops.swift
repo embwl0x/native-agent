@@ -349,7 +349,7 @@ public actor SwiftNativeBackgroundLoops: BackgroundLoopsProtocol {
                 "title": .string("Swift background loop tick"),
                 "detail": .string("Latest registered loop tick."),
                 "status": .string(running ? "ok" : "stopped"),
-                "missionId": .null,
+                "executionId": .null,
                 "createdAt": .string(Self.isoTimestamp(lastRun)),
             ])
         }

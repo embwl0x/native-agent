@@ -64,6 +64,54 @@ REMOTE_TARGET="$(gh api "repos/$REPOSITORY/commits/$TARGET" --jq '.sha' 2>/dev/n
 [[ "$REMOTE_TARGET" == "$TARGET" ]] \
   || fail "source commit $TARGET is not present in $REPOSITORY. Publish the reviewed source first."
 
+# ---------------------------------------------------------------------------
+# Git tag (sweep R4 C1). `gh release create --target` creates the tag on the
+# REMOTE only, so the repo this release was cut from carried no tag at all —
+# no local tag exists past pre-swift-migration-2026-05-30 despite every publish
+# computing TAG="v$VERSION". Create and push it HERE, before the release is
+# created, so a failure aborts while nothing has been published yet. gh then
+# reuses the tag that already exists at $TARGET.
+#
+# Gated: generate_appcast.sh refuses --rehearsal with --publish, so this script
+# is never reached on a rehearsal; the check below makes that a guard rather
+# than an assumption.
+# ---------------------------------------------------------------------------
+[[ "${NATIVEAGENT_APPCAST_REHEARSAL:-false}" != "true" ]] \
+  || fail "refusing to tag or publish: this is a rehearsal run."
+
+GIT_REMOTE=""
+while read -r name url _; do
+  case "$url" in
+    *"$REPOSITORY"*) GIT_REMOTE="$name"; break ;;
+  esac
+done < <(git -C "$ROOT" remote -v 2>/dev/null || true)
+[[ -n "$GIT_REMOTE" ]] \
+  || fail "no git remote points at $REPOSITORY, so the release tag $TAG cannot be pushed.
+       Add the remote (git remote add origin https://github.com/$REPOSITORY.git) and retry."
+
+if EXISTING_TAG_COMMIT="$(git -C "$ROOT" rev-list -n 1 "$TAG" 2>/dev/null)"; then
+  [[ "$EXISTING_TAG_COMMIT" == "$TARGET" ]] \
+    || fail "local tag $TAG already points at $EXISTING_TAG_COMMIT, not the release commit $TARGET.
+       Resolve that by hand — a release tag must name the bytes it shipped."
+  echo "==> Tag $TAG already exists locally at $TARGET"
+else
+  echo "==> Creating release tag $TAG at $TARGET"
+  git -C "$ROOT" tag -a "$TAG" -m "NativeAgent $VERSION" "$TARGET" \
+    || fail "could not create the release tag $TAG."
+fi
+
+REMOTE_TAG_COMMIT="$(git -C "$ROOT" ls-remote --tags "$GIT_REMOTE" "refs/tags/$TAG^{}" 2>/dev/null | awk '{print $1}' | head -1)"
+if [[ -z "$REMOTE_TAG_COMMIT" ]]; then
+  echo "==> Pushing $TAG to $GIT_REMOTE"
+  git -C "$ROOT" push "$GIT_REMOTE" "refs/tags/$TAG" \
+    || fail "could not push the release tag $TAG to $GIT_REMOTE."
+  REMOTE_TAG_COMMIT="$(git -C "$ROOT" ls-remote --tags "$GIT_REMOTE" "refs/tags/$TAG^{}" 2>/dev/null | awk '{print $1}' | head -1)"
+fi
+# A push exit code is not existence, same rule as the feed itself.
+[[ "$REMOTE_TAG_COMMIT" == "$TARGET" ]] \
+  || fail "after pushing, $GIT_REMOTE has $TAG at '${REMOTE_TAG_COMMIT:-<absent>}', expected $TARGET."
+echo "==> Release tag $TAG is live on $GIT_REMOTE at $TARGET"
+
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/nativeagent-github-release.XXXXXX")"
 cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT

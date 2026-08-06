@@ -403,6 +403,282 @@ extension SwiftToolDispatcher {
         return TimeInterval(min(300, max(5, rawSeconds)))
     }
 
+    // MARK: - OMP asynchronous bridge
+
+    func runOMPMessage(input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        guard case .string(let text)? = input["text"], !text.isEmpty else {
+            return .object([
+                "status": .string("failed"),
+                "reason": .string("missing_text"),
+                "fix": .string("omp_message requires a non-empty 'text' parameter."),
+            ])
+        }
+        let priority: String = {
+            guard case .string(let raw)? = input["priority"] else { return "info" }
+            let value = raw.lowercased()
+            return ["info", "important", "urgent"].contains(value) ? value : "info"
+        }()
+        let topic: String? = {
+            guard case .string(let raw)? = input["topic"] else { return nil }
+            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            return value.isEmpty ? nil : String(value.prefix(120))
+        }()
+        let timeoutSeconds: Int = {
+            if case .int(let value)? = input["timeout_seconds"] {
+                return max(60, min(3600, Int(value)))
+            }
+            if case .double(let value)? = input["timeout_seconds"] {
+                return max(60, min(3600, Int(value)))
+            }
+            return 900
+        }()
+        let workingDirectory: String?
+        switch await resolveAgentBridgeWorkingDirectory(input: input, surface: surface) {
+        case .success(let path): workingDirectory = path
+        case .failure(let envelope): return envelope
+        }
+
+        if ompMessageWakeupOverride == nil, ompMessageWakeupHelperOverride == nil {
+            let returnPath = AgentBridgeRuntime.returnPathReadiness(configRoot: agentBridgeConfigRoot)
+            guard returnPath.isReady else { return Self.returnBridgeUnavailableEnvelope(returnPath) }
+        }
+
+        let directory = Self.bridgeConfigDirectory(
+            named: "omp-bridge",
+            configRootOverride: agentBridgeConfigRoot
+        )
+        let inboxURL = directory.appendingPathComponent("omp-inbox.jsonl")
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        } catch {
+            return .object([
+                "status": .string("failed"),
+                "reason": .string("inbox_dir_create_failed"),
+                "detail": .string(String(describing: error)),
+            ])
+        }
+
+        let messageId: String = {
+            guard case .string(let raw)? = input["message_id"] else { return UUID().uuidString }
+            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            return value.isEmpty ? UUID().uuidString : String(value.prefix(160))
+        }()
+        let queuedAt = ISO8601DateFormatter().string(from: Date())
+        let originSessionId = Self.extractSessionId(from: input)
+        var row: [String: JSONValue] = [
+            "id": .string(messageId),
+            "messageId": .string(messageId),
+            "createdAt": .string(queuedAt),
+            "from": .string("assistant"),
+            "priority": .string(priority),
+            "text": .string(text),
+            "timeoutSeconds": .int(Int64(timeoutSeconds)),
+            "read": .bool(false),
+        ]
+        if let topic { row["topic"] = .string(topic) }
+        if let workingDirectory { row["workingDirectory"] = .string(workingDirectory) }
+        if !originSessionId.isEmpty { row["sessionId"] = .string(originSessionId) }
+        let inboxEntry = row
+
+        let persistence = SwiftNativePersistenceCore()
+        let appendStatus: String
+        do {
+            appendStatus = try await persistence.withFileLock(inboxURL) {
+                let existing = try await persistence.readJSONL(inboxURL).first { value in
+                    guard case .object(let object) = value else { return false }
+                    return object["messageId"] == .string(messageId) || object["id"] == .string(messageId)
+                }
+                if case .object(let object)? = existing {
+                    guard object["text"] == .string(text),
+                          object["topic"] == inboxEntry["topic"],
+                          object["workingDirectory"] == inboxEntry["workingDirectory"] else {
+                        return "conflict"
+                    }
+                    return "duplicate"
+                }
+                try await appendJSONLCapped(
+                    .object(inboxEntry),
+                    to: inboxURL,
+                    using: persistence,
+                    maxLines: JSONLLineCaps.ompBridgeInbox,
+                    logLabel: "SwiftToolDispatcher.ompMessage",
+                    takeLock: false
+                )
+                return "appended"
+            }
+        } catch {
+            return .object([
+                "status": .string("failed"),
+                "reason": .string("inbox_write_failed"),
+                "detail": .string(String(describing: error)),
+            ])
+        }
+        guard appendStatus != "conflict" else {
+            return .object([
+                "status": .string("failed"),
+                "reason": .string("message_id_conflict"),
+                "messageId": .string(messageId),
+            ])
+        }
+
+        var response: [String: JSONValue] = [
+            "status": .string("queued"),
+            "messageId": .string(messageId),
+            "deduplicated": .bool(appendStatus == "duplicate"),
+            "filePath": .string(inboxURL.path),
+            "priority": .string(priority),
+            "queuedAt": .string(queuedAt),
+            "timeoutSeconds": .int(Int64(timeoutSeconds)),
+        ]
+        if let topic { response["topic"] = .string(topic) }
+        if let workingDirectory { response["workingDirectory"] = .string(workingDirectory) }
+        if appendStatus == "duplicate" {
+            response["wakeup"] = .object(["status": .string("deduplicated")])
+        } else {
+            response["wakeup"] = await postOMPThreadWakeup(
+                messageId: messageId,
+                text: text,
+                priority: priority,
+                topic: topic,
+                queuedAt: queuedAt,
+                inboxPath: inboxURL.path,
+                originSessionId: originSessionId,
+                timeoutSeconds: timeoutSeconds,
+                workingDirectory: workingDirectory
+            )
+        }
+        return .object(response)
+    }
+
+    private func postOMPThreadWakeup(
+        messageId: String,
+        text: String,
+        priority: String,
+        topic: String?,
+        queuedAt: String,
+        inboxPath: String,
+        originSessionId: String,
+        timeoutSeconds: Int,
+        workingDirectory: String?
+    ) async -> JSONValue {
+        var payload: [String: JSONValue] = [
+            "messageId": .string(messageId),
+            "text": .string(text),
+            "priority": .string(priority),
+            "queuedAt": .string(queuedAt),
+            "inboxPath": .string(inboxPath),
+            "source": .string("omp_message"),
+            "timeoutSeconds": .int(Int64(timeoutSeconds)),
+        ]
+        if let topic { payload["topic"] = .string(topic) }
+        if !originSessionId.isEmpty { payload["sessionId"] = .string(originSessionId) }
+        if let workingDirectory { payload["cwd"] = .string(workingDirectory) }
+        if let ompMessageWakeupOverride { return await ompMessageWakeupOverride(payload) }
+
+        let disabled = ProcessInfo.processInfo.environment["NATIVE_AGENT_OMP_WAKEUP_DISABLED"]?.lowercased()
+        if ["1", "true", "yes"].contains(disabled ?? "") {
+            return .object([
+                "status": .string("skipped"),
+                "reason": .string("disabled_by_environment"),
+                "env": .string("NATIVE_AGENT_OMP_WAKEUP_DISABLED"),
+            ])
+        }
+        guard let helper = AgentBridgeRuntime.ompHelperURL(
+            override: ompMessageWakeupHelperOverride,
+            repoRoot: rootForRead
+        ) else {
+            return .object([
+                "status": .string("skipped"),
+                "reason": .string("helper_not_found"),
+                "fix": .string("Install script/omp_thread_wakeup.js or set NATIVE_AGENT_OMP_WAKEUP_HELPER."),
+            ])
+        }
+        let inputData: Data
+        do {
+            inputData = try JSONValue.object(payload).serializedData(pretty: false)
+        } catch {
+            return .object([
+                "status": .string("failed"),
+                "reason": .string("wakeup_payload_encode_failed"),
+                "error": .string(String(describing: error)),
+            ])
+        }
+        let cwd = Self.builderSourceRepoRoot(dataRoot: dataRoot)
+            ?? NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot)
+        return await Task.detached(priority: .utility) {
+            Self.runOMPWakeupHelper(helper: helper, inputData: inputData, cwd: cwd)
+        }.value
+    }
+
+    private static func runOMPWakeupHelper(helper: URL, inputData: Data, cwd: URL) -> JSONValue {
+        let environment = AgentBridgeRuntime.processEnvironment()
+        guard let node = AgentBridgeRuntime.executableURL(named: "node", environment: environment) else {
+            return .object([
+                "status": .string("failed"),
+                "reason": .string("node_runtime_not_found"),
+                "helper": .string(helper.path),
+            ])
+        }
+        let process = Process()
+        process.executableURL = node
+        process.arguments = [helper.path]
+        process.currentDirectoryURL = cwd
+        var childEnvironment = environment
+        if childEnvironment["NATIVE_AGENT_OMP_WAKE_BIN"] == nil,
+           let omp = AgentBridgeRuntime.executableURL(named: "omp", environment: environment) {
+            childEnvironment["NATIVE_AGENT_OMP_WAKE_BIN"] = omp.path
+        }
+        process.environment = childEnvironment
+        let stdin = Pipe()
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardInput = stdin
+        process.standardOutput = stdout
+        process.standardError = stderr
+        do { try process.run() } catch {
+            return .object([
+                "status": .string("failed"),
+                "reason": .string("helper_spawn_failed"),
+                "helper": .string(helper.path),
+                "error": .string(String(describing: error)),
+            ])
+        }
+        stdin.fileHandleForWriting.write(inputData)
+        try? stdin.fileHandleForWriting.close()
+        let deadline = Date().addingTimeInterval(30)
+        while process.isRunning, Date() < deadline { Thread.sleep(forTimeInterval: 0.05) }
+        if process.isRunning {
+            process.terminate()
+            Thread.sleep(forTimeInterval: 0.2)
+            if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+            return .object([
+                "status": .string("failed"),
+                "reason": .string("helper_timeout"),
+                "helper": .string(helper.path),
+            ])
+        }
+        let out = String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let err = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let lastLine = out.split(separator: "\n").last.map(String.init) ?? ""
+        if let data = lastLine.data(using: .utf8),
+           case .object(var object)? = try? JSONValue.parse(data) {
+            object["helper"] = .string(helper.path)
+            object["exitCode"] = .int(Int64(process.terminationStatus))
+            if !err.isEmpty { object["stderrPreview"] = .string(String(err.prefix(500))) }
+            return .object(object)
+        }
+        return .object([
+            "status": .string("failed"),
+            "reason": .string("helper_returned_no_json"),
+            "helper": .string(helper.path),
+            "exitCode": .int(Int64(process.terminationStatus)),
+            "stderrPreview": .string(String(err.prefix(500))),
+        ])
+    }
+
     // MARK: - Codex return-channel handler
     //
     // Agent calls `codex_message` when she wants to leave Codex an async
@@ -538,6 +814,83 @@ extension SwiftToolDispatcher {
             guard part.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return false }
         }
         return true
+    }
+
+    /// Repository slugs a codex_message request mentions, most-confident first.
+    ///
+    /// This exists because forgetting the `repository` parameter silently costs
+    /// the caller the whole `github-command-repository-network-v1` execution
+    /// profile: no network, no writable checkout, so Codex has zero GitHub paths
+    /// and grinds until the harness kills the turn (2026-08-05 incident, turn
+    /// 019fd2e5-0b16-7b31-bf28-1df55570c4bd). Omission must be impossible, not
+    /// merely rare.
+    ///
+    /// This widens only WHERE the slug is read from, never the trust boundary:
+    /// every candidate still goes through `GitHubCommandCheckoutResolver`, whose
+    /// anchor is the checkout's own git remote. The explicit `repository`
+    /// parameter already accepts any model-authored slug, so reading one out of
+    /// the request text grants no authority the caller did not already have.
+    static func repositorySlugCandidates(inRequestText text: String) -> [String] {
+        var urlSlugs: [String] = []
+        var bareSlugs: [String] = []
+        // github.com/<owner>/<name> is unambiguous; a bare owner/name token is a
+        // weaker signal and is only consulted when no URL names a repository.
+        for rawToken in text.split(whereSeparator: { $0.isWhitespace }) {
+            var token = String(rawToken).trimmingCharacters(
+                in: CharacterSet(charactersIn: "`\"'<>(),;:[]{}!?*")
+            )
+            if token.isEmpty { continue }
+            // Both the https path form and the SSH form git@github.com:owner/name.
+            let hostRange = token.range(of: "github.com/") ?? token.range(of: "github.com:")
+            if let range = hostRange {
+                var slug = String(token[range.upperBound...])
+                for suffix in [".git", "/pull", "/issues", "/tree", "/blob", "/commit", "/compare"] {
+                    if let cut = slug.range(of: suffix) { slug = String(slug[slug.startIndex..<cut.lowerBound]) }
+                }
+                let parts = slug.split(separator: "/").prefix(2).map(String.init)
+                if parts.count == 2 {
+                    let candidate = "\(parts[0])/\(parts[1])"
+                    if isWellFormedRepositorySlug(candidate), !urlSlugs.contains(candidate) {
+                        urlSlugs.append(candidate)
+                    }
+                }
+                continue
+            }
+            // A bare token must be exactly owner/name -- never a path fragment
+            // ("docs/build_plans" resolves to nothing, but rejecting the shape
+            // early keeps the resolver off obviously-wrong candidates).
+            if token.hasPrefix("/") || token.hasSuffix("/") { continue }
+            if token.hasSuffix(".git") { token = String(token.dropLast(4)) }
+            guard isWellFormedRepositorySlug(token) else { continue }
+            let parts = token.split(separator: "/").map(String.init)
+            guard parts.count == 2, parts[0].count >= 2, parts[1].count >= 2 else { continue }
+            if !bareSlugs.contains(token) { bareSlugs.append(token) }
+        }
+        // Cap the resolver's work: each candidate walks directories and shells
+        // out to git. A request naming a dozen slugs is not a repo request.
+        return Array((urlSlugs.isEmpty ? bareSlugs : urlSlugs).prefix(8))
+    }
+
+    /// Resolve at most ONE checkout from the request text. Ambiguity -- two
+    /// different repositories that both resolve -- yields nil and the send
+    /// proceeds with today's no-profile behavior, because guessing which
+    /// repository the caller meant would hand Codex a network-enabled writable
+    /// checkout of the wrong tree.
+    private func inferredRepositoryCheckout(fromRequestText text: String) -> String? {
+        let candidates = Self.repositorySlugCandidates(inRequestText: text)
+        guard !candidates.isEmpty else { return nil }
+        var resolved: [String] = []
+        for candidate in candidates {
+            guard let checkout = GitHubCommandCheckoutResolver.resolve(
+                repository: candidate,
+                headSHA: nil,
+                dataRoot: dataRoot
+            ) else { continue }
+            let path = checkout.standardizedFileURL.path
+            if !resolved.contains(path) { resolved.append(path) }
+            if resolved.count > 1 { return nil }
+        }
+        return resolved.count == 1 ? resolved[0] : nil
     }
 
     private enum AgentBridgeWorkingDirectoryResolution {
@@ -686,11 +1039,29 @@ extension SwiftToolDispatcher {
             return checkout.standardizedFileURL.path
         }()
 
-        let workingDirectory = dispatcherSuppliedDirectory ?? requestedDirectory ?? repositoryResolvedDirectory
+        // Trusted path C: nobody named a repository, so infer one from the
+        // request itself. Same resolver, same remote-verified trust anchor as
+        // path B -- this only removes the caller's obligation to remember the
+        // parameter, which is what cost the 2026-08-05 turn every GitHub path.
+        let inferredRepositoryDirectory: String? = {
+            guard dispatcherSuppliedDirectory == nil,
+                  requestedDirectory == nil,
+                  repositoryResolvedDirectory == nil else { return nil }
+            return inferredRepositoryCheckout(fromRequestText: [text, topic ?? ""].joined(separator: "\n"))
+        }()
+
+        let workingDirectory = dispatcherSuppliedDirectory
+            ?? requestedDirectory
+            ?? repositoryResolvedDirectory
+            ?? inferredRepositoryDirectory
         // This capability marker is created only from the trusted dispatcher
         // surface plus an app-verified checkout. It is never accepted from
-        // model-authored input, topic text, or repository-controlled prose.
-        let executionProfile = (dispatcherSuppliedDirectory != nil || repositoryResolvedDirectory != nil)
+        // model-authored input, topic text, or repository-controlled prose:
+        // the inferred path carries it only because the checkout itself was
+        // resolved by remote verification, exactly as the explicit path is.
+        let executionProfile = (dispatcherSuppliedDirectory != nil
+            || repositoryResolvedDirectory != nil
+            || inferredRepositoryDirectory != nil)
             ? "github-command-repository-network-v1"
             : nil
 
@@ -757,8 +1128,16 @@ extension SwiftToolDispatcher {
                     return object["messageId"] == .string(messageId) || object["id"] == .string(messageId)
                 }
                 if case .object(let object)? = existing {
+                    // executionProfile is part of the equality contract: a row
+                    // queued WITHOUT the network profile is not the same work
+                    // order as one queued with it. Without this, a resend that
+                    // newly resolves a repository is answered "duplicate" while
+                    // the durable row still carries no profile -- the response
+                    // would advertise a capability the queued turn never gets
+                    // (gpt-5.5 review, 2026-08-05).
                     guard object["text"] == .string(text),
-                          object["workingDirectory"] == inboxEntry["workingDirectory"] else {
+                          object["workingDirectory"] == inboxEntry["workingDirectory"],
+                          object["executionProfile"] == inboxEntry["executionProfile"] else {
                         return "conflict"
                     }
                     return "duplicate"
@@ -794,6 +1173,16 @@ extension SwiftToolDispatcher {
             "note": .string("Codex can read this through the local NativeAgent bridge inbox; NativeAgent also attempts a local Mac notification, a Codex thread wakeup, and a reply watcher that delivers Codex's final answer back through the local bridge. If Codex is already busy, the wakeup is queued until that thread is idle."),
         ]
         if let workingDirectory { response["workingDirectory"] = .string(workingDirectory) }
+        if let executionProfile {
+            // Make the auto-attach observable: a silently-applied profile is
+            // indistinguishable from a silently-missing one at the call site.
+            response["executionProfile"] = .string(executionProfile)
+            response["repositorySource"] = .string(
+                dispatcherSuppliedDirectory != nil ? "dispatcher"
+                    : repositoryResolvedDirectory != nil ? "repository_parameter"
+                    : "inferred_from_request"
+            )
+        }
         response["notification"] = await postCodexMessageArrivalNotification(
             messageId: messageId,
             text: text,

@@ -236,6 +236,12 @@ if [[ -z "$SPARKLE_GEN" ]]; then
   exit 0
 fi
 
+# The generated feed must match the repo VERSION file (sweep R4 C1), and that
+# gate has no --publish escape — so the e2e fixture is built at the repo version
+# rather than a synthetic one.
+FIXTURE_VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION")"
+[[ -n "$FIXTURE_VERSION" ]] || fail "could not read $ROOT/VERSION"
+
 WORK="$TMP_ROOT/e2e work"
 mkdir -p "$WORK/stage/NativeAgent.app/Contents/MacOS" "$WORK/out" "$WORK/host" "$WORK/bin"
 
@@ -251,7 +257,7 @@ DERIVED="$(swift "$ROOT/script/sparkle_ed_public_key.swift" "$WORK/priv.key")"
 [[ "$DERIVED" == "$PUB" ]] \
   || fail "the Swift derivation does not round-trip its own key pair ($DERIVED != $PUB)"
 APPCAST_URL="https://updates.nativeagent.test/appcast.xml"
-DMG_URL="https://dl.nativeagent.test/NativeAgent-9.9.9.dmg"
+DMG_URL="https://dl.nativeagent.test/NativeAgent-$FIXTURE_VERSION.dmg"
 cat > "$WORK/stage/NativeAgent.app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -259,8 +265,8 @@ cat > "$WORK/stage/NativeAgent.app/Contents/Info.plist" <<PLIST
   <key>CFBundleIdentifier</key><string>io.github.embwl0x.nativeagent.mac</string>
   <key>CFBundleExecutable</key><string>NativeAgentApp</string>
   <key>CFBundleName</key><string>NativeAgent</string>
-  <key>CFBundleVersion</key><string>9.9.9</string>
-  <key>CFBundleShortVersionString</key><string>9.9.9</string>
+  <key>CFBundleVersion</key><string>$FIXTURE_VERSION</string>
+  <key>CFBundleShortVersionString</key><string>$FIXTURE_VERSION</string>
   <key>SUPublicEDKey</key><string>$PUB</string>
   <key>SUFeedURL</key><string>$APPCAST_URL</string>
   <key>NativeAgentUpdateFeedPublished</key><true/>
@@ -269,7 +275,7 @@ cat > "$WORK/stage/NativeAgent.app/Contents/Info.plist" <<PLIST
 PLIST
 printf '#!/bin/sh\nexit 0\n' > "$WORK/stage/NativeAgent.app/Contents/MacOS/NativeAgentApp"
 chmod +x "$WORK/stage/NativeAgent.app/Contents/MacOS/NativeAgentApp"
-TEST_DMG="$WORK/NativeAgent-9.9.9.dmg"
+TEST_DMG="$WORK/NativeAgent-$FIXTURE_VERSION.dmg"
 hdiutil create -quiet -srcfolder "$WORK/stage" -volname NativeAgent -format UDZO -ov "$TEST_DMG" \
   || fail "could not build the synthetic test DMG"
 
@@ -343,7 +349,7 @@ run_publish() { # $1 = out subdir; echoes combined output, never aborts
       NATIVEAGENT_DMG_DOWNLOAD_URL="$DMG_URL" \
       NATIVEAGENT_APPCAST_PUBLISH_CMD="$PUBLISH_CMD" \
       NATIVEAGENT_APPCAST_VERIFY_ATTEMPTS=1 NATIVEAGENT_APPCAST_VERIFY_DELAY=0 \
-      bash "$GENERATE" --dmg "$TEST_DMG" --version 9.9.9 --out "$outdir/appcast" --publish 2>&1 )
+      bash "$GENERATE" --dmg "$TEST_DMG" --version "$FIXTURE_VERSION" --out "$outdir/appcast" --publish 2>&1 )
   set -e
 }
 
@@ -424,9 +430,88 @@ out="$( cd "$ROOT" && PATH="$WORK/bin:$PATH" NATIVEAGENT_TEST_HOST_DIR="$WORK/ho
       -u NATIVEAGENT_RELEASE_PAGE_URL -u NATIVE_AGENT_RELEASE_PAGE_URL \
   NATIVEAGENT_SPARKLE_ED_PRIV_KEY="$WORK/wrong.key" \
   NATIVEAGENT_APPCAST_URL="$APPCAST_URL" NATIVEAGENT_DMG_DOWNLOAD_URL="$DMG_URL" \
-  bash "$GENERATE" --dmg "$TEST_DMG" --version 9.9.9 --out "$WORK/out/f/appcast" 2>&1 )"
+  bash "$GENERATE" --dmg "$TEST_DMG" --version "$FIXTURE_VERSION" --out "$WORK/out/f/appcast" 2>&1 )"
 set -e
 grep -q 'SIGNING KEY MISMATCH' <<<"$out" \
   || fail "signing with a key the bundle does not trust was not refused: $out"
+
+# ---------------------------------------------------------------------------
+# 4. Sweep R4 C1/C12: the VERSION-file gate and release notes.
+# ---------------------------------------------------------------------------
+# (g) a feed version that disagrees with the repo VERSION file is refused, and
+#     the drift escape hatch can never be combined with --publish.
+set +e
+out="$( cd "$ROOT" && env -u NATIVE_AGENT_SPARKLE_ED_PRIV_KEY -u NATIVEAGENT_SPARKLE_ED_PRIV_KEY \
+  bash "$GENERATE" --dmg "$TEST_DMG" --version 0.0.0 --allow-version-drift --publish 2>&1 )"
+set -e
+grep -q -- '--allow-version-drift and --publish are mutually exclusive' <<<"$out" \
+  || fail "a published feed can still be signed with --allow-version-drift: $out"
+grep -Fq 'says $REPO_VERSION' "$GENERATE" \
+  || fail "generate_appcast.sh no longer gates the feed version against the VERSION file"
+
+# (g2) the gate must actually FIRE, not merely exist: a DMG whose bundle+feed
+#      version is internally consistent but DISAGREES with the repo VERSION file
+#      is exactly the 0.3.2-vs-0.3.7 shape that stranded users. Refused without
+#      the escape hatch; accepted with it.
+DRIFT_VERSION="9.9.9"
+[[ "$DRIFT_VERSION" != "$FIXTURE_VERSION" ]] || DRIFT_VERSION="9.9.8"
+mkdir -p "$WORK/drift stage/NativeAgent.app/Contents/MacOS" "$WORK/out/g2"
+sed -e "s/>$FIXTURE_VERSION</>$DRIFT_VERSION</g" \
+  "$WORK/stage/NativeAgent.app/Contents/Info.plist" > "$WORK/drift stage/NativeAgent.app/Contents/Info.plist"
+printf '#!/bin/sh\nexit 0\n' > "$WORK/drift stage/NativeAgent.app/Contents/MacOS/NativeAgentApp"
+chmod +x "$WORK/drift stage/NativeAgent.app/Contents/MacOS/NativeAgentApp"
+DRIFT_DMG="$WORK/NativeAgent-$DRIFT_VERSION.dmg"
+hdiutil create -quiet -srcfolder "$WORK/drift stage" -volname NativeAgent -format UDZO -ov "$DRIFT_DMG" \
+  || fail "could not build the drift-version test DMG"
+run_drift() { # $@ extra generate args; echoes combined output, never aborts
+  set +e
+  ( cd "$ROOT" && env -u NATIVE_AGENT_SPARKLE_ED_PRIV_KEY -u NATIVE_AGENT_APPCAST_URL \
+      -u NATIVE_AGENT_DMG_DOWNLOAD_URL -u NATIVE_AGENT_RELEASE_PAGE_URL \
+      -u NATIVEAGENT_RELEASE_PAGE_URL \
+    NATIVEAGENT_SPARKLE_ED_PRIV_KEY="$WORK/priv.key" \
+    NATIVEAGENT_APPCAST_URL="$APPCAST_URL" \
+    NATIVEAGENT_DMG_DOWNLOAD_URL="https://dl.nativeagent.test/NativeAgent-$DRIFT_VERSION.dmg" \
+    bash "$GENERATE" --dmg "$DRIFT_DMG" --version "$DRIFT_VERSION" "$@" 2>&1 )
+  set -e
+}
+out="$(run_drift --out "$WORK/out/g2/refused")"
+grep -q "but .*VERSION says $FIXTURE_VERSION" <<<"$out" \
+  || fail "a feed advertising $DRIFT_VERSION while VERSION says $FIXTURE_VERSION was NOT refused: $out"
+[[ ! -f "$WORK/out/g2/refused/appcast.xml" ]] \
+  || fail "the version-mismatched feed survived on disk"
+out="$(run_drift --allow-version-drift --out "$WORK/out/g2/allowed")"
+grep -q 'Appcast generated and verified' <<<"$out" \
+  || fail "--allow-version-drift does not permit a synthetic-version run: $out"
+
+# (h) release notes are embedded as a <description> and the publish still
+#     verifies — the signed enclosure must be untouched by the insertion.
+mkdir -p "$WORK/out/h"
+NOTES="$WORK/notes.md"
+printf 'Fixed the thing.\nAlso <b>escaped</b> & safe.\n' > "$NOTES"
+PUBLISH_CMD='cp "$NATIVEAGENT_PUBLISH_APPCAST" "$NATIVEAGENT_TEST_HOST_DIR/appcast.xml"; cp "$NATIVEAGENT_PUBLISH_DMG" "$NATIVEAGENT_TEST_HOST_DIR/dmg"'
+set +e
+out="$( cd "$ROOT" && PATH="$WORK/bin:$PATH" NATIVEAGENT_TEST_HOST_DIR="$WORK/host" \
+  env -u NATIVE_AGENT_SPARKLE_ED_PRIV_KEY -u NATIVE_AGENT_APPCAST_URL \
+      -u NATIVE_AGENT_DMG_DOWNLOAD_URL -u NATIVE_AGENT_RELEASE_PAGE_URL \
+      -u NATIVEAGENT_RELEASE_PAGE_URL \
+  NATIVEAGENT_SPARKLE_ED_PRIV_KEY="$WORK/priv.key" \
+  NATIVEAGENT_APPCAST_URL="$APPCAST_URL" NATIVEAGENT_DMG_DOWNLOAD_URL="$DMG_URL" \
+  NATIVEAGENT_APPCAST_PUBLISH_CMD="$PUBLISH_CMD" \
+  NATIVEAGENT_APPCAST_VERIFY_ATTEMPTS=1 NATIVEAGENT_APPCAST_VERIFY_DELAY=0 \
+  bash "$GENERATE" --dmg "$TEST_DMG" --version "$FIXTURE_VERSION" --notes "$NOTES" \
+       --out "$WORK/out/h/appcast" --publish 2>&1 )"
+set -e
+grep -q 'Published and VERIFIED live' <<<"$out" \
+  || fail "a publish carrying release notes was rejected: $out"
+grep -q '<description>' "$WORK/out/h/appcast/appcast.xml" \
+  || fail "release notes were not embedded in the feed"
+grep -q 'Fixed the thing' "$WORK/out/h/appcast/appcast.xml" \
+  || fail "the embedded description does not carry the notes text"
+[[ "$(grep -c '<item>' "$WORK/out/h/appcast/appcast.xml")" == "1" ]] \
+  || fail "embedding notes changed the feed item count"
+grep -q 'sparkle:edSignature' "$WORK/out/h/appcast/appcast.xml" \
+  || fail "the signed enclosure did not survive the notes insertion"
+[[ ! -e "$WORK/out/h/appcast/.release-notes.fragment" ]] \
+  || fail "the notes fragment was left in the publishable output directory"
 
 echo "[test] sparkle publish ordering + verification guards OK"

@@ -537,13 +537,19 @@ public enum ChatSessionRetention {
     private struct PruneMark {
         let at: Date
         let stamp: ArchiveTierStamp
+        /// How many passes have actually scanned this root. Lives inside the
+        /// mark so the count is per-root — a process-global counter made the
+        /// throttle tests racy under parallel suite execution, because every
+        /// suite's temp-root prunes incremented one shared number.
+        let runCount: Int
     }
 
     private static let pruneStateLock = NSLock()
     nonisolated(unsafe) private static var pruneMarks: [String: PruneMark] = [:]
-    /// Bound on distinct data roots tracked at once — every insert has a
-    /// matching eviction, so a process that walks many temp roots (the test
-    /// suite) cannot grow this map without limit.
+    /// Bound on distinct data roots tracked at once — inserting a new root at
+    /// the cap evicts the stalest mark, so a process that walks many temp
+    /// roots (the test suite) cannot grow this map without limit, and live
+    /// roots' marks survive the churn.
     private static let pruneMarksMax = 16
 
     private static func archiveTierStamp(_ archiveDir: URL) -> ArchiveTierStamp {
@@ -578,21 +584,23 @@ public enum ChatSessionRetention {
            now >= mark.at {
             return false
         }
-        if pruneMarks[key] == nil, pruneMarks.count >= pruneMarksMax {
-            pruneMarks.removeAll()
-        }
-        pruneMarks[key] = PruneMark(at: now, stamp: stamp)
-        pruneRunCount += 1
+        evictStalestMarkIfAtCapLocked(insertingKey: key)
+        let priorRuns = pruneMarks[key]?.runCount ?? 0
+        pruneMarks[key] = PruneMark(at: now, stamp: stamp, runCount: priorRuns + 1)
         return true
     }
 
-    /// Test seam: how many passes actually scanned the tier.
-    nonisolated(unsafe) private static var pruneRunCount = 0
-
-    public static func _archivePruneRunCountForTesting() -> Int {
+    /// Test seam: how many passes actually scanned THIS root's tier. Per-root
+    /// so parallel suites pruning their own temp roots cannot perturb each
+    /// other's readings.
+    public static func _archivePruneRunCountForTesting(dataRoot: URL) -> Int {
+        let key = dataRoot
+            .appendingPathComponent("chat", isDirectory: true)
+            .appendingPathComponent("archive", isDirectory: true)
+            .resolvingSymlinksInPath().path
         pruneStateLock.lock()
         defer { pruneStateLock.unlock() }
-        return pruneRunCount
+        return pruneMarks[key]?.runCount ?? 0
     }
 
     /// Stamp with the tier as it stood BEFORE the scan (caller captures it).
@@ -602,17 +610,28 @@ public enum ChatSessionRetention {
     private static func notePruneCompleted(archiveDir: URL, now: Date, stamp: ArchiveTierStamp) {
         let key = archiveDir.resolvingSymlinksInPath().path
         pruneStateLock.lock()
-        pruneMarks[key] = PruneMark(at: now, stamp: stamp)
+        // If the key was evicted while the pass ran, the reinsert restarts the
+        // run count at this pass — the history is gone with the mark. Accepted:
+        // the count is a test seam, and product behaviour (when to prune) never
+        // reads it.
+        evictStalestMarkIfAtCapLocked(insertingKey: key)
+        let priorRuns = pruneMarks[key]?.runCount ?? 1
+        pruneMarks[key] = PruneMark(at: now, stamp: stamp, runCount: priorRuns)
         pruneStateLock.unlock()
     }
 
-    /// TEST HOOK ONLY: forget every prune deadline (a fresh-process
-    /// equivalent). Never called by product code.
-    public static func _resetArchivePruneThrottleForTesting() {
-        pruneStateLock.lock()
-        pruneMarks.removeAll()
-        pruneRunCount = 0
-        pruneStateLock.unlock()
+    /// Caller must hold `pruneStateLock`. Evicts the stalest root's mark when
+    /// inserting a NEW key would exceed the cap. A blanket removeAll here
+    /// wiped LIVE marks belonging to other roots mid-interval — under
+    /// parallel test execution that re-armed another suite's prune inside its
+    /// throttle window and made the skip tests flaky. Dropping a mark can
+    /// only cause an extra prune, never a skip, so the throttle's latency
+    /// bound is unchanged.
+    private static func evictStalestMarkIfAtCapLocked(insertingKey key: String) {
+        if pruneMarks[key] == nil, pruneMarks.count >= pruneMarksMax,
+           let oldest = pruneMarks.min(by: { $0.value.at < $1.value.at })?.key {
+            pruneMarks.removeValue(forKey: oldest)
+        }
     }
 
     private static func isStaleEmpty(

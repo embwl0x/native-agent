@@ -121,7 +121,7 @@ extension SchedulerDueJobRunner {
             "title": .string(NativeAppSecretRedactor.redactText(title)),
             "detail": .string(NativeAppSecretRedactor.redactText(String(detail.prefix(1000)))),
             "status": .string(status),
-            "missionId": .null,
+            "executionId": .null,
             "payload": NativeAppSecretRedactor.redactValue(.object(payloadObj)),
             "createdAt": .string(Self.iso(Date())),
         ])

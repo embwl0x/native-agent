@@ -71,8 +71,12 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         executionRecordsRoot.appendingPathComponent(id, isDirectory: true)
     }
 
+    /// Resolved record path: `execution.json`, falling back to a legacy
+    /// `mission.json` for a directory the P2-1 rename pass hasn't reached
+    /// (crash mid-migration, iCloud straggler). A directory with neither
+    /// resolves to the canonical name, so submit() writes `execution.json`.
     public nonisolated func executionRecordPath(_ id: String) -> URL {
-        workshopExecutionDir(id).appendingPathComponent("mission.json")
+        ExecutionRecordFile.resolve(in: workshopExecutionDir(id))
     }
 
     public nonisolated func timelinePath(_ id: String) -> URL {
@@ -164,7 +168,12 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     ///   - otherwise -> retired truthiness of `enabled`.
     public static func workshopPolicyAllows(_ policy: [String: JSONValue]) -> Bool {
         if WorkshopExecutionUpdate.pyTruthy(policy["developerMode"]) { return true }
-        let mpRaw = policy["missionPolicy"]
+        // Wave 4 read-both (phase A): accept the FUTURE `workshopPolicy`
+        // spelling, falling back to the on-wire `missionPolicy`. Every writer
+        // still emits the old key, so on a real policy this resolves to exactly
+        // the same value it did before — and a policy that carries ONLY the new
+        // key can no longer read as "absent → allow" (a fail-OPEN).
+        let mpRaw = WorkshopPolicyBlockVocabulary.block(policy)
         if mpRaw == nil {
             return true   // missionPolicy absent → merged default enabled=true
         }
@@ -235,8 +244,11 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         var count = 0
         for dir in subdirs {
             let marker = dir.appendingPathComponent(".reserved")
+            // EITHER record name counts as "the durable write landed" — a
+            // canonical-only probe would read an unmigrated dir as a live
+            // reservation and leak an admission slot for 10 minutes.
             guard fm.fileExists(atPath: marker.path),
-                  !fm.fileExists(atPath: dir.appendingPathComponent("mission.json").path) else {
+                  !ExecutionRecordFile.exists(in: dir, fileManager: fm) else {
                 continue
             }
             let mtime = (try? marker.resourceValues(forKeys: [.contentModificationDateKey])
@@ -283,7 +295,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
             "title": .string(NativeAgentSecretRedactor.redactText(title)),
             "detail": .string(NativeAgentSecretRedactor.redactText(detail)),
             "status": .string(status),
-            "missionId": executionId.map { JSONValue.string($0) } ?? .null,
+            "executionId": executionId.map { JSONValue.string($0) } ?? .null,
             "payload": NativeAgentSecretRedactor.redactValue(payload),
             "createdAt": .string(Self.isoTimestamp(now())),
         ])
@@ -682,7 +694,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
             detail: titleTrunc,
             status: "ok",
             executionId: id,
-            payload: .object(["missionId": .string(id)])
+            payload: .object(["executionId": .string(id)])
         )
 
         try Task.checkCancellation() // cancel after the write+activity should NOT fire the detached auto-start
@@ -1065,7 +1077,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         for sub in entries {
             let isDir = (try? sub.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
             guard isDir else { continue }
-            let mp = sub.appendingPathComponent("mission.json")
+            let mp = ExecutionRecordFile.resolve(in: sub, fileManager: fm)
             let raw = await persistence.readJSON(mp, defaultValue: .null)
             guard case .object(let obj) = raw, case .string(let gotId)? = obj["id"], !gotId.isEmpty else {
                 continue

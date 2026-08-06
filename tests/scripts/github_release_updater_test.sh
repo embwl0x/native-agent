@@ -58,6 +58,44 @@ exit 1
 STUB
 chmod +x "$TMP/bin/gh"
 
+# Sweep R4 C1: the publisher now creates and pushes the release tag v$VERSION
+# (gh --target only ever made the tag on the remote, so the repo carried none).
+# git is stubbed so this test can PROVE the tag work happens without touching
+# the real repository or a real remote.
+cat > "$TMP/bin/git" <<'GITSTUB'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "$*" >> "$GIT_CALLS"
+args=( "$@" )
+# Drop a leading `-C <path>`; every call the publisher makes uses it.
+if [[ "${args[0]:-}" == "-C" ]]; then args=( "${args[@]:2}" ); fi
+case "${args[0]:-} ${args[1]:-}" in
+  "rev-parse HEAD") printf '%s\n' "$GIT_HEAD"; exit 0 ;;
+  "remote -v")
+    printf 'origin\thttps://github.com/%s.git\t(fetch)\n' "$NATIVEAGENT_GITHUB_REPOSITORY"
+    printf 'origin\thttps://github.com/%s.git\t(push)\n' "$NATIVEAGENT_GITHUB_REPOSITORY"
+    exit 0 ;;
+esac
+case "${args[0]:-}" in
+  rev-list)
+    [[ -f "$GIT_STATE/local-tag" ]] || exit 128
+    cat "$GIT_STATE/local-tag"; exit 0 ;;
+  tag)
+    printf '%s\n' "${args[${#args[@]}-1]}" > "$GIT_STATE/local-tag"; exit 0 ;;
+  ls-remote)
+    if [[ -f "$GIT_STATE/remote-tag" ]]; then
+      printf '%s\trefs/tags/%s^{}\n' "$(cat "$GIT_STATE/remote-tag")" "${args[${#args[@]}-1]}"
+    fi
+    exit 0 ;;
+  push)
+    [[ -f "$GIT_STATE/local-tag" ]] || { echo "no local tag to push" >&2; exit 1; }
+    cp "$GIT_STATE/local-tag" "$GIT_STATE/remote-tag"; exit 0 ;;
+esac
+exit 1
+GITSTUB
+chmod +x "$TMP/bin/git"
+mkdir -p "$TMP/gitstate"
+
 APPCAST="$TMP/appcast.xml"
 DMG="$TMP/NativeAgent-9.9.9.dmg"
 cat > "$APPCAST" <<'XML'
@@ -72,6 +110,9 @@ HEAD="$(git -C "$ROOT" rev-parse HEAD)"
 COMMON_ENV=(
   PATH="$TMP/bin:$PATH"
   GH_CALLS="$TMP/gh.calls"
+  GIT_CALLS="$TMP/git.calls"
+  GIT_STATE="$TMP/gitstate"
+  GIT_HEAD="$HEAD"
   GH_REMOTE="$TMP/remote"
   NATIVEAGENT_GITHUB_REPOSITORY="acme/NativeAgent"
   NATIVEAGENT_GITHUB_TARGET_COMMIT="$HEAD"
@@ -100,6 +141,19 @@ cmp -s "$DMG" "$TMP/remote/NativeAgent-9.9.9.dmg" || fail "published DMG bytes d
 grep -q '^release create ' "$TMP/gh.calls" || fail "publisher did not create a draft release"
 grep -q '^release download ' "$TMP/gh.calls" || fail "publisher did not read back draft assets"
 grep -q '^release edit ' "$TMP/gh.calls" || fail "publisher did not publish the verified draft"
+# The release tag must exist locally AND on the remote, at the release commit.
+grep -q '^-C .* tag -a v9.9.9 ' "$TMP/git.calls" \
+  || fail "publisher did not create the release tag v9.9.9"
+grep -q '^-C .* push origin refs/tags/v9.9.9' "$TMP/git.calls" \
+  || fail "publisher did not push the release tag"
+[[ "$(cat "$TMP/gitstate/remote-tag")" == "$HEAD" ]] \
+  || fail "the pushed tag does not point at the release commit"
+grep -q 'Release tag v9.9.9 is live' "$TMP/public.log" \
+  || fail "publisher did not report the tag as live"
+# The tag step must run BEFORE anything is published, so a tag failure aborts
+# while nothing is live.
+awk '/tag -a v9.9.9/ { t=NR } END { exit !t }' "$TMP/git.calls" \
+  || fail "no tag creation recorded"
 
 # Retry is idempotent only when both already-public assets are byte-identical.
 : > "$TMP/gh.calls"

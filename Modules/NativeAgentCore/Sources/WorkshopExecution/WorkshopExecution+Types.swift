@@ -581,7 +581,7 @@ public struct WorkshopExecutionUpdate: Sendable, Equatable {
                 return nil
             }
         }
-        let id = str("id") ?? str("mission_id") ?? ""
+        let id = str("id") ?? str("execution_id") ?? str("mission_id") ?? ""
         // `summary` is the alias Python reads FIRST for `result`, joined by
         // Python's `or` (FALSY-fallback, not nil-fallback):
         //   str(body.get("summary") or body.get("result") or qm.result or "")

@@ -105,6 +105,31 @@ struct ChatMessageMetadata: Codable, Hashable {
         case attachments
     }
 
+    /// Empty metadata. Declaring `init(from:)` in the body suppresses the
+    /// synthesized memberwise init, so callers that need to stamp a single
+    /// field (the synthetic-error bubbles below) had no way to build one.
+    init() {}
+
+    /// Metadata for an in-memory synthetic failure bubble. `error` is the field
+    /// `messageNeedsRetry` (ChatMessageListView) reads, so stamping it is what
+    /// makes the "Try again" affordance the bubble's own copy names actually
+    /// render (sweep R4 C7). `userRowPersisted` records whether the ORIGINAL
+    /// turn wrote the user's message to the transcript before failing — the
+    /// no-provider guard bails out before client.chat ever runs, so retrying
+    /// that bubble with suppressUserAppend would lose the user's message from
+    /// the persisted thread (gpt-5.5 review 2026-08-06, blocking). In-memory
+    /// only: deliberately NOT in CodingKeys, so it never touches the wire.
+    static func syntheticError(_ message: String, userRowPersisted: Bool = true) -> ChatMessageMetadata {
+        var metadata = ChatMessageMetadata()
+        metadata.error = message
+        metadata.syntheticUserRowPersisted = userRowPersisted
+        return metadata
+    }
+
+    /// See `syntheticError(_:userRowPersisted:)`. Nil on every decoded row —
+    /// only synthetic in-memory bubbles carry it.
+    var syntheticUserRowPersisted: Bool?
+
     // Decode `input` dict as JSON string so we stay Codable without Any.
     // PATCH-2026-05-08: review-fix-B Cap big strings at decode time so a tool
     // returning a 500KB blob doesn't blow up SwiftUI rendering or memory.

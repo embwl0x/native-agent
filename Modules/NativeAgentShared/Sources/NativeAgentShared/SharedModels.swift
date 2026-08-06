@@ -19,7 +19,43 @@ public struct ActivityEvent: Identifiable, Codable, Hashable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case id, kind, title, detail, status, createdAt
-        case executionId = "missionId" // compatibility wire ID
+        case executionId // encodes as "executionId" (P2-2 de-mission)
+        case legacyExecutionId = "missionId" // decode-only fallback — FOREVER, see below
+    }
+}
+
+// P2-2 de-mission: activity rows are Mac-local (<root>/activity/events.jsonl,
+// never synced to iOS — no iOS target references ActivityEvent and the MacSync
+// snapshot carries no activity), so the writer flips to "executionId" now.
+//
+// The "missionId" read-fallback is PERMANENT, not a migration window: 4762
+// historical rows in the live events.jsonl carry the old key, the log is
+// append-only and never rewritten, and `getActivity()` tails it. Removing the
+// fallback silently blanks executionId on every one of those rows.
+extension ActivityEvent {
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(String.self, forKey: .id)
+        self.kind = try c.decode(String.self, forKey: .kind)
+        self.title = try c.decode(String.self, forKey: .title)
+        self.detail = try c.decodeIfPresent(String.self, forKey: .detail)
+        self.status = try c.decode(String.self, forKey: .status)
+        self.createdAt = try c.decode(String.self, forKey: .createdAt)
+        // New key first; legacy rows fall back. Absent/null in both -> nil,
+        // exactly as before the flip (the field has always been optional).
+        self.executionId = try c.decodeIfPresent(String.self, forKey: .executionId)
+            ?? c.decodeIfPresent(String.self, forKey: .legacyExecutionId)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(kind, forKey: .kind)
+        try c.encode(title, forKey: .title)
+        try c.encodeIfPresent(detail, forKey: .detail)
+        try c.encode(status, forKey: .status)
+        try c.encode(createdAt, forKey: .createdAt)
+        try c.encodeIfPresent(executionId, forKey: .executionId) // new key ONLY
     }
 }
 

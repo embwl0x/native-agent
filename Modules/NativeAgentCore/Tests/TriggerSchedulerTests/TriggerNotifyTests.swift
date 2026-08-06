@@ -248,7 +248,7 @@ struct NotifyDispatchSuite {
         let e = try #require(events.first)
         #expect(str(e["status"]) == "ok")
         #expect(str(e["title"]) == "Morning brief — Thursday, March 5")
-        #expect(e["missionId"] == .null)
+        #expect(e["executionId"] == .null)
         let p = payload(e)
         #expect(p["notified"] == .bool(true))
         #expect(p["placeholder"] == .bool(false))

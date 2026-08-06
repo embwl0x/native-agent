@@ -1,5 +1,6 @@
 import Foundation
 import MacControl
+import NativeAgentCore
 import PersistenceCore
 
 extension SwiftNativeSecurityCenter {
@@ -58,14 +59,15 @@ extension SwiftNativeSecurityCenter {
     /// P2-3: `workshop` is the canonical Workshop surface; `mission`/`missions`
     /// stay for turns that still arrive on the 0.3.x spelling. Dropping either
     /// makes full-mac yolo quietly stop elevating Workshop builder steps.
-    static let fullMacYoloLocalSurfaces: Set<String> = [
-        "chat",
-        "codex-bridge",
-        "claude-bridge",
-        "workshop",
-        "mission",
-        "missions",
-    ]
+    ///
+    /// Wave 5b: the Workshop spellings come from
+    /// `WorkshopSurfaceVocabulary.gateSpellings` rather than being open-coded
+    /// here, per this vocabulary's own rule (no caller may hand-write an
+    /// `== "missions"` check). Same three strings, same membership.
+    static let fullMacYoloLocalSurfaces: Set<String> = Set(
+        ["chat", "codex-bridge", "claude-bridge"]
+            + WorkshopSurfaceVocabulary.gateSpellings
+    )
 
     static let fullMacYoloTrustedRemoteSurfaces: Set<String> = [
         "telegram",

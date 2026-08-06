@@ -778,7 +778,7 @@ private func readJSONLFile(_ url: URL) -> [JSONValue] {
     #expect(a["title"] == .string("Research lab run"))
     #expect(a["detail"] == .string("quantum"))
     #expect(a["status"] == .string("ok"))
-    #expect(a["missionId"] == JSONValue.null)
+    #expect(a["executionId"] == JSONValue.null)
     guard case .object(let ap) = a["payload"] ?? .null else { Issue.record("no payload"); return }
     #expect(ap["researchRunId"] == .string("run-1"))
     #expect(ap["sourceCount"] == .int(2))

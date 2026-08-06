@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import PersistenceCore
 import WorkshopExecution
 
@@ -386,6 +387,55 @@ struct DeskView: View {
     // W2b: the GitHub Command operational lane (workshop-github-command.md).
     @State private var githubLane: DeskLaneState<GitHubCommandItem> = .rows([])
 
+    // MARK: W5 — the interaction tier (sweep R4, desk interaction)
+    //
+    // ADDITIVE BY CONTRACT: with `selectedHandle == nil` every byte of the
+    // render below is what it was before this wave. Glance mode is untouched;
+    // the action bar, the highlight and the row affordances appear only once
+    // User has actually picked something. Agent maintains, User glances — and now
+    // User can also act.
+    @State private var selectedHandle: String?
+    @State private var noteDraft: String = ""
+    @State private var showingNoteField = false
+    @State private var showingDeferOptions = false
+    @FocusState private var noteFieldFocused: Bool
+    @State private var showingPalette = false
+    @State private var showingNagsPanel = false
+    @State private var nagConfig = DeskNagConfig()
+    @State private var actionInFlight = false
+    @State private var actionNotice: DeskActionNotice?
+    @FocusState private var benchFocused: Bool
+
+    /// A one-line receipt for the last action — the tool's OWN confirmation
+    /// string (or its honest refusal), never a UI-invented "Done".
+    private struct DeskActionNotice: Equatable {
+        let text: String
+        let isError: Bool
+    }
+
+    /// The mutation seam. Same dispatcher, same `impl_desk_*` functions, same
+    /// ledger as the chat tools — see DeskQuickActions.swift.
+    private var actionRouter: DeskToolDispatchRouter { DeskToolDispatchRouter(dataRoot: dataRoot) }
+
+    /// Every handle that can take the selection, in render order.
+    private var selectionOrder: [String] {
+        DeskBoardLayout.selectableHandles(items: items, expandedRoots: expandedRoots)
+    }
+
+    private var selectedItem: DeskItem? {
+        guard let selectedHandle else { return nil }
+        return items.first { $0.handle == selectedHandle }
+    }
+
+    /// The palette's pool is EVERY live item, not `selectionOrder` — search
+    /// exists precisely to reach the rows that are collapsed out of sight, and
+    /// `select(_:)` opens whatever family the match lives in before scrolling.
+    /// Scoping the pool to what is already on screen would make ⌘K useless for
+    /// exactly the items it is most needed for.
+    private var paletteRows: [DeskPaletteRow] {
+        activeItems.map(DeskPaletteRow.init(item:))
+    }
+
     // Lane unwrapping happens in ONE place: every slice below reads rows, and
     // the sections read the reason. A lane that failed contributes zero rows AND
     // renders its own unavailable notice — it never contributes silent emptiness.
@@ -403,30 +453,20 @@ struct DeskView: View {
 
     // MARK: section slices
 
-    private var activeItems: [DeskItem] { items.filter { !$0.status.isTerminal } }
+    // W5: the partition itself moved to `DeskBoardLayout` (DeskInteraction.swift)
+    // so the selection order is derived from the SAME definition this surface
+    // renders from. A second copy would let arrow-down land on a row that isn't
+    // on screen — which is exactly how a keyboard surface starts feeling broken.
+    private var activeItems: [DeskItem] { DeskBoardLayout.activeItems(items) }
     private var doneItems: [DeskItem] { items.filter { $0.status.isTerminal } }
 
-    private var pursuitItems: [DeskItem] { activeItems.filter(\.isPursuit) }
+    private var pursuitItems: [DeskItem] { DeskBoardLayout.pursuits(activeItems) }
 
-    // Partition over activeItems (disjoint + exhaustive — no item may vanish):
-    // pursuits claim first; watches and board both gate !isPursuit and board
-    // negates the exact watch predicate, so pursuits ∪ watches ∪ board =
-    // activeItems. Inside board, kind == .gh is the sole discriminator.
-    private static func isWatchShaped(_ item: DeskItem) -> Bool {
-        item.kind == .watch || item.status == .watch
-    }
-    private var watchItems: [DeskItem] {
-        activeItems.filter { !$0.isPursuit && Self.isWatchShaped($0) }
-    }
-    private var boardItems: [DeskItem] {
-        activeItems.filter { !$0.isPursuit && !Self.isWatchShaped($0) }
-    }
-    private var boardNonGhItems: [DeskItem] { boardItems.filter { $0.kind != .gh } }
-    private var ghItems: [DeskItem] { boardItems.filter { $0.kind == .gh } }
+    private var watchItems: [DeskItem] { DeskBoardLayout.watches(activeItems) }
+    private var boardItems: [DeskItem] { DeskBoardLayout.board(activeItems) }
+    private var boardNonGhItems: [DeskItem] { DeskBoardLayout.boardNonGh(boardItems) }
     private var ghByProject: [(project: String, items: [DeskItem])] {
-        Dictionary(grouping: ghItems, by: \.project)
-            .map { (project: $0.key, items: $0.value) }
-            .sorted { $0.project < $1.project }
+        DeskBoardLayout.ghByProject(boardItems)
     }
 
     // Blocked/flagged PURSUITS belong in the attention strip too (review
@@ -475,6 +515,52 @@ struct DeskView: View {
     }
 
     var body: some View {
+        ScrollViewReader { proxy in
+            benchScroll
+                // Selection drives the scroll for EVERY path that sets it —
+                // arrows, a palette match, a blocker pill. One rule, so
+                // "select it" and "show it to me" can never diverge.
+                .onChange(of: selectedHandle) { _, new in
+                    guard let new else { return }
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        proxy.scrollTo(new, anchor: .center)
+                    }
+                }
+        }
+        .navigationTitle("Workshop")
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button { showingPalette = true } label: { Image(systemName: "command") }
+                    .help("Find or act on a desk item (\u{2318}K)")
+                    .keyboardShortcut("k", modifiers: .command)
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button { Task { await load() } } label: { Image(systemName: "arrow.clockwise") }
+                    .help("Refresh the bench")
+            }
+        }
+        .sheet(isPresented: $showingPalette) {
+            DeskCommandPaletteView(
+                rows: paletteRows,
+                selectedHandle: selectedHandle,
+                onSelect: { select($0) },
+                onCommand: { verb, handle in applyPaletteCommand(verb, handle: handle) },
+                isPresented: $showingPalette)
+        }
+        .task {
+            let reloader = DeskLiveReloader.shared
+            reloader.setSceneActive(scenePhase == .active)
+            reloader.activate(
+                paths: [store.opsPath, GitHubCommandStore(dataRoot: dataRoot).opsPath]
+            ) { await load() }
+        }
+        .onDisappear { DeskLiveReloader.shared.deactivate() }
+        .onChange(of: scenePhase) { _, phase in
+            DeskLiveReloader.shared.setSceneActive(phase == .active)
+        }
+    }
+
+    private var benchScroll: some View {
         ScrollView {
             // Lazy: the board's history sections can hold hundreds of rows;
             // only what scrolls into view is built (NEEDS_FIX 4).
@@ -511,24 +597,391 @@ struct DeskView: View {
             .padding(20)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .navigationTitle("Workshop")
-        .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                Button { Task { await load() } } label: { Image(systemName: "arrow.clockwise") }
-                    .help("Refresh the bench")
+        // Keyboard-first mutation — the whole point of this wave. EVERY binding
+        // here also has a mouse affordance (the selection bar's buttons, the
+        // row taps, the ⌘K toolbar button), so nothing is keyboard-only.
+        //
+        // The letter keys are guarded on `noteFieldFocused`: with the note field
+        // open, "c" is a character User is typing, not a close.
+        //
+        // The bench takes key focus on appear. Without it the arrows do nothing
+        // until User happens to tab into the scroll view, and a keyboard surface
+        // that needs a Tab first reads as a keyboard surface that is broken.
+        .focusable()
+        .focusEffectDisabled()
+        .focused($benchFocused)
+        .onAppear { benchFocused = true }
+        // Pinned action bar: the selected row can be a thousand points down the
+        // board, so its affordances live in a bottom inset that is always on
+        // screen — not inline at the top where `n` would open a note field User
+        // can't see. Renders NOTHING when there is no selection and no notice,
+        // so glance mode keeps its exact former geometry.
+        .safeAreaInset(edge: .bottom, spacing: 0) { selectionInspector }
+        .onKeyPress(.upArrow) { moveSelection(-1) }
+        .onKeyPress(.downArrow) { moveSelection(1) }
+        .onKeyPress(.escape) {
+            guard showingNoteField || showingDeferOptions || selectedHandle != nil
+                    || actionNotice != nil else { return .ignored }
+            clearInteraction()
+            return .handled
+        }
+        .onKeyPress(keys: [KeyEquivalent("k")], phases: .down) { press in
+            // Click-through 2026-08-06: with the bench .focusable holding key
+            // focus, the toolbar button's .keyboardShortcut("k", .command)
+            // never fired — the focused view swallows the key equivalent. The
+            // palette must open from the keyboard (that IS the feature), so
+            // handle it here too; the toolbar shortcut stays for when focus
+            // is elsewhere.
+            guard press.modifiers.contains(.command) else { return .ignored }
+            showingPalette = true
+            return .handled
+        }
+        .onKeyPress("c") { quickKey { closeSelected() } }
+        .onKeyPress("d") { quickKey { beginDefer() } }
+        .onKeyPress("n") { quickKey { beginNote() } }
+        .onChange(of: items) { _, _ in
+            // A row that closed, collapsed away or was archived must not keep
+            // the caret: `c` would then fire on something User can't see.
+            selectedHandle = DeskSelection.reconcile(selectedHandle, order: selectionOrder)
+        }
+        // NOTE: the live-reloader activation stays on `body` (with its paired
+        // onDisappear/scenePhase handlers). Attaching a second `.task` here
+        // would activate the reloader TWICE per appearance — one watcher per
+        // view layer, both calling load().
+        .task { await refreshNagConfig() }
+    }
+
+    // MARK: W5 — keyboard plumbing
+
+    /// A letter shortcut fires only when a row is selected AND the note field
+    /// isn't eating keystrokes. Guards on `showingNoteField` (set
+    /// SYNCHRONOUSLY by beginNote) as well as the focus binding — focus lands
+    /// ~20ms later, and a fast `n`-then-`c` in that window would have closed
+    /// the item User was about to annotate (review blocking #3).
+    private func quickKey(_ body: () -> Void) -> KeyPress.Result {
+        guard selectedHandle != nil, !noteFieldFocused, !showingNoteField,
+              !showingDeferOptions else { return .ignored }
+        body()
+        return .handled
+    }
+
+    private func moveSelection(_ delta: Int) -> KeyPress.Result {
+        let order = selectionOrder
+        guard !order.isEmpty else { return .ignored }
+        guard !noteFieldFocused else { return .ignored }
+        let next = DeskSelection.move(from: selectedHandle, by: delta, in: order)
+        guard next != selectedHandle else { return .handled }
+        // Both affordances close on a move: a defer menu or note field left
+        // open would now be pointing at a row User just walked away from.
+        showingNoteField = false
+        showingDeferOptions = false
+        noteDraft = ""
+        selectedHandle = next
+        return .handled
+    }
+
+    /// Esc: drop the open affordance first, then the selection. Two escapes to
+    /// leave glance mode from a half-typed note, one from a bare selection.
+    private func clearInteraction() {
+        if showingNoteField || showingDeferOptions {
+            showingNoteField = false
+            showingDeferOptions = false
+            noteDraft = ""
+            return
+        }
+        selectedHandle = nil
+        actionNotice = nil
+    }
+
+    // MARK: W5 — selection
+
+    /// The ONE way the caret moves. Opens whatever families the row is buried
+    /// in first, so `scrollTo` has something to scroll to — a selection that
+    /// can't be seen is worse than no selection.
+    private func select(_ handle: String) {
+        // Terminal rows are NOT selectable — close/defer/note on something
+        // already closed is meaningless, and `finishedSection` shares
+        // `groupView` with the board. Glance mode for history stays glance-only.
+        guard DeskBoardLayout.activeItems(items).contains(where: { $0.handle == handle })
+        else { return }
+        let keys = DeskBoardLayout.revealKeys(for: handle, items: items)
+        if !keys.isEmpty {
+            withAnimation(.easeInOut(duration: 0.15)) {
+                for key in keys { expandedRoots.insert(key) }
             }
         }
-        .task {
-            let reloader = DeskLiveReloader.shared
-            reloader.setSceneActive(scenePhase == .active)
-            reloader.activate(
-                paths: [store.opsPath, GitHubCommandStore(dataRoot: dataRoot).opsPath]
-            ) { await load() }
+        showingNoteField = false
+        showingDeferOptions = false
+        selectedHandle = handle
+    }
+
+    /// Row tap: pick it, or drop the selection when it's already the one.
+    private func toggleSelection(_ handle: String) {
+        if selectedHandle == handle {
+            selectedHandle = nil
+            showingNoteField = false
+            showingDeferOptions = false
+        } else {
+            select(handle)
         }
-        .onDisappear { DeskLiveReloader.shared.deactivate() }
-        .onChange(of: scenePhase) { _, phase in
-            DeskLiveReloader.shared.setSceneActive(phase == .active)
+    }
+
+    // MARK: W5 — the pinned selection inspector (mouse parity for every shortcut)
+
+    /// The bottom inset. Empty — genuinely zero-height, no divider, no material
+    /// — whenever there is nothing selected and nothing to report, which is the
+    /// whole of glance mode.
+    @ViewBuilder
+    private var selectionInspector: some View {
+        if selectedItem != nil || actionNotice != nil {
+            VStack(alignment: .leading, spacing: 8) {
+                Divider()
+                actionNoticeRow
+                selectionBar
+            }
+            .padding(.horizontal, 20)
+            .padding(.bottom, 12)
+            .background(.regularMaterial)
         }
+    }
+
+    @ViewBuilder
+    private var selectionBar: some View {
+        if let item = selectedItem {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    statusPill(item.status)
+                    Text(item.title).font(.callout.weight(.semibold)).lineLimit(1)
+                    Text(item.alias)
+                        .font(.caption2.monospaced()).foregroundStyle(.tertiary)
+                    Spacer(minLength: 8)
+                    if actionInFlight {
+                        ProgressView().controlSize(.small)
+                    }
+                    Button { closeSelected() } label: { Label("Close", systemImage: "checkmark.circle") }
+                        .help("Close this item (c)")
+                    Button { beginDefer() } label: { Label("Defer", systemImage: "pause.circle") }
+                        .help("Park this item (d)")
+                    Button { beginNote() } label: { Label("Note", systemImage: "text.bubble") }
+                        .help("Add a note (n)")
+                    Button { clearInteraction() } label: { Image(systemName: "xmark") }
+                        .help("Clear the selection (esc)")
+                }
+                .disabled(actionInFlight)
+                if showingDeferOptions { deferOptionsRow(item) }
+                if showingNoteField { noteFieldRow(item) }
+                // Refs are an affordance, not glance chrome: they appear on the
+                // SELECTED row only. A ref that carries a URL opens; a bare ref
+                // (file path, sha, trace id) copies — clicking and getting
+                // nothing is the worst of the three outcomes.
+                if !item.refs.isEmpty { refsRow(item) }
+            }
+            .padding(12)
+            .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(Color.accentColor.opacity(0.28), lineWidth: 1))
+        }
+    }
+
+    private func deferOptionsRow(_ item: DeskItem) -> some View {
+        HStack(spacing: 8) {
+            Text("Park until").font(.caption).foregroundStyle(.secondary)
+            ForEach(DeskDeferPreset.allCases) { preset in
+                Button(preset.label) {
+                    perform(.defer_(handle: item.handle, until: preset.day(from: Date())))
+                }
+                .controlSize(.small)
+            }
+            if item.deferUntil?.isEmpty == false {
+                Button("Un-park") { perform(.defer_(handle: item.handle, until: nil)) }
+                    .controlSize(.small)
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    private func noteFieldRow(_ item: DeskItem) -> some View {
+        HStack(spacing: 8) {
+            TextField("Note…", text: $noteDraft)
+                .textFieldStyle(.roundedBorder)
+                .focused($noteFieldFocused)
+                .onSubmit { submitNote(item) }
+            Button("Add") { submitNote(item) }
+                .disabled(noteDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .keyboardShortcut(.defaultAction)
+        }
+    }
+
+    private func refsRow(_ item: DeskItem) -> some View {
+        HStack(spacing: 6) {
+            ForEach(item.refs.sorted { $0.priority < $1.priority }, id: \.refId) { ref in
+                let action = DeskRefAffordance.action(for: ref)
+                Button {
+                    switch action {
+                    case .open(let url, _):
+                        if let parsed = URL(string: url) { NSWorkspace.shared.open(parsed) }
+                    case .copy(let text, _):
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(text, forType: .string)
+                        actionNotice = DeskActionNotice(text: "Copied \(text)", isError: false)
+                    }
+                } label: {
+                    Label(
+                        action.label,
+                        systemImage: action.opensExternally ? "arrow.up.right.square" : "doc.on.doc")
+                        .font(.caption2)
+                        .lineLimit(1)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(action.opensExternally ? Color.accentColor : Color.secondary)
+                .help(action.opensExternally ? "Open" : "Copy")
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    @ViewBuilder
+    private var actionNoticeRow: some View {
+        if let notice = actionNotice {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: notice.isError ? "exclamationmark.triangle" : "checkmark.circle")
+                    .font(.caption)
+                    .foregroundStyle(notice.isError ? Color.orange : Color.green)
+                // The TOOL's own words — a confirmation or an honest refusal.
+                // The desk never invents a success line the ledger can't back.
+                Text(notice.text).font(.caption).lineLimit(3)
+                Spacer(minLength: 0)
+                Button { actionNotice = nil } label: { Image(systemName: "xmark") }
+                    .buttonStyle(.plain).foregroundStyle(.tertiary)
+            }
+            .padding(10)
+            .background(
+                (notice.isError ? Color.orange : Color.green).opacity(0.10),
+                in: RoundedRectangle(cornerRadius: 8))
+        }
+    }
+
+    // MARK: W5 — actions
+
+    private func closeSelected() {
+        guard let item = selectedItem else { return }
+        perform(.close(handle: item.handle, outcome: DeskQuickAction.deskCloseOutcome))
+    }
+
+    private func beginDefer() {
+        guard selectedHandle != nil else { return }
+        showingNoteField = false
+        showingDeferOptions.toggle()
+    }
+
+    private func beginNote() {
+        guard selectedHandle != nil else { return }
+        showingDeferOptions = false
+        showingNoteField = true
+        noteDraft = ""
+        // The TextField does not exist yet in THIS render pass, so focusing it
+        // synchronously is a no-op and User's next keystroke goes to the bench
+        // (where "c" would close the item he was about to annotate). Same
+        // one-tick deferral CommandPaletteView.swift already uses for its own
+        // re-focus after a clear.
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 20_000_000)
+            if showingNoteField { noteFieldFocused = true }
+        }
+    }
+
+    private func submitNote(_ item: DeskItem) {
+        let text = noteDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        perform(.note(handle: item.handle, text: text))
+    }
+
+    private func applyPaletteCommand(_ verb: DeskPaletteQuery.Verb, handle: String) {
+        select(handle)
+        switch verb {
+        case .close:
+            perform(.close(handle: handle, outcome: DeskQuickAction.deskCloseOutcome))
+        case .deferItem:
+            showingDeferOptions = true
+        case .note:
+            beginNote()
+        }
+    }
+
+    /// Optimistic-then-refresh, the same shape the chat surface uses for a
+    /// dispatch (`ChatView+SlashCommands.runDispatchAndRenderReceipt`: show the
+    /// pending state immediately, replace it with the real receipt).
+    ///
+    /// Here the optimistic step edits the LOCAL row so the board reacts on the
+    /// same frame as the click, and `load()` afterwards replaces it wholesale
+    /// with what the store actually says — including on failure, so a refused
+    /// write cannot leave a lie on screen.
+    private func perform(_ action: DeskQuickAction) {
+        guard !actionInFlight else { return }
+        actionInFlight = true
+        actionNotice = nil
+        showingNoteField = false
+        showingDeferOptions = false
+        noteDraft = ""
+        // Snapshot BEFORE the local echo: a failed tool result — or a load()
+        // that cannot re-read the store — must restore the pre-action truth,
+        // or the desk shows an optimistic lie (a row rendered closed that the
+        // ledger never closed; review blocking #2).
+        let preActionItems = items
+        applyOptimistically(action)
+        let router = actionRouter
+        Task { @MainActor in
+            let outcome = await DeskActionRunner.perform(action, via: router)
+            actionNotice = DeskActionNotice(text: outcome.message, isError: !outcome.ok)
+            actionInFlight = false
+            let itemsBeforeLoad = items
+            await load()
+            if !outcome.ok, items == itemsBeforeLoad || loadError != nil {
+                // The action FAILED and the reload did not replace our echo
+                // with store truth — put the pre-action rows back. (When the
+                // action succeeded but the reload failed, the echo stands: it
+                // matches what the tool reported, and reverting would show
+                // the OPPOSITE lie — an open row the ledger already closed.)
+                items = preActionItems
+            }
+            await refreshNagConfig()
+            selectedHandle = DeskSelection.reconcile(selectedHandle, order: selectionOrder)
+            // The note field held key focus; hand it back to the bench or the
+            // arrows go dead after the first note User types.
+            benchFocused = true
+        }
+    }
+
+    /// Local echo only. Deliberately narrow: status/park/note are the three
+    /// fields whose change User would notice within the frame. Everything
+    /// derived (the sequencing plan, the rollups, the attention strip) is left
+    /// to `load()` — guessing at a derived value is how an optimistic update
+    /// starts disagreeing with the store.
+    private func applyOptimistically(_ action: DeskQuickAction) {
+        switch action {
+        case let .close(handle, _):
+            guard let idx = items.firstIndex(where: { $0.handle == handle }) else { return }
+            items[idx].status = .done
+            items[idx].closedAt = DeskClock.nowISO()
+            items[idx].updatedAt = DeskClock.nowISO()
+        case let .defer_(handle, until):
+            guard let idx = items.firstIndex(where: { $0.handle == handle }) else { return }
+            items[idx].deferUntil = until
+            items[idx].updatedAt = DeskClock.nowISO()
+        case let .note(handle, text):
+            guard let idx = items.firstIndex(where: { $0.handle == handle }) else { return }
+            items[idx].notes.append(DeskNote(ts: DeskClock.nowISO(), text: text))
+            items[idx].updatedAt = DeskClock.nowISO()
+        case .nagGlobal, .nagProject, .nagItem, .nagMute, .nagUnmute:
+            // Nag state is not desk-item state; the panel re-reads the config
+            // after the write instead of guessing at a window bump.
+            break
+        }
+    }
+
+    private func refreshNagConfig() async {
+        nagConfig = await DeskNagConfigStore(dataRoot: dataRoot).load()
     }
 
     // MARK: header
@@ -543,7 +996,37 @@ struct DeskView: View {
             Spacer()
             Text(headerCounts)
                 .font(.caption).foregroundStyle(.tertiary)
+            nagsButton
         }
+    }
+
+    /// C6: User's nag switch, in the UI. It shipped controllable ONLY through the
+    /// `desk_nag_control` chat tool — he had to ask Agent to turn his own
+    /// pressure on. The icon states the answer without a click: a slashed bell
+    /// while muted, a filled one while armed.
+    private var nagsButton: some View {
+        Button { showingNagsPanel = true } label: {
+            Image(systemName: nagBellSymbol)
+                .foregroundStyle(nagConfig.isMuted(now: Date())
+                                 ? AnyShapeStyle(Color.orange)
+                                 : AnyShapeStyle(nagConfig.enabled ? Color.accentColor : Color.secondary))
+        }
+        .buttonStyle(.plain)
+        .help("Nagging — what pings you, and when")
+        .popover(isPresented: $showingNagsPanel, arrowEdge: .bottom) {
+            DeskNagsPanel(
+                items: items,
+                selectedHandle: selectedHandle,
+                selectedTitle: selectedItem?.title,
+                perform: { perform($0) },
+                config: nagConfig,
+                isBusy: actionInFlight)
+        }
+    }
+
+    private var nagBellSymbol: String {
+        if nagConfig.isMuted(now: Date()) { return "bell.slash" }
+        return nagConfig.enabled ? "bell.fill" : "bell"
     }
 
     private var headerCounts: String {
@@ -1033,8 +1516,14 @@ struct DeskView: View {
             .background(Color.purple.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
             .overlay(
                 RoundedRectangle(cornerRadius: 10)
-                    .strokeBorder(Color.purple.opacity(0.15), lineWidth: 1)
+                    .strokeBorder(selectedHandle == item.handle
+                                  ? Color.accentColor.opacity(0.85)
+                                  : Color.purple.opacity(0.15),
+                                  lineWidth: selectedHandle == item.handle ? 2 : 1)
             )
+            .contentShape(Rectangle())
+            .onTapGesture { toggleSelection(item.handle) }
+            .id(item.handle)
         }
     }
 
@@ -1104,7 +1593,11 @@ struct DeskView: View {
         .contentShape(Rectangle())
         .onTapGesture { toggle(toggleKey, expanded: expanded) }
         if expanded {
-            ForEach(group.items, id: \.handle) { itemRow($0) }
+            ForEach(group.items, id: \.handle) { child in
+                itemRow(child)
+                    .contentShape(Rectangle())
+                    .onTapGesture { toggleSelection(child.handle) }
+            }
         }
     }
 
@@ -1153,39 +1646,12 @@ struct DeskView: View {
     // spread came mostly from exactly these orphan families. A lone orphan
     // sub-item renders flat; one row is already compact.
 
-    private struct DeskGroup {
-        let key: String
-        let root: DeskItem?
-        let parentTitle: String?   // title of a root living elsewhere (e.g. done)
-        let children: [DeskItem]
-    }
+    // W5: the grouping itself lives in `DeskBoardLayout.groups` so the selection
+    // order can walk EXACTLY the rows this renders (see DeskInteraction.swift).
+    private typealias DeskGroup = DeskBoardLayout.Group
 
     private func groups(_ list: [DeskItem]) -> [DeskGroup] {
-        var order: [String] = []
-        var roots: [String: DeskItem] = [:]
-        var children: [String: [DeskItem]] = [:]
-        for item in list {
-            let key = item.alias.split(separator: ".").first.map(String.init) ?? item.alias
-            if roots[key] == nil && children[key] == nil { order.append(key) }
-            if item.alias.contains(".") || roots[key] != nil {
-                // Dot-nested items are children; so is any duplicate depth-0
-                // alias (should never happen, but a dict overwrite would hide
-                // an item entirely — nothing on this board may vanish).
-                children[key, default: []].append(item)
-            } else {
-                roots[key] = item
-            }
-        }
-        return order.map { key in
-            DeskGroup(
-                key: key,
-                root: roots[key],
-                parentTitle: roots[key] == nil
-                    ? items.first(where: { $0.alias == key })?.title
-                    : nil,
-                children: children[key] ?? []
-            )
-        }
+        DeskBoardLayout.groups(list, allItems: items)
     }
 
     private func toggle(_ toggleKey: String, expanded: Bool) {
@@ -1203,21 +1669,37 @@ struct DeskView: View {
             itemRow(root, childCount: group.children.count, expanded: expanded)
                 .contentShape(Rectangle())
                 .onTapGesture {
+                    // W5: one click means both — pick the row AND open the
+                    // family. Splitting them would put two hit targets on one
+                    // row, and the family chevron was already the whole row.
+                    toggleSelection(root.handle)
                     guard !group.children.isEmpty else { return }
                     toggle(toggleKey, expanded: expanded)
                 }
             if expanded {
-                ForEach(group.children, id: \.handle) { itemRow($0) }
+                ForEach(group.children, id: \.handle) { child in
+                    itemRow(child)
+                        .contentShape(Rectangle())
+                        .onTapGesture { toggleSelection(child.handle) }
+                }
             }
         } else if group.children.count > 1 {
             orphanFamilyHeader(group, expanded: expanded)
                 .contentShape(Rectangle())
                 .onTapGesture { toggle(toggleKey, expanded: expanded) }
             if expanded {
-                ForEach(group.children, id: \.handle) { itemRow($0) }
+                ForEach(group.children, id: \.handle) { child in
+                    itemRow(child)
+                        .contentShape(Rectangle())
+                        .onTapGesture { toggleSelection(child.handle) }
+                }
             }
         } else {
-            ForEach(group.children, id: \.handle) { itemRow($0) }
+            ForEach(group.children, id: \.handle) { child in
+                itemRow(child)
+                    .contentShape(Rectangle())
+                    .onTapGesture { toggleSelection(child.handle) }
+            }
         }
     }
 
@@ -1302,8 +1784,13 @@ struct DeskView: View {
         .padding(.vertical, 8).padding(.horizontal, 10)
         .background(depth == 0 ? Color.primary.opacity(0.04) : Color.clear,
                     in: RoundedRectangle(cornerRadius: 8))
+        .selectionHighlight(selectedHandle == item.handle)
         .padding(.leading, CGFloat(depth) * 18)
+        // Anchor for `proxy.scrollTo` — arrows, palette matches and blocker
+        // pills all land through the same id.
+        .id(item.handle)
     }
+
 
     private func subLine(_ item: DeskItem) -> String {
         var parts: [String] = []
@@ -1347,9 +1834,22 @@ struct DeskView: View {
                         .capsuleTag(itemPlan.doneCount == itemPlan.totalCount ? .green : .gray)
                 }
                 if let blocked = blockedPillText(itemPlan) {
-                    Text(blocked)
-                        .lineLimit(1).truncationMode(.tail)
-                        .capsuleTag(.orange)
+                    // W5: the pill NAVIGATES. "waiting on 2.1" was a fact User
+                    // then had to go find by eye; clicking it now selects the
+                    // blocker, opening whatever family it's buried in and
+                    // scrolling to it. First blocker only — the pill already
+                    // collapses a fan-in to "+N", and a multi-target click
+                    // would have to pick one anyway.
+                    Button {
+                        if let first = itemPlan.effectiveBlockers.first { select(first) }
+                    } label: {
+                        Label(blocked, systemImage: "arrow.turn.down.right")
+                            .labelStyle(.titleAndIcon)
+                            .lineLimit(1).truncationMode(.tail)
+                            .capsuleTag(.orange)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Go to the item this is waiting on")
                 }
                 // Rare, and worse than an ordinary block: nothing here can ever
                 // clear itself, so it must never be quiet.
@@ -1498,13 +1998,15 @@ struct DeskView: View {
     ///
     /// Mirrors `scanAllQueueWorkshopExecutions()` (WorkshopExecution+Runner.swift:1046)
     /// exactly — it counts a `<root>/<id>/` directory iff that directory holds a
-    /// `mission.json`, which is precisely the marker the runner writes and the
-    /// scanner keys on. Two states the old bare count got wrong:
+    /// record file, which is precisely the marker the runner writes and the
+    /// scanner keys on. `ExecutionRecordFile.exists` accepts EITHER name, so an
+    /// unmigrated `mission.json` directory still counts as a record (P2-1).
+    /// Two states the old bare count got wrong:
     ///   • root unreadable → it returned 0, so the corrupt store rendered as an
     ///     empty bench. That is the ONE case this check exists for.
-    ///   • reservation (`.reserved`, no mission.json yet) and cancelled dirs →
+    ///   • reservation (`.reserved`, no record yet) and cancelled dirs →
     ///     it counted them, so a healthy empty bench got an "unavailable"
-    ///     banner. A cleanly-absent mission.json is the runner's own
+    ///     banner. A cleanly-absent record is the runner's own
     ///     crash-safe ordering, not a lost record.
     /// A record dir whose CONTENTS can't be listed still counts: unreadable is
     /// not absent, and that skew is exactly what should surface.
@@ -1528,7 +2030,7 @@ struct DeskView: View {
             guard !entry.lastPathComponent.hasPrefix(".") else { continue }
             guard (try? entry.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
             else { continue }
-            if fm.fileExists(atPath: entry.appendingPathComponent("mission.json").path) {
+            if ExecutionRecordFile.exists(in: entry, fileManager: fm) {
                 count += 1
             } else if (try? fm.contentsOfDirectory(atPath: entry.path)) == nil {
                 // Can't tell whether it holds a record — malformed, count it.

@@ -124,35 +124,35 @@ public actor SwiftNativeSecurityCenter {
                 id: "security_center",
                 title: "Security Center",
                 status: killSwitch ? "blocked" : "ready",
-                detail: killSwitch ? "Global kill switch is active" : "Swift-native security evaluator is active",
+                detail: killSwitch ? "Everything is paused — the agent cannot take any action right now." : "Every action the agent takes is checked before it runs.",
                 enabled: true
             ),
             SecurityStatusFlag(
                 id: "capability_policy",
                 title: "Capability Policy",
                 status: "ready",
-                detail: "Tool risk is derived from capability class before dispatch",
+                detail: "How risky each action is gets worked out before it is allowed to run.",
                 enabled: Self.bool(security["capabilityPolicyEnabled"], default: true)
             ),
             SecurityStatusFlag(
                 id: "origin_trust",
                 title: "Origin Trust",
                 status: trustedOrigins > 0 ? "ready" : "limited",
-                detail: trustedOrigins > 0 ? "\(trustedOrigins) remote trust root(s) configured" : "Remote high-risk actions require stronger proof",
+                detail: trustedOrigins > 0 ? "\(trustedOrigins) device(s) you have approved can send requests." : "Requests from other devices need extra proof before anything risky runs.",
                 enabled: Self.bool(security["originTrustEnabled"], default: true)
             ),
             SecurityStatusFlag(
                 id: "signed_remote_commands",
                 title: "Signed Remote Commands",
                 status: "ready",
-                detail: "Remote high-risk commands require a command signature",
+                detail: "Anything risky sent from your iPhone must carry a signature only your paired devices can produce.",
                 enabled: Self.bool(security["signedRemoteCommandsRequired"], default: true)
             ),
             SecurityStatusFlag(
                 id: "prompt_injection_shield",
                 title: "Prompt-Injection Shield",
                 status: "ready",
-                detail: "Tool inputs are scanned for instruction hijacks and exfiltration requests",
+                detail: "Text the agent reads from files, pages, and messages is checked for hidden instructions trying to redirect it.",
                 enabled: Self.bool(security["promptInjectionShieldEnabled"], default: true)
             ),
             SecurityStatusFlag(
@@ -160,38 +160,46 @@ public actor SwiftNativeSecurityCenter {
                 title: "Danger Gates",
                 status: (developerMode || fullMac) ? "armed" : "ready",
                 detail: developerMode
-                    ? "Developer Mode allows critical local actions"
+                    ? "Developer Mode is on, so the agent is allowed to take destructive actions on this Mac."
                     : (fullMac
-                        ? "Full Mac (yolo) window grants Developer-Mode access to critical local actions"
-                        : "Critical actions are blocked without Developer Mode"),
+                        ? "The Full Mac session is open: broad file and app "
+                          + "access is allowed until it expires. The most "
+                          + "destructive Mac-control actions — shell, moving "
+                          + "files to the Trash, system control — still "
+                          + "require Developer Mode."
+                        : "Destructive actions on this Mac are blocked."),
                 enabled: Self.bool(security["dangerGatesEnabled"], default: true)
             ),
             SecurityStatusFlag(
                 id: "rollback_by_default",
                 title: "Rollback By Default",
                 status: "ready",
-                detail: "Write/delete capability classes carry backup expectations",
+                detail: "Anything that writes or deletes is expected to leave a restore point first.",
                 enabled: Self.bool(security["rollbackByDefault"], default: true)
             ),
             SecurityStatusFlag(
                 id: "secret_firewall",
                 title: "Secret Firewall",
                 status: "ready",
-                detail: "Secrets are redacted from receipts and blocked from unsafe egress",
+                detail: "Passwords and keys are hidden from the activity log and blocked from leaving your Mac.",
                 enabled: Self.bool(security["secretFirewallEnabled"], default: true)
             ),
             SecurityStatusFlag(
                 id: "skill_tool_signing",
                 title: "Skill/Tool Signing",
                 status: "ready",
-                detail: "Promoted manifests keep HMAC signatures and unsigned high-risk tools are gated",
+                detail: "Tools are signed; an unsigned tool that could do damage is not allowed to run.",
                 enabled: Self.bool(security["toolSigningRequired"], default: true)
             ),
             SecurityStatusFlag(
                 id: "audit_receipts",
                 title: "Audit Receipts",
                 status: auditEnabled ? "ready" : "off",
-                detail: auditReceiptsPath.path,
+                // Sweep R4 C9: was the raw filesystem path, which the panel
+                // already renders on its own line directly below the flags.
+                detail: auditEnabled
+                    ? "A record of every gated action is kept on this Mac so you can check what ran."
+                    : "Recording is off, so gated actions are not being logged.",
                 enabled: auditEnabled
             ),
         ]

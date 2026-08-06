@@ -65,6 +65,12 @@ struct MemoryView: View {
         }
         .navigationTitle("Memory")
         .toolbar {
+            // Sweep R4 C11.4. SyncBadge only appears once the snapshot is
+            // >30s old and says nothing about the Mac itself, so the chip
+            // sits beside it rather than replacing it.
+            ToolbarItem(placement: .navigationBarLeading) {
+                MacStatusChip()
+            }
             ToolbarItem(placement: .navigationBarLeading) {
                 if let syncAt = iCloudSyncEngine.shared.lastSyncAt {
                     SyncBadge(date: syncAt)

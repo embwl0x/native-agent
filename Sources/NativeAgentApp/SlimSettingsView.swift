@@ -8,6 +8,29 @@ import NativeAgentCore
 // MARK: - Slim Settings (the new "Settings" primary tab)
 
 struct SlimSettingsView: View {
+    /// One-line, paste-into-a-bug-report identity of the running bytes:
+    /// `0.3.7 (abc1234, modified)`. The revision is shown short; `modified` is
+    /// shown whenever the builder did not stamp clean-source truth, because an
+    /// unstamped bundle is exactly the case that must not be read as exact
+    /// proof of a commit (see NativeAgentBuildIdentity).
+    static func buildIdentityLine(_ identity: NativeAgentBuildIdentity) -> String {
+        var line = identity.version
+        var parenthetical: [String] = []
+        if let revision = identity.sourceRevision, !revision.isEmpty {
+            parenthetical.append(String(revision.prefix(7)))
+        }
+        if identity.sourceDirty {
+            parenthetical.append("modified")
+        }
+        if !parenthetical.isEmpty {
+            line += " (\(parenthetical.joined(separator: ", ")))"
+        }
+        if identity.build != identity.version {
+            line += " build \(identity.build)"
+        }
+        return line
+    }
+
     @Environment(AppModel.self) private var appModel
     // The app menu and Settings use one Sparkle scheduler/controller.
     @State private var updateController = UpdateController.shared
@@ -140,8 +163,21 @@ struct SlimSettingsView: View {
                 }
 
                 Section {
-                    if let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String {
-                        LabeledContent("Version", value: version)
+                    // Sweep R4 C13: NativeAgentBuildIdentity already computes
+                    // version + source revision + dirty truth and no View
+                    // rendered it, so a dev build and a release build looked
+                    // identical and a bug report could not name the bytes.
+                    // Copyable, because the point is pasting it into a report.
+                    let identity = NativeAgentBuildIdentity.current
+                    LabeledContent("Version") {
+                        Text(Self.buildIdentityLine(identity))
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                    }
+                    .contextMenu {
+                        Button("Copy build identity") {
+                            ChatClipboard.copy(Self.buildIdentityLine(identity))
+                        }
                     }
                     Button {
                         updateController.checkForUpdates()

@@ -460,7 +460,7 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
             "title": .string(WorkflowRedaction.redactText(title)),
             "detail": .string(WorkflowRedaction.redactText(detail)),
             "status": .string(status),
-            "missionId": .null,
+            "executionId": .null,
             "payload": WorkflowRedaction.redactValue(.object(payload)),
             "createdAt": .string(now()),
         ])
@@ -699,6 +699,11 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
             "action": .string(action),
             "risk": .string(approvalClassRisk(step)),
             "reason": .string(reason),
+            // Sweep R4 B2: ApprovalInbox now fails CLOSED on an undeclared
+            // `remoteResolvable`. A parked workflow step is the canonical
+            // approve-from-your-phone case, so declare it explicitly rather
+            // than inherit the old permissive default.
+            "remoteResolvable": .bool(true),
             "payload": .object([
                 "workflowRunId": .string(runId ?? ""),
                 "workflowId": .string(workflowId),
@@ -739,6 +744,9 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
             "action": .string(action),
             "risk": .string(approvalClassRisk(step)),
             "reason": .string("Workflow \(workflowName) is waiting before step \(title)."),
+            // Sweep R4 B2: explicit remote-safe declaration (see the sibling
+            // create above) now that an undeclared flag fails closed.
+            "remoteResolvable": .bool(true),
             "payload": .object([
                 "workflowRunId": .string(runId),
                 "workflowId": .string(workflowId),
@@ -837,6 +845,9 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
                     "action": .string("mcp_tool"),
                     "risk": .string(effectiveRisk),
                     "reason": .string("Workflow \(objectString(workflow, "name")) needs approval before MCP tool \(toolName) (risk=\(effectiveRisk))."),
+                    // Sweep R4 B2: explicit remote-safe declaration — a parked
+                    // MCP-tool gate is approve-from-your-phone by design.
+                    "remoteResolvable": .bool(true),
                     "payload": .object([
                         "workflowId": .string(objectString(workflow, "id")),
                         "workflowRunId": .string(runId ?? ""),

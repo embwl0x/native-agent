@@ -79,6 +79,50 @@ struct TrustMacControlPolicy: Codable, Hashable {
     }
 }
 
+// MARK: - Approval categories (Sweep R4 C9)
+
+/// Human labels for the five `approvalRequiredFor` policy keys.
+///
+/// COPY ONLY. `key` is the persisted policy value and is written to
+/// `TrustMacControlPolicy.approvalRequiredFor` unchanged — it must never be
+/// edited to match a label. `title`/`detail` are the strings the user reads;
+/// the key is still shown as a caption so support can name a specific row.
+struct MacControlApprovalCategory: Identifiable, Hashable {
+    let key: String
+    let title: String
+    let detail: String
+
+    var id: String { key }
+
+    static let all: [MacControlApprovalCategory] = [
+        MacControlApprovalCategory(
+            key: "shell",
+            title: "Running terminal commands",
+            detail: "Commands run on your Mac the way you would type them into Terminal."
+        ),
+        MacControlApprovalCategory(
+            key: "file_ops",
+            title: "Creating, changing, or deleting files",
+            detail: "Writing to files and folders on disk, including moving them to the Trash."
+        ),
+        MacControlApprovalCategory(
+            key: "applescript",
+            title: "Telling other apps what to do (AppleScript)",
+            detail: "Driving apps like Mail, Calendar, or Music through macOS automation."
+        ),
+        MacControlApprovalCategory(
+            key: "jxa",
+            title: "Telling other apps what to do (JavaScript)",
+            detail: "The same app automation as above, written in JavaScript instead."
+        ),
+        MacControlApprovalCategory(
+            key: "accessibility",
+            title: "Clicking buttons and typing for you",
+            detail: "Moving through windows, menus, and controls the way your hands would."
+        ),
+    ]
+}
+
 // MARK: - Audit Entry
 
 /// Decoder for one row of `<dataRoot>/mac_control_audit.jsonl`.
@@ -569,27 +613,42 @@ struct MacControlPermissionsView: View {
                 }
             }
 
-            NativePanel(title: "Approval Required For", systemImage: "checkmark.shield") {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("These categories always require explicit user approval before NativeAgent runs the action.")
+            NativePanel(title: "Ask Me First About", systemImage: "checkmark.shield") {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("NativeAgent stops and asks for your approval before it does any of these, however it was asked to.")
                         .font(.caption).foregroundStyle(.secondary)
-                    let categories = ["shell", "file_ops", "applescript", "jxa", "accessibility"]
-                    ForEach(categories, id: \.self) { cat in
-                        let isRequired = policy.approvalRequiredFor.contains(cat)
-                        HStack {
-                            Toggle(cat, isOn: Binding(
-                                get: { isRequired },
-                                set: { newVal in
-                                    if newVal {
-                                        if !policy.approvalRequiredFor.contains(cat) {
-                                            policy.approvalRequiredFor.append(cat)
+                    // Sweep R4 C9 — COPY ONLY. These were rendered as their raw
+                    // policy keys (shell, file_ops, applescript, jxa,
+                    // accessibility). The KEY is unchanged and still what gets
+                    // written to `approvalRequiredFor`; only the label the user
+                    // reads changed, with the key kept as a caption so a support
+                    // conversation can still name the exact row.
+                    ForEach(MacControlApprovalCategory.all) { category in
+                        let isRequired = policy.approvalRequiredFor.contains(category.key)
+                        HStack(alignment: .top) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Toggle(category.title, isOn: Binding(
+                                    get: { isRequired },
+                                    set: { newVal in
+                                        if newVal {
+                                            if !policy.approvalRequiredFor.contains(category.key) {
+                                                policy.approvalRequiredFor.append(category.key)
+                                            }
+                                        } else {
+                                            policy.approvalRequiredFor.removeAll { $0 == category.key }
                                         }
-                                    } else {
-                                        policy.approvalRequiredFor.removeAll { $0 == cat }
                                     }
-                                }
-                            ))
-                            .font(.caption)
+                                ))
+                                Text(category.detail)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                Text(category.key)
+                                    .font(NativeAgentFont.mono)
+                                    .foregroundStyle(.tertiary)
+                                    .textSelection(.enabled)
+                                    .help("Policy key for this row — quote it when asking for support.")
+                            }
                             EffectTimingTag(timing: .now)
                             Spacer()
                         }

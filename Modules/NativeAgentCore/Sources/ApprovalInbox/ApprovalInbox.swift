@@ -413,20 +413,34 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         // `autonomy.promote` with remoteResolvable=true and thereby make a
         // security loosening remotely approvable. Force the flags; ignore any
         // caller-supplied override for these actions.
+        // SECURITY (best-agent sweep R4, finding B2): `remoteResolvable` is an
+        // AUTHORITY field — it decides whether a remote/chat/iCloud surface may
+        // mint the decision. Two fail-OPEN holes existed here:
+        //   1. `pyBool` is Python-truthiness, so the string "false" (any
+        //      non-empty string) coerced to TRUE. A malformed caller — or a
+        //      JSON round-trip that stringified the flag — silently WIDENED
+        //      the approval's authority.
+        //   2. A MISSING flag defaulted to `true`, so every caller that simply
+        //      forgot the key got remote resolution by accident.
+        // Both now fail CLOSED: only a literal JSON `true`/`false` is honored,
+        // and anything else (missing, malformed, wrong type) means NOT
+        // remotely resolvable unless the action is explicitly declared
+        // remote-safe below. The hard-local override above still wins outright.
         let isHardLocalOnly = localOnlyActions.contains(action)
+        let declaredRemoteResolvable = Self.strictBool(bodyObj["remoteResolvable"])
         let remoteResolvable: Bool
         if isHardLocalOnly {
             remoteResolvable = false
-        } else if let raw = bodyObj["remoteResolvable"] {
-            remoteResolvable = pyBool(raw)
+        } else if let declaredRemoteResolvable {
+            remoteResolvable = declaredRemoteResolvable
         } else {
-            remoteResolvable = true
+            remoteResolvable = Self.remoteSafeActions.contains(action)
         }
         let localOnly: Bool
         if isHardLocalOnly {
             localOnly = true
-        } else if let raw = bodyObj["localOnly"] {
-            localOnly = pyBool(raw)
+        } else if let declared = Self.strictBool(bodyObj["localOnly"]) {
+            localOnly = declared
         } else {
             localOnly = !remoteResolvable
         }
@@ -605,6 +619,32 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         case .array, .object: return ""
         }
     }
+
+    /// STRICT JSON bool parse for authority fields. Unlike `pyBool` (Python
+    /// truthiness, used for cosmetic/behavioral flags), this returns nil for
+    /// ANYTHING that is not a literal JSON `true`/`false` — no string coercion,
+    /// no numeric coercion. Callers of authority fields treat nil as
+    /// "undeclared" and fall back to the fail-CLOSED default.
+    nonisolated static func strictBool(_ value: JSONValue?) -> Bool? {
+        guard case .bool(let b)? = value else { return nil }
+        return b
+    }
+
+    /// Actions declared REMOTE-SAFE: an approval for one of these may be
+    /// resolved from a remote surface (iCloud/Telegram/chat) even when the
+    /// creating caller did not pass an explicit `remoteResolvable` boolean.
+    /// Everything NOT listed here (and not carrying an explicit `true`) fails
+    /// closed to local-only. Keep this list minimal and justified — adding an
+    /// entry widens who can approve that action.
+    ///
+    /// Workflow/MCP step gates live here because "the run is parked waiting on
+    /// you" is exactly the case a phone approval exists for, and both actions
+    /// were remotely resolvable before the fail-closed flip (behavior preserved
+    /// deliberately, not by accident).
+    nonisolated static let remoteSafeActions: Set<String> = [
+        "workflow_step",
+        "mcp_tool",
+    ]
 
     private nonisolated static func pyBool(_ value: JSONValue) -> Bool {
         switch value {

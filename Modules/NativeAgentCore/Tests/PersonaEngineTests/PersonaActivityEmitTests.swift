@@ -70,7 +70,7 @@ func emit_savePersonalityDoc_emitsRow() async throws {
     #expect(ev["detail"] as? String == "Personality document saved")
     #expect(ev["status"] as? String == "ok")
     // missionId is null on the persona path (daemon passes mission_id=None).
-    #expect(ev["missionId"] is NSNull)
+    #expect(ev["executionId"] is NSNull)
     // payload defaults to {} (daemon `payload or {}`).
     #expect((ev["payload"] as? [String: Any])?.isEmpty == true)
     // id + createdAt are present and non-empty.
@@ -101,10 +101,11 @@ func emit_savePersonalityDoc_sortKeysByteShape() async throws {
     #expect(text.hasSuffix("\n"))
     let line = String(text.dropLast())
     // Keys appear in UTF-8 byte (== ASCII lexicographic) order, matching
-    // json.dumps(sort_keys=True): createdAt, detail, id, kind, missionId,
-    // payload, status, title.
-    let expectedOrder = ["\"createdAt\"", "\"detail\"", "\"id\"", "\"kind\"",
-                         "\"missionId\"", "\"payload\"", "\"status\"", "\"title\""]
+    // json.dumps(sort_keys=True): createdAt, detail, executionId, id, kind,
+    // payload, status, title. (P2-2 renamed the envelope key missionId ->
+    // executionId, which also moved its sort position: e < i.)
+    let expectedOrder = ["\"createdAt\"", "\"detail\"", "\"executionId\"", "\"id\"",
+                         "\"kind\"", "\"payload\"", "\"status\"", "\"title\""]
     var cursor = line.startIndex
     for key in expectedOrder {
         guard let r = line.range(of: key, range: cursor..<line.endIndex) else {

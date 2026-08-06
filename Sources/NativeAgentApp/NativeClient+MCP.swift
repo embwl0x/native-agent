@@ -108,7 +108,7 @@ enum MCPResultEvidence {
             "title": .string("MCP tool call"),
             "detail": .string(String(projection.preview.prefix(400))),
             "status": .string(["error", "failed"].contains(status.lowercased()) ? "warn" : "ok"),
-            "missionId": .null,
+            "executionId": .null,
             "payload": .object([
                 "callId": .string(callID),
                 "serverId": .string(serverID),

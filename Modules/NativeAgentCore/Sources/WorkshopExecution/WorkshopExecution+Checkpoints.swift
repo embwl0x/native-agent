@@ -8,8 +8,10 @@
 //
 // Layout (under PersistenceCore.defaultDataRoot()):
 //
-//   <root>/missions/<missionId>/checkpoints.jsonl   — append-only checkpoint log
-//   <root>/missions/<missionId>/escalations.jsonl   — append-only escalation log
+//   <root>/workshop/executions/<executionId>/checkpoints.jsonl  — append-only
+//                                                     checkpoint log
+//   <root>/workshop/executions/<executionId>/escalations.jsonl  — append-only
+//                                                     escalation log
 //   <root>/notifications/inbox.jsonl                — surface the escalation as
 //                                                     a NotificationInboxItem in
 //                                                     the LIVE inbox (A5.2 cutover
@@ -17,8 +19,9 @@
 //                                                     <root>/inbox/ silo)
 //
 // NOTE on the executions root: the existing SwiftNativeWorkshopRunner writes its
-// queue under <root>/missions/QUEUE/<id>/ (note the extra "queue" dir). This
-// new subsystem writes one level higher, under <root>/missions/<id>/, so the
+// queue under <root>/workshop/executions/QUEUE/<id>/ (note the extra "queue"
+// dir). This subsystem writes one level higher, under
+// <root>/workshop/executions/<id>/, so the
 // checkpoints/escalations log does NOT interleave inside the runner's queue
 // dir. A future v2 may unify the layout; for v1 the separation is intentional
 // so this subsystem can land without touching the runner's existing file
@@ -47,7 +50,8 @@ public struct WorkshopCheckpoint: Codable, Sendable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case id, ts, phase, progress, summary, detail, nextStep, blockingQuestion
-        case executionId = "missionId" // compatibility wire ID
+        case executionId // encodes as "executionId" (P2-2 de-mission)
+        case legacyExecutionId = "missionId" // decode-only fallback
     }
 
     public init(
@@ -91,7 +95,8 @@ public struct WorkshopEscalation: Codable, Sendable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case id, ts, reason, question, checkpoint
-        case executionId = "missionId" // compatibility wire ID
+        case executionId // encodes as "executionId" (P2-2 de-mission)
+        case legacyExecutionId = "missionId" // decode-only fallback
     }
 
     public init(
@@ -111,6 +116,90 @@ public struct WorkshopEscalation: Codable, Sendable, Equatable {
     }
 }
 
+// MARK: - Dual-vocabulary codec (P2-2 de-mission)
+//
+// These two logs are Mac-local
+// (<root>/workshop/executions/<id>/{checkpoints,escalations}.jsonl)
+// and are NEVER synced to iOS, so the WRITER flips to "executionId" now. The
+// reader accepts "executionId" first and falls back to the legacy "missionId"
+// so stray fixture/backup rows written by an older binary still decode. No rows
+// exist under the live data root today; the fallback ships for those strays.
+//
+// Absent-in-both stays a thrown decoding error — identical to the pre-flip
+// behavior of a non-optional `executionId`.
+
+extension WorkshopCheckpoint {
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(String.self, forKey: .id)
+        self.executionId = try Self.decodeExecutionId(from: c)
+        self.ts = try c.decode(String.self, forKey: .ts)
+        self.phase = try c.decode(String.self, forKey: .phase)
+        self.progress = try c.decodeIfPresent(Double.self, forKey: .progress)
+        self.summary = try c.decode(String.self, forKey: .summary)
+        self.detail = try c.decodeIfPresent(String.self, forKey: .detail)
+        self.nextStep = try c.decodeIfPresent(String.self, forKey: .nextStep)
+        self.blockingQuestion = try c.decodeIfPresent(String.self, forKey: .blockingQuestion)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(executionId, forKey: .executionId) // new key ONLY
+        try c.encode(ts, forKey: .ts)
+        try c.encode(phase, forKey: .phase)
+        try c.encodeIfPresent(progress, forKey: .progress)
+        try c.encode(summary, forKey: .summary)
+        try c.encodeIfPresent(detail, forKey: .detail)
+        try c.encodeIfPresent(nextStep, forKey: .nextStep)
+        try c.encodeIfPresent(blockingQuestion, forKey: .blockingQuestion)
+    }
+
+    static func decodeExecutionId(
+        from c: KeyedDecodingContainer<CodingKeys>
+    ) throws -> String {
+        if let new = try c.decodeIfPresent(String.self, forKey: .executionId) { return new }
+        if let old = try c.decodeIfPresent(String.self, forKey: .legacyExecutionId) { return old }
+        throw DecodingError.keyNotFound(
+            CodingKeys.executionId,
+            .init(codingPath: c.codingPath,
+                  debugDescription: "neither \"executionId\" nor legacy \"missionId\" present"))
+    }
+}
+
+extension WorkshopEscalation {
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(String.self, forKey: .id)
+        self.executionId = try Self.decodeExecutionId(from: c)
+        self.ts = try c.decode(String.self, forKey: .ts)
+        self.reason = try c.decode(WorkshopEscalationReason.self, forKey: .reason)
+        self.question = try c.decode(String.self, forKey: .question)
+        self.checkpoint = try c.decode(WorkshopCheckpoint.self, forKey: .checkpoint)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(executionId, forKey: .executionId) // new key ONLY
+        try c.encode(ts, forKey: .ts)
+        try c.encode(reason, forKey: .reason)
+        try c.encode(question, forKey: .question)
+        try c.encode(checkpoint, forKey: .checkpoint)
+    }
+
+    static func decodeExecutionId(
+        from c: KeyedDecodingContainer<CodingKeys>
+    ) throws -> String {
+        if let new = try c.decodeIfPresent(String.self, forKey: .executionId) { return new }
+        if let old = try c.decodeIfPresent(String.self, forKey: .legacyExecutionId) { return old }
+        throw DecodingError.keyNotFound(
+            CodingKeys.executionId,
+            .init(codingPath: c.codingPath,
+                  debugDescription: "neither \"executionId\" nor legacy \"missionId\" present"))
+    }
+}
+
 public enum WorkshopCheckpointError: Error, LocalizedError, Equatable {
     case invalidWorkshopExecutionId(String)
     case invalidEscalation(String)
@@ -118,7 +207,7 @@ public enum WorkshopCheckpointError: Error, LocalizedError, Equatable {
 
     public var errorDescription: String? {
         switch self {
-        case .invalidWorkshopExecutionId(let s):  return "invalid missionId: \(s)"
+        case .invalidWorkshopExecutionId(let s):  return "invalid executionId: \(s)"
         case .invalidEscalation(let s): return "invalid escalation: \(s)"
         case .persistenceFailure(let s): return "persistence failure: \(s)"
         }
@@ -153,7 +242,7 @@ public actor SwiftNativeWorkshopCheckpointStore {
         workshopExecutionDir(executionId: executionId).appendingPathComponent("checkpoints.jsonl")
     }
 
-    /// gpt-5.5 cross-feature review NEEDS_FIX: missionId becomes a path
+    /// gpt-5.5 cross-feature review NEEDS_FIX: executionId becomes a path
     /// component, so it MUST be a safe single segment. Without this guard a
     /// caller can pass `../escape`, `queue/<id>`, or paths containing `/`,
     /// `\`, NUL, `.`, `..` and traverse outside the intended execution directory
@@ -163,21 +252,21 @@ public actor SwiftNativeWorkshopCheckpointStore {
     internal nonisolated static func validateWorkshopExecutionIdAsSafeComponent(_ rawId: String) throws -> String {
         let id = rawId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !id.isEmpty else {
-            throw WorkshopCheckpointError.invalidWorkshopExecutionId("missionId must be non-empty")
+            throw WorkshopCheckpointError.invalidWorkshopExecutionId("executionId must be non-empty")
         }
         if id == "." || id == ".." {
-            throw WorkshopCheckpointError.invalidWorkshopExecutionId("missionId cannot be '.' or '..'")
+            throw WorkshopCheckpointError.invalidWorkshopExecutionId("executionId cannot be '.' or '..'")
         }
         if id.contains("/") || id.contains("\\") || id.contains("\0") {
             throw WorkshopCheckpointError.invalidWorkshopExecutionId(
-                "missionId cannot contain path separators or NUL: \(id)"
+                "executionId cannot contain path separators or NUL: \(id)"
             )
         }
         // Reject any control character (CR/LF/tab etc.) — JSONL append would
         // tear the line and downstream readers would silently skip rows.
         if id.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7F }) {
             throw WorkshopCheckpointError.invalidWorkshopExecutionId(
-                "missionId cannot contain control characters: \(id)"
+                "executionId cannot contain control characters: \(id)"
             )
         }
         return id
@@ -314,7 +403,7 @@ public actor SwiftNativeWorkshopEscalator {
         // gpt-5.5 cross-feature review NEEDS_FIX: same path-safety guard as
         // SwiftNativeWorkshopCheckpointStore. Without this, an attacker (or a
         // misbehaving caller) could pass `../escape` and write the escalation
-        // outside the missions/ namespace.
+        // outside the workshop/executions/ namespace.
         let trimmedWorkshopExecutionId = try SwiftNativeWorkshopCheckpointStore.validateWorkshopExecutionIdAsSafeComponent(executionId)
         let trimmedQuestion = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedQuestion.isEmpty else {

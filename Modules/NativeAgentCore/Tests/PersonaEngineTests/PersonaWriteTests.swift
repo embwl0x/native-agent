@@ -656,7 +656,7 @@ func saveDoc_emitsActivityRow() async throws {
     #expect(row["title"] as? String == "VOICE.md updated")
     #expect(row["detail"] as? String == "Personality document saved")
     #expect(row["status"] as? String == "ok")
-    #expect(row["missionId"] is NSNull)
+    #expect(row["executionId"] is NSNull)
     #expect((row["payload"] as? [String: Any])?.isEmpty == true)
     #expect((row["id"] as? String)?.isEmpty == false)
     #expect((row["createdAt"] as? String)?.isEmpty == false)
@@ -744,7 +744,7 @@ func saveDoc_activityRow_byteShapeMatchesCanonicalJSON() async throws {
     #expect(obj["title"] == .string("GROWTH.md updated"))
     #expect(obj["detail"] == .string("Personality document saved"))
     #expect(obj["status"] == .string("ok"))
-    #expect(obj["missionId"] == .null)
+    #expect(obj["executionId"] == .null)
     #expect(obj["payload"] == .object([:]))
     if case .string(let id)? = obj["id"] {
         #expect(!id.isEmpty)

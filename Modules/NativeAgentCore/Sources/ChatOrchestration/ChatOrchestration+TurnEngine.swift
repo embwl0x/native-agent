@@ -636,8 +636,10 @@ public actor SwiftNativeTurnEngine {
             throw TurnEngineError.emptyMessage
         }
         // Start the existing MiniLM query lane before the bounded attention
-        // read. The ticket is sampled after that already-required work and is
-        // never awaited for a vector, so semantic recall cannot add turn wait.
+        // read. The ticket is read after that already-required work, and the
+        // read is bounded by `queryEmbeddingWarmupWaitNanos` — so semantic
+        // recall can add at most that much turn wait, and only when the
+        // embedder is still cold.
         let queryEmbeddingTicket = await contextFlow?.beginQueryEmbedding(userMessage)
 
         // Mind-into-circulation: feed Fluid Context's dormant NeedSignal inputs
@@ -662,8 +664,30 @@ public actor SwiftNativeTurnEngine {
         // surface now, and the suppression follows the surface, not the
         // spelling.
         let suppressPursuitIntent = ContextSurface(rawValue: surface) == .workshop
-        let readyQueryEmbedding = queryEmbeddingTicket?.valueIfReady
+        // Sweep R4 A5: this used to be a bare `valueIfReady` — a pure sample,
+        // never awaited. On the FIRST message after launch MiniLM is still
+        // warming, so the sample came back nil and the 1.2-weighted semantic
+        // term was zeroed for the whole turn: turn 1 was reliably dumber than
+        // turn 2. Wait a bounded interval instead. On timeout we land exactly
+        // where the old code landed (nil → lexical-only scoring), so the turn
+        // can never block indefinitely; when the embedder warms inside the
+        // window, turn 1 gets real semantic scoring. Skipped entirely when
+        // ContextFlow is off, where the vector has no consumer.
+        let contextFlowMode = await contextFlow?.contextFlowMode() ?? .off
+        let readyQueryEmbedding: ContextQueryEmbeddingValue?
+        if contextFlowMode == .off {
+            readyQueryEmbedding = queryEmbeddingTicket?.valueIfReady
+        } else {
+            readyQueryEmbedding = await queryEmbeddingTicket?.value(
+                waitingUpTo: Self.queryEmbeddingWarmupWaitNanos
+            )
+        }
         trace.setFlag("contextFlow.semanticQueryReady", readyQueryEmbedding != nil)
+        let packetBudget = ContextBudgetPolicy.resolve(
+            model: LLMCallContext.admittedModel,
+            surface: surface
+        )
+        trace.setFlag("budget.packetDerived", packetBudget.isDerived)
         let contextFlowRequest = ContextTurnRequest(
             surface: ContextSurface(rawValue: surface),
             origin: Self.contextOrigin(for: surface),
@@ -685,10 +709,17 @@ public actor SwiftNativeTurnEngine {
             // the common case byte-identical, but allow one bounded retry with
             // enough room for mandatory truth plus useful memory/task context
             // instead of falling back to the much larger legacy prompt.
-            maximumCharacterBudget: 24_000,
-            postMandatoryCharacterReserve: 4_000
+            //
+            // Sweep R4 W3: sized from the window when one is known. The packet
+            // is assembled BEFORE the router resolves this turn's model, so the
+            // only model available here is the one the chat facade already
+            // admitted and bound into `LLMCallContext` (the live chat path).
+            // Direct callers that skip admission get nil → the 6k/24k/4k
+            // floors, byte-identical to before.
+            characterBudget: packetBudget.packetChars,
+            maximumCharacterBudget: packetBudget.packetExpandedChars,
+            postMandatoryCharacterReserve: packetBudget.packetPostMandatoryReserve
         )
-        let contextFlowMode = await contextFlow?.contextFlowMode() ?? .off
         var preparedContextTurn: ContextPreparedTurn?
         switch contextFlowMode {
         case .off:
@@ -855,6 +886,15 @@ public actor SwiftNativeTurnEngine {
         //    user message exactly as before. Recalls that share a topic/key
         //    with a REM pin are REPLACED by the pin (fix 6 dedup pass below).
         let memoryStartNs = DispatchTime.now().uptimeNanoseconds
+        // Sweep R4 W3: `modelId` is resolved above, so recall breadth and the
+        // memory block's character bound are now a function of the window
+        // instead of the hardcoded k=5 / 5×1,200. Floor regime (small or
+        // unknown model) reproduces both exactly.
+        let turnBudget = ContextBudgetPolicy.resolve(model: modelId, surface: surface)
+        trace.setCount("budget.windowTokens", turnBudget.windowTokens ?? 0)
+        trace.setFlag("budget.derived", turnBudget.isDerived)
+        trace.setCount("budget.recallRowLimit", turnBudget.recallRowLimit)
+        trace.setCount("budget.memoryBlockChars", turnBudget.memoryBlockChars)
         var recalled: [MemoryRecallHit] = []
         if let preparedContextTurn {
             let memoryAtomCount = preparedContextTurn.packet.selectedItems.reduce(into: 0) {
@@ -879,7 +919,7 @@ public actor SwiftNativeTurnEngine {
             do {
                 recalled = try await memory.recall(
                     effectiveRecallQuery,
-                    k: 5,
+                    k: turnBudget.recallRowLimit,
                     persona: memoryRecallPersonaFilter(resolvedPersonaID),
                     surface: surface
                 )
@@ -942,13 +982,15 @@ public actor SwiftNativeTurnEngine {
             rawSegments = Self.renderSystemPromptSegments(
                 compiledPersonaPrompt: compiledPersonaPrompt,
                 recalled: recalled,
-                remPins: remPins
+                remPins: remPins,
+                budget: turnBudget
             )
         } else {
             rawSegments = Self.renderSystemPromptSegments(
                 personaDocs: personaMap,
                 recalled: recalled,
-                remPins: remPins
+                remPins: remPins,
+                budget: turnBudget
             )
         }
         let packetDynamic = preparedContextTurn.map(Self.renderContextPacket) ?? ""
@@ -1326,6 +1368,118 @@ public actor SwiftNativeTurnEngine {
         ).combined
     }
 
+    /// Bounded wait for a cold MiniLM to publish the query embedding (sweep R4
+    /// A5). Sized to cover a first-turn model load without being felt as
+    /// latency; on expiry the turn proceeds with no semantic term, exactly as
+    /// it did before this wait existed.
+    nonisolated static let queryEmbeddingWarmupWaitNanos: UInt64 = 700_000_000
+
+    // MARK: - Recalled-memory prompt block (sweep R4, finding A4)
+
+    /// Per-row character bound and row count for recalled memories rendered
+    /// into the system prompt moved to `ContextBudgetPolicy` in sweep R4 W3
+    /// (`floorMemoryRowChars` / `floorRecallRowLimit`, and their window-scaled
+    /// forms `memoryRowChars` / `recallRowLimit`). They are deliberately NOT
+    /// mirrored back here: two sources of truth for a budget is exactly the
+    /// shape this wave retired.
+    ///
+    /// Why 1,200 is the floor, retained from A4: `MemoryRecallHit.content`
+    /// carries the (sentence-safe capped) FULL memory text and exists precisely
+    /// so prompt render sites stop showing the 200-char `preview` (see the
+    /// field's doc comment in MemoryV2.swift). 1,200 keeps a long memory whole
+    /// in the common case while still bounding a pathological row.
+    ///
+    /// Renders the recall block for BOTH system-prompt lanes (legacy persona
+    /// docs and compiled persona packet), which previously duplicated a
+    /// `- \(hit.preview)` bullet list under a `Recent memory:` header. Three
+    /// things were wrong with that: it showed a 200-char preview when the full
+    /// text was already in hand, it carried no timestamp or authority so the
+    /// model could not tell a 2024 fact from yesterday's correction, and the
+    /// header claimed RECENCY for rows that are RELEVANCE-ranked.
+    /// Sweep R4 W3: row count, per-row cap and the block's aggregate bound all
+    /// come from `ContextBudgetPolicy` now. `budget == nil` resolves the floor
+    /// regime, whose values are the former `recalledMemoryRowLimit` /
+    /// `recalledMemoryRowCharCap` literals — so every existing caller and test
+    /// renders byte-identical output. The aggregate bound is what stops a
+    /// doubled row count on a wide window from multiplying the block without
+    /// limit; it never binds in the floor regime (5 × 1,200 == 6,000).
+    nonisolated static func renderRecalledMemoryBlock(
+        _ recalled: [MemoryRecallHit],
+        budget: ContextBudgetPolicy.Resolved? = nil
+    ) -> String? {
+        guard !recalled.isEmpty else { return nil }
+        let resolved = budget ?? ContextBudgetPolicy.resolve(
+            windowTokens: nil, surface: "chat"
+        )
+        var used = 0
+        var bullets: [String] = []
+        for hit in recalled.prefix(resolved.recallRowLimit) {
+            let full = (hit.content ?? hit.preview)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !full.isEmpty else { continue }
+            let bounded = full.count > resolved.memoryRowChars
+                ? String(full.prefix(resolved.memoryRowChars)) + "…"
+                : full
+            let marker = recalledMemoryMarker(hit)
+            let line = marker.isEmpty ? "- \(bounded)" : "- \(bounded) \(marker)"
+            // The aggregate bound is a DERIVED-regime instrument only. In the
+            // floor regime the pre-policy renderer emitted all 5 rows with no
+            // block-level check, and the provenance markers push 5 full rows a
+            // few hundred chars past 5×1,200 — applying the bound there would
+            // silently drop the last row. Byte-identity wins.
+            // First derived row always renders (a single oversized memory beats
+            // an empty block); later rows must fit the bound.
+            if resolved.isDerived, !bullets.isEmpty,
+               used + line.count > resolved.memoryBlockChars { break }
+            used += line.count
+            bullets.append(line)
+        }
+        guard !bullets.isEmpty else { return nil }
+        return "Relevant memory:\n" + bullets.joined(separator: "\n")
+    }
+
+    /// Compact `[2026-07-14, preference]` provenance marker. Either half may be
+    /// absent (KG-fallback rows carry no timestamp; legacy rows carry no kind),
+    /// and an entirely empty marker is omitted rather than rendered as `[]`.
+    nonisolated static func recalledMemoryMarker(_ hit: MemoryRecallHit) -> String {
+        var parts: [String] = []
+        if let day = recalledMemoryDay(hit.ts) { parts.append(day) }
+        if let kind = recalledMemoryKind(hit) { parts.append(kind) }
+        guard !parts.isEmpty else { return "" }
+        return "[\(parts.joined(separator: ", "))]"
+    }
+
+    /// `YYYY-MM-DD` prefix of an ISO-8601 stamp, or nil when the stamp is
+    /// missing or not actually ISO-shaped (never guess a date at the model).
+    private nonisolated static func recalledMemoryDay(_ ts: String?) -> String? {
+        guard let ts else { return nil }
+        let trimmed = ts.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 10 else { return nil }
+        let day = String(trimmed.prefix(10))
+        let parts = day.split(separator: "-", omittingEmptySubsequences: false)
+        guard parts.count == 3,
+              parts[0].count == 4, parts[1].count == 2, parts[2].count == 2,
+              parts.allSatisfy({ $0.allSatisfy(\.isNumber) })
+        else { return nil }
+        return day
+    }
+
+    /// Memory kind ("preference", "fact", …). The SQLite recall lane stamps it
+    /// into the hit's free-form `extras` bag; older/other producers only carry
+    /// `role`. No new struct field, so no wire-shape change.
+    private nonisolated static func recalledMemoryKind(_ hit: MemoryRecallHit) -> String? {
+        if case .object(let extras)? = hit.extras,
+           case .string(let kind)? = extras["kind"] {
+            let trimmed = kind.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        if let role = hit.role?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !role.isEmpty {
+            return role
+        }
+        return nil
+    }
+
     /// Segment-producing core for the legacy (non-compiled) persona path.
     /// Stable = persona block only. The legacy render order puts recall
     /// BEFORE pins, so pins land in the dynamic segment here — the byte
@@ -1334,7 +1488,8 @@ public actor SwiftNativeTurnEngine {
     nonisolated static func renderSystemPromptSegments(
         personaDocs: [String: String],
         recalled: [MemoryRecallHit],
-        remPins: [REMPin]
+        remPins: [REMPin],
+        budget: ContextBudgetPolicy.Resolved? = nil
     ) -> SystemPromptSegments {
         let stable: String
         if !personaDocs.isEmpty {
@@ -1347,9 +1502,8 @@ public actor SwiftNativeTurnEngine {
             stable = "You are a helpful assistant."
         }
         var dynamicLines: [String] = []
-        if !recalled.isEmpty {
-            let bullets = recalled.prefix(5).map { "- \($0.preview)" }.joined(separator: "\n")
-            dynamicLines.append("Recent memory:\n\(bullets)")
+        if let memoryBlock = renderRecalledMemoryBlock(recalled, budget: budget) {
+            dynamicLines.append(memoryBlock)
         }
         if !remPins.isEmpty {
             let bullets = remPins.map { "- \($0.text)" }.joined(separator: "\n")
@@ -1394,7 +1548,8 @@ public actor SwiftNativeTurnEngine {
     nonisolated static func renderSystemPromptSegments(
         compiledPersonaPrompt: String,
         recalled: [MemoryRecallHit],
-        remPins: [REMPin]
+        remPins: [REMPin],
+        budget: ContextBudgetPolicy.Resolved? = nil
     ) -> SystemPromptSegments {
         var stableLines: [String] = []
         let body = compiledPersonaPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1409,9 +1564,8 @@ public actor SwiftNativeTurnEngine {
             stableLines.append("# Pinned facts (REM-approved overrides)\n\(bullets)")
         }
         var dynamicLines: [String] = []
-        if !recalled.isEmpty {
-            let bullets = recalled.prefix(5).map { "- \($0.preview)" }.joined(separator: "\n")
-            dynamicLines.append("Recent memory:\n\(bullets)")
+        if let memoryBlock = renderRecalledMemoryBlock(recalled, budget: budget) {
+            dynamicLines.append(memoryBlock)
         }
         return SystemPromptSegments(
             stable: stableLines.joined(separator: "\n\n"),

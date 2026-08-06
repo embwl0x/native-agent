@@ -2042,6 +2042,84 @@ async function attachConsumeAndReplyDelivery(result, entries, config, options = 
   return result;
 }
 
+const CONNECTOR_SCHEMA_MISMATCH_MARKER = "failed connector schema validation";
+
+/// Pull the failing property names out of a connector schema-validation reply.
+/// Observed shape (2026-08-05, GitHub connector after a workspace-admin
+/// constraint change):
+///   "Parameters failed connector schema validation: owner [required]: Missing
+///    required property (does not match constraints configured by your ChatGPT
+///    workspace admin...); repo_name [required]: Missing required property..."
+/// These arrive as an MCP *success* (`result.Ok`) whose text is the failure, so
+/// nothing upstream classifies them — Codex just retries into a wall.
+function parseConnectorSchemaMismatch(text) {
+  if (typeof text !== "string" || !text.toLowerCase().includes(CONNECTOR_SCHEMA_MISMATCH_MARKER)) {
+    return null;
+  }
+  const properties = [];
+  const pattern = /([A-Za-z_][A-Za-z0-9_.-]*)\s*\[(required|optional)\]\s*:\s*([^;)]+)/g;
+  let match;
+  while ((match = pattern.exec(text)) !== null) {
+    if (properties.some((entry) => entry.property === match[1])) continue;
+    properties.push({
+      property: match[1],
+      requirement: match[2],
+      detail: match[3].trim(),
+    });
+    if (properties.length >= 12) break;
+  }
+  return {
+    diagnostic: "connector_schema_mismatch",
+    properties,
+    message: redactDiagnosticText(text.trim().slice(0, 600)),
+  };
+}
+
+/// Text payloads live in several shapes across event_msg/response_item rows.
+/// Flatten defensively rather than matching one shape: a missed shape silently
+/// drops the diagnostic, which is the failure mode this fix exists to end.
+function connectorDiagnosticTextsFromPayload(payload, depth = 0) {
+  if (depth > 6 || payload == null) return [];
+  if (typeof payload === "string") return [payload];
+  if (Array.isArray(payload)) {
+    return payload.flatMap((item) => connectorDiagnosticTextsFromPayload(item, depth + 1));
+  }
+  if (typeof payload !== "object") return [];
+  return Object.values(payload)
+    .flatMap((value) => connectorDiagnosticTextsFromPayload(value, depth + 1));
+}
+
+function collectConnectorSchemaMismatch(payload, sink) {
+  for (const text of connectorDiagnosticTextsFromPayload(payload)) {
+    const parsed = parseConnectorSchemaMismatch(text);
+    if (!parsed) continue;
+    const key = parsed.properties.map((entry) => entry.property).join(",");
+    if (sink.seen.has(key)) {
+      sink.occurrences += 1;
+      continue;
+    }
+    sink.seen.add(key);
+    sink.occurrences += 1;
+    sink.failures.push(parsed);
+  }
+}
+
+function summarizeConnectorDiagnostics(sink) {
+  if (!sink || sink.failures.length === 0) return null;
+  const properties = [];
+  for (const failure of sink.failures) {
+    for (const entry of failure.properties) {
+      if (!properties.includes(entry.property)) properties.push(entry.property);
+    }
+  }
+  return {
+    diagnostic: "connector_schema_mismatch",
+    occurrences: sink.occurrences,
+    properties,
+    detail: sink.failures[0].message,
+  };
+}
+
 function extractTurnResultFromRollout(rolloutPath, turnId, options = {}) {
   let text;
   try {
@@ -2056,6 +2134,7 @@ function extractTurnResultFromRollout(rolloutPath, turnId, options = {}) {
   let assistantMessage = "";
   let toolActivityCount = 0;
   let completed = null;
+  const connectorSink = { failures: [], seen: new Set(), occurrences: 0 };
   // Codex writes provider/backend failures (e.g. OpenAI 503) as task_complete
   // rows carrying an `error` field and last_agent_message:null — NOT as
   // turn_aborted. Folding those into "completed" produced the 2026-07-25
@@ -2097,6 +2176,9 @@ function extractTurnResultFromRollout(rolloutPath, turnId, options = {}) {
       continue;
     }
     if (currentTurnId === turnId && row.type === "event_msg" && payload) {
+      // mcp_tool_call_end carries the connector reply, including the
+      // schema-validation failures that arrive as an MCP success.
+      if (payload.type === "mcp_tool_call_end") collectConnectorSchemaMismatch(payload, connectorSink);
       if (payload.type === "agent_message" && payload.phase === "final_answer" && typeof payload.message === "string") {
         finalAgentMessage = payload.message;
       } else if (payload.type === "task_complete" && payload.turn_id === turnId) {
@@ -2120,6 +2202,9 @@ function extractTurnResultFromRollout(rolloutPath, turnId, options = {}) {
           if (item && item.type === "output_text" && typeof item.text === "string") parts.push(item.text);
         }
         if (parts.length > 0) assistantMessage = parts.join("\n");
+      } else if (payload.type === "custom_tool_call_output" || payload.type === "function_call_output") {
+        // exec-wrapped connector calls surface the same failure text here.
+        collectConnectorSchemaMismatch(payload, connectorSink);
       } else if (typeof payload.type === "string" && payload.type.endsWith("_call")) {
         // Structural match: this Codex build writes custom_tool_call and
         // function_call today, and has written other *_call shapes across
@@ -2127,6 +2212,14 @@ function extractTurnResultFromRollout(rolloutPath, turnId, options = {}) {
         toolActivityCount += 1;
       }
       continue;
+    }
+    if (row.type === "event_msg" && payload && payload.turn_id === turnId
+        && payload.type === "mcp_tool_call_end") {
+      // Explicitly-attributed fallback: today's Codex omits turn_id on this row
+      // shape, so ambient attribution above is the live path. If the turn's
+      // task_started is missing (rotated rollout) and a future build does stamp
+      // turn_id, the diagnostic must still be found rather than silently lost.
+      collectConnectorSchemaMismatch(payload, connectorSink);
     }
     if (row.type === "event_msg" && payload && payload.turn_id === turnId && payload.type === "task_complete") {
       // Unattributed fallback: the file lacked (or we missed) this turn's
@@ -2159,10 +2252,12 @@ function extractTurnResultFromRollout(rolloutPath, turnId, options = {}) {
         sawTurnStart,
         toolActivityCount,
         hasMessage: Boolean((finalAgentMessage || assistantMessage || "").trim()),
+        connectorDiagnostics: summarizeConnectorDiagnostics(connectorSink),
       };
     }
     return null;
   }
+  const connectorDiagnostics = summarizeConnectorDiagnostics(connectorSink);
   const message = (completed.lastAgentMessage || finalAgentMessage || assistantMessage || "").trim();
   if (completed.status === "failed") {
     // Three-state: true = we watched the whole turn and saw nothing execute
@@ -2176,12 +2271,20 @@ function extractTurnResultFromRollout(rolloutPath, turnId, options = {}) {
       rolloutPath,
       toolActivityCount,
       noWorkObserved,
+      connectorDiagnostics,
     };
   }
   if (completed.status === "completed" && !message) {
-    return { ...completed, status: "completed_without_reply", message, rolloutPath, toolActivityCount };
+    return {
+      ...completed,
+      status: "completed_without_reply",
+      message,
+      rolloutPath,
+      toolActivityCount,
+      connectorDiagnostics,
+    };
   }
-  return { ...completed, message, rolloutPath, toolActivityCount };
+  return { ...completed, message, rolloutPath, toolActivityCount, connectorDiagnostics };
 }
 
 function extractTurnResultFromTurn(turn, turnId, rolloutPath = null) {
@@ -2519,14 +2622,21 @@ function createTurnCompletionEventWaiter(client, threadId, turnId, config, deadl
   return { promise, close, rolloutPath };
 }
 
-async function waitForTurnResultEventFirst(threadId, turnId, config, client = null) {
+async function waitForTurnResultEventFirst(threadId, turnId, config, client = null, windowMs = null) {
   const timeoutMs = numberSetting(
     config,
     "replyWaitTimeoutMs",
     "NATIVE_AGENT_CODEX_REPLY_WAIT_TIMEOUT_MS",
     60 * 60 * 1000
   );
-  const deadline = Date.now() + timeoutMs;
+  // A caller may shorten THIS window without shortening the overall wait: the
+  // durable loop re-waits after every timeout, so a shorter window only moves
+  // the stall-judging cadence (2026-08-05). It is a floor-1ms clamp, never an
+  // extension -- a window longer than the configured reply wait is ignored.
+  const effectiveMs = Number.isFinite(windowMs) && windowMs > 0
+    ? Math.min(timeoutMs, windowMs)
+    : timeoutMs;
+  const deadline = Date.now() + effectiveMs;
   let lastRolloutPath = findThreadRolloutPath(threadId, config);
 
   while (Date.now() < deadline) {
@@ -2573,7 +2683,7 @@ async function waitForTurnResultEventFirst(threadId, turnId, config, client = nu
   };
 }
 
-async function waitForTurnResult(threadId, turnId, config) {
+async function waitForTurnResult(threadId, turnId, config, windowMs = null) {
   const requestTimeoutMs = numberSetting(
     config,
     "requestTimeoutMs",
@@ -2587,7 +2697,7 @@ async function waitForTurnResult(threadId, turnId, config) {
     // The vnode-backed durable rollout path still provides event-first repair.
   }
   try {
-    return await waitForTurnResultEventFirst(threadId, turnId, config, client);
+    return await waitForTurnResultEventFirst(threadId, turnId, config, client, windowMs);
   } finally {
     if (client) client.close();
   }
@@ -2715,7 +2825,7 @@ async function waitForTurnResultWithEmptyRetry(job, config, options = {}) {
   const threadId = job.threadId;
   const turnId = job.turnId;
   const wait = options.waitForTurnResult || waitForTurnResult;
-  const turnResult = await wait(threadId, turnId, config);
+  const turnResult = await wait(threadId, turnId, config, options.windowMs || null);
   return { threadId, turnId, turnResult, attempts: [{ threadId, turnId, turnResult }] };
 }
 
@@ -2780,8 +2890,41 @@ async function probeTurnLiveness(threadId, turnId, config) {
 async function waitForDurableTerminalExecution(job, config, onTimeout, options = {}) {
   const snapshotFn = options.rolloutStallSnapshot || rolloutStallSnapshot;
   const probeFn = options.probeTurnLiveness || probeTurnLiveness;
+  const nowFn = options.now || Date.now;
+  // Stall judging used to happen only at replyWaitTimeoutMs boundaries (1h), so
+  // the earliest possible stalled verdict was ~2h and Agent saw dead turns sit
+  // "in flight" indefinitely (2026-08-05 incident, turn
+  // 019fd2e5-0a92-7640-a965-8dbdf55f730b: died mid custom_tool_call at
+  // 17:12:25Z with no task_complete). The judging cadence is now its own knob.
+  const stallIdleMs = numberSetting(
+    config,
+    "stallIdleMs",
+    "NATIVE_AGENT_CODEX_STALL_IDLE_MS",
+    15 * 60 * 1000
+  );
+  // A server still claiming inProgress is NOT judged on the 15-minute knob: a
+  // single long tool call (a multi-hour build under the github-command profile)
+  // legitimately writes zero rollout bytes while running (2026-07-31 audit).
+  // Default preserves the pre-change effective behavior (4 x 1h windows).
+  //
+  // RATIFIED, do not lower without User (2026-08-05): the 4h default was raised
+  // as an explicit question at ship time and kept deliberately. Reasoning is
+  // forward-looking, not legacy — delegation is scaling to multi-hour project
+  // chunks, so server-claimed-live turns that write nothing for hours become
+  // NORMAL. Killing them at the dead-liveness knob would destroy real work; a
+  // wedged turn that is genuinely dead still converges, just slowly. The fast
+  // path is the dead-liveness arm (server unreachable / turn unlisted), which
+  // is the shape the 2026-08-05 incident actually took.
+  const stallWedgedIdleMs = Math.max(stallIdleMs, numberSetting(
+    config,
+    "stallWedgedIdleMs",
+    "NATIVE_AGENT_CODEX_STALL_WEDGED_IDLE_MS",
+    4 * 60 * 60 * 1000
+  ));
+  const judgingWindowMs = options.windowMs || stallIdleMs;
+  const waitOptions = { ...options, windowMs: judgingWindowMs };
   while (true) {
-    const observed = await waitForTurnResultWithEmptyRetry(job, config, options);
+    const observed = await waitForTurnResultWithEmptyRetry(job, config, waitOptions);
     if (observed.turnResult.status !== "timeout") return observed;
 
     // Stalled-turn detection (2026-07-30): a turn whose runtime died without
@@ -2792,14 +2935,26 @@ async function waitForDurableTerminalExecution(job, config, onTimeout, options =
     //     across one full wait window, or stayed undiscoverable;
     //   - liveness: the app-server is unreachable, or reachable but no longer
     //     lists this turn.
-    // Stagnant + dead liveness => stalled after one stagnant window ON TOP of
-    // the baseline window (earliest possible verdict: end of window 2). A
-    // server still claiming inProgress needs `stallWedgedWindows` stagnant
-    // windows (default 4): rollout stagnation measures BYTES WRITTEN, and a
-    // single long tool call — a multi-hour build under the github-command
-    // profile — legitimately writes nothing until the call returns
-    // (2026-07-31 audit). Rollout movement resets the count.
+    // Stagnant + dead liveness => stalled. When the rollout is discoverable the
+    // gate is MEASURED idle time (now - mtime >= stallIdleMs), not a count of
+    // windows: mtime is a real timestamp, so no baseline window is needed to
+    // interpret it, and a dead-liveness stall settles ~15 min after the last
+    // rollout byte instead of ~2h. When the rollout is NOT discoverable there is
+    // no timestamp to measure, so the original window-counting baseline still
+    // applies -- "I can't find the subject" must never read as "the subject is
+    // dead" (2026-07-31 audit: a rotated rolloutPath plus one transient RPC
+    // failure manufactured a one-window terminal stall on a healthy turn). The
+    // transient-RPC half of that trap is closed separately by confirming every
+    // dead-liveness reading with a second probe before settling.
+    // A server still claiming inProgress needs `stallWedgedIdleMs` (default 4h,
+    // matching the old 4 x 1h windows): rollout stagnation measures BYTES
+    // WRITTEN, and a single long tool call — a multi-hour build under the
+    // github-command profile — legitimately writes nothing until the call
+    // returns (2026-07-31 audit). Rollout movement resets everything.
     const currentSnapshot = snapshotFn(observed.threadId, config);
+    const idleMs = currentSnapshot && Number.isFinite(currentSnapshot.mtimeMs)
+      ? Math.max(0, nowFn() - currentSnapshot.mtimeMs)
+      : null;
     const prior = job.stallProbe || null;
     let effectiveStagnant;
     if (!prior) {
@@ -2822,11 +2977,32 @@ async function waitForDurableTerminalExecution(job, config, onTimeout, options =
       "NATIVE_AGENT_CODEX_STALL_WEDGED_WINDOWS",
       4
     ));
+    // Idle-time gates when the rollout is discoverable; window counts otherwise.
+    const idleReady = idleMs != null ? idleMs >= stallIdleMs : effectiveStagnant >= 1;
+    const wedgedReady = idleMs != null
+      ? idleMs >= stallWedgedIdleMs
+      : effectiveStagnant >= wedgedWindows;
     let liveness = null;
-    if (effectiveStagnant >= 1) {
+    if (idleReady) {
       liveness = await probeFn(observed.threadId, observed.turnId, config);
-      const deadLiveness = !liveness.serverReachable || !liveness.turnFound;
-      const wedgedInProgress = liveness.turnClaimsInProgress && effectiveStagnant >= wedgedWindows;
+      let deadLiveness = !liveness.serverReachable || !liveness.turnFound;
+      if (deadLiveness) {
+        // Confirm before settling: a single transient connectRpc failure or a
+        // mid-restart app-server must never be the sole evidence that a turn
+        // died. Two independent readings must agree (2026-07-31 audit).
+        await sleep(numberSetting(
+          config,
+          "stallProbeConfirmDelayMs",
+          "NATIVE_AGENT_CODEX_STALL_PROBE_CONFIRM_DELAY_MS",
+          5000
+        ));
+        const confirm = await probeFn(observed.threadId, observed.turnId, config);
+        if (confirm.serverReachable && confirm.turnFound) {
+          deadLiveness = false;
+        }
+        liveness = confirm;
+      }
+      const wedgedInProgress = liveness.turnClaimsInProgress && wedgedReady;
       if (deadLiveness || wedgedInProgress) {
         const rolloutPath = currentSnapshot ? currentSnapshot.path : null;
         const activity = rolloutPath
@@ -2843,12 +3019,20 @@ async function waitForDurableTerminalExecution(job, config, onTimeout, options =
             status: "stalled",
             noWorkObserved,
             toolActivityCount: inFlight ? inFlight.toolActivityCount : null,
+            connectorDiagnostics: inFlight ? inFlight.connectorDiagnostics || null : null,
             stallEvidence: {
               stagnantWindows: effectiveStagnant,
               rolloutPath,
               serverReachable: liveness.serverReachable,
               turnFound: liveness.turnFound,
               turnClaimsInProgress: liveness.turnClaimsInProgress,
+              idleMs,
+              idleThresholdMs: liveness.turnClaimsInProgress && !(!liveness.serverReachable || !liveness.turnFound)
+                ? stallWedgedIdleMs
+                : stallIdleMs,
+              lastActivityAt: currentSnapshot && Number.isFinite(currentSnapshot.mtimeMs)
+                ? new Date(currentSnapshot.mtimeMs).toISOString()
+                : null,
               detectedAt: nowISO(),
             },
           },
@@ -2918,7 +3102,11 @@ function formatCodexReplyForNativeAgent(job, turnResult) {
       : !ev.turnFound
         ? "the Codex app-server no longer lists this turn"
         : `the turn still claims to be running but wrote nothing across ${ev.stagnantWindows} full wait windows`;
-    lines.push(`Codex stopped making progress: no terminal row landed, the session file stayed unchanged across ${ev.stagnantWindows} consecutive wait window(s) after a baseline observation, and ${cause}. This turn will not complete on its own.`);
+    const idleClause = ev.lastActivityAt
+      ? `the session file has been unchanged since ${ev.lastActivityAt}`
+        + (Number.isFinite(ev.idleMs) ? ` (${Math.round(ev.idleMs / 60000)} min idle)` : "")
+      : `the session file stayed unchanged across ${ev.stagnantWindows} consecutive wait window(s) after a baseline observation`;
+    lines.push(`Codex stopped making progress: no terminal row landed, ${idleClause}, and ${cause}. This turn will not complete on its own.`);
     if (turnResult.noWorkObserved === true) {
       lines.push("No tool or shell activity was recorded before the stall: the request never executed, so resending it cannot stomp partial work.");
     } else if (turnResult.noWorkObserved === false) {
@@ -2942,6 +3130,18 @@ function formatCodexReplyForNativeAgent(job, turnResult) {
     }
   } else {
     lines.push("Codex did not finish before the reply watcher timed out.");
+  }
+  const connector = turnResult.connectorDiagnostics;
+  if (connector && connector.diagnostic === "connector_schema_mismatch") {
+    const properties = Array.isArray(connector.properties) && connector.properties.length > 0
+      ? connector.properties.join(", ")
+      : "(unnamed)";
+    lines.push(
+      "",
+      `Diagnostic: connector_schema_mismatch — ${connector.occurrences || 1} connector call(s) were rejected by workspace-admin schema validation on required property/properties: ${properties}.`,
+      "This is a tool-surface configuration failure, not a Codex reasoning failure: the connector's required parameters no longer match what Codex sends, so every retry down that path fails identically. Resending the same request will not help until the connector schema or the caller's parameters are reconciled (a workspace admin change is the usual cause).",
+    );
+    if (connector.detail) lines.push(`Verbatim: ${connector.detail}`);
   }
   lines.push("", "Now give User the completion update in this same conversation. Do not wait for him to ask whether Codex finished.");
   return lines.join("\n");
@@ -3145,6 +3345,7 @@ async function deliverReplyJobUnlocked(jobPath, config) {
       codexErrorInfo: turnResult.codexErrorInfo || null,
       noWorkObserved: turnResult.noWorkObserved ?? null,
       stallEvidence: turnResult.stallEvidence || null,
+      connectorDiagnostics: turnResult.connectorDiagnostics || null,
     },
   };
   const bridge = await postBridgeMessageWithRetry(
@@ -3192,6 +3393,7 @@ async function deliverReplyJobUnlocked(jobPath, config) {
       codexErrorInfo: turnResult.codexErrorInfo || null,
       noWorkObserved: turnResult.noWorkObserved ?? null,
       stallEvidence: turnResult.stallEvidence || null,
+      connectorDiagnostics: turnResult.connectorDiagnostics || null,
       brain: turnResult.brain || null,
       messagePreview: (turnResult.message || "").slice(0, 1000),
     },

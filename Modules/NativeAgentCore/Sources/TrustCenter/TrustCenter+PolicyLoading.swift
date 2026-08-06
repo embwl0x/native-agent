@@ -36,7 +36,11 @@ extension SwiftNativeTrustCenter {
         _ policy: [String: JSONValue]
     ) throws {
         let objectPaths: [[String]] = [
-            ["missionPolicy"],
+            [WorkshopPolicyBlockVocabulary.wireKey],
+            // Wave 4 read-both: a saved policy carrying the FUTURE spelling is
+            // held to the same must-be-an-object rule, so a scalar under either
+            // key fails the same way instead of only the wire one.
+            [WorkshopPolicyBlockVocabulary.futureKey],
             ["toolAutonomy"],
             ["toolPolicy"],
             ["filePolicy"],
@@ -135,7 +139,13 @@ extension SwiftNativeTrustCenter {
     }
 
     public func loadTrustPolicyChecked() async throws -> [String: JSONValue] {
-        let saved = try Self.loadRawPolicyChecked(at: trustPolicyURL)
+        // Fold the future spelling BEFORE type validation, not just before the
+        // normalize merge — otherwise a `workshopPolicy` block skips the
+        // nested type checks the legacy spelling gets (defaults only carry the
+        // wire key), making future-key reads more permissive than old-key
+        // reads (review 2026-08-06 blocking #3).
+        let saved = WorkshopPolicyBlockVocabulary.foldToWireKey(
+            try Self.loadRawPolicyChecked(at: trustPolicyURL))
         try Self.validateKnownAuthorityPolicyTypes(saved, against: defaultTrustPolicy())
         return normalizedTrustPolicy(saved: saved)
     }
@@ -179,6 +189,13 @@ extension SwiftNativeTrustCenter {
     private func normalizedTrustPolicy(saved savedDict: [String: JSONValue]) -> [String: JSONValue] {
         let defaults = defaultTrustPolicy()
         var merged = defaults
+        // Wave 4 read-both (phase A): a saved policy written by a future build
+        // may carry `workshopPolicy`. Fold it onto the WIRE key here, at the one
+        // read seam, so the merge below and every gate downstream keep looking
+        // at exactly one key — and so the normalized result still carries the
+        // old spelling, which is what every writer emits and what a 0.3.7 iOS
+        // install decodes. A policy with only the old key is untouched.
+        let savedDict = WorkshopPolicyBlockVocabulary.foldToWireKey(savedDict)
         for (k, v) in savedDict {
             if case .object(let savedNested) = v,
                case .object(let defNested)? = merged[k] {
@@ -224,7 +241,8 @@ extension SwiftNativeTrustCenter {
             "autoRunSafeTools": .bool(false),
             "riskyToolApproval": .string("deny"),
         ])
-        policy["missionPolicy"] = .object([
+        // Wave 4 phase A: still the old key (see defaultTrustPolicy).
+        policy[WorkshopPolicyBlockVocabulary.wireKey] = .object([
             "allowBackgroundMissions": .bool(false),
             "requireReceipts": .bool(true),
             "autoCreateMissionFromChat": .bool(false),

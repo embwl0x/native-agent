@@ -455,7 +455,12 @@ private struct InternallyFailingCheck: DoctorCheck {
     let root = tempDir()
     defer { try? FileManager.default.removeItem(at: root) }
     let docs = root.appendingPathComponent("Documents", isDirectory: true)
-    let result = await ICloudBridgeStateCheck(docsURLProvider: { docs }).run(repair: true)
+    // dataRoot pinned: the check also reports the sync engine's LOCAL
+    // bookkeeping state, and a test must never read the live data root.
+    let result = await ICloudBridgeStateCheck(
+        docsURLProvider: { docs },
+        dataRoot: root
+    ).run(repair: true)
     #expect(result.status == "ok")
     #expect(result.repair?.contains("outbox/mac") == true)
     #expect(FileManager.default.fileExists(atPath: docs.appendingPathComponent("outbox/mac").path))
@@ -469,9 +474,12 @@ private struct InternallyFailingCheck: DoctorCheck {
     // unavailable container is EXPECTED and must NOT nag — report ok, not warn.
     // iCloudConfigured is passed explicitly so the assertion is hermetic and
     // doesn't depend on the ambient NATIVEAGENT_ICLOUD_CONTAINER_ID.
+    let root = tempDir()
+    defer { try? FileManager.default.removeItem(at: root) }
     let result = await ICloudBridgeStateCheck(
         docsURLProvider: { nil },
-        iCloudConfigured: false
+        iCloudConfigured: false,
+        dataRoot: root
     ).run(repair: true)
     #expect(result.status == "ok")
     #expect(result.detail.contains("isn't part of this build"))
@@ -482,9 +490,12 @@ private struct InternallyFailingCheck: DoctorCheck {
     // A build that DOES configure a real iCloud container but can't reach it
     // (not signed in / CLI lacks the iCloud entitlement) is a genuine problem —
     // warn and point the user at signing in from the signed Mac app.
+    let root = tempDir()
+    defer { try? FileManager.default.removeItem(at: root) }
     let result = await ICloudBridgeStateCheck(
         docsURLProvider: { nil },
-        iCloudConfigured: true
+        iCloudConfigured: true,
+        dataRoot: root
     ).run(repair: true)
     #expect(result.status == "warn")
     #expect(result.detail.contains("unavailable"))

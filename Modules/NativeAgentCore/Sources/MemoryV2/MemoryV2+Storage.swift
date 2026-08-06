@@ -1211,7 +1211,17 @@ public actor MemoryStorage {
             ? allCandidates
             : allCandidates.filter { $0.memory.personaId == persona }
         let queryNorm = Self.l2norm(query)
-        guard queryNorm > 0 else { return [] }
+        // Sweep R4 A5: a COLD embedder (MiniLM not yet warm on the Neural
+        // Engine — reliably the state on the first message after launch) hands
+        // us a zero/empty vector, and this used to return [] — total recall
+        // silence with nothing but a trace flag to show for it. Degrade to the
+        // lexical lane instead: a keyword ranking is worse than semantic, and
+        // enormously better than nothing.
+        guard queryNorm > 0 else {
+            return try await recallByKeyword(
+                queryText: queryText, topK: topK, persona: persona
+            )
+        }
         let now = Date()
         let lexicalScores = MemoryRecallScoring.normalizedBM25Scores(
             query: queryText,
@@ -1242,6 +1252,88 @@ public actor MemoryStorage {
         }
         scored.sort { $0.1 > $1.1 }
         return Self.uniqueRecallResults(scored, limit: topK)
+    }
+
+    // MARK: - Keyword recall fallback (sweep R4, finding A5)
+
+    /// How many candidate rows the LIKE prefilter may pull before BM25 ranking.
+    /// The dense lane scans a cached in-memory candidate set; this lane hits
+    /// SQL, so it stays explicitly bounded.
+    private static let keywordRecallCandidateCap = 400
+
+    /// Lexical-only recall for when NO usable query embedding exists (cold
+    /// embedder, embedder failure, epoch mismatch). Selection is a
+    /// case-insensitive LIKE over active rows for any query token; ranking is
+    /// the SAME normalized BM25 the hybrid lane already blends in, times the
+    /// same lifecycle factor. Crucially this does NOT require `embedding IS NOT
+    /// NULL`, so it also answers on a store whose vectors have not been
+    /// backfilled yet.
+    ///
+    /// Callers mark these rows as fallback-sourced (see `MemoryV2.recall`) so
+    /// the trace never presents keyword hits as semantic ones.
+    public func recallByKeyword(
+        queryText: String?,
+        topK: Int,
+        persona: String? = nil
+    ) async throws -> [(memory: StoredMemory, similarity: Double)] {
+        guard topK > 0 else { return [] }
+        let tokens = Array(Set(MemoryRecallScoring.lexicalTokens(queryText ?? "")))
+        guard !tokens.isEmpty else { return [] }
+        let candidateCap = Self.keywordRecallCandidateCap
+        let candidates = try await dbPool.read { db -> [StoredMemory] in
+            var sql = """
+                SELECT * FROM memories
+                WHERE status = 'active'
+                  AND lifecycle NOT IN ('corrected', 'contradicted', 'deleted')
+            """
+            var arguments: [DatabaseValueConvertible] = []
+            if let persona {
+                sql += " AND persona_id = ?"
+                arguments.append(persona)
+            }
+            let likeClauses = tokens.map { _ in "content LIKE ? ESCAPE '\\'" }
+            sql += " AND (" + likeClauses.joined(separator: " OR ") + ")"
+            for token in tokens {
+                arguments.append("%" + Self.escapedLikePattern(token) + "%")
+            }
+            sql += " ORDER BY rowid LIMIT ?"
+            arguments.append(candidateCap)
+            let rows = try Row.fetchAll(
+                db, sql: sql, arguments: StatementArguments(arguments)
+            )
+            return rows.map(Self.decodeMemory)
+        }
+        guard !candidates.isEmpty else { return [] }
+        let lexicalScores = MemoryRecallScoring.normalizedBM25Scores(
+            query: queryText,
+            documents: candidates.map(\.content)
+        )
+        let now = Date()
+        var scored: [(StoredMemory, Double)] = []
+        scored.reserveCapacity(candidates.count)
+        for (idx, memory) in candidates.enumerated() {
+            let lexical = idx < lexicalScores.count ? lexicalScores[idx] : 0
+            guard lexical > 0 else { continue }
+            let decay = MemoryRecallScoring.decayFactor(
+                kind: MemoryRecallScoring.kind(of: memory.metadata),
+                updatedAt: memory.updatedAt,
+                now: now
+            )
+            scored.append(
+                (memory, lexical * decay * MemoryLifecycle.rankingFactor(memory.lifecycle))
+            )
+        }
+        scored.sort { $0.1 > $1.1 }
+        return Self.uniqueRecallResults(scored, limit: topK)
+    }
+
+    /// Escape LIKE wildcards in a user-derived token so a query containing `%`
+    /// or `_` cannot widen the prefilter into a full scan-and-match.
+    private static func escapedLikePattern(_ token: String) -> String {
+        token
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "%", with: "\\%")
+            .replacingOccurrences(of: "_", with: "\\_")
     }
 
     /// U3 wave-2 item 4: top-1 nearest ACTIVE neighbor by RAW cosine — the

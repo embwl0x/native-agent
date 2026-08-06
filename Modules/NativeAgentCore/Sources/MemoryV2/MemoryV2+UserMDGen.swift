@@ -267,6 +267,33 @@ public actor UserMDGenerator {
             // (gpt-5.5 review HIGH, 2026-07-03).
             if m.id.hasPrefix(SwiftNativeMemoryV2.skillPointerIDPrefix) { continue }
             if Self.memoryKind(m) == "skill" { continue }
+            // Workshop execution outcomes are the AGENT'S work journal —
+            // legitimate durable memories (E-2 writes them so she remembers
+            // what she built), but they are facts about her work, not about
+            // the USER. Without this gate they flooded the identity doc: 46
+            // of ~60 bullets were "Workshop execution X completed/failed"
+            // rows (User, 2026-08-06). Provenance-gated, not content-sniffed:
+            // the literal must equal WorkshopExecutionMemory.sourcePrefix
+            // ("workshop:") — MemoryV2 cannot import WorkshopExecution
+            // (dependency direction), so the two spellings are pinned by
+            // convention only. If sourcePrefix ever changes, this literal
+            // and UserMDGenTests must change with it.
+            if (m.source ?? "").hasPrefix("workshop:") { continue }
+            // USER.md is User's IDENTITY doc, not the agent's working memory.
+            // The workshop gate above killed one pollution source; the disease
+            // was that renderBody projected EVERY active row, and the store
+            // legitimately holds the agent's own operational knowledge —
+            // corrections, procedures, delegation forensics, build decisions
+            // (2026-08-06 live read: ~45 of 60 rendered bullets were agent ops,
+            // zero about User). Kind labels are model-chosen at commit time, so
+            // a denylist of "bad" kinds leaks on every new label; this is a
+            // fail-closed ALLOWLIST of person-kinds instead. A row with no
+            // kind, an unknown kind, or an ops kind stays fully recallable —
+            // it just doesn't ride the identity doc. Cost accepted: a genuine
+            // User-fact mislabeled `decision` drops out until relabeled; a
+            // 100%-about-User doc beats a complete-but-70%-noise one.
+            guard let kind = Self.memoryKind(m),
+                  Self.userIdentityKinds.contains(kind) else { continue }
             // Admission parity with the memory CONTEXT projection
             // (2026-07-24). USER.md is a projection of the same rows the
             // context projection compiles into memory atoms, and
@@ -308,6 +335,16 @@ public actor UserMDGenerator {
         out += "\n"
         return out
     }
+
+    /// Kinds that describe the PERSON (or the User↔Agent relationship) rather
+    /// than the agent's work. The union observed live 2026-08-06 across
+    /// chat.commit_memory and adaptive-promoter rows; extend deliberately,
+    /// never automatically — every addition puts rows on a doc that rides
+    /// every prompt.
+    static let userIdentityKinds: Set<String> = [
+        "user_fact", "user_preference", "preference", "relationship",
+        "identity", "attribute", "moment", "experience",
+    ]
 
     private static func memoryKind(_ memory: StoredMemory) -> String? {
         guard case .object(let obj)? = memory.metadata,

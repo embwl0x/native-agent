@@ -37,6 +37,22 @@ import Foundation
 
 public enum TaskLedgerActor: String, Sendable, CaseIterable {
     case claude, assistant, codex, user
+
+    /// Legacy actor spellings that predate the identity-neutral rename fold to
+    /// their canonical case on decode. Without this, one historical row wedges
+    /// snapshot+tail compaction forever: the row can never decode, `isClean`
+    /// never goes true, and the feed can never shrink (op_log_health BLOCKED,
+    /// 2026-08-06). Decode-side only — writers always emit the canonical
+    /// rawValue, and historical bytes on disk are never rewritten.
+    public init?(wire raw: String) {
+        if let canonical = TaskLedgerActor(rawValue: raw) {
+            self = canonical
+        } else if raw == "agent" {
+            self = .assistant
+        } else {
+            return nil
+        }
+    }
 }
 
 public enum TaskLedgerKind: String, Sendable, CaseIterable {
@@ -103,7 +119,7 @@ public struct TaskLedgerEvent: Sendable, Equatable {
               case .string(let ts)? = obj["ts"],
               case .string(let actorRaw)? = obj["actor"],
               case .string(let kindRaw)? = obj["kind"],
-              let actor = TaskLedgerActor(rawValue: actorRaw),
+              let actor = TaskLedgerActor(wire: actorRaw),
               let kind = TaskLedgerKind(rawValue: kindRaw) else {
             return nil
         }
@@ -162,7 +178,7 @@ public struct TaskLedgerTaskState: Sendable, Equatable {
         var title: String?
         if case .string(let t)? = obj["title"] { title = t }
         var owner: TaskLedgerActor?
-        if case .string(let o)? = obj["owner"] { owner = TaskLedgerActor(rawValue: o) }
+        if case .string(let o)? = obj["owner"] { owner = TaskLedgerActor(wire: o) }
         var lastNote: String?
         if case .string(let n)? = obj["lastNote"] { lastNote = n }
         var refs: [String] = []

@@ -8,6 +8,11 @@
 #   ./script/release.sh --publish-appcast  — generate+sign AND publish the feed;
 #                                            only this mode lets the app claim that
 #                                            automatic updates work (A2.1)
+#   ./script/release.sh --notes FILE       — release notes for the Sparkle update
+#                                            dialog AND the GitHub release body.
+#                                            Defaults to docs/release-notes/<VERSION>.md
+#                                            when that file exists; with neither,
+#                                            the update dialog stays blank (C12).
 #   ./script/release.sh --self-test-gates dist/NativeAgent.app
 #                                          — run the A1.1 identity leak gate and the
 #                                            A1.5 bundle assertion against an existing
@@ -40,25 +45,46 @@ DRY_RUN=false
 # CLAIMS a working update feed when none was published. See UpdateController.swift.
 GENERATE_APPCAST=false
 PUBLISH_APPCAST=false
+# Sweep R4 C12: release notes for the Sparkle update dialog. Explicit --notes
+# FILE wins; otherwise docs/release-notes/<VERSION>.md is picked up if it
+# exists. No file, no notes — the dialog stays blank, honestly, rather than
+# inventing a changelog.
+RELEASE_NOTES_FILE=""
 
 # RELEASE-2026-05-06: parse flags
 SELF_TEST_GATES_TARGET=""
 _expect_self_test_target=false
+_expect_notes_file=false
 for arg in "$@"; do
   if [[ "$_expect_self_test_target" == "true" ]]; then
     SELF_TEST_GATES_TARGET="$arg"
     _expect_self_test_target=false
     continue
   fi
+  if [[ "$_expect_notes_file" == "true" ]]; then
+    RELEASE_NOTES_FILE="$arg"
+    _expect_notes_file=false
+    continue
+  fi
   case "$arg" in
     --dry-run) DRY_RUN=true ;;
     --appcast) GENERATE_APPCAST=true ;;
     --publish-appcast) GENERATE_APPCAST=true; PUBLISH_APPCAST=true ;;
+    --notes) _expect_notes_file=true ;;
+    --notes=*) RELEASE_NOTES_FILE="${arg#--notes=}" ;;
     --self-test-gates) _expect_self_test_target=true ;;
     --self-test-gates=*) SELF_TEST_GATES_TARGET="${arg#--self-test-gates=}" ;;
     *) echo "Unknown argument: $arg" >&2; exit 1 ;;
   esac
 done
+if [[ "$_expect_notes_file" == "true" ]]; then
+  echo "ERROR: --notes requires a path to a release-notes file." >&2
+  exit 1
+fi
+if [[ -n "$RELEASE_NOTES_FILE" && ! -f "$RELEASE_NOTES_FILE" ]]; then
+  echo "ERROR: --notes file not found: $RELEASE_NOTES_FILE" >&2
+  exit 1
+fi
 if [[ "$_expect_self_test_target" == "true" ]]; then
   echo "ERROR: --self-test-gates requires a path to a .app bundle." >&2
   exit 1
@@ -1240,6 +1266,21 @@ fi
 # --publish-appcast was passed, so a release that cannot publish must not ship.
 if [[ "$GENERATE_APPCAST" == "true" ]]; then
   APPCAST_ARGS=( --dmg "$DMG_PATH" --version "$VERSION" )
+  # Sweep R4 C12 — release notes seam. --notes wins; the conventional
+  # docs/release-notes/<version>.md is the zero-flag path. Nothing is
+  # synthesized: with no file the Sparkle dialog stays blank as before.
+  if [[ -z "$RELEASE_NOTES_FILE" && -f "$ROOT/docs/release-notes/$VERSION.md" ]]; then
+    RELEASE_NOTES_FILE="$ROOT/docs/release-notes/$VERSION.md"
+    echo "==> Release notes: $RELEASE_NOTES_FILE (conventional path)"
+  fi
+  if [[ -n "$RELEASE_NOTES_FILE" ]]; then
+    APPCAST_ARGS+=( --notes "$RELEASE_NOTES_FILE" )
+    # The GitHub release body gets the same text as the Sparkle dialog.
+    export NATIVEAGENT_GITHUB_RELEASE_NOTES_FILE="$RELEASE_NOTES_FILE"
+  else
+    echo "==> Release notes: none supplied (--notes FILE or docs/release-notes/$VERSION.md);"
+    echo "    the Sparkle update dialog for this build will have no description."
+  fi
   if [[ "$PUBLISH_APPCAST" == "true" ]]; then
     APPCAST_ARGS+=( --publish )
   else

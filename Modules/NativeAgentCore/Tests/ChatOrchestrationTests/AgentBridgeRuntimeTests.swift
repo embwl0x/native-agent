@@ -4,7 +4,7 @@ import Testing
 
 @Suite("Agent bridge runtime discovery")
 struct AgentBridgeRuntimeTests {
-    @Test("app-only install resolves bundled Codex and Claude wakeup helpers")
+    @Test("app-only install resolves bundled Codex, Claude, and OMP wakeup helpers")
     func resolvesBundledHelpers() throws {
         let root = try temporaryDirectory("bundled")
         let resources = root.appendingPathComponent("Resources", isDirectory: true)
@@ -12,8 +12,10 @@ struct AgentBridgeRuntimeTests {
         try FileManager.default.createDirectory(at: bundle, withIntermediateDirectories: true)
         let codex = bundle.appendingPathComponent("codex_thread_wakeup.js")
         let claude = bundle.appendingPathComponent("claude_thread_wakeup.js")
+        let omp = bundle.appendingPathComponent("omp_thread_wakeup.js")
         try "codex".write(to: codex, atomically: true, encoding: .utf8)
         try "claude".write(to: claude, atomically: true, encoding: .utf8)
+        try "omp".write(to: omp, atomically: true, encoding: .utf8)
 
         let missingRepo = root.appendingPathComponent("no-source-checkout", isDirectory: true)
         #expect(AgentBridgeRuntime.codexHelperURL(
@@ -27,6 +29,11 @@ struct AgentBridgeRuntimeTests {
             bundleResourceRoot: resources,
             environment: [:]
         ) == claude.standardizedFileURL)
+        #expect(AgentBridgeRuntime.ompHelperURL(
+            repoRoot: missingRepo,
+            bundleResourceRoot: resources,
+            environment: [:]
+        ) == omp.standardizedFileURL)
     }
 
     @Test("explicit helper override wins over source and bundle candidates")

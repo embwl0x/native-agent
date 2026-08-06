@@ -123,7 +123,7 @@ struct NativeContextFlowRuntimeTests {
         ]
         let missionPath = fixture.dataRoot
             .appendingPathComponent("workshop/executions/\(executionID)", isDirectory: true)
-            .appendingPathComponent("mission.json")
+            .appendingPathComponent("execution.json")
         try FileManager.default.createDirectory(
             at: missionPath.deletingLastPathComponent(),
             withIntermediateDirectories: true

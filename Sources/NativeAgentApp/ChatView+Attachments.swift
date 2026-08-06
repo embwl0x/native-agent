@@ -228,7 +228,9 @@ extension ChatView {
                     guard let data = try? Data(contentsOf: url) else {
                         // error_handling fix: surface read failure instead of
                         // returning silently with no user feedback.
-                        DispatchQueue.main.async { self.showToast("Could not read file: \(url.lastPathComponent)") }
+                        // Sweep R4 C14: one spelling for this failure across the
+                        // picker and drop paths ("Couldn't read file: <name>").
+                        DispatchQueue.main.async { self.showToast("Couldn't read file: \(url.lastPathComponent)") }
                         return
                     }
                     let b64 = data.base64EncodedString()

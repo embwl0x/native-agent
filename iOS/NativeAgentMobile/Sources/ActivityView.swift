@@ -102,6 +102,15 @@ struct ActivityView: View {
             }
             .listStyle(.insetGrouped)
             .navigationTitle("Activity")
+            // Sweep R4 C11.3 / C11.4 — render-only surfacing of state this
+            // screen's own `sync` engine and the shared bridge client already
+            // publish. No new polling.
+            .macSyncErrorBanner()
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    MacStatusChip()
+                }
+            }
             .navigationDestination(for: ActivitySection.self) { section in
                 // `embedInNavigationStack: false` — these destinations live
                 // INSIDE Activity's NavigationStack; if they wrap themselves

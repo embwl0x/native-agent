@@ -71,7 +71,7 @@ struct MemoryConsolidationGateTests {
             content: "the user ships fast and verifies empirically",
             source: "gate-test",
             embedding: [0, 0, 1, 0],
-            metadata: .object(["durability_score": .double(0.91)])
+            metadata: .object(["durability_score": .double(0.91), "kind": .string("user_fact")])
         )
         _ = try await storage.insertProposal(proposal)
 
@@ -718,7 +718,7 @@ struct MemoryConsolidationGateTests {
         _ = try await storage.insertProposal(StoredProposal(
             content: "the user ships fast and verifies empirically",
             source: "gate-test", embedding: [0, 0, 1, 0],
-            metadata: .object(["durability_score": .double(0.91)])))
+            metadata: .object(["durability_score": .double(0.91), "kind": .string("user_fact")])))
 
         let probes = MemoryProbeSet(topK: 5, probes: [
             MemoryProbe(id: "qColor", question: "What is the user's favorite color?",

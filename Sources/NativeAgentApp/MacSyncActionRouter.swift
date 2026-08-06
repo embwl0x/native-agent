@@ -149,13 +149,20 @@ struct MacSyncActionRouter {
                 let result = try await api.submitWorkshopExecution(title: title, objective: objective)
                 return [
                     "status": "ok",
-                    "missionId": result.executionId ?? result.id ?? "",
+                    // Wave 4 phase A: STILL the old key. A 0.3.7 iOS install
+                    // reads this response, so the emitted spelling does not
+                    // move until the iOS floor does.
+                    InboxActionExecutionIdVocabulary.wireKey: result.executionId ?? result.id ?? "",
                     "deskHandle": result.desk_handle ?? "",
                     "deskAlias": result.desk_alias ?? "",
                 ]
 
             case "approveStep":
-                let executionId = payload["missionId"] ?? ""
+                // Wave 4 (phase A) read-both: a future iOS build may send
+                // `executionId`; 0.3.7 sends `missionId`. Accept either. The
+                // iOS writer and the submit response above BOTH still emit
+                // `missionId`, so nothing on this wire changed shape.
+                let executionId = InboxActionExecutionIdVocabulary.executionId(payload) ?? ""
                 let stepId = payload["stepId"] ?? ""
                 guard !executionId.isEmpty, !stepId.isEmpty, stepId != "pending" else {
                     return ["status": "error", "error": "missing_real_step_id"]
@@ -164,7 +171,8 @@ struct MacSyncActionRouter {
                 return ["status": "ok"]
 
             case "rejectStep":
-                let executionId = payload["missionId"] ?? ""
+                // Wave 4 (phase A) read-both — see `approveStep` above.
+                let executionId = InboxActionExecutionIdVocabulary.executionId(payload) ?? ""
                 let stepId = payload["stepId"] ?? ""
                 guard !executionId.isEmpty, !stepId.isEmpty, stepId != "pending" else {
                     return observed(["status": "error", "error": "missing_real_step_id"])

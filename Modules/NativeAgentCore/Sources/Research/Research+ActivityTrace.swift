@@ -35,7 +35,7 @@ extension SwiftNativeResearchClient {
             "title": .string(Self.redactSecretText(title)),
             "detail": .string(Self.redactSecretText(detail)),
             "status": .string(status),
-            "missionId": .null,
+            "executionId": .null,
             "payload": Self.redactSecretValue(payload),
             "createdAt": .string(Self.isoTimestamp(now())),
         ])

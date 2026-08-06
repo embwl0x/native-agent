@@ -8,6 +8,45 @@ import PersistenceCore
 // status. Concrete loop assembly stays in NativeAgentApp and is injected via
 // `start(loops:)`, keeping this module dependency-light.
 
+/// Liveness of ONE event-driven loop's stream listener (sweep R4 item 3).
+///
+/// An `EventDeadlineLoopRunner` is invalidated by its event stream, not by a
+/// timer. When that stream ends — a file watcher invalidated, an upstream
+/// continuation finished — the `for await` returns and the listener task exits
+/// normally. Before this type existed nothing recorded that exit, so a loop
+/// with a dead listener still reported `running: true` and simply stopped
+/// firing. `nil` on `LoopStatus` means "this loop has no event listener", which
+/// is a different statement from "its listener is down".
+public struct LoopEventListenerHealth: Sendable, Equatable {
+    /// A listener task is currently consuming the stream.
+    public var active: Bool
+    /// When the stream last ended on its own (nil = it never has).
+    public var lastEndedAt: Date?
+    /// How many times this loop's listener has been restarted since
+    /// registration. Monotonic; a healthy loop stays at 0.
+    public var restartCount: Int
+    /// Ends since the last event actually arrived. Reset by a delivered event,
+    /// which is the only proof the replacement listener is really working — a
+    /// stream that ends immediately on every restart keeps climbing.
+    public var consecutiveEnds: Int
+    /// Human-readable last termination, carried into Doctor.
+    public var lastError: String?
+
+    public init(
+        active: Bool = true,
+        lastEndedAt: Date? = nil,
+        restartCount: Int = 0,
+        consecutiveEnds: Int = 0,
+        lastError: String? = nil
+    ) {
+        self.active = active
+        self.lastEndedAt = lastEndedAt
+        self.restartCount = restartCount
+        self.consecutiveEnds = consecutiveEnds
+        self.lastError = lastError
+    }
+}
+
 public struct LoopStatus: Sendable, Equatable {
     public let name: String
     public let lastRun: Date?
@@ -15,6 +54,8 @@ public struct LoopStatus: Sendable, Equatable {
     public let runCount: Int
     public let lastError: String?
     public let running: Bool
+    /// nil for loops that are not event-driven at all.
+    public let eventListener: LoopEventListenerHealth?
 
     public init(
         name: String,
@@ -22,7 +63,8 @@ public struct LoopStatus: Sendable, Equatable {
         nextRun: Date?,
         runCount: Int,
         lastError: String?,
-        running: Bool = false
+        running: Bool = false,
+        eventListener: LoopEventListenerHealth? = nil
     ) {
         self.name = name
         self.lastRun = lastRun
@@ -30,6 +72,7 @@ public struct LoopStatus: Sendable, Equatable {
         self.runCount = runCount
         self.lastError = lastError
         self.running = running
+        self.eventListener = eventListener
     }
 }
 
@@ -311,6 +354,15 @@ public actor BackgroundLoopsManager {
     private var physiologyDebounceTasks: [String: Task<Void, Never>] = [:]
     private var physiologyDeadlineTasks: [String: Task<Void, Never>] = [:]
     private var physiologyDeadlines: [String: Date] = [:]
+    /// Sweep R4 item 3: per-loop listener liveness + the pending restart task.
+    private var physiologyListenerHealth: [String: LoopEventListenerHealth] = [:]
+    private var physiologyListenerRestartTasks: [String: Task<Void, Never>] = [:]
+    /// Bounded restart backoff for an event listener whose stream ended. The
+    /// last entry is the ceiling: a permanently dead source retries every 30s
+    /// forever rather than spinning, and its climbing `consecutiveEnds` is what
+    /// surfaces the problem in `status()` instead of a respawn loop hiding it.
+    /// `internal` so a test can compress the schedule; production never sets it.
+    internal var eventListenerRestartBackoff: [TimeInterval] = [1, 5, 30]
 
     public init(
         scheduler: SwiftNativeLoopScheduler = SwiftNativeLoopScheduler(),
@@ -423,7 +475,15 @@ public actor BackgroundLoopsManager {
                 nextRun: nextRun,
                 runCount: max(state.tickCount, snapshot?.runCount ?? 0),
                 lastError: state.lastError,
-                running: started && registrations[state.loopId] != nil
+                running: started && registrations[state.loopId] != nil,
+                // Sweep R4 item 3: liveness of the EVENT lane, reported
+                // separately from `running` (which only proves the manager
+                // started and the loop is registered). A loop can be running
+                // with a dead listener; that is precisely the state that used
+                // to be invisible.
+                eventListener: physiologyRunners[state.loopId] == nil
+                    ? nil
+                    : (physiologyListenerHealth[state.loopId] ?? LoopEventListenerHealth())
             ))
         }
         return result
@@ -553,29 +613,87 @@ public actor BackgroundLoopsManager {
         }
     }
 
-    private func activatePhysiology(loopId: String) {
+    private func activatePhysiology(loopId: String, reconcile: Bool = true) {
         guard started,
               let runner = physiologyRunners[loopId],
               let generation = physiologyGenerations[loopId]
         else { return }
         physiologyStartupTasks.removeValue(forKey: loopId)?.cancel()
         physiologyEventTasks[loopId]?.cancel()
+        physiologyListenerRestartTasks.removeValue(forKey: loopId)?.cancel()
+        var health = physiologyListenerHealth[loopId] ?? LoopEventListenerHealth()
+        health.active = true
+        physiologyListenerHealth[loopId] = health
         let stream = runner.physiologyEvents()
         physiologyEventTasks[loopId] = Task { [weak self] in
             for await _ in stream {
                 guard !Task.isCancelled else { return }
                 await self?.physiologyEventArrived(loopId: loopId, generation: generation)
             }
+            // The stream ENDED. Before sweep R4 item 3 this task simply
+            // returned and nothing anywhere knew: `status()` still reported the
+            // loop running, and a purely event-driven loop stopped firing until
+            // the process restarted. Cancellation is the legitimate exit
+            // (stop/restart/replacement) and stays silent.
+            guard !Task.isCancelled else { return }
+            await self?.physiologyEventStreamEnded(loopId: loopId, generation: generation)
         }
         // Startup/restart reconciliation closes the missed-event window
         // without waiting for the slow integrity sweep. It is deliberately a
         // separately owned one-shot task: coupling it to the infinite stream
         // consumer made completion depend on when that listener happened to
         // receive executor time under whole-suite or host saturation.
+        //
+        // `reconcile: false` is the PERMANENTLY-DEAD-SOURCE case (sweep R4
+        // item 3). Reconciling on every listener restart is right while the
+        // source might come back, but a source that is simply gone retries at
+        // the 30s ceiling forever — and reconciling each time would turn a dead
+        // watcher into a forced tick every 30s for the life of the process.
+        // After the third consecutive end we keep rebuilding the listener and
+        // keep reporting the failure, without the tick.
+        guard reconcile else { return }
         physiologyStartupTasks[loopId] = Task { [weak self] in
             await self?.reschedulePhysiologyDeadline(loopId: loopId)
             await self?.firePhysiology(loopId: loopId, generation: generation)
         }
+    }
+
+    /// A listener's stream finished on its own. Record it, then rebuild the
+    /// listener after a bounded backoff. The rebuild goes through
+    /// `activatePhysiology`, which ALSO re-runs the startup reconciliation —
+    /// deliberately: the window in which no listener existed is a window in
+    /// which events were missed, and reconciliation is the existing mechanism
+    /// for closing exactly that gap.
+    private func physiologyEventStreamEnded(loopId: String, generation: UUID) async {
+        guard started, physiologyGenerations[loopId] == generation else { return }
+        var health = physiologyListenerHealth[loopId] ?? LoopEventListenerHealth()
+        health.active = false
+        health.lastEndedAt = clock()
+        health.consecutiveEnds += 1
+        let delay = backoffDelay(forEndCount: health.consecutiveEnds)
+        health.lastError = "event stream ended (\(health.consecutiveEnds) consecutive); restarting in \(formatTimeout(delay))"
+        physiologyListenerHealth[loopId] = health
+
+        physiologyListenerRestartTasks.removeValue(forKey: loopId)?.cancel()
+        physiologyListenerRestartTasks[loopId] = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled else { return }
+            await self?.restartPhysiologyListener(loopId: loopId, generation: generation)
+        }
+    }
+
+    private func restartPhysiologyListener(loopId: String, generation: UUID) {
+        physiologyListenerRestartTasks.removeValue(forKey: loopId)
+        guard started, physiologyGenerations[loopId] == generation else { return }
+        physiologyListenerHealth[loopId]?.restartCount += 1
+        let ends = physiologyListenerHealth[loopId]?.consecutiveEnds ?? 0
+        activatePhysiology(loopId: loopId, reconcile: ends <= 2)
+    }
+
+    private func backoffDelay(forEndCount count: Int) -> TimeInterval {
+        guard !eventListenerRestartBackoff.isEmpty else { return 30 }
+        let index = min(max(count, 1) - 1, eventListenerRestartBackoff.count - 1)
+        return eventListenerRestartBackoff[index]
     }
 
     private func physiologyEventArrived(loopId: String, generation: UUID) {
@@ -583,6 +701,15 @@ public actor BackgroundLoopsManager {
               physiologyGenerations[loopId] == generation,
               let runner = physiologyRunners[loopId]
         else { return }
+        // A delivered event is the ONLY proof a restarted listener actually
+        // works; a stream that ends immediately every time never gets here, so
+        // its consecutive-end count keeps climbing into Doctor.
+        if var health = physiologyListenerHealth[loopId], health.consecutiveEnds != 0 || !health.active {
+            health.consecutiveEnds = 0
+            health.active = true
+            health.lastError = nil
+            physiologyListenerHealth[loopId] = health
+        }
         physiologyDeadlineTasks.removeValue(forKey: loopId)?.cancel()
         physiologyDeadlines.removeValue(forKey: loopId)
         physiologyDebounceTasks.removeValue(forKey: loopId)?.cancel()
@@ -644,6 +771,10 @@ public actor BackgroundLoopsManager {
     private func cancelPhysiology(loopId: String) {
         physiologyStartupTasks.removeValue(forKey: loopId)?.cancel()
         physiologyEventTasks.removeValue(forKey: loopId)?.cancel()
+        physiologyListenerRestartTasks.removeValue(forKey: loopId)?.cancel()
+        // Health belongs to a REGISTRATION, not to a process: a replaced or
+        // unregistered runner must not inherit the old one's restart history.
+        physiologyListenerHealth.removeValue(forKey: loopId)
         physiologyDebounceTasks.removeValue(forKey: loopId)?.cancel()
         physiologyDeadlineTasks.removeValue(forKey: loopId)?.cancel()
         physiologyDeadlines.removeValue(forKey: loopId)
@@ -656,11 +787,19 @@ public actor BackgroundLoopsManager {
         for task in physiologyEventTasks.values { task.cancel() }
         for task in physiologyDebounceTasks.values { task.cancel() }
         for task in physiologyDeadlineTasks.values { task.cancel() }
+        for task in physiologyListenerRestartTasks.values { task.cancel() }
         physiologyStartupTasks.removeAll()
         physiologyEventTasks.removeAll()
         physiologyDebounceTasks.removeAll()
         physiologyDeadlineTasks.removeAll()
+        physiologyListenerRestartTasks.removeAll()
         physiologyDeadlines.removeAll()
+        // A stopped manager has no listeners by definition. Marking them
+        // inactive (rather than dropping the history) keeps a subsequent
+        // status() honest without inventing a fresh healthy record.
+        for id in physiologyListenerHealth.keys {
+            physiologyListenerHealth[id]?.active = false
+        }
     }
 
     private func waitForStartTransition() async {
@@ -708,6 +847,23 @@ public actor BackgroundLoopsManager {
 
     internal func _testPhysiologyDeadline(loopId: String) -> Date? {
         physiologyDeadlines[loopId]
+    }
+
+    /// Compresses the listener restart backoff so a test proves the SHAPE
+    /// (ended → recorded → restarted after a delay) without sleeping seconds.
+    internal func _testSetEventListenerBackoff(_ schedule: [TimeInterval]) {
+        eventListenerRestartBackoff = schedule
+    }
+
+    internal func _testEventListenerHealth(loopId: String) -> LoopEventListenerHealth? {
+        physiologyListenerHealth[loopId]
+    }
+
+    /// Awaits the pending restart task rather than polling a wall clock, so the
+    /// restart is proven to have run even on a saturated host.
+    internal func _testAwaitListenerRestart(loopId: String) async {
+        guard let task = physiologyListenerRestartTasks[loopId] else { return }
+        await task.value
     }
 
     /// Deterministic proof seam for the manager-owned startup reconciliation.

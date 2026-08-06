@@ -26,13 +26,9 @@ extension MacSyncEngine {
         }
     }
 
-    // PATCH-2026-05-08: fix-A.3 Persist processed IDs so restarts don't replay archived files.
-    private var processedIdsURL: URL? {
-        // Phase 11c: icloud state goes into <repo>/data/ via shared resolver.
-        let dir = NativeAgentPaths.dataRoot.appendingPathComponent("icloud", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("processed_ids.json")
-    }
+    // PATCH-2026-05-08: fix-A.3 Persist processed IDs so restarts don't replay
+    // archived files. Path shape is owned by ICloudSyncStatePaths so Doctor
+    // reads exactly what this writes.
 
     // fix-snapshot-digest-persist: persist snapshot content digests across
     // restarts so an iCloud reconnect / bridge teardown→setup doesn't re-write
@@ -45,31 +41,245 @@ extension MacSyncEngine {
     }
 
     // PATCH-2026-05-08: fix-A.3 Persist processedMsgIds across restarts.
-    // R10-N8: wrap decode in do/catch — on corruption or partial write start with
-    // empty set rather than crashing or silently losing the entire ID window.
+    // R10-N8: wrap decode in do/catch so corruption doesn't crash.
+    //
+    // Sweep R4 item 1: MISSING and UNREADABLE are no longer the same thing.
+    // A missing file is genesis — first run, nothing has been processed, an
+    // empty set is the truth. An unreadable one (corrupt, partial, permission
+    // denied) means the id window EXISTS and we cannot see it; treating that as
+    // "nothing has been processed" is precisely what re-dispatches an already
+    // executed remote Mac action. On unreadable we keep whatever the in-memory
+    // set holds, refuse to trust the empty read, raise syncError, and preserve
+    // the bytes so the next save can't quietly destroy the evidence.
     func loadProcessedIds() {
-        guard let url = processedIdsURL else { return }
+        let restored = Self.restoreProcessedIds(
+            dataRoot: NativeAgentPaths.dataRoot,
+            inMemory: processedMsgIdsOrdered
+        )
+        // Re-apply the cap here, not just in recordProcessed: merging markers
+        // into a full stored window can push the list past it, and an
+        // uncapped window grows without bound across restarts. ACTIVE MARKER
+        // ids are EXEMPT from the trim — their whole purpose is preventing a
+        // replay while the pending file may still exist, and relying on list
+        // ordering to protect them was wrong (markers land near the front;
+        // front-eviction would drop them first — gpt-5.5 review 2026-08-06,
+        // blocking #1). Markers are bounded by the 30-day prune, so the
+        // exemption cannot grow without bound.
+        let ids = Self.cappedPreservingMarkers(
+            restored.ids,
+            cap: processedIdsCap,
+            dataRoot: NativeAgentPaths.dataRoot)
+        processedMsgIdsOrdered = ids
+        processedMsgIds = Set(ids)
+        processedIdsUnreadable = restored.unreadable
+        if let message = restored.message { syncError = message }
+    }
+
+    /// What a restart should believe about already-processed commands, computed
+    /// from disk alone so it is provable without a running engine.
+    ///
+    /// Three inputs, in priority order:
+    ///  - completed-but-unarchived MARKERS: the command ran and its response
+    ///    landed; only bookkeeping failed. These are processed ids, full stop,
+    ///    and folding them in here is what makes the existing duplicate guard
+    ///    in `processInboxFiles` refuse to dispatch them again.
+    ///  - a MISSING processed_ids.json: genesis. Empty really is the truth.
+    ///  - an UNREADABLE processed_ids.json: the window exists and we cannot see
+    ///    it. We keep what memory holds, flag it, and preserve the bytes.
+    /// Oldest-first trim to `cap` that NEVER evicts an active
+    /// completed-unarchived marker id — a trimmed marker id whose pending
+    /// file still exists re-dispatches an already-executed remote action on
+    /// restart (gpt-5.5 review 2026-08-06, blocking #1). Markers are bounded
+    /// by the 30-day prune, so the exemption cannot grow unbounded. Static +
+    /// dataRoot-injected so the hermetic tests can prove the exemption.
+    nonisolated static func cappedPreservingMarkers(
+        _ ids: [String], cap: Int, dataRoot: URL
+    ) -> [String] {
+        guard ids.count > cap else { return ids }
+        let markerIds = Set(ICloudSyncStatePaths.completedUnarchivedMsgIds(dataRoot: dataRoot))
+        var overflow = ids.count - cap
+        var trimmed: [String] = []
+        trimmed.reserveCapacity(cap)
+        for id in ids {
+            if overflow > 0, !markerIds.contains(id) {
+                overflow -= 1
+                continue
+            }
+            trimmed.append(id)
+        }
+        return trimmed
+    }
+
+    nonisolated static func restoreProcessedIds(
+        dataRoot: URL,
+        inMemory: [String] = []
+    ) -> (ids: [String], unreadable: Bool, message: String?) {
+        var ids = inMemory
+        var messages: [String] = []
+        func add(_ id: String) { if !ids.contains(id) { ids.append(id) } }
+
+        let markers = ICloudSyncStatePaths.completedUnarchivedMsgIds(dataRoot: dataRoot)
+        if !markers.isEmpty {
+            for id in markers { add(id) }
+            messages.append(
+                "\(markers.count) iPhone command(s) completed but could not be filed; they will not be run again."
+            )
+            NSLog("[MacSyncEngine] loaded %d completed-but-unarchived marker(s): %@",
+                  markers.count, markers.joined(separator: ", "))
+        }
+
+        let url = ICloudSyncStatePaths.processedIds(dataRoot: dataRoot)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            // Genesis: no file has ever been written. Nothing to distrust.
+            return (ids, false, messages.isEmpty ? nil : messages.joined(separator: " "))
+        }
         do {
             let data = try Data(contentsOf: url)
-            let arr = try JSONDecoder().decode([String].self, from: data)
-            // fix-R9-9 Restore ordered array so insertion-order eviction is preserved.
-            processedMsgIdsOrdered = arr
-            processedMsgIds = Set(arr)
+            let stored = try JSONDecoder().decode([String].self, from: data)
+            // fix-R9-9 Restore ordered array so insertion-order eviction is
+            // preserved; marker ids append after the stored window.
+            var merged = stored
+            for id in ids where !stored.contains(id) { merged.append(id) }
+            return (merged, false, messages.isEmpty ? nil : messages.joined(separator: " "))
         } catch {
-            // Corrupted or partial write — start fresh. The file will be overwritten
-            // on the next saveProcessedIds() call.
-            NSLog("[MacSyncEngine] processed_ids.json load failed (\(error.localizedDescription)) — starting with empty set")
-            processedMsgIdsOrdered = []
-            processedMsgIds = []
+            NSLog("[MacSyncEngine] processed_ids.json UNREADABLE (%@) — keeping %d in-memory id(s); not trusting the empty read",
+                  error.localizedDescription, ids.count)
+            // Preserve the bytes before any later save overwrites them: this is
+            // both the recovery evidence and the durable signal Doctor reports.
+            let backup = ICloudSyncStatePaths.processedIdsCorruptBackup(dataRoot: dataRoot)
+            if !FileManager.default.fileExists(atPath: backup.path) {
+                try? FileManager.default.copyItem(at: url, to: backup)
+            }
+            messages.append(
+                "Could not read the processed-command list (\(error.localizedDescription)); "
+                + "iPhone commands may be re-run. The unreadable file was kept as processed_ids.corrupt.json."
+            )
+            return (ids, true, messages.joined(separator: " "))
         }
     }
 
-    func saveProcessedIds() {
-        guard let url = processedIdsURL else { return }
-        // fix-R9-9 Save ordered array (already capped by recordProcessed).
-        if let data = try? JSONEncoder().encode(processedMsgIdsOrdered) {
-            try? data.write(to: url, options: .atomic)
+    /// Returns false when the id window could NOT be persisted. Callers must
+    /// treat that as "this completion is not durable yet" and leave a marker —
+    /// the swallowed `try?` this replaced is half of the replay window.
+    @discardableResult
+    func saveProcessedIds() -> Bool {
+        let saved = Self.persistProcessedIds(processedMsgIdsOrdered, dataRoot: NativeAgentPaths.dataRoot)
+        if saved { processedIdsUnreadable = false }
+        return saved
+    }
+
+    nonisolated static func persistProcessedIds(_ ids: [String], dataRoot: URL) -> Bool {
+        let url = ICloudSyncStatePaths.processedIds(dataRoot: dataRoot)
+        do {
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            // fix-R9-9 Save ordered array (already capped by recordProcessed).
+            let data = try JSONEncoder().encode(ids)
+            try data.write(to: url, options: .atomic)
+            return true
+        } catch {
+            NSLog("[MacSyncEngine] processed_ids.json save FAILED: %@", error.localizedDescription)
+            return false
         }
+    }
+
+    /// Durably records that `msgId` completed even though its bookkeeping did
+    /// not. Returns false when even the marker could not be written — the only
+    /// case in which a replay is still possible, and one the caller surfaces
+    /// rather than swallows.
+    @discardableResult
+    func writeCompletedUnarchivedMarker(msgId: String, reason: String) -> Bool {
+        Self.writeCompletedUnarchivedMarker(
+            dataRoot: NativeAgentPaths.dataRoot,
+            msgId: msgId,
+            reason: reason
+        )
+    }
+
+    @discardableResult
+    nonisolated static func writeCompletedUnarchivedMarker(
+        dataRoot: URL,
+        msgId: String,
+        reason: String
+    ) -> Bool {
+        let dir = ICloudSyncStatePaths.completedUnarchivedDirectory(dataRoot: dataRoot)
+        let url = ICloudSyncStatePaths.completedUnarchivedMarker(dataRoot: dataRoot, msgId: msgId)
+        let payload: [String: String] = [
+            "msgId": msgId,
+            "completedAt": ISO8601DateFormatter().string(from: Date()),
+            "reason": reason,
+        ]
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let data = try JSONEncoder().encode(payload)
+            try data.write(to: url, options: .atomic)
+            return true
+        } catch {
+            NSLog("[MacSyncEngine] could not write completed-unarchived marker for %@: %@",
+                  msgId, error.localizedDescription)
+            return false
+        }
+    }
+
+    /// Outcome of the post-response bookkeeping transaction for one command.
+    struct CompletionCommit: Sendable, Equatable {
+        /// True when the completion is durable through the NORMAL path
+        /// (processed-id list saved AND pending file archived).
+        var clean: Bool
+        /// True when a fallback marker now guarantees no re-dispatch.
+        var markerWritten: Bool
+        /// nil only when `clean`.
+        var syncError: String?
+        /// Transaction state to record; nil when `clean` (the caller already
+        /// wrote the completed/failed state).
+        var transactionState: String?
+    }
+
+    /// The post-response half of processing an iOS command, as ONE decision.
+    ///
+    /// By the time this runs the action has executed and its response has
+    /// landed, so the only acceptable outcome is "never dispatch this again".
+    /// If either bookkeeping step failed, a durable local marker takes over
+    /// that job; if even the marker fails, that is the one case where a replay
+    /// is still possible and it is stated plainly instead of swallowed.
+    nonisolated static func commitCompletionBookkeeping(
+        dataRoot: URL,
+        msgId: String,
+        processedSaved: Bool,
+        archiveError: String?
+    ) -> CompletionCommit {
+        guard !processedSaved || archiveError != nil else {
+            clearCompletedUnarchivedMarker(dataRoot: dataRoot, msgId: msgId)
+            return CompletionCommit(clean: true, markerWritten: false, syncError: nil, transactionState: nil)
+        }
+        var reasons: [String] = []
+        if !processedSaved { reasons.append("processed-id list could not be saved") }
+        if let archiveError { reasons.append("pending file could not be archived: \(archiveError)") }
+        let reason = reasons.joined(separator: "; ")
+        let marked = writeCompletedUnarchivedMarker(dataRoot: dataRoot, msgId: msgId, reason: reason)
+        let message = marked
+            ? "Command \(msgId) finished but its completion record could not be filed (\(reason)). It is marked completed and will not run again."
+            : "Command \(msgId) finished but NEITHER its completion record NOR the fallback marker could be written (\(reason)). It could run again on restart — free disk space and check iCloud permissions."
+        NSLog("MacSyncEngine.commitCompletionBookkeeping: %@", message)
+        return CompletionCommit(
+            clean: false,
+            markerWritten: marked,
+            syncError: message,
+            transactionState: "completed_unarchived"
+        )
+    }
+
+    /// Drops the marker once the completion is durable through the normal path.
+    func clearCompletedUnarchivedMarker(msgId: String) {
+        Self.clearCompletedUnarchivedMarker(dataRoot: NativeAgentPaths.dataRoot, msgId: msgId)
+    }
+
+    nonisolated static func clearCompletedUnarchivedMarker(dataRoot: URL, msgId: String) {
+        let url = ICloudSyncStatePaths.completedUnarchivedMarker(dataRoot: dataRoot, msgId: msgId)
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        try? FileManager.default.removeItem(at: url)
     }
 
     func loadSnapshotDigests() {
@@ -272,6 +482,16 @@ extension MacSyncEngine {
         // rejected files get the same 7-day TTL + 50 MB cap as other archives —
         // otherwise they accumulate unbounded. pruneArchiveDirs no-ops on a
         // missing dir, so it's safe to list even before _rejected is created.
+        // Sweep R4 item 1: completion markers are state, so they get a cleanup
+        // path like every other add. They must outlive the pending files that
+        // could still re-present the same command (7-day archive TTL), so 30
+        // days is a deliberate multiple of that, not a guess.
+        let markerDir = ICloudSyncStatePaths.completedUnarchivedDirectory(
+            dataRoot: NativeAgentPaths.dataRoot
+        )
+        Task.detached(priority: .background) {
+            Self.pruneCompletedUnarchivedMarkers(in: markerDir)
+        }
         let rejectedDir = inboxDir?.appendingPathComponent("_rejected")
         let dirs = [inboxDir, responsesDir, rejectedDir].compactMap { $0 }
         guard !dirs.isEmpty else { return }
@@ -337,6 +557,32 @@ extension MacSyncEngine {
             if totalBytes > maxBytes { deadlines.append(now) }
         }
         return deadlines.min()
+    }
+
+    /// Drops completion markers older than the retention floor. A marker only
+    /// matters while a pending file for the same command could still be seen,
+    /// and those are gone after 7 days.
+    nonisolated static func pruneCompletedUnarchivedMarkers(
+        in dir: URL,
+        olderThan retention: TimeInterval = 30 * 24 * 3600,
+        now: Date = Date()
+    ) {
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(
+            at: dir,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+        let cutoff = now.addingTimeInterval(-retention)
+        for url in items
+        where url.pathExtension == ICloudSyncStatePaths.completedUnarchivedExtension {
+            guard let modified = try? url.resourceValues(
+                forKeys: [.contentModificationDateKey]
+            ).contentModificationDate else { continue }
+            if modified < cutoff {
+                try? fm.removeItem(at: url)
+            }
+        }
     }
 
     /// nonisolated static — runs the prune scan/delete off the main actor.

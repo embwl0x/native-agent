@@ -562,8 +562,8 @@ Tool families belong here:
 | `SwiftToolDispatcher+CloudConnectorTools.swift` | Bounded Gmail, Google Calendar, and Notion reads plus Google refresh-token persistence under the dispatcher's exact data root |
 | `SwiftToolDispatcher+MCP.swift` | MCP bridge name parsing and live MCP calls |
 | `SwiftToolDispatcher+ExternalConnectors.swift` | Connector-specific helper seams such as X fallback |
-| `SwiftToolDispatcher+AgentBridgeTools.swift` | `time_now`, `claude_message`, `codex_message`, invoke helpers |
-| `AgentBridgeRuntime.swift` | One deterministic owner for bundled wakeup-helper lookup, Finder-safe local Codex/Claude/Node discovery, child-process environment construction, and structural bridge readiness; it never owns authentication or verification |
+| `SwiftToolDispatcher+AgentBridgeTools.swift` | `time_now`, `claude_message`, `codex_message`, `omp_message`, invoke helpers |
+| `AgentBridgeRuntime.swift` | One deterministic owner for bundled wakeup-helper lookup, Finder-safe local Codex/Claude/OMP/Node discovery, child-process environment construction, and structural bridge readiness; it never owns authentication or verification |
 | `SwiftToolDispatcher+SubprocessSupport.swift` | Shared subprocess latches, timeout, bounded pipe buffers |
 | `SwiftToolDispatcher+BuilderTools.swift` | shell/bash/git/apply_patch/tests/build/install tool execution; on a fresh Mac with no selected developer directory, the shared Process environment suppresses Apple's interactive Command Line Tools prompt so `/usr/bin` toolchain shims fail honestly instead of opening installer UI |
 | `SwiftToolDispatcher+MacIntegration.swift` | Mail/Calendar/Contacts/Music/Scheduler bridge permission wrapper |

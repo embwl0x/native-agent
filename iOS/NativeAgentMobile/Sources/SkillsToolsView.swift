@@ -43,6 +43,14 @@ struct SkillsToolsView: View {
                 }
             }
             .navigationTitle("Skills & Tools")
+            // Sweep R4 C11.4: skills and tools are read straight from the last
+            // Mac snapshot, so "is the Mac reachable" decides whether this list
+            // is current.
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    MacStatusChip()
+                }
+            }
         }
     }
 }

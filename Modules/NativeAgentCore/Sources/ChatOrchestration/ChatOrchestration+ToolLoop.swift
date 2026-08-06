@@ -109,7 +109,11 @@ public enum ToolLoopBudget {
             return 90
         case "swarm", "swarms", "worker", "workers":
             return 80
-        case "autonomy", "workshop", "mission", "missions", "background":
+        // Wave 5b: Workshop spellings via `WorkshopSurfaceVocabulary`
+        // (same three strings as the open-coded list this replaces).
+        case "autonomy", "background":
+            return 80
+        case let s where WorkshopSurfaceVocabulary.isWorkshopGateSurface(s):
             return 80
         default:
             return 60
@@ -178,8 +182,12 @@ public enum ToolDispatchDeadline {
     /// machine-driven set in `ToolLoopBudget.defaultIterations` (+ "training").
     static func isUnattended(surface: String) -> Bool {
         switch surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "autonomy", "workshop", "mission", "missions", "background",
+        // Wave 5b: Workshop spellings via `WorkshopSurfaceVocabulary`
+        // (same three strings as the open-coded list this replaces).
+        case "autonomy", "background",
              "swarm", "swarms", "worker", "workers", "training":
+            return true
+        case let s where WorkshopSurfaceVocabulary.isWorkshopGateSurface(s):
             return true
         default:
             return false
@@ -268,8 +276,8 @@ public enum ToolDispatchDeadline {
 // CAPABILITY FLOOR (hard constraint): the model must still be able to
 // reference recent results — the CURRENT iteration plus the last
 // `keepFullIterations` (N=5 floor) iterations always stay full, the stub
-// keeps a 180-char head (mirrors the cross-turn ~180-char summaries in
-// ChatOrchestration+SessionHistory.swift `toolSummary`), and the marker tells
+// keeps a 180-char head (comparable in size to the cross-turn head+tail
+// projection in ChatOrchestration+SessionHistory.swift `toolSummary`), and the marker tells
 // the model it can re-run the tool if it needs the full body again.
 enum IntraTurnToolResultClearing {
     /// Number of PRIOR loop iterations (in addition to the current one)
@@ -278,8 +286,10 @@ enum IntraTurnToolResultClearing {
     /// values are not acceptable; raise only with QA-equivalence evidence.
     static let keepFullIterations = 5
 
-    /// Head of the original body preserved in the stub. Mirrors the
-    /// cross-turn stub budget (`cap(result, 180)` in SessionHistory).
+    /// Head of the original body preserved in the stub. Sized in the same
+    /// ballpark as the cross-turn projection in SessionHistory
+    /// (`toolResultProjection`, which since sweep R4 keeps head+tail rather
+    /// than a 180-char head); the two budgets are independent.
     static let headLength = 180
 
     /// Prefix of OUR stub's terminal marker line.

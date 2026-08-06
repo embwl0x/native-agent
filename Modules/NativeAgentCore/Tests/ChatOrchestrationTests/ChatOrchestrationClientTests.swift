@@ -1972,6 +1972,139 @@ func swiftToolDispatcher_codexMessageRepositoryGrantsProfileFromChat() async thr
     #expect(inputs[0]["executionProfile"] == .string("github-command-repository-network-v1"))
 }
 
+/// Slug extraction from request prose. Pure string work -- the resolver still
+/// decides whether any candidate is a real checkout.
+@Test
+func swiftToolDispatcher_repositorySlugCandidatesFromRequestText() {
+    // A GitHub URL is the strongest signal and wins outright.
+    #expect(SwiftToolDispatcher.repositorySlugCandidates(
+        inRequestText: "Please rebase https://github.com/NousResearch/hermes-agent/pull/64288 onto main"
+    ) == ["NousResearch/hermes-agent"])
+
+    // The real SSH form uses a colon, not a slash.
+    #expect(SwiftToolDispatcher.repositorySlugCandidates(
+        inRequestText: "clone git@github.com:acme/widget.git"
+    ) == ["acme/widget"])
+    #expect(SwiftToolDispatcher.repositorySlugCandidates(
+        inRequestText: "clone https://github.com/acme/widget.git"
+    ) == ["acme/widget"])
+
+    // A bare slug is accepted only when no URL named a repository.
+    #expect(SwiftToolDispatcher.repositorySlugCandidates(
+        inRequestText: "sync NousResearch/hermes-agent for me"
+    ) == ["NousResearch/hermes-agent"])
+
+    // URL beats the bare token when both appear.
+    #expect(SwiftToolDispatcher.repositorySlugCandidates(
+        inRequestText: "see github.com/acme/widget, not other/thing"
+    ) == ["acme/widget"])
+
+    // Path-shaped and malformed tokens never become candidates.
+    let noise = SwiftToolDispatcher.repositorySlugCandidates(
+        inRequestText: "check /etc/passwd and ~/Projects/secret and owner/../../etc and a/b/c and just-a-word"
+    )
+    #expect(noise.isEmpty)
+
+    // Ambiguity is preserved for the resolver to reject, not silently collapsed.
+    let two = SwiftToolDispatcher.repositorySlugCandidates(
+        inRequestText: "compare github.com/acme/widget with github.com/acme/gadget"
+    )
+    #expect(two == ["acme/widget", "acme/gadget"])
+
+    // The resolver's work stays bounded no matter how slug-shaped the prose is.
+    let many = (1...20).map { "owner\($0)/name\($0)" }.joined(separator: " ")
+    #expect(SwiftToolDispatcher.repositorySlugCandidates(inRequestText: many).count == 8)
+}
+
+/// The 2026-08-05 regression: Agent omitted `repository`, so the send carried no
+/// execution profile, Codex had no GitHub network path, and the turn ground to a
+/// silent harness kill. The profile must now attach from the request text alone.
+@Test
+func swiftToolDispatcher_codexMessageInfersRepositoryFromRequestText() async throws {
+    let base = try makeTempRoot("codex-message-repository-inferred")
+    let dataRoot = base
+        .appendingPathComponent("NativeAgent", isDirectory: true)
+        .appendingPathComponent("data", isDirectory: true)
+    try FileManager.default.createDirectory(at: dataRoot, withIntermediateDirectories: true)
+
+    let checkout = base.appendingPathComponent("nativeagent-inferred-fixture", isDirectory: true)
+    try FileManager.default.createDirectory(at: checkout, withIntermediateDirectories: true)
+    try runRepositoryTestGit(["init", "-q"], at: checkout)
+    try runRepositoryTestGit(
+        ["remote", "add", "origin", "https://github.com/nativeagent-tests/nativeagent-inferred-fixture.git"],
+        at: checkout
+    )
+
+    let wakeup = CodexWakeupInputRecorder()
+    let tools = SwiftToolDispatcher(
+        dataRoot: dataRoot,
+        agentBridgeConfigRoot: base.appendingPathComponent("config", isDirectory: true),
+        codexMessageNotificationPermissionOverride: false,
+        codexMessageWakeupOverride: { input in
+            await wakeup.append(input)
+            return .object(["status": .string("sent")])
+        }
+    )
+
+    // No `repository`, no `working_directory` -- only prose naming the repo.
+    let response = try await tools.dispatch(
+        tool: "codex_message",
+        input: [
+            "text": .string("Rebase https://github.com/nativeagent-tests/nativeagent-inferred-fixture/pull/64288 onto main and push."),
+            "message_id": .string("repo-inferred"),
+        ],
+        surface: "chat"
+    )
+
+    let inputs = await wakeup.all()
+    #expect(inputs.count == 1)
+    #expect(inputs[0]["workingDirectory"] == .string(checkout.standardizedFileURL.path))
+    #expect(inputs[0]["executionProfile"] == .string("github-command-repository-network-v1"))
+    // The auto-attach is observable at the call site, not silent.
+    if case .object(let object) = response {
+        #expect(object["executionProfile"] == .string("github-command-repository-network-v1"))
+        #expect(object["repositorySource"] == .string("inferred_from_request"))
+    } else {
+        Issue.record("codex_message returned a non-object response")
+    }
+}
+
+/// Prose naming NO resolvable repository must degrade to today's behavior rather
+/// than handing Codex a network-enabled checkout of something adjacent.
+@Test
+func swiftToolDispatcher_codexMessageInferenceDegradesWhenNothingResolves() async throws {
+    let base = try makeTempRoot("codex-message-repository-inferred-miss")
+    let dataRoot = base
+        .appendingPathComponent("NativeAgent", isDirectory: true)
+        .appendingPathComponent("data", isDirectory: true)
+    try FileManager.default.createDirectory(at: dataRoot, withIntermediateDirectories: true)
+
+    let wakeup = CodexWakeupInputRecorder()
+    let tools = SwiftToolDispatcher(
+        dataRoot: dataRoot,
+        agentBridgeConfigRoot: base.appendingPathComponent("config", isDirectory: true),
+        codexMessageNotificationPermissionOverride: false,
+        codexMessageWakeupOverride: { input in
+            await wakeup.append(input)
+            return .object(["status": .string("sent")])
+        }
+    )
+
+    _ = try await tools.dispatch(
+        tool: "codex_message",
+        input: [
+            "text": .string("Look at github.com/nativeagent-tests/never-cloned-anywhere please."),
+            "message_id": .string("repo-inferred-miss"),
+        ],
+        surface: "chat"
+    )
+
+    let inputs = await wakeup.all()
+    #expect(inputs.count == 1)
+    #expect(inputs[0]["workingDirectory"] == nil)
+    #expect(inputs[0]["executionProfile"] == nil)
+}
+
 /// A model must not be able to smuggle path syntax through `repository`.
 @Test
 func swiftToolDispatcher_repositorySlugRejectsPathShapedInput() {

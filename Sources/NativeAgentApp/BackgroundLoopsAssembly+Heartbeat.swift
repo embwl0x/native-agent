@@ -442,7 +442,7 @@ extension BackgroundLoopsAssembly {
         if let subs = try? FileManager.default.contentsOfDirectory(
             at: executionsDir, includingPropertiesForKeys: nil) {
             for sub in subs {
-                let mp = sub.appendingPathComponent("mission.json")
+                let mp = ExecutionRecordFile.resolve(in: sub)
                 guard let data = try? Data(contentsOf: mp),
                       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                       let status = obj["status"] as? String else { continue }

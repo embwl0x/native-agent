@@ -281,7 +281,16 @@ struct ChatView: View {
             .navigationTitle("Chat")
             .navigationBarTitleDisplayMode(.inline)
             .animation(AppMotion.snappy, value: voiceInput.isListening)
+            // Sweep R4 C11.3: iCloudSyncEngine.syncError was published and read
+            // by nothing. Render-only — no retry, no new sync work.
+            .macSyncErrorBanner()
             .toolbar {
+                // Sweep R4 C11.4: connection state used to live on Diagnostics
+                // and Settings only, so a sleeping Mac looked exactly like a
+                // healthy one right up until a send timed out.
+                ToolbarItem(placement: .navigationBarLeading) {
+                    MacStatusChip()
+                }
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button {
                         store.regenerateLast(client: bridgeClient, controls: runtimeControls)

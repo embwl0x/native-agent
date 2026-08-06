@@ -150,7 +150,7 @@ extension NativeClient {
             return DoctorCheck(
                 id: "live.providers", title: "Providers and OAuth", status: "warn",
                 detail: "Provider registry is readable, but no provider currently reports ready authentication.",
-                repair: "Open Settings → Providers and authenticate one provider."
+                repair: "Open the Providers tab in the sidebar and authenticate one provider."
             )
         }
         return DoctorCheck(

@@ -20,6 +20,9 @@
 //         {"id":"doctor","actions":["open_doctor","repair_safe"],"risk":"low"},
 //         {"id":"mission","actions":["open_mission"],"risk":"low"},
 //       ],
+// (Wave 5 P2-6: the ported literal now emits "open_execution" for that action.
+//  The category `id` stays "mission" — it is a different token, unrelated to
+//  this wave, and moves with the category rename if one is ever scheduled.)
 //       "pendingApprovals": pending_approvals,
 //       "receiptCount": len(receipts),
 //       "latestReceipt": receipts[0] if receipts else None,
@@ -150,7 +153,17 @@ public struct SwiftNativeNotificationStatus: NotificationStatusReader {
                 ]),
                 .object([
                     "id": .string("mission"),
-                    "actions": .array([.string("open_mission")]),
+                    // Wave 5 (P2-6 residue): the EMITTER flips to the canonical
+                    // spelling. Safe to flip here and nowhere else because this
+                    // id has no consumer — the category array is dropped by
+                    // `NotificationRuntimeStatus`'s decoder (it has no
+                    // `actionCategories` field), no `UNNotificationCategory` is
+                    // ever registered with this id, no delivery handler matches
+                    // on `response.actionIdentifier`, and nothing persists it.
+                    // Any future reader must go through
+                    // `WorkshopOpenNotificationAction.matches`, which still
+                    // accepts the legacy `open_mission`.
+                    "actions": .array([.string(WorkshopOpenNotificationAction.canonical)]),
                     "risk": .string("low"),
                 ]),
             ]),

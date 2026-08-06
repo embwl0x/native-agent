@@ -15,6 +15,7 @@ extension SwiftNativeSecurityCenter {
         "mobile.notify",
         "claude_message",
         "codex_message",
+        "omp_message",
     ]
     // Local agent bridge handoffs are meant to carry task specifications to
     // another local agent. Those specs often contain instruction-looking text
@@ -24,6 +25,7 @@ extension SwiftNativeSecurityCenter {
     static let localAgentBridgeToolNames: Set<String> = [
         "claude_message",
         "codex_message",
+        "omp_message",
         "invoke_claude",
         "invoke_codex",
     ]
@@ -134,6 +136,7 @@ extension SwiftNativeSecurityCenter {
         // note. Local inbox write to ~/.config/codex-agent-bridge/ plus a
         // best-effort local Mac notification when the app bridge is wired.
         "codex_message",
+        "omp_message",
         // AgentMail chat lane: list/read are external reads; send only stages a
         // bounded replay request for the shared approval executor.
         "agentmail_list",

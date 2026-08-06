@@ -44,6 +44,48 @@ struct InboxItemRecord: Identifiable, Codable, Hashable, Sendable {
         case related_approval_id, related_paths, related_groups, actions, status, read_at
     }
 
+    /// Wave 4 (phase A) read-both: accept the FUTURE `related_execution_id`
+    /// spelling as well as the on-wire `related_mission_id` above. Decode-only —
+    /// `encode(to:)` stays the synthesized one, so anything this build writes
+    /// still carries `related_mission_id`.
+    fileprivate enum FutureCodingKeys: String, CodingKey {
+        case related_execution_id
+    }
+}
+
+// The decoder lives in an extension on purpose: declaring `init(from:)` in the
+// struct body would suppress the synthesized memberwise init that the view
+// (InboxView.swift:151) and InboxStoreTests both construct records with.
+extension InboxItemRecord {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        // Every non-optional field keeps the SYNTHESIZED semantics exactly
+        // (`decode`, i.e. a missing key still throws). This init exists only to
+        // widen the one execution-link key; it must not quietly become a more
+        // lenient decoder.
+        created_at = try c.decode(String.self, forKey: .created_at)
+        source = try c.decode(String.self, forKey: .source)
+        severity = try c.decode(String.self, forKey: .severity)
+        title = try c.decode(String.self, forKey: .title)
+        summary = try c.decode(String.self, forKey: .summary)
+        detail = try c.decodeIfPresent(String.self, forKey: .detail)
+        let futureRelatedExecutionId: String? = {
+            guard let future = try? decoder.container(keyedBy: FutureCodingKeys.self) else {
+                return nil
+            }
+            return try? future.decodeIfPresent(String.self, forKey: .related_execution_id)
+        }()
+        relatedWorkshopExecutionId = try futureRelatedExecutionId
+            ?? c.decodeIfPresent(String.self, forKey: .relatedWorkshopExecutionId)
+        related_approval_id = try c.decodeIfPresent(String.self, forKey: .related_approval_id)
+        related_paths = try c.decodeIfPresent([String].self, forKey: .related_paths)
+        related_groups = try c.decodeIfPresent([InboxRelatedGroup].self, forKey: .related_groups)
+        actions = try c.decode([InboxActionRecord].self, forKey: .actions)
+        status = try c.decode(String.self, forKey: .status)
+        read_at = try c.decodeIfPresent(String.self, forKey: .read_at)
+    }
+
     var isUnread: Bool { status == "unread" }
     var hasLinkedApproval: Bool { !(related_approval_id ?? "").isEmpty }
 

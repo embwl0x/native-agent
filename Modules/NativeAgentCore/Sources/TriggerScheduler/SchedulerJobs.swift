@@ -254,7 +254,7 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
                 "title": .string(SchedulerSecretRedactor.redactText("Scheduled job created")),
                 "detail": .string(SchedulerSecretRedactor.redactText("\(jobName) · \(jobKind)")),
                 "status": .string("ok"),
-                "missionId": .null,
+                "executionId": .null,
                 "payload": SchedulerSecretRedactor.redactValue(.object([
                     "jobId": jobObj["id"] ?? .null,
                     "kind": jobObj["kind"] ?? .null,
@@ -382,7 +382,7 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
                 "title": .string(SchedulerSecretRedactor.redactText("Scheduled job cancelled")),
                 "detail": .string(SchedulerSecretRedactor.redactText(detailRaw)),
                 "status": .string("warn"),
-                "missionId": .null,
+                "executionId": .null,
                 "payload": SchedulerSecretRedactor.redactValue(.object(["jobId": .string(jobId)])),
                 "createdAt": .string(SwiftNativeTriggerScheduler.isoTimestamp(now())),
             ])

@@ -117,3 +117,47 @@ struct NativeAgentBuildIdentityTests {
         #expect(identity.exactSourceRevision == nil)
     }
 }
+
+/// Sweep R4 C13: the identity above was computed and rendered nowhere. These
+/// lock the one-line form the About section now shows, including the honesty
+/// property that matters — an unstamped/dirty build says so out loud.
+@Suite("Build identity settings line")
+struct BuildIdentitySettingsLineTests {
+    @Test("clean stamped build renders version + short revision, no modified tag")
+    func cleanLine() {
+        let identity = NativeAgentBuildIdentity(
+            version: "0.3.7",
+            build: "0.3.7",
+            sourceRevision: "abc1234def5678000000000000000000000000aa",
+            sourceDirty: false
+        )
+        #expect(SlimSettingsView.buildIdentityLine(identity) == "0.3.7 (abc1234)")
+    }
+
+    @Test("dirty build is labelled modified")
+    func dirtyLine() {
+        let identity = NativeAgentBuildIdentity(
+            version: "0.3.7",
+            build: "0.3.7",
+            sourceRevision: "abc1234def5678000000000000000000000000aa",
+            sourceDirty: true
+        )
+        #expect(SlimSettingsView.buildIdentityLine(identity) == "0.3.7 (abc1234, modified)")
+    }
+
+    @Test("unstamped dev build still names itself rather than looking like a release")
+    func devLine() {
+        let identity = NativeAgentBuildIdentity(
+            version: "dev", build: "dev", sourceRevision: nil, sourceDirty: true
+        )
+        #expect(SlimSettingsView.buildIdentityLine(identity) == "dev (modified)")
+    }
+
+    @Test("a build number that differs from the version is shown")
+    func buildNumberLine() {
+        let identity = NativeAgentBuildIdentity(
+            version: "0.3.7", build: "1042", sourceRevision: nil, sourceDirty: false
+        )
+        #expect(SlimSettingsView.buildIdentityLine(identity) == "0.3.7 build 1042")
+    }
+}

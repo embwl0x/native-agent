@@ -145,6 +145,14 @@ struct TrustPolicy: Codable, Hashable {
         case developerMode, enableAutonomy, trainingPolicy, promotionPolicy, memoryPolicy, macControlPolicy
     }
 
+    /// Wave 4 (phase A) read-both: accept the FUTURE `workshopPolicy` spelling
+    /// as well as the on-wire `missionPolicy` above. Decode-only — `encode(to:)`
+    /// is still the synthesized one, so it emits `missionPolicy` and a 0.3.7 iOS
+    /// install keeps decoding Mac snapshots byte-for-byte.
+    private enum FutureCodingKeys: String, CodingKey {
+        case workshopPolicy
+    }
+
     init(
         permissionLevel: String = "balanced",
         autonomyDefault: String? = nil,
@@ -193,7 +201,15 @@ struct TrustPolicy: Codable, Hashable {
         autonomyDefault = try c.decodeIfPresent(String.self, forKey: .autonomyDefault)
         updatedAt = try c.decodeIfPresent(String.self, forKey: .updatedAt)
         appDataRoot = try c.decodeIfPresent(String.self, forKey: .appDataRoot)
-        workshopPolicy = try c.decodeIfPresent(TrustWorkshopPolicy.self, forKey: .workshopPolicy)
+        // Future spelling first, on-wire spelling as the fallback.
+        let futureWorkshopPolicy: TrustWorkshopPolicy? = {
+            guard let future = try? decoder.container(keyedBy: FutureCodingKeys.self) else {
+                return nil
+            }
+            return try? future.decodeIfPresent(TrustWorkshopPolicy.self, forKey: .workshopPolicy)
+        }()
+        workshopPolicy = try futureWorkshopPolicy
+            ?? c.decodeIfPresent(TrustWorkshopPolicy.self, forKey: .workshopPolicy)
         toolPolicy = try c.decodeIfPresent(TrustToolPolicy.self, forKey: .toolPolicy)
         filePolicy = try c.decodeIfPresent(TrustFilePolicy.self, forKey: .filePolicy)
         connectorPolicy = try c.decodeIfPresent(TrustConnectorPolicy.self, forKey: .connectorPolicy)

@@ -179,7 +179,7 @@ struct DetachedChatPanelView: View {
                     } else {
                         // Reuse the main chat's grouped render path so tool
                         // pills, approval cards, and bubbles look identical.
-                        ChatMessageListView(messages: messages, sessionId: sessionId)
+                        ChatMessageListView(messages: messages, sessionId: sessionId, isStreaming: isBusy)
                     }
                     // phase 6: scoped fade for the detached typing chip (mirrors
                     // the main-list pattern) so it doesn't pop in/out.

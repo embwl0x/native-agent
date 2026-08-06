@@ -17,7 +17,17 @@
 #
 # Usage:
 #   script/generate_appcast.sh --dmg dist/NativeAgent-0.2.0.dmg --version 0.2.0 \
-#       [--out dist/appcast] [--rehearsal | --publish]
+#       [--out dist/appcast] [--notes NOTES.md] [--rehearsal | --publish]
+#
+# Options:
+#   --notes FILE   release notes shown in Sparkle's update dialog. Embedded in
+#                  the feed item as <description> (CDATA). Markdown-ish text is
+#                  wrapped in <pre>; a file that already looks like HTML is
+#                  embedded as-is. Added only AFTER every signature/version/URL
+#                  guard below has passed, and the feed is re-validated after.
+#   --allow-version-drift
+#                  permit a feed version that differs from the repo VERSION file.
+#                  For synthetic-version test runs ONLY; refused with --publish.
 #
 # Required environment:
 #   NATIVEAGENT_SPARKLE_ED_PRIV_KEY  path to the Sparkle EdDSA private key file
@@ -50,9 +60,17 @@ PUBLISH=false
 # the two bundle<->feed cross-checks; every signature/version/URL/length guard
 # below still runs, and publishing is refused.
 REHEARSAL=false
+# Release notes to embed in the feed item as <description> (sweep R4 C12).
+# Sparkle shows the item's description in its update dialog; with no notes,
+# every update dialog this project has ever shown was blank.
+NOTES_FILE=""
+# Escape hatch for the VERSION-file gate below. Synthetic-version runs (the
+# script test suites sign a 9.9.9 fixture DMG) are the only legitimate users.
+# Refused together with --publish: a real publish must match VERSION.
+ALLOW_VERSION_DRIFT=false
 
 usage() {
-  sed -n '2,37p' "${BASH_SOURCE[0]}" >&2
+  sed -n '2,47p' "${BASH_SOURCE[0]}" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -62,6 +80,8 @@ while [[ $# -gt 0 ]]; do
     --out)     [[ $# -ge 2 ]] || { usage; exit 2; }; OUT_DIR="$2"; shift 2 ;;
     --publish) PUBLISH=true; shift ;;
     --rehearsal) REHEARSAL=true; shift ;;
+    --notes)   [[ $# -ge 2 ]] || { usage; exit 2; }; NOTES_FILE="$2"; shift 2 ;;
+    --allow-version-drift) ALLOW_VERSION_DRIFT=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage; exit 2 ;;
   esac
@@ -72,6 +92,17 @@ fail() {
   echo "ERROR: $*" >&2
   exit 1
 }
+
+if [[ "$ALLOW_VERSION_DRIFT" == "true" && "$PUBLISH" == "true" ]]; then
+  echo "ERROR: --allow-version-drift and --publish are mutually exclusive." >&2
+  echo "       A published feed must advertise the version in the repo VERSION file." >&2
+  exit 1
+fi
+if [[ -n "$NOTES_FILE" ]]; then
+  [[ -f "$NOTES_FILE" ]] || { echo "ERROR: --notes file not found: $NOTES_FILE" >&2; exit 1; }
+  [[ -s "$NOTES_FILE" ]] || { echo "ERROR: --notes file is empty: $NOTES_FILE" >&2; exit 1; }
+  NOTES_FILE="$(cd "$(dirname "$NOTES_FILE")" && pwd)/$(basename "$NOTES_FILE")"
+fi
 
 [[ -n "$DMG_PATH" ]] || fail "--dmg is required."
 [[ -f "$DMG_PATH" ]] || fail "DMG not found: $DMG_PATH"
@@ -321,6 +352,26 @@ ACTUAL_LEN="$(stat -f%z "$DMG_PATH")"
   || fail "enclosure length $ENCLOSURE_LEN != actual DMG size $ACTUAL_LEN"
 [[ "$FEED_VERSION" == "$VERSION" && "$FEED_SHORT_VERSION" == "$VERSION" ]] \
   || fail "feed advertises version=$FEED_VERSION short=$FEED_SHORT_VERSION, expected $VERSION"
+
+# Sweep R4 C1: the check above only proves the feed matches whatever --version
+# was handed in. The failure that actually shipped was a feed left advertising
+# 0.3.2 while the repo had moved to 0.3.7 — every user five releases behind and
+# told they were current. The single source of truth is the VERSION file, so the
+# feed must match IT, not just its own argument.
+if [[ -f "$ROOT/VERSION" ]]; then
+  REPO_VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION")"
+  if [[ "$FEED_VERSION" != "$REPO_VERSION" ]]; then
+    if [[ "$ALLOW_VERSION_DRIFT" == "true" ]]; then
+      echo "    NOTE: feed version $FEED_VERSION != VERSION file $REPO_VERSION" >&2
+      echo "          (allowed only because --allow-version-drift was passed; never on --publish)" >&2
+    else
+      fail "the generated feed advertises $FEED_VERSION but $ROOT/VERSION says $REPO_VERSION.
+       Publishing this would tell every user they are current while the repo has
+       moved on. Bump/settle VERSION and rebuild the DMG, or pass
+       --allow-version-drift for a synthetic-version test run (never with --publish)."
+    fi
+  fi
+fi
 if grep -Eqi "$PLACEHOLDER_RE" "$APPCAST_XML"; then
   fail "the generated appcast still contains a placeholder URL; refusing to publish."
 fi
@@ -333,7 +384,67 @@ fi
 "$SIGN_UPDATE" --verify --ed-key-file "$PRIV_KEY" "$DMG_PATH" "$ED_SIGNATURE" >/dev/null \
   || fail "the sparkle:edSignature in the generated feed does NOT verify against $DMG_BASENAME."
 
-# Every guard passed — the feed may now survive on disk.
+# ---------------------------------------------------------------------------
+# 5b. Release notes (sweep R4 C12). Sparkle renders the item's <description> in
+#     its update dialog; without one, every dialog this project ever showed was
+#     blank — "install this binary, we won't say what changed."
+#
+#     Deliberately done HERE, after every signature/version/URL/length guard
+#     above has PASSED, so notes text can never influence a guard (a notes file
+#     mentioning example.com must not trip the placeholder scan, and must not be
+#     able to smuggle an <enclosure> or <item> past the counts). Everything that
+#     could change is re-asserted immediately afterwards: the enclosure line
+#     must be byte-identical, the item count still 1, and the XML still
+#     well-formed. The EdDSA signature covers the DMG bytes, not the feed, so
+#     editing the XML here cannot invalidate it.
+# ---------------------------------------------------------------------------
+if [[ -n "$NOTES_FILE" ]]; then
+  echo "==> Embedding release notes from $NOTES_FILE"
+  ENCLOSURE_BEFORE="$ENCLOSURE_LINE"
+  NOTES_TMP="$OUT_DIR/.release-notes.fragment"
+  {
+    printf '        <description><![CDATA[\n'
+    # CDATA cannot contain the terminator; split it if the notes ever do.
+    if grep -qi '<html\|<p>\|<ul>\|<h[1-6]>' "$NOTES_FILE"; then
+      sed 's/]]>/]]]]><![CDATA[>/g' "$NOTES_FILE"
+    else
+      # Escaping & < > first also neutralises any "]]>" in the notes (it becomes
+      # "]]&gt;"), so the CDATA terminator cannot be closed early from here.
+      printf '<pre>'
+      sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' "$NOTES_FILE"
+      printf '</pre>'
+      printf '\n'
+    fi
+    printf '        ]]></description>\n'
+  } > "$NOTES_TMP"
+
+  # Insert immediately before the (single) </item>.
+  NOTES_APPCAST="$OUT_DIR/.appcast.with-notes.xml"
+  awk -v frag="$NOTES_TMP" '
+    /<\/item>/ && !done { while ((getline line < frag) > 0) print line; close(frag); done = 1 }
+    { print }
+  ' "$APPCAST_XML" > "$NOTES_APPCAST"
+  grep -q '<description>' "$NOTES_APPCAST" \
+    || fail "release notes were not inserted into the feed; refusing a silently-unchanged appcast."
+  mv "$NOTES_APPCAST" "$APPCAST_XML"
+  rm -f "$NOTES_TMP"
+
+  # Re-assert every invariant the insertion could have broken.
+  xmllint --noout "$APPCAST_XML" 2>/dev/null \
+    || fail "the appcast is no longer well-formed XML after embedding $NOTES_FILE."
+  ITEM_COUNT_AFTER="$(grep -c '<item>' "$APPCAST_XML" || true)"
+  [[ "$ITEM_COUNT_AFTER" == "1" ]] \
+    || fail "embedding release notes changed the <item> count to $ITEM_COUNT_AFTER."
+  ENCLOSURE_AFTER="$(grep '<enclosure' "$APPCAST_XML" | head -1)"
+  [[ "$ENCLOSURE_AFTER" == "$ENCLOSURE_BEFORE" ]] \
+    || fail "embedding release notes altered the signed <enclosure> line. Refusing."
+  [[ "$(tag 'sparkle:version')" == "$VERSION" ]] \
+    || fail "embedding release notes altered the advertised feed version. Refusing."
+  echo "    notes:     embedded as <description> ($(wc -c <"$NOTES_FILE" | tr -d ' ') bytes)"
+fi
+
+# Every guard passed — the feed may now survive on disk. (Set AFTER the notes
+# step so a failed embed discards the feed like any other rejection.)
 APPCAST_ACCEPTED=true
 
 # The staged DMG was only ever input to generate_appcast. Drop it so the output
@@ -387,6 +498,8 @@ echo "==> Publishing via NATIVEAGENT_APPCAST_PUBLISH_CMD"
 NATIVEAGENT_PUBLISH_APPCAST="$APPCAST_XML" \
 NATIVEAGENT_PUBLISH_DMG="$DMG_PATH" \
 NATIVEAGENT_PUBLISH_APPCAST_URL="$APPCAST_URL" \
+NATIVEAGENT_PUBLISH_VERSION="$VERSION" \
+NATIVEAGENT_APPCAST_REHEARSAL="$REHEARSAL" \
   bash -c "$PUBLISH_CMD" \
   || fail "publish command failed; the feed was NOT published."
 

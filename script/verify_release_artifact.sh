@@ -255,7 +255,7 @@ verify_minilm_swiftpm_resources() {
 }
 
 verify_bridge_helper_source_resources() {
-  local repo_root="$1" codex_helper claude_helper
+  local repo_root="$1" codex_helper claude_helper omp_helper
   codex_helper="$repo_root/script/codex_thread_wakeup.js"
   [[ -f "$codex_helper" && ! -L "$codex_helper" ]] \
     || fail "source tree missing required Codex bridge helper: $codex_helper"
@@ -271,26 +271,37 @@ verify_bridge_helper_source_resources() {
     || fail "Codex bridge helper is unexpectedly small: $codex_helper"
   [[ "$(wc -c < "$claude_helper" | tr -d '[:space:]')" -gt 10000 ]] \
     || fail "Claude Code bridge helper is unexpectedly small: $claude_helper"
+  omp_helper="$repo_root/script/omp_thread_wakeup.js"
+  [[ -f "$omp_helper" && ! -L "$omp_helper" ]] \
+    || fail "source tree missing required OMP bridge helper: $omp_helper"
+  [[ "$(wc -c < "$omp_helper" | tr -d '[:space:]')" -gt 10000 ]] \
+    || fail "OMP bridge helper is unexpectedly small: $omp_helper"
   echo "[resources] verified bridge helper source resources"
 }
 
 verify_bridge_helper_bundle_resources() {
-  local contents_resources="$1" codex_hits claude_hits codex_count claude_count
+  local contents_resources="$1" codex_hits claude_hits omp_hits codex_count claude_count omp_count
   codex_hits="$(find "$contents_resources" -type f -name 'codex_thread_wakeup.js' -print 2>/dev/null || true)"
   claude_hits="$(find "$contents_resources" -type f \
     \( -name 'claude_thread_wakeup.js' -o -name 'claude_thread_wakeup.js' \) \
     -print 2>/dev/null || true)"
+  omp_hits="$(find "$contents_resources" -type f -name 'omp_thread_wakeup.js' -print 2>/dev/null || true)"
   codex_count="$(printf '%s\n' "$codex_hits" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
   claude_count="$(printf '%s\n' "$claude_hits" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
+  omp_count="$(printf '%s\n' "$omp_hits" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
   [[ "$codex_count" == "1" ]] \
     || fail "release resources require exactly one Codex bridge helper; found $codex_count"
   [[ "$claude_count" == "1" ]] \
     || fail "release resources require exactly one Claude Code bridge helper; found $claude_count"
+  [[ "$omp_count" == "1" ]] \
+    || fail "release resources require exactly one OMP bridge helper; found $omp_count"
   [[ "$(wc -c < "$codex_hits" | tr -d '[:space:]')" -gt 10000 ]] \
     || fail "bundled Codex bridge helper is unexpectedly small: $codex_hits"
   [[ "$(wc -c < "$claude_hits" | tr -d '[:space:]')" -gt 10000 ]] \
     || fail "bundled Claude Code bridge helper is unexpectedly small: $claude_hits"
-  echo "[resources] verified staged Codex and Claude Code bridge helpers"
+  [[ "$(wc -c < "$omp_hits" | tr -d '[:space:]')" -gt 10000 ]] \
+    || fail "bundled OMP bridge helper is unexpectedly small: $omp_hits"
+  echo "[resources] verified staged Codex, Claude Code, and OMP bridge helpers"
 }
 
 SPECIAL_MODE_COUNT=0

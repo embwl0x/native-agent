@@ -228,3 +228,209 @@ private struct ToastPillSurface: ViewModifier {
         }
     }
 }
+
+// MARK: - Mac connection chip (Sweep R4 C11.4)
+//
+// Until now the phone's connection state rendered on exactly two screens:
+// Diagnostics → Status and Settings → Connection. On Chat, Activity, Memory
+// and Skills the app looked completely normal while the Mac was asleep — you
+// found out by sending a message and waiting for a timeout.
+//
+// This is the SAME source of truth those two screens already read
+// (`MacBridgeClient.bridgeStatus`, refreshed by the existing 5s poll in
+// MacBridgeClient.init). No new timer, no new fetch — a second reader of a
+// value that was already being computed.
+
+/// A compact connection indicator for a navigation bar. Renders a bare dot
+/// when everything is fine and a labeled pill when it is not, so a healthy
+/// screen stays quiet and an unhealthy one is impossible to miss.
+struct MacStatusChip: View {
+    @EnvironmentObject private var bridgeClient: MacBridgeClient
+    @ObservedObject private var sync = iCloudSyncEngine.shared
+    @State private var showDetail = false
+
+    private var status: BridgeStatus { bridgeClient.bridgeStatus }
+    private var isHealthy: Bool { status == .online }
+
+    var body: some View {
+        Button {
+            showDetail = true
+        } label: {
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(status.color)
+                    .frame(width: 8, height: 8)
+                if !isHealthy {
+                    Text(shortLabel)
+                        .font(AppFont.tag)
+                        .foregroundStyle(status.color)
+                }
+            }
+            .padding(.horizontal, isHealthy ? 2 : 7)
+            .padding(.vertical, isHealthy ? 2 : 3)
+            .background {
+                if !isHealthy {
+                    Capsule(style: .continuous).fill(status.color.opacity(0.14))
+                }
+            }
+            // A bare 8pt dot is far under the 44pt minimum target, so pad the
+            // hit area without padding the visual.
+            .contentShape(Rectangle())
+            .frame(minWidth: 32, minHeight: 32)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Mac connection: \(status.displayName)")
+        .popover(isPresented: $showDetail) {
+            MacStatusDetail(status: status, lastSeenAt: bridgeClient.lastSeenAt, lastSyncAt: sync.lastSyncAt)
+                .presentationCompactAdaptation(.popover)
+        }
+    }
+
+    /// Navigation bars are tight — the full `displayName` ("Connected via
+    /// iCloud", "Last seen 4m ago") does not fit beside a title. The popover
+    /// carries the full sentence.
+    private var shortLabel: String {
+        switch status {
+        case .online: return "Live"
+        case .offline: return "No iCloud"
+        case .macUnreachable: return "Mac asleep"
+        case .stale(let minutesAgo): return "\(minutesAgo)m ago"
+        case .connecting: return "Connecting"
+        }
+    }
+}
+
+private struct MacStatusDetail: View {
+    let status: BridgeStatus
+    let lastSeenAt: Date?
+    let lastSyncAt: Date?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 7) {
+                Circle().fill(status.color).frame(width: 9, height: 9)
+                Text(status.displayName)
+                    .font(AppFont.label)
+                    .foregroundStyle(status.color)
+            }
+            Text(explanation)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let lastSeenAt {
+                LabeledContent("Mac last seen") {
+                    Text(lastSeenAt, style: .relative).foregroundStyle(.secondary)
+                }
+                .font(.footnote)
+            }
+            if let lastSyncAt {
+                LabeledContent("Last synced") {
+                    Text(lastSyncAt, style: .relative).foregroundStyle(.secondary)
+                }
+                .font(.footnote)
+            }
+        }
+        .padding(16)
+        .frame(minWidth: 240, maxWidth: 300, alignment: .leading)
+    }
+
+    private var explanation: String {
+        switch status {
+        case .online:
+            return "The Mac is awake and picking up what you send."
+        case .offline:
+            return "This iPhone cannot reach iCloud right now, so nothing can be sent or received."
+        case .macUnreachable:
+            return "iCloud is fine, but the Mac has not checked in. It is probably asleep or closed — anything you send waits until it wakes up."
+        case .stale:
+            return "The Mac has gone quiet. What you see may be out of date, and a new message may sit waiting."
+        case .connecting:
+            return "Still establishing the iCloud link. Give it a moment."
+        }
+    }
+}
+
+// MARK: - Sync error banner (Sweep R4 C11.3)
+//
+// `iCloudSyncEngine.syncError` has always been `@Published` and read by
+// nothing — a CloudKit decode failure (iCloudSyncEngine+Setup.swift) set a
+// string that no view rendered, so a screen showing stale data looked
+// identical to a screen showing fresh data.
+//
+// RENDER-ONLY. This adds no retry, no polling and no sync machinery; it shows
+// the string the engine already writes.
+
+/// One-line dismissible banner over the top of a screen. Tap to see the full
+/// text, X to dismiss. A NEW error text un-dismisses itself — dismissing
+/// "snapshots downloading" must not also silence a later decode failure.
+struct MacSyncErrorBanner: View {
+    @ObservedObject private var sync = iCloudSyncEngine.shared
+    @State private var dismissedMessage: String?
+    @State private var isExpanded = false
+
+    private var message: String? {
+        guard let error = sync.syncError, !error.isEmpty else { return nil }
+        return error == dismissedMessage ? nil : error
+    }
+
+    var body: some View {
+        Group {
+            if let message {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "exclamationmark.icloud")
+                        .foregroundStyle(.orange)
+                        .accessibilityHidden(true)
+                    Text(message)
+                        .font(.footnote)
+                        .foregroundStyle(.primary)
+                        .lineLimit(isExpanded ? nil : 1)
+                        .fixedSize(horizontal: false, vertical: isExpanded)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Button {
+                        dismissedMessage = message
+                        isExpanded = false
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 44, height: 24)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Dismiss sync warning")
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(.ultraThinMaterial)
+                .overlay(alignment: .bottom) {
+                    Rectangle().fill(Color.orange.opacity(0.35)).frame(height: 0.5)
+                }
+                .contentShape(Rectangle())
+                .onTapGesture { isExpanded.toggle() }
+                .accessibilityElement(children: .contain)
+                .accessibilityHint(isExpanded ? "Tap to collapse" : "Tap to read the full message")
+                .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+        .animation(AppMotion.snappy, value: sync.syncError)
+        .animation(AppMotion.snappy, value: isExpanded)
+        // The latch must only survive as long as the condition does. Without
+        // this, dismissing "snapshots still downloading", letting a sync
+        // succeed, and then hitting the SAME failure again would leave the
+        // banner permanently silent — a dismissal in one situation would
+        // swallow a genuinely new occurrence later.
+        .onChange(of: sync.syncError) { _, newValue in
+            if newValue == nil { dismissedMessage = nil }
+        }
+    }
+}
+
+extension View {
+    /// Pins `MacSyncErrorBanner` to the top of a screen without disturbing the
+    /// layout underneath it (a `safeAreaInset` reflows scroll content rather
+    /// than covering it, which matters on Chat where the last bubble must stay
+    /// visible).
+    func macSyncErrorBanner() -> some View {
+        safeAreaInset(edge: .top, spacing: 0) { MacSyncErrorBanner() }
+    }
+}

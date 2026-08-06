@@ -41,6 +41,7 @@ extension SwiftToolDispatcher {
         "agent_introspect",
         "claude_message",
         "codex_message",
+        "omp_message",
         // Agent Desk — desk_read is ALWAYS-ON so "update me on what you're
         // tracking" / "what's on the desk" works regardless of phrasing (User's
         // pull-to-retrieve flow, 2026-06-29). The nine desk MUTATIONS stay lazy
@@ -61,7 +62,7 @@ extension SwiftToolDispatcher {
         // listAvailableTools() didn't include them → tool_catalog's nameSet
         // intersection dropped them from currently_loaded. Add here.
         "time_now", "claude_message", "invoke_claude",
-        "codex_message", "invoke_codex",
+        "codex_message", "invoke_codex", "omp_message",
         "agent_swarm",
         "market_status", "market_watchlists", "tradingview_watchlist", "market_quote",
         // X (Twitter) read tools — the user's connected account. Posting/DM is

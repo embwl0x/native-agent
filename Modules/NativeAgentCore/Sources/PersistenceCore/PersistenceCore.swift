@@ -365,6 +365,16 @@ public protocol PersistenceCoreProtocol: Sendable {
     /// live in the extension below, so no existing conformer breaks.
     func readJSONLReporting(_ path: URL) async throws -> (rows: [JSONValue], report: JSONLReadReport)
     func appendJSONLDurable(_ record: JSONValue, to path: URL) async throws
+    /// Atomic replacement of an ALREADY-SERIALIZED payload with the same
+    /// durability guarantees `writeJSON` gets: temp file written + fsync'd,
+    /// renamed, then the PARENT DIRECTORY fsync'd so power loss cannot forget
+    /// the rename. Exists because callers that own their own byte formatting
+    /// (the chat session index, which serializes through `ChatSessionIndexFile`
+    /// so its on-disk shape is fixed) were reaching for bare
+    /// `Data.write(.atomic)` — atomic against a crash, but NOT durable against
+    /// power loss. A protocol requirement, not extension-only, so an
+    /// existential dispatches to the real implementation.
+    func writeDataAtomicDurable(_ data: Data, to path: URL) async throws
 }
 
 /// What a raw JSONL scan had to throw away (audit 2026-08-02, finding 2).
@@ -445,6 +455,16 @@ extension PersistenceCoreProtocol {
     public func appendJSONLDurable(_ record: JSONValue, to path: URL) async throws {
         try await appendJSONL(record, to: path)
     }
+
+    /// Durable atomic replacement of pre-serialized bytes.
+    ///
+    /// The default routes through the canonical writer rather than
+    /// `Data.write(.atomic)` so a delegating wrapper that never thinks about
+    /// this method still gets the temp-fsync + rename + parent-dir-fsync
+    /// guarantees. An in-memory shim that wants different behavior overrides it.
+    public func writeDataAtomicDurable(_ data: Data, to path: URL) async throws {
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: path)
+    }
 }
 
 extension PersistenceCoreProtocol {
@@ -487,6 +507,19 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let payload = try value.serializedData(pretty: true)
         try Self.atomicWrite(payload, to: path)
+    }
+
+    public func writeDataAtomicDurable(_ data: Data, to path: URL) async throws {
+        try Self.writeDataAtomicDurable(data, to: path)
+    }
+
+    /// Synchronous entry point for callers that own their serialization and
+    /// hold a lock across the write (the chat session index). Same durability
+    /// tail as `writeJSON`: tmp fsync → rename → parent-directory fsync.
+    public static func writeDataAtomicDurable(_ data: Data, to path: URL) throws {
+        let dir = path.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try atomicWrite(data, to: path)
     }
 
     public func appendJSONL(_ record: JSONValue, to path: URL) async throws {
@@ -976,6 +1009,7 @@ public enum JSONLLineCaps {
     /// durable inbox rows (audit 2026-07-21: raw uncapped append; same
     /// budget as the other bridge feeds).
     public static let claudeBridgeInbox = 5000
+    public static let ompBridgeInbox = 5000
     /// `<dataRoot>/slack/receipts.jsonl`, `errors.jsonl`, `ignored.jsonl` —
     /// Socket Mode loop ledgers (audit 2026-07-21: raw uncapped appends).
     public static let slackReceipts = 5000

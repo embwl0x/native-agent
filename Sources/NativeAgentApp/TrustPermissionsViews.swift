@@ -125,8 +125,10 @@ struct TrainingPermissionsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
+                // Sweep R4 C9 — COPY ONLY. "improvement kernel" named an
+                // internal component, not a thing the user grants.
                 Toggle(
-                    "Enable autonomous improvement kernel",
+                    "Let the agent improve itself in the background",
                     isOn: Binding(
                         get: { draftEnableAutonomy },
                         set: { newValue in
@@ -135,18 +137,18 @@ struct TrainingPermissionsView: View {
                         }
                     )
                 )
-                .help("Master Trust switch for background improvement runs. Guardrails still keep autonomous self-improvement inside NativeAgent-owned paths.")
+                .help("The master switch for everything on this card. Even when it is on, the agent can only change its own files inside NativeAgent — never the rest of your Mac.")
                 EffectTimingTag(timing: .restart)
                 Spacer()
             }
             Divider()
             // Taste pass 2026-07-24: was "Autonomous Training", an exact echo
             // of the card title directly above it.
-            Text("Training Runs")
+            Text("Practice Runs")
                 .font(.headline)
             HStack {
                 Toggle(
-                    "Allow autonomous training",
+                    "Let the agent practice on its own",
                     isOn: Binding(
                         get: { draftTraining.autonomous_training },
                         set: { newValue in
@@ -161,7 +163,10 @@ struct TrainingPermissionsView: View {
                         }
                     )
                 )
-                .help("Unlocks /v1/training/* endpoints: drill battery, drift detection, proposals. All proposals still require manual approval.")
+                // Sweep R4 C9 — COPY ONLY. Was a raw endpoint path for a
+                // daemon that no longer exists (README "What exists today":
+                // the Swift app owns the runtime in-process).
+                .help("The agent works through its own saved exercises in the background, notices where its answers have slipped, and writes up suggested changes. It never applies a change on its own — every suggestion waits for you.")
                 EffectTimingTag(timing: .nextRun)
                 Spacer()
             }
@@ -180,7 +185,7 @@ struct TrainingPermissionsView: View {
                     )
                 )
                 .disabled(!draftTraining.autonomous_training)
-                .help("When enabled, the agent runs one nightly DreamCycle at 3:30 AM, reflects over recent chats and memory deltas, writes the dated dream diary, and surfaces a morning digest. Disabled until autonomous training is on.")
+                .help("Once a night at 3:30 AM the agent looks back over recent conversations and what it learned that day, writes it up as a dated diary entry, and leaves you a short digest in the morning. Needs practice runs turned on above.")
                 EffectTimingTag(timing: .nextRun)
                 Spacer()
             }
@@ -188,11 +193,14 @@ struct TrainingPermissionsView: View {
             Divider()
 
             // PATCH-2026-05-07: self-improvement-ui Promotion engine trust toggles
-            Text("Promotion Engine")
+            // Sweep R4 C9 — COPY ONLY. "Promotion engine" was the internal
+            // component name; what the user is granting is an automatic
+            // check that a proposed change is good enough to keep.
+            Text("Automatic Review")
                 .font(.headline)
             HStack {
                 Toggle(
-                    "Allow promotion engine",
+                    "Check proposed changes automatically",
                     isOn: Binding(
                         get: { draftPromotion.enabled },
                         set: { newValue in
@@ -212,13 +220,16 @@ struct TrainingPermissionsView: View {
                         }
                     )
                 )
-                .help("Unlocks /v1/promotion/* endpoints. Candidates must pass harness eval before any promotion action.")
+                // Sweep R4 C9 — COPY ONLY. Was a raw endpoint path plus
+                // "harness eval", neither of which appears anywhere else
+                // in the UI.
+                .help("Before any suggested change is kept, the agent re-runs its own test set against it. A change that scores worse than what it replaces is thrown away instead of applied.")
                 EffectTimingTag(timing: .nextRun)
                 Spacer()
             }
             HStack {
                 Toggle(
-                    "Auto-promote Tier A changes (personality docs, drill suites)",
+                    "Keep low-risk changes without asking me (personality notes, practice exercises)",
                     isOn: Binding(
                         get: { draftPromotion.auto_promote_tier_a },
                         set: { newValue in
@@ -231,13 +242,16 @@ struct TrainingPermissionsView: View {
                     )
                 )
                 .disabled(!draftPromotion.enabled)
-                .help("When off, Tier A acts as Tier B and requires human sign-off. Enable only when you trust harness eval quality.")
+                // Sweep R4 C9 — COPY ONLY. "Tier A acts as Tier B" was the
+                // only place those tiers were ever named; nothing in the UI
+                // defined either one.
+                .help("Low-risk means the agent's own notes about how it should behave and the exercises it practices against — never your files or your settings. With this off, every change waits for your sign-off no matter how small. Turn it on only if you trust the automatic check above to catch a bad one.")
                 EffectTimingTag(timing: .nextRun)
                 Spacer()
             }
             HStack {
                 Toggle(
-                    "Route training proposals through promotion engine",
+                    "Put practice suggestions through the automatic check too",
                     isOn: Binding(
                         get: { draftTraining.route_through_promotion },
                         set: { newValue in
@@ -253,7 +267,7 @@ struct TrainingPermissionsView: View {
                     )
                 )
                 .disabled(!draftPromotion.enabled || !draftTraining.autonomous_training)
-                .help("Approved training proposals are fed into the promotion harness before being written. Requires both autonomous training and promotion engine to be enabled.")
+                .help("A suggestion you approve is still tested before it is written, instead of being applied straight away. Needs both practice runs and automatic review turned on.")
                 EffectTimingTag(timing: .nextRun)
                 Spacer()
             }
@@ -496,7 +510,9 @@ struct LivingMemoryPermissionsView: View {
                     .font(.caption)
                     .foregroundStyle(.green)
             }
-            Text("Memory Graph, recall, consolidation, adaptive promotion, and hygiene are controlled here. Memory proposals stay in Memory; harness and promotion proposals stay in Self-Improvement.")
+            // Sweep R4 C9 — COPY ONLY. "harness and promotion proposals"
+            // named machinery; the user is being told which page to look on.
+            Text("What the agent remembers, how it recalls it, and how it tidies itself up are all set here. Suggested memory changes wait for you in Memory; suggested changes to how the agent behaves wait in Self-Improvement.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

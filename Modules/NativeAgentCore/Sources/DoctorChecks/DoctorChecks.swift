@@ -990,6 +990,11 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
     /// 2026-07-04). Only a build that genuinely configures iCloud should nag to
     /// sign in.
     private let iCloudConfigured: Bool
+    /// Local (non-iCloud) sync bookkeeping root. Sweep R4 items 1 + 2 record
+    /// their durable failure state here, and this row is where it surfaces —
+    /// reusing the existing iCloud bridge row rather than opening a second
+    /// reporting lane for the same subsystem.
+    private let dataRoot: URL
 
     public init(
         docsURLProvider: @escaping @Sendable () -> URL? = {
@@ -998,10 +1003,60 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
                 .url(forUbiquityContainerIdentifier: containerID)?
                 .appendingPathComponent("Documents", isDirectory: true)
         },
-        iCloudConfigured: Bool = ICloudBridgeStateCheck.buildConfiguresICloud()
+        iCloudConfigured: Bool = ICloudBridgeStateCheck.buildConfiguresICloud(),
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) {
         self.docsURLProvider = docsURLProvider
         self.iCloudConfigured = iCloudConfigured
+        self.dataRoot = dataRoot
+    }
+
+    /// Warnings derived from the sync engine's own durable state files.
+    /// Deliberately ordered most-actionable first.
+    static func localSyncStateWarnings(dataRoot: URL) -> [String] {
+        var warnings: [String] = []
+        let stranded = ICloudSyncStatePaths.completedUnarchivedMsgIds(dataRoot: dataRoot)
+        if !stranded.isEmpty {
+            warnings.append(
+                "\(stranded.count) iPhone command(s) completed but their completion record could not be filed "
+                + "(\(stranded.prefix(3).joined(separator: ", "))\(stranded.count > 3 ? ", …" : "")). "
+                + "They are marked completed and will not run again; free disk space or fix iCloud permissions."
+            )
+        }
+        let corrupt = ICloudSyncStatePaths.processedIdsCorruptBackup(dataRoot: dataRoot)
+        if FileManager.default.fileExists(atPath: corrupt.path) {
+            warnings.append(
+                "The processed-command list was unreadable and was preserved as processed_ids.corrupt.json — "
+                + "iPhone commands from before that point may be re-run."
+            )
+        }
+        let skipsURL = ICloudSyncStatePaths.snapshotSkips(dataRoot: dataRoot)
+        if let data = try? Data(contentsOf: skipsURL),
+           let skips = try? JSONDecoder().decode([String: String].self, from: data) {
+            let groups = skips.keys.filter { !$0.hasPrefix("_") }.sorted()
+            if !groups.isEmpty {
+                warnings.append(
+                    "iPhone is showing stale \(groups.joined(separator: ", ")) — the last snapshot pass could not "
+                    + "build \(groups.count == 1 ? "that group" : "those groups")."
+                )
+            }
+        }
+        return warnings
+    }
+
+    /// Folds local sync-state warnings into a bridge-directory verdict without
+    /// downgrading a harder existing status.
+    private func merging(_ result: CheckResult) -> CheckResult {
+        let warnings = Self.localSyncStateWarnings(dataRoot: dataRoot)
+        guard !warnings.isEmpty else { return result }
+        let status = result.status == "fail" ? "fail" : "warn"
+        return CheckResult(
+            id: result.id,
+            title: result.title,
+            status: status,
+            detail: "\(result.detail) \(warnings.joined(separator: " "))",
+            repair: result.repair
+        )
     }
 
     /// The configured container id, or the standalone "com.example" sentinel.
@@ -1027,20 +1082,22 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
             // Public no-iCloud build: iCloud isn't part of it, so an
             // unavailable container is expected — report OK, not a warning.
             if !iCloudConfigured {
-                return CheckResult(
+                // Even a no-iCloud build runs the CloudKit projection lane, so
+                // its local sync bookkeeping still matters here.
+                return merging(CheckResult(
                     id: id,
                     title: title,
                     status: "ok",
                     detail: "iCloud sync isn't part of this build (no iCloud container configured)."
-                )
+                ))
             }
-            return CheckResult(
+            return merging(CheckResult(
                 id: id,
                 title: title,
                 status: "warn",
                 detail: "iCloud container is unavailable to this process.",
                 repair: "Run Doctor from the signed Mac app after signing into iCloud; CLI builds may not have the iCloud entitlement."
-            )
+            ))
         }
         let bridgeDirs = [
             "outbox/mac",
@@ -1078,29 +1135,29 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
             }
         }
         if repair, !created.isEmpty {
-            return CheckResult(
+            return merging(CheckResult(
                 id: id,
                 title: title,
                 status: "ok",
                 detail: "iCloud/APNS bridge directories are present after repair.",
                 repair: "Created: \(created.joined(separator: ", "))."
-            )
+            ))
         }
         if !missing.isEmpty {
-            return CheckResult(
+            return merging(CheckResult(
                 id: id,
                 title: title,
                 status: "warn",
                 detail: "Missing iCloud/APNS bridge path(s): \(missing.joined(separator: ", ")).",
                 repair: "Run Repair Safe Issues to recreate bridge directories."
-            )
+            ))
         }
-        return CheckResult(
+        return merging(CheckResult(
             id: id,
             title: title,
             status: "ok",
             detail: "iCloud/APNS bridge directories are present."
-        )
+        ))
     }
 }
 
