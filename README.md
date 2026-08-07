@@ -130,11 +130,20 @@ existing authority.
 - Optional: `gitleaks` for the repository privacy guard
 - Optional: Xcode signing, iCloud, and APNS configuration for the iPhone app
 
+## Install the app (recommended)
+
+Download the latest notarized DMG from the
+[releases page](https://github.com/embwl0x/native-agent/releases), open it,
+and drag NativeAgent to Applications. The app is Developer ID signed and
+notarized; installed copies update in place via **Check for Updates…**
+(Sparkle, EdDSA-signed feed). See the [Changelog](docs/CHANGELOG.md) for
+what each release contains.
+
 ## Install from source
 
 ```bash
 git clone https://github.com/embwl0x/native-agent.git
-cd NativeAgent
+cd native-agent
 
 # Recommended for contributors: installs the staged-secret/privacy hook.
 bash script/hooks/install.sh
@@ -190,7 +199,7 @@ runs the production release command from the scrubbed public export:
 
 ```bash
 NATIVEAGENT_GITHUB_REPOSITORY=embwl0x/native-agent \
-NATIVEAGENT_NOTARY_KEYCHAIN_PROFILE=NativeAgent-notary \
+NATIVEAGENT_NOTARY_KEYCHAIN_PROFILE=NativeAgent-notarytool \
 ./script/release_github.sh
 ```
 

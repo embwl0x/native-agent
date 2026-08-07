@@ -1,8 +1,21 @@
 # NativeAgent Project Status
 
-Last updated: 2026-08-03
+Last updated: 2026-08-06
 
 ## Summary
+
+Release `0.3.8` (2026-08-06) is the current public build: notarized DMG on
+the releases page, Sparkle feed serving it to installed 0.3.7 clients, and
+a clean-VM install verified end-to-end (Gatekeeper-accepted, blank first
+run with zero inherited credentials). Highlights: the generated user
+profile now renders only person-facts (the agent's own work journal stays
+in memory, off the identity document); strict fail-closed validation of
+remote approval actions; bounded chat-history compaction budgets; a sync
+fix that exempts completion markers from processed-id cap eviction;
+background-loop event-listener liveness tracking; human-readable Trust
+Center copy; desk quick actions routed through the same gated dispatch as
+chat; and the internal wire-vocabulary migration to `execution.json` with
+automatic legacy migration. See [docs/CHANGELOG.md](docs/CHANGELOG.md).
 
 NativeAgent is a Swift-native macOS + iOS personal agent runtime. The macOS app owns the runtime in-process; the iOS app is a first-class remote cockpit over iCloud/APNS. Runtime state, persona files, credentials, local signing material, and work products are local-only and ignored by git.
 
