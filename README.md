@@ -18,6 +18,7 @@ trust, transcript, and receipt rules converge on the same orchestration path.
 > and signed-update machinery are real. The public source repository and a
 > notarized binary GitHub Release are live; connector depth varies, so see
 > [Project Status](PROJECT_STATUS.md) for the honest capability ledger.
+> Release history: [Changelog](docs/CHANGELOG.md).
 
 ## What exists today
 
