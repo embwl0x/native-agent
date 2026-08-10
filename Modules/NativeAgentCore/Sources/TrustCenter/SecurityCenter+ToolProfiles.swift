@@ -97,6 +97,8 @@ extension SwiftNativeSecurityCenter {
         "evolution_propose",
         "evolution_status",
         "self_install",
+        "remote_node_list",
+        "remote_node_execute",
         // Both names dispatch to the same built-in transcript reader. Keeping
         // the canonical name registered here prevents it from looking like an
         // unsigned dynamic tool while the compatibility alias looks built-in.
@@ -453,6 +455,16 @@ extension SwiftNativeSecurityCenter {
         }
         if tool == "evolution_status" {
             add("safe_read", .low)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
+        if tool == "remote_node_list" {
+            add("safe_read", .low)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
+        if tool == "remote_node_execute" {
+            add("process_spawn", .critical)
+            add("remote_effect", .critical)
+            add("filesystem_write", .high)
             return ToolProfile(capabilities: capabilities, risk: risk)
         }
         // restart_app (2026-06-10): spawns a detached relauncher process AND

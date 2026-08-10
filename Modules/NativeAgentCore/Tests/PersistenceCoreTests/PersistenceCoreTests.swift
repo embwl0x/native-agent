@@ -654,6 +654,26 @@ private final class FixedCWDFileManager: FileManager, @unchecked Sendable {
             "JSONEncoder output MUST NOT match serializedData(pretty:) — if this fires, the byte-sensitive contract documented on the Codable extension may have silently changed.")
 }
 
+@Test func canonicalSerializer_largeStringProjectionStaysLinearEnoughForRuntimeSnapshots() throws {
+    // This is intentionally a runtime-sized projection, not a microbenchmark.
+    // Calling String.count inside encodeString once per value made this shape
+    // quadratic and held multiple launch workers busy for tens of seconds.
+    let rows = (0..<12_000).map { index in
+        JSONValue.object([
+            "id": .string("row-\(index)"),
+            "text": .string("NativeAgent canonical projection payload \(index)"),
+        ])
+    }
+    let clock = ContinuousClock()
+    let started = clock.now
+    let bytes = try JSONValue.array(rows).serializedData(pretty: false)
+    let elapsed = started.duration(to: clock.now)
+
+    #expect(bytes.count > 900_000)
+    #expect(elapsed < .seconds(5), "large canonical JSON serialization regressed to \(elapsed)")
+    #expect(try JSONValue.parse(bytes) == .array(rows))
+}
+
 // MARK: - Persona-root resolver
 //
 // Swift-native runtime code should prefer the real Agent persona docs wherever

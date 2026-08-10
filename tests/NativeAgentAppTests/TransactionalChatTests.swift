@@ -197,3 +197,50 @@ func cachedSessionSelectionCommitsBeforeRefreshCompletes() async throws {
     await refresh.value
     #expect(model.chatMessages == refreshedMessages)
 }
+
+@MainActor
+@Test
+func liveSessionIndexRefreshAddsExternalSessionWithoutDisturbingActiveChat() async throws {
+    let model = AppModel()
+    let active = try transactionalSession("active")
+    let bridge = try transactionalSession("bridge-created")
+    let activeMessages = [
+        transactionalMessage("active-message", sessionId: active.id, content: "keep me visible")
+    ]
+    model.chatSessions = [active]
+    model.activeChatSessionId = active.id
+    model.chatMessagesBySession[active.id] = activeMessages
+    model.chatDrafts[active.id] = "unfinished draft"
+
+    await model.refreshChatSessionIndex {
+        [bridge, active]
+    }
+
+    #expect(model.chatSessions.map(\.id) == [bridge.id, active.id])
+    #expect(model.activeChatSessionId == active.id)
+    #expect(model.chatMessages == activeMessages)
+    #expect(model.chatDrafts[active.id] == "unfinished draft")
+}
+
+@MainActor
+@Test
+func failedLiveSessionIndexRefreshKeepsLastProvenRowsAndRecoversCleanly() async throws {
+    struct FixtureFailure: Error {}
+    let model = AppModel()
+    let active = try transactionalSession("active")
+    model.chatSessions = [active]
+
+    await model.refreshChatSessionIndex {
+        throw FixtureFailure()
+    }
+
+    #expect(model.chatSessions == [active])
+    #expect(model.chatSessionIndexRefreshFailed)
+
+    await model.refreshChatSessionIndex {
+        [active]
+    }
+
+    #expect(model.chatSessions == [active])
+    #expect(!model.chatSessionIndexRefreshFailed)
+}

@@ -103,6 +103,20 @@ private func makeResponse(_ url: URL, _ status: Int) -> HTTPURLResponse {
 
 private let tokenStr = "TKN123"
 
+private actor TelegramTaskPriorityCapture {
+    private var value: TaskPriority?
+
+    func record(_ priority: TaskPriority) { value = priority }
+
+    func wait(timeout: TimeInterval = 15) async -> TaskPriority? {
+        let deadline = Date().addingTimeInterval(timeout)
+        while value == nil, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        return value
+    }
+}
+
 private func writeTelegramConfigRoot(
     enabled: Bool = true,
     token: String = "123:abc",
@@ -483,6 +497,42 @@ struct SwiftNativeTelegramBotPhaseBTests {
         if case .int(let i) = v { read = Int(i) }
         else if case .double(let d) = v { read = Int(d) }
         #expect(read == 43)
+    }
+
+    @Test func telegramHumanTurnPromotesBackgroundPollWorkToUserInitiated() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("telegram_priority_\(UUID().uuidString)", isDirectory: true)
+        let offset = root.appendingPathComponent("last_offset.json")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let raw = #"{"ok":true,"result":[{"update_id":43,"message":{"message_id":2,"chat":{"id":9},"from":{"id":11},"text":"hello","date":1}}]}"#
+        let session = mockSession { req in
+            (makeResponse(req.url!, 200), Data(raw.utf8))
+        }
+        let capture = TelegramTaskPriorityCapture()
+        let loop = TelegramPollLoop(
+            interval: 60,
+            token: tokenStr,
+            bot: SwiftNativeTelegramBot(dataRoot: root),
+            session: session,
+            dataRoot: root,
+            offsetURL: offset,
+            sendMessage: { _, _, _ in },
+            sendChatAction: { _, _, _ in },
+            chatHandler: { _, _ in
+                await capture.record(Task.currentPriority)
+                return "reply"
+            },
+            typingRefreshNanoseconds: 0
+        )
+
+        // Do not await the driver until the handler has recorded its priority;
+        // that prevents this test task from priority-donating to the driver and
+        // proves the production promotion rather than an await-side escalation.
+        let driver = Task.detached(priority: .background) { await loop.tick() }
+        let observed = await capture.wait()
+        #expect(observed?.rawValue ?? 0 >= TaskPriority.userInitiated.rawValue)
+        await driver.value
     }
 
     @Test func telegramPollLoop_tick_routes_updates_to_dispatch() async throws {

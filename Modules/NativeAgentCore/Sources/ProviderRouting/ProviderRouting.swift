@@ -1635,7 +1635,10 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         case "openai", "codex": return PRIMARY_MODEL
         case "xai": return XAIOAuthDirectAdapter.defaultModel
         case "moonshot": return MoonshotAdapter.defaultModel
-        case "openrouter": return "anthropic/claude-3.5-sonnet"
+        // Verified live on OpenRouter 2026-08-07; the previous default
+        // `anthropic/claude-3.5-sonnet` was delisted, which made an unpinned
+        // OpenRouter selection default to a 404 model.
+        case "openrouter": return "anthropic/claude-sonnet-5"
         default: return nil
         }
     }
@@ -2099,9 +2102,14 @@ public func contextLength(forModel modelId: String) -> Int {
     case "claude-opus-5": return 200_000
     case "claude-sonnet-4-6": return 200_000
     case "claude-haiku-4-5": return 200_000
-    // OpenRouter passthroughs
-    case "meta-llama/llama-3.3-70b-instruct": return 128_000
-    case "anthropic/claude-3.5-sonnet": return 200_000
+    // OpenRouter passthroughs (live rows 2026-08-07; the delisted
+    // anthropic/claude-3.5-sonnet entry was retired with them).
+    // Non-gauge consumer note: ChatSessionAutocompactor reads this length
+    // directly, so the 1M row lets a Sonnet-5-via-OpenRouter session keep the
+    // user-configured compaction ceiling instead of clamping to a 200k
+    // window's 40% — correct for a genuinely 1M-window model.
+    case "meta-llama/llama-3.3-70b-instruct": return 131_072
+    case "anthropic/claude-sonnet-5": return 1_000_000
     default:
         // gpt-5.5 review #4 (NEEDS_FIX): unknown-model fallback was 200_000
         // which is optimistic — a 128k-window model would then read percent

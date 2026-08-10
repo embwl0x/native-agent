@@ -98,7 +98,14 @@ struct ProviderOAuthConfig: @unchecked Sendable {
         ],
         tokenBodyFormat: .form,
         persistTokens: { tokens in
-            var existing = (try? loadJSONObject(NativeOAuthFlow.openAIAuthPath())) ?? [:]
+            // Persist to the APP-OWNED auth path, never the resolved active
+            // path: with CLI-session adoption allowed, the resolved path is
+            // ~/.codex/auth.json, and an in-app re-auth must not overwrite
+            // the Codex CLI's own session file (gpt-5.5 review 2026-08-06).
+            // The app-owned candidate precedes the shared one in resolution,
+            // so freshly written tokens win on the next turn.
+            let authPath = NativeOAuthFlow.openAIAppOwnedAuthPath()
+            var existing = (try? loadJSONObject(authPath)) ?? [:]
             if existing["auth_mode"] == nil { existing["auth_mode"] = "chatgpt" }
             if existing["OPENAI_API_KEY"] == nil { existing["OPENAI_API_KEY"] = NSNull() }
             var merged = (existing["tokens"] as? [String: Any]) ?? [:]
@@ -113,7 +120,7 @@ struct ProviderOAuthConfig: @unchecked Sendable {
             }
             existing["tokens"] = merged
             existing["last_refresh"] = isoNow()
-            try writeJSONObject(existing, to: NativeOAuthFlow.openAIAuthPath())
+            try writeJSONObject(existing, to: authPath)
         },
         extraTokenParams: { _ in [:] }
     )

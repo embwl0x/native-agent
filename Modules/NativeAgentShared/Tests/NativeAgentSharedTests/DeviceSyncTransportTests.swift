@@ -507,6 +507,55 @@ struct MockDeviceSyncTransportTests {
 // MARK: - CloudKit crash-guard (the 2026-06-03 _os_crash defense)
 
 #if canImport(CloudKit) && !os(Linux)
+@Suite("CloudKitDeviceTransport pull cursor")
+struct CloudKitDeviceTransportPullCursorTests {
+    private let now = Date(timeIntervalSince1970: 2_000_000)
+
+    @Test func establishedIdleCursorSlidesWithSafetyOverlap() {
+        let previous = now.addingTimeInterval(-86_400)
+        let next = CloudKitDeviceTransport.nextPullCursor(
+            previousCursor: previous,
+            queryStartedAt: now,
+            safeRecordDate: nil,
+            halted: false
+        )
+        #expect(next == now.addingTimeInterval(-30))
+    }
+
+    @Test func firstEverEmptyPullRetainsBootstrapCursor() {
+        let next = CloudKitDeviceTransport.nextPullCursor(
+            previousCursor: nil,
+            queryStartedAt: now,
+            safeRecordDate: nil,
+            halted: false
+        )
+        #expect(next == nil)
+    }
+
+    @Test func rejectedFirstRecordCannotAdvanceCursor() {
+        let previous = now.addingTimeInterval(-120)
+        let next = CloudKitDeviceTransport.nextPullCursor(
+            previousCursor: previous,
+            queryStartedAt: now,
+            safeRecordDate: nil,
+            halted: true
+        )
+        #expect(next == previous)
+    }
+
+    @Test func cursorNeverRegressesWhilePreservingOverlap() {
+        let previous = now.addingTimeInterval(-20)
+        let safeRecord = now.addingTimeInterval(-10)
+        let next = CloudKitDeviceTransport.nextPullCursor(
+            previousCursor: previous,
+            queryStartedAt: now,
+            safeRecordDate: safeRecord,
+            halted: true
+        )
+        #expect(next == previous)
+    }
+}
+
 // An UNCONFIGURED CloudKitDeviceTransport (CloudKit entitlement absent) must
 // NEVER construct a CKContainer. `CKContainer.__allocating_init` traps
 // synchronously (AMFI hard-kill, exit 137) when CloudKit isn't entitled — so if

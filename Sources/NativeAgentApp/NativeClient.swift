@@ -239,7 +239,10 @@ struct NativeClient {
         }
     }
 
-    static func privacyCategories(dataRoot: URL) -> [PrivacyCategory] {
+    static func privacyCategories(
+        dataRoot: URL,
+        includeInventory: Bool = true
+    ) -> [PrivacyCategory] {
         struct Spec {
             var id: String
             var title: String
@@ -275,11 +278,12 @@ struct NativeClient {
         ]
         return specs.map { spec in
             let path = dataRoot.appendingPathComponent(spec.relativePath)
+            let inventory = includeInventory ? "; \(privacyItemSummary(path))" : ""
             return PrivacyCategory(
                 id: spec.id,
                 title: spec.title,
                 path: path.path,
-                contains: "\(spec.detail); \(privacyItemSummary(path))",
+                contains: "\(spec.detail)\(inventory)",
                 exportable: spec.exportable
             )
         }

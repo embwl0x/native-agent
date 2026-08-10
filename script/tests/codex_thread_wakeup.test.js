@@ -191,6 +191,7 @@ test("rollout completion without assistant text is a semantic failure", () => {
 
 test("completion prompt makes Agent assess the result and proactively tell User", () => {
   const text = wakeup.formatCodexReplyForNativeAgent({
+    threadId: "thread-continue-1",
     turnId: "turn-2",
     entries: [entry({
       messageId: "message-2",
@@ -206,6 +207,8 @@ test("completion prompt makes Agent assess the result and proactively tell User"
   assert.match(text, /decide whether it succeeded, partially succeeded, or failed/i);
   assert.match(text, /Original request:\nFix the missing completion return path\./);
   assert.match(text, /Codex result:\nImplemented and tested the return path\./);
+  assert.match(text, /Conversation: codex:thread-continue-1/);
+  assert.match(text, /codex_message with conversation_id/);
   assert.match(text, /Do not wait for him to ask/i);
 });
 
@@ -2087,30 +2090,26 @@ test("a retained job is re-delivered by the existing recovery scan", async () =>
 
 // --- BRIDGES-5 source conformance guard -------------------------------------
 
-test("shipped helper arms pipe drains before process.run and writes stdin async", () => {
+test("all builder wake helpers use the shared event-driven process owner", () => {
   const swiftPath = path.join(
     __dirname, "..", "..",
     "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+AgentBridgeTools.swift"
   );
   const source = fs.readFileSync(swiftPath, "utf8");
-  const helperStart = source.indexOf("private static func runCodexWakeupHelper");
-  assert.ok(helperStart > 0, "runCodexWakeupHelper not found");
-  const helper = source.slice(helperStart, helperStart + 6000);
+  const ownerStart = source.indexOf("private static func runBuilderWakeupHelper");
+  const ownerEnd = source.indexOf("private static func runCodexWakeupHelper", ownerStart);
+  assert.ok(ownerStart > 0 && ownerEnd > ownerStart, "shared builder process owner not found");
+  const owner = source.slice(ownerStart, ownerEnd);
+  assert.ok(owner.includes("SystemProcessAdapter().run("), "shared owner must use the native process adapter");
+  assert.ok(owner.includes("standardInput: inputData"), "stdin payload must use the adapter's off-thread writer");
+  assert.ok(owner.includes("outputByteLimit: 8 * 1024 * 1024"), "helper output must stay bounded");
+  assert.equal(owner.includes("while process.isRunning"), false, "shared owner must not poll child state");
+  assert.equal(owner.includes("Thread.sleep"), false, "shared owner must not sleep-poll");
 
-  const attachOut = helper.indexOf("outDrain.attach(to: stdout.fileHandleForReading)");
-  const attachErr = helper.indexOf("errDrain.attach(to: stderr.fileHandleForReading)");
-  const run = helper.indexOf("try process.run()");
-  assert.ok(attachOut > 0 && attachErr > 0, "both pipes must have a drain attached");
-  // BRIDGES-5: a drain attached AFTER run() still leaves a window where a fast
-  // helper can fill 64KB and wedge. Order is the fix.
-  assert.ok(attachOut < run, "stdout drain must be attached before process.run()");
-  assert.ok(attachErr < run, "stderr drain must be attached before process.run()");
-
-  // The pre-fix read-after-wait calls must be gone from this helper.
-  assert.equal(helper.includes("stdout.fileHandleForReading.readDataToEndOfFile()"), false);
-  assert.equal(helper.includes("stderr.fileHandleForReading.readDataToEndOfFile()"), false);
-
-  // stdin must not be written synchronously on the polling thread.
-  assert.ok(/DispatchQueue\.global\([^)]*\)\.async \{[\s\S]{0,200}stdin\.fileHandleForWriting/.test(helper),
-    "stdin must be written off-thread");
+  for (const name of ["runClaudeWakeupHelper", "runOMPWakeupHelper", "runCodexWakeupHelper"]) {
+    const start = source.indexOf(`private static func ${name}`);
+    assert.ok(start > 0, `${name} not found`);
+    const wrapper = source.slice(start, start + 2200);
+    assert.ok(wrapper.includes("runBuilderWakeupHelper("), `${name} must delegate to the shared owner`);
+  }
 });

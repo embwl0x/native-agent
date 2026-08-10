@@ -167,7 +167,11 @@ extension NativeClient {
     // cross-process flock on workshop/executions/<id>/{mission.json,timeline.jsonl}
     // were built in waves 33/34/35 W07; this flips the CONSUMER seam so the Mac
     // UI's create/update/cancel land natively without the daemon.
-    func createWorkshopTask(title: String, objective: String) async throws -> WorkshopExecutionRecord {
+    func createWorkshopTask(
+        title: String,
+        objective: String,
+        projectSpaceId: String? = nil
+    ) async throws -> WorkshopExecutionRecord {
         // Native submit mirrors the daemon's `/v1/missions` queue-bridge:
         // runner.submit(title, objective, "manual", "none") — same defaults
         // as the Python handler. submit()
@@ -182,7 +186,8 @@ extension NativeClient {
             title: title,
             objective: objective,
             triggerSource: "manual",
-            trustRequired: "none"
+            trustRequired: "none",
+            projectSpaceId: projectSpaceId
         )
         let result = try await WorkshopExecution.WorkshopDirectedTaskSubmitter(
             dataRoot: PersistenceCore.defaultDataRoot(),
@@ -790,7 +795,12 @@ extension NativeClient {
 
     // SUBSYSTEM #17 (2026-05-31): retired diagnostic UI + /v1/inbox/self_test
 
-    func submitWorkshopExecution(title: String, objective: String, triggerSource: String = "manual") async throws -> WorkshopActionResult {
+    func submitWorkshopExecution(
+        title: String,
+        objective: String,
+        triggerSource: String = "manual",
+        projectSpaceId: String? = nil
+    ) async throws -> WorkshopActionResult {
         // Compatibility seam retained for the live Workshop create consumer.
         // Gate it behind the SAME `.missionsWrites` wire flag as the legacy
         // create route so every create path stays native together. Mirrors the
@@ -805,7 +815,8 @@ extension NativeClient {
             title: title,
             objective: objective,
             triggerSource: triggerSource,
-            trustRequired: "none"
+            trustRequired: "none",
+            projectSpaceId: projectSpaceId
         )
         let result = try await WorkshopExecution.WorkshopDirectedTaskSubmitter(
             dataRoot: PersistenceCore.defaultDataRoot(),
@@ -853,8 +864,8 @@ extension NativeClient {
         }
         guard let executor = WorkshopExecutorRef.shared.current() else {
             throw NSError(domain: "NativeAgentWorkshop", code: 503, userInfo: [
-                NSLocalizedDescriptionKey: "startWorkshopExecution: Workshop executor is not running in this process "
-                    + "(background loops have not been assembled) — Workshop execution left queued"
+                NSLocalizedDescriptionKey: "startWorkshopExecution: Desk executor is not running in this process "
+                    + "(background loops have not been assembled) — Desk execution left queued"
             ])
         }
         let record = try await executor.start(executionId: trimmed)

@@ -265,7 +265,10 @@ extension JSONValue {
     /// other C0 controls and DEL, \uXXXX for non-ASCII (surrogate pairs >0xFFFF).
     /// Forward slash is NOT escaped.
     private static func encodeString(_ s: String, into out: inout String) {
-        out.reserveCapacity(out.count + s.utf8.count + 2)
+        // Do not derive reserve capacity from `out.count` here. String.count
+        // walks the entire accumulated Unicode output, so doing it once per
+        // JSON string makes a large projection quadratic. Swift's String
+        // storage already grows amortized while we append.
         out.append("\"")
         for scalar in s.unicodeScalars {
             let v = scalar.value

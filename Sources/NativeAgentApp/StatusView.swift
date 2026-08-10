@@ -50,7 +50,7 @@ struct StatusView: View {
                                 .foregroundStyle(.secondary)
                             Spacer()
                         }
-                        Text("Lifecycle: \(watchdog.runtimeLifecycleStatus) · active Workshop executions \(watchdog.runningExecutions) · improvements \(watchdog.runningImprovements)")
+                        Text("Lifecycle: \(watchdog.runtimeLifecycleStatus) · active Desk executions \(watchdog.runningExecutions) · improvements \(watchdog.runningImprovements)")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                         if !watchdog.launchAgentStatus.isEmpty {

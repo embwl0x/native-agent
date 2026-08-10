@@ -206,3 +206,94 @@ struct AutonomousPursuitProposerTests {
         #expect(proposal == nil)
     }
 }
+
+// MARK: - Paraphrase rut guard (rule e, 2026-08-08)
+
+@Suite("AutonomousPursuitProposer paraphrase guard")
+struct PursuitParaphraseGuardTests {
+    private func resolver(_ map: [String: CognitiveStandingView.Status]) -> (String) -> CognitiveStandingView.Status? {
+        { map[$0] }
+    }
+
+    /// THE LIVE RUT: two User-approved standing views carrying the same thought
+    /// reworded produced two open pursuits two days apart. The id dedup can't
+    /// see it; the title-similarity gate must.
+    @Test("refuses a proposal whose title paraphrases an open pursuit")
+    func refusesParaphraseOfOpenPursuit() {
+        let id = "view-quiet-system"
+        let proposal = AutonomousPursuitProposer.propose(
+            candidates: [StandingViewCandidate(
+                id: id,
+                title: "A quiet system is at rest until a second, verified read says otherwise",
+                body: "A quiet system is at rest until a second, verified read says otherwise — absence of evidence needs its own check."
+            )],
+            openAgentPursuitCount: 1,
+            standingViewIdsWithOpenPursuit: ["view-absence"],
+            openPursuitTitles: ["Pursue: Absence is a system at rest until a second, verified read says otherwise"],
+            resolveStatus: resolver([id: .active])
+        )
+        #expect(proposal == nil,
+                "the live paraphrase pair must be refused by the similarity gate")
+    }
+
+    /// Threshold calibration (gpt-5.5 review): surface-variant pursuits that
+    /// share domain words but differ in the distinguishing token are DISTINCT
+    /// and must pass — under-blocking is the chosen failure mode.
+    @Test("surface-variant pursuits sharing domain words are not blocked")
+    func surfaceVariantPasses() {
+        let id = "view-slack-recall"
+        let proposal = AutonomousPursuitProposer.propose(
+            candidates: [StandingViewCandidate(
+                id: id,
+                title: "Improve memory recall for Slack conversations",
+                body: "Slack threads deserve the same recall quality as Mac chat."
+            )],
+            openAgentPursuitCount: 1,
+            standingViewIdsWithOpenPursuit: [],
+            openPursuitTitles: ["Pursue: Improve memory recall for Telegram conversations"],
+            resolveStatus: resolver([id: .active])
+        )
+        #expect(proposal != nil,
+                "Telegram-vs-Slack variants score ~0.67 and must clear the 0.7 threshold")
+    }
+
+    @Test("a genuinely different pursuit still passes the gate")
+    func distinctTitlePasses() {
+        let id = "view-small-maintenance"
+        let proposal = AutonomousPursuitProposer.propose(
+            candidates: [StandingViewCandidate(
+                id: id,
+                title: "Care shows up in the small maintenance work",
+                body: "The unglamorous upkeep is where trust is actually built."
+            )],
+            openAgentPursuitCount: 1,
+            standingViewIdsWithOpenPursuit: ["view-absence"],
+            openPursuitTitles: ["Pursue: Absence is a system at rest until a second, verified read says otherwise"],
+            resolveStatus: resolver([id: .active])
+        )
+        #expect(proposal != nil, "distinct thoughts must not be blocked by the gate")
+    }
+
+    @Test("a later distinct candidate wins when the first is a paraphrase")
+    func gateSkipsToNextCandidate() {
+        let dup = StandingViewCandidate(
+            id: "view-dup",
+            title: "A quiet system is at rest until a second, verified read says otherwise",
+            body: "same thought reworded"
+        )
+        let fresh = StandingViewCandidate(
+            id: "view-fresh",
+            title: "Care shows up in the small maintenance work",
+            body: "The unglamorous upkeep is where trust is actually built."
+        )
+        let proposal = AutonomousPursuitProposer.propose(
+            candidates: [dup, fresh],
+            openAgentPursuitCount: 1,
+            standingViewIdsWithOpenPursuit: [],
+            openPursuitTitles: ["Pursue: Absence is a system at rest until a second, verified read says otherwise"],
+            resolveStatus: resolver(["view-dup": .active, "view-fresh": .active])
+        )
+        #expect(proposal?.citedStandingViewId == "view-fresh",
+                "the gate refuses the paraphrase but lets the next candidate through")
+    }
+}

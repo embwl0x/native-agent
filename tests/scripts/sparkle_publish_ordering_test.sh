@@ -202,7 +202,12 @@ PLIST
 }
 run_verifier() {
   set +e
-  bash "$ROOT/script/verify_release_artifact.sh" --bundle "$VBUNDLE" 2>&1
+  # Developer installs may export their private bundle identity in the parent
+  # shell. This fixture is deliberately a public release bundle, so pin the
+  # verifier contract instead of letting machine-local signing state leak into
+  # the test.
+  NATIVEAGENT_EXPECTED_MAC_BUNDLE_ID=io.github.embwl0x.nativeagent.mac \
+    bash "$ROOT/script/verify_release_artifact.sh" --bundle "$VBUNDLE" 2>&1
   local rc=$?
   set -e
   return $rc

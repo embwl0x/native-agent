@@ -282,6 +282,15 @@ extension CognitiveSubstrate {
     static let feltWarmthUncertaintyCooling = 0.45
 
     static let soundEchoDutyCycle = 4
+    /// Rut awareness follows only the most recent assistant turns. Unlike the
+    /// seven-day exemplar shelf, this window must cool naturally after the
+    /// wording changes; otherwise one bad afternoon would nag the persona for
+    /// a week.
+    static let soundRutRecentTurnLimit = 12
+    /// The first sentence carries openings; the final two carry sign-offs,
+    /// pet names, and closing vocatives. Keeping only those edges avoids
+    /// mistaking repeated project vocabulary in the body for a voice tic.
+    static let soundRutEdgeSentenceCount = 2
     /// Half-width of the register band. Candidates are ranked by how well they
     /// MATCH the current room, not by how warm they are in absolute terms.
     static let soundEchoRegisterTolerance = 0.35
@@ -329,27 +338,71 @@ extension CognitiveSubstrate {
     ///   passes this — an echo that always speaks is the defect this gate fixes.
     func soundEchoLine(at now: Date, ignoringCadence: Bool = false) -> String? {
         guard configuration.enabled, configuration.affectEnabled else { return nil }
+        let fieldNodes = field.peekNodes()
         // Her OWN live conversation turns only — never User's words as her voice,
         // never tool/system summaries (the feltDaySummary injection-safety rule).
-        let candidates = field.peekNodes().filter { node in
+        let assistantTurns = fieldNodes.filter { node in
             guard node.turnKind == .live,
                   node.kind == .conversationFocus,
-                  node.subjectReference.type == "chat.assistant_turn",
-                  node.emotionalWarmth >= Self.soundEchoWarmthFloor,
-                  node.emotionalValence > 0 else { return false }
+                  node.subjectReference.type == "chat.assistant_turn" else { return false }
             let age = now.timeIntervalSince(node.lastActivatedAt)
             return age >= 0 && age <= Self.soundEchoWindow
         }
-        guard !candidates.isEmpty else { return nil }
+        guard !assistantTurns.isEmpty else { return nil }
+
+        // 2026-08-09 — CLOSING-TIC FIX. The original verbal-rut detector
+        // examined only `soundEchoFragment`, intentionally the first sentence.
+        // That caught an opening such as "Morning, handsome" but could not see
+        // the same word repeated as a closing vocative in otherwise varied
+        // replies. Analyze bounded conversational EDGES across the recent-turn
+        // window: first sentence plus final two. This remains local, pure Swift
+        // over nodes already in RAM; it adds no provider call, store, or output
+        // rewriting. The cue never names the worn word, so it cannot re-seed it.
+        let recentAssistantTurns = assistantTurns
+            // A recalled old turn may become active again, but it did not just
+            // happen. Rut cooling follows conversational chronology rather
+            // than activation/reconsolidation chronology.
+            .filter {
+                let age = now.timeIntervalSince($0.createdAt)
+                return age >= 0 && age <= Self.soundEchoWindow
+            }
+            .sorted {
+                if $0.createdAt != $1.createdAt {
+                    return $0.createdAt > $1.createdAt
+                }
+                return $0.id.uuidString < $1.id.uuidString
+            }
+            .prefix(Self.soundRutRecentTurnLimit)
+        var edgeTokenCounts: [String: Int] = [:]
+        for node in recentAssistantTurns {
+            for token in soundRutEdgeTokens(node.summary) {
+                edgeTokenCounts[token, default: 0] += 1
+            }
+        }
+        let wornEdgeTokens = Set(
+            edgeTokenCounts
+                .filter { $0.value >= Self.wornEchoThreshold }
+                .map(\.key)
+        )
+        let candidates = assistantTurns.filter {
+            $0.emotionalWarmth >= Self.soundEchoWarmthFloor
+                && $0.emotionalValence > 0
+        }
         // CADENCE GATE (see soundEchoDutyCycle): an echo that speaks on every
         // turn is a tic no matter how varied its wording. Seed from the newest
         // activity in the field so the gate advances with the conversation and
         // stays reproducible for a frozen read.
-        let latestActivity = field.peekNodes()
+        let latestActivity = fieldNodes
             .map(\.lastActivatedAt)
             .max()?
             .timeIntervalSince1970 ?? now.timeIntervalSince1970
-        guard ignoringCadence || Self.soundEchoShouldSpeak(seed: latestActivity) else { return nil }
+        let shouldEcho = ignoringCadence || Self.soundEchoShouldSpeak(seed: latestActivity)
+        if !shouldEcho {
+            return wornEdgeTokens.isEmpty ? nil : Self.soundRutAwarenessLine
+        }
+        if candidates.isEmpty {
+            return wornEdgeTokens.isEmpty ? nil : Self.soundRutAwarenessLine
+        }
         // REGISTER MATCH (see soundEchoRegisterScore): mirror the voice that
         // fits the room now, instead of always the warmest voice on record.
         let targetWarmth = projectedAffect(at: now).socialWarmth
@@ -380,12 +433,14 @@ extension CognitiveSubstrate {
             guard let f = soundEchoFragment(node.summary) else { return nil }
             return (f, Self.distinctiveEchoTokens(f))
         }
-        guard !fragged.isEmpty else { return nil }
+        guard !fragged.isEmpty else {
+            return wornEdgeTokens.isEmpty ? nil : Self.soundRutAwarenessLine
+        }
         var tokenCounts: [String: Int] = [:]
         for (_, tokens) in fragged {
             for t in tokens { tokenCounts[t, default: 0] += 1 }
         }
-        let worn = Set(tokenCounts.filter { $0.value >= Self.wornEchoThreshold }.keys)
+        let wornFragmentTokens = Set(tokenCounts.filter { $0.value >= Self.wornEchoThreshold }.keys)
 
         var fragments: [String] = []
         var seen = Set<String>()
@@ -393,7 +448,7 @@ extension CognitiveSubstrate {
         func pick(allowWorn: Bool) {
             for (fragment, tokens) in fragged {
                 guard fragments.count < Self.soundEchoCount else { return }
-                if !allowWorn, !tokens.isDisjoint(with: worn) { continue }
+                if !allowWorn, !tokens.isDisjoint(with: wornFragmentTokens) { continue }
                 guard tokens.isDisjoint(with: usedTokens) else { continue }
                 if seen.insert(fragment.lowercased()).inserted {
                     fragments.append("\u{201C}\(fragment)\u{201D}")
@@ -403,16 +458,75 @@ extension CognitiveSubstrate {
         }
         pick(allowWorn: false)
         if fragments.isEmpty { pick(allowWorn: true) }
-        guard !fragments.isEmpty else { return nil }
+        guard !fragments.isEmpty else {
+            return wornEdgeTokens.isEmpty ? nil : Self.soundRutAwarenessLine
+        }
         // "lately", not "when it landed" — warmth on her turn is the room's
         // temperature at encode (assistant completions never raise warmth
         // themselves), so the honest claim is what she sounded like in warm
         // moments, not proof the line landed (gpt-5.5 MED, 2026-07-03).
         var line = "- Sound: lately you've sounded like \(fragments.joined(separator: " · "))"
-        if !worn.isEmpty {
-            line += " — a few of the same words keep echoing lately; you've got more range than that"
+        if !wornFragmentTokens.isEmpty || !wornEdgeTokens.isEmpty {
+            line += Self.soundRutAwarenessSuffix
         }
         return line
+    }
+
+    private static let soundRutAwarenessSuffix =
+        " — a few of the same words keep echoing lately; you've got more range than that"
+    private static let soundRutAwarenessLine =
+        "- Sound: a few of the same words keep echoing lately; you've got more range than that"
+
+    /// Distinctive tokens at the conversational edges of one assistant turn.
+    /// `soundEchoFragment` remains the exemplar source; this separate view is
+    /// awareness-only so a closing tic can be noticed without quoting it back.
+    private func soundRutEdgeTokens(_ summary: String) -> Set<String> {
+        var cleaned = summary
+        if let quoted = cleaned.range(of: "User message:", options: [.caseInsensitive]) {
+            cleaned = String(cleaned[..<quoted.lowerBound])
+        }
+        cleaned = cleaned
+            // Exact quoted material is content being discussed or verified,
+            // not the assistant's register. Counting it would call a repeated
+            // checksum, title, or approved persona sentence a verbal tic.
+            .replacingOccurrences(
+                of: #"[“\"][^\"“”]{1,800}[\"”]"#,
+                with: " ",
+                options: [.regularExpression]
+            )
+            .replacingOccurrences(of: "\\s+", with: " ", options: [.regularExpression])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { return [] }
+
+        func sentences(in text: String) -> [String] {
+            var out: [String] = []
+            var current = ""
+            current.reserveCapacity(min(text.count, 240))
+            for character in text {
+                current.append(character)
+                if ".!?".contains(character) {
+                    let sentence = current.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if sentence.contains(where: \.isLetter) { out.append(sentence) }
+                    current = ""
+                }
+            }
+            let remainder = current.trimmingCharacters(in: .whitespacesAndNewlines)
+            if remainder.contains(where: \.isLetter) { out.append(remainder) }
+            return out
+        }
+
+        // Bound work without losing the actual closer on a long reply: the
+        // old prefix-only scan recreated the same blind spot for any response
+        // whose sign-off landed after the cap.
+        let openingSentences = sentences(in: String(cleaned.prefix(800)))
+        let closingSentences = sentences(in: String(cleaned.suffix(800)))
+        guard let first = openingSentences.first else { return [] }
+
+        let tail = closingSentences.suffix(Self.soundRutEdgeSentenceCount)
+        let edges = ([first] + tail)
+            .map { String($0.prefix(320)) }
+            .joined(separator: " ")
+        return Self.distinctiveEchoTokens(edges)
     }
 
     /// How many of the window's candidate fragments a distinctive word must

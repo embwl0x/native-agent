@@ -112,19 +112,26 @@ struct NativeAgentAppCoordinatorTests {
             NativeAgentNavigationDestination.route("sidebar:autoImprovement")
                 == .activity(.selfImprovement)
         )
+        #expect(
+            NativeAgentNavigationDestination.route("sidebar:journey")
+                == .activity(.journey)
+        )
     }
 
-    @Test("Workshop is the primary work surface and legacy routes converge on it")
-    func workshopOwnsLegacyWorkshopExecutionAndDeskRoutes() {
-        #expect(SidebarItem.primaryItems.contains(.workshop))
+    @Test("Desk is the primary work surface and retired routes converge on it")
+    func deskOwnsLegacyWorkshopExecutionAndWorkRoutes() {
+        #expect(SidebarItem.primaryItems.contains(.desk))
+        #expect(!SidebarItem.primaryItems.contains(.workshop))
         #expect(!SidebarItem.primaryItems.contains(.legacyWorkshop))
         #expect(!SidebarItem.advancedItems.contains(.desk))
-        #expect(SidebarItem.legacyWorkshop.normalized == .workshop)
-        #expect(SidebarItem.desk.normalized == .workshop)
-        #expect(SidebarItem.work.normalized == .workshop)
-        #expect(NativeAgentNavigationDestination.route("sidebar:workshop") == .sidebar(.workshop))
-        #expect(NativeAgentNavigationDestination.route("sidebar:missions") == .sidebar(.workshop))
-        #expect(NativeAgentNavigationDestination.route("sidebar:desk") == .sidebar(.workshop))
+        #expect(SidebarItem.desk.displayName == "Desk")
+        #expect(SidebarItem.workshop.normalized == .desk)
+        #expect(SidebarItem.legacyWorkshop.normalized == .desk)
+        #expect(SidebarItem.desk.normalized == .desk)
+        #expect(SidebarItem.work.normalized == .desk)
+        #expect(NativeAgentNavigationDestination.route("sidebar:workshop") == .sidebar(.desk))
+        #expect(NativeAgentNavigationDestination.route("sidebar:missions") == .sidebar(.desk))
+        #expect(NativeAgentNavigationDestination.route("sidebar:desk") == .sidebar(.desk))
     }
 
     @Test("Trust is primary, seated between Providers and Mac Integration")
@@ -184,15 +191,15 @@ struct NativeAgentAppCoordinatorTests {
         #expect(!SidebarItem.connectors.isDeveloperSurface)
     }
 
-    @Test("Command Center retired: case is a normalized alias to Workshop")
-    func commandCenterRetiredAliasesToWorkshop() {
+    @Test("Command Center retired: case is a normalized alias to Desk")
+    func commandCenterRetiredAliasesToDesk() {
         // The view is gone; the case survives only as a routing alias so saved
         // scene state and deep links still land somewhere sane.
-        #expect(SidebarItem.command.normalized == .workshop)
+        #expect(SidebarItem.command.normalized == .desk)
         #expect(!SidebarItem.advancedItems.contains(.command))
         #expect(!SidebarItem.primaryItems.contains(.command))
         #expect(!SidebarItem.developerItems.contains(.command))
-        #expect(NativeAgentNavigationDestination.route("sidebar:command") == .sidebar(.workshop))
+        #expect(NativeAgentNavigationDestination.route("sidebar:command") == .sidebar(.desk))
     }
 
     @Test("Skills and Tools share one sidebar destination with exact child routes")

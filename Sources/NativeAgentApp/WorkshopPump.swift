@@ -125,8 +125,42 @@ public struct WorkshopPump: Sendable {
         }
 
         // ---- 2. SELECT (pure read — no LLM, no reservation yet) ----
-        guard let state = try? await store.liveState(),
-              let candidate = Self.selectDueItem(from: state, now: now()) else {
+        guard let state = try? await store.liveState() else {
+            return .quiet
+        }
+
+        // ---- 2a. BUDGET-EXHAUSTION CLOSURE (2026-08-08) ----
+        // A pursuit whose session budget is spent can never be picked again
+        // (the selector filters it), but it still occupies one of the
+        // maxOpenAgentPursuits cap slots — with no closer, two exhausted
+        // pursuits starve the volition lane FOREVER (live case: both slots
+        // heading to 12/12 with zero terminal paths). Its own written
+        // abandonCondition promises "I close it with a note", so honor that
+        // mechanically: receipt first, then cancel. Best-effort — a store
+        // refusal (e.g. open children) logs and retries on a later tick.
+        for item in state.items {
+            guard item.isPursuit, item.origin == .agent, !item.status.isTerminal,
+                  let p = item.pursuit, p.reservations.count >= p.maxSessions else { continue }
+            do {
+                // CAS close (gpt-5.5 review): re-verifies live + untouched
+                // under the ops flock, so a mutation landing between our
+                // state read and the close skips this sweep (retries next
+                // tick) instead of being stomped.
+                _ = try await store.closeItemIfUnchanged(
+                    item.handle,
+                    expectedUpdatedAt: item.updatedAt,
+                    outcomeSummary: "abandon-condition close: session budget exhausted "
+                        + "(\(p.reservations.count)/\(p.maxSessions)) with no completion — "
+                        + "closed per the pursuit's own abandon condition.",
+                    canceled: true
+                )
+            } catch {
+                NSLog("[workshop] exhausted-pursuit close failed for %@: %@",
+                      item.handle, String(describing: error))
+            }
+        }
+
+        guard let candidate = Self.selectDueItem(from: state, now: now()) else {
             return .quiet   // quiet day → zero dispatch
         }
 
@@ -241,6 +275,17 @@ public struct WorkshopPump: Sendable {
             let done = picked.pursuit?.doneLooksLike ?? ""
             var seed = "Work session on your pursuit \"\(picked.title)\".\nWhy: \(why)"
             if !done.isEmpty { seed += "\nDone looks like: \(done)" }
+            // The session must know the budget and the exit: without these,
+            // every session "makes progress" forever and the pursuit only ends
+            // by mechanical exhaustion (2026-08-08 — neither live pursuit had
+            // ever been told its own abandon condition).
+            if let p = picked.pursuit {
+                seed += "\nThis is session \(p.reservations.count + 1) of at most \(p.maxSessions)."
+                let abandon = p.abandonCondition.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !abandon.isEmpty {
+                    seed += "\nAbandon condition (honor it honestly): \(abandon)"
+                }
+            }
             seed += "\nDo one bounded, honest step. Write artifacts with workshop_artifact_write; anything outward needs a desk approval."
             return WorkshopCandidate(
                 handle: picked.handle, title: picked.title, promptSeed: seed, isPursuit: true,

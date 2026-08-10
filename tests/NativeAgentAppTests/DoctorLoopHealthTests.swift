@@ -15,15 +15,57 @@ private func observation(
     interval: TimeInterval = 300,
     lastError: String?,
     nextRun: Date? = nil,
-    running: Bool = true
+    running: Bool = true,
+    executing: Bool = false,
+    executionStartedAt: Date? = nil,
+    executionTimeout: TimeInterval = 300
 ) -> LoopHealthObservation {
     LoopHealthObservation(
         loopId: loopId,
         lastRun: lastRun,
         nextRun: nextRun ?? lastRun?.addingTimeInterval(interval),
         lastError: lastError,
-        running: running
+        running: running,
+        executing: executing,
+        executionStartedAt: executionStartedAt,
+        executionTimeout: executionTimeout
     )
+}
+
+@Test func long_lived_active_tick_is_not_called_overdue() {
+    let now = Date(timeIntervalSince1970: 1_784_200_000)
+    let obs = observation(
+        loopId: "slack_socket_mode",
+        lastRun: now.addingTimeInterval(-1_200),
+        interval: 2,
+        lastError: nil,
+        nextRun: now.addingTimeInterval(-1_198),
+        executing: true,
+        executionStartedAt: now.addingTimeInterval(-900),
+        executionTimeout: 3_900
+    )
+    let verdict = DoctorLoopHealth.evaluate(
+        observations: [obs], recentFailureDates: [:], now: now
+    )[0]
+    #expect(verdict.level == .ok)
+    #expect(verdict.detail.contains("Active tick in progress"))
+    #expect(!verdict.detail.contains("Overdue"))
+}
+
+@Test func active_tick_past_its_watchdog_is_not_hidden() {
+    let now = Date(timeIntervalSince1970: 1_784_200_000)
+    let obs = observation(
+        lastRun: now.addingTimeInterval(-600),
+        lastError: nil,
+        executing: true,
+        executionStartedAt: now.addingTimeInterval(-700),
+        executionTimeout: 300
+    )
+    let verdict = DoctorLoopHealth.evaluate(
+        observations: [obs], recentFailureDates: [:], now: now
+    )[0]
+    #expect(verdict.level == .fail)
+    #expect(verdict.detail.contains("exceeded"))
 }
 
 @Test func persistently_failing_loop_is_fail() {

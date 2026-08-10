@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 
@@ -259,6 +260,25 @@ public protocol SkillsClient: Sendable {
     /// created or updated record. No Mac-UI caller today; included for surface
     /// completeness + smoke parity.
     func createSkill(body: JSONValue) async throws -> JSONValue
+
+    /// Read newest-first reversible versions owned by the Skills subsystem.
+    func listSkillVersions(id: String) async throws -> [JSONValue]
+
+    /// Archive without deleting the registry row or body.
+    func archiveSkill(id: String) async throws -> JSONValue
+
+    /// Restore one exact recorded version into the canonical registry/body.
+    func restoreSkill(id: String, versionId: String) async throws -> JSONValue
+}
+
+public extension SkillsClient {
+    func listSkillVersions(id: String) async throws -> [JSONValue] { [] }
+    func archiveSkill(id: String) async throws -> JSONValue {
+        throw SkillsError.historyUnavailable("skill archive is unavailable")
+    }
+    func restoreSkill(id: String, versionId: String) async throws -> JSONValue {
+        throw SkillsError.historyUnavailable("skill restore is unavailable")
+    }
 }
 
 /// Mutation failure modes. `unknownSkill` mirrors the daemon's
@@ -271,6 +291,8 @@ public enum SkillsError: Error, Equatable, Sendable {
     case unknownSkill(String)
     case stateNotAllowed(name: String, state: String, requirement: String)
     case invalidSkillBody(String)
+    case historyUnavailable(String)
+    case unknownVersion(String)
 }
 
 // MARK: - SwiftNative impl
@@ -320,6 +342,9 @@ public final class SwiftNativeSkillsClient: SkillsClient {
     /// The data-root manifest (`self.manifest_skills_path` in the daemon).
     private var dataRootManifestPath: URL {
         root.appendingPathComponent("skills/manifest_registry.json")
+    }
+    private var historyDir: URL {
+        root.appendingPathComponent("skills/history", isDirectory: true)
     }
 
     public func listSkills() async throws -> [JSONValue] {
@@ -504,6 +529,7 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                 let sid = SkillMutation.pyStr(skill["id"] ?? .null)
                 let sname = SkillMutation.pyStr(skill["name"] ?? .null)
                 if sid != skillId && sname != skillId { continue }
+                try await self.recordSkillVersion(.object(skill), reason: "before-update")
                 // Patch only the allowed keys present in the body.
                 if case .object(let bodyObj) = body {
                     for key in ["name", "description", "triggers", "kind", "status"] where bodyObj[key] != nil {
@@ -514,6 +540,7 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                 let updated = JSONValue.object(skill)
                 skills[index] = updated
                 try await self.persistence.writeJSON(.array(skills), to: self.registryPath)
+                try? await self.recordSkillVersion(updated, reason: "updated")
                 return updated
             }
             throw SkillsError.unknownSkill(skillId)
@@ -546,6 +573,13 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                 if sid == skillId || sname == skillId { removed = skill } else { kept.append(skill) }
             }
             guard let removedSkill = removed else { return nil }
+            try await self.recordSkillVersion(removedSkill, reason: "before-delete")
+            // Commit the canonical registry change before removing the body.
+            // If registry persistence fails, the still-registered skill must
+            // not be left pointing at a body we already destroyed. A later
+            // body cleanup failure is safer: the registry remains truthful
+            // and the orphaned file is recoverable from version history.
+            try await self.persistence.writeJSON(.array(kept), to: self.registryPath)
             // Body-file cleanup, path-confined to skill_bodies_dir (mirrors
             // delete_skill L26883-26891; an unreadable/outside path is skipped
             // with a "warn" activity event but the delete still proceeds).
@@ -553,7 +587,6 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                case .string(let bodyPathRaw)? = robj["bodyPath"], !bodyPathRaw.isEmpty {
                 await self.cleanupBodyFile(bodyPathRaw, skillId: skillId, displayName: SkillMutation.pyStrTruthyOr(robj["name"], skillId))
             }
-            try await self.persistence.writeJSON(.array(kept), to: self.registryPath)
             let displayName = SkillMutation.pyStrTruthyOr(removedSkill.objectValue?["name"], skillId)
             return (.object(["id": .string(skillId), "deleted": .bool(true)]), displayName)
         }
@@ -674,6 +707,7 @@ public final class SwiftNativeSkillsClient: SkillsClient {
             if let idx = skills.firstIndex(where: {
                 SkillMutation.pyStrTruthyOr($0.objectValue?["name"], "").lowercased() == name.lowercased()
             }), case .object(var existing) = skills[idx] {
+                try await self.recordSkillVersion(.object(existing), reason: "before-create-update")
                 // Normalize early/hand-authored registry rows that predate the
                 // canonical writer and have no id. `str(null)` used to produce
                 // a literal "None.md", disconnecting the manifest name from
@@ -697,6 +731,7 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                 let updated = JSONValue.object(existing)
                 skills[idx] = updated
                 try await self.persistence.writeJSON(.array(skills), to: self.registryPath)
+                try? await self.recordSkillVersion(updated, reason: "created-update")
                 return updated
             }
             var skillId = SkillMutation.slugify(name)
@@ -726,15 +761,163 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                 "useCount": .int(Int64(SkillMutation.intValue(obj["useCount"]) ?? 0)),
                 "lastUsedAt": .null,
             ])
+            try await self.recordSkillVersion(record, reason: "created")
             skills.append(record)
             try await self.persistence.writeJSON(.array(skills), to: self.registryPath)
             return record
         }
     }
 
+    public func listSkillVersions(id rawId: String) async throws -> [JSONValue] {
+        let skillId = SkillMutation.unquote(rawId).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !skillId.isEmpty else { throw SkillsError.unknownSkill(skillId) }
+        let path = historyPath(for: skillId)
+        return try await persistence.withFileLock(path) {
+            let rows = try self.loadHistoryStrict(path)
+            return Array(rows.reversed())
+        }
+    }
+
+    public func archiveSkill(id rawId: String) async throws -> JSONValue {
+        let skillId = SkillMutation.unquote(rawId).trimmingCharacters(in: .whitespacesAndNewlines)
+        return try await updateSkill(body: .object([
+            "id": .string(skillId),
+            "status": .string("archived"),
+        ]))
+    }
+
+    public func restoreSkill(id rawId: String, versionId rawVersionId: String) async throws -> JSONValue {
+        let skillId = SkillMutation.unquote(rawId).trimmingCharacters(in: .whitespacesAndNewlines)
+        let versionId = SkillMutation.unquote(rawVersionId).trimmingCharacters(in: .whitespacesAndNewlines)
+        let versions = try await listSkillVersions(id: skillId)
+        guard let version = versions.first(where: {
+            guard case .object(let row) = $0, case .string(let id)? = row["versionId"] else { return false }
+            return id == versionId
+        }), case .object(let versionObject) = version,
+              case .object(let recordedSkill)? = versionObject["skill"] else {
+            throw SkillsError.unknownVersion(versionId)
+        }
+        let restoredId = SkillMutation.pyStrTruthyOr(recordedSkill["id"], skillId)
+        guard restoredId == skillId else {
+            throw SkillsError.historyUnavailable("Recorded version does not belong to this skill.")
+        }
+        let restoredBody: String?
+        if case .string(let body)? = versionObject["body"] { restoredBody = body } else { restoredBody = nil }
+        if let restoredBody {
+            let violations = SkillBodyHygiene.violations(in: restoredBody)
+            if !violations.isEmpty {
+                throw SkillsError.invalidSkillBody(SkillBodyHygiene.failureMessage(for: violations))
+            }
+        }
+        let capturedSkill = recordedSkill
+        let capturedBody = restoredBody
+        return try await withRegistryLock {
+            let raw = await self.persistence.readJSON(self.registryPath, defaultValue: .array([]))
+            var skills: [JSONValue] = { if case .array(let rows) = raw { return rows } else { return [] } }()
+            guard let index = skills.firstIndex(where: {
+                let object = $0.objectValue
+                return SkillMutation.pyStr(object?["id"] ?? .null) == skillId
+                    || SkillMutation.pyStr(object?["name"] ?? .null) == skillId
+            }) else { throw SkillsError.unknownSkill(skillId) }
+            try await self.recordSkillVersion(skills[index], reason: "before-restore")
+            var restored = capturedSkill
+            let bodyPath = self.skillBodiesDir.appendingPathComponent("\(skillId).md")
+            let priorBody = try? Data(contentsOf: bodyPath)
+            let bodyExisted = FileManager.default.fileExists(atPath: bodyPath.path)
+            if let capturedBody {
+                try await self.writeBody(capturedBody, to: bodyPath)
+                restored["bodyPath"] = .string(bodyPath.path)
+            }
+            restored["updatedAt"] = .string(SkillMutation.nowISO(self.now))
+            let restoredValue = JSONValue.object(restored)
+            skills[index] = restoredValue
+            do {
+                try await self.persistence.writeJSON(.array(skills), to: self.registryPath)
+            } catch {
+                if let priorBody { try? priorBody.write(to: bodyPath, options: .atomic) }
+                else if !bodyExisted { try? FileManager.default.removeItem(at: bodyPath) }
+                throw error
+            }
+            try? await self.recordSkillVersion(restoredValue, reason: "restored")
+            return restoredValue
+        }
+    }
+
     // MARK: - Mutation helpers
 
     private var skillBodiesDir: URL { root.appendingPathComponent("skills/bodies", isDirectory: true) }
+
+    private func historyPath(for id: String) -> URL {
+        historyDir.appendingPathComponent("\(SkillMutation.slugify(id)).json")
+    }
+
+    /// Additive, bounded evidence owned by Skills. Nothing consults this data
+    /// during chat or background cognition; only an explicit restore reads it.
+    private func recordSkillVersion(_ skill: JSONValue, reason: String) async throws {
+        guard case .object(let object) = skill else {
+            throw SkillsError.historyUnavailable("Cannot version a malformed skill row.")
+        }
+        let skillId = SkillMutation.pyStrTruthyOr(
+            object["id"],
+            SkillMutation.pyStrTruthyOr(object["name"], "")
+        )
+        guard !skillId.isEmpty else {
+            throw SkillsError.historyUnavailable("Cannot version a skill without an identifier.")
+        }
+        var bodyText: String?
+        if let path = confinedBodyPath(for: object, skillId: skillId),
+           let data = try? Data(contentsOf: path), data.count <= 65_536 {
+            bodyText = String(data: data, encoding: .utf8)
+        }
+        let bodyHash = bodyText.map {
+            SHA256.hash(data: Data($0.utf8)).map { String(format: "%02x", $0) }.joined()
+        } ?? ""
+        let path = historyPath(for: skillId)
+        let capturedBody = bodyText
+        let capturedSkill = skill
+        try await persistence.withFileLock(path) {
+            var rows = try self.loadHistoryStrict(path)
+            var row: [String: JSONValue] = [
+                "versionId": .string(UUID().uuidString.lowercased()),
+                "skillId": .string(skillId),
+                "reason": .string(String(reason.prefix(80))),
+                "createdAt": .string(SkillMutation.nowISO(self.now)),
+                "bodySHA256": .string(bodyHash),
+                "skill": capturedSkill,
+            ]
+            if let capturedBody { row["body"] = .string(capturedBody) }
+            rows.append(.object(row))
+            if rows.count > 100 { rows.removeFirst(rows.count - 100) }
+            try await self.persistence.writeJSON(.array(rows), to: path)
+        }
+    }
+
+    private func loadHistoryStrict(_ path: URL) throws -> [JSONValue] {
+        guard FileManager.default.fileExists(atPath: path.path) else { return [] }
+        do {
+            guard case .array(let rows) = try JSONValue.parse(Data(contentsOf: path)) else {
+                throw SkillsError.historyUnavailable("Skill history is not a JSON array.")
+            }
+            return rows
+        } catch let error as SkillsError {
+            throw error
+        } catch {
+            throw SkillsError.historyUnavailable("Skill history is unreadable; mutation was refused.")
+        }
+    }
+
+    private func confinedBodyPath(for skill: [String: JSONValue], skillId: String) -> URL? {
+        let candidate: URL
+        if case .string(let raw)? = skill["bodyPath"], !raw.isEmpty {
+            candidate = URL(fileURLWithPath: (raw as NSString).expandingTildeInPath)
+        } else {
+            candidate = skillBodiesDir.appendingPathComponent("\(skillId).md")
+        }
+        let resolved = candidate.standardizedFileURL.resolvingSymlinksInPath()
+        let bodiesRoot = skillBodiesDir.standardizedFileURL.resolvingSymlinksInPath()
+        guard resolved.path.hasPrefix(bodiesRoot.path + "/") else { return nil }
+        return resolved
+    }
 
     private var activity: SkillActivityEmitter {
         SkillActivityEmitter(persistence: persistence,

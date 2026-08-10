@@ -307,6 +307,9 @@ public struct TurnContext: Sendable {
     /// Pins one immutable ContextFlow generation through the complete
     /// provider/tool loop. nil keeps the legacy/off path unchanged.
     public let fluidContextTurn: ContextPreparedTurn?
+    /// Request-scoped candidate derived from existing history. It is not model
+    /// visible until the shared turn-plan seam confirms an ordinary chat turn.
+    public let naturalExpressionCue: String?
     /// The memory record identities behind THIS turn — legacy recall hits
     /// plus the ContextFlow packet's resolved provenance. On active turns
     /// memory arrives in the packet and `recalled` is empty, so without the
@@ -345,7 +348,8 @@ public struct TurnContext: Sendable {
         toolSchemas: [LLMToolSchema] = [],
         systemSegments: SystemPromptSegments? = nil,
         imageBlocks: [LLMContentBlock] = [],
-        fluidContextTurn: ContextPreparedTurn? = nil
+        fluidContextTurn: ContextPreparedTurn? = nil,
+        naturalExpressionCue: String? = nil
     ) {
         self.surface = surface
         self.personaID = personaID
@@ -362,6 +366,7 @@ public struct TurnContext: Sendable {
         self.systemSegments = systemSegments
         self.imageBlocks = imageBlocks
         self.fluidContextTurn = fluidContextTurn
+        self.naturalExpressionCue = naturalExpressionCue
     }
 }
 
@@ -491,6 +496,9 @@ public actor SwiftNativeTurnEngine {
     /// module. nil → memory-keyed activation is dropped (terms/intent still
     /// flow); empty is the byte-identical default.
     private let memoryAtomTranslator: (@Sendable (String) -> ContextAtomID?)?
+    /// One constructor seam disables both additions for an immediate rollback
+    /// without changing persona docs or any durable runtime state.
+    let naturalExpressionGuidanceEnabled: Bool
 
     /// Upper bound on the attention-signal read. A slow substrate must never
     /// stall the turn: on expiry we proceed with no signals and flag the trace.
@@ -510,7 +518,8 @@ public actor SwiftNativeTurnEngine {
         turnTraceBus: TurnTraceBus = .shared,
         contextFlow: (any ContextTurnPreparing)? = nil,
         cognitiveContextProvider: (any CognitiveContextProviding)? = nil,
-        memoryAtomTranslator: (@Sendable (String) -> ContextAtomID?)? = nil
+        memoryAtomTranslator: (@Sendable (String) -> ContextAtomID?)? = nil,
+        naturalExpressionGuidanceEnabled: Bool = true
     ) {
         self.persona = persona
         self.memory = memory
@@ -528,6 +537,7 @@ public actor SwiftNativeTurnEngine {
         self.contextFlow = contextFlow
         self.cognitiveContextProvider = cognitiveContextProvider
         self.memoryAtomTranslator = memoryAtomTranslator
+        self.naturalExpressionGuidanceEnabled = naturalExpressionGuidanceEnabled
     }
 
     func checkedActiveProviderID(for surface: String) async throws -> String? {
@@ -983,14 +993,16 @@ public actor SwiftNativeTurnEngine {
                 compiledPersonaPrompt: compiledPersonaPrompt,
                 recalled: recalled,
                 remPins: remPins,
-                budget: turnBudget
+                budget: turnBudget,
+                includeNaturalExpressionGuidance: naturalExpressionGuidanceEnabled
             )
         } else {
             rawSegments = Self.renderSystemPromptSegments(
                 personaDocs: personaMap,
                 recalled: recalled,
                 remPins: remPins,
-                budget: turnBudget
+                budget: turnBudget,
+                includeNaturalExpressionGuidance: naturalExpressionGuidanceEnabled
             )
         }
         let packetDynamic = preparedContextTurn.map(Self.renderContextPacket) ?? ""
@@ -1489,17 +1501,21 @@ public actor SwiftNativeTurnEngine {
         personaDocs: [String: String],
         recalled: [MemoryRecallHit],
         remPins: [REMPin],
-        budget: ContextBudgetPolicy.Resolved? = nil
+        budget: ContextBudgetPolicy.Resolved? = nil,
+        includeNaturalExpressionGuidance: Bool = true
     ) -> SystemPromptSegments {
-        let stable: String
+        var stableLines: [String] = []
         if !personaDocs.isEmpty {
             let ids = personaDocs.keys.sorted()
             let concatenated = ids
                 .map { "## \($0)\n\(personaDocs[$0] ?? "")" }
                 .joined(separator: "\n\n")
-            stable = "You are the persona described by these documents:\n\(concatenated)"
+            stableLines.append("You are the persona described by these documents:\n\(concatenated)")
         } else {
-            stable = "You are a helpful assistant."
+            stableLines.append("You are a helpful assistant.")
+        }
+        if includeNaturalExpressionGuidance {
+            stableLines.append(NaturalExpressionGuidance.baseline)
         }
         var dynamicLines: [String] = []
         if let memoryBlock = renderRecalledMemoryBlock(recalled, budget: budget) {
@@ -1510,7 +1526,7 @@ public actor SwiftNativeTurnEngine {
             dynamicLines.append("Recent REM-approved persona drift:\n\(bullets)")
         }
         return SystemPromptSegments(
-            stable: stable,
+            stable: stableLines.joined(separator: "\n\n"),
             dynamic: dynamicLines.joined(separator: "\n\n")
         )
     }
@@ -1549,7 +1565,8 @@ public actor SwiftNativeTurnEngine {
         compiledPersonaPrompt: String,
         recalled: [MemoryRecallHit],
         remPins: [REMPin],
-        budget: ContextBudgetPolicy.Resolved? = nil
+        budget: ContextBudgetPolicy.Resolved? = nil,
+        includeNaturalExpressionGuidance: Bool = true
     ) -> SystemPromptSegments {
         var stableLines: [String] = []
         let body = compiledPersonaPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1557,6 +1574,9 @@ public actor SwiftNativeTurnEngine {
             stableLines.append(body)
         } else {
             stableLines.append("You are a helpful assistant.")
+        }
+        if includeNaturalExpressionGuidance {
+            stableLines.append(NaturalExpressionGuidance.baseline)
         }
         // Fix 6: pins rendered FIRST, under a dedicated authority header.
         if !remPins.isEmpty {

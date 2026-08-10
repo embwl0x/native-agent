@@ -128,10 +128,10 @@ extension AppModel {
     func createWorkshopTask(title: String, objective: String) async {
         do {
             _ = try await client.createWorkshopTask(title: title, objective: objective)
-            statusText = "Workshop task created"
+            statusText = "Desk task created"
             await refreshAll()
         } catch {
-            statusText = "Workshop task creation failed: \(error.localizedDescription)"
+            statusText = "Desk task creation failed: \(error.localizedDescription)"
         }
     }
 
@@ -158,9 +158,9 @@ extension AppModel {
                 workshopExecutionEnabled: enabled,
                 workshopExecutionShowTimeline: showTimeline
             )
-            applySavedTrustPolicy(savedPolicy, status: "Workshop policy saved")
+            applySavedTrustPolicy(savedPolicy, status: "Desk execution policy saved")
         } catch {
-            statusText = "Workshop policy save failed: \(error.localizedDescription)"
+            statusText = "Desk execution policy save failed: \(error.localizedDescription)"
         }
     }
 

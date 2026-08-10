@@ -69,6 +69,23 @@ extension NativeClient {
         return EmptyResponse()
     }
 
+    func skillVersions(id: String) async throws -> [ExperienceSkillVersion] {
+        let impl = makeSkillsClient(root: PersistenceCore.defaultDataRoot())
+        return try await impl.listSkillVersions(id: id).compactMap(ExperienceSkillVersion.decode)
+    }
+
+    func archiveSkill(id: String) async throws -> SkillRecord {
+        let impl = makeSkillsClient(root: PersistenceCore.defaultDataRoot())
+        let result = try await impl.archiveSkill(id: id)
+        return try Self.decodeJSONValue(result, as: SkillRecord.self, context: "archiveSkill(swiftNative)")
+    }
+
+    func restoreSkill(id: String, versionId: String) async throws -> SkillRecord {
+        let impl = makeSkillsClient(root: PersistenceCore.defaultDataRoot())
+        let result = try await impl.restoreSkill(id: id, versionId: versionId)
+        return try Self.decodeJSONValue(result, as: SkillRecord.self, context: "restoreSkill(swiftNative)")
+    }
+
     func updateTool(id: String, autoRun: Bool) async throws -> ToolRecord {
         // DAEMON-DEAD PORT P4: read tools/registry.json under flock, merge
         // {autoRun} into the matching tool by id, write back, return the

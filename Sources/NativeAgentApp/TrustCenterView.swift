@@ -89,7 +89,7 @@ struct TrustCenterView: View {
                         featureGroup(title: "Self-Improvement", systemImage: "brain", tint: .purple) {
                             TrainingPermissionsView()
                         }
-                        featureGroup(title: "Workshop Autonomy", systemImage: "hammer.circle", tint: .cyan) {
+                        featureGroup(title: "Desk Autonomy", systemImage: "checklist", tint: .cyan) {
                             WorkshopPermissionsView()
                         }
                         featureGroup(title: "Living Memory", systemImage: "brain.filled.head.profile", tint: .green) {

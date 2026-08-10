@@ -61,6 +61,15 @@ test("JSON event parsing captures the id from OMP's session event", () => {
   assert.equal(parsed.parsedEvents, 2);
 });
 
+test("completion text carries the stable OMP conversation reference", () => {
+  const text = wakeup.completionText(
+    { status: "completed", reply: "done", durationMs: 1000 },
+    { messageId: "omp-message-1", topic: "Bridge Topic", priority: "important" }
+  );
+  assert.match(text, /Conversation: omp:bridge-topic/);
+  assert.match(text, /omp_message with conversation_id/);
+});
+
 test("first wake uses required OMP print/json/max-time flags and pins its session", () => {
   const ctx = fixture("new", 'printf "%s\\n" "$@" > "$0.args"\nprintf \'%s\\n\' \'{"type":"session","id":"omp-session-1"}\' \'{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"OMP ok"}]}}\'');
   const result = run(ctx, { messageId: "new-1", text: "ping" });

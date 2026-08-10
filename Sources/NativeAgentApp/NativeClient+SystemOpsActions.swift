@@ -321,38 +321,21 @@ extension NativeClient {
         currentDirectory: URL,
         timeout: TimeInterval
     ) async throws -> (status: Int32, stdout: String, stderr: String) {
-        try await Task.detached(priority: .utility) {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: executable)
-            process.arguments = arguments
-            process.currentDirectoryURL = currentDirectory
-            let outPipe = Pipe()
-            let errPipe = Pipe()
-            process.standardOutput = outPipe
-            process.standardError = errPipe
-            try process.run()
-
-            let deadline = Date().addingTimeInterval(timeout)
-            while process.isRunning && Date() < deadline {
-                usleep(50_000)
-            }
-            var timedOut = false
-            if process.isRunning {
-                timedOut = true
-                process.terminate()
-                usleep(200_000)
-                if process.isRunning {
-                    kill(process.processIdentifier, SIGKILL)
-                }
-            }
-            process.waitUntilExit()
-            let stdout = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            let stderr = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            if timedOut {
-                return (124, stdout, stderr.isEmpty ? "\(URL(fileURLWithPath: executable).lastPathComponent) command timed out" : stderr)
-            }
-            return (process.terminationStatus, stdout, stderr)
-        }.value
+        let result = try await SystemProcessAdapter().run(
+            executable: executable,
+            arguments: arguments,
+            currentDirectory: currentDirectory,
+            environment: nil,
+            standardInput: nil,
+            timeoutSeconds: timeout
+        )
+        if result.timedOut {
+            let stderr = result.stderr.isEmpty
+                ? "\(URL(fileURLWithPath: executable).lastPathComponent) command timed out"
+                : result.stderr
+            return (124, result.stdout, stderr)
+        }
+        return (result.exitCode, result.stdout, result.stderr)
     }
 
     // W-H Improvements-band lift (move-only): private→internal — a shared

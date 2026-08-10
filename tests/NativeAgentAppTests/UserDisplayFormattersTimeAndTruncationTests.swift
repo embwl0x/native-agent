@@ -66,6 +66,22 @@ func mediumDateTime_parsesFractionalAndPlain_returnsRawOnGarbage() {
     #expect(UserDisplayFormatters.mediumDateTime("garbage") == "garbage")
 }
 
+// MARK: - chatTimestamp (backs every chat bubble)
+
+@Test
+func chatTimestamp_usesSharedParserForBothWireShapesAndPreservesGarbage() throws {
+    let instant = try #require(UserDisplayFormatters.parseISOTimestamp(fractionalISO))
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+    // Pin "today" to the message day by giving the helper a calendar whose
+    // date comparison still follows the real current date? For this 2020
+    // fixture it must include a date under every current runtime.
+    let expected = instant.formatted(date: .abbreviated, time: .shortened)
+    #expect(UserDisplayFormatters.chatTimestamp(fractionalISO, calendar: calendar) == expected)
+    #expect(UserDisplayFormatters.chatTimestamp(plainISO, calendar: calendar) == expected)
+    #expect(UserDisplayFormatters.chatTimestamp("garbage", calendar: calendar) == "garbage")
+}
+
 // MARK: - String.truncated (backs the 5 chat/observatory truncation sites)
 
 @Test

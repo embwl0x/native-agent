@@ -4,6 +4,14 @@ import NativeAgentShared
 import PersistenceCore
 
 enum LivingAttentionPolicy {
+    /// Useful review queues that do not block a user-requested action. They
+    /// remain visible in Approvals without paging the owner as though an
+    /// irreversible operation were waiting at a consent boundary.
+    private static let optionalReviewActions: Set<String> = [
+        "rem.proposal",
+        "self_improvement.apply",
+    ]
+
     static func ownerDecisionDeskCount(in items: [DeskItem]) -> Int {
         items.filter(\.requiresOwnerInput).count
     }
@@ -22,8 +30,15 @@ enum LivingAttentionPolicy {
             || organism.reflexSummary.reviewRequiredCount > 0
     }
 
-    static func needsUser(pendingApprovals: Int, ownerDecisionDeskCount: Int) -> Bool {
-        pendingApprovals > 0 || ownerDecisionDeskCount > 0
+    static func requiredApprovalCount(in rows: [ApprovalRequest]) -> Int {
+        rows.filter { row in
+            row.status.lowercased() == "pending"
+                && !optionalReviewActions.contains(row.action.lowercased())
+        }.count
+    }
+
+    static func needsUser(requiredApprovals: Int, ownerDecisionDeskCount: Int) -> Bool {
+        requiredApprovals > 0 || ownerDecisionDeskCount > 0
     }
 }
 
@@ -65,11 +80,13 @@ struct LivingStatusSnapshot: Sendable, Equatable {
         blockedDeskCount: Int,
         ownerDecisionDeskCount: Int = 0,
         pendingApprovals: Int,
+        requiredApprovals: Int? = nil,
         latestDream: DreamEntry?,
         agentDisplayName: String = "NativeAgent"
     ) -> LivingStatusSnapshot {
+        let effectiveRequiredApprovals = requiredApprovals ?? pendingApprovals
         let needsUser = LivingAttentionPolicy.needsUser(
-            pendingApprovals: pendingApprovals,
+            requiredApprovals: effectiveRequiredApprovals,
             ownerDecisionDeskCount: ownerDecisionDeskCount
         )
         let needsAttention = !needsUser && (
@@ -92,6 +109,7 @@ struct LivingStatusSnapshot: Sendable, Equatable {
             whyLine: Self.whyLine(
                 for: organism,
                 pendingApprovals: pendingApprovals,
+                requiredApprovals: effectiveRequiredApprovals,
                 blockedDeskCount: blockedDeskCount,
                 ownerDecisionDeskCount: ownerDecisionDeskCount,
                 agentDisplayName: agentDisplayName
@@ -99,7 +117,10 @@ struct LivingStatusSnapshot: Sendable, Equatable {
             carryLine: Self.carryLine(for: organism),
             innerLine: Self.innerLine(from: organism.projectedBodyLine, enabled: organism.enabled),
             deskSummary: Self.deskSummary(active: activeDeskCount, blocked: blockedDeskCount),
-            approvalsSummary: pendingApprovals == 0 ? "no approvals pending" : "\(pendingApprovals) approval\(pendingApprovals == 1 ? "" : "s") pending",
+            approvalsSummary: Self.approvalsSummary(
+                pending: pendingApprovals,
+                required: effectiveRequiredApprovals
+            ),
             lastDreamSummary: latestDream.map { "last dream \($0.date)" } ?? "no dream entry yet",
             needsText: needsUser ? "needs you" : (needsAttention ? "no action needed" : "needs nothing"),
             showsOrganismDetails: organism.enabled
@@ -154,11 +175,12 @@ struct LivingStatusSnapshot: Sendable, Equatable {
     private static func whyLine(
         for organism: OrganismSnapshot,
         pendingApprovals: Int,
+        requiredApprovals: Int,
         blockedDeskCount: Int,
         ownerDecisionDeskCount: Int,
         agentDisplayName: String
     ) -> String {
-        if pendingApprovals > 0 { return "Waiting on approval before irreversible movement." }
+        if requiredApprovals > 0 { return "Waiting on approval before irreversible movement." }
         if ownerDecisionDeskCount > 0 { return "Desk has work explicitly waiting on your decision." }
         guard organism.enabled else { return "No body line appears while the organism kernel is off." }
         let body = organism.bodySchema
@@ -171,6 +193,9 @@ struct LivingStatusSnapshot: Sendable, Equatable {
         if blockedDeskCount > 0 { return "Desk has blocked work, but it is not waiting on your decision." }
         if organism.reflexSummary.reviewRequiredCount > 0 {
             return "\(agentDisplayName) has review work queued, but no user action is requested."
+        }
+        if pendingApprovals > 0 {
+            return "Optional reviews are ready, but nothing is waiting on you."
         }
         if organism.projectedBodyLine == nil { return "No Body line appears because the body state is steady enough to stay quiet." }
         return "Body line is active because the current state is shaping the turn."
@@ -187,6 +212,14 @@ struct LivingStatusSnapshot: Sendable, Equatable {
         let activeText = "\(max(0, active)) desk item\(active == 1 ? "" : "s")"
         guard blocked > 0 else { return activeText }
         return "\(activeText), \(blocked) blocked"
+    }
+
+    private static func approvalsSummary(pending: Int, required: Int) -> String {
+        guard pending > 0 else { return "no approvals pending" }
+        guard required == 0 else {
+            return "\(pending) approval\(pending == 1 ? "" : "s") pending"
+        }
+        return "\(pending) optional review\(pending == 1 ? "" : "s")"
     }
 
     private static func innerLine(from projectedBodyLine: String?, enabled: Bool) -> String {
@@ -413,12 +446,14 @@ struct LivingStatusPanel: View {
             return
         }
         let pendingApprovals = approvalRows.filter { $0.status.lowercased() == "pending" }.count
+        let requiredApprovals = LivingAttentionPolicy.requiredApprovalCount(in: approvalRows)
         snapshot = LivingStatusSnapshot.make(
             organism: organism,
             activeDeskCount: activeDeskCount,
             blockedDeskCount: blockedDeskCount,
             ownerDecisionDeskCount: ownerDecisionDeskCount,
             pendingApprovals: pendingApprovals,
+            requiredApprovals: requiredApprovals,
             latestDream: latestDream,
             agentDisplayName: appModel.agentDisplayName
         )

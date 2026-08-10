@@ -3075,6 +3075,10 @@ function formatCodexReplyForNativeAgent(job, turnResult) {
   ];
   if (firstPayload.topic) lines.push(`Topic: ${firstPayload.topic}`);
   if (firstPayload.messageId) lines.push(`Message id: ${firstPayload.messageId}`);
+  if (job.threadId) {
+    lines.push(`Conversation: codex:${job.threadId}`);
+    lines.push("Continue this same work by calling codex_message with conversation_id set to that exact value. Omit conversation_id for new work.");
+  }
   if (job.turnId) lines.push(`Codex turn: ${job.turnId}`);
   if (turnResult.execution) lines.push(`Completion path: ${turnResult.execution}`);
   if (turnResult.waitSource) lines.push(`Wake source: ${turnResult.waitSource}`);

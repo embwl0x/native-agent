@@ -217,48 +217,146 @@ struct ContextSelectionSection: View {
     }
 }
 
+// sidebar-density 2026-08-10 (User): one line per session so the list shows
+// more. The preview text is gone from the ROW but stays in the search filter —
+// finding a session by remembered content still works. Rename mirrors
+// PinnedSessionTab's contract exactly (pencil/menu begins, Enter
+// commits, Esc cancels, focus-loss commits, empty reverts) so the two
+// surfaces never teach conflicting muscle memory.
 struct SessionRow: View {
     var session: ChatSession
     var selected: Bool
     var pinned: Bool = false
+    var renaming: Bool = false
+    var onUnpin: (() -> Void)? = nil
+    var onRenameBegin: (() -> Void)? = nil
+    /// nil = rename canceled/no-op; non-nil = commit this cleaned title.
+    var onRenameEnd: ((String?) -> Void)? = nil
+
+    @State private var hovering = false
+
+    @State private var draftTitle = ""
+    @FocusState private var titleFocused: Bool
+    // One rename ends exactly once. Esc fires onExitCommand AND the resulting
+    // focus loss fires the onChange commit before the parent's renaming=false
+    // re-render lands — without this guard a canceled edit could still
+    // commit. (PinnedSessionTab gets this for free from its local isRenaming;
+    // this row's rename state lives in the parent, so the sync guard is local.)
+    @State private var renameEnded = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text(session.displayTitle)
-                    .font(.subheadline.weight(.semibold))
-                    .lineLimit(1)
-                Spacer()
-                if pinned {
+        HStack(spacing: 6) {
+            if pinned {
+                Button {
+                    onUnpin?()
+                } label: {
                     Image(systemName: "pin.fill")
+                        .font(.caption2)
+                        .foregroundStyle(Color.accentColor)
+                }
+                .buttonStyle(.plain)
+                .help("Unpin session")
+                .accessibilityLabel("Unpin session")
+            }
+            titleView
+            Spacer(minLength: 4)
+            // Rename affordance is a hover pencil, deliberately NOT a
+            // double-click: a count-2 gesture sharing the row with the
+            // single-tap select is racy (the select's state rebuild resets
+            // the recognizer — live-verified 2026-08-10), and prioritizing
+            // it would lag every selection by the double-click window.
+            // The slot is always reserved and only fades in, so hovering
+            // never reflows or re-truncates the title.
+            if onRenameBegin != nil {
+                Button {
+                    onRenameBegin?()
+                } label: {
+                    Image(systemName: "pencil")
                         .font(.caption)
-                        .foregroundStyle(Color.accentColor)
+                        .foregroundStyle(.secondary)
                 }
-                if selected {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(Color.accentColor)
-                }
+                .buttonStyle(.plain)
+                .frame(width: 14)
+                .opacity(hovering && !renaming ? 1 : 0)
+                .allowsHitTesting(hovering && !renaming)
+                .help("Rename session")
+                .accessibilityLabel("Rename session")
+                .accessibilityHidden(!(hovering && !renaming))
             }
-            if let preview = session.lastMessagePreview, !preview.isEmpty {
-                Text(preview)
+            if let source = session.source, source != "app" {
+                Text(source)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
+            if selected {
+                Image(systemName: "checkmark.circle.fill")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                    .foregroundStyle(Color.accentColor)
             }
-            HStack(spacing: 6) {
-                Label("\(session.messageCount ?? 0)", systemImage: "text.bubble")
-                if let source = session.source, source != "app" {
-                    Label(source, systemImage: "point.3.connected.trianglepath.dotted")
-                }
-            }
-            .font(.caption2)
-            .foregroundStyle(.tertiary)
         }
-        .padding(8)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
         .background {
             RoundedRectangle(cornerRadius: 8)
                 .fill(selected ? AnyShapeStyle(Color.accentColor.opacity(0.16)) : AnyShapeStyle(Color.clear))
         }
+        .onHover { hovering = $0 }
+    }
+
+    @ViewBuilder
+    private var titleView: some View {
+        if renaming {
+            TextField("Session", text: $draftTitle)
+                .textFieldStyle(.plain)
+                .font(.subheadline.weight(.semibold))
+                .lineLimit(1)
+                .focused($titleFocused)
+                .onSubmit { commitRename() }
+                // COMMIT only on deliberate signals: Enter, or genuine focus
+                // loss (clicking the search field / composer — real focus
+                // targets). Everything structural CANCELS: Esc, clicking
+                // another row (parent clears renamingSessionId), the row
+                // scrolling out of the LazyVStack, or a search filter
+                // removing it — a disappearance can't tell click-away from
+                // recycling, and committing a half-typed title on a scroll
+                // is worse than dropping an edit (review round 3).
+                // renameEnded keeps every end path single-fire.
+                .onKeyPress(.escape) {
+                    endRename(nil)
+                    return .handled
+                }
+                .onExitCommand { endRename(nil) }
+                .onChange(of: titleFocused) { _, focused in
+                    if !focused && renaming { commitRename() }
+                }
+                .onAppear {
+                    draftTitle = session.title
+                    renameEnded = false
+                    DispatchQueue.main.async { titleFocused = true }
+                }
+                .onDisappear { endRename(nil) }
+        } else {
+            Text(session.displayTitle)
+                .font(.subheadline.weight(selected ? .semibold : .regular))
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+    }
+
+    private func commitRename() {
+        let clean = draftTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty, clean != session.title else {
+            endRename(nil)
+            return
+        }
+        endRename(clean)
+    }
+
+    private func endRename(_ result: String?) {
+        guard !renameEnded else { return }
+        renameEnded = true
+        onRenameEnd?(result)
     }
 }
 
@@ -418,6 +516,11 @@ private struct PinnedSessionTab: View {
                 .focused($titleFocused)
                 .onSubmit {
                     commitRename()
+                }
+                // Esc gets both SwiftUI cancel paths, matching SessionRow.
+                .onKeyPress(.escape) {
+                    cancelRename()
+                    return .handled
                 }
                 .onExitCommand {
                     cancelRename()

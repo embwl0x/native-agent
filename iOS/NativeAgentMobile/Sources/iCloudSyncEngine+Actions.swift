@@ -138,6 +138,30 @@ extension iCloudSyncEngine {
         }
     }
 
+    /// A failed transport is not terminally accounted for until its ledger
+    /// transition has survived write/read-back verification. Never hide the
+    /// second failure: callers must know when neither delivery nor receipt is
+    /// trustworthy.
+    func persistTerminalSendFailure(
+        transactionID: String,
+        action: String,
+        sendError: Error
+    ) async throws {
+        do {
+            try await writeTransaction(
+                id: transactionID,
+                action: action,
+                state: "send_failed",
+                attempts: 1,
+                error: sendError.localizedDescription
+            )
+        } catch {
+            throw SyncError.persistence(
+                "iCloud send failed (\(sendError.localizedDescription)) and its terminal receipt could not be persisted (\(error.localizedDescription))."
+            )
+        }
+    }
+
     private nonisolated static func readCoordinatedTransaction(at url: URL) throws -> Data? {
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         let coordinator = NSFileCoordinator(filePresenter: nil)
@@ -253,14 +277,13 @@ extension iCloudSyncEngine {
                 )
                 return action.msgId
             } catch {
-                try? await writeTransaction(
-                    id: transactionId,
+                let sendError = error
+                try await persistTerminalSendFailure(
+                    transactionID: transactionId,
                     action: action.action,
-                    state: "send_failed",
-                    attempts: 1,
-                    error: error.localizedDescription
+                    sendError: sendError
                 )
-                throw error
+                throw sendError
             }
         }
 
@@ -336,19 +359,11 @@ extension iCloudSyncEngine {
             }
         } catch {
             let sendError = error
-            do {
-                try await writeTransaction(
-                    id: transactionId,
-                    action: action.action,
-                    state: "send_failed",
-                    attempts: 1,
-                    error: sendError.localizedDescription
-                )
-            } catch {
-                throw SyncError.persistence(
-                    "iCloud send failed (\(sendError.localizedDescription)) and its terminal receipt could not be persisted (\(error.localizedDescription))."
-                )
-            }
+            try await persistTerminalSendFailure(
+                transactionID: transactionId,
+                action: action.action,
+                sendError: sendError
+            )
             throw sendError
         }
         if Task.isCancelled {

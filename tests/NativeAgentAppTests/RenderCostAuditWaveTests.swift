@@ -118,6 +118,49 @@ func setIfChanged_changedCollectionPayload_invalidates() throws {
     #expect(model.activityEvents.first?.title == "CHANGED")
 }
 
+@MainActor
+@Test
+func healthCard_timestampOnlyPoll_performsNoObservableWrite() {
+    let model = AppModel()
+    let rows = [HealthCardSubsystem(id: "runtime", label: "Runtime", status: "ok", detail: "Ready", fixAction: nil)]
+    model.healthCard = HealthCard(overall: "ok", subsystems: rows, createdAt: "first")
+
+    let flag = FireFlag()
+    withObservationTracking {
+        _ = model.healthCard
+    } onChange: {
+        flag.fired = true
+    }
+
+    model.setHealthCardIfMeaningfullyChanged(
+        HealthCard(overall: "ok", subsystems: rows, createdAt: "later")
+    )
+
+    #expect(flag.fired == false)
+    #expect(model.healthCard?.createdAt == "first")
+}
+
+@MainActor
+@Test
+func healthCard_verdictChange_stillInvalidatesImmediately() {
+    let model = AppModel()
+    model.healthCard = HealthCard(overall: "ok", subsystems: [], createdAt: "first")
+
+    let flag = FireFlag()
+    withObservationTracking {
+        _ = model.healthCard
+    } onChange: {
+        flag.fired = true
+    }
+
+    model.setHealthCardIfMeaningfullyChanged(
+        HealthCard(overall: "warn", subsystems: [], createdAt: "later")
+    )
+
+    #expect(flag.fired == true)
+    #expect(model.healthCard?.overall == "warn")
+}
+
 // MARK: - F14: PanelRefreshStatus no longer guarantees a redraw
 
 @MainActor

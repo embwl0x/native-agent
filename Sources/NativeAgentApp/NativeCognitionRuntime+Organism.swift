@@ -1058,10 +1058,16 @@ extension NativeCognitionRuntime {
             return false
         }
 
-        let homeCodexAuth = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".codex", isDirectory: true)
-            .appendingPathComponent("auth.json")
-        if hasReadableContent(homeCodexAuth) { return true }
+        // The shared CLI session counts only with recorded adoption consent
+        // AND real usable tokens: an unconsented (or token-less) ~/.codex
+        // file must not make the body report a provider the runtime will
+        // fail closed on (gpt-5.5 review 2026-08-06).
+        if OpenAIOAuthDirectAdapter.cliAdoptionConsent(dataRoot: dataRoot) == .allowed {
+            let homeCodexAuth = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".codex", isDirectory: true)
+                .appendingPathComponent("auth.json")
+            if OpenAIOAuthDirectAdapter.hasUsableTokens(at: homeCodexAuth) { return true }
+        }
 
         let env = ProcessInfo.processInfo.environment
         let keyVars = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "XAI_API_KEY"]

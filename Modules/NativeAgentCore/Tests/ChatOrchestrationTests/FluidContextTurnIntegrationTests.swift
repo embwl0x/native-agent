@@ -305,7 +305,7 @@ private func fluidEngine(
         includeClockContext: false
     )
 
-    #expect(context.systemPrompt == "# SOUL\nRAM identity")
+    #expect(context.systemPrompt == "# SOUL\nRAM identity\n\n\(NaturalExpressionGuidance.baseline)")
     #expect(context.personaDocs == ["SOUL": "RAM identity"])
     #expect(context.fluidContextTurn === prepared)
     #expect(await flow.prepareCount == 1)

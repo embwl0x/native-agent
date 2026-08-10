@@ -26,7 +26,7 @@ private enum RunKindStyle {
         // a maintainer's private nickname in the public product.
         case "claude": return "Claude Code"
         case "swarm": return "Swarm"
-        case "mission": return "Workshop"
+        case "mission": return "Desk"
         default: return kind.capitalized
         }
     }
@@ -61,7 +61,7 @@ struct RunsView: View {
             if appModel.runs.isEmpty {
                 NativeEmptyState(
                     title: "No Runs Yet",
-                    detail: "Codex, swarm, and Workshop runs land here as they finish.",
+                    detail: "Codex, swarm, and Desk runs land here as they finish.",
                     systemImage: "list.bullet.clipboard"
                 )
             } else {

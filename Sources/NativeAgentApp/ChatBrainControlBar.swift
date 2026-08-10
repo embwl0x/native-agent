@@ -9,6 +9,7 @@ import UniformTypeIdentifiers
 import NativeAgentShared
 import MemoryV2
 import PersistenceCore
+import ProviderRouting
 #if canImport(CoreSpotlight)
 import CoreSpotlight
 #endif
@@ -74,6 +75,14 @@ struct ChatBrainControlBar: View {
 
     private var selectedModelSupportsFast: Bool {
         providerModels.first(where: { $0.id == appModel.chatModel })?.supportsFast == true
+    }
+
+    private var selectedModelIsUnavailable: Bool {
+        appModel.chatProvider == "openrouter"
+            && OpenRouterModelCatalog.cachedAvailability(
+                of: appModel.chatModel,
+                dataRoot: PersistenceCore.defaultDataRoot()
+            ) == .unavailable
     }
 
     /// Compact picker label: vendor name only ("Anthropic (OAuth /
@@ -182,7 +191,8 @@ struct ChatBrainControlBar: View {
                 .foregroundStyle(.secondary)
             Picker("Model", selection: Bindable(appModel).chatModel) {
                 if !providerModels.contains(where: { $0.id == appModel.chatModel }) {
-                    Text(appModel.chatModel).tag(appModel.chatModel)
+                    Text(appModel.chatModel + (selectedModelIsUnavailable ? " — Unavailable" : ""))
+                        .tag(appModel.chatModel)
                 }
                 ForEach(providerModels) { model in
                     Text(model.displayName).tag(model.id)
@@ -202,6 +212,13 @@ struct ChatBrainControlBar: View {
                 Task { @MainActor in await appModel.saveChatBrainDefaults() }
             }
 
+            if selectedModelIsUnavailable {
+                Label("Choose a replacement", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .help("OpenRouter's latest catalog no longer contains the selected model. NativeAgent will not silently use another model.")
+            }
+
             Text("Think")
                 .font(NativeAgentFont.tag)
                 .foregroundStyle(.secondary)
@@ -212,6 +229,7 @@ struct ChatBrainControlBar: View {
             }
             .pickerStyle(.segmented)
             .frame(minWidth: 220, idealWidth: 300, maxWidth: 390)
+            .disabled(selectedModelIsUnavailable)
             .help("Reasoning effort supported by the selected model, from Low through Max or Ultra where available.")
             .onChange(of: appModel.chatReasoningEffort) { _, _ in
                 Task { @MainActor in await appModel.saveChatBrainDefaults() }

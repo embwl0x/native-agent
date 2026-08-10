@@ -129,7 +129,15 @@ extension NativeCognitionRuntime {
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
         guard let state = try? await store.liveState() else { return }
         let openPursuits = state.items.filter { $0.isPursuit && !$0.status.isTerminal }
-        let citedViewIds = Set(openPursuits.flatMap { item -> [String] in
+        // Dedup against EVERY pursuit the desk remembers, terminal included
+        // (gpt-5.5 review 2026-08-08, blocking): the exhaustion closer cancels
+        // a spent pursuit, and an open-only dedup would make its standing view
+        // eligible again on the very next reflection — the paraphrase rut,
+        // cycling. A view gets ONE auto-pursuit per desk lifetime; pursuing it
+        // again is a decision for the user, not the proposer. (Archived rows
+        // leave the live feed eventually — accepted residual, months out.)
+        let allAgentPursuits = state.items.filter { $0.isPursuit && $0.origin == .agent }
+        let citedViewIds = Set(allAgentPursuits.flatMap { item -> [String] in
             (item.pursuit?.evidence.citations ?? []).compactMap { citation in
                 if case .standingView(let id) = citation { return id }
                 return nil
@@ -140,25 +148,27 @@ extension NativeCognitionRuntime {
             candidates: candidates,
             openAgentPursuitCount: openPursuits.count,
             standingViewIdsWithOpenPursuit: citedViewIds,
+            openPursuitTitles: allAgentPursuits.map(\.title),
             resolveStatus: { statusById[$0] }
         ) else { return }
 
         do {
             // openPursuit re-validates STRUCTURALLY under the flock (fields +
             // dossier + open-pursuit cap) — the store owns the invariant, not this.
+            let notify = NotifyPolicy(
+                level: .direct,
+                on: ["explicit"],
+                notifyReason: "\(PersonaCompiler.agentDisplayName(dataRoot: dataRoot)) opened a self-pursuit: \(proposal.title)"
+            )
             let item = try await store.openPursuit(
                 project: proposal.project,
                 title: proposal.title,
                 pursuit: proposal.pursuit,
-                summary: proposal.summary
+                summary: proposal.summary,
+                notify: notify
             )
-            // Announce via the desk notify DIGEST surface at DIRECT level (never
-            // urgent) — the existing DeskNotify loop fires it once on its next tick.
-            _ = try? await store.setNotify(item.handle, policy: NotifyPolicy(
-                level: .direct,
-                on: ["explicit"],
-                notifyReason: "\(PersonaCompiler.agentDisplayName(dataRoot: dataRoot)) opened a self-pursuit: \(proposal.title)"
-            ))
+            // The create and its direct-level announcement policy share one
+            // durable op, so a crash cannot leave an unannounced pursuit.
             // Honest receipt: which standing view, why proposed.
             await substrate.recordReceipt(
                 kind: "workshop.pursuit_proposed",
@@ -359,6 +369,15 @@ extension NativeCognitionRuntime {
     }
 
     func setReflectionModel(_ model: String) async throws {
+        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedModel = trimmed.isEmpty ? Self.defaultReflectionModel : trimmed
+        try await setReflectionSelection(
+            model: resolvedModel,
+            provider: Self.inferredReflectionProvider(for: resolvedModel)
+        )
+    }
+
+    func setReflectionSelection(model: String, provider: String) async throws {
         guard usesLiveAppBody else {
             throw NSError(
                 domain: "NativeCognitionRuntime",
@@ -369,10 +388,94 @@ extension NativeCognitionRuntime {
         }
         let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
         let resolvedModel = trimmed.isEmpty ? Self.defaultReflectionModel : trimmed
-        let provider = Self.inferredReflectionProvider(for: resolvedModel)
-        try await writeReflectionSurface(model: resolvedModel, provider: provider)
+        let resolvedProvider = provider.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !resolvedProvider.isEmpty else {
+            throw NSError(
+                domain: "NativeCognitionRuntime",
+                code: 400,
+                userInfo: [NSLocalizedDescriptionKey: "Reflection provider is missing."]
+            )
+        }
+        try await writeReflectionSurface(model: resolvedModel, provider: resolvedProvider)
+        UserDefaults.standard.set(resolvedModel, forKey: Self.reflectionModelKey)
+        UserDefaults.standard.set(resolvedProvider, forKey: Self.reflectionProviderKey)
         await refreshConfiguration()
         publishRuntimeChange(reason: "configuration:reflection_model")
+    }
+
+    func reflectionRouteStatus() async -> NativeReflectionRouteStatus {
+        do {
+            let router = SwiftNativeProviderRouting(dataRoot: dataRoot)
+            let snapshot = try await router.checkedRoutingSnapshot()
+            let surface = "cognition_reflection"
+            guard let preference = snapshot.preferences[surface] else {
+                return NativeReflectionRouteStatus(
+                    model: "",
+                    providerID: "",
+                    providerReady: false,
+                    modelKnown: nil,
+                    detail: "No reflection route is configured."
+                )
+            }
+            let providerID = snapshot.activeProviders[surface]
+                ?? router.inferProviderForModel(preference.model)
+                ?? ""
+            let providers = try await router.listProviders()
+            guard let provider = providers.first(where: { $0.id == providerID }) else {
+                return NativeReflectionRouteStatus(
+                    model: preference.model,
+                    providerID: providerID,
+                    providerReady: false,
+                    modelKnown: nil,
+                    detail: "The selected reflection provider is unavailable."
+                )
+            }
+            let providerReady = provider.configured == true
+            let modelKnown: Bool? = {
+                if providerID == "openrouter" {
+                    switch OpenRouterModelCatalog.cachedAvailability(
+                        of: preference.model,
+                        dataRoot: dataRoot
+                    ) {
+                    case .available: return true
+                    case .unavailable: return false
+                    case .unknown: return nil
+                    }
+                }
+                guard case .array(let rows)? = provider.modelCatalog else { return nil }
+                let ids = Set(rows.compactMap { row -> String? in
+                    guard case .object(let object) = row,
+                          case .string(let id)? = object["id"] else { return nil }
+                    return id
+                })
+                return ids.isEmpty ? nil : ids.contains(preference.model)
+            }()
+            let detail: String
+            if !providerReady {
+                detail = provider.lastError ?? "Connect \(provider.displayName ?? providerID) before reflection can run."
+            } else if modelKnown == false {
+                detail = "\(provider.displayName ?? providerID) no longer offers \(preference.model). Choose a replacement."
+            } else if modelKnown == nil {
+                detail = "Provider credentials are ready; model availability has not been freshly verified."
+            } else {
+                detail = "Reflection route is ready."
+            }
+            return NativeReflectionRouteStatus(
+                model: preference.model,
+                providerID: providerID,
+                providerReady: providerReady,
+                modelKnown: modelKnown,
+                detail: detail
+            )
+        } catch {
+            return NativeReflectionRouteStatus(
+                model: "",
+                providerID: "",
+                providerReady: false,
+                modelKnown: nil,
+                detail: "Reflection routing is unavailable: \(error.localizedDescription)"
+            )
+        }
     }
 
     func ensureReflectionSurfaceSeed() async {  // internal for actor extensions (move-only Wave C)

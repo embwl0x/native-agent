@@ -637,7 +637,7 @@ public struct SwiftNativeDeskStore: Sendable {
                 } else {
                     bump("", seq: Int(alias))
                 }
-            case let .openPursuit(alias, _, _, _, _):
+            case let .openPursuit(alias, _, _, _, _, _):
                 bump("", seq: Int(alias))
             default:
                 break
@@ -745,7 +745,8 @@ public struct SwiftNativeDeskStore: Sendable {
         project: String,
         title: String,
         pursuit: Pursuit,
-        summary: String? = nil
+        summary: String? = nil,
+        notify: NotifyPolicy = NotifyPolicy()
     ) async throws -> DeskItem {
         return try await persistence.withFileLock(opsPath) {
             let feed = try await readFeedUnlocked()
@@ -756,7 +757,7 @@ public struct SwiftNativeDeskStore: Sendable {
                 handle: handle,
                 body: .openPursuit(
                     alias: alias, project: project, title: title,
-                    summary: summary, pursuit: pursuit
+                    summary: summary, pursuit: pursuit, notify: notify
                 )
             )
             let state = Self.compact(base: feed.base, feed.ops)
@@ -1384,7 +1385,7 @@ public struct SwiftNativeDeskStore: Sendable {
             guard origin == .agent else { return }   // owner/system creates are unconstrained here
             throw DeskError.genericPathCannotCreateAgent(handle: op.handle)
 
-        case let .openPursuit(_, _, _, _, pursuit):
+        case let .openPursuit(_, _, _, _, pursuit, _):
             if viaGenericPath {
                 throw DeskError.genericPathCannotCreateAgent(handle: op.handle)
             }
@@ -1638,7 +1639,7 @@ public struct SwiftNativeDeskStore: Sendable {
             switch op.body {
             case .createItem(let alias, _, _, _, let parent, _, _, _):
                 return parent == parentHandle ? alias : nil
-            case .openPursuit(let alias, _, _, _, _):
+            case .openPursuit(let alias, _, _, _, _, _):
                 return parentHandle == nil ? alias : nil
             default:
                 return nil
@@ -1697,14 +1698,14 @@ public struct SwiftNativeDeskStore: Sendable {
                     openedAt: op.ts, updatedAt: op.ts,
                     origin: origin, pursuit: pursuit
                 )
-            case let .openPursuit(alias, project, title, summary, pursuit):
+            case let .openPursuit(alias, project, title, summary, pursuit, notify):
                 // Dedicated agent-pursuit create (H2). Same materialization as a
                 // create_item pinned to origin=.agent/kind=.project.
                 if byHandle[op.handle] == nil { createOrder.append(op.handle) }
                 byHandle[op.handle] = DeskItem(
                     handle: op.handle, alias: alias, parent: nil, kind: .project,
                     status: .watch, project: project, title: title, summary: summary,
-                    cadence: Cadence(), notify: NotifyPolicy(),
+                    cadence: Cadence(), notify: notify,
                     openedAt: op.ts, updatedAt: op.ts,
                     origin: .agent, pursuit: pursuit
                 )

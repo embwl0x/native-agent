@@ -162,15 +162,15 @@ extension AppModel {
             // (Executions running-count + Activity pending-count), triggering
             // a double re-layout that shifted the scroll position. Approvals
             // have their own refresh in the .activity case and the sidebar's
-            // own 30s poll; they don't need to ride along with WorkshopExecution.
+            // own 30s poll; they don't need to ride along with the execution lane.
             async let nextExecutions = try? api.getWorkshopExecutions()
             async let nextRuns = try? api.getRuns()
             let (executionRows, runRows) = await (nextExecutions, nextRuns)
             executions = fresh("missions", executionRows) ?? executions
             runs = fresh("runs", runRows) ?? runs
-        case .workshop, .desk, .work, .command:
+        case .desk, .workshop, .work, .command:
             // DeskView, SchedulerView, and ResearchView own their bounded reads.
-            // `.command` is a retired alias → Workshop (Command Center retired
+            // `.command` and `.workshop` are retired aliases → Desk
             // 2026-07-23); its old command-summary fetch went with the view.
             break
         case .memory, .memories, .knowledge:
@@ -660,6 +660,45 @@ extension AppModel {
         finishChatStateLoad()
     }
 
+    /// Lightweight live refresh for session-backed Mac read models.
+    ///
+    /// Bridge, iOS, Slack, Telegram, and other app-owned chat paths all mutate
+    /// the canonical `chat/sessions.json` index. The view's file-event task
+    /// calls this after those mutations so a newly created or retitled session
+    /// appears in Chat, detached-window titles, Status, command search, and
+    /// project/session lineage without navigation. This deliberately does not
+    /// reload the active transcript, providers, health, trust policy, or context
+    /// receipt; those retain their existing owners.
+    @MainActor
+    func refreshChatSessionIndex() async {
+        await refreshChatSessionIndex { [client] in
+            try await client.getChatSessions()
+        }
+    }
+
+    /// Injectable seam for the bridge-created-session regression. A failed
+    /// read preserves the last proven list; an equal read performs no observed
+    /// write, so duplicate vnode edges cannot relayout Chat.
+    @MainActor
+    func refreshChatSessionIndex(
+        load: @escaping @MainActor @Sendable () async throws -> [ChatSession]
+    ) async {
+        do {
+            let refreshed = try await load()
+            if chatSessionIndexRefreshFailed {
+                chatSessionIndexRefreshFailed = false
+            }
+            guard refreshed != chatSessions else { return }
+            chatSessions = refreshed
+            pruneChatDrafts()
+            pruneStaleSessionChatState(knownSessionIds: Set(refreshed.map(\.id)))
+        } catch {
+            if !chatSessionIndexRefreshFailed {
+                chatSessionIndexRefreshFailed = true
+            }
+        }
+    }
+
     @MainActor
     private func performLoadChatState(api: NativeClient) async {
         let activeAtStart = activeChatSessionId
@@ -678,6 +717,7 @@ extension AppModel {
                 trustPolicy = policy
             }
             let fetchedSessions = try await api.getChatSessions()
+            chatSessionIndexRefreshFailed = false
             chatSessions = fetchedSessions
             if activeChatSessionId.isEmpty || !chatSessions.contains(where: { $0.id == activeChatSessionId }) {
                 if !activeAtStart.isEmpty,

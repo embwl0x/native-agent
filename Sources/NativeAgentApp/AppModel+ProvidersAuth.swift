@@ -103,25 +103,162 @@ extension AppModel {
     }
 
     @MainActor
-    func saveChatBrainDefaults() async {
-        isSavingChatBrain = true
-        defer { isSavingChatBrain = false }
-        do {
-            modelCatalog = try await client.configureModel(
-                surface: "chat",
-                model: chatModel,
-                reasoningEffort: chatReasoningEffort,
-                serviceTier: chatFastMode ? "priority" : "default"
-            )
-            let providerSnapshot = providersList
-            Task {
-                _ = await iCloudBridge.shared.publishProviderCatalogStatus(
-                    providers: providerSnapshot
-                )
+    @discardableResult
+    func saveChatBrainDefaults() async -> ChatBrainSaveResult {
+        let requested = currentChatBrainSelection
+        if chatBrainSaveTask == nil, requested == chatBrainCanonicalSelection {
+            let result = ChatBrainSaveResult.unchanged(requested)
+            statusText = result.userMessage
+            return result
+        }
+
+        chatBrainSaveGeneration &+= 1
+        let requestedGeneration = chatBrainSaveGeneration
+        chatBrainPendingSave = (requestedGeneration, requested)
+        if chatBrainSaveTask == nil {
+            isSavingChatBrain = true
+            chatBrainSaveTask = Task { @MainActor [weak self] in
+                await self?.drainChatBrainSaves()
             }
-            statusText = "Chat brain saved: \(chatModel) / \(chatReasoningEffort)\(chatFastMode ? " / Fast" : "")"
-        } catch {
-            statusText = "Chat brain save failed: \(error.localizedDescription)"
+        }
+
+        // The one writer drains every value that arrived before it quiesces.
+        // All overlapping callers therefore observe the final canonical result,
+        // never an intermediate success whose bytes may already be superseded.
+        while let task = chatBrainSaveTask {
+            await task.value
+            if let completed = chatBrainLastSaveResult,
+               completed.generation >= requestedGeneration {
+                return completed.result
+            }
+        }
+        let fallback = ChatBrainSaveResult.failed(
+            message: "save coordinator stopped before producing a canonical result",
+            rolledBackTo: chatBrainCanonicalSelection
+        )
+        statusText = fallback.userMessage
+        return fallback
+    }
+
+    private var currentChatBrainSelection: ChatBrainSelection {
+        ChatBrainSelection(
+            model: chatModel,
+            reasoningEffort: chatReasoningEffort,
+            fastMode: chatFastMode
+        )
+    }
+
+    private func drainChatBrainSaves() async {
+        defer {
+            isSavingChatBrain = false
+            chatBrainSaveTask = nil
+        }
+
+        while let pending = chatBrainPendingSave {
+            chatBrainPendingSave = nil
+            let rollback = await canonicalChatBrainForRollback()
+            do {
+                let receipt = try await writeChatBrainSelection(pending.selection)
+                if let catalog = receipt.catalog {
+                    modelCatalog = catalog
+                }
+                chatBrainCanonicalSelection = receipt.selection
+
+                // A newer edit arrived while this write was in flight. Leave
+                // its optimistic fields visible and serialize the next write.
+                if chatBrainPendingSave != nil {
+                    continue
+                }
+
+                applyCanonicalChatBrainSelection(receipt.selection)
+                let result = ChatBrainSaveResult.saved(receipt.selection)
+                chatBrainLastSaveResult = (pending.generation, result)
+                statusText = result.userMessage
+                publishProviderCatalogStatusAfterBrainSave()
+            } catch {
+                if chatBrainPendingSave != nil {
+                    // The pending latest value owns the eventual UI/readback.
+                    // Do not replace it with an older rollback while it waits.
+                    continue
+                }
+                let canonical = (try? await readCanonicalChatBrainSelection()) ?? rollback
+                if let canonical {
+                    chatBrainCanonicalSelection = canonical
+                    applyCanonicalChatBrainSelection(canonical)
+                }
+                let result = ChatBrainSaveResult.failed(
+                    message: error.localizedDescription,
+                    rolledBackTo: canonical
+                )
+                chatBrainLastSaveResult = (pending.generation, result)
+                statusText = result.userMessage
+            }
+        }
+    }
+
+    private func canonicalChatBrainForRollback() async -> ChatBrainSelection? {
+        if let chatBrainCanonicalSelection { return chatBrainCanonicalSelection }
+        let canonical = try? await readCanonicalChatBrainSelection()
+        if let canonical { chatBrainCanonicalSelection = canonical }
+        return canonical
+    }
+
+    private func writeChatBrainSelection(
+        _ selection: ChatBrainSelection
+    ) async throws -> ChatBrainWriteReceipt {
+        if let chatBrainWriteOverride {
+            return try await chatBrainWriteOverride(selection)
+        }
+        let catalog = try await client.configureModel(
+            surface: "chat",
+            model: selection.model,
+            reasoningEffort: selection.reasoningEffort,
+            serviceTier: selection.fastMode ? "priority" : "default"
+        )
+        let canonical = catalog.current.chat
+        return ChatBrainWriteReceipt(
+            selection: ChatBrainSelection(
+                model: canonical.model,
+                reasoningEffort: canonical.reasoningEffort,
+                fastMode: canonical.serviceTier == "priority"
+            ),
+            catalog: catalog
+        )
+    }
+
+    private func readCanonicalChatBrainSelection() async throws -> ChatBrainSelection {
+        if let chatBrainReadOverride {
+            return try await chatBrainReadOverride()
+        }
+        guard let preference = try await SwiftNativeProviderRouting()
+            .computeModelPreferences()["chat"] else {
+            throw NSError(
+                domain: "NativeAgent.ChatBrain",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "canonical chat routing is missing"]
+            )
+        }
+        return ChatBrainSelection(
+            model: preference.model,
+            reasoningEffort: preference.reasoningEffort,
+            fastMode: preference.serviceTier == "priority"
+        )
+    }
+
+    private func applyCanonicalChatBrainSelection(_ selection: ChatBrainSelection) {
+        if chatModel != selection.model { chatModel = selection.model }
+        if chatReasoningEffort != selection.reasoningEffort {
+            chatReasoningEffort = selection.reasoningEffort
+        }
+        if chatFastMode != selection.fastMode { chatFastMode = selection.fastMode }
+    }
+
+    private func publishProviderCatalogStatusAfterBrainSave() {
+        let providerSnapshot = providersList
+        Task {
+            _ = await iCloudBridge.shared.publishProviderCatalogStatus(
+                providers: providerSnapshot
+            )
         }
     }
 

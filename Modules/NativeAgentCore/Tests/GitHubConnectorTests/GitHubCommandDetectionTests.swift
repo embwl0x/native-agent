@@ -64,30 +64,69 @@ struct GitHubCommandDetectionTests {
         #expect(evidence.contains { $0.signal == .conflict })
     }
 
-    @Test("only explicit human judgment evidence routes needs_user")
-    func humanDecisionIsExplicitAndRepositoryGeneral() {
-        let observation = GitHubCommandObservationBuilder.pullRequest(
-            repository: "another/project",
-            number: 3,
+    @Test("decision labels require assignment before routing needs_user")
+    func decisionLabelsRequireAssignment() {
+        func observation(assignees: [[String: Any]] = []) -> GitHubCommandObservation {
+            GitHubCommandObservationBuilder.pullRequest(
+                repository: "another/project",
+                number: 3,
+                pull: [
+                    "title": "Choose the public behavior",
+                    "state": "open",
+                    "updated_at": "2026-07-11T10:00:00Z",
+                    "mergeable_state": "clean",
+                    "head": ["sha": "head-3"],
+                    "labels": [["name": "product-decision"]],
+                    "assignees": assignees,
+                ],
+                reviews: [],
+                reviewComments: [],
+                checkRuns: ["check_runs": []],
+                combinedStatus: ["statuses": []],
+                actor: "maintainer",
+                staleAfterHours: 72
+            )
+        }
+
+        #expect(observation().signals.isEmpty)
+        #expect(observation().humanDecision == nil)
+        let assigned = observation(assignees: [["login": "maintainer"]])
+        #expect(assigned.humanDecision?.detail.contains("product-decision") == true)
+        #expect(assigned.humanDecision?.owner == "maintainer")
+    }
+
+    @Test("an unassigned upstream decision never creates owner-attention Desk work")
+    func unassignedDecisionDoesNotCreateDeskWork() async throws {
+        let entity = GitHubConnectorActions.testDetailedTrackingEntity(
             pull: [
-                "title": "Choose the public behavior",
+                "number": 7,
+                "title": "Choose the upstream behavior",
                 "state": "open",
                 "updated_at": "2026-07-11T10:00:00Z",
+                "html_url": "https://github.com/owner/repo/pull/7",
                 "mergeable_state": "clean",
-                "head": ["sha": "head-3"],
-                "labels": [["name": "product-decision"]],
+                "head": ["sha": "head-7"],
+                "labels": [["name": "needs-decision"]],
+                "user": ["login": "contributor"],
             ],
             reviews: [],
             reviewComments: [],
-            checkRuns: ["check_runs": []],
-            combinedStatus: ["statuses": []],
-            actor: "maintainer",
-            staleAfterHours: 72
+            reviewThreads: []
         )
+        guard case .object(let object) = entity else {
+            Issue.record("tracking entity was not an object")
+            return
+        }
+        #expect(object["needsUser"] == .bool(false))
 
-        #expect(observation.signals.isEmpty)
-        #expect(observation.humanDecision?.detail.contains("product-decision") == true)
-        #expect(observation.humanDecision?.owner == "Repository owner")
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("github-unassigned-decision-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let result = try await GitHubConnectorActions.testUpsertTrackingEntities(
+            [entity], project: "Upstream work", changedKeys: ["owner/repo#pr#7"], dataRoot: root
+        )
+        #expect(result == .object(["archived": .int(0), "created": .int(0), "updated": .int(0)]))
+        #expect(try await SwiftNativeDeskStore(dataRoot: root).liveState().items.isEmpty)
     }
 
     // Decision-delivered rule (live case 2026-07-16, #65180): a decision
@@ -107,6 +146,7 @@ struct GitHubCommandDetectionTests {
                     "mergeable_state": "clean",
                     "head": ["sha": "head-3"],
                     "labels": [["name": "needs-decision"]],
+                    "assignees": [["login": "contributor"]],
                 ],
                 reviews: [],
                 reviewComments: [],
@@ -153,9 +193,20 @@ struct GitHubCommandDetectionTests {
 
     @Test("label-armed gate and latest-comment author parsing")
     func decisionFetchHelpers() {
-        #expect(GitHubCommandObservationBuilder.labelDecisionArmed(pull: ["labels": [["name": "Needs-Decision"]]]))
-        #expect(!GitHubCommandObservationBuilder.labelDecisionArmed(pull: ["labels": [["name": "P3"]]]))
-        #expect(!GitHubCommandObservationBuilder.labelDecisionArmed(pull: [:]))
+        #expect(GitHubCommandObservationBuilder.labelDecisionArmed(
+            pull: ["labels": [["name": "Needs-Decision"]], "assignees": [["login": "contributor"]]],
+            repository: "another/project", actor: "contributor"
+        ))
+        #expect(!GitHubCommandObservationBuilder.labelDecisionArmed(
+            pull: ["labels": [["name": "Needs-Decision"]]],
+            repository: "another/project", actor: "contributor"
+        ))
+        #expect(!GitHubCommandObservationBuilder.labelDecisionArmed(
+            pull: ["labels": [["name": "P3"]]], repository: "another/project", actor: "contributor"
+        ))
+        #expect(!GitHubCommandObservationBuilder.labelDecisionArmed(
+            pull: [:], repository: "another/project", actor: "contributor"
+        ))
         #expect(GitHubCommandObservationBuilder.latestCommentAuthor([["user": ["login": "contributor"], "body": "done"]]) == "contributor")
         #expect(GitHubCommandObservationBuilder.latestCommentAuthor([]) == nil)
         #expect(GitHubCommandObservationBuilder.latestCommentAuthor("garbage") == nil)
@@ -201,6 +252,7 @@ struct GitHubCommandDetectionTests {
                 "mergeable_state": "clean",
                 "head": ["sha": "head-5"],
                 "labels": [["name": "needs-decision"]],
+                "assignees": [["login": "contributor"]],
             ],
             reviews: [],
             reviewComments: [],
@@ -213,20 +265,25 @@ struct GitHubCommandDetectionTests {
         #expect(observation.humanDecision == nil)
     }
 
-    @Test("the issue builder treats breaking-change as a decision label")
-    func issueBuilderAlignsDecisionLabels() {
-        let observation = GitHubCommandObservationBuilder.issue(
-            repository: "sample/engine",
-            row: [
-                "number": 12,
-                "state": "open",
-                "title": "Drop the legacy API",
-                "updated_at": "2026-07-20T10:00:00Z",
-                "labels": [["name": "breaking-change"]],
-            ],
-            staleAfterHours: 72
-        )
-        #expect(observation?.humanDecision != nil)
+    @Test("issue decision labels also require contributor assignment")
+    func issueBuilderRequiresAssignment() {
+        func observation(assignees: [[String: Any]] = []) -> GitHubCommandObservation? {
+            GitHubCommandObservationBuilder.issue(
+                repository: "sample/engine",
+                row: [
+                    "number": 12,
+                    "state": "open",
+                    "title": "Drop the legacy API",
+                    "updated_at": "2026-07-20T10:00:00Z",
+                    "labels": [["name": "breaking-change"]],
+                    "assignees": assignees,
+                ],
+                actor: "contributor",
+                staleAfterHours: 72
+            )
+        }
+        #expect(observation()?.humanDecision == nil)
+        #expect(observation(assignees: [["login": "contributor"]])?.humanDecision?.owner == "contributor")
     }
 
     @Test("resolved and outdated review threads produce no actionable signal")

@@ -202,6 +202,20 @@ struct BuilderToolYoloAutonomyTests {
         }
     }
 
+    @Test func remoteNodeExecutionKeepsApprovalFloorEvenInYolo() async throws {
+        let root = tempRoot("remote-node")
+        try seedYoloActive_shellFlagOff(root)
+        let tc = SwiftNativeTrustCenter(dataRoot: root)
+        for surface in ["chat", "codex-bridge", "telegram", "ios"] {
+            let level = try await tc.autonomyLevel(
+                forTool: "remote_node_execute",
+                surface: surface,
+                originTrusted: true
+            )
+            #expect(level == "confirm", "remote effects must retain an approval floor on \(surface) (got \(level))")
+        }
+    }
+
     @Test func approvalGatedExternalSendTools_stayNonAuto_evenInYolo() async throws {
         let root = tempRoot("send")
         try seedYoloActive_shellFlagOff(root)

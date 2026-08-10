@@ -54,6 +54,12 @@ public struct LoopStatus: Sendable, Equatable {
     public let runCount: Int
     public let lastError: String?
     public let running: Bool
+    /// A loop body is executing right now. This differs from `running`, which
+    /// only means the manager owns an active scheduler registration.
+    public let executing: Bool
+    public let executionStartedAt: Date?
+    /// Watchdog budget for the active tick.
+    public let executionTimeout: TimeInterval
     /// nil for loops that are not event-driven at all.
     public let eventListener: LoopEventListenerHealth?
 
@@ -64,6 +70,9 @@ public struct LoopStatus: Sendable, Equatable {
         runCount: Int,
         lastError: String?,
         running: Bool = false,
+        executing: Bool = false,
+        executionStartedAt: Date? = nil,
+        executionTimeout: TimeInterval = 300,
         eventListener: LoopEventListenerHealth? = nil
     ) {
         self.name = name
@@ -72,6 +81,9 @@ public struct LoopStatus: Sendable, Equatable {
         self.runCount = runCount
         self.lastError = lastError
         self.running = running
+        self.executing = executing
+        self.executionStartedAt = executionStartedAt
+        self.executionTimeout = executionTimeout
         self.eventListener = eventListener
     }
 }
@@ -92,9 +104,12 @@ private actor LoopExecutionGate {
     struct Snapshot: Sendable {
         let lastRun: Date?
         let runCount: Int
+        let executing: Bool
+        let executionStartedAt: Date?
     }
 
     private var active = false
+    private var activeSince: Date?
     private var lastRun: Date?
     private var runCount = 0
     private var idleWaiters: [IdleWait] = []
@@ -110,9 +125,10 @@ private actor LoopExecutionGate {
 
     /// Returns the ownership token to the request that owns this execution.
     /// Coalesced callers wait for that owner and receive nil.
-    func acquireOrJoin() async -> UInt64? {
+    func acquireOrJoin(startedAt: Date) async -> UInt64? {
         guard active else {
             active = true
+            activeSince = startedAt
             runCount += 1
             generation &+= 1
             return generation
@@ -134,6 +150,7 @@ private actor LoopExecutionGate {
         guard active, token == generation else { return }
         if let date { lastRun = date }
         active = false
+        activeSince = nil
         let waiters = idleWaiters
         idleWaiters.removeAll()
         for waiter in waiters {
@@ -181,7 +198,12 @@ private actor LoopExecutionGate {
     }
 
     func snapshot() -> Snapshot {
-        Snapshot(lastRun: lastRun, runCount: runCount)
+        Snapshot(
+            lastRun: lastRun,
+            runCount: runCount,
+            executing: active,
+            executionStartedAt: activeSince
+        )
     }
 
     /// Parks until a coalescing request joins the active tick.
@@ -284,7 +306,7 @@ private struct ManagedLoopRunner: LoopRunner {
     /// active forever and every later tick coalesced into a skip, permanently
     /// wedging the loop behind a one-time timeout.
     func tickOutcome() async -> LoopTickOutcome {
-        guard let token = await gate.acquireOrJoin() else {
+        guard let token = await gate.acquireOrJoin(startedAt: clock()) else {
             return .skipped(reason: LoopTickOutcome.coalescedSkipReason)
         }
         let race = ManagedTickRace()
@@ -476,6 +498,9 @@ public actor BackgroundLoopsManager {
                 runCount: max(state.tickCount, snapshot?.runCount ?? 0),
                 lastError: state.lastError,
                 running: started && registrations[state.loopId] != nil,
+                executing: snapshot?.executing ?? false,
+                executionStartedAt: snapshot?.executionStartedAt,
+                executionTimeout: registrations[state.loopId]?.runner.tickTimeoutOverride ?? 300,
                 // Sweep R4 item 3: liveness of the EVENT lane, reported
                 // separately from `running` (which only proves the manager
                 // started and the loop is registered). A loop can be running

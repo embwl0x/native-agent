@@ -1,6 +1,7 @@
 import Foundation
 import Testing
 import CognitiveSubstrate
+import NativeAgentShared
 import PersistenceCore
 @testable import NativeAgentApp
 
@@ -93,6 +94,41 @@ private func livingOrganismSnapshot(
     #expect(snapshot.needsText == "needs you")
     #expect(snapshot.homeLine.contains("needs you"))
     #expect(snapshot.whyLine == "Waiting on approval before irreversible movement.")
+}
+
+@Test func livingStatusKeepsOptionalReviewsVisibleWithoutClaimingItNeedsUser() {
+    let snapshot = LivingStatusSnapshot.make(
+        organism: livingOrganismSnapshot(),
+        activeDeskCount: 0,
+        blockedDeskCount: 0,
+        pendingApprovals: 7,
+        requiredApprovals: 0,
+        latestDream: nil
+    )
+
+    #expect(snapshot.needsText == "needs nothing")
+    #expect(snapshot.homeLine.contains("does not need you"))
+    #expect(snapshot.approvalsSummary == "7 optional reviews")
+    #expect(snapshot.whyLine == "Optional reviews are ready, but nothing is waiting on you.")
+}
+
+@Test func livingAttentionPolicySeparatesOptionalReviewsFromRequiredConsent() {
+    func approval(action: String) -> ApprovalRequest {
+        ApprovalRequest(
+            id: UUID().uuidString,
+            title: action,
+            action: action,
+            risk: "medium",
+            status: "pending"
+        )
+    }
+    let rows = [
+        approval(action: "rem.proposal"),
+        approval(action: "self_improvement.apply"),
+        approval(action: "connector.external_send"),
+    ]
+
+    #expect(LivingAttentionPolicy.requiredApprovalCount(in: rows) == 1)
 }
 
 @Test func deskOwnerInputRequiresAnExactNonterminalWaitingParty() {

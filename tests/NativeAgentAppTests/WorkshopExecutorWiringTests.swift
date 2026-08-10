@@ -46,8 +46,8 @@ struct WorkshopExecutorRefWiringSuite {
         } catch {
             // Honest "executor not running" — NOT a silent no-op, NOT the old
             // dead-path WorkshopExecutionError.unavailable ("Workshop executions unavailable").
-            #expect(error.localizedDescription.contains("Workshop executor is not running"))
-            #expect(error.localizedDescription.contains("Workshop execution left queued"))
+            #expect(error.localizedDescription.contains("Desk executor is not running"))
+            #expect(error.localizedDescription.contains("Desk execution left queued"))
         }
     }
 

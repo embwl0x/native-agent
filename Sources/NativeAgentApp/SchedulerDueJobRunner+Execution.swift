@@ -58,6 +58,28 @@ extension SchedulerDueJobRunner {
                 detail: "proactive scan surfaced \(scan.itemIds.count) opportunity card(s)",
                 output: scan.output
             )
+        case "workshop":
+            let title = string(job.payload["title"]) ?? job.name
+            let objective = string(job.payload["objective"]) ?? ""
+            guard !objective.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw NSError(domain: "NativeAgentScheduler", code: -400, userInfo: [
+                    NSLocalizedDescriptionKey: "workshop job requires an objective"
+                ])
+            }
+            let execution = try await NativeClient(baseURL: "").createWorkshopTask(
+                title: title,
+                objective: objective,
+                projectSpaceId: string(job.payload["projectSpaceId"])
+            )
+            return JobResult(
+                status: "completed",
+                detail: "Desk execution \(execution.id) queued",
+                output: .object([
+                    "executionId": .string(execution.id),
+                    "status": .string(execution.status),
+                    "expectedEvidence": job.payload["expectedEvidence"] ?? .string("canonical Desk completion receipt"),
+                ])
+            )
         default:
             throw NSError(domain: "NativeAgentScheduler", code: -410, userInfo: [
                 NSLocalizedDescriptionKey: "Unsupported scheduled job kind: \(job.kind)"

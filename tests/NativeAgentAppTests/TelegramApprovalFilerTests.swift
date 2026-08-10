@@ -250,4 +250,115 @@ struct TelegramApprovalFilerTests {
         )
         #expect(transcript.count == 1)
     }
+
+    @Test func reconcileApprovedPersonaReplay_recoversPriorDoubleApprovalFailureExactlyOnce() async throws {
+        let root = try tempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let persistence = SwiftNativePersistenceCore()
+        try await persistence.writeJSON(
+            .object([
+                "permissionLevel": .string("full_mac_os"),
+                "developerMode": .bool(true),
+                "filePolicy": .object(["outsideWorkspaceDefault": .string("allow")]),
+            ]),
+            to: root
+                .appendingPathComponent("trust", isDirectory: true)
+                .appendingPathComponent("policy.json")
+        )
+        try await persistence.writeJSON(
+            .object([
+                "bot_token": .string("redacted"),
+                "allowed_chat_ids": .array([.int(77)]),
+                "allowed_user_ids": .array([.int(11)]),
+            ]),
+            to: root
+                .appendingPathComponent("telegram", isDirectory: true)
+                .appendingPathComponent("config.json")
+        )
+        let personaRoot = root.appendingPathComponent("persona", isDirectory: true)
+        try FileManager.default.createDirectory(at: personaRoot, withIntermediateDirectories: true)
+        let soul = personaRoot.appendingPathComponent("SOUL.md")
+        try "# Soul\n".write(to: soul, atomically: true, encoding: .utf8)
+
+        let input: [String: JSONValue] = [
+            "kind": .string("soul"),
+            "title": .string("User-approved identity note"),
+            "content": .string("Carry this bounded note forward."),
+        ]
+        let inbox = SwiftNativeApprovalInbox(root: root)
+        let approval = try await inbox.create(.object([
+            "title": .string("Approve persona update"),
+            "action": .string("persona_append_section"),
+            "risk": .string("confirm"),
+            "reason": .string("autonomy=confirm source=dynamic_persona_guard"),
+            "payload": .object([
+                "kind": .string("chat_tool_approval"),
+                "toolName": .string("persona_append_section"),
+                "surface": .string("telegram"),
+                "input": .object(input),
+                "origin": .object([
+                    "sessionId": .string("telegram-session"),
+                    "chatId": .string("77"),
+                    "userId": .string("11"),
+                ]),
+            ]),
+            "remoteResolvable": .bool(true),
+            "localOnly": .bool(false),
+        ]))
+        _ = try await inbox.resolve(
+            approval.id,
+            decision: .approved,
+            decidedBy: "telegram-test"
+        )
+        try await NativeClient.annotateApprovalExecution(
+            id: approval.id,
+            executedAction: .object([
+                "op": .string("chat_tool_approval_replay"),
+                "tool": .string("persona_append_section"),
+                "surface": .string("telegram"),
+                "status": .string("failed"),
+                "error": .string(
+                    "tool denied: approval required, no filer is available on this noninteractive surface: "
+                        + "autonomy=confirm source=dynamic_persona_guard"
+                ),
+            ]),
+            detail: "persona_append_section approved replay FAILED",
+            root: root
+        )
+        let failed = try await inbox.get(approval.id)
+        await NativeClient.ensureChatToolApprovalOutcomeReceipt(from: failed, dataRoot: root)
+
+        await NativeClient.reconcileUnappliedChatToolApprovalExecutions(dataRoot: root)
+        await NativeClient.reconcileUnappliedChatToolApprovalExecutions(dataRoot: root)
+
+        let healed = try await inbox.get(approval.id)
+        guard case .object(let executed)? = healed.executedAction else {
+            Issue.record("expected healed execution annotation")
+            return
+        }
+        if executed["status"] != .string("succeeded") {
+            Issue.record("replay did not heal: \(healed.detail ?? String(describing: executed))")
+        }
+
+        let body = try String(contentsOf: soul, encoding: .utf8)
+        #expect(body.components(separatedBy: "## User-approved identity note").count == 2)
+        #expect(body.contains("Carry this bounded note forward."))
+        #expect(executed["status"] == .string("succeeded"))
+
+        let transcript = try await persistence.readJSONL(
+            root
+                .appendingPathComponent("chat", isDirectory: true)
+                .appendingPathComponent("messages", isDirectory: true)
+                .appendingPathComponent("telegram-session.jsonl")
+        )
+        #expect(transcript.count == 1)
+        guard case .object(let row) = transcript[0],
+              case .object(let metadata)? = row["metadata"] else {
+            Issue.record("expected healed canonical approval receipt")
+            return
+        }
+        #expect(metadata["approvalId"] == .string(approval.id))
+        #expect(metadata["ok"] == .bool(true))
+    }
 }

@@ -279,6 +279,36 @@ final class ActionChannelTests: XCTestCase {
         XCTAssertEqual(transaction.state, "queued", "failed sent receipt must never be reported as terminal success")
     }
 
+    func test_terminalSendFailureNeverSwallowsLedgerPersistenceFailure() async throws {
+        engine.transactionWriteTestHook = { state in
+            guard state == "send_failed" else { return }
+            throw NSError(
+                domain: "ActionChannelTests",
+                code: 92,
+                userInfo: [NSLocalizedDescriptionKey: "terminal ledger unavailable"]
+            )
+        }
+        let transportError = NSError(
+            domain: "ActionChannelTests",
+            code: 93,
+            userInfo: [NSLocalizedDescriptionKey: "CloudKit transport unavailable"]
+        )
+
+        do {
+            try await engine.persistTerminalSendFailure(
+                transactionID: UUID().uuidString,
+                action: "approveApproval",
+                sendError: transportError
+            )
+            XCTFail("expected the unpersisted terminal receipt to fail closed")
+        } catch SyncError.persistence(let message) {
+            XCTAssertTrue(message.contains("CloudKit transport unavailable"), message)
+            XCTAssertTrue(message.contains("terminal ledger unavailable"), message)
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
+
     func test_sendAction_transactionTimeoutReleasesOwnershipAndNextSendCanSucceed() async throws {
         let releaseStalledWrite = DispatchSemaphore(value: 0)
         defer { releaseStalledWrite.signal() }

@@ -44,6 +44,18 @@ struct SlimSettingsView: View {
     // Cognition, …) behind an explicit preference. Off on fresh installs. Purely
     // a UI-visibility preference — NOT Trust Center's developerMode policy.
     @AppStorage("showDeveloperSurfaces") private var showDeveloperSurfaces = false
+    @AppStorage(NativeExperiencePreferences.masterKey) private var experienceEnabled = false
+    @AppStorage(NativeExperiencePreferences.journeyKey) private var journeyEnabled = true
+    @AppStorage(NativeExperiencePreferences.contextKey) private var experienceContextEnabled = true
+    @AppStorage(NativeExperiencePreferences.projectsKey) private var experienceProjectsEnabled = true
+    @AppStorage(NativeExperiencePreferences.automationsKey) private var experienceAutomationsEnabled = true
+    @AppStorage(NativeExperiencePreferences.capabilitiesKey) private var experienceCapabilitiesEnabled = true
+    @AppStorage(NativeExperiencePreferences.lineageKey) private var experienceLineageEnabled = true
+    @AppStorage(NativeExperiencePreferences.workbenchKey) private var experienceWorkbenchEnabled = true
+    @AppStorage(NativeExperiencePreferences.diagnosticsKey) private var experienceDiagnosticsEnabled = true
+    @AppStorage(NativeExperiencePreferences.kitsKey) private var experienceKitsEnabled = true
+    @AppStorage(NativeExperiencePreferences.remoteNodesKey) private var experienceRemoteNodesEnabled = true
+    @AppStorage(NativeExperiencePreferences.skillEvolutionKey) private var experienceSkillEvolutionEnabled = true
     // 2026-07-23 B2.6c: Subconscious + Embeddings are power-user internals a
     // stranger never touches; they collapse behind this persisted Advanced
     // disclosure. Attention flags let an error/partial state still surface a
@@ -51,6 +63,7 @@ struct SlimSettingsView: View {
     @AppStorage("nativeagent.settingsShowAdvanced") private var showAdvancedSettings = false
     @State private var embeddingsAttention = false
     @State private var subconsciousAttention = false
+    @State private var confirmClassicPresentation = false
 
     var body: some View {
         NavigationStack {
@@ -82,6 +95,33 @@ struct SlimSettingsView: View {
                     Text("Appearance")
                 } footer: {
                     Text("Reveals internal tabs — Capabilities, Knowledge Graph, Dreams, Diagnostics (home of the Cognition and Inspector segments), Inbox Policy, and MCP — in the sidebar's Advanced group and the Cmd+K palette. Off by default; deep links to these still resolve.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+
+                Section {
+                    Toggle("Native Experience", isOn: $experienceEnabled)
+
+                    if experienceEnabled {
+                        Toggle("Learning journey", isOn: $journeyEnabled)
+                        Toggle("Context economics", isOn: $experienceContextEnabled)
+                        Toggle("Project spaces", isOn: $experienceProjectsEnabled)
+                        Toggle("Automation blueprints", isOn: $experienceAutomationsEnabled)
+                        Toggle("Capability readiness", isOn: $experienceCapabilitiesEnabled)
+                        Toggle("Conversation lineage", isOn: $experienceLineageEnabled)
+                        Toggle("Native workbench", isOn: $experienceWorkbenchEnabled)
+                        Toggle("Diagnostic observer", isOn: $experienceDiagnosticsEnabled)
+                        Toggle("Capability Kits", isOn: $experienceKitsEnabled)
+                        Toggle("Skill evolution", isOn: $experienceSkillEvolutionEnabled)
+                        Toggle("Trusted remote nodes", isOn: $experienceRemoteNodesEnabled)
+
+                        Button("Return to Classic NativeAgent", role: .destructive) {
+                            confirmClassicPresentation = true
+                        }
+                    }
+                } header: {
+                    Text("NativeAgent Experience")
+                } footer: {
+                    Text("Adds optional native views over existing NativeAgent owners. It does not change chat, models, memory, Fluid Context, the subconscious, the organism, trust, or background work. Return to Classic hides every addition without deleting data, tool loadouts, versions, receipts, or schedules you created.")
                         .font(.caption2).foregroundStyle(.secondary)
                 }
 
@@ -179,10 +219,20 @@ struct SlimSettingsView: View {
                             ChatClipboard.copy(Self.buildIdentityLine(identity))
                         }
                     }
+                    if let notice = updateController.updateNoticeText {
+                        Label(notice, systemImage: "arrow.down.circle.fill")
+                            .foregroundStyle(Color.accentColor)
+                            .fontWeight(.semibold)
+                    }
                     Button {
                         updateController.checkForUpdates()
                     } label: {
-                        Label(updateController.menuTitle, systemImage: "arrow.triangle.2.circlepath")
+                        Label(
+                            updateController.menuTitle,
+                            systemImage: updateController.updateNoticeText == nil
+                                ? "arrow.triangle.2.circlepath"
+                                : "arrow.down.circle.fill"
+                        )
                     }
                     .accessibilityHint(
                         updateController.updatesAreAvailable
@@ -209,6 +259,19 @@ struct SlimSettingsView: View {
                 guard !showAdvancedSettings else { return }
                 await seedEmbeddingsAttention()
             }
+            .confirmationDialog(
+                "Return to the classic NativeAgent presentation?",
+                isPresented: $confirmClassicPresentation,
+                titleVisibility: .visible
+            ) {
+                Button("Return to Classic", role: .destructive) {
+                    NativeExperiencePreferences.returnToClassic()
+                    experienceEnabled = false
+                }
+                Button("Keep Native Experience", role: .cancel) {}
+            } message: {
+                Text("Only the optional presentation is removed. NativeAgent's capabilities and living runtime stay exactly as they are.")
+            }
         }
     }
 
@@ -234,6 +297,14 @@ struct SlimSettingsView: View {
 // MARK: - Subconscious section
 
 private struct SubconsciousSettingsSection: View {
+    private struct ReflectionModelChoice: Identifiable, Equatable {
+        let id: String
+        let providerID: String
+        let modelID: String
+        let label: String
+        let providerReady: Bool
+    }
+
     @Environment(AppModel.self) private var appModel
     // 2026-07-23 B2.6c: reports an attention signal up to the Advanced
     // disclosure so a partial/errored Subconscious still surfaces a warn badge
@@ -247,11 +318,14 @@ private struct SubconsciousSettingsSection: View {
     @AppStorage("organismKernelEnabled") private var organismEnabled = false
     @AppStorage("contextFlowMode") private var contextFlowMode = ContextFlowMode.shadow.rawValue
     @AppStorage("cognitiveSubstrateReflectionModel") private var subconsciousModel = "claude-opus-4-8"
+    @AppStorage("cognitiveSubstrateReflectionProvider") private var subconsciousProvider = ""
     @State private var savingToggle = false
     @State private var savingContextFlow = false
     @State private var savingModel = false
     @State private var errorMessage: String?
     @State private var contextFlowStatus: NativeContextFlowModeStatus?
+    @State private var reflectionRouteStatus: NativeReflectionRouteStatus?
+    @State private var pendingReflectionChoiceID: String?
 
     var body: some View {
         Section {
@@ -279,14 +353,35 @@ private struct SubconsciousSettingsSection: View {
                     .foregroundStyle(.secondary)
             }
 
-            Picker("LLM", selection: $subconsciousModel) {
-                ForEach(subconsciousModelOptions) { model in
-                    Text(model.displayName).tag(model.id)
+            if reflectionModelChoices.isEmpty {
+                LabeledContent("LLM") {
+                    Text("Connect a provider to choose a reflection model")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
                 }
+            } else {
+                Picker("LLM", selection: Binding(
+                    get: { pendingReflectionChoiceID ?? currentReflectionChoiceID },
+                    set: { choiceID in
+                        guard let choice = reflectionModelChoices.first(where: { $0.id == choiceID }) else {
+                            return
+                        }
+                        pendingReflectionChoiceID = choiceID
+                        Task { await saveSubconsciousSelection(choice) }
+                    }
+                )) {
+                    ForEach(reflectionModelChoices) { choice in
+                        Text(choice.label + (choice.providerReady ? "" : " ⚠️"))
+                            .tag(choice.id)
+                    }
+                }
+                .disabled(savingToggle || savingModel)
             }
-            .disabled(savingToggle || savingModel)
-            .onChange(of: subconsciousModel) { _, model in
-                Task { await saveSubconsciousModel(model) }
+
+            if let reflectionRouteStatus, !reflectionRouteStatus.isReady {
+                Text(reflectionRouteStatus.detail)
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
             }
 
             HStack {
@@ -316,7 +411,9 @@ private struct SubconsciousSettingsSection: View {
             if appModel.modelCatalog == nil {
                 await appModel.refreshModelCatalog()
             }
+            _ = await appModel.loadProvidersForChat()
             contextFlowStatus = await NativeContextFlowRuntime.shared.modeStatus()
+            await refreshReflectionRouteStatus()
             attention = attentionState
         }
         .onChange(of: attentionState) { _, newValue in
@@ -324,55 +421,72 @@ private struct SubconsciousSettingsSection: View {
         }
     }
 
-    private var subconsciousModelOptions: [ModelCatalogItem] {
-        let preferred = ModelCatalogItem(
-            id: "claude-opus-4-8",
-            displayName: "Claude Opus 4.8",
-            description: nil,
-            defaultReasoningEffort: "high",
-            supportedReasoningEfforts: ["high", "xhigh"],
-            supportsFast: nil,
-            priority: 0
-        )
-        let fallbacks = [
-            preferred,
-            ModelCatalogItem(
-                id: nativeAgentPrimaryModel,
-                displayName: "GPT-5.6 Sol",
-                description: nil,
-                defaultReasoningEffort: "low",
-                supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
-                supportsFast: true,
-                priority: 10
-            ),
-        ]
-        let catalog = appModel.modelCatalog?.models ?? []
+    private var reflectionModelChoices: [ReflectionModelChoice] {
+        var choices: [ReflectionModelChoice] = []
         var seen: Set<String> = []
-        var out: [ModelCatalogItem] = []
-
-        for model in fallbacks + catalog {
-            if seen.insert(model.id).inserted {
-                out.append(model)
+        for provider in appModel.providersList {
+            let ready = provider.auth_status.state == "ready"
+            for model in provider.models {
+                let id = reflectionChoiceID(providerID: provider.provider_id, modelID: model.id)
+                guard seen.insert(id).inserted else { continue }
+                choices.append(ReflectionModelChoice(
+                    id: id,
+                    providerID: provider.provider_id,
+                    modelID: model.id,
+                    label: "\(model.name) · \(provider.display_name)",
+                    providerReady: ready
+                ))
             }
         }
-        if !subconsciousModel.isEmpty,
-           seen.insert(subconsciousModel).inserted {
-            out.insert(ModelCatalogItem(
-                id: subconsciousModel,
-                displayName: subconsciousModel,
-                description: "Custom model",
-                defaultReasoningEffort: "high",
-                supportedReasoningEfforts: ["low", "medium", "high", "xhigh"],
-                supportsFast: nil,
-                priority: 999
-            ), at: 0)
+
+        let currentProvider = effectiveSubconsciousProvider
+        let currentID = reflectionChoiceID(
+            providerID: currentProvider,
+            modelID: effectiveSubconsciousModel
+        )
+        if !effectiveSubconsciousModel.isEmpty, !currentProvider.isEmpty,
+           seen.insert(currentID).inserted {
+            let provider = appModel.providersList.first { $0.provider_id == currentProvider }
+            choices.append(ReflectionModelChoice(
+                id: currentID,
+                providerID: currentProvider,
+                modelID: effectiveSubconsciousModel,
+                label: "\(effectiveSubconsciousModel) · \(provider?.display_name ?? currentProvider) — Unavailable",
+                providerReady: false
+            ))
         }
-        return out
+        return choices.sorted { lhs, rhs in
+            if lhs.id == currentID { return true }
+            if rhs.id == currentID { return false }
+            if lhs.providerReady != rhs.providerReady { return lhs.providerReady && !rhs.providerReady }
+            return lhs.label.localizedCaseInsensitiveCompare(rhs.label) == .orderedAscending
+        }
+    }
+
+    private var effectiveSubconsciousProvider: String {
+        let stored = subconsciousProvider.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !stored.isEmpty { return stored }
+        if let live = reflectionRouteStatus?.providerID, !live.isEmpty { return live }
+        return NativeCognitionRuntime.inferredReflectionProvider(for: effectiveSubconsciousModel)
+    }
+
+    private var effectiveSubconsciousModel: String {
+        if let live = reflectionRouteStatus?.model, !live.isEmpty { return live }
+        return subconsciousModel
+    }
+
+    private var currentReflectionChoiceID: String {
+        reflectionChoiceID(providerID: effectiveSubconsciousProvider, modelID: effectiveSubconsciousModel)
+    }
+
+    private func reflectionChoiceID(providerID: String, modelID: String) -> String {
+        providerID + "\u{1f}" + modelID
     }
 
     private var fullyRunning: Bool {
         subconsciousEnabled && capsuleEnabled && backgroundEnabled && reflectionEnabled
             && reflectionBudget > 0 && organismEnabled
+            && reflectionRouteStatus?.isReady == true
     }
 
     // Attention = enabled-but-not-fully-running (orange) or an error. Surfaced
@@ -382,7 +496,8 @@ private struct SubconsciousSettingsSection: View {
     }
 
     private var statusLabel: String {
-        if fullyRunning { return "Running with \(subconsciousModel)" }
+        if fullyRunning { return "Running with \(effectiveSubconsciousModel)" }
+        if subconsciousEnabled, reflectionRouteStatus?.isReady != true { return "Needs LLM setup" }
         if subconsciousEnabled { return "Partially enabled" }
         return "Off"
     }
@@ -403,6 +518,13 @@ private struct SubconsciousSettingsSection: View {
     private func setSubconsciousEnabled(_ enabled: Bool) async {
         savingToggle = true
         defer { savingToggle = false }
+        if enabled, !(await ensureReflectionRouteForEnable()) {
+            subconsciousEnabled = false
+            errorMessage = reflectionRouteStatus?.detail
+                ?? "Connect a provider or choose an available LLM before enabling Subconscious."
+            appModel.statusText = "Subconscious needs a ready reflection LLM"
+            return
+        }
         subconsciousEnabled = enabled
         capsuleEnabled = enabled
         backgroundEnabled = enabled
@@ -415,17 +537,19 @@ private struct SubconsciousSettingsSection: View {
             enabled,
             reflectionBudget: enabled ? max(1, reflectionBudget) : 0
         )
+        await refreshReflectionRouteStatus()
         applySubconsciousRuntimeState(actual)
         let fullyActive = actual.enabled && actual.capsuleEnabled
             && actual.backgroundEnabled && actual.reflectionEnabled
             && actual.reflectionBudget > 0 && actual.organismEnabled
+            && reflectionRouteStatus?.isReady == true
         if enabled && !fullyActive {
             errorMessage = "Some Subconscious lanes are held off by setup, safety, or provider health."
             appModel.statusText = "Subconscious is only partially active"
         } else {
             errorMessage = nil
             appModel.statusText = enabled
-                ? "Subconscious running with \(subconsciousModel)"
+                ? "Subconscious running with \(effectiveSubconsciousModel)"
                 : "Subconscious disabled"
         }
     }
@@ -480,27 +604,89 @@ private struct SubconsciousSettingsSection: View {
     }
 
     @MainActor
-    private func saveSubconsciousModel(
-        _ model: String,
+    @discardableResult
+    private func saveSubconsciousSelection(
+        _ choice: ReflectionModelChoice,
         updateStatus: Bool = true
-    ) async {
-        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+    ) async -> Bool {
         savingModel = true
         defer { savingModel = false }
         do {
-            try await NativeCognitionRuntime.shared.setReflectionModel(trimmed)
-            if subconsciousModel != trimmed {
-                subconsciousModel = trimmed
-            }
+            try await NativeCognitionRuntime.shared.setReflectionSelection(
+                model: choice.modelID,
+                provider: choice.providerID
+            )
+            subconsciousModel = choice.modelID
+            subconsciousProvider = choice.providerID
+            pendingReflectionChoiceID = nil
+            await refreshReflectionRouteStatus()
             errorMessage = nil
             if updateStatus {
-                appModel.statusText = "Subconscious LLM saved: \(trimmed)"
+                appModel.statusText = reflectionRouteStatus?.isReady == true
+                    ? "Subconscious LLM saved: \(choice.modelID)"
+                    : "Subconscious LLM saved, but its provider is not ready"
             }
+            return true
         } catch {
+            pendingReflectionChoiceID = nil
             errorMessage = "Subconscious LLM save failed: \(error.localizedDescription)"
             appModel.statusText = errorMessage ?? appModel.statusText
+            return false
         }
+    }
+
+    @MainActor
+    private func refreshReflectionRouteStatus() async {
+        reflectionRouteStatus = await NativeCognitionRuntime.shared.reflectionRouteStatus()
+    }
+
+    @MainActor
+    private func ensureReflectionRouteForEnable() async -> Bool {
+        _ = await appModel.loadProvidersForChat()
+        let defaults = UserDefaults.standard
+        let hasExplicitSelection = defaults.object(
+            forKey: NativeCognitionRuntime.reflectionModelKey
+        ) != nil || defaults.object(
+            forKey: NativeCognitionRuntime.reflectionProviderKey
+        ) != nil
+
+        if hasExplicitSelection {
+            await refreshReflectionRouteStatus()
+            return reflectionRouteStatus?.isReady == true
+        }
+
+        let readyProviders = appModel.providersList.filter { $0.auth_status.state == "ready" }
+        let chatProvider = readyProviders.first { $0.provider_id == appModel.chatProvider }
+        let preferred: ReflectionModelChoice? = {
+            if let chatProvider {
+                let model = chatProvider.models.first { $0.id == appModel.chatModel }
+                    ?? chatProvider.models.first
+                if let model {
+                    return ReflectionModelChoice(
+                        id: reflectionChoiceID(providerID: chatProvider.provider_id, modelID: model.id),
+                        providerID: chatProvider.provider_id,
+                        modelID: model.id,
+                        label: "\(model.name) · \(chatProvider.display_name)",
+                        providerReady: true
+                    )
+                }
+            }
+            guard let provider = readyProviders.first,
+                  let model = provider.models.first else { return nil }
+            return ReflectionModelChoice(
+                id: reflectionChoiceID(providerID: provider.provider_id, modelID: model.id),
+                providerID: provider.provider_id,
+                modelID: model.id,
+                label: "\(model.name) · \(provider.display_name)",
+                providerReady: true
+            )
+        }()
+        guard let preferred else {
+            await refreshReflectionRouteStatus()
+            return false
+        }
+        return await saveSubconsciousSelection(preferred, updateStatus: false)
+            && reflectionRouteStatus?.isReady == true
     }
 }
 

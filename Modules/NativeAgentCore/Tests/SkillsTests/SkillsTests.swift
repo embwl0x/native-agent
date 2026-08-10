@@ -771,3 +771,47 @@ private func clientFor(_ root: URL) -> SwiftNativeSkillsClient {
     let deleted = try await client.deleteSkill(id: "s1")
     if case .object(let d) = deleted { #expect(d["deleted"] == .bool(true)) }
 }
+
+@Test func skillEvolutionVersionsArchiveAndRestoreCanonicalSkill() async throws {
+    let root = try makeTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let client = clientFor(root)
+    let created = try await client.createSkill(body: obj([
+        "name": .string("Release Review"),
+        "description": .string("Review a release safely."),
+        "content": .string("# Release Review\n\nInspect the release evidence and report gaps."),
+    ]))
+    let id = stringField(created, "id")!
+    let createdVersions = try await client.listSkillVersions(id: id)
+    #expect(createdVersions.count == 1)
+    let createdVersionID = stringField(createdVersions[0], "versionId")!
+
+    let archived = try await client.archiveSkill(id: id)
+    #expect(stringField(archived, "status") == "archived")
+    #expect(try await client.listSkillVersions(id: id).count == 3)
+
+    let restored = try await client.restoreSkill(id: id, versionId: createdVersionID)
+    #expect(stringField(restored, "status") == "active")
+    let rows = try await client.listSkills()
+    #expect(rows.contains { stringField($0, "id") == id && stringField($0, "status") == "active" })
+    #expect(try await client.listSkillVersions(id: id).count == 5)
+}
+
+@Test func skillEvolutionCorruptHistoryFailsClosedBeforeUpdate() async throws {
+    let root = try makeTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try writeJSON(.array([
+        obj(["id": .string("stable"), "name": .string("Stable"), "status": .string("active")]),
+    ]), to: root.appendingPathComponent("skills/registry.json"))
+    let history = root.appendingPathComponent("skills/history/stable.json")
+    try FileManager.default.createDirectory(at: history.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try Data("{broken".utf8).write(to: history)
+    let client = clientFor(root)
+
+    await #expect(throws: SkillsError.self) {
+        try await client.updateSkill(body: obj(["id": .string("stable"), "status": .string("disabled")]))
+    }
+    let rows = try await client.listSkills()
+    #expect(rows.contains { stringField($0, "id") == "stable" && stringField($0, "status") == "active" })
+    #expect(try Data(contentsOf: history) == Data("{broken".utf8))
+}

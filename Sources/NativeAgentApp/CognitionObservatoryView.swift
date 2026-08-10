@@ -180,7 +180,7 @@ struct CognitionObservatoryView: View {
                     // Desk projection — an open pursuit can never fall out of view.
                     collapsible(
                         "workshop",
-                        title: "Workshop",
+                        title: "Desk",
                         systemImage: "hammer",
                         tint: .purple,
                         count: workshop?.model?.openPursuitCount,
@@ -356,7 +356,7 @@ struct CognitionObservatoryView: View {
         let store = SwiftNativeDeskStore(dataRoot: PersistenceCore.defaultDataRoot())
         do {
             _ = try await store.setStatus(handle, status: .canceled)
-            _ = try? await store.appendNote(handle, text: "Vetoed by the user from the Workshop Observatory.")
+            _ = try? await store.appendNote(handle, text: "Vetoed by the user from the Desk observatory.")
             appModel.systemToasts.push(success: "Pursuit vetoed — closed as canceled.")
         } catch {
             appModel.systemToasts.push(error: "Veto failed: \(error.localizedDescription)")

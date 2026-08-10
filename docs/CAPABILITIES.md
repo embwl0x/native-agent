@@ -24,7 +24,7 @@ bridges.
 - Fluid Context generations and the resident context arena;
 - TrustCenter, SecurityCenter, approvals, and Mac/file gates;
 - lazy tools, MCP, connectors, browser, and workflows;
-- Workshop planning and execution;
+- Desk planning and execution;
 - background loops, notifications, dreams, REM, and maintenance;
 - iCloud/CloudKit/APNS device coordination;
 - optional CognitiveSubstrate and Organism Kernel state.
@@ -47,7 +47,7 @@ but they do not own the agent.
   the main conversation.
 - Provider, model, Think, Fast, context occupancy, transcript estimate, and
   compaction threshold are visible controls/readouts.
-- A Today panel projects bounded organism posture, Workshop, approvals, dream,
+- A Today panel projects bounded organism posture, Desk, approvals, dream,
   and needs-user status.
 - Development and personal installs never create hidden greeting turns during
   startup, onboarding, provider changes, or session selection. A blank-slate
@@ -60,7 +60,7 @@ but they do not own the agent.
 - Session lists, pinned chats, attachments, cancellation, and model controls.
 - The same visible send-next queue is available while a reply is active;
   steering confirms Mac cancellation before the promoted message is sent.
-- Activity, approvals, Workshop, memory, skills, connectors, provider status,
+- Activity, approvals, Desk, memory, skills, connectors, provider status,
   runtime health, and organism living status through targeted snapshots.
 - Signed remote actions with a durable transaction ledger and response
   read-back before success is shown.
@@ -170,20 +170,20 @@ The organism cannot write persona files, commit MemoryV2 facts, dispatch tools,
 send notifications, or approve its own reflexes. It is default-off and forced
 neutral before public onboarding.
 
-## Workshop and directed work
+## Desk and directed work
 
-Workshop is the single work surface for both user-directed tasks and the
+Desk is the single work surface for both user-directed tasks and the
 agent's own bounded pursuits.
 
 - Desk owns canonical item identity, hierarchy, origin, status, and terminal
   invariants.
 - User-directed work can use a multi-step planner/executor with checkpoints,
   approval pauses, retries, and an outcome scoreboard.
-- Agent pursuits use a restricted Workshop session and membrane rather than
+- Agent pursuits use a restricted Desk work session and membrane rather than
   unrestricted normal chat tools.
 - Durable leases and reservations prevent double execution.
 - Terminal execution state synchronizes back to the same Desk item.
-- Mac and iPhone use the same Workshop identity and receipts.
+- Mac and iPhone use the same Desk identity and receipts.
 - Legacy Missions UI/tools/storage are retired; old serialized wire identifiers
   survive only where required to migrate existing local state safely.
 
@@ -209,7 +209,7 @@ NativeAgent does not inject its entire tool catalog into every turn.
   auto-implementation ledger are unported and render nowhere.
 
 Current families include files and shell, Git, Mac apps, Mail/Calendar/Contacts/
-Music, visible browser, screen vision, research, memory and graph, Workshop,
+Music, visible browser, screen vision, research, memory and graph, Desk,
 workflows, GitHub, Slack, X, Telegram, notifications, image generation, system
 doctor/repair, backup/restore, skills, tool registry, MCP, and local agent
 handoffs. Availability depends on policy, credentials, platform permissions,
@@ -222,7 +222,7 @@ progress. NativeAgent projects supported actions into one bounded phase and
 verification vocabulary while preserving the exact domain state underneath.
 MCP transport normalization prevents raw and wrapped remote errors from being
 reported differently; the tool causal boundary connects supported result
-envelopes to the existing Workshop, Browser, Mac Control, and external-send
+envelopes to the existing Desk execution, Browser, Mac Control, and external-send
 owners.
 
 This does not make a transport response authoritative. A successful MCP call,
@@ -268,7 +268,7 @@ changing the chosen authentication route.
 - Loopback bridges bind to the loopback interface and also require bearer auth.
 - Session indexes and critical transaction ledgers fail closed on malformed
   state rather than treating corruption as an empty fresh install.
-- Action, approval, tool, Workshop, notification, and delivery receipts make
+- Action, approval, tool, Desk execution, notification, and delivery receipts make
   completion claims inspectable.
 
 NativeAgent is still a single-operator system. Its shell deny list is

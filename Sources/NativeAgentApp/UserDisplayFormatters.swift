@@ -16,6 +16,13 @@ import Foundation
 enum UserDisplayFormatters {
     // MARK: - Timestamps
 
+    // Value-typed, immutable parse strategies are safe to share and avoid
+    // constructing two Foundation formatter objects for every timestamp in a
+    // list render. Fractional and plain wire shapes remain distinct because
+    // both are produced by NativeAgent's durable stores.
+    private static let fractionalISO = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
+    private static let plainISO = Date.ISO8601FormatStyle()
+
     /// Convert an ISO-8601 timestamp (with or without fractional seconds) to
     /// a relative phrase like "5 weeks ago" / "in 3 hours". On parse failure
     /// returns the raw input — better than dropping the field, but signals
@@ -24,9 +31,7 @@ enum UserDisplayFormatters {
     static func humanizeISOTimestamp(_ iso: String) -> String {
         let trimmed = iso.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return "" }
-        let fmt = ISO8601DateFormatter()
-        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let date = fmt.date(from: trimmed) ?? ISO8601DateFormatter().date(from: trimmed)
+        let date = parseISOTimestamp(trimmed)
         guard let date else { return trimmed }
         let rel = RelativeDateTimeFormatter()
         rel.unitsStyle = .full
@@ -37,9 +42,17 @@ enum UserDisplayFormatters {
     static func parseISOTimestamp(_ iso: String) -> Date? {
         let trimmed = iso.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return nil }
-        let fmt = ISO8601DateFormatter()
-        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return fmt.date(from: trimmed) ?? ISO8601DateFormatter().date(from: trimmed)
+        return (try? fractionalISO.parse(trimmed)) ?? (try? plainISO.parse(trimmed))
+    }
+
+    /// Timestamp used under a chat bubble. Kept here with the canonical wire
+    /// parser so every bubble does not rebuild its own pair of ISO formatters.
+    static func chatTimestamp(_ iso: String, calendar: Calendar = .current) -> String {
+        guard let date = parseISOTimestamp(iso) else { return iso }
+        return date.formatted(
+            date: calendar.isDateInToday(date) ? .omitted : .abbreviated,
+            time: .shortened
+        )
     }
 
     /// Relative phrase ("5m ago") with a caller-chosen units style. Use this

@@ -210,6 +210,11 @@ final class iCloudBridge: ObservableObject {
                 cloudKitTransportActive: deviceTransport != nil,
                 ubiquityContainerAvailable: false
             ) {
+                // Transport selection is now final: there is no Drive root to
+                // replace this cache. Starting projection here avoids building
+                // the same heavy snapshots once for the temporary CloudKit
+                // cache and again moments later when Drive resolves.
+                MacSyncEngine.shared.startCloudKitSnapshotProjection()
                 available = true
                 syncStatus = "CloudKit ready — iCloud Drive unavailable"
                 return
@@ -294,7 +299,6 @@ final class iCloudBridge: ObservableObject {
         available = true
         syncStatus = "CloudKit connecting…"
         NSLog("[iCloudBridge] device transport: CloudKit ACTIVE (role=mac)")
-        MacSyncEngine.shared.startCloudKitSnapshotProjection()
 
         Task {
             await transport.observeIncoming { [weak self] msg in

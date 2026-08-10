@@ -286,7 +286,7 @@ private func stubSession() -> URLSession {
         #expect(resolved.standardizedFileURL == appSupportAuth.standardizedFileURL)
     }
 
-    @Test func preferredAuthPath_uses_sharedCodex_when_appOwnedAuth_is_missing() throws {
+    @Test func preferredAuthPath_uses_sharedCodex_only_after_recorded_consent() throws {
         let base = FileManager.default.temporaryDirectory
             .appendingPathComponent("oauth-path-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: base) }
@@ -295,6 +295,9 @@ private func stubSession() -> URLSession {
         let appSupport = base.appendingPathComponent("AppSupport", isDirectory: true)
         let sharedCodexHome = base.appendingPathComponent(".codex", isDirectory: true)
         let sharedAuth = sharedCodexHome.appendingPathComponent("auth.json")
+        let appSupportAuth = appSupport
+            .appendingPathComponent("codex_home", isDirectory: true)
+            .appendingPathComponent("auth.json")
 
         writeAuthJSON([
             "tokens": [
@@ -303,14 +306,106 @@ private func stubSession() -> URLSession {
             ],
         ], to: sharedAuth)
 
-        let resolved = OpenAIOAuthDirectAdapter.preferredAuthPath(
-            dataRoot: repoData,
-            environment: [:],
-            currentDirectoryPath: repo.path,
-            appSupportRoot: appSupport,
-            userCodexHome: sharedCodexHome
-        )
-        #expect(resolved.standardizedFileURL == sharedAuth.standardizedFileURL)
+        func resolve() -> URL {
+            OpenAIOAuthDirectAdapter.preferredAuthPath(
+                dataRoot: repoData,
+                environment: [:],
+                currentDirectoryPath: repo.path,
+                appSupportRoot: appSupport,
+                userCodexHome: sharedCodexHome,
+                defaultRoot: repoData
+            )
+        }
+        func candidates() -> [URL] {
+            OpenAIOAuthDirectAdapter.authPathCandidates(
+                dataRoot: repoData,
+                environment: [:],
+                currentDirectoryPath: repo.path,
+                appSupportRoot: appSupport,
+                userCodexHome: sharedCodexHome,
+                defaultRoot: repoData
+            ).map(\.standardizedFileURL)
+        }
+
+        // No recorded decision: the shared CLI session is not even a
+        // candidate, and resolution falls back to the writable app-owned
+        // path (0.3.8 silent-adoption lesson).
+        #expect(!candidates().contains(sharedAuth.standardizedFileURL))
+        #expect(resolve().standardizedFileURL == appSupportAuth.standardizedFileURL)
+
+        // Declined: same fail-closed result.
+        try OpenAIOAuthDirectAdapter.recordCLIAdoptionConsent(
+            .declined, source: "test", dataRoot: repoData)
+        #expect(!candidates().contains(sharedAuth.standardizedFileURL))
+        #expect(resolve().standardizedFileURL == appSupportAuth.standardizedFileURL)
+
+        // Allowed: the shared CLI session joins the candidates LAST and wins
+        // resolution only while no app-owned path has usable tokens.
+        try OpenAIOAuthDirectAdapter.recordCLIAdoptionConsent(
+            .allowed, source: "test", dataRoot: repoData)
+        #expect(candidates().last == sharedAuth.standardizedFileURL)
+        #expect(resolve().standardizedFileURL == sharedAuth.standardizedFileURL)
+
+        // An in-app (re-)auth writes app-owned tokens; every app-owned
+        // candidate outranks the adopted CLI session, so the fresh sign-in
+        // must win immediately even with consent still allowed (gpt-5.5
+        // review round 2 — stale adopted session outranked a fresh re-auth).
+        writeAuthJSON([
+            "tokens": [
+                "access_token": makeAccessJWT(accountID: "acct_appowned"),
+                "refresh_token": "refresh",
+            ],
+        ], to: appSupportAuth)
+        #expect(resolve().standardizedFileURL == appSupportAuth.standardizedFileURL)
+    }
+
+    @Test func cliAdoptionConsent_malformed_record_reads_as_no_consent() throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("oauth-consent-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let path = OpenAIOAuthDirectAdapter.cliAdoptionConsentPath(dataRoot: base)
+        try FileManager.default.createDirectory(
+            at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("not json".utf8).write(to: path)
+        #expect(OpenAIOAuthDirectAdapter.cliAdoptionConsent(dataRoot: base) == nil)
+        guard case .corrupt(let reason) = OpenAIOAuthDirectAdapter
+            .cliAdoptionConsentState(dataRoot: base) else {
+            Issue.record("expected corrupt checked consent state")
+            return
+        }
+        #expect(reason.contains("malformed"))
+        // Fail-closed read must not rewrite existing state.
+        #expect(try String(contentsOf: path, encoding: .utf8) == "not json")
+        // And a write over corrupt authority must refuse, byte-preserving it.
+        #expect(throws: (any Error).self) {
+            try OpenAIOAuthDirectAdapter.recordCLIAdoptionConsent(
+                .allowed, source: "test", dataRoot: base)
+        }
+        #expect(try String(contentsOf: path, encoding: .utf8) == "not json")
+
+        let backup = try OpenAIOAuthDirectAdapter
+            .backupAndResetCorruptCLIAdoptionConsent(dataRoot: base)
+        #expect(try String(contentsOf: backup, encoding: .utf8) == "not json")
+        #expect(FileManager.default.fileExists(atPath: path.path) == false)
+        #expect(OpenAIOAuthDirectAdapter.cliAdoptionConsentState(dataRoot: base) == .missing)
+
+        try OpenAIOAuthDirectAdapter.recordCLIAdoptionConsent(
+            .allowed, source: "test-after-repair", dataRoot: base)
+        #expect(OpenAIOAuthDirectAdapter.cliAdoptionConsentState(dataRoot: base) == .allowed)
+    }
+
+    @Test func cliAdoptionConsent_checked_state_distinguishes_missing_and_decisions() throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("oauth-consent-state-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+
+        #expect(OpenAIOAuthDirectAdapter.cliAdoptionConsentState(dataRoot: base) == .missing)
+        try OpenAIOAuthDirectAdapter.recordCLIAdoptionConsent(
+            .declined, source: "test", dataRoot: base)
+        #expect(OpenAIOAuthDirectAdapter.cliAdoptionConsentState(dataRoot: base) == .declined)
+        try OpenAIOAuthDirectAdapter.recordCLIAdoptionConsent(
+            .allowed, source: "test", dataRoot: base)
+        #expect(OpenAIOAuthDirectAdapter.cliAdoptionConsentState(dataRoot: base) == .allowed)
     }
 
     @Test func preferredAuthPath_respects_explicit_codexHome_even_when_appSupport_has_token() throws {

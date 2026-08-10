@@ -7,7 +7,7 @@ Modules/NativeAgentCore/Sources/ChatOrchestration/ChatCompactionDistiller.swift	
 Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+AutonomyGate.swift	*	1	timeout_retry_deadline	AutonomyGate
 Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+ToolLoop.swift	*	1	timeout_retry_deadline	ToolDispatchDeadline
 Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+TurnEngine.swift	*	1	timeout_retry_deadline	TurnEngine.attentionRead
-Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+AgentBridgeTools.swift	*	7	timeout_retry_deadline	AgentBridgeToolDispatch
+Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+AgentBridgeTools.swift	*	1	timeout_retry_deadline	AgentBridgeToolDispatch
 Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+SubprocessSupport.swift	*	3	timeout_retry_deadline	ToolSubprocessOwner
 Modules/NativeAgentCore/Sources/Context/ContextSourceMonitoring.swift	*	1	event_deadline	ContextSourceDebouncer
 Modules/NativeAgentCore/Sources/Dispatcher/Actions/FileSystemActions.swift	*	2	timeout_retry_deadline	FileSystemProcessOwner
@@ -15,6 +15,7 @@ Modules/NativeAgentCore/Sources/MCPDispatcher/MCPHTTPTransport.swift	*	1	timeout
 Modules/NativeAgentCore/Sources/MCPDispatcher/MCPSubprocess+Pool.swift	*	1	event_deadline	MCPSubprocessPool.idleDeadline
 Modules/NativeAgentCore/Sources/MCPDispatcher/MCPSubprocess+Process.swift	*	1	timeout_retry_deadline	MCPSubprocessProcess
 Modules/NativeAgentCore/Sources/MacControl/MacControl+Client.swift	*	3	timeout_retry_deadline	MacControlOperationOwner
+Modules/NativeAgentCore/Sources/MacControl/TrustedRemoteEffectNodes.swift	*	2	timeout_retry_deadline	TrustedRemoteEffectNodeProcessDeadline
 Modules/NativeAgentCore/Sources/NativeAgentCore/ProcessTreeReaper.swift	*	1	timeout_retry_deadline	ProcessTreeReaper
 Modules/NativeAgentCore/Sources/MemoryV2/MemoryV2+CloudKit.swift	*	2	external_protocol_poll	MemoryCloudKitTransport
 Modules/NativeAgentCore/Sources/MemoryV2/MemoryV2+EmbeddingRuntime.swift	*	1	timeout_retry_deadline	EmbeddingRuntimeBackoff
@@ -66,7 +67,6 @@ Sources/NativeAgentApp/MemoryView.swift	*	2	visible_ui	MemoryViewUI
 Sources/NativeAgentApp/MenuBarController.swift	*	1	visible_ui	MenuBarUI
 Sources/NativeAgentApp/NativeAgentApp.swift	*	1	visible_ui	NativeAgentAppUI
 Sources/NativeAgentApp/NativeClient+ChatRuntime.swift	*	1	timeout_retry_deadline	ChatSlowNetworkAdvisory
-Sources/NativeAgentApp/NativeClient+SystemOpsActions.swift	*	2	timeout_retry_deadline	SystemOpsProcessOwner
 Sources/NativeAgentApp/NativeCognitionRuntime.swift	*	2	event_deadline	NativeCognitionRuntime
 Sources/NativeAgentApp/NativeCognitionRuntime+Deadlines.swift	*	1	event_deadline	NativeCognitionRuntime
 Sources/NativeAgentApp/NativeOAuthFlow+Loopback.swift	*	1	timeout_retry_deadline	OAuthLoopbackExpiry

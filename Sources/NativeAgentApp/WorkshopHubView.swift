@@ -16,22 +16,23 @@ import CoreSpotlight
 import CloudKit
 #endif
 
-// PATCH-2026-05-19: ui-pull-together — Executions keeps execution-adjacent
-// operational pages only. Self-Improvement owns harness proposals separately.
-private enum WorkshopMode: String, CaseIterable, Identifiable {
-    case desk = "Bench"
+// The Desk is the agent's one work surface. Schedule and Research are adjacent
+// views over the same mind and canonical stores; the Workshop execution engine
+// remains an implementation detail behind directed Desk runs.
+private enum DeskMode: String, CaseIterable, Identifiable {
+    case desk = "Desk"
     case schedule = "Schedule"
     case research = "Research"
     var id: String { rawValue }
 }
 
-struct WorkshopHubView: View {
-    @State private var mode: WorkshopMode = .desk
+struct DeskHubView: View {
+    @State private var mode: DeskMode = .desk
 
     var body: some View {
         VStack(spacing: 12) {
-            Picker("Workshop", selection: $mode) {
-                ForEach(WorkshopMode.allCases) { item in
+            Picker("Desk", selection: $mode) {
+                ForEach(DeskMode.allCases) { item in
                     Text(item.rawValue).tag(item)
                 }
             }
@@ -48,7 +49,7 @@ struct WorkshopHubView: View {
                 }
             }
         }
-        .navigationTitle("Workshop")
+        .navigationTitle("Desk")
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button("New Task", systemImage: "plus.circle") {
@@ -65,9 +66,9 @@ struct WorkshopHubView: View {
 }
 
 // B2.3: the single unique control salvaged from the retired Command Center —
-// Title + Objective → AppModel.createWorkshopTask. Behavior mirrors the old
-// panel: createWorkshopTask reports via statusText ("Workshop task created" on
-// success, "Workshop task creation failed: …" on error), so we dismiss only
+// Title + Objective → AppModel.createWorkshopTask. The implementation keeps
+// its compatibility name, but the user-facing task belongs to the Desk. We
+// dismiss only when the runner did not report a creation failure.
 // when the status does not indicate failure, never eating the user's text.
 struct NewWorkshopTaskSheet: View {
     @Environment(AppModel.self) private var appModel
@@ -78,7 +79,7 @@ struct NewWorkshopTaskSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
-            Text("New Workshop Task")
+            Text("New Desk Task")
                 .font(NativeAgentFont.title)
 
             Form {
@@ -114,7 +115,7 @@ struct NewWorkshopTaskSheet: View {
                 objective: nextObjective.isEmpty ? nextTitle : nextObjective
             )
             submitting = false
-            if !appModel.statusText.hasPrefix("Workshop task creation failed") {
+            if !appModel.statusText.hasPrefix("Desk task creation failed") {
                 dismiss()
             }
         }

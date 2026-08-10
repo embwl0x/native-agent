@@ -55,6 +55,15 @@ public struct ProviderModelDescriptor: Sendable, Equatable {
 }
 
 public enum OpenRouterModelCatalog {
+    public enum CachedModelAvailability: Equatable, Sendable {
+        /// A recent live-backed cache contains the exact id.
+        case available
+        /// A recent live-backed cache does not contain the exact id.
+        case unavailable
+        /// No recent live-backed catalog exists; offline fallback/stale bytes
+        /// are insufficient evidence to reject a user pin.
+        case unknown
+    }
     public static let endpoint = URL(string: "https://openrouter.ai/api/v1/models?output_modalities=text")!
 
     /// Shared TTL + backoff machinery (R-M3). OpenRouter keeps only its own
@@ -84,6 +93,21 @@ public enum OpenRouterModelCatalog {
         ttlCache.cacheIsStale(dataRoot: dataRoot, now: now)
     }
 
+    public static func cachedAvailability(
+        of modelID: String,
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        now: Date = Date()
+    ) -> CachedModelAvailability {
+        guard !cacheIsStale(dataRoot: dataRoot, now: now),
+              let cached = readCache(dataRoot: dataRoot),
+              !cached.isEmpty else {
+            return .unknown
+        }
+        let wanted = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !wanted.isEmpty else { return .unavailable }
+        return cached.contains(where: { $0.id == wanted }) ? .available : .unavailable
+    }
+
     private static func cacheUpdatedAt(dataRoot: URL) -> Date? {
         let path = cachePath(dataRoot: dataRoot)
         guard let data = try? Data(contentsOf: path),
@@ -103,21 +127,26 @@ public enum OpenRouterModelCatalog {
         await models(dataRoot: dataRoot, session: session, refresh: refresh).map { $0.providerJSON() }
     }
 
+    /// Served only when both the on-disk cache and a live fetch are
+    /// unavailable. Ids must exist on OpenRouter TODAY — a retired id here
+    /// turns the no-network first-run picker into a 404 factory. Verified
+    /// against the live /api/v1/models response 2026-08-07 (the previous
+    /// entry `anthropic/claude-3.5-sonnet` had been delisted).
     public static func fallbackModels() -> [ProviderModelDescriptor] {
         sortModels([
             ProviderModelDescriptor(
                 id: "meta-llama/llama-3.3-70b-instruct",
                 name: "Llama 3.3 70B (OpenRouter)",
-                contextLength: 128_000,
+                contextLength: 131_072,
                 supportsStreaming: false,
                 supportsVision: false,
                 supportsTools: false,
                 supportsJSONMode: false
             ),
             ProviderModelDescriptor(
-                id: "anthropic/claude-3.5-sonnet",
-                name: "Claude 3.5 Sonnet (OpenRouter)",
-                contextLength: 200_000,
+                id: "anthropic/claude-sonnet-5",
+                name: "Claude Sonnet 5 (OpenRouter)",
+                contextLength: 1_000_000,
                 supportsStreaming: false,
                 supportsVision: false,
                 supportsTools: false,

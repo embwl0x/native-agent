@@ -67,6 +67,15 @@ public final class OpenRouterAdapter: LLMAdapter {
             throw mapTransportError(error, fallback: .underlying(message: "connection refused: \(endpoint.host ?? "openrouter")"))
         }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if status == 404 {
+            let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+            _ = await OpenRouterModelCatalog.models(
+                dataRoot: root,
+                session: session,
+                refresh: true
+            )
+            throw LLMError.modelUnavailable(provider: "openrouter", model: model)
+        }
         try throwIfChatCompletionsError(status: status, data: data, mapping: Self.statusMapping, response: response)
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let choices = obj["choices"] as? [[String: Any]],
@@ -134,6 +143,19 @@ public final class OpenRouterAdapter: LLMAdapter {
                     let body = await Self.drainErrorBody(
                         bytes, maxBytes: 4096, timeout: 2.0
                     )
+                    if status == 404 {
+                        let root = self.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+                        _ = await OpenRouterModelCatalog.models(
+                            dataRoot: root,
+                            session: session,
+                            refresh: true
+                        )
+                        continuation.finish(throwing: LLMError.modelUnavailable(
+                            provider: "openrouter",
+                            model: model
+                        ))
+                        return
+                    }
                     do {
                         try throwIfChatCompletionsError(
                             status: status, data: body, mapping: Self.statusMapping, response: response

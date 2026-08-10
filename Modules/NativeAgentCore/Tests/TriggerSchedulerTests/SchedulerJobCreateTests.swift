@@ -33,6 +33,11 @@ private func readJobs(root: URL) throws -> [JSONValue] {
     return arr
 }
 
+private func writeJSON(_ value: JSONValue, to url: URL) throws {
+    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try value.serializedData(pretty: false).write(to: url, options: .atomic)
+}
+
 private func readActivityLines(root: URL) throws -> [JSONValue] {
     let url = root.appendingPathComponent("activity", isDirectory: true)
         .appendingPathComponent("events.jsonl")
@@ -126,6 +131,41 @@ private func makeSchedulerClient(root: URL) -> SwiftNativeTriggerScheduler {
     }
     // Nothing persisted on the validation throw (normalization runs before write).
     #expect(try readJobs(root: root).isEmpty)
+}
+
+@Test func installWorkshopBlueprintIsIdempotentAndRepairsCancelledVersion() async throws {
+    let root = try makeTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let client = makeSchedulerClient(root: root)
+    let body: JSONValue = .object([
+        "id": .string("native-experience-project-status"),
+        "name": .string("Project status"),
+        "kind": .string("workshop"),
+        "schedule": .object(["type": .string("daily"), "at": .string("17:00")]),
+        "payload": .object([
+            "title": .string("Project status"),
+            "objective": .string("Review the selected project with read-only evidence."),
+            "expectedEvidence": .string("Git and Workshop receipts"),
+            "blueprintId": .string("project-status"),
+            "blueprintVersion": .int(1),
+        ]),
+    ])
+    let first = obj(try await client.installBlueprintJob(body: body))
+    #expect(str(first["status"]) == "installed")
+    let second = obj(try await client.installBlueprintJob(body: body))
+    #expect(str(second["status"]) == "already_present")
+    #expect(try readJobs(root: root).count == 1)
+
+    let jobsPath = root.appendingPathComponent("scheduler/jobs.json")
+    var row = obj(try readJobs(root: root).first)
+    row["enabled"] = .bool(false)
+    row["status"] = .string("cancelled")
+    try writeJSON(.array([.object(row)]), to: jobsPath)
+    let repaired = obj(try await client.installBlueprintJob(body: body))
+    #expect(str(repaired["status"]) == "repaired")
+    let persisted = obj(try readJobs(root: root).first)
+    #expect(persisted["enabled"] == .bool(true))
+    #expect(str(persisted["status"]) != "cancelled")
 }
 
 // MARK: - runtime schedule advancement

@@ -73,16 +73,33 @@ struct QueuedChatTurn: Identifiable, Equatable, Sendable {
     var shouldDisplayInSendNextQueue: Bool { !hideUserBubble }
 }
 
+struct AppMutationResult: Equatable, Sendable {
+    let succeeded: Bool
+    let userMessage: String
+
+    static func success(_ message: String) -> Self {
+        Self(succeeded: true, userMessage: message)
+    }
+
+    static func failure(_ message: String) -> Self {
+        Self(succeeded: false, userMessage: message)
+    }
+}
+
 @MainActor
 extension AppModel {
-    func compactActiveChat() async {
-        guard !activeChatSessionId.isEmpty else { return }
+    func compactActiveChat() async -> AppMutationResult {
+        guard !activeChatSessionId.isEmpty else {
+            return .failure("No active session to compact")
+        }
         do {
             _ = try await client.compactSession(sessionId: activeChatSessionId, force: true)
             chatMessages = (try? await client.getChatMessages(sessionId: activeChatSessionId)) ?? chatMessages
             statusText = "Session compacted"
+            return .success(statusText)
         } catch {
             statusText = "Compact failed: \(error.localizedDescription)"
+            return .failure(statusText)
         }
     }
 
@@ -189,30 +206,34 @@ extension AppModel {
 
     // PATCH-2026-05-08: wave2-chat-ux slash /remember
     @MainActor
-    func addMemoryFact(_ text: String) async {
+    func addMemoryFact(_ text: String) async -> AppMutationResult {
         do {
             _ = try await client.addMemory(text: text)
             statusText = "Memory saved"
+            return .success(statusText)
         } catch {
             statusText = "Remember failed: \(error.localizedDescription)"
+            return .failure(statusText)
         }
     }
 
     // PATCH-Phase1a-dispatcher: /note slash command handler.
     // POSTs to /v1/notes → daemon dispatches commit_memory via Dispatcher.run().
     // Same execution path as the agent calling commit_memory as a tool.
-    func addNote(_ text: String) async {
+    func addNote(_ text: String) async -> AppMutationResult {
         do {
             _ = try await client.postNote(text: text, kind: "user_note")
             statusText = "Note committed"
+            return .success(statusText)
         } catch {
             statusText = "Note failed: \(error.localizedDescription)"
+            return .failure(statusText)
         }
     }
 
     // PATCH-phase-3c: /scratch slash command handler.
     // POSTs to /v1/scratch → daemon dispatches scratchpad_write via Dispatcher.run().
-    func writeScratch(key: String, value: String) async -> Bool {
+    func writeScratch(key: String, value: String) async -> AppMutationResult {
         do {
             let sessionId = activeChatSessionId.isEmpty ? nil : activeChatSessionId
             let body = try await client.postScratch(key: key, value: value, sessionId: sessionId)
@@ -223,13 +244,13 @@ extension AppModel {
             guard (body["ok"] as? Bool) == true else {
                 let reason = (body["error"] as? String) ?? "scratch write rejected"
                 statusText = "Scratch write failed: \(reason)"
-                return false
+                return .failure(statusText)
             }
             statusText = "Scratch \(key) set"
-            return true
+            return .success(statusText)
         } catch {
             statusText = "Scratch write failed: \(error.localizedDescription)"
-            return false
+            return .failure(statusText)
         }
     }
 

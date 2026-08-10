@@ -35,8 +35,8 @@ struct ContentView: View {
     @State private var showingDoctor = false
     // PATCH-2026-06-06: command-palette — Cmd+K modal sheet flag.
     @State private var showCommandPalette = false
-    // B2.3 follow-up: Workshop's New Task sheet is presented HERE, not in
-    // WorkshopHubView — a sheet attached to NavigationSplitView detail content
+    // B2.3 follow-up: Desk's New Task sheet is presented HERE, not in
+    // DeskHubView — a sheet attached to NavigationSplitView detail content
     // presents only once per app run on macOS (the bridge never releases the
     // presentation seat after dismiss). ContentView-level sheets re-present
     // reliably (the command palette proves it), so the toolbar button posts
@@ -173,7 +173,7 @@ struct ContentView: View {
                     case .activity: ActivityView()
                     case .memories: MemoryView()
                     case .skills: SkillsToolsView(selection: skillsToolsSection)
-                    case .workshop: WorkshopHubView()
+                    case .desk: DeskHubView()
                     case .personality: PersonalityView()
                     case .connectors: ConnectorsView()
                     case .trust: TrustCenterView()
@@ -202,8 +202,8 @@ struct ContentView: View {
                     // ── Legacy aliases (unreachable post-normalize, kept exhaustive) ───
                     // .autoImprovement → .activity and .panels → .diagnostics
                     // joined this list in the 2026-07-03 dead-weight sweep.
-                    // .command → .workshop joined 2026-07-23 (Command Center retired).
-                    case .memory, .settingsHub, .approvals, .legacyWorkshop, .desk, .work, .skillLifecycle, .tools,
+                    // .command/.workshop → .desk keep retired routes and saved state working.
+                    case .memory, .settingsHub, .approvals, .workshop, .legacyWorkshop, .work, .skillLifecycle, .tools,
                          .autoImprovement, .panels, .command:
                         EmptyView()  // unreachable: .normalized routes these above
                     }
@@ -263,6 +263,24 @@ struct ContentView: View {
         }
         .task {
             await checkFirstRunOnboardingIfNeeded()
+        }
+        // All Mac projections of chat sessions share AppModel's one canonical
+        // list: Chat, detached-window titles, Status, command search, and the
+        // optional project/session lineage page. Keep it current from the
+        // canonical index while the app scene is active. This watcher is
+        // vnode-driven, burst-coalesced, and performs no idle polling; the
+        // lightweight refresh also suppresses equal observed writes.
+        .task(id: scenePhase) {
+            guard scenePhase == .active else { return }
+            let sessionIndexPath = PersistenceCore.defaultDataRoot()
+                .appendingPathComponent("chat", isDirectory: true)
+                .appendingPathComponent("sessions.json")
+            await ViewFileRefreshTask.run(
+                paths: [sessionIndexPath],
+                debounceDelay: .milliseconds(150)
+            ) {
+                await appModel.refreshChatSessionIndex()
+            }
         }
         .sheet(isPresented: $showFirstRunOnboarding) {
             OnboardingWizard {
@@ -377,7 +395,7 @@ struct ContentView: View {
         switch item {
         case .activity:
             return appModel.pendingActivityCount
-        case .workshop:
+        case .desk:
             return 0
         default:
             return 0
@@ -786,7 +804,7 @@ extension Notification.Name {
     static let openTelegramRequest = Notification.Name("NativeAgent.openTelegramRequest")
     static let openCommandRouteRequest = Notification.Name("NativeAgent.openCommandRouteRequest")
     static let openCommandPaletteRequest = Notification.Name("NativeAgent.openCommandPaletteRequest")
-    /// B2.3 follow-up: posted by Workshop's New Task toolbar button; ContentView
+    /// B2.3 follow-up: posted by Desk's New Task toolbar button; ContentView
     /// owns the sheet (detail-attached sheets present only once on macOS).
     static let newWorkshopTaskRequest = Notification.Name("NativeAgent.newWorkshopTaskRequest")
     static let iCloudInboxDidProcess = Notification.Name("NativeAgent.iCloudInboxDidProcess")

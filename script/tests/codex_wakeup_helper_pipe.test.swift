@@ -8,10 +8,10 @@
 // shipped pattern (readabilityHandler armed before run()), both driven against
 // a child that emits far more than one macOS pipe buffer (~64KB).
 //
-// Drift guard: the node suite asserts that the shipped
-// SwiftToolDispatcher+AgentBridgeTools.swift still uses the pattern this file
-// proves correct ("shipped helper arms pipe drains before process.run"), so a
-// revert of the real fix fails there even though this file keeps passing.
+// Drift guard: the node suite asserts that all three shipped builder helpers
+// delegate to SystemProcessAdapter, whose pipe readers are armed before run,
+// stdin writer is off-thread, and capture is bounded. A revert to local
+// polling fails there even though this mechanism proof keeps passing.
 
 import Foundation
 
@@ -62,8 +62,8 @@ func preFixRun() -> (timedOut: Bool, stdoutBytes: Int) {
     return (false, out.count)
 }
 
-/// SHIPPED shape: accumulators attached to both pipes before run(), stdin
-/// written off-thread, bounded EOF wait after exit.
+/// Event-driven adapter mechanism: accumulators attached to both pipes before
+/// run(), stdin written off-thread, bounded EOF wait after exit.
 final class Drain: @unchecked Sendable {
     private let lock = NSLock()
     private let finished = DispatchSemaphore(value: 0)
@@ -142,10 +142,10 @@ check(pre.timedOut,
       "pre-fix pattern wedges on \(payloadBytes)-byte helper output and reports helper_timeout")
 
 let fixed = fixedRun()
-check(!fixed.timedOut, "shipped pattern completes without hitting the deadline")
+check(!fixed.timedOut, "event-driven pattern completes without hitting the deadline")
 check(fixed.stdoutBytes >= payloadBytes,
-      "shipped pattern captured full stdout (\(fixed.stdoutBytes) bytes >= \(payloadBytes))")
+      "event-driven pattern captured full stdout (\(fixed.stdoutBytes) bytes >= \(payloadBytes))")
 check(fixed.stderrBytes >= payloadBytes,
-      "shipped pattern captured full stderr (\(fixed.stderrBytes) bytes >= \(payloadBytes))")
+      "event-driven pattern captured full stderr (\(fixed.stderrBytes) bytes >= \(payloadBytes))")
 print(failures == 0 ? "\n# swift pipe tests: PASS" : "\n# swift pipe tests: \(failures) FAILED")
 exit(failures == 0 ? 0 : 1)

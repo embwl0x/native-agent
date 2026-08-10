@@ -81,19 +81,24 @@ public struct WorkshopExecutionSpec: Codable, Sendable, Equatable {
     /// Stable Desk identity for the Workshop-owned path. Nil is retained for
     /// daemon-era callers while consumers migrate shadow-first.
     public var deskHandle: String?
+    /// Optional reference to the existing connector workspace registry. This
+    /// is association metadata only; it grants no path or tool authority.
+    public var projectSpaceId: String?
 
     public init(
         title: String,
         objective: String,
         triggerSource: String = "manual",
         trustRequired: String = "none",
-        deskHandle: String? = nil
+        deskHandle: String? = nil,
+        projectSpaceId: String? = nil
     ) {
         self.title = title
         self.objective = objective
         self.triggerSource = triggerSource
         self.trustRequired = trustRequired
         self.deskHandle = deskHandle
+        self.projectSpaceId = projectSpaceId
     }
 }
 
@@ -214,6 +219,7 @@ public struct WorkshopExecutionRecord: Codable, Sendable, Equatable {
     /// Authoritative Workshop/Desk identity. The execution id remains an
     /// internal compatibility key until the legacy queue is retired.
     public var deskHandle: String? = nil
+    public var projectSpaceId: String? = nil
     public var title: String
     public var objective: String
     public var createdAt: String         // "created_at" in JSON
@@ -258,6 +264,9 @@ public struct WorkshopExecutionRecord: Codable, Sendable, Equatable {
         ]
         if let deskHandle, !deskHandle.isEmpty {
             object["desk_handle"] = .string(deskHandle)
+        }
+        if let projectSpaceId, !projectSpaceId.isEmpty {
+            object["project_space_id"] = .string(projectSpaceId)
         }
         if let verification {
             object["verification"] = verification.toJSON()

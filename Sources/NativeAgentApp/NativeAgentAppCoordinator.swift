@@ -25,6 +25,8 @@ enum NativeAgentNavigationDestination: Equatable, Sendable {
         }
 
         switch route.lowercased() {
+        case "journey", "learning-journey", "experience":
+            return .activity(.journey)
         case "activity/approvals", "approvals":
             return .activity(.approvals)
         case "activity/inbox", "inbox":
@@ -43,9 +45,9 @@ enum NativeAgentNavigationDestination: Equatable, Sendable {
         case "skills":
             return .skillsTools(.skills)
         case "workshop", "missions", "desk", "command":
-            // "command" retired 2026-07-23 (Command Center → Workshop); the
-            // route string is kept as an alias so saved deep links still land.
-            return .sidebar(.workshop)
+            // Retired Workshop/Command Center names remain compatibility
+            // aliases; every route lands on the agent's canonical Desk.
+            return .sidebar(.desk)
         case "personality":
             return .sidebar(.personality)
         case "connectors":

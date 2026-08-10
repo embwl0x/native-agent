@@ -34,6 +34,12 @@ struct QueuedChatSend: Identifiable, Codable {
 
 @MainActor
 final class ChatStore: ObservableObject {
+    struct CachedTranscript: Codable {
+        let schemaVersion: Int
+        let sessionID: String?
+        let messages: [ChatMessage]
+    }
+
     @Published var messages: [ChatMessage] = [] {
         didSet {
             noteMessageArrivals(previous: oldValue, current: messages)
@@ -60,21 +66,18 @@ final class ChatStore: ObservableObject {
     /// session, but cap the on-disk copy too).
     private let queuedSendsKey = "NativeAgentMobile.chatQueuedSends.v1"
     private let maxPersistedQueuedSends = 60
-    /// Restore runs ONCE per process: production relaunch = new process = one
-    /// restore. Multiple in-process instances (tests) must not each restore —
-    /// the persisted queue would duplicate into every instance (the full
-    /// script/test.sh iOS gate caught exactly that: [first, second] became
-    /// [first, second, first, second]).
-    private static var didRestoreQueuedSendsThisProcess = false
+    /// Production has one app-owned store, so queue restoration has one owner.
+    /// Tests inject an isolated defaults suite and may opt out of restoration.
+    let defaults: UserDefaults
 
     private func persistQueuedSends() {
         let trimmed = Array(queuedSends.suffix(maxPersistedQueuedSends))
         if trimmed.isEmpty {
-            UserDefaults.standard.removeObject(forKey: queuedSendsKey)
+            defaults.removeObject(forKey: queuedSendsKey)
             return
         }
         if let data = try? JSONEncoder().encode(trimmed) {
-            UserDefaults.standard.set(data, forKey: queuedSendsKey)
+            defaults.set(data, forKey: queuedSendsKey)
         }
     }
     @Published var pausedQueueSessionKeys: Set<String> = []
@@ -102,28 +105,28 @@ final class ChatStore: ObservableObject {
     let transcriptPrefix = "NativeAgentMobile.chatMessages.session."
     var suppressMessagePersistence = false
 
-    init() {
-        if !UserDefaults.standard.bool(forKey: "NativeAgent.unifiedSession.v1") {
-            UserDefaults.standard.removeObject(forKey: Self.selectedSessionIDKey)
-            UserDefaults.standard.removeObject(forKey: Self.mainSessionIDKey)
-            UserDefaults.standard.set(true, forKey: "NativeAgent.unifiedSession.v1")
+    init(defaults: UserDefaults = .standard, restoreQueuedSends: Bool = true) {
+        self.defaults = defaults
+        if !defaults.bool(forKey: "NativeAgent.unifiedSession.v1") {
+            defaults.removeObject(forKey: Self.selectedSessionIDKey)
+            defaults.removeObject(forKey: Self.mainSessionIDKey)
+            defaults.set(true, forKey: "NativeAgent.unifiedSession.v1")
         }
-        let savedSelected = Self.cleanSessionID(UserDefaults.standard.string(forKey: Self.selectedSessionIDKey))
-        let savedMain = Self.cleanSessionID(UserDefaults.standard.string(forKey: Self.mainSessionIDKey)) ?? savedSelected
+        let savedSelected = Self.cleanSessionID(defaults.string(forKey: Self.selectedSessionIDKey))
+        let savedMain = Self.cleanSessionID(defaults.string(forKey: Self.mainSessionIDKey)) ?? savedSelected
         selectedSessionID = savedSelected
         mainSessionID = savedMain
         // 2026-07-21 audit fix: restore persisted queued sends (were in-memory
-        // only; a relaunch silently discarded user-composed messages). Once
-        // per process — see didRestoreQueuedSendsThisProcess.
-        if !Self.didRestoreQueuedSendsThisProcess {
-            Self.didRestoreQueuedSendsThisProcess = true
-            if let queueData = UserDefaults.standard.data(forKey: queuedSendsKey),
-               let restoredQueue = try? JSONDecoder().decode([QueuedChatSend].self, from: queueData) {
-                queuedSends = restoredQueue
-            }
+        // only; a relaunch silently discarded user-composed messages). ChatStore
+        // is owned once at the App boundary, so no process-global restore latch
+        // can strand the queue when a view/store is recreated.
+        if restoreQueuedSends,
+           let queueData = defaults.data(forKey: queuedSendsKey),
+           let restoredQueue = try? JSONDecoder().decode([QueuedChatSend].self, from: queueData) {
+            queuedSends = Array(restoredQueue.suffix(maxPersistedQueuedSends))
         }
-        if let savedMain, UserDefaults.standard.string(forKey: Self.mainSessionIDKey) == nil {
-            UserDefaults.standard.set(savedMain, forKey: Self.mainSessionIDKey)
+        if let savedMain, defaults.string(forKey: Self.mainSessionIDKey) == nil {
+            defaults.set(savedMain, forKey: Self.mainSessionIDKey)
         }
         messages = loadCachedMessages(for: savedSelected ?? savedMain)
     }
@@ -137,9 +140,9 @@ final class ChatStore: ObservableObject {
         let clean = Self.cleanSessionID(value)
         selectedSessionID = clean
         if let clean {
-            UserDefaults.standard.set(clean, forKey: Self.selectedSessionIDKey)
+            defaults.set(clean, forKey: Self.selectedSessionIDKey)
         } else {
-            UserDefaults.standard.removeObject(forKey: Self.selectedSessionIDKey)
+            defaults.removeObject(forKey: Self.selectedSessionIDKey)
         }
     }
 
@@ -147,22 +150,22 @@ final class ChatStore: ObservableObject {
         let clean = Self.cleanSessionID(value)
         mainSessionID = clean
         if let clean {
-            UserDefaults.standard.set(clean, forKey: Self.mainSessionIDKey)
+            defaults.set(clean, forKey: Self.mainSessionIDKey)
         } else {
-            UserDefaults.standard.removeObject(forKey: Self.mainSessionIDKey)
+            defaults.removeObject(forKey: Self.mainSessionIDKey)
         }
     }
 
     func rememberMainSessionIDIfNeeded(_ value: String?) {
         guard mainSessionID == nil, let clean = Self.cleanSessionID(value) else { return }
         mainSessionID = clean
-        UserDefaults.standard.set(clean, forKey: Self.mainSessionIDKey)
+        defaults.set(clean, forKey: Self.mainSessionIDKey)
     }
 
     func adoptMainSessionIDIfNeeded(_ value: String?) {
         guard mainSessionID == nil, let clean = Self.cleanSessionID(value) else { return }
         mainSessionID = clean
-        UserDefaults.standard.set(clean, forKey: Self.mainSessionIDKey)
+        defaults.set(clean, forKey: Self.mainSessionIDKey)
     }
 
     func transcriptStorageKey(for sessionID: String?) -> String {
@@ -171,17 +174,61 @@ final class ChatStore: ObservableObject {
     }
 
     func loadCachedMessages(for sessionID: String?) -> [ChatMessage] {
-        let keys = [transcriptStorageKey(for: sessionID), transcriptKey]
-        for key in keys {
-            guard let data = UserDefaults.standard.data(forKey: key),
-                  let saved = try? JSONDecoder().decode([ChatMessage].self, from: data) else { continue }
-            return saved.map { msg in
-                var copy = msg
-                copy.isStreaming = false
-                return copy
+        let cleanSessionID = Self.cleanSessionID(sessionID)
+        let exactKey = transcriptStorageKey(for: cleanSessionID)
+        if let data = defaults.data(forKey: exactKey) {
+            guard let saved = decodeCachedTranscript(
+                data,
+                expectedSessionID: cleanSessionID,
+                permitsLegacyArray: exactKey != transcriptKey || cleanSessionID == nil
+            ) else {
+                errorBanner = "The cached transcript for this chat was unreadable. Refreshing from the Mac."
+                return []
             }
+            return normalizedCachedMessages(saved)
         }
-        return []
+
+        // The old global key has no session identity. It is safe only for an
+        // unresolved main session, or when a v2 envelope proves the exact owner.
+        guard exactKey != transcriptKey,
+              let legacyData = defaults.data(forKey: transcriptKey),
+              let saved = decodeCachedTranscript(
+                legacyData,
+                expectedSessionID: cleanSessionID,
+                permitsLegacyArray: false
+              ) else { return [] }
+        let normalized = normalizedCachedMessages(saved)
+        if let envelope = try? JSONEncoder().encode(CachedTranscript(
+            schemaVersion: 2,
+            sessionID: cleanSessionID,
+            messages: normalized
+        )) {
+            defaults.set(envelope, forKey: exactKey)
+        }
+        return normalized
+    }
+
+    private func decodeCachedTranscript(
+        _ data: Data,
+        expectedSessionID: String?,
+        permitsLegacyArray: Bool
+    ) -> [ChatMessage]? {
+        let decoder = JSONDecoder()
+        if let envelope = try? decoder.decode(CachedTranscript.self, from: data),
+           envelope.schemaVersion == 2,
+           Self.cleanSessionID(envelope.sessionID) == expectedSessionID {
+            return envelope.messages
+        }
+        guard permitsLegacyArray else { return nil }
+        return try? decoder.decode([ChatMessage].self, from: data)
+    }
+
+    private func normalizedCachedMessages(_ saved: [ChatMessage]) -> [ChatMessage] {
+        saved.map { msg in
+            var copy = msg
+            copy.isStreaming = false
+            return copy
+        }
     }
 
     /// Set by ChatView after init; called with each assistant reply text so

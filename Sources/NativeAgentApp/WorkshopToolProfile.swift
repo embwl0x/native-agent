@@ -169,13 +169,13 @@ public enum WorkshopMembraneError: Error, LocalizedError, Equatable {
     public var errorDescription: String? {
         switch self {
         case .toolNotPermitted(let tool):
-            return "tool '\(tool)' is not permitted in a workshop session "
+            return "tool '\(tool)' is not permitted in a Desk work session "
                 + "(allowlist: \(WorkshopToolProfile.allowed.sorted().joined(separator: ", ")), "
                 + "plus \(WorkshopToolProfile.artifactToolName)). Anything outward is a desk approval, not a tool call."
         case .badArtifactArgs(let why):
             return "workshop_artifact_write: \(why)"
         case .pathEscapesRoot(let p):
-            return "workshop_artifact_write: path '\(p)' escapes the pursuit's workshop folder"
+            return "workshop_artifact_write: path '\(p)' escapes the pursuit's work folder"
         case .unsafeComponent(let p):
             return "workshop_artifact_write: path '\(p)' contains an unsafe segment (.., separator, NUL, or control char)"
         }

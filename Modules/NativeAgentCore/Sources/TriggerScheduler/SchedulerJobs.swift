@@ -119,8 +119,8 @@ import WorkshopExecution
 //     retirement_path documented in CUTOVER_PLAN §6.180.
 //
 // SCOPE / BOUNDARY:
-//   - FULLY native for all six job kinds: notify, connector_action, dream,
-//     improve, harness_benchmark, proactive_scan. Schedule computation is ported
+//   - FULLY native for all eight job kinds: notify, connector_action, dream,
+//     improve, harness_benchmark, proactive_scan, rem, and workshop. Schedule computation is ported
 //     byte-for-byte across all seven schedule types (once / every / hourly /
 //     daily / weekly / monthly / cron) including the cron field parser.
 //   - `connector_action` validates `payload.actionId` against the Swift
@@ -180,6 +180,18 @@ public protocol SchedulerJobWriter: Sendable {
     /// epoch → ISO-8601 UTC; adds `nextRunAtEpoch` + `nextRunAtISO`). Returns the
     /// decorated array verbatim (`[JSONValue]`).
     func listJobs() async throws -> [JSONValue]
+
+    /// Idempotently install a user-selected blueprint as one canonical job.
+    /// An active row with the same blueprint id/version is retained exactly;
+    /// a cancelled or older row is replaced in place. No passive/background
+    /// path calls this mutation.
+    func installBlueprintJob(body: JSONValue) async throws -> JSONValue
+}
+
+public extension SchedulerJobWriter {
+    func installBlueprintJob(body: JSONValue) async throws -> JSONValue {
+        throw TriggerSchedulerError.schedulerInvalid("blueprint installation is unavailable")
+    }
 }
 
 // MARK: - SwiftNative create-job impl
@@ -283,6 +295,99 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
         }
 
         return job
+    }
+
+    public func installBlueprintJob(body: JSONValue) async throws -> JSONValue {
+        guard case .object(let requested) = body,
+              case .string(let requestedID)? = requested["id"],
+              !requestedID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              case .object(let requestedPayload)? = requested["payload"],
+              case .string(let blueprintID)? = requestedPayload["blueprintId"],
+              case .int(let blueprintVersion)? = requestedPayload["blueprintVersion"],
+              blueprintVersion > 0 else {
+            throw TriggerSchedulerError.schedulerInvalid(
+                "blueprint jobs require id, payload.blueprintId, and payload.blueprintVersion"
+            )
+        }
+        let normalized = try SchedulerJobNormalizer.normalize(
+            body: requested,
+            now: now,
+            uuid: uuid,
+            displayNameFallback: Self.displayNameFallback,
+            connectorActionIDs: connectorActionIDs
+        )
+        let result: (status: String, job: JSONValue) = try await runSerialized {
+            [persistence, jobsPath] () async throws -> (String, JSONValue) in
+            try await persistence.withFileLock(jobsPath) {
+                let raw = await persistence.readJSON(jobsPath, defaultValue: .array([]))
+                var jobs: [JSONValue]
+                if case .array(let rows) = raw { jobs = rows } else { jobs = [] }
+
+                let index = jobs.firstIndex { row in
+                    guard case .object(let object) = row,
+                          case .string(let id)? = object["id"] else { return false }
+                    return id == requestedID
+                }
+                if let index,
+                   case .object(let existing) = jobs[index],
+                   case .bool(true)? = existing["enabled"],
+                   case .object(let existingPayload)? = existing["payload"],
+                   case .string(let existingBlueprintID)? = existingPayload["blueprintId"],
+                   existingBlueprintID == blueprintID,
+                   case .int(let existingBlueprintVersion)? = existingPayload["blueprintVersion"],
+                   existingBlueprintVersion == blueprintVersion {
+                    return ("already_present", jobs[index])
+                }
+
+                let status: String
+                if let index {
+                    jobs[index] = normalized
+                    status = "repaired"
+                } else {
+                    jobs.append(normalized)
+                    status = "installed"
+                }
+                do {
+                    try await persistence.writeJSON(.array(jobs), to: jobsPath)
+                } catch {
+                    throw TriggerSchedulerError.persistenceFailure(String(describing: error))
+                }
+                return (status, normalized)
+            }
+        }
+        if result.status != "already_present" {
+            let event: JSONValue = .object([
+                "id": .string(uuid()),
+                "kind": .string("scheduler"),
+                "title": .string(SchedulerSecretRedactor.redactText("Automation blueprint \(result.status)")),
+                "detail": .string(SchedulerSecretRedactor.redactText(blueprintID)),
+                "status": .string("ok"),
+                "executionId": .null,
+                "payload": SchedulerSecretRedactor.redactValue(.object([
+                    "jobId": .string(requestedID),
+                    "blueprintId": .string(blueprintID),
+                    "blueprintVersion": .int(blueprintVersion),
+                    "installStatus": .string(result.status),
+                ])),
+                "createdAt": .string(SwiftNativeTriggerScheduler.isoTimestamp(now())),
+            ])
+            let eventPath = activityPath
+            let eventPersistence = persistence
+            try await eventPersistence.withFileLock(eventPath) {
+                try await appendJSONLCapped(
+                    event,
+                    to: eventPath,
+                    using: eventPersistence,
+                    maxLines: JSONLLineCaps.activityEvents,
+                    logLabel: "SchedulerJobs.blueprint.activity",
+                    takeLock: false
+                )
+            }
+        }
+        return .object([
+            "status": .string(result.status),
+            "job": result.job,
+        ])
     }
 
     /// Faithful port of Daemon.cancel_job:
@@ -464,7 +569,7 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
 
 enum SchedulerJobNormalizer {
     static let allowedKinds: Set<String> = [
-        "notify", "connector_action", "dream", "rem", "improve", "harness_benchmark", "proactive_scan",
+        "notify", "connector_action", "dream", "rem", "improve", "harness_benchmark", "proactive_scan", "workshop",
     ]
 
     /// DEFAULT_IMPROVEMENT_OBJECTIVE — EXACT copy so a
@@ -577,6 +682,9 @@ enum SchedulerJobNormalizer {
                 "source": .string(string(pyOr(payload["source"], .string("scheduled_job"))) ?? "scheduled_job"),
                 "delivery": .array(delivery.map { .string($0) }),
             ]
+            if case .string(let projectSpaceId)? = payload["projectSpaceId"], !projectSpaceId.isEmpty {
+                outPayload["projectSpaceId"] = .string(projectSpaceId.prefixString(160))
+            }
             // delivery_options = payload.deliveryOptions or payload.delivery_options or {}
             let rawOpts = pyOr(payload["deliveryOptions"], payload["delivery_options"], .object([:]))
             if case .object(let opts)? = rawOpts {
@@ -592,6 +700,25 @@ enum SchedulerJobNormalizer {
                     : (kind == "rem" ? "Scheduled REM consolidation" : "Scheduled reflection")
             }
             outPayload = ["objective": .string(objective.prefixString(2000))]
+        case "workshop":
+            let objective = (string(pyOr(payload["objective"], body["objective"], .string(""))) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !objective.isEmpty else {
+                throw TriggerSchedulerError.schedulerInvalid("workshop jobs require payload.objective")
+            }
+            let title = (string(pyOr(payload["title"], body["title"], .string(name))) ?? name)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let expectedEvidence = (string(pyOr(
+                payload["expectedEvidence"], payload["expected_evidence"], .string("canonical Workshop completion receipt")
+            )) ?? "canonical Workshop completion receipt")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let delivery = deliveryChannels(payload)
+            outPayload = [
+                "title": .string((title.isEmpty ? name : title).prefixString(160)),
+                "objective": .string(objective.prefixString(2000)),
+                "expectedEvidence": .string(expectedEvidence.prefixString(500)),
+                "delivery": .array(delivery.map { .string($0) }),
+            ]
         case "proactive_scan":
             // reason = str(orig.reason or body.reason or "scheduled_proactive_scan")[:120]
             let reason = (string(pyOr(
@@ -659,6 +786,17 @@ enum SchedulerJobNormalizer {
             outPayload = payload
             outPayload["manualAllowed"] = .bool(true)
             outPayload["lightweight"] = .bool(true)
+        }
+
+        // Native Experience blueprints compile into ordinary canonical jobs.
+        // Preserve only their bounded identity/version markers so an explicit
+        // reinstall can be idempotent or repair a cancelled/older row without
+        // creating a parallel blueprint store.
+        if case .string(let blueprintId)? = payload["blueprintId"], !blueprintId.isEmpty {
+            outPayload["blueprintId"] = .string(blueprintId.prefixString(120))
+        }
+        if case .int(let blueprintVersion)? = payload["blueprintVersion"], blueprintVersion > 0 {
+            outPayload["blueprintVersion"] = .int(min(blueprintVersion, 10_000))
         }
 
         // id = str(body.get("id") or uuid.uuid4())

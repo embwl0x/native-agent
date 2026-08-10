@@ -1363,7 +1363,8 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         currentDirectoryPath: String = FileManager.default.currentDirectoryPath,
         appSupportRoot: URL = libraryAppSupportFallback(),
         userCodexHome: URL = defaultUserCodexHome(),
-        allowSharedFallbacks: Bool = true
+        allowSharedFallbacks: Bool = true,
+        defaultRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> [URL] {
         if !allowSharedFallbacks, let dataRoot {
             return [dataRoot.standardizedFileURL
@@ -1398,16 +1399,25 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
             .appendingPathComponent("codex_home", isDirectory: true)
             .appendingPathComponent("auth.json")
         append(appSupport)
-        append(userCodexHome.appendingPathComponent("auth.json"))
         if let dataRoot {
             append(dataRoot
                 .appendingPathComponent("codex_home", isDirectory: true)
                 .appendingPathComponent("auth.json"))
         }
-        let defaultRoot = PersistenceCore.defaultDataRoot()
         append(defaultRoot
             .appendingPathComponent("codex_home", isDirectory: true)
             .appendingPathComponent("auth.json"))
+        // The shared Codex CLI session is the LAST candidate, and only after
+        // an explicit recorded user decision: every app-owned path outranks
+        // the foreign-owned CLI file, so an in-app (re-)auth always wins over
+        // an adopted session on the next resolution. `CODEX_HOME` above stays
+        // consent-free: an env override is itself a deliberate user act.
+        // (0.3.8 lesson — silent adoption on a fresh install; gpt-5.5 review
+        // 2026-08-06 round 2 — shared-before-dataRoot let a stale adopted
+        // session outrank a fresh in-app re-auth on stamped dev roots.)
+        if cliAdoptionConsent(dataRoot: dataRoot) == .allowed {
+            append(userCodexHome.appendingPathComponent("auth.json"))
+        }
         return candidates
     }
 
@@ -1419,7 +1429,8 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         currentDirectoryPath: String = FileManager.default.currentDirectoryPath,
         appSupportRoot: URL = libraryAppSupportFallback(),
         userCodexHome: URL = defaultUserCodexHome(),
-        allowSharedFallbacks: Bool = true
+        allowSharedFallbacks: Bool = true,
+        defaultRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> URL {
         if !allowSharedFallbacks, let dataRoot {
             return dataRoot.standardizedFileURL
@@ -1441,7 +1452,8 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
             currentDirectoryPath: currentDirectoryPath,
             appSupportRoot: appSupportRoot,
             userCodexHome: userCodexHome,
-            allowSharedFallbacks: allowSharedFallbacks
+            allowSharedFallbacks: allowSharedFallbacks,
+            defaultRoot: defaultRoot
         )
         // Only honor the repo path when the FILE exists AND it carries real
         // tokens. Mere presence of `data/` (or worse, root-relative `/data/`)
@@ -1471,6 +1483,132 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
     public static func defaultUserCodexHome() -> URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".codex", isDirectory: true)
+    }
+
+    // MARK: - Shared CLI session adoption consent
+
+    /// Whether the user has decided about adopting the shared Codex CLI
+    /// session (`~/.codex/auth.json`) as the app's ChatGPT sign-in.
+    public enum CLISessionAdoptionConsent: String {
+        case allowed
+        case declined
+    }
+
+    /// Checked authority read. Compatibility callers may still ask only for
+    /// the decision, but UI/repair paths must preserve the distinction between
+    /// a genuinely missing record and existing bytes that cannot be trusted.
+    public enum CLISessionAdoptionConsentState: Equatable, Sendable {
+        case missing
+        case allowed
+        case declined
+        case corrupt(reason: String)
+
+        public var decision: CLISessionAdoptionConsent? {
+            switch self {
+            case .allowed: return .allowed
+            case .declined: return .declined
+            case .missing, .corrupt: return nil
+            }
+        }
+    }
+
+    /// Consent record path: `<dataRoot>/providers/cli_session_adoption.json`.
+    public static func cliAdoptionConsentPath(dataRoot: URL? = nil) -> URL {
+        (dataRoot ?? PersistenceCore.defaultDataRoot())
+            .appendingPathComponent("providers", isDirectory: true)
+            .appendingPathComponent("cli_session_adoption.json")
+    }
+
+    /// Read the recorded decision. Missing file means NO decision — the
+    /// shared CLI candidate stays out of auth resolution until the user
+    /// explicitly allows it (0.3.8 lesson: a fresh install silently adopting
+    /// the machine's CLI session looked signed-in with nobody having
+    /// consented). Unreadable or malformed existing state is treated as
+    /// no-consent and is never rewritten.
+    public static func cliAdoptionConsent(dataRoot: URL? = nil) -> CLISessionAdoptionConsent? {
+        cliAdoptionConsentState(dataRoot: dataRoot).decision
+    }
+
+    public static func cliAdoptionConsentState(
+        dataRoot: URL? = nil
+    ) -> CLISessionAdoptionConsentState {
+        let path = cliAdoptionConsentPath(dataRoot: dataRoot)
+        guard FileManager.default.fileExists(atPath: path.path) else {
+            return .missing
+        }
+        let data: Data
+        do {
+            data = try Data(contentsOf: path)
+        } catch {
+            return .corrupt(reason: "The saved consent record cannot be read: \(error.localizedDescription)")
+        }
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let raw = obj["decision"] as? String,
+              let decision = CLISessionAdoptionConsent(rawValue: raw) else {
+            return .corrupt(reason: "The saved consent record is malformed or contains an unknown decision.")
+        }
+        return decision == .allowed ? .allowed : .declined
+    }
+
+    /// Persist an explicit user decision. `source` names the UI moment that
+    /// captured it (for the receipt, not for authority). An existing record
+    /// that does not parse to a known decision is corrupt authority: it is
+    /// byte-preserved and this write fails loud rather than papering over it
+    /// (standard corrupt-authority contract; gpt-5.5 review 2026-08-06).
+    public static func recordCLIAdoptionConsent(
+        _ decision: CLISessionAdoptionConsent,
+        source: String,
+        dataRoot: URL? = nil
+    ) throws {
+        let path = cliAdoptionConsentPath(dataRoot: dataRoot)
+        if case .corrupt = cliAdoptionConsentState(dataRoot: dataRoot) {
+            throw NSError(
+                domain: "ProviderRouting.CLISessionAdoptionConsent", code: 1,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "existing consent record is unreadable; refusing to overwrite it"])
+        }
+        try FileManager.default.createDirectory(
+            at: path.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let payload: [String: Any] = [
+            "decision": decision.rawValue,
+            "decidedAt": ISO8601DateFormatter().string(from: Date()),
+            "source": source,
+        ]
+        let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+        try data.write(to: path, options: [.atomic])
+    }
+
+    /// Explicit repair for corrupt authority. The exact bytes are copied and
+    /// read back before the authoritative path is removed. The next read is
+    /// therefore genuinely `.missing`; no decision is invented by repair.
+    @discardableResult
+    public static func backupAndResetCorruptCLIAdoptionConsent(
+        dataRoot: URL? = nil
+    ) throws -> URL {
+        let path = cliAdoptionConsentPath(dataRoot: dataRoot)
+        guard case .corrupt = cliAdoptionConsentState(dataRoot: dataRoot) else {
+            throw NSError(
+                domain: "ProviderRouting.CLISessionAdoptionConsent", code: 2,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "the consent record is not corrupt; no repair was performed"]
+            )
+        }
+        let original = try Data(contentsOf: path)
+        let backup = path.deletingLastPathComponent().appendingPathComponent(
+            "cli_session_adoption.corrupt-\(UUID().uuidString.lowercased()).backup"
+        )
+        try original.write(to: backup, options: [.atomic])
+        guard try Data(contentsOf: backup) == original else {
+            throw NSError(
+                domain: "ProviderRouting.CLISessionAdoptionConsent", code: 3,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "the corrupt consent backup could not be verified"]
+            )
+        }
+        try FileManager.default.removeItem(at: path)
+        return backup
     }
 
     /// Load the auth blob from disk. Returns `nil` when the file is missing

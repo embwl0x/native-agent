@@ -419,7 +419,7 @@ struct FireCarveSuite {
 
     // ── Inbox: per-kind native stub items ────────────────────────────────
 
-    @Test func fireInboxStubFileWatchSurfacesNativeItem() async throws {
+    @Test func fireInboxFileWatchRefusesFabricatedPlaceholder() async throws {
         let root = try makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         try seedInbox([
@@ -433,34 +433,11 @@ struct FireCarveSuite {
         let client = makeClient(root: root)
 
         let result = try await client.fireInboxTrigger(name: "file_watch", isStub: true)
-        #expect(result.status == "fired")
+        #expect(result.status == "error")
         #expect(result.name == "file_watch")
-        #expect(result.stub == true)
-        guard let id = result.itemId, !id.isEmpty else {
-            Issue.record("expected non-empty itemId"); return
-        }
-
-        // A5.2: the built card is carried on the FIRE RESULT. Nothing writes
-        // the retired <root>/inbox/ silo anymore, and in Core there is no app
-        // seam to land it in the live inbox — the result IS the card.
-        guard let o = obj(try #require(result.item)) else { Issue.record("item not object"); return }
-        #expect(str(o["id"]) == id)
-        #expect(str(o["title"]) == "File change detected")
-        #expect(str(o["source"]) == "trigger:file_watch:stub")
-        #expect(str(o["severity"]) == "info")
-        #expect(str(o["status"]) == "unread")
-        #expect(o["read_at"] == .null)
-        guard case .array(let actions) = o["actions"] ?? .null else {
-            Issue.record("actions not array"); return
-        }
-        let ids = actions.compactMap { v -> String? in
-            if case .object(let a) = v, case .string(let s) = a["id"] ?? .null { return s }
-            return nil
-        }
-        #expect(ids == ["view", "act", "archive", "dismiss"])
-
-        // RETIREMENT PIN: the legacy silo is never written, index overlay gone
-        // (status/read_at asserted above live ON the card itself).
+        #expect(result.stub == false)
+        #expect(result.item == nil)
+        #expect((result.error ?? "").contains("evidence-backed content path is unavailable"))
         #expect(try readInboxItemsJSONL(root: root).isEmpty)
         #expect(!FileManager.default.fileExists(
             atPath: root.appendingPathComponent("inbox/items.jsonl").path))
@@ -534,7 +511,7 @@ struct FireCarveSuite {
         #expect(result.stub == false)
     }
 
-    @Test func fireInboxStubWorkshopExecutionFollowupSurfacesNativeItem() async throws {
+    @Test func fireInboxWorkshopFollowupRefusesFabricatedPlaceholder() async throws {
         let root = try makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         try seedInbox([
@@ -547,17 +524,13 @@ struct FireCarveSuite {
         ], root: root)
         let client = makeClient(root: root)
         let result = try await client.fireInboxTrigger(name: "mission_followup", isStub: true)
-        #expect(result.status == "fired")
-        guard let o = obj(try #require(result.item)) else { Issue.record("no item"); return }
-        #expect(str(o["severity"]) == "actionable")
-        // Mismatched pair (P2-4): the seeded config file above is 0.3.x
-        // vocabulary and the fire request uses the old NAME, but the card this
-        // writes carries the CANONICAL source prefix.
-        #expect((str(o["source"]) ?? "").hasPrefix("execution_complete:"))
-        #expect(str(o["title"]) == "Workshop complete: Stub task")
+        #expect(result.status == "error")
+        #expect(result.stub == false)
+        #expect(result.item == nil)
+        #expect((result.error ?? "").contains("evidence-backed content path is unavailable"))
     }
 
-    @Test func fireInboxStubStuckPatternSurfacesNativeItem() async throws {
+    @Test func fireInboxStuckPatternRefusesFabricatedPlaceholder() async throws {
         let root = try makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         try seedInbox([
@@ -570,10 +543,10 @@ struct FireCarveSuite {
         ], root: root)
         let client = makeClient(root: root)
         let result = try await client.fireInboxTrigger(name: "stuck_pattern", isStub: true)
-        #expect(result.status == "fired")
-        guard let o = obj(try #require(result.item)) else { Issue.record("no item"); return }
-        #expect(str(o["title"]) == "We might be circling")
-        #expect(str(o["source"]) == "trigger:stuck_pattern")
+        #expect(result.status == "error")
+        #expect(result.stub == false)
+        #expect(result.item == nil)
+        #expect((result.error ?? "").contains("evidence-backed content path is unavailable"))
     }
 
     // -- Inbox: non-stub is explicit unsupported until the native live path lands --
@@ -757,7 +730,7 @@ struct FireCarveSuite {
         #expect(result.name == "nope")
     }
 
-    @Test func fireInboxStubFileWatchEmbedsWatchedPathsSuffix() async throws {
+    @Test func fireInboxStubFileWatchRefusesToInventChangeEvidence() async throws {
         let root = try makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         try seedInbox([
@@ -773,16 +746,9 @@ struct FireCarveSuite {
         ], root: root)
         let client = makeClient(root: root)
         let result = try await client.fireInboxTrigger(name: "file_watch", isStub: true)
-        #expect(result.status == "fired")
-        guard let o = obj(try #require(result.item)) else { Issue.record("no item"); return }
-        #expect(str(o["source"]) == "trigger:file_watch:main.swift,util.swift")
-        #expect(str(o["title"]) == "File change detected (2 files)")
-        guard case .array(let rp) = o["related_paths"] ?? .null else {
-            Issue.record("related_paths missing"); return
-        }
-        #expect(rp.count == 2)
-        #expect(rp[0] == .string("/Users/example/Projects/foo/main.swift"))
-        #expect(rp[1] == .string("/Users/example/Projects/bar/util.swift"))
+        #expect(result.status == "error")
+        #expect(result.item == nil)
+        #expect(result.error?.contains("evidence-backed content path is unavailable") == true)
     }
 
     @Test func fireInboxStubUnknownKindReturnsNotFound() async throws {
@@ -1882,16 +1848,16 @@ struct TriggerVocabularySeamSuite {
         #expect(try await client.listInboxTriggers().first?.enabled == false)
     }
 
-    @Test func canonicalNameFiresARowStoredWithTheLegacyName() async throws {
+    @Test func canonicalNameFindsLegacyRowButRefusesFabricatedFollowup() async throws {
         let root = try makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         try seedLegacyFollowup(root: root)
         let result = try await makeClient(root: root)
             .fireInboxTrigger(name: "execution_followup", isStub: true)
-        #expect(result.status == "fired")
-        guard let o = obj(try #require(result.item)) else { Issue.record("no item"); return }
-        // Writers emit the canonical source prefix even off a legacy config row.
-        #expect((str(o["source"]) ?? "").hasPrefix("execution_complete:"))
+        #expect(result.status == "error")
+        #expect(result.name == "execution_followup")
+        #expect(result.item == nil)
+        #expect(result.error?.contains("evidence-backed content path is unavailable") == true)
     }
 
     @Test func anUnknownTriggerNameIsStillNotFound() async throws {

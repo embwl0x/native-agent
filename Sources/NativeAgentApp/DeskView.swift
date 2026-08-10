@@ -3,19 +3,19 @@ import AppKit
 import PersistenceCore
 import WorkshopExecution
 
-// MARK: - DeskView — User's read-only window into Agent's Workshop bench
+// MARK: - DeskView — the owner's window into the agent's Desk
 //
 // Agent captures + mutates the desk through chat tools (desk_*); this tab is the
 // human-pleasant render of the same live state (SwiftNativeDeskStore.liveState())
-// plus the Workshop execution lane, and a disclosure showing the exact compact
+// plus its directed execution lane, and a disclosure showing the exact compact
 // projection she reads in-context. READ-ONLY by design: User glances, Agent
 // maintains.
 //
-// Sectioned bench (User, 2026-07-11: "it just shows up like her regular desk did
-// — make it into sections"). The Workshop absorbed Executions, so this surface
-// now tells the bench's story top-to-bottom by urgency and ownership:
+// Sectioned Desk (User, 2026-07-11: "it just shows up like her regular desk did
+// — make it into sections"). Directed executions are one lane on the Desk, so
+// this surface tells its story top-to-bottom by urgency and ownership:
 //   1. Waiting on you    — approval-blocked executions + blocked/flagged items
-//   2. On the bench      — queued/running Workshop executions
+//   2. In progress       — queued/running directed executions
 //   3. Her pursuits      — origin=agent self-pursuits, in her own words
 //   4. The board         — User/system items, family-grouped as before
 //   5. Recently finished — terminal items + recent terminal executions
@@ -527,7 +527,7 @@ struct DeskView: View {
                     }
                 }
         }
-        .navigationTitle("Workshop")
+        .navigationTitle("Desk")
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button { showingPalette = true } label: { Image(systemName: "command") }
@@ -536,7 +536,7 @@ struct DeskView: View {
             }
             ToolbarItem(placement: .primaryAction) {
                 Button { Task { await load() } } label: { Image(systemName: "arrow.clockwise") }
-                    .help("Refresh the bench")
+                    .help("Refresh the desk")
             }
         }
         .sheet(isPresented: $showingPalette) {
@@ -989,8 +989,8 @@ struct DeskView: View {
     private var headerRow: some View {
         HStack(alignment: .firstTextBaseline) {
             VStack(alignment: .leading, spacing: 2) {
-                Text("The Workshop").font(.title2.weight(.semibold))
-                Text("\(appModel.agentDisplayName)'s bench — your tasks, the agent's pursuits, and what's on it right now")
+                Text("\(appModel.agentDisplayName)'s Desk").font(.title2.weight(.semibold))
+                Text("Projects, commitments, bridge work, and the agent's own pursuits — lined up in one place")
                     .font(.subheadline).foregroundStyle(.secondary)
             }
             Spacer()
@@ -1031,7 +1031,7 @@ struct DeskView: View {
 
     private var headerCounts: String {
         var parts: [String] = []
-        if !benchExecutions.isEmpty { parts.append("\(benchExecutions.count) on the bench") }
+        if !benchExecutions.isEmpty { parts.append("\(benchExecutions.count) in progress") }
         if !pursuitItems.isEmpty { parts.append("\(pursuitItems.count) pursuit\(pursuitItems.count == 1 ? "" : "s")") }
         parts.append("\(boardItems.count) on the board")
         if !watchItems.isEmpty { parts.append("\(watchItems.count) watching") }
@@ -1074,8 +1074,8 @@ struct DeskView: View {
 
     private var emptyState: some View {
         VStack(spacing: 10) {
-            Image(systemName: "hammer").font(.system(size: 34)).foregroundStyle(.tertiary)
-            Text("The bench is clear").font(.headline)
+            Image(systemName: "checklist").font(.system(size: 34)).foregroundStyle(.tertiary)
+            Text("The desk is clear").font(.headline)
             Text("Tell \(appModel.agentDisplayName) \u{201C}keep track of\u{2026}\u{201D} or give the agent a task and it lands here. Self-pursuits appear once something earns repeated attention.")
                 .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
         }
@@ -1355,11 +1355,11 @@ struct DeskView: View {
             .capsuleTag(color)
     }
 
-    // MARK: section 2 — on the bench (live Workshop executions)
+    // MARK: section 2 — in progress (directed execution engine)
 
     @ViewBuilder
     private var benchSection: some View {
-        sectionHeader("On the bench", count: benchExecutions.isEmpty ? nil : benchExecutions.count,
+        sectionHeader("In progress", count: benchExecutions.isEmpty ? nil : benchExecutions.count,
                       systemImage: "hammer")
         if let reason = executionsLane.unavailableReason {
             // "Quiet right now" would be a lie here: the lane didn't say quiet,

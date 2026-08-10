@@ -398,7 +398,7 @@ struct NotifyDispatchSuite {
         #expect(payload(try #require(events.first))["deduped"] == nil)
     }
 
-    @Test func declaredStubKindsStillMarkThemselvesAsStubs() async throws {
+    @Test func placeholderKindsRefuseToFabricateCardsOrReceipts() async throws {
         let root = try tempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         try seedInbox([
@@ -409,11 +409,11 @@ struct NotifyDispatchSuite {
         let client = makeClient(root: root, notifier: rec.notifier())
 
         let result = try await client.fireInboxTrigger(name: "mission_followup", isStub: true)
-        #expect(result.stub == true)
-        #expect(await rec.count == 0)                    // not in the notify table
-        let e = try #require(triggerEvents(root: root).first)
-        #expect(payload(e)["placeholder"] == .bool(true))
-        #expect(payload(e)["notified"] == .bool(false))
+        #expect(result.status == "error")
+        #expect(result.stub == false)
+        #expect(result.item == nil)
+        #expect(await rec.count == 0)
+        #expect(triggerEvents(root: root).isEmpty)
     }
 
     /// A fire that never happened writes nothing — the receipt is a receipt,

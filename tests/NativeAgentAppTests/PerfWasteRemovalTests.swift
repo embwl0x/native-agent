@@ -282,3 +282,74 @@ struct GitHubTrackingReplayGateTests {
         #expect(await runtime._testConnectorReplayCount() == 2)
     }
 }
+
+// MARK: - Shared event-driven subprocess ownership
+
+@Suite("App subprocess consolidation")
+struct NativeClientProcessConsolidationTests {
+    @Test("app commands preserve cwd and output through the shared process owner")
+    func workingDirectoryAndOutputArePreserved() async throws {
+        let root = perfTempRoot("shared-process")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let result = try await NativeClient.runProcess(
+            executable: "/bin/pwd",
+            arguments: [],
+            currentDirectory: root,
+            timeout: 2
+        )
+
+        #expect(result.status == 0)
+        #expect(
+            result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+                .hasSuffix("/\(root.lastPathComponent)")
+        )
+        #expect(result.stderr.isEmpty)
+    }
+
+    @Test("app timeout contract remains exit 124 with an honest detail")
+    func timeoutContractIsPreserved() async throws {
+        let root = perfTempRoot("shared-process-timeout")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let result = try await NativeClient.runProcess(
+            executable: "/bin/sleep",
+            arguments: ["2"],
+            currentDirectory: root,
+            timeout: 0.05
+        )
+
+        #expect(result.status == 124)
+        #expect(result.stderr.contains("timed out"))
+    }
+}
+
+// MARK: - Lazy privacy inventory
+
+@Suite("Privacy inventory refresh cost")
+struct PrivacyInventoryRefreshCostTests {
+    @Test("metadata-only refresh skips recursive counts while explicit inventory keeps them")
+    func inventoryIsLazyWithoutChangingTheExplicitMap() throws {
+        let root = perfTempRoot("privacy-inventory")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let chat = root.appendingPathComponent("chat", isDirectory: true)
+        try FileManager.default.createDirectory(at: chat, withIntermediateDirectories: true)
+        try Data("one".utf8).write(to: chat.appendingPathComponent("one.jsonl"))
+
+        let metadataOnly = NativeClient.privacyCategories(
+            dataRoot: root,
+            includeInventory: false
+        )
+        let inventoried = NativeClient.privacyCategories(
+            dataRoot: root,
+            includeInventory: true
+        )
+        let metadataChat = try #require(metadataOnly.first { $0.id == "chat" })
+        let inventoriedChat = try #require(inventoried.first { $0.id == "chat" })
+
+        #expect(metadataChat.path == inventoriedChat.path)
+        #expect(metadataChat.exportable == inventoriedChat.exportable)
+        #expect(!metadataChat.contains.contains("1 file"))
+        #expect(inventoriedChat.contains.contains("1 file, 3 bytes"))
+    }
+}

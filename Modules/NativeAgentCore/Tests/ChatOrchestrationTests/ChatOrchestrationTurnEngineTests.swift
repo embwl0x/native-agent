@@ -268,7 +268,8 @@ private func makeEngine(
     activeProviders: [String: String] = [:],
     llm: any LLMClient,
     tools: any ToolDispatchClient = MockToolDispatchClient(),
-    clock: @escaping @Sendable () -> Date = { Date() }
+    clock: @escaping @Sendable () -> Date = { Date() },
+    naturalExpressionGuidanceEnabled: Bool = true
 ) -> SwiftNativeTurnEngine {
     SwiftNativeTurnEngine(
         persona: persona,
@@ -277,7 +278,8 @@ private func makeEngine(
         trust: hermeticTrust(),
         llm: llm,
         tools: tools,
-        clock: clock
+        clock: clock,
+        naturalExpressionGuidanceEnabled: naturalExpressionGuidanceEnabled
     )
 }
 
@@ -414,6 +416,37 @@ func turnEngine_buildTurnContext_includes_systemPrompt_with_persona() async thro
     let ctx = try await engine.buildTurnContext(surface: "chat", userMessage: "hi")
     #expect(ctx.systemPrompt != nil)
     #expect(ctx.systemPrompt!.contains("marker-content-soul"))
+}
+
+@Test
+func turnEngine_naturalExpressionGuidance_isSharedAcrossSurfacesAndReversible() async throws {
+    let dir = try makeTempDir("natural-expression-surfaces")
+    try writeFile(dir.appendingPathComponent("SOUL.md"), "SURFACE-PERSONA-MARKER")
+    let persona = hermeticPersona(root: dir)
+    let llm = MockLLMClient(scriptedResponses: ["ok"])
+    let enabled = makeEngine(persona: persona, llm: llm)
+
+    for surface in ["chat", "telegram", "slack", "ios", "codex"] {
+        let context = try await enabled.buildTurnContext(
+            surface: surface,
+            userMessage: "hello"
+        )
+        let stable = try #require(context.systemSegments?.stable)
+        #expect(stable.contains("SURFACE-PERSONA-MARKER"))
+        #expect(stable.contains(NaturalExpressionGuidance.baseline))
+        #expect(context.systemPrompt == context.systemSegments?.combined)
+    }
+
+    let disabled = makeEngine(
+        persona: persona,
+        llm: llm,
+        naturalExpressionGuidanceEnabled: false
+    )
+    let rolledBack = try await disabled.buildTurnContext(
+        surface: "chat",
+        userMessage: "hello"
+    )
+    #expect(rolledBack.systemPrompt?.contains(NaturalExpressionGuidance.baseline) == false)
 }
 
 @Test

@@ -52,8 +52,8 @@ struct NativeAgentDoctorIntent: AppIntent {
 }
 
 struct NativeAgentWorkshopTaskIntent: AppIntent {
-    static let title: LocalizedStringResource = "Create NativeAgent Workshop Task"
-    static let description = IntentDescription("Creates a task on the configured agent's Workshop Desk.")
+    static let title: LocalizedStringResource = "Create NativeAgent Desk Task"
+    static let description = IntentDescription("Creates a directed task on the configured agent's Desk.")
     static let openAppWhenRun = false
 
     @Parameter(title: "Title")
@@ -63,12 +63,12 @@ struct NativeAgentWorkshopTaskIntent: AppIntent {
     var objective: String
 
     static var parameterSummary: some ParameterSummary {
-        Summary("Create Workshop task \(\.$title) for \(\.$objective)")
+        Summary("Create Desk task \(\.$title) for \(\.$objective)")
     }
 
     func perform() async throws -> some IntentResult & ProvidesDialog {
         let task = try await intentClient().createWorkshopTask(title: title, objective: objective)
-        return .result(dialog: "Workshop task created: \(task.title).")
+        return .result(dialog: "Desk task created: \(task.title).")
     }
 }
 
@@ -134,6 +134,33 @@ struct NativeAgentShortcuts: AppShortcutsProvider {
             phrases: ["Review \(.applicationName) approvals"],
             shortTitle: "Approvals",
             systemImageName: "checkmark.shield"
+        )
+        AppShortcut(
+            intent: QueryMemoryIntent(),
+            phrases: [
+                "Query \(.applicationName) memory",
+                "Ask \(.applicationName) about memory",
+            ],
+            shortTitle: "Query Memory",
+            systemImageName: "brain"
+        )
+        AppShortcut(
+            intent: StoreMemoryIntent(),
+            phrases: [
+                "Save a memory in \(.applicationName)",
+                "Tell \(.applicationName) to remember something",
+            ],
+            shortTitle: "Remember",
+            systemImageName: "pencil.and.list.clipboard"
+        )
+        AppShortcut(
+            intent: ListPendingMemoryProposalsIntent(),
+            phrases: [
+                "List pending memory proposals in \(.applicationName)",
+                "Review \(.applicationName) memory proposals",
+            ],
+            shortTitle: "Pending Proposals",
+            systemImageName: "tray.full"
         )
     }
 }

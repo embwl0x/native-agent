@@ -9,6 +9,20 @@ import PhotosUI
 import NativeAgentShared
 
 extension ChatStore {
+    static func shouldReturnToMainSession(
+        selectedSessionID: String?,
+        mainSessionID: String?,
+        availablePinnedSessionIDs: Set<String>
+    ) -> Bool {
+        // Without a known main-session identity we cannot distinguish a Mac
+        // pin from the phone's still-being-adopted main chat. Wait for that
+        // authority instead of resetting an iOS-created session to nil.
+        guard let selected = cleanSessionID(selectedSessionID),
+              let main = cleanSessionID(mainSessionID),
+              selected != main else { return false }
+        return !availablePinnedSessionIDs.contains(selected)
+    }
+
     func switchSession(to sessionID: String, using client: MacBridgeClient, fallbackMessages: [ChatMessage]?) {
         guard !isLoading, !isSwitchingSession, let clean = Self.cleanSessionID(sessionID) else { return }
         guard clean != selectedSessionID else {
@@ -91,6 +105,14 @@ extension ChatStore {
     private func loadSelectedSession(using client: MacBridgeClient, fallbackMessages: [ChatMessage]?) {
         sendTask?.cancel()
         sendTask = nil
+        let retiringCorrelations = Set(pendingICloudPlaceholders.keys)
+            .union(pendingSendArgs.keys)
+            .union(timedOutPendingIds.keys)
+            .union(canceledPendingIds)
+            .union(maxDeltaSeqByCorrelation.keys)
+        for correlationID in retiringCorrelations {
+            markICloudReplyResolved(correlationID)
+        }
         pendingTimeouts.values.forEach { $0.cancel() }
         pendingTimeouts.removeAll()
         pendingPolls.values.forEach { $0.cancel() }

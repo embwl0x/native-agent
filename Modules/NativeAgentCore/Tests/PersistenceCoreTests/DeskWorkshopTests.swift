@@ -157,6 +157,32 @@ struct DeskWorkshopTests {
         }
     }
 
+    @Test func pursuitCreationAndAnnouncementPolicyCommitAsOneOp() async throws {
+        let root = tmpRoot(); defer { try? FileManager.default.removeItem(at: root) }
+        let store = SwiftNativeDeskStore(dataRoot: root)
+        let policy = NotifyPolicy(
+            level: .direct,
+            on: ["explicit"],
+            notifyReason: "A self-pursuit was opened."
+        )
+
+        let created = try await store.openPursuit(
+            project: "na",
+            title: "Atomic pursuit",
+            pursuit: validPursuit(1),
+            notify: policy
+        )
+
+        #expect(created.notify == policy)
+        let ops = try await store.readOpsUnlocked()
+        #expect(ops.count == 1)
+        guard case let .openPursuit(_, _, _, _, _, persistedPolicy) = ops[0].body else {
+            Issue.record("expected one open_pursuit op")
+            return
+        }
+        #expect(persistedPolicy == policy)
+    }
+
     @Test func closingAPursuitFreesACapSlot() async throws {
         let root = tmpRoot(); defer { try? FileManager.default.removeItem(at: root) }
         let store = SwiftNativeDeskStore(dataRoot: root)

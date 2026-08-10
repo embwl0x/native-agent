@@ -42,9 +42,9 @@ private let tourSteps: [TourStep] = [
     ),
     TourStep(
         id: 4,
-        item: .workshop,
-        title: "Workshop",
-        body: "The agent's work bench. Create a task with the New Task button, then track it across the Bench, Schedule, and Research views.",
+        item: .desk,
+        title: "Desk",
+        body: "The agent's durable work system. Large projects, dependencies, bridge work, scheduled tasks, research, and verified results stay lined up here.",
         buttonLabel: "Continue"
     ),
     TourStep(

@@ -178,7 +178,7 @@ struct NativeContextFlowRuntimeTests {
             query: "What is happening with the orchid lighthouse beacon?"
         )
         #expect(queued.contains("Desk handle: \(item.handle)"))
-        #expect(queued.contains("Workshop status: queued"))
+        #expect(queued.contains("Execution status: queued"))
         #expect(queued.contains("Decision need: quiet_wait"))
 
         let completedAt = SwiftNativeWorkshopRunner.isoTimestamp(Date().addingTimeInterval(1))
@@ -221,7 +221,7 @@ struct NativeContextFlowRuntimeTests {
             try await Task.sleep(for: .milliseconds(20))
         }
         #expect(settled.contains("Desk status: done"))
-        #expect(settled.contains("Workshop status: completed"))
+        #expect(settled.contains("Execution status: completed"))
         #expect(settled.contains("Verification: satisfied"))
         #expect(settled.contains("Decision need: none"))
         #expect(completedExecution.planningProviderCallCount == 0)

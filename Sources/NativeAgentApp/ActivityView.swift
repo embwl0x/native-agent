@@ -33,6 +33,7 @@ import CognitiveSubstrate
 /// Which sub-queue to auto-push into when ActivityView opens. Posted via
 /// `.openActivitySectionRequest` by the Cmd+Shift+A / Cmd+Shift+I shortcuts.
 enum ActivitySection: String, Sendable {
+    case journey
     case approvals
     case inbox
     case memoryProposals
@@ -44,6 +45,7 @@ enum ActivitySection: String, Sendable {
 
 struct ActivityView: View {
     @Environment(AppModel.self) private var appModel
+    @AppStorage(NativeExperiencePreferences.masterKey) private var experienceEnabled = false
     @State private var path = NavigationPath()
     // B2.4: cognition proposals aren't mirrored into AppModel's badge counts;
     // this view loads the proposed set directly from the cognition runtime.
@@ -72,6 +74,33 @@ struct ActivityView: View {
     var body: some View {
         NavigationStack(path: $path) {
             List {
+                if experienceEnabled {
+                    Section {
+                        NavigationLink(value: ActivitySection.journey) {
+                            HStack(spacing: 14) {
+                                Image(systemName: "point.3.filled.connected.trianglepath.dotted")
+                                    .font(.title3)
+                                    .foregroundStyle(.purple)
+                                    .frame(width: 32)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Native Experience").font(NativeAgentFont.section)
+                                    Text("Learning, context, projects, workbench, capabilities, and receipts")
+                                        .font(NativeAgentFont.label)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.tertiary)
+                            }
+                            .padding(.vertical, 4)
+                        }
+                    } header: {
+                        Text("Explore")
+                            .font(NativeAgentFont.section)
+                    }
+                }
+
                 // ── Approvals ────────────────────────────────────────────
                 Section {
                     NavigationLink(value: ActivitySection.approvals) {
@@ -253,6 +282,7 @@ struct ActivityView: View {
             .navigationTitle("Activity")
             .navigationDestination(for: ActivitySection.self) { section in
                 switch section {
+                case .journey:          NativeExperienceView()
                 case .approvals:        ApprovalsView()
                 case .inbox:            InboxView()
                 // gpt-5.5 review #2: MemoryView defaults to the Active tab;

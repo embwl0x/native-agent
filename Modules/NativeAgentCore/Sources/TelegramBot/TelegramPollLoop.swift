@@ -473,7 +473,14 @@ public struct TelegramPollLoop: LoopRunner {
             // anything) still needs a plain send. Declared OUTSIDE the do so
             // the error path can convert a dangling partial draft into the
             // honest error notice instead of leaving stale text behind.
-            let normalTurnTask = Task {
+            // A Telegram message is human-interactive work even though it
+            // arrives through the utility-priority long-poll loop. Without an
+            // explicit promotion this child inherits the scheduler priority,
+            // so local context/history preparation can be starved behind a
+            // concurrent build while the provider itself remains healthy.
+            // The coordinator still owns this exact task for /stop and normal
+            // lifecycle cancellation; only its scheduling priority changes.
+            let normalTurnTask = Task(priority: .userInitiated) {
                 let draft = TelegramDraftStreamer(
                     token: token,
                     chatId: msg.chatId,

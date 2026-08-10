@@ -302,6 +302,8 @@ function completionText(result, payload) {
     "",
     `Originating message id: ${payload.messageId}`,
     `Topic: ${payload.topic || DEFAULT_TOPIC}`,
+    `Conversation: omp:${topicSlug(payload.topic)}`,
+    "Continue this same work by calling omp_message with conversation_id set to that exact value. Omit conversation_id for new work.",
     `Priority: ${payload.priority || "info"}`,
     `Status: ${result.status}`,
     `Duration: ${Math.round((result.durationMs || 0) / 1000)}s`,

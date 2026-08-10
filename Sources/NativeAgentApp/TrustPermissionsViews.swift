@@ -336,7 +336,7 @@ struct WorkshopPermissionsView: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Toggle(
-                    "Allow Workshop task execution",
+                    "Allow Desk task execution",
                     isOn: Binding(
                         get: { workshopExecutionsEnabled },
                         set: { newValue in
@@ -344,13 +344,13 @@ struct WorkshopPermissionsView: View {
                         }
                     )
                 )
-                .help("Allows Swift-native Workshop task creation and multi-step planning.")
+                .help("Allows Swift-native Desk task creation and multi-step planning.")
                 EffectTimingTag(timing: .nextRun)
                 Spacer()
             }
             HStack {
                 Toggle(
-                    "Show Workshop execution timeline",
+                    "Show Desk execution timeline",
                     isOn: Binding(
                         get: { showTimeline },
                         set: { newValue in
@@ -361,7 +361,7 @@ struct WorkshopPermissionsView: View {
                 EffectTimingTag(timing: .now)
                 Spacer()
             }
-            Text("Workshop execution follows app-wide tool autonomy. Read-only tools run without prompting; sends and destructive actions require approval.")
+            Text("Desk execution follows app-wide tool autonomy. Read-only tools run without prompting; sends and destructive actions require approval.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

@@ -636,8 +636,8 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     // MARK: fire_now — Swift-native
 
     /// Mirrors daemon proactive_triggers.py::ProactiveTriggerScheduler.fire_now.
-    /// - isStub=true  → builds the per-kind stub InboxItem natively + surfaces
-    ///   it via ProactiveInboxStore. Returns {status:"fired", name, item_id, stub:true}.
+    /// - isStub=true  → Time/Idle build evidence-backed InboxItems natively;
+    ///   configured placeholder kinds return an explicit unavailable error.
     /// - isStub=false → explicit error envelope because the non-stub
     ///   `build_inbox_item` branches invoke codex/connectors/runtime reads
     ///   that are not Swift-native yet.
@@ -687,9 +687,20 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
             return TriggerFireResult(status: "not_found", name: name, stub: true)
         }
 
-        // Swift-native fire path. `morning_brief` (time) and `idle_checkin`
-        // (idle) now carry REAL content; the other three are still declared
-        // placeholders (see `_buildInboxItem`).
+        // Manual or API callers may only surface content grounded in current
+        // runtime evidence. The other canonical kinds remain configured but
+        // dormant until their missing diff/completion/register signals exist.
+        guard rowKind == "time" || rowKind == "idle" else {
+            return TriggerFireResult(
+                status: "error",
+                name: name,
+                stub: false,
+                error: "trigger '\(name)' cannot fire yet because its evidence-backed content path is unavailable"
+            )
+        }
+
+        // Swift-native fire path. Only `morning_brief` (time) and
+        // `idle_checkin` (idle) reach this point, and both carry real content.
         do {
             let built = try await _buildInboxItem(kind: rowKind, row: row, name: name)
             let store = ProactiveInboxStore(

@@ -141,7 +141,8 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
                 telemetryDataRootOverride: dataRoot
             ),
             openRouter: OpenRouterAdapter(dataRootOverride: dataRoot),
-            lifecycleObserver: lifecycleObserver
+            lifecycleObserver: lifecycleObserver,
+            moonshotCatalogDataRoot: dataRoot
         )
         self.init(
             llm: rootedLLM,

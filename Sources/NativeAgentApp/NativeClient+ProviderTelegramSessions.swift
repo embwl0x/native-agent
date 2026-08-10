@@ -779,11 +779,14 @@ extension NativeClient {
         )
     }
 
-    func getPrivacyMap() async throws -> PrivacyMap {
+    func getPrivacyMap(includeInventory: Bool = true) async throws -> PrivacyMap {
         let dataRoot = PersistenceCore.defaultDataRoot()
         return PrivacyMap(
             dataRoot: dataRoot.path,
-            categories: Self.privacyCategories(dataRoot: dataRoot),
+            categories: Self.privacyCategories(
+                dataRoot: dataRoot,
+                includeInventory: includeInventory
+            ),
             generatedAt: SwiftNativeManifestSigner.isoTimestamp(Date())
         )
     }

@@ -28,6 +28,9 @@ struct OAuthSignInButton: View {
     @State private var lastError: String? = nil
     @State private var authStatusText: String? = nil
     @State private var flowTask: Task<Void, Never>? = nil
+    @State private var cliSessionOffer: NativeOAuthFlow.CodexCLISessionOffer? = nil
+    @State private var showingCLIConsentRepairConfirmation = false
+    @State private var cliConsentRepairMessage: String? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -71,6 +74,59 @@ struct OAuthSignInButton: View {
                     .font(.system(size: 11))
                     .foregroundStyle(.red)
             }
+            if status != .complete, provider.id == "openai_oauth_direct",
+               let offer = cliSessionOffer {
+                switch offer {
+                case .available(let email, let alreadyDeclined):
+                    VStack(alignment: .leading, spacing: 6) {
+                        Label(
+                            email.map { "Found an existing Codex CLI sign-in on this Mac (\($0))." }
+                                ?? "Found an existing Codex CLI sign-in on this Mac (~/.codex).",
+                            systemImage: "terminal"
+                        )
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        HStack(spacing: 8) {
+                            Button("Use it") {
+                                Task { await acceptCLISessionOffer() }
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            if !alreadyDeclined {
+                                Button("Ignore") {
+                                    NativeOAuthFlow.recordCodexCLISessionDecision(
+                                        allow: false, source: "providers_offer")
+                                    cliSessionOffer = NativeOAuthFlow.codexCLISessionOffer()
+                                }
+                                .buttonStyle(.plain)
+                                .controlSize(.small)
+                                .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .padding(.top, 2)
+                case .unavailable(let reason):
+                    VStack(alignment: .leading, spacing: 6) {
+                        Label("Codex CLI sign-in adoption is unavailable.", systemImage: "exclamationmark.triangle.fill")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.orange)
+                        Text(reason)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                        Button("Repair saved consent…") {
+                            showingCLIConsentRepairConfirmation = true
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                    .padding(.top, 2)
+                }
+            }
+            if let cliConsentRepairMessage {
+                Label(cliConsentRepairMessage, systemImage: "checkmark.circle")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
         }
         .task {
             await refreshStatus()
@@ -79,6 +135,18 @@ struct OAuthSignInButton: View {
             // B.9: cancel in-flight polling when the view disappears
             flowTask?.cancel()
             flowTask = nil
+        }
+        .confirmationDialog(
+            "Repair saved Codex CLI consent?",
+            isPresented: $showingCLIConsentRepairConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Back Up and Reset") {
+                Task { await repairCLISessionConsent() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("NativeAgent will preserve the unreadable bytes in a backup, then reset only this consent decision. It will not change or delete your Codex CLI sign-in.")
         }
     }
 
@@ -164,6 +232,9 @@ struct OAuthSignInButton: View {
                     if auth?.appOwnedLoggedIn == true {
                         status = .complete
                         authStatusText = "Signed in through Codex"
+                        // No CLI-adoption consent write here: the device flow
+                        // writes tokens into the APP-OWNED data/codex_home,
+                        // not the shared ~/.codex session.
                         onSuccess?()
                     } else {
                         status = .idle
@@ -217,6 +288,37 @@ struct OAuthSignInButton: View {
         } else {
             status = .idle
             authStatusText = nil
+        }
+        cliSessionOffer = provider.id == "openai_oauth_direct"
+            ? NativeOAuthFlow.codexCLISessionOffer()
+            : nil
+    }
+
+    /// User accepted the "use your existing Codex CLI sign-in" offer: record
+    /// consent, then re-resolve — the shared session becomes a candidate and
+    /// the badge labels it as an adopted CLI session.
+    @MainActor
+    private func acceptCLISessionOffer() async {
+        guard NativeOAuthFlow.recordCodexCLISessionDecision(
+            allow: true, source: "providers_offer") else {
+            lastError = "Could not save the choice — check disk permissions."
+            return
+        }
+        await refreshStatus()
+        await appModel.loadProvidersForChat()
+        await appModel.adoptProviderForBlankSurfaces(provider.id)
+        onSuccess?()
+    }
+
+    @MainActor
+    private func repairCLISessionConsent() async {
+        do {
+            let backup = try NativeOAuthFlow.repairCodexCLISessionConsent()
+            cliConsentRepairMessage = "Unreadable consent was backed up as \(backup.lastPathComponent). Choose Use it or Ignore again."
+            lastError = nil
+            cliSessionOffer = NativeOAuthFlow.codexCLISessionOffer()
+        } catch {
+            lastError = "Consent repair failed: \(error.localizedDescription)"
         }
     }
 

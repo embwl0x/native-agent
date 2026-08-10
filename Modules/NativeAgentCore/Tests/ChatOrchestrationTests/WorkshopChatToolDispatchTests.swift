@@ -7,7 +7,7 @@ import WorkshopExecution
 
 // MARK: - workshop_submit / workshop_status dispatcher-surface tests (U5 W-I)
 //
-// Agent's execution chat lane: she could neither submit nor check an execution from
+// The agent's directed execution chat lane: it could neither submit nor check an execution from
 // chat (zero mission_* hits anywhere in ChatOrchestration; her own honest
 // refusal caught it). These are STANDARD tools — no Process spawn —
 // classified LAZY-LOAD (catalog-visible + builtInToolNames, NOT
@@ -44,8 +44,9 @@ struct WorkshopExecutionChatToolDispatchTests {
         let schemas = dispatcher.builtInToolSchemas(includeFullMacFileTools: false)
 
         let submit = try #require(schemas.first { $0.name == "workshop_submit" })
-        #expect(submit.description.contains("Workshop"))
-        #expect(submit.description.contains("Desk"))
+        #expect(submit.description.contains("Desk's execution lane"))
+        #expect(submit.description.contains("retained for compatibility"))
+        #expect(!submit.description.contains("user-directed Workshop task"))
         let submitParsed = try JSONValue.parse(submit.parametersJSON)
         guard case .object(let so) = submitParsed,
               case .object(let sprops)? = so["properties"],
@@ -78,7 +79,8 @@ struct WorkshopExecutionChatToolDispatchTests {
         #expect(streq == [])  // id optional
         #expect(stprops["id"] != nil)
 
-        #expect(status.description.contains("Workshop"))
+        #expect(status.description.contains("Desk's directed task execution status"))
+        #expect(status.description.contains("retained for compatibility"))
     }
 
     @Test func workshopToolsAreLazyLoadedBuiltIns() {

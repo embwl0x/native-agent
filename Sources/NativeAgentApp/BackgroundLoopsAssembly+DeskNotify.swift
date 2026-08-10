@@ -104,8 +104,16 @@ private struct DeskNotifyRunner: EventDeadlineLoopRunner {
             // change landed during this tick, skip the stamp so the next tick
             // pings the newer state (no lost ping). markNotified does NOT bump
             // updatedAt, so it can never re-trigger itself.
+            // EXCEPT one-time announcements: those stamp unconditionally —
+            // the announcement fired, and a mid-tick content change must not
+            // leave lastNotifiedAt nil and resurrect it as a fresh first ping
+            // (gpt-5.5 review 2026-08-08, the self-pursuit push storm).
             do {
-                _ = try await store.markNotifiedIfUnchanged(decision.handle, expectedUpdatedAt: decision.observedUpdatedAt)
+                if decision.oneTimeAnnouncement {
+                    _ = try await store.markNotified(decision.handle)
+                } else {
+                    _ = try await store.markNotifiedIfUnchanged(decision.handle, expectedUpdatedAt: decision.observedUpdatedAt)
+                }
             } catch {
                 NSLog("desk_notify: stamp failed for \(decision.handle): \(error) — may re-ping next tick")
                 failures.append("\(decision.handle) notification stamp: \(error)")

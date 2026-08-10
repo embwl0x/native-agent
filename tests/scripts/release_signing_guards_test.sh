@@ -92,6 +92,35 @@ grep -Fq 'chmod 0644 "$BUNDLE/Contents/embedded.provisionprofile"' "$ROOT/script
 grep -Fq 'chmod 0644 "$TEMP_BUNDLE/Contents/embedded.provisionprofile"' "$ROOT/script/install_app.sh" \
   || fail "development install packaging no longer normalizes embedded profile readability"
 
+# A replacement developer install is not committed until the authenticated
+# runtime proves both chat readiness and its exact stamped source identity.
+# Keep the previous bundle available through that gate and restore it on a
+# failed launch/readiness check.
+INSTALLER="$ROOT/script/install_app.sh"
+READINESS="$ROOT/script/verify_installed_runtime_ready.sh"
+[[ -x "$READINESS" ]] \
+  || fail "installed-runtime readiness verifier is missing or not executable"
+bash -n "$INSTALLER" "$READINESS" \
+  || fail "installer/readiness scripts have invalid shell syntax"
+grep -Fq 'LOCAL_ENV="$ROOT/local/nativeagent.local.env"' "$INSTALLER" \
+  || fail "installer no longer loads the machine-local signing identity used by build_and_run"
+grep -Fq 'source "$LOCAL_ENV"' "$INSTALLER" \
+  || fail "installer no longer applies the machine-local signing identity before its final signing pass"
+grep -Fq 'verify_installed_runtime_ready.sh' "$INSTALLER" \
+  || fail "installer no longer gates commit on authenticated runtime readiness"
+grep -Fq 'rm -rf "$APP_OLD"' "$INSTALLER" \
+  || fail "installer no longer retains the previous bundle until readiness succeeds"
+grep -Fq 'mv "$APP_OLD" "$APP_DEST"' "$INSTALLER" \
+  || fail "installer no longer restores the previous bundle after failed readiness"
+grep -Fq '/codex/state' "$READINESS" \
+  || fail "readiness verifier no longer uses the authenticated state surface"
+grep -Fq 'chatReady' "$READINESS" \
+  || fail "readiness verifier no longer proves chat readiness"
+grep -Fq 'buildIdentity.sourceRevision' "$READINESS" \
+  || fail "readiness verifier no longer proves exact source revision"
+grep -Fq 'buildIdentity.sourceDirty' "$READINESS" \
+  || fail "readiness verifier no longer proves exact source dirty state"
+
 # Exercise the shared pure plist contract without requiring a maintainer's
 # signed provisioning profiles in the repository.
 # shellcheck source=../../script/lib/provisioning_profile_contract.sh

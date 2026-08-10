@@ -16,6 +16,148 @@ import SwarmRuns
 import MacIntegration
 
 extension SwiftToolDispatcher {
+    /// A wire handle over the builder CLIs' existing conversation state.
+    /// NativeAgent does not copy transcripts or create a second session store:
+    /// Codex owns its thread id, while Claude and OMP own per-topic pointers.
+    private enum BuilderConversationAgent: String {
+        case codex
+        case claude
+        case omp
+    }
+
+    private struct BuilderConversationSelection {
+        let conversationId: String?
+        let resumeId: String?
+        let topic: String?
+    }
+
+    private enum BuilderConversationReferenceError: Error {
+        case malformed(expectedAgent: BuilderConversationAgent)
+        case agentMismatch(expected: BuilderConversationAgent, actual: String)
+        case topicMismatch(conversationId: String, topic: String)
+
+        var envelope: JSONValue {
+            switch self {
+            case .malformed(let expectedAgent):
+                return .object([
+                    "status": .string("failed"),
+                    "reason": .string("invalid_conversation_id"),
+                    "fix": .string("Pass the exact \(expectedAgent.rawValue):… conversationId returned by the first builder message."),
+                ])
+            case .agentMismatch(let expected, let actual):
+                return .object([
+                    "status": .string("failed"),
+                    "reason": .string("conversation_agent_mismatch"),
+                    "expectedAgent": .string(expected.rawValue),
+                    "actualAgent": .string(actual),
+                    "fix": .string("Reply with the same builder tool that created this conversation."),
+                ])
+            case .topicMismatch(let conversationId, let topic):
+                return .object([
+                    "status": .string("failed"),
+                    "reason": .string("conversation_topic_mismatch"),
+                    "conversationId": .string(conversationId),
+                    "topic": .string(topic),
+                    "fix": .string("Omit topic when replying, or use the topic encoded by conversationId."),
+                ])
+            }
+        }
+    }
+
+    private static func builderConversationSelection(
+        input: [String: JSONValue],
+        agent: BuilderConversationAgent,
+        topic: String?,
+        messageId: String
+    ) -> Result<BuilderConversationSelection, BuilderConversationReferenceError> {
+        let suppliedReference: String?
+        if let rawReference = input["conversation_id"] {
+            guard case .string(let raw) = rawReference else {
+                return .failure(.malformed(expectedAgent: agent))
+            }
+            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty else { return .failure(.malformed(expectedAgent: agent)) }
+            suppliedReference = value
+        } else {
+            suppliedReference = nil
+        }
+
+        guard let suppliedReference else {
+            if agent == .codex {
+                return .success(.init(conversationId: nil, resumeId: nil, topic: topic))
+            }
+            let stableTopic = topic ?? "conversation-\(shortStableBuilderMessageId(messageId))"
+            let slug = builderTopicSlug(stableTopic)
+            return .success(.init(
+                conversationId: "\(agent.rawValue):\(slug)",
+                resumeId: slug,
+                topic: slug
+            ))
+        }
+
+        let pieces = suppliedReference.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+        guard pieces.count == 2 else { return .failure(.malformed(expectedAgent: agent)) }
+        let actualAgent = String(pieces[0])
+        guard actualAgent == agent.rawValue else {
+            return .failure(.agentMismatch(expected: agent, actual: actualAgent))
+        }
+        let resumeId = String(pieces[1])
+        guard !resumeId.isEmpty, resumeId.count <= 160,
+              resumeId.unicodeScalars.allSatisfy({ scalar in
+                  let value = scalar.value
+                  return (48...57).contains(value)
+                      || (65...90).contains(value)
+                      || (97...122).contains(value)
+                      || scalar == "-" || scalar == "_" || scalar == "."
+              }) else {
+            return .failure(.malformed(expectedAgent: agent))
+        }
+
+        if agent != .codex {
+            guard builderTopicSlug(resumeId) == resumeId else {
+                return .failure(.malformed(expectedAgent: agent))
+            }
+            if let topic, builderTopicSlug(topic) != resumeId {
+                return .failure(.topicMismatch(conversationId: suppliedReference, topic: topic))
+            }
+        }
+        return .success(.init(
+            conversationId: suppliedReference,
+            resumeId: resumeId,
+            topic: agent == .codex ? topic : resumeId
+        ))
+    }
+
+    /// Matches `topicSlug` in both builder wake helpers: ASCII lowercase
+    /// alphanumerics, collapsed dash separators, 64-character ceiling.
+    private static func builderTopicSlug(_ raw: String) -> String {
+        var output = ""
+        var pendingSeparator = false
+        for scalar in raw.lowercased().unicodeScalars {
+            let value = scalar.value
+            let isASCIIAlphaNumeric = (48...57).contains(value) || (97...122).contains(value)
+            if isASCIIAlphaNumeric {
+                if pendingSeparator, !output.isEmpty { output.append("-") }
+                pendingSeparator = false
+                output.unicodeScalars.append(scalar)
+            } else if !output.isEmpty {
+                pendingSeparator = true
+            }
+        }
+        let canonical = String(output.prefix(64))
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        return canonical.isEmpty ? "general" : canonical
+    }
+
+    private static func shortStableBuilderMessageId(_ messageId: String) -> String {
+        SHA256.hash(data: Data(messageId.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func stringField(_ name: String, in value: JSONValue) -> String? {
+        guard case .object(let object) = value, case .string(let string)? = object[name] else { return nil }
+        return string
+    }
+
     // MARK: - time_now handler
 
     /// Return current date/time in multiple representations. Zero-input,
@@ -86,9 +228,10 @@ extension SwiftToolDispatcher {
             }
             return "info"
         }()
-        let topic: String? = {
-            if case .string(let t)? = input["topic"], !t.isEmpty { return t }
-            return nil
+        let requestedTopic: String? = {
+            guard case .string(let raw)? = input["topic"] else { return nil }
+            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            return value.isEmpty ? nil : value
         }()
         let workingDirectory: String?
         switch await resolveAgentBridgeWorkingDirectory(input: input, surface: surface) {
@@ -134,6 +277,17 @@ extension SwiftToolDispatcher {
             let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             return value.isEmpty ? UUID().uuidString : String(value.prefix(160))
         }()
+        let conversation: BuilderConversationSelection
+        switch Self.builderConversationSelection(
+            input: input,
+            agent: .claude,
+            topic: requestedTopic,
+            messageId: messageId
+        ) {
+        case .success(let selection): conversation = selection
+        case .failure(let error): return error.envelope
+        }
+        let topic = conversation.topic
         let timestamp = ISO8601DateFormatter().string(from: Date())
         var entry: [String: JSONValue] = [
             "id": .string(messageId),
@@ -145,6 +299,9 @@ extension SwiftToolDispatcher {
             "read": .bool(false),
         ]
         if let topic { entry["topic"] = .string(topic) }
+        if let conversationId = conversation.conversationId {
+            entry["conversationId"] = .string(conversationId)
+        }
         if let workingDirectory { entry["workingDirectory"] = .string(workingDirectory) }
         let inboxEntry = entry
 
@@ -162,6 +319,7 @@ extension SwiftToolDispatcher {
                 }
                 if case .object(let object)? = existing {
                     guard object["text"] == .string(text),
+                          object["topic"] == inboxEntry["topic"],
                           object["workingDirectory"] == inboxEntry["workingDirectory"] else {
                         return "conflict"
                     }
@@ -200,9 +358,13 @@ extension SwiftToolDispatcher {
             "filePath": .string(path),
             "priority": .string(priority),
             "queuedAt": .string(timestamp),
-            "note": .string("The durable inbox row is written, and NativeAgent also wakes a real Claude session with this message as its turn input. Her final reply comes back to you as a separate bridge event; do not wait on this tool result for it."),
+            "note": .string("The durable inbox row is written and a real Claude session is waking. Her final reply returns as a separate bridge event. Use conversationId with claude_message for a contextual follow-up; omit it for new work."),
         ]
         if let workingDirectory { response["workingDirectory"] = .string(workingDirectory) }
+        if let conversationId = conversation.conversationId {
+            response["conversationId"] = .string(conversationId)
+            response["replyWith"] = .string("claude_message")
+        }
         if deduplicated {
             // A duplicate message_id means this exact event already claimed its
             // wake job on first delivery. Re-firing would double-wake Claude.
@@ -291,15 +453,13 @@ extension SwiftToolDispatcher {
 
         let cwd = Self.builderSourceRepoRoot(dataRoot: dataRoot)
             ?? NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot)
-        return await Task.detached(priority: .utility) {
-            Self.runClaudeWakeupHelper(helper: helper, inputData: inputData, cwd: cwd)
-        }.value
+        return await Self.runClaudeWakeupHelper(helper: helper, inputData: inputData, cwd: cwd)
     }
 
     /// The helper claims the job and detaches; it must never hold the tool
     /// call for the length of Claude's turn. A deadline breach here is a
     /// helper bug, and it is reported as one rather than as a silent success.
-    private static func runClaudeWakeupHelper(helper: URL, inputData: Data, cwd: URL) -> JSONValue {
+    private static func runClaudeWakeupHelper(helper: URL, inputData: Data, cwd: URL) async -> JSONValue {
         let environment = AgentBridgeRuntime.processEnvironment()
         guard let node = AgentBridgeRuntime.executableURL(named: "node", environment: environment) else {
             return .object([
@@ -309,87 +469,20 @@ extension SwiftToolDispatcher {
                 "fix": .string("Install Node.js, then restart NativeAgent."),
             ])
         }
-        let process = Process()
-        process.executableURL = node
-        process.arguments = [helper.path]
-        process.currentDirectoryURL = cwd
         var childEnvironment = environment
         if childEnvironment["NATIVE_AGENT_CLAUDE_WAKE_CLAUDE_BIN"] == nil,
            let claude = AgentBridgeRuntime.executableURL(named: "claude", environment: environment) {
             childEnvironment["NATIVE_AGENT_CLAUDE_WAKE_CLAUDE_BIN"] = claude.path
         }
-        process.environment = childEnvironment
-
-        let stdin = Pipe()
-        let stdout = Pipe()
-        let stderr = Pipe()
-        process.standardInput = stdin
-        process.standardOutput = stdout
-        process.standardError = stderr
-
-        do {
-            try process.run()
-        } catch {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("helper_spawn_failed"),
-                "helper": .string(helper.path),
-                "error": .string(String(describing: error)),
-            ])
-        }
-
-        stdin.fileHandleForWriting.write(inputData)
-        try? stdin.fileHandleForWriting.close()
-
-        let deadline = Date().addingTimeInterval(Self.claudeWakeupHelperTimeoutSeconds())
-        while process.isRunning, Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.05)
-        }
-        if process.isRunning {
-            process.terminate()
-            Thread.sleep(forTimeInterval: 0.2)
-            if process.isRunning {
-                kill(process.processIdentifier, SIGKILL)
-            }
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("helper_timeout"),
-                "helper": .string(helper.path),
-            ])
-        }
-
-        let outData = stdout.fileHandleForReading.readDataToEndOfFile()
-        let errData = stderr.fileHandleForReading.readDataToEndOfFile()
-        let stdoutText = String(data: outData, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let stderrText = String(data: errData, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-
-        // The helper writes exactly one JSON envelope line; take the LAST line
-        // so an unexpected warning above it cannot make a good run read as
-        // "no JSON".
-        let lastLine = stdoutText.split(separator: "\n").last.map(String.init) ?? ""
-        if !lastLine.isEmpty,
-           let data = lastLine.data(using: .utf8),
-           let parsed = try? JSONValue.parse(data) {
-            if case .object(var obj) = parsed {
-                obj["helper"] = .string(helper.path)
-                obj["exitCode"] = .int(Int64(process.terminationStatus))
-                if !stderrText.isEmpty {
-                    obj["stderrPreview"] = .string(String(stderrText.prefix(500)))
-                }
-                return .object(obj)
-            }
-            return parsed
-        }
-
-        return .object([
-            "status": .string("failed"),
-            "reason": .string("helper_returned_no_json"),
-            "helper": .string(helper.path),
-            "exitCode": .int(Int64(process.terminationStatus)),
-            "stderrPreview": .string(String(stderrText.prefix(500))),
-        ])
+        return await runBuilderWakeupHelper(
+            node: node,
+            helper: helper,
+            inputData: inputData,
+            cwd: cwd,
+            environment: childEnvironment,
+            timeoutSeconds: claudeWakeupHelperTimeoutSeconds(),
+            successfulNoJSONStatus: "failed"
+        )
     }
 
     /// The helper's own work is a job claim plus a detached spawn — seconds at
@@ -418,7 +511,7 @@ extension SwiftToolDispatcher {
             let value = raw.lowercased()
             return ["info", "important", "urgent"].contains(value) ? value : "info"
         }()
-        let topic: String? = {
+        let requestedTopic: String? = {
             guard case .string(let raw)? = input["topic"] else { return nil }
             let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             return value.isEmpty ? nil : String(value.prefix(120))
@@ -464,6 +557,17 @@ extension SwiftToolDispatcher {
             let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             return value.isEmpty ? UUID().uuidString : String(value.prefix(160))
         }()
+        let conversation: BuilderConversationSelection
+        switch Self.builderConversationSelection(
+            input: input,
+            agent: .omp,
+            topic: requestedTopic,
+            messageId: messageId
+        ) {
+        case .success(let selection): conversation = selection
+        case .failure(let error): return error.envelope
+        }
+        let topic = conversation.topic
         let queuedAt = ISO8601DateFormatter().string(from: Date())
         let originSessionId = Self.extractSessionId(from: input)
         var row: [String: JSONValue] = [
@@ -477,6 +581,9 @@ extension SwiftToolDispatcher {
             "read": .bool(false),
         ]
         if let topic { row["topic"] = .string(topic) }
+        if let conversationId = conversation.conversationId {
+            row["conversationId"] = .string(conversationId)
+        }
         if let workingDirectory { row["workingDirectory"] = .string(workingDirectory) }
         if !originSessionId.isEmpty { row["sessionId"] = .string(originSessionId) }
         let inboxEntry = row
@@ -530,8 +637,13 @@ extension SwiftToolDispatcher {
             "priority": .string(priority),
             "queuedAt": .string(queuedAt),
             "timeoutSeconds": .int(Int64(timeoutSeconds)),
+            "note": .string("OMP's final reply returns as a separate bridge event. Use conversationId with omp_message for a contextual follow-up; omit it for new work."),
         ]
         if let topic { response["topic"] = .string(topic) }
+        if let conversationId = conversation.conversationId {
+            response["conversationId"] = .string(conversationId)
+            response["replyWith"] = .string("omp_message")
+        }
         if let workingDirectory { response["workingDirectory"] = .string(workingDirectory) }
         if appendStatus == "duplicate" {
             response["wakeup"] = .object(["status": .string("deduplicated")])
@@ -606,12 +718,10 @@ extension SwiftToolDispatcher {
         }
         let cwd = Self.builderSourceRepoRoot(dataRoot: dataRoot)
             ?? NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot)
-        return await Task.detached(priority: .utility) {
-            Self.runOMPWakeupHelper(helper: helper, inputData: inputData, cwd: cwd)
-        }.value
+        return await Self.runOMPWakeupHelper(helper: helper, inputData: inputData, cwd: cwd)
     }
 
-    private static func runOMPWakeupHelper(helper: URL, inputData: Data, cwd: URL) -> JSONValue {
+    private static func runOMPWakeupHelper(helper: URL, inputData: Data, cwd: URL) async -> JSONValue {
         let environment = AgentBridgeRuntime.processEnvironment()
         guard let node = AgentBridgeRuntime.executableURL(named: "node", environment: environment) else {
             return .object([
@@ -620,63 +730,20 @@ extension SwiftToolDispatcher {
                 "helper": .string(helper.path),
             ])
         }
-        let process = Process()
-        process.executableURL = node
-        process.arguments = [helper.path]
-        process.currentDirectoryURL = cwd
         var childEnvironment = environment
         if childEnvironment["NATIVE_AGENT_OMP_WAKE_BIN"] == nil,
            let omp = AgentBridgeRuntime.executableURL(named: "omp", environment: environment) {
             childEnvironment["NATIVE_AGENT_OMP_WAKE_BIN"] = omp.path
         }
-        process.environment = childEnvironment
-        let stdin = Pipe()
-        let stdout = Pipe()
-        let stderr = Pipe()
-        process.standardInput = stdin
-        process.standardOutput = stdout
-        process.standardError = stderr
-        do { try process.run() } catch {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("helper_spawn_failed"),
-                "helper": .string(helper.path),
-                "error": .string(String(describing: error)),
-            ])
-        }
-        stdin.fileHandleForWriting.write(inputData)
-        try? stdin.fileHandleForWriting.close()
-        let deadline = Date().addingTimeInterval(30)
-        while process.isRunning, Date() < deadline { Thread.sleep(forTimeInterval: 0.05) }
-        if process.isRunning {
-            process.terminate()
-            Thread.sleep(forTimeInterval: 0.2)
-            if process.isRunning { kill(process.processIdentifier, SIGKILL) }
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("helper_timeout"),
-                "helper": .string(helper.path),
-            ])
-        }
-        let out = String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let err = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let lastLine = out.split(separator: "\n").last.map(String.init) ?? ""
-        if let data = lastLine.data(using: .utf8),
-           case .object(var object)? = try? JSONValue.parse(data) {
-            object["helper"] = .string(helper.path)
-            object["exitCode"] = .int(Int64(process.terminationStatus))
-            if !err.isEmpty { object["stderrPreview"] = .string(String(err.prefix(500))) }
-            return .object(object)
-        }
-        return .object([
-            "status": .string("failed"),
-            "reason": .string("helper_returned_no_json"),
-            "helper": .string(helper.path),
-            "exitCode": .int(Int64(process.terminationStatus)),
-            "stderrPreview": .string(String(err.prefix(500))),
-        ])
+        return await runBuilderWakeupHelper(
+            node: node,
+            helper: helper,
+            inputData: inputData,
+            cwd: cwd,
+            environment: childEnvironment,
+            timeoutSeconds: 30,
+            successfulNoJSONStatus: "failed"
+        )
     }
 
     // MARK: - Codex return-channel handler
@@ -981,10 +1048,30 @@ extension SwiftToolDispatcher {
             }
             return "info"
         }()
-        let topic: String? = {
-            if case .string(let t)? = input["topic"], !t.isEmpty { return t }
-            return nil
+        let requestedTopic: String? = {
+            guard case .string(let raw)? = input["topic"] else { return nil }
+            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            return value.isEmpty ? nil : value
         }()
+        // Resolve the builder conversation before repository inference so a
+        // follow-up remains the same worker thread while still using the new
+        // message text/topic for trusted checkout selection.
+        let messageId: String = {
+            guard case .string(let raw)? = input["message_id"] else { return UUID().uuidString }
+            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            return value.isEmpty ? UUID().uuidString : String(value.prefix(160))
+        }()
+        let conversation: BuilderConversationSelection
+        switch Self.builderConversationSelection(
+            input: input,
+            agent: .codex,
+            topic: requestedTopic,
+            messageId: messageId
+        ) {
+        case .success(let selection): conversation = selection
+        case .failure(let error): return error.envelope
+        }
+        let topic = conversation.topic
         let originSessionId = Self.extractSessionId(from: input)
         let brain: CodexBrainControls
         switch Self.codexBrainControls(from: input) {
@@ -1088,15 +1175,6 @@ extension SwiftToolDispatcher {
             ])
         }
 
-        // Honor a caller-supplied internal idempotency key (GitHub Command
-        // dispatch): the dedup read below matches on messageId, so a random
-        // UUID here would make at-most-once delivery unreachable — the same
-        // actionable event would append a fresh row on every retry/replay.
-        let messageId: String = {
-            guard case .string(let raw)? = input["message_id"] else { return UUID().uuidString }
-            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            return value.isEmpty ? UUID().uuidString : String(value.prefix(160))
-        }()
         let timestamp = ISO8601DateFormatter().string(from: Date())
         var entry: [String: JSONValue] = [
             "id": .string(messageId),
@@ -1108,6 +1186,9 @@ extension SwiftToolDispatcher {
             "read": .bool(false),
         ]
         if let topic { entry["topic"] = .string(topic) }
+        if let conversationId = conversation.conversationId {
+            entry["conversationId"] = .string(conversationId)
+        }
         if !originSessionId.isEmpty { entry["sessionId"] = .string(originSessionId) }
         entry["origin"] = origin
         entry["brain"] = brain.jsonValue
@@ -1136,6 +1217,7 @@ extension SwiftToolDispatcher {
                     // would advertise a capability the queued turn never gets
                     // (gpt-5.5 review, 2026-08-05).
                     guard object["text"] == .string(text),
+                          object["conversationId"] == inboxEntry["conversationId"],
                           object["workingDirectory"] == inboxEntry["workingDirectory"],
                           object["executionProfile"] == inboxEntry["executionProfile"] else {
                         return "conflict"
@@ -1170,7 +1252,7 @@ extension SwiftToolDispatcher {
             "queuedAt": .string(timestamp),
             "origin": origin,
             "brain": brain.jsonValue,
-            "note": .string("Codex can read this through the local NativeAgent bridge inbox; NativeAgent also attempts a local Mac notification, a Codex thread wakeup, and a reply watcher that delivers Codex's final answer back through the local bridge. If Codex is already busy, the wakeup is queued until that thread is idle."),
+            "note": .string("NativeAgent queues the inbox row, attempts a Mac notification, wakes Codex, and watches for the final answer. Use the returned conversationId with codex_message for a contextual follow-up; omit it for new work. If Codex is busy, the wake remains queued until that thread is idle."),
         ]
         if let workingDirectory { response["workingDirectory"] = .string(workingDirectory) }
         if let executionProfile {
@@ -1182,6 +1264,10 @@ extension SwiftToolDispatcher {
                     : repositoryResolvedDirectory != nil ? "repository_parameter"
                     : "inferred_from_request"
             )
+        }
+        if let conversationId = conversation.conversationId {
+            response["conversationId"] = .string(conversationId)
+            response["replyWith"] = .string("codex_message")
         }
         response["notification"] = await postCodexMessageArrivalNotification(
             messageId: messageId,
@@ -1196,7 +1282,7 @@ extension SwiftToolDispatcher {
             // wakeup side effect entirely and report the dedup outcome.
             response["wakeup"] = .object(["status": .string("deduplicated")])
         } else {
-            response["wakeup"] = await postCodexThreadWakeup(
+            let wakeup = await postCodexThreadWakeup(
                 messageId: messageId,
                 text: text,
                 priority: priority,
@@ -1206,9 +1292,17 @@ extension SwiftToolDispatcher {
                 originSessionId: originSessionId,
                 origin: origin,
                 brain: brain,
+                threadId: conversation.resumeId,
                 workingDirectory: workingDirectory,
                 executionProfile: executionProfile
             )
+            response["wakeup"] = wakeup
+            let conversationId = conversation.conversationId
+                ?? Self.stringField("threadId", in: wakeup).map { "codex:\($0)" }
+            if let conversationId {
+                response["conversationId"] = .string(conversationId)
+                response["replyWith"] = .string("codex_message")
+            }
         }
         return .object(response)
     }
@@ -1330,6 +1424,7 @@ extension SwiftToolDispatcher {
         originSessionId: String,
         origin: JSONValue,
         brain: CodexBrainControls,
+        threadId: String?,
         workingDirectory: String?,
         executionProfile: String?
     ) async -> JSONValue {
@@ -1350,6 +1445,7 @@ extension SwiftToolDispatcher {
             if let effort = brain.reasoningEffort { payload["reasoningEffort"] = .string(effort) }
             if let tier = brain.serviceTier { payload["serviceTier"] = .string(tier) }
             if let fast = brain.fast { payload["fast"] = .bool(fast) }
+            if let threadId { payload["threadId"] = .string(threadId) }
             if let workingDirectory { payload["workingDirectory"] = .string(workingDirectory) }
             if let executionProfile { payload["executionProfile"] = .string(executionProfile) }
             return await codexMessageWakeupOverride(payload)
@@ -1391,6 +1487,7 @@ extension SwiftToolDispatcher {
         if let effort = brain.reasoningEffort { payload["reasoningEffort"] = .string(effort) }
         if let tier = brain.serviceTier { payload["serviceTier"] = .string(tier) }
         if let fast = brain.fast { payload["fast"] = .bool(fast) }
+        if let threadId { payload["threadId"] = .string(threadId) }
         if let workingDirectory { payload["workingDirectory"] = .string(workingDirectory) }
         if let executionProfile { payload["executionProfile"] = .string(executionProfile) }
 
@@ -1407,86 +1504,92 @@ extension SwiftToolDispatcher {
 
         let cwd = Self.builderSourceRepoRoot(dataRoot: dataRoot)
             ?? NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot)
-        return await Task.detached(priority: .utility) {
-            Self.runCodexWakeupHelper(helper: helper, inputData: inputData, cwd: cwd)
-        }.value
+        return await Self.runCodexWakeupHelper(helper: helper, inputData: inputData, cwd: cwd)
     }
 
-    /// Concurrent accumulator for one child pipe.
-    ///
-    /// BRIDGES-5: the helper's stdout/stderr must be drained WHILE the child
-    /// runs. A macOS pipe holds ~64KB; a helper that emits more (a large
-    /// `--recover-reply-jobs` report, a node stack trace) blocks in `write(2)`
-    /// forever if the parent only reads after `waitUntilExit`. The old code
-    /// read at line 953 — after the poll loop — so any >64KB helper wedged,
-    /// hit the deadline, and got reported as `helper_timeout`: a lie, because
-    /// the helper was alive and blocked on us.
-    private final class HelperPipeDrain: @unchecked Sendable {
-        private let lock = NSLock()
-        private let finished = DispatchSemaphore(value: 0)
-        private let byteCap: Int
-        private var buffer = Data()
-        private var truncatedBytes = 0
-        private var didFinish = false
-
-        init(byteCap: Int = 8 * 1024 * 1024) {
-            self.byteCap = byteCap
+    /// One lifecycle owner for the Codex, Claude, and OMP wake helpers. The
+    /// shared adapter drains both pipes while the child runs, feeds stdin off
+    /// the waiting path, bounds captured output, and owns cancellation plus
+    /// process-tree timeout escalation. Builder-specific wrappers only supply
+    /// environment and deadline policy.
+    private static func runBuilderWakeupHelper(
+        node: URL,
+        helper: URL,
+        inputData: Data,
+        cwd: URL,
+        environment: [String: String],
+        timeoutSeconds: TimeInterval,
+        successfulNoJSONStatus: String
+    ) async -> JSONValue {
+        let result: ProcessRunResult
+        do {
+            result = try await SystemProcessAdapter().run(
+                executable: node.path,
+                arguments: [helper.path],
+                currentDirectory: cwd,
+                environment: environment,
+                standardInput: inputData,
+                timeoutSeconds: timeoutSeconds,
+                outputByteLimit: 8 * 1024 * 1024
+            )
+        } catch is CancellationError {
+            return .object([
+                "status": .string("failed"),
+                "reason": .string("helper_cancelled"),
+                "helper": .string(helper.path),
+            ])
+        } catch {
+            return .object([
+                "status": .string("failed"),
+                "reason": .string("helper_spawn_failed"),
+                "helper": .string(helper.path),
+                "error": .string(String(describing: error)),
+            ])
         }
 
-        /// Installs the reader. MUST be called before `process.run()`.
-        func attach(to handle: FileHandle) {
-            handle.readabilityHandler = { [weak self] readHandle in
-                guard let self else { return }
-                let chunk = readHandle.availableData
-                if chunk.isEmpty {
-                    readHandle.readabilityHandler = nil
-                    self.finish()
-                    return
-                }
-                self.lock.lock()
-                // Always CONSUME, even past the cap — dropping bytes we already
-                // read keeps memory bounded without ever re-wedging the pipe.
-                let room = self.byteCap - self.buffer.count
-                if room > 0 {
-                    self.buffer.append(chunk.prefix(room))
-                    self.truncatedBytes += max(0, chunk.count - room)
-                } else {
-                    self.truncatedBytes += chunk.count
-                }
-                self.lock.unlock()
+        let stderrText = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        if result.timedOut {
+            var envelope: [String: JSONValue] = [
+                "status": .string("failed"),
+                "reason": .string("helper_timeout"),
+                "helper": .string(helper.path),
+            ]
+            if !stderrText.isEmpty {
+                envelope["stderrPreview"] = .string(String(stderrText.prefix(500)))
             }
+            return .object(envelope)
         }
 
-        private func finish() {
-            lock.lock()
-            let alreadyFinished = didFinish
-            didFinish = true
-            lock.unlock()
-            if !alreadyFinished { finished.signal() }
+        let stdoutText = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lastLine = stdoutText.split(separator: "\n").last.map(String.init) ?? ""
+        let parsed = [stdoutText, lastLine]
+            .lazy
+            .filter { !$0.isEmpty }
+            .compactMap { $0.data(using: .utf8) }
+            .compactMap { try? JSONValue.parse($0) }
+            .first
+        if let parsed {
+            if case .object(var object) = parsed {
+                object["helper"] = .string(helper.path)
+                object["exitCode"] = .int(Int64(result.exitCode))
+                if !stderrText.isEmpty {
+                    object["stderrPreview"] = .string(String(stderrText.prefix(500)))
+                }
+                return .object(object)
+            }
+            return parsed
         }
 
-        /// Bounded wait for EOF, then detach. Never blocks indefinitely: a
-        /// killed child can leave a pipe held open by a grandchild.
-        func waitForEOF(timeout: TimeInterval, handle: FileHandle) {
-            _ = finished.wait(timeout: .now() + timeout)
-            handle.readabilityHandler = nil
-            finish()
-        }
-
-        var data: Data {
-            lock.lock()
-            defer { lock.unlock() }
-            return buffer
-        }
-
-        var truncated: Bool {
-            lock.lock()
-            defer { lock.unlock() }
-            return truncatedBytes > 0
-        }
+        return .object([
+            "status": .string(result.exitCode == 0 ? successfulNoJSONStatus : "failed"),
+            "reason": .string(result.stdoutTruncated ? "helper_output_truncated" : "helper_returned_no_json"),
+            "helper": .string(helper.path),
+            "exitCode": .int(Int64(result.exitCode)),
+            "stderrPreview": .string(String(stderrText.prefix(500))),
+        ])
     }
 
-    private static func runCodexWakeupHelper(helper: URL, inputData: Data, cwd: URL) -> JSONValue {
+    private static func runCodexWakeupHelper(helper: URL, inputData: Data, cwd: URL) async -> JSONValue {
         let environment = AgentBridgeRuntime.processEnvironment()
         guard let node = AgentBridgeRuntime.executableURL(named: "node", environment: environment) else {
             return .object([
@@ -1496,123 +1599,20 @@ extension SwiftToolDispatcher {
                 "fix": .string("Install Node.js, then restart NativeAgent."),
             ])
         }
-        let process = Process()
-        process.executableURL = node
-        process.arguments = [helper.path]
-        process.currentDirectoryURL = cwd
         var childEnvironment = environment
         if childEnvironment["CODEX_BIN"] == nil,
            let codex = AgentBridgeRuntime.executableURL(named: "codex", environment: environment) {
             childEnvironment["CODEX_BIN"] = codex.path
         }
-        process.environment = childEnvironment
-
-        let stdin = Pipe()
-        let stdout = Pipe()
-        let stderr = Pipe()
-        process.standardInput = stdin
-        process.standardOutput = stdout
-        process.standardError = stderr
-
-        // Readers armed BEFORE run(): from the child's first byte there is a
-        // consumer on both pipes, so neither can fill.
-        let outDrain = HelperPipeDrain()
-        let errDrain = HelperPipeDrain()
-        outDrain.attach(to: stdout.fileHandleForReading)
-        errDrain.attach(to: stderr.fileHandleForReading)
-
-        do {
-            try process.run()
-        } catch {
-            stdout.fileHandleForReading.readabilityHandler = nil
-            stderr.fileHandleForReading.readabilityHandler = nil
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("helper_spawn_failed"),
-                "helper": .string(helper.path),
-                "error": .string(String(describing: error)),
-            ])
-        }
-
-        // Same hazard in the other direction: a payload larger than the pipe
-        // buffer blocks this thread if the helper hasn't started reading yet.
-        // Write off-thread and let the deadline loop below stay responsive.
-        DispatchQueue.global(qos: .utility).async {
-            let handle = stdin.fileHandleForWriting
-            try? handle.write(contentsOf: inputData)
-            try? handle.close()
-        }
-
-        let deadline = Date().addingTimeInterval(Self.codexWakeupHelperTimeoutSeconds())
-        while process.isRunning, Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.05)
-        }
-        if process.isRunning {
-            process.terminate()
-            Thread.sleep(forTimeInterval: 0.2)
-            if process.isRunning {
-                kill(process.processIdentifier, SIGKILL)
-            }
-            // Whatever the helper managed to say before the deadline is real
-            // diagnostic evidence — a timeout is no longer a blind report.
-            outDrain.waitForEOF(timeout: 1.0, handle: stdout.fileHandleForReading)
-            errDrain.waitForEOF(timeout: 1.0, handle: stderr.fileHandleForReading)
-            let partialErr = String(data: errDrain.data, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            var timeoutObject: [String: JSONValue] = [
-                "status": .string("failed"),
-                "reason": .string("helper_timeout"),
-                "helper": .string(helper.path),
-            ]
-            if !partialErr.isEmpty {
-                timeoutObject["stderrPreview"] = .string(String(partialErr.prefix(500)))
-            }
-            return .object(timeoutObject)
-        }
-
-        // The child exited; drain to EOF before parsing so a large final flush
-        // is never truncated mid-JSON. Waits run CONCURRENTLY and stay short:
-        // serial 5s+5s could stretch the helper timeout contract by 10s when a
-        // grandchild holds a pipe open (gpt-5.5 review MED) — the normal case
-        // (writers closed at exit) returns immediately either way.
-        let eofGroup = DispatchGroup()
-        eofGroup.enter()
-        DispatchQueue.global(qos: .utility).async {
-            outDrain.waitForEOF(timeout: 2.0, handle: stdout.fileHandleForReading)
-            eofGroup.leave()
-        }
-        errDrain.waitForEOF(timeout: 2.0, handle: stderr.fileHandleForReading)
-        eofGroup.wait()
-        let outData = outDrain.data
-        let errData = errDrain.data
-        let stdoutText = String(data: outData, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let stderrText = String(data: errData, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-
-        if !stdoutText.isEmpty,
-           let data = stdoutText.data(using: .utf8),
-           let parsed = try? JSONValue.parse(data) {
-            if case .object(var obj) = parsed {
-                obj["helper"] = .string(helper.path)
-                obj["exitCode"] = .int(Int64(process.terminationStatus))
-                if !stderrText.isEmpty {
-                    obj["stderrPreview"] = .string(String(stderrText.prefix(500)))
-                }
-                return .object(obj)
-            }
-            return parsed
-        }
-
-        // A capped drain that dropped bytes explains a failed parse honestly:
-        // "no JSON" on a >8MiB report is truncation, not a silent helper.
-        return .object([
-            "status": .string(process.terminationStatus == 0 ? "completed" : "failed"),
-            "reason": .string(outDrain.truncated ? "helper_output_truncated" : "helper_returned_no_json"),
-            "helper": .string(helper.path),
-            "exitCode": .int(Int64(process.terminationStatus)),
-            "stderrPreview": .string(String(stderrText.prefix(500))),
-        ])
+        return await runBuilderWakeupHelper(
+            node: node,
+            helper: helper,
+            inputData: inputData,
+            cwd: cwd,
+            environment: childEnvironment,
+            timeoutSeconds: codexWakeupHelperTimeoutSeconds(),
+            successfulNoJSONStatus: "completed"
+        )
     }
 
     /// The Node helper owns an RPC timeout (12 seconds by default). Keep the

@@ -152,6 +152,8 @@ public func makeChatOrchestrationClient(
 ///   `SwiftNativeTrustCenter` on `dataRoot`.
 /// - `verifiedSessionId`: optional session id used by SecurityCenter for
 ///   origin attribution; pass nil for stateless callers.
+/// - `approvedReplay`: exact approval evidence for a resolved chat-tool replay.
+///   It satisfies only a matching persona confirmation; hard gates still run.
 public func makeGatedToolDispatchClient(
     tools: any ToolDispatchClient,
     fileAccess: String = "read_only",
@@ -159,7 +161,8 @@ public func makeGatedToolDispatchClient(
     approvalTimeoutSeconds: Double = 30,
     dataRoot: URL = PersistenceCore.defaultDataRoot(),
     trust: (any AutonomyResolver)? = nil,
-    verifiedSessionId: String? = nil
+    verifiedSessionId: String? = nil,
+    approvedReplay: ApprovedChatToolReplay? = nil
 ) -> any ToolDispatchClient {
     let resolvedTrust: any AutonomyResolver = trust ?? SwiftNativeTrustCenter(dataRoot: dataRoot)
     let gate = AutonomyGate(trust: resolvedTrust, approvalFiler: approvalFiler)
@@ -168,9 +171,11 @@ public func makeGatedToolDispatchClient(
         inner: fileAccessGated,
         gate: gate,
         approvalFiler: approvalFiler,
+        securityCenter: SwiftNativeSecurityCenter(dataRoot: dataRoot),
         hasFiler: approvalFiler != nil,
         approvalTimeoutSeconds: approvalTimeoutSeconds,
-        verifiedSessionId: verifiedSessionId
+        verifiedSessionId: verifiedSessionId,
+        approvedReplay: approvedReplay
     )
 }
 

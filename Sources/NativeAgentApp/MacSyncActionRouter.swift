@@ -144,7 +144,7 @@ struct MacSyncActionRouter {
         do {
             switch action.action {
             case "submitWorkshopTask", "submitMission":
-                let title = payload["title"] ?? "iOS Workshop Task"
+                let title = payload["title"] ?? "iOS Desk Task"
                 let objective = payload["objective"] ?? ""
                 let result = try await api.submitWorkshopExecution(title: title, objective: objective)
                 return [

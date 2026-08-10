@@ -10,63 +10,6 @@ import PersonaEngine
 import TrustCenter
 import WorkshopExecution
 
-/// FIFO relay for fire-and-forget work that must leave a hot path immediately
-/// but still reach its consumer in submission order.
-///
-/// The naive fix for "stop awaiting this" is a bare `Task.detached` per call,
-/// which drops ordering: N tool results in a turn would race, and a hint
-/// planner that dedupes on a monotonic `revision` can then observe them out of
-/// order. Chaining each task on its predecessor keeps the exact serialization
-/// the inline `await` gave us, while the enqueue itself is synchronous and
-/// allocation-cheap on the caller.
-///
-/// Detached on purpose: this work is housekeeping that outlives the turn that
-/// produced it, so a cancelled turn must not silently drop already-observed
-/// results, and it should never inherit the turn's priority.
-final class SerialDetachedRelay: @unchecked Sendable {
-    private let label: String
-    private let lock = NSLock()
-    private var tail: Task<Void, Never>?
-
-    init(label: String) {
-        self.label = label
-    }
-
-    /// Append `work` to the chain. Returns the handle for the enqueued unit so
-    /// tests can await one specific submission; production callers discard it.
-    @discardableResult
-    func enqueue(_ work: @escaping @Sendable () async -> Void) -> Task<Void, Never> {
-        lock.lock()
-        let previous = tail
-        let next = Task.detached(priority: .utility) {
-            if let previous {
-                _ = await previous.value
-            }
-            await work()
-        }
-        tail = next
-        lock.unlock()
-        return next
-    }
-
-    /// Wait for everything enqueued before this call. Because the chain is
-    /// strictly serial, awaiting the current tail awaits the whole backlog.
-    func drain() async {
-        if let current = currentTail() {
-            _ = await current.value
-        }
-    }
-
-    /// Deliberately synchronous and `nonisolated`: `NSLock.lock()` is
-    /// unavailable from an async context, so the critical section stays out of
-    /// one entirely and `drain` only awaits the handle it hands back.
-    private func currentTail() -> Task<Void, Never>? {
-        lock.lock()
-        defer { lock.unlock() }
-        return tail
-    }
-}
-
 /// App-owned tool shim for chat surfaces.
 ///
 /// Core's SwiftToolDispatcher intentionally knows nothing about Mac app
@@ -1545,27 +1488,6 @@ private enum AppNotificationToolError: LocalizedError {
 /// drift from its siblings by relying on the factory's Boolean defaults. This
 /// is only construction policy: authority remains owned by SecurityCenter,
 /// TrustCenter, and the per-turn gated dispatcher.
-enum NativeAgentAppChatSurfaceProfile: String, CaseIterable, Sendable {
-    case mac
-    case slack
-    case telegram
-    case ios
-    case bridge
-
-    var includesEvolutionBridge: Bool {
-        switch self {
-        case .mac, .bridge:
-            return true
-        case .slack, .telegram, .ios:
-            return false
-        }
-    }
-
-    var deniesExternalMCP: Bool {
-        self == .bridge
-    }
-}
-
 /// Build the app's chat orchestration client.
 ///
 /// `includeEvolutionBridge` (2026-06-11, U4 Wave D): the self-evolution chat

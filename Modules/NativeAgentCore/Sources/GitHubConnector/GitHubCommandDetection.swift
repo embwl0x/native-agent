@@ -10,16 +10,41 @@ enum GitHubCommandObservationBuilder {
         "disputed-direction", "breaking-change", "irreversible",
     ]
 
-    /// True when the pull carries a needs-decision-class label — the one
-    /// decision signal whose lifecycle outlives the answer. Callers use this
-    /// to decide whether the (single, cheap) latest-issue-comment fetch is
-    /// worth making; requested-reviewer entries clear themselves on review
-    /// submission and never need it.
-    static func labelDecisionArmed(pull: [String: Any]) -> Bool {
+    /// True when a needs-decision-class label is actually addressed to the
+    /// configured contributor. A repository-wide label alone says that
+    /// somebody must decide; it does not prove that this user's attention is
+    /// required. Explicit assignment (or owning the repository) is the trust
+    /// boundary that allows the label to raise needs-you state.
+    static func labelDecisionArmed(
+        pull: [String: Any],
+        repository: String,
+        actor: String?
+    ) -> Bool {
         let labels = Set(((pull["labels"] as? [[String: Any]]) ?? []).compactMap {
             ($0["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         })
         return !labels.intersection(decisionLabels).isEmpty
+            && decisionLabelTargetsActor(item: pull, repository: repository, actor: actor)
+    }
+
+    private static func decisionLabelTargetsActor(
+        item: [String: Any],
+        repository: String,
+        actor: String?
+    ) -> Bool {
+        guard let actor = actor?.trimmingCharacters(in: .whitespacesAndNewlines), !actor.isEmpty else {
+            return false
+        }
+        let assignees = ((item["assignees"] as? [[String: Any]]) ?? []).compactMap {
+            $0["login"] as? String
+        }
+        if assignees.contains(where: { $0.caseInsensitiveCompare(actor) == .orderedSame }) {
+            return true
+        }
+        guard let repositoryOwner = repository.split(separator: "/", maxSplits: 1).first else {
+            return false
+        }
+        return String(repositoryOwner).caseInsensitiveCompare(actor) == .orderedSame
     }
 
     /// Author login of the first row of an issue-comments response fetched
@@ -202,9 +227,13 @@ enum GitHubCommandObservationBuilder {
             humanDecision = GitHubCommandBlocker(
                 detail: "A human review decision is requested on this pull request.", owner: actor
             )
-        } else if let label = labels.intersection(decisionLabels).sorted().first, !actorSpokeLast {
+        } else if let label = labels.intersection(decisionLabels).sorted().first,
+                  decisionLabelTargetsActor(item: pull, repository: repository, actor: actor),
+                  !actorSpokeLast,
+                  let actor {
             humanDecision = GitHubCommandBlocker(
-                detail: "GitHub marks this as a genuine human decision (\(label)).", owner: "Repository owner"
+                detail: "GitHub explicitly assigns this decision to the configured contributor (\(label)).",
+                owner: actor
             )
         } else {
             humanDecision = nil
@@ -261,6 +290,7 @@ enum GitHubCommandObservationBuilder {
     static func issue(
         repository: String,
         row: [String: Any],
+        actor: String?,
         staleAfterHours: Int
     ) -> GitHubCommandObservation? {
         guard let number = row["number"] as? Int else { return nil }
@@ -270,9 +300,12 @@ enum GitHubCommandObservationBuilder {
             ($0["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         })
         let decisionLabels = Self.decisionLabels
-        let decision = labels.intersection(decisionLabels).sorted().first.map {
-            GitHubCommandBlocker(
-                detail: "GitHub marks this as a genuine human decision (\($0)).", owner: "Repository owner"
+        let decision: GitHubCommandBlocker? = labels.intersection(decisionLabels).sorted().first.flatMap { label in
+            guard decisionLabelTargetsActor(item: row, repository: repository, actor: actor),
+                  let actor else { return nil }
+            return GitHubCommandBlocker(
+                detail: "GitHub explicitly assigns this decision to the configured contributor (\(label)).",
+                owner: actor
             )
         }
         return GitHubCommandObservation(
@@ -416,13 +449,20 @@ public extension GitHubConnectorActions {
         staleAfterHours: Int = 72,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async throws -> GitHubCommandObservation {
+        let actor: String?
+        if let user = try? await validateStoredToken(dataRoot: dataRoot) {
+            actor = user["login"] as? String
+        } else {
+            actor = nil
+        }
         switch item.kind {
         case .issue:
             guard let row = try await call(
                 path: "repos/\(item.repository)/issues/\(item.number)", dataRoot: dataRoot
             ) as? [String: Any],
             let observation = GitHubCommandObservationBuilder.issue(
-                repository: item.repository, row: row, staleAfterHours: staleAfterHours
+                repository: item.repository, row: row, actor: actor,
+                staleAfterHours: staleAfterHours
             ) else {
                 throw GitHubConnectorError.invalidResponse("tracked issue was not an object")
             }
@@ -465,12 +505,6 @@ public extension GitHubConnectorActions {
                     path: "repos/\(item.repository)/commits/\(sha)/status", dataRoot: dataRoot
                 )
             }
-            let actor: String?
-            if let user = try? await validateStoredToken(dataRoot: dataRoot) {
-                actor = user["login"] as? String
-            } else {
-                actor = nil
-            }
             // Only decision-labeled PRs need the newest NON-BOT issue
             // comment (the decision-delivered rule); everything else skips
             // the call. The per-issue endpoint lists ASCENDING and ignores
@@ -479,7 +513,9 @@ public extension GitHubConnectorActions {
             // a bot reply after the actor's answer must not re-arm needs_user).
             var latestIssueCommentAuthor: String? = nil
             let issueCommentCount = GitHubCommandObservationBuilder.issueCommentCount(pull: pull)
-            if issueCommentCount > 0, GitHubCommandObservationBuilder.labelDecisionArmed(pull: pull) {
+            if issueCommentCount > 0, GitHubCommandObservationBuilder.labelDecisionArmed(
+                pull: pull, repository: item.repository, actor: actor
+            ) {
                 let lastPage = (issueCommentCount + 9) / 10
                 let latest = try await call(
                     path: "repos/\(item.repository)/issues/\(item.number)/comments",

@@ -157,7 +157,7 @@ extension SwiftToolDispatcher {
     ]
 
     static let fullMacSystemToolNames: [String] = [
-        "system_info",
+        "system_info", "remote_node_list",
     ]
 
     static let fullMacAppToolNames: [String] = [
@@ -172,7 +172,7 @@ extension SwiftToolDispatcher {
     // wrapper to avoid SwiftPM's nested sandbox failure.
     static let fullMacBuilderToolNames: [String] = [
         "shell", "bash", "git", "apply_patch", "run_tests",
-        "swift_build", "swift_test",
+        "swift_build", "swift_test", "remote_node_execute",
     ]
 
     // App lifecycle tools. Not general builder tools (no arbitrary Process

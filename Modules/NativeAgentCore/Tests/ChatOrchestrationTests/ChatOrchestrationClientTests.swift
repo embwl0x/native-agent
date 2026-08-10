@@ -1367,6 +1367,8 @@ func swiftToolDispatcher_codexMessageQueuesInboxAndPostsMacNotification() async 
     }
     #expect(obj["status"] == JSONValue.string("queued"))
     #expect(obj["priority"] == JSONValue.string("important"))
+    #expect(obj["conversationId"] == JSONValue.string("codex:thread-test"))
+    #expect(obj["replyWith"] == JSONValue.string("codex_message"))
 
     guard let filePathValue = obj["filePath"],
           case .string(let filePath) = filePathValue else {
@@ -1445,7 +1447,88 @@ func swiftToolDispatcher_codexMessageQueuesInboxAndPostsMacNotification() async 
     #expect(wakeupInputs.first?["reasoningEffort"] == JSONValue.string("ultra"))
     #expect(wakeupInputs.first?["serviceTier"] == JSONValue.string("priority"))
     #expect(wakeupInputs.first?["fast"] == JSONValue.bool(true))
+    #expect(wakeupInputs.first?["threadId"] == nil)
     #expect(wakeupInputs.first?["origin"] == row["origin"])
+}
+
+@Test
+func swiftToolDispatcher_codexConversationReferenceResumesExactThread() async throws {
+    let root = try makeTempRoot("codex-conversation-reply")
+    let wakeup = CodexWakeupInputRecorder()
+    let tools = SwiftToolDispatcher(
+        dataRoot: root,
+        agentBridgeConfigRoot: root.appendingPathComponent("config", isDirectory: true),
+        codexMessageNotificationPermissionOverride: false,
+        codexMessageWakeupOverride: { input in
+            await wakeup.append(input)
+            return .object(["status": .string("sent"), "threadId": .string("thread-original")])
+        }
+    )
+
+    let result = try await tools.dispatch(
+        tool: "codex_message",
+        input: [
+            "text": .string("Please adjust the same implementation."),
+            "conversation_id": .string("codex:thread-original"),
+            "message_id": .string("codex-reply-1"),
+            "__session_id": .string("agent-origin-session"),
+        ],
+        surface: "chat"
+    )
+    guard case .object(let object) = result else {
+        Issue.record("codex_message reply should return an object")
+        return
+    }
+    #expect(object["conversationId"] == .string("codex:thread-original"))
+    let payloads = await wakeup.all()
+    #expect(payloads.count == 1)
+    #expect(payloads[0]["threadId"] == .string("thread-original"))
+    #expect(payloads[0]["sessionId"] == .string("agent-origin-session"))
+
+    let retargetedDuplicate = try await tools.dispatch(
+        tool: "codex_message",
+        input: [
+            "text": .string("Please adjust the same implementation."),
+            "conversation_id": .string("codex:different-thread"),
+            "message_id": .string("codex-reply-1"),
+            "__session_id": .string("agent-origin-session"),
+        ],
+        surface: "chat"
+    )
+    guard case .object(let retargetedObject) = retargetedDuplicate else {
+        Issue.record("retargeted duplicate should return an object")
+        return
+    }
+    #expect(retargetedObject["reason"] == .string("message_id_conflict"))
+    #expect(await wakeup.all().count == 1)
+
+    let mismatch = try await tools.dispatch(
+        tool: "codex_message",
+        input: [
+            "text": .string("Wrong worker must not run."),
+            "conversation_id": .string("claude:wake-parity"),
+        ],
+        surface: "chat"
+    )
+    guard case .object(let mismatchObject) = mismatch else {
+        Issue.record("mismatched conversation should return an object")
+        return
+    }
+    #expect(mismatchObject["status"] == .string("failed"))
+    #expect(mismatchObject["reason"] == .string("conversation_agent_mismatch"))
+    #expect(await wakeup.all().count == 1)
+
+    let malformed = try await tools.dispatch(
+        tool: "codex_message",
+        input: ["text": .string("Malformed reference must not start fresh."), "conversation_id": .int(42)],
+        surface: "chat"
+    )
+    guard case .object(let malformedObject) = malformed else {
+        Issue.record("malformed conversation should return an object")
+        return
+    }
+    #expect(malformedObject["reason"] == .string("invalid_conversation_id"))
+    #expect(await wakeup.all().count == 1)
 }
 
 @Test
@@ -1481,6 +1564,8 @@ func swiftToolDispatcher_claudeMessageQueuesInboxAndWakesClaudeSession() async t
     }
     #expect(obj["status"] == JSONValue.string("queued"))
     #expect(obj["deduplicated"] == JSONValue.bool(false))
+    #expect(obj["conversationId"] == JSONValue.string("claude:wake-parity"))
+    #expect(obj["replyWith"] == JSONValue.string("claude_message"))
 
     guard let wakeupValue = obj["wakeup"], case .object(let receipt) = wakeupValue else {
         Issue.record("claude_message should carry a wakeup receipt")
@@ -1494,7 +1579,7 @@ func swiftToolDispatcher_claudeMessageQueuesInboxAndWakesClaudeSession() async t
     #expect(sent.first?["messageId"] == JSONValue.string("claude-wake-1"))
     #expect(sent.first?["text"] == JSONValue.string("write the parity proof artifact"))
     #expect(sent.first?["priority"] == JSONValue.string("important"))
-    #expect(sent.first?["topic"] == JSONValue.string("wake parity"))
+    #expect(sent.first?["topic"] == JSONValue.string("wake-parity"))
     #expect(sent.first?["source"] == JSONValue.string("claude_message"))
     #expect(sent.first?["sessionId"] == JSONValue.string("agent-session-1"))
     guard case .string(let inboxPath)? = sent.first?["inboxPath"] else {
@@ -1516,6 +1601,63 @@ func swiftToolDispatcher_claudeMessageQueuesInboxAndWakesClaudeSession() async t
     #expect(replayObj["deduplicated"] == JSONValue.bool(true))
     #expect(replayReceipt["status"] == JSONValue.string("deduplicated"))
     #expect(await wakeup.all().count == 1)
+}
+
+@Test
+func swiftToolDispatcher_claudeConversationReferenceResumesTopicPointer() async throws {
+    let root = try makeTempRoot("claude-conversation-reply")
+    let wakeup = CodexWakeupInputRecorder()
+    let tools = SwiftToolDispatcher(
+        dataRoot: root,
+        agentBridgeConfigRoot: root.appendingPathComponent("config", isDirectory: true),
+        claudeMessageWakeupOverride: { input in
+            await wakeup.append(input)
+            return .object(["status": .string("sent")])
+        }
+    )
+
+    let first = try await tools.dispatch(
+        tool: "claude_message",
+        input: ["text": .string("Start new work."), "message_id": .string("claude-first")],
+        surface: "chat"
+    )
+    guard case .object(let firstObject) = first,
+          case .string(let conversationId)? = firstObject["conversationId"] else {
+        Issue.record("first claude_message should return a conversation reference")
+        return
+    }
+    #expect(conversationId.hasPrefix("claude:conversation-"))
+
+    _ = try await tools.dispatch(
+        tool: "claude_message",
+        input: [
+            "text": .string("Continue with one adjustment."),
+            "conversation_id": .string(conversationId),
+            "message_id": .string("claude-reply"),
+        ],
+        surface: "chat"
+    )
+    let payloads = await wakeup.all()
+    #expect(payloads.count == 2)
+    let referenceTopic = String(conversationId.dropFirst("claude:".count))
+    #expect(payloads[0]["topic"] == .string(referenceTopic))
+    #expect(payloads[1]["topic"] == .string(referenceTopic))
+
+    let mismatch = try await tools.dispatch(
+        tool: "claude_message",
+        input: [
+            "text": .string("Conflicting topic must fail."),
+            "conversation_id": .string(conversationId),
+            "topic": .string("another-topic"),
+        ],
+        surface: "chat"
+    )
+    guard case .object(let mismatchObject) = mismatch else {
+        Issue.record("topic mismatch should return an object")
+        return
+    }
+    #expect(mismatchObject["reason"] == .string("conversation_topic_mismatch"))
+    #expect(await wakeup.all().count == 2)
 }
 
 @Test
@@ -2548,6 +2690,24 @@ func swiftToolDispatcher_recent_trace_summary_schema_supports_session_aliases() 
     }
     #expect(properties["session_id"] != nil)
     #expect(properties["sessionId"] != nil)
+}
+
+@Test
+func swiftToolDispatcher_builderMessageSchemasExposeConversationReplies() async throws {
+    let root = try makeTempRoot("builder-conversation-schemas")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let schemas = try await SwiftToolDispatcher(dataRoot: root).listAvailableToolSchemas()
+    for toolName in ["codex_message", "claude_message", "omp_message"] {
+        let schema = try #require(schemas.first { $0.name == toolName })
+        let parsed = try JSONValue.parse(schema.parametersJSON)
+        guard case .object(let object) = parsed,
+              case .object(let properties)? = object["properties"] else {
+            Issue.record("expected \(toolName) object schema")
+            continue
+        }
+        #expect(properties["conversation_id"] != nil)
+        #expect(schema.description.contains("conversationId"))
+    }
 }
 
 @Test

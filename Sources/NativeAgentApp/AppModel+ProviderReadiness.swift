@@ -110,11 +110,17 @@ extension AppModel {
         guard isInstalledRoot else { return false }
 
         // 3. The global ~/.codex default, for installs whose CLI was signed in
-        //    outside the app. Same token requirement.
-        let homeCodexAuth = homeDirectory
-            .appendingPathComponent(".codex", isDirectory: true)
-            .appendingPathComponent("auth.json")
-        if codexAuthFileIsUsable(homeCodexAuth) { return true }
+        //    outside the app. Same token requirement — and ONLY after the
+        //    user has explicitly allowed adopting the CLI session. Without
+        //    consent the send path fails closed, so counting this file as a
+        //    usable provider would suppress the first-run guidance the user
+        //    needs (gpt-5.5 review 2026-08-06, blocking).
+        if OpenAIOAuthDirectAdapter.cliAdoptionConsent(dataRoot: dataRoot) == .allowed {
+            let homeCodexAuth = homeDirectory
+                .appendingPathComponent(".codex", isDirectory: true)
+                .appendingPathComponent("auth.json")
+            if codexAuthFileIsUsable(homeCodexAuth) { return true }
+        }
 
         // 4. Environment API keys the credential resolver honors.
         let keyVars = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "XAI_API_KEY"]

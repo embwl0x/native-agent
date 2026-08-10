@@ -11,7 +11,7 @@ enum SkillsToolsSection: String, CaseIterable, Identifiable, Sendable {
 }
 
 // PATCH-2026-05-19: ui-pull-together — keep the primary Mac sidebar compact:
-// Chat, Activity, Memories, Skills & Tools, Workshop, Providers, Trust, Mac Integration, Settings. Feature-specific
+// Chat, Activity, Memories, Skills & Tools, Desk, Providers, Trust, Mac Integration, Settings. Feature-specific
 // control rooms stay in Advanced and the command palette instead of competing
 // as always-visible tabs.
 // Legacy cases (memory, settingsHub, approvals, work, skillLifecycle) stay
@@ -23,7 +23,7 @@ enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
     case activity = "Activity"           // approvals + inbox + proposals
     case memories = "Memories"           // was: memory (hub); now: just the memory list
     case skills = "Skills"               // displayed as Skills & Tools; owns both subpages
-    case workshop = "Workshop"
+    case desk = "Desk"                   // the agent's canonical planning and work surface
     case trust = "Trust"                 // policy, autonomy, Mac control
     case providers = "Providers"
     case macIntegration = "Mac Integration" // per-integration READ/WRITE permission toggles (Calendar, Mail, Messages, ...)
@@ -54,9 +54,9 @@ enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
     case memory = "Memory"               // alias → .memories
     case settingsHub = "Settings (Hub)"  // alias → .settings
     case approvals = "Approvals"         // alias → .activity
-    case legacyWorkshop = "Executions"       // compatibility wire ID; retired alias → .workshop
-    case desk = "Desk"                   // retired alias → .workshop
-    case work = "Work"                   // alias → .workshop
+    case workshop = "Workshop"           // retired presentation alias → .desk
+    case legacyWorkshop = "Executions"   // compatibility route alias → .desk
+    case work = "Work"                   // alias → .desk
     case skillLifecycle = "Skill Lifecycle" // alias → .skills
     // Retired tabs (2026-07-03 dead-weight sweep) — cases kept so saved
     // selections and command routes still parse:
@@ -71,12 +71,12 @@ enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
         case .memory: .memories
         case .settingsHub: .settings
         case .approvals: .activity
-        case .legacyWorkshop, .desk, .work: .workshop
+        case .workshop, .legacyWorkshop, .work: .desk
         case .skillLifecycle, .tools: .skills
         case .autoImprovement: .activity   // tab retired 2026-07-03; SI lives in Activity
         case .panels: .diagnostics         // tab retired 2026-07-03; dynamic layer was dead
-        case .command: .workshop           // Command Center retired 2026-07-23 → its one
-                                           // real control (Create Task) now lives in Workshop
+        case .command: .desk               // Command Center retired 2026-07-23 → its one
+                                           // real control (Create Task) now lives on the Desk
         default: self
         }
     }
@@ -87,12 +87,12 @@ enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
     // 2026-07-22: Trust promoted to primary between Providers and Mac
     // Integration — it's one of the first pages a new user should see.
     static var primaryItems: [SidebarItem] {
-        [.chat, .activity, .memories, .workshop, .skills, .providers, .trust, .macIntegration, .settings]
+        [.chat, .activity, .memories, .desk, .skills, .providers, .trust, .macIntegration, .settings]
     }
 
     // Authoritative full Advanced set — the single source of membership.
     // 2026-07-23: `.command` removed (Command Center retired; case survives as
-    // a normalized alias → .workshop). Consumer-facing set-once tabs come
+    // a normalized alias → .desk). Consumer-facing set-once tabs come
     // first, developer/internal surfaces after.
     static var advancedItems: [SidebarItem] {
         // B2.4/B2.6: .cognition and .inspector are route-only now — their
@@ -152,7 +152,7 @@ enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
         case .activity: "tray.full"
         case .memories: "brain"
         case .skills: "puzzlepiece.extension"
-        case .workshop: "hammer"
+        case .desk: "checklist"
         case .personality: "person.crop.circle"
         case .connectors: "point.3.connected.trianglepath.dotted"
         case .trust: "lock.shield"
@@ -177,8 +177,8 @@ enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
         case .memory: "brain"
         case .settingsHub: "gearshape"
         case .approvals: "tray.full"
+        case .workshop: "hammer"
         case .legacyWorkshop: "target"
-        case .desk: "checklist"
         case .work: "hammer"
         case .skillLifecycle: "puzzlepiece.extension"
         }

@@ -237,7 +237,7 @@ struct NativeAgentApp: App {
                     .keyboardShortcut("2", modifiers: .command)
                 Button("Memories") { NativeAgentAppCoordinator.shared.request(.sidebar(.memories)) }
                     .keyboardShortcut("3", modifiers: .command)
-                Button("Workshop") { NativeAgentAppCoordinator.shared.request(.sidebar(.workshop)) }
+                Button("Desk") { NativeAgentAppCoordinator.shared.request(.sidebar(.desk)) }
                     .keyboardShortcut("4", modifiers: .command)
                 Button("Personality") { NativeAgentAppCoordinator.shared.request(.sidebar(.personality)) }
                     .keyboardShortcut("5", modifiers: .command)

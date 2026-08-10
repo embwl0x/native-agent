@@ -235,6 +235,55 @@ public enum ChatToolSessionContext {
     @TaskLocal public static var replyRoute: ReplyRoute?
 }
 
+/// Exact, single-dispatch evidence that a human already approved the persisted
+/// chat-tool request being replayed. This is deliberately not a general
+/// autonomy override: it only prevents `PersonaWriteGuard` from asking the
+/// same confirmation question twice when every approved payload and verified
+/// origin field still matches. SecurityCenter, file access, and the tool's own
+/// effect-time validation continue to run normally.
+public struct ApprovedChatToolReplay: Sendable, Equatable {
+    public let approvalID: String
+    public let tool: String
+    public let surface: String
+    public let input: [String: JSONValue]
+    public let verifiedSessionID: String?
+    public let verifiedChatID: String?
+    public let verifiedUserID: String?
+
+    public init(
+        approvalID: String,
+        tool: String,
+        surface: String,
+        input: [String: JSONValue],
+        verifiedSessionID: String?,
+        verifiedChatID: String?,
+        verifiedUserID: String?
+    ) {
+        self.approvalID = approvalID
+        self.tool = tool
+        self.surface = surface
+        self.input = input
+        self.verifiedSessionID = verifiedSessionID
+        self.verifiedChatID = verifiedChatID
+        self.verifiedUserID = verifiedUserID
+    }
+
+    fileprivate func matches(
+        tool: String,
+        surface: String,
+        input: [String: JSONValue],
+        verifiedSessionID: String?
+    ) -> Bool {
+        !approvalID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && self.tool == tool
+            && self.surface == surface
+            && self.input == input
+            && self.verifiedSessionID == verifiedSessionID
+            && verifiedChatID == ChatToolSessionContext.verifiedChatId
+            && verifiedUserID == ChatToolSessionContext.verifiedUserId
+    }
+}
+
 /// Per-turn runtime facts the tool loop binds so in-process tools can report
 /// what's actually generating the current turn. `agent_introspect` reads this
 /// to answer "which model/provider is running me right now" accurately — the
@@ -320,6 +369,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
     private let hasFiler: Bool
     private let approvalTimeoutSeconds: Double
     private let verifiedSessionId: String?
+    private let approvedReplay: ApprovedChatToolReplay?
     private static let approvalStagingToolNames: Set<String> = [
         "agentmail.send",
         "agentmail_send",
@@ -334,7 +384,8 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         securityCenter: SwiftNativeSecurityCenter = SwiftNativeSecurityCenter(),
         hasFiler: Bool = false,
         approvalTimeoutSeconds: Double = 30,
-        verifiedSessionId: String? = nil
+        verifiedSessionId: String? = nil,
+        approvedReplay: ApprovedChatToolReplay? = nil
     ) {
         self.inner = inner
         self.gate = gate
@@ -343,6 +394,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         self.hasFiler = hasFiler
         self.approvalTimeoutSeconds = approvalTimeoutSeconds
         self.verifiedSessionId = verifiedSessionId
+        self.approvedReplay = approvedReplay
     }
 
     func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
@@ -379,7 +431,16 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             tool: tool,
             kind: Self.jsonString(input["kind"]),
             resolvedAutonomy: autonomyLevel,
-            hasExplicitAutonomyOverride: false
+            // A resolved approval is equivalent to the explicit confirmation
+            // PersonaWriteGuard was created to require, but only for the exact
+            // persisted call and authenticated origin. A mismatch falls back
+            // to the normal guard and fails closed when no filer is present.
+            hasExplicitAutonomyOverride: approvedReplay?.matches(
+                tool: tool,
+                surface: surface,
+                input: input,
+                verifiedSessionID: verifiedSessionId
+            ) == true
         )
         let autonomyDecision: AutonomyDecision
         if guardResult.source == PersonaWriteGuard.autonomySource {

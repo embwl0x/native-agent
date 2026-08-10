@@ -16,12 +16,6 @@ import CoreSpotlight
 import CloudKit
 #endif
 
-// PATCH-Phase1a-dispatcher: "note" added — routes to POST /v1/notes via Dispatcher.run(commit_memory)
-// PATCH-phase-3c: "scratch" added — routes to POST /v1/scratch via Dispatcher.run(scratchpad_write)
-// PATCH-Phase6b: added "tools" — opens the canonical Tools destination
-// PATCH-2026-05-09: nextgen-surface — added "nextgen" command to navigate to NextGen panel
-// PATCH-2026-06-06: chat-upgrades — added "export" (dumps current session as Markdown to ~/Downloads)
-let knownSlashCommands: Set<String> = ["clear", "compact", "model", "think", "fast", "persona", "remember", "note", "scratch", "help", "tools", "nextgen", "export"]
 let chatSessionDragType = UTType(exportedAs: "com.nativeagent.chat-session")
 let chatSessionDragPlainTextPrefix = "nativeagent-chat-session:"
 let chatSessionDropTypes: [UTType] = [chatSessionDragType, .plainText]
@@ -75,6 +69,11 @@ struct ChatView: View {
     }
     @State var renameTitle = ""
     @State var sessionSearch = ""
+    // sidebar-density 2026-08-10: single driver for in-list rename — exactly
+    // one row may be editing; SessionRow reports commit/cancel back and this
+    // clears. Kept outside the row so the context menu (which lives on the
+    // row's ChatView-side wrapper) can start the edit.
+    @State var renamingSessionId: String? = nil
     @State var showContext = false
     @State var showConversationControls = false
     let bottomAnchor = "chat-bottom-anchor"
@@ -154,6 +153,20 @@ struct ChatView: View {
         return ids.compactMap { byId[$0] }
     }
 
+    // sidebar-density 2026-08-10: the sidebar shows pinned sessions in their
+    // own section (pin ORDER, matching the tab strip) with everything else
+    // below. Both sections respect the live search filter.
+    var filteredPinnedSidebarSessions: [ChatSession] {
+        let visible = Set(filteredSessions.map(\.id))
+        return pinnedSessions.filter { visible.contains($0.id) }
+    }
+
+    var filteredUnpinnedSidebarSessions: [ChatSession] {
+        let pinned = Set(pinnedSessionIds)
+        guard !pinned.isEmpty else { return filteredSessions }
+        return filteredSessions.filter { !pinned.contains($0.id) }
+    }
+
     var body: some View {
         HStack(spacing: 0) {
             sessionSidebar
@@ -230,6 +243,12 @@ struct ChatView: View {
         }
         .onChange(of: chatSessionIdsFingerprint) {
             prunePinnedSessions()
+            // A rename target that left the list (archived/deleted/refreshed
+            // away) must not leave a phantom editor pointed at a dead id.
+            if let id = renamingSessionId,
+               !appModel.chatSessions.contains(where: { $0.id == id }) {
+                renamingSessionId = nil
+            }
         }
         // Read-aloud failures (trust denied / not configured / auth rejected)
         // land in voiceOutput.errorMessage, which nothing else reads — surface
@@ -292,78 +311,144 @@ struct ChatView: View {
                 StalePanelNotice(text: notice)
             }
 
+            if appModel.chatSessionIndexRefreshFailed {
+                StalePanelNotice(text: "The session list could not update, so it is showing the last known sessions.")
+            }
+
             TextField("Search sessions", text: $sessionSearch)
                 .textFieldStyle(.roundedBorder)
 
             ScrollView {
-                LazyVStack(spacing: 6) {
-                    if filteredSessions.isEmpty {
+                LazyVStack(spacing: 4) {
+                    let pinnedRows = filteredPinnedSidebarSessions
+                    let recentRows = filteredUnpinnedSidebarSessions
+                    if pinnedRows.isEmpty && recentRows.isEmpty {
                         Text("No matching sessions")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.vertical, 8)
                     }
-                    ForEach(filteredSessions) { session in
-                        let isPinned = pinnedSessionIds.contains(session.id)
-                        SessionRow(
-                            session: session,
-                            selected: session.id == appModel.activeChatSessionId,
-                            pinned: isPinned
-                        )
-                            .contentShape(Rectangle())
-                            .onTapGesture {
-                                renameTitle = session.title
-                                Task { await appModel.selectChatSession(session) }
-                            }
-                            // detached-chat-windows Phase 1 W1.3: AppKit drag
-                            // source replaces SwiftUI .onDrag so we can detect
-                            // "dropped on desktop" via NSDraggingSource and
-                            // open a detached panel at the drop point. The
-                            // payload is the custom chat-session UTI only —
-                            // no plain-text, so Finder can't mint a desktop
-                            // .textClipping (2026-07-24 fix).
-                            .overlay(SessionDragSource(sessionId: session.id, sessionTitle: session.title))
-                            .contextMenu {
-                                if isPinned {
-                                    Button("Unpin Tab", systemImage: "pin.slash") {
-                                        unpinSession(session.id)
-                                    }
-                                } else {
-                                    Button("Pin as Tab", systemImage: "pin") {
-                                        pinSession(session.id, selectAfterPin: false)
-                                    }
-                                }
-                                Divider()
-                                // detached-chat-windows Phase 1 W1.8: context-menu
-                                // trigger for detaching a session into its own
-                                // floating window. One panel per session — when
-                                // already detached, the entry focuses it / offers
-                                // close instead.
-                                if DetachedChatWindowController.shared.isDetached(session.id) {
-                                    Button("Bring Detached Window to Front", systemImage: "macwindow.on.rectangle") {
-                                        DetachedChatWindowController.shared.focus(sessionId: session.id)
-                                    }
-                                    Button("Close Detached Window", systemImage: "xmark.rectangle") {
-                                        DetachedChatWindowController.shared.close(sessionId: session.id)
-                                    }
-                                } else {
-                                    Button("Open in Detached Window", systemImage: "rectangle.badge.plus") {
-                                        DetachedChatWindowController.shared.open(sessionId: session.id, origin: nil)
-                                    }
-                                }
-                            }
-                            .help("Drag into chat to pin · right-click to open in a detached window")
+                    if !pinnedRows.isEmpty {
+                        sessionSectionHeader("Pinned")
+                        ForEach(pinnedRows) { session in
+                            sidebarSessionRow(session, pinned: true)
+                        }
+                        if !recentRows.isEmpty {
+                            sessionSectionHeader("Recent")
+                                .padding(.top, 6)
+                        }
+                    }
+                    ForEach(recentRows) { session in
+                        sidebarSessionRow(session, pinned: false)
                     }
                 }
             }
             // M12: dim the list when the session/message fetch itself failed —
             // the rows on screen are a snapshot from an earlier refresh.
-            .opacity(appModel.chatStateLoadFailed ? 0.55 : 1)
+            .opacity(appModel.chatStateLoadFailed || appModel.chatSessionIndexRefreshFailed ? 0.55 : 1)
         }
         .frame(width: 240)
         .padding()
         .background(.thinMaterial)
+    }
+
+    func sessionSectionHeader(_ title: String) -> some View {
+        Text(title)
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 4)
+            .accessibilityAddTraits(.isHeader)
+    }
+
+    // sidebar-density 2026-08-10: one row builder for both sections so the
+    // pinned rows keep every affordance (select, drag-to-detach, context
+    // menu) the plain rows have.
+    @ViewBuilder
+    func sidebarSessionRow(_ session: ChatSession, pinned isPinned: Bool) -> some View {
+        let renaming = renamingSessionId == session.id
+        SessionRow(
+            session: session,
+            selected: session.id == appModel.activeChatSessionId,
+            pinned: isPinned,
+            renaming: renaming,
+            onUnpin: { unpinSession(session.id) },
+            onRenameBegin: { renamingSessionId = session.id },
+            onRenameEnd: { title in
+                renamingSessionId = nil
+                if let title { renameSession(session.id, title) }
+            }
+        )
+            .contentShape(Rectangle())
+            .onTapGesture {
+                // While this row is editing its title, clicks belong to the
+                // TextField — re-selecting would steal focus mid-rename.
+                guard !renaming else { return }
+                // Clicking any other row while an editor is open CANCELS
+                // that edit (the vanishing TextField's onDisappear ends it
+                // without committing) — required because macOS never moves
+                // first responder to a non-focusable row, so a focus-loss
+                // commit can't fire; committing here would be
+                // indistinguishable from a scroll-recycle commit.
+                if renamingSessionId != nil { renamingSessionId = nil }
+                renameTitle = session.title
+                Task { await appModel.selectChatSession(session) }
+            }
+            // detached-chat-windows Phase 1 W1.3: AppKit drag
+            // source replaces SwiftUI .onDrag so we can detect
+            // "dropped on desktop" via NSDraggingSource and
+            // open a detached panel at the drop point. The
+            // payload is the custom chat-session UTI only —
+            // no plain-text, so Finder can't mint a desktop
+            // .textClipping (2026-07-24 fix).
+            // Suspended during rename: the AppKit overlay sits above the
+            // row and would swallow the TextField's mouse events.
+            .overlay {
+                if !renaming {
+                    SessionDragSource(sessionId: session.id, sessionTitle: session.title)
+                }
+            }
+            .contextMenu {
+                if isPinned {
+                    Button("Unpin Tab", systemImage: "pin.slash") {
+                        unpinSession(session.id)
+                    }
+                } else {
+                    Button("Pin as Tab", systemImage: "pin") {
+                        pinSession(session.id, selectAfterPin: false)
+                    }
+                }
+                Button("Rename Session", systemImage: "pencil") {
+                    renamingSessionId = session.id
+                }
+                Divider()
+                // detached-chat-windows Phase 1 W1.8: context-menu
+                // trigger for detaching a session into its own
+                // floating window. One panel per session — when
+                // already detached, the entry focuses it / offers
+                // close instead.
+                if DetachedChatWindowController.shared.isDetached(session.id) {
+                    Button("Bring Detached Window to Front", systemImage: "macwindow.on.rectangle") {
+                        DetachedChatWindowController.shared.focus(sessionId: session.id)
+                    }
+                    Button("Close Detached Window", systemImage: "xmark.rectangle") {
+                        DetachedChatWindowController.shared.close(sessionId: session.id)
+                    }
+                } else {
+                    Button("Open in Detached Window", systemImage: "rectangle.badge.plus") {
+                        DetachedChatWindowController.shared.open(sessionId: session.id, origin: nil)
+                    }
+                }
+            }
+            .help("Hover for rename · drag into chat to pin · right-click for more")
+            // Live-verified 2026-08-10: when a session moves between the
+            // Pinned and Recent sections, the LazyVStack can hand back a
+            // recycled row still wearing the OLD section's appearance (pin
+            // glyph after an unpin) until the whole view rebuilds. Branding
+            // the row id with its section makes a pin flip a destroy+create
+            // instead of a reuse.
+            .id((isPinned ? "pinned-" : "recent-") + session.id)
     }
 
     @ViewBuilder
@@ -932,7 +1017,7 @@ struct ChatView: View {
                                     let dynamicCommandNames = capabilitiesStore.slashCommandTools().map(\.name)
                                     let prefixMatch = !hasArgsAlready && (
                                         lowerToken.isEmpty
-                                        || knownSlashCommands.contains { $0.hasPrefix(lowerToken) }
+                                        || ChatSlashCommandRegistry.commandNames.contains { $0.hasPrefix(lowerToken) }
                                         || dynamicCommandNames.contains { $0.hasPrefix(lowerToken) }
                                     )
                                     if prefixMatch {

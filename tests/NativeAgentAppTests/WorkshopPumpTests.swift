@@ -420,3 +420,54 @@ private func makePump(
     let due = try #require(WorkshopPump.nextMeaningfulDeadline(from: state, after: now))
     #expect(formatter.string(from: due) == "2026-07-13T12:00:00Z")
 }
+
+// MARK: - Budget-exhaustion closure (2026-08-08)
+
+/// A pursuit whose session budget is spent could never be picked again but
+/// stayed OPEN forever, squatting one of the two open-pursuit cap slots —
+/// with both slots exhausted, the volition lane starves permanently (live
+/// case: 10/12 and 6/12 heading to zombie-hood). The pump now honors the
+/// pursuit's own abandonCondition mechanically: receipt, then cancel.
+@Test func exhaustedPursuitIsClosedByTheNextTick() async throws {
+    let root = makeTempRoot(); defer { try? FileManager.default.removeItem(at: root) }
+    let store = SwiftNativeDeskStore(dataRoot: root)
+
+    let pursuit = Pursuit(
+        why: "test exhaustion",
+        evidence: validDossier(),
+        doneLooksLike: "n/a",
+        maxSessions: 1,
+        abandonCondition: "If sessions run out, close with a note."
+    )
+    let item = try await store.openPursuit(project: "curiosity", title: "exhaust me", pursuit: pursuit)
+    _ = try await store.reserveWorkSession(item.handle, day: "2026-08-07", slot: "w1")
+
+    let spy = SessionSpy()
+    let pump = makePump(root: root, store: store, spy: spy, posture: { normalPosture() })
+    let outcome = await pump.tick()
+
+    // Nothing else is due, and the exhausted pursuit must not be worked.
+    #expect(outcome == .quiet)
+    #expect(await spy.callCount() == 0)
+
+    let state = try await store.liveState()
+    let closed = state.items.first { $0.handle == item.handle }
+    #expect(closed?.status == .canceled,
+            "an exhausted pursuit is closed per its own abandon condition")
+}
+
+/// An in-budget pursuit must be untouched by the closure sweep.
+@Test func inBudgetPursuitIsNotClosed() async throws {
+    let root = makeTempRoot(); defer { try? FileManager.default.removeItem(at: root) }
+    let store = SwiftNativeDeskStore(dataRoot: root)
+    let item = try await openTestPursuit(store)
+
+    let spy = SessionSpy()
+    let pump = makePump(root: root, store: store, spy: spy, posture: { normalPosture() })
+    _ = await pump.tick()
+
+    let state = try await store.liveState()
+    let row = state.items.first { $0.handle == item.handle }
+    #expect(row?.status.isTerminal == false,
+            "a pursuit with budget remaining must never be swept closed")
+}

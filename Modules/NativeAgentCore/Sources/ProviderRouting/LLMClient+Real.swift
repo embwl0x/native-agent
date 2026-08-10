@@ -218,6 +218,10 @@ extension LLMAdapter {
 
 public enum LLMError: Error, Equatable, LocalizedError {
     case notConfigured(provider: String)
+    /// A fresh provider-owned catalog positively excludes an explicitly
+    /// selected model. The selection is preserved for user repair; execution
+    /// must not substitute a different model or provider.
+    case modelUnavailable(provider: String, model: String)
     /// The provider POSITIVELY REJECTED the credentials we sent — an HTTP 401,
     /// or a 403 that means "this key/token is not authorized" (as opposed to a
     /// genuinely-missing key, which stays `.notConfigured`). `detail` carries
@@ -245,6 +249,8 @@ public enum LLMError: Error, Equatable, LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .notConfigured(let p): return "llm: not configured: \(p)"
+        case .modelUnavailable(let provider, let model):
+            return "llm: \(provider) no longer offers selected model '\(model)'; choose a replacement in Providers"
         case .authRejected(let p, let detail):
             let base = "llm: \(p) rejected the key/token — reconnect or check billing"
             if let d = detail?.trimmingCharacters(in: .whitespacesAndNewlines), !d.isEmpty {
@@ -375,10 +381,10 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
     private let openRouter: (any LLMAdapter)?
     private let streamGuardConfig: ProviderStreamGuardConfig
     private let lifecycleObserver: (any LLMCallLifecycleObserving)?
-    /// M-F3 (review round 2): where the Moonshot live-catalog disk cache lives.
-    /// Routing consults it so account-visible ids WITHOUT the kimi-/moonshot-
-    /// prefix still route to moonshot. Injectable for tests; defaults to the
-    /// live data root.
+    /// Exact root for provider-owned rebuildable model catalogs. The public
+    /// initializer label retains its older Moonshot-specific name for source
+    /// compatibility; OpenRouter retirement checks now use the same root so a
+    /// secondary body cannot consult the live user's cache.
     private let moonshotCatalogDataRoot: URL
 
     public init(
@@ -409,6 +415,19 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         self.streamGuardConfig = streamGuardConfig
         self.lifecycleObserver = lifecycleObserver
         self.moonshotCatalogDataRoot = moonshotCatalogDataRoot
+    }
+
+    private func validateCatalogAvailability(_ resolution: AdapterResolution) throws {
+        guard resolution.choice == .openRouter else { return }
+        if OpenRouterModelCatalog.cachedAvailability(
+            of: resolution.model,
+            dataRoot: moonshotCatalogDataRoot
+        ) == .unavailable {
+            throw LLMError.modelUnavailable(
+                provider: "openrouter",
+                model: resolution.model
+            )
+        }
     }
 
     /// M-F3: Moonshot recognition is CATALOG MEMBERSHIP, not just the
@@ -684,7 +703,9 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         case "xai": return XAIOAuthDirectAdapter.defaultModel
         case "moonshot": return MoonshotAdapter.defaultModel
         case "kimi-code": return "kimi-for-coding"
-        case "openrouter": return "anthropic/claude-3.5-sonnet"
+        // Must exist on OpenRouter today (claude-3.5-sonnet was delisted;
+        // keep in lockstep with ProviderRouting.defaultModel's openrouter row).
+        case "openrouter": return "anthropic/claude-sonnet-5"
         default: return nil
         }
     }
@@ -778,6 +799,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
             surface: surface,
             routingSnapshot: routingSnapshot
         )
+        try validateCatalogAvailability(resolution)
         let effectiveModel = resolution.model
         let controls = executionControls(for: surface, routingSnapshot: routingSnapshot)
         let lifecycle = await providerLifecycleStart(
@@ -863,6 +885,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
             surface: surface,
             routingSnapshot: routingSnapshot
         )
+        try validateCatalogAvailability(resolution)
         let effectiveModel = resolution.model
         let controls = executionControls(for: surface, routingSnapshot: routingSnapshot)
         let lifecycle = await providerLifecycleStart(
@@ -969,6 +992,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                         surface: surface,
                         routingSnapshot: routingSnapshot
                     )
+                    try self.validateCatalogAvailability(resolution)
                     // F1-M1 NOTE: the guard for "tools[] must never reach a
                     // Claude OAuth adapter" lives inside the `.anthropic`
                     // dispatch case below — NOT here. `tools != nil` is NOT
@@ -1133,6 +1157,12 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                     surface: surface,
                     routingSnapshot: routingSnapshot
                 )
+                do {
+                    try self.validateCatalogAvailability(resolution)
+                } catch {
+                    continuation.finish(throwing: error)
+                    return
+                }
                 let effectiveModel = resolution.model
                 let controls = self.executionControls(
                     for: surface,

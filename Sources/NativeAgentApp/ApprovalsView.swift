@@ -63,7 +63,7 @@ struct ApprovalsView: View {
                         VStack(alignment: .leading, spacing: 4) {
                             Text(pending.isEmpty ? "No actions need approval" : "\(pending.count) action\(pending.count == 1 ? "" : "s") need approval")
                                 .font(NativeAgentFont.section)
-                            Text("Approvals include tool calls, memory changes, Mac control, connector writes, browser/native actions, Workshop tasks, and harness improvements.")
+                            Text("Approvals include tool calls, memory changes, Mac control, connector writes, browser/native actions, Desk tasks, and harness improvements.")
                                 .font(NativeAgentFont.body)
                                 .foregroundStyle(.secondary)
                         }

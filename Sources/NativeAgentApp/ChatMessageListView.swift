@@ -633,6 +633,7 @@ struct SlashCommandMenu: View {
     var onDismiss: (() -> Void)? = nil
     // PATCH-Phase6b: read-only tools to show as dynamic slash-command entries
     var extraTools: [ToolCapability] = []
+    @AppStorage("showDeveloperSurfaces") private var showDeveloperSurfaces = false
 
     private struct SlashCmd: Identifiable {
         var id: String { command }
@@ -642,26 +643,11 @@ struct SlashCommandMenu: View {
         var isToolEntry: Bool = false
     }
 
-    private let hardcodedCommands: [SlashCmd] = [
-        SlashCmd(command: "clear",    description: "Wipe all messages in this session",    placeholder: ""),
-        SlashCmd(command: "compact",  description: "Force-compact context window",         placeholder: ""),
-        SlashCmd(command: "model",    description: "Set model",                              placeholder: "model <id>"),
-        SlashCmd(command: "think",    description: "Reasoning effort",                       placeholder: "think <low|medium|high|xhigh|max|ultra>"),
-        SlashCmd(command: "fast",     description: "GPT priority processing",                placeholder: "fast <on|off>"),
-        SlashCmd(command: "persona",  description: "Set active persona",                   placeholder: "persona <name>"),
-        SlashCmd(command: "remember", description: "Save a fact to memory",               placeholder: "remember <fact>"),
-        // PATCH-Phase1a-dispatcher: /note routes to POST /v1/notes → Dispatcher.run(commit_memory)
-        SlashCmd(command: "note",     description: "Commit a note to agent memory", placeholder: "note <text>"),
-        // PATCH-phase-3c: /scratch routes to POST /v1/scratch → Dispatcher.run(scratchpad_write)
-        SlashCmd(command: "scratch",  description: "Write ephemeral session scratchpad key",    placeholder: "scratch <key> <value>"),
-        SlashCmd(command: "help",     description: "Show all slash commands",              placeholder: ""),
-        // /tools opens the same canonical tool catalog as the sidebar.
-        SlashCmd(command: "tools",    description: "Open the Tools catalog",               placeholder: ""),
-        // PATCH-2026-05-09: nextgen-surface
-        SlashCmd(command: "nextgen",  description: "Open NextGen panel in Capabilities",  placeholder: ""),
-        // PATCH-2026-06-06: chat-upgrades
-        SlashCmd(command: "export",   description: "Export chat as Markdown to ~/Downloads", placeholder: ""),
-    ]
+    private var hardcodedCommands: [SlashCmd] {
+        ChatSlashCommandRegistry.visible(showDeveloperSurfaces: showDeveloperSurfaces).map {
+            SlashCmd(command: $0.command, description: $0.description, placeholder: $0.placeholder)
+        }
+    }
 
     // All commands: hardcoded entries + dynamic tool entries (tools not already covered by hardcoded names)
     private var allCommands: [SlashCmd] {
@@ -956,7 +942,7 @@ struct MessageBubble: View {
 
                         Button {
                             Task {
-                                await appModel.addMemoryFact(message.content)
+                                _ = await appModel.addMemoryFact(message.content)
                                 showBubbleToast(appModel.statusText)
                             }
                         } label: { Label("Remember this", systemImage: "brain") }
@@ -1128,16 +1114,7 @@ struct MessageBubble: View {
     }
 
     private var displayTimestamp: String {
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        guard let date = fractional.date(from: message.createdAt)
-                ?? ISO8601DateFormatter().date(from: message.createdAt)
-        else { return message.createdAt }
-
-        return date.formatted(
-            date: Calendar.current.isDateInToday(date) ? .omitted : .abbreviated,
-            time: .shortened
-        )
+        UserDisplayFormatters.chatTimestamp(message.createdAt)
     }
 
     private var localImageAttachments: [PersistedAttachment] {

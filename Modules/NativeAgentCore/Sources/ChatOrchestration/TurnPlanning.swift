@@ -573,22 +573,41 @@ extension SwiftNativeTurnEngine {
         _ context: TurnContext,
         turnPlan: TurnPlan?
     ) -> TurnContext {
-        guard let hint = turnPlan?.contextHint else { return context }
+        var additions: [String] = []
+        if let hint = turnPlan?.contextHint { additions.append(hint) }
+        if let cue = context.naturalExpressionCue,
+           let goalType = turnPlan?.goalType,
+           goalType == "chat" || goalType == "personality" {
+            additions.append(cue)
+        }
+        // Always consume the request-scoped candidate here, even for a task
+        // turn. It must never leak through a later context transform.
+        guard !additions.isEmpty || context.naturalExpressionCue != nil else { return context }
+        let addition = additions.joined(separator: "\n\n")
         let segments: SystemPromptSegments?
         let systemPrompt: String?
         if let existingSegments = context.systemSegments {
-            let dynamic = existingSegments.dynamic.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                ? hint
-                : existingSegments.dynamic + "\n\n" + hint
+            let dynamic: String
+            if addition.isEmpty {
+                dynamic = existingSegments.dynamic
+            } else {
+                dynamic = existingSegments.dynamic.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? addition
+                    : existingSegments.dynamic + "\n\n" + addition
+            }
             segments = SystemPromptSegments(stable: existingSegments.stable, dynamic: dynamic)
             systemPrompt = segments?.combined
         } else {
             segments = nil
             let existing = context.systemPrompt?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            systemPrompt = existing.isEmpty
-                ? hint
-                : existing + "\n\n" + hint
+            if addition.isEmpty {
+                systemPrompt = context.systemPrompt
+            } else {
+                systemPrompt = existing.isEmpty
+                    ? addition
+                    : existing + "\n\n" + addition
+            }
         }
         return TurnContext(
             surface: context.surface,
@@ -605,7 +624,8 @@ extension SwiftNativeTurnEngine {
             toolSchemas: context.toolSchemas,
             systemSegments: segments,
             imageBlocks: context.imageBlocks,
-            fluidContextTurn: context.fluidContextTurn
+            fluidContextTurn: context.fluidContextTurn,
+            naturalExpressionCue: nil
         )
     }
 }

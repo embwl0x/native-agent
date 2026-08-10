@@ -169,6 +169,13 @@ final class AppModel {
         if let tier = chat.serviceTier {
             chatFastMode = tier == "priority"
         }
+        if let model = chat.model, !model.isEmpty {
+            chatBrainCanonicalSelection = ChatBrainSelection(
+                model: model,
+                reasoningEffort: chat.effort ?? chatReasoningEffort,
+                fastMode: chat.serviceTier.map { $0 == "priority" } ?? chatFastMode
+            )
+        }
         let tg = entryFor("telegram")
         if let m = tg.model, !m.isEmpty, m != telegramModel { telegramModel = m }
         if let e = tg.effort, !e.isEmpty, e != telegramReasoningEffort { telegramReasoningEffort = e }
@@ -277,6 +284,9 @@ final class AppModel {
     /// Set by `performLoadChatState` when the chat message/session fetch threw.
     /// Folded into the `.chat` panel's failed-endpoint list.
     var chatStateLoadFailed = false
+    /// The event-driven session-index read failed, so shared Mac projections
+    /// are retaining their last proven rows until the next canonical edge.
+    var chatSessionIndexRefreshFailed = false
 
     var compiledPersonality: CompiledPersonality?
     var privacyMap: PrivacyMap?
@@ -411,6 +421,44 @@ final class AppModel {
     var codexDeviceLogin: CodexDeviceLogin?
     var modelCatalog: ModelCatalogResponse?
     var isSavingChatBrain = false
+    /// One captured chat-brain tuple. Picker fields are optimistic UI caches;
+    /// this value is updated only from a checked canonical read or a successful
+    /// configure response. It lets a failed optimistic edit roll back without
+    /// firing a second write for the rollback itself.
+    struct ChatBrainSelection: Equatable, Sendable {
+        var model: String
+        var reasoningEffort: String
+        var fastMode: Bool
+    }
+
+    enum ChatBrainSaveResult: Equatable, Sendable {
+        case unchanged(ChatBrainSelection)
+        case saved(ChatBrainSelection)
+        case failed(message: String, rolledBackTo: ChatBrainSelection?)
+
+        var userMessage: String {
+            switch self {
+            case .unchanged(let selection), .saved(let selection):
+                return "Chat brain saved: \(selection.model) / \(selection.reasoningEffort)\(selection.fastMode ? " / Fast" : "")"
+            case .failed(let message, _):
+                return "Chat brain save failed: \(message)"
+            }
+        }
+    }
+
+    struct ChatBrainWriteReceipt {
+        var selection: ChatBrainSelection
+        var catalog: ModelCatalogResponse?
+    }
+
+    @ObservationIgnored var chatBrainCanonicalSelection: ChatBrainSelection?
+    @ObservationIgnored var chatBrainPendingSave: (generation: UInt64, selection: ChatBrainSelection)?
+    @ObservationIgnored var chatBrainSaveGeneration: UInt64 = 0
+    @ObservationIgnored var chatBrainLastSaveResult: (generation: UInt64, result: ChatBrainSaveResult)?
+    @ObservationIgnored var chatBrainSaveTask: Task<Void, Never>?
+    /// Hermetic seams for concurrency/failure tests. Production leaves both nil.
+    @ObservationIgnored var chatBrainWriteOverride: (@MainActor @Sendable (ChatBrainSelection) async throws -> ChatBrainWriteReceipt)?
+    @ObservationIgnored var chatBrainReadOverride: (@MainActor @Sendable () async throws -> ChatBrainSelection)?
     // PATCH-2026-05-07: chat-provider-picker Cache provider list + active
     // chat provider so the chat screen can render a Provider→Model dual
     // picker without re-fetching every render.

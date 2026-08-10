@@ -78,10 +78,10 @@ extension AppModel {
     func loadHealthCard(includeApprovals: Bool = true) async {
         // Fix 10: catch and log decode/network errors instead of silently swallowing them
         do {
-            healthCard = try await client.getHealthCard()
+            setHealthCardIfMeaningfullyChanged(try await client.getHealthCard())
         } catch {
             print("[NativeAgent] loadHealthCard failed: \(error)")
-            healthCard = HealthCard(
+            setHealthCardIfMeaningfullyChanged(HealthCard(
                 overall: "error",
                 subsystems: [
                     HealthCardSubsystem(
@@ -93,7 +93,7 @@ extension AppModel {
                     )
                 ],
                 createdAt: nil
-            )
+            ))
         }
         if includeApprovals {
             do {
@@ -106,6 +106,17 @@ extension AppModel {
                 approvals = []
                 statusText = "Approvals unavailable: \(error.localizedDescription)"
             }
+        }
+    }
+
+    /// The live health poll intentionally runs while chat is visible, but its
+    /// `createdAt` timestamp is not rendered anywhere. Treating that timestamp
+    /// as UI state forced a complete health-surface layout every 15 seconds even
+    /// when every visible verdict was identical.
+    @MainActor
+    func setHealthCardIfMeaningfullyChanged(_ next: HealthCard) {
+        if healthCard?.overall != next.overall || healthCard?.subsystems != next.subsystems {
+            healthCard = next
         }
     }
 

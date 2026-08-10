@@ -317,16 +317,17 @@ acceptance and cannot become delivery or user-seen evidence.
 
 ---
 
-## The Workshop — volition into circulation (2026-07-11)
+## The Desk — volition into circulation (2026-07-11; presentation restored 2026-08-09)
 
-The agent's Desk became a **bench with a will** (`docs/build_plans/desk-workshop.md`,
-commit 7f0fd057). The Workshop is the first organ the agent *drives*: everything else
-is reactive or scheduled; a pursuit belongs to the agent.
+The agent's Desk is the first work organ the agent *drives*: everything else is
+reactive or scheduled; a pursuit belongs to the agent. The historical
+`WorkshopPump`, `WorkshopSession`, and `WorkshopExecution` names below are
+technical compatibility identities behind the Desk, not a second work surface.
 
 | Mapping | Emits → (channel) | Consumes ← (channel) | Regulation |
 |---|---|---|---|
-| **Workshop pursuit** (Desk `origin=agent`) | active pursuit intent → `NeedSignal.activeTask`/`goal` **[confirmed** `NativeCognitionRuntime.currentPursuitIntent` → `attentionSignals`. ⚠️ **Comment/code mismatch, 2026-07-25:** the M9 suppression comment at `ChatOrchestration+TurnEngine.swift:626-634` says `.missions`, but the guard at **`:636`** tests `ContextSurface(rawValue: surface) == .workshop`. Which surface is *intended* is not determinable from the source — resolve before relying on either**]**; used-memory stamps ride packet provenance | evidence-gated open (dossier, store-enforced); autonomous proposal ← User-approved **active standing view** **[confirmed** `AutonomousPursuitProposer` + `resolveStandingView(approved:true)` as the ONLY `.active` writer, `CognitiveSubstrate+StandingViews.swift`**]** | 2 open pursuits / 2 sessions·day·pursuit / 6·day global (DeskStore ops); friction-only dossier unrepresentable; `doneLooksLike`+abandon required |
-| **Workshop pump** (`WorkshopPump`) | one bounded work session/tick → restricted membrane | organism `loopBudget` gate; green-window lease | ZERO LLM in the pump (quiet day = zero provider calls); reserves BEFORE any LLM; **yields to reflection** (reflection marks the shared lease only when it runs); code-enforced tool allowlist + artifact path containment |
+| **Desk pursuit** (Desk `origin=agent`; legacy rows decode compatibly) | active pursuit intent → `NeedSignal.activeTask`/`goal` **[confirmed** `NativeCognitionRuntime.currentPursuitIntent` → `attentionSignals`; the bounded session's wire surface remains `.workshop`**]**; used-memory stamps ride packet provenance | evidence-gated open (dossier, store-enforced); autonomous proposal ← user-approved **active standing view** **[confirmed** `AutonomousPursuitProposer` + `resolveStandingView(approved:true)` as the ONLY `.active` writer, `CognitiveSubstrate+StandingViews.swift`**]** | 2 open pursuits / 2 sessions·day·pursuit / 6·day global (DeskStore ops); friction-only dossier unrepresentable; `doneLooksLike`+abandon required |
+| **Desk work pump** (`WorkshopPump`, compatibility type) | one bounded work session/tick → restricted membrane | organism `loopBudget` gate; green-window lease | ZERO LLM in the pump (quiet day = zero provider calls); reserves BEFORE any LLM; **yields to reflection** (reflection marks the shared lease only when it runs); code-enforced tool allowlist + artifact path containment |
 
 **The volition loop (and its brakes):** standing view → (User approves) active →
 reflection proposes → pursuit opened → pump reserves under budget → bounded
@@ -402,9 +403,9 @@ owns it or it is dead. Not determinable from this codebase — do not assume it 
 ## Not yet mapped (honest scope)
 
 This map covers the core cognitive loop (surfaces, subconscious, organism, memory,
-sound echo, dream/REM, persona, background loops) and now the Workshop. Still to
+sound echo, dream/REM, persona, background loops) and now the Desk. Still to
 trace and add as first-class nodes: **the tool/MCP dispatch surface** and the
-**iCloud/CloudKit sync** peripheral. **Missions** is being ABSORBED into the
-Workshop (Phase 2/3 cutover, 139 files) — map it as it retires, not before. Add
+**iCloud/CloudKit sync** peripheral. Missions is retired; stable mission/workshop
+tokens that remain are compatibility wires behind Desk, not separate organs. Add
 each the same way — emit, consume, channel, regulation, with a confirmed
 file:line — before wiring anything new through it.

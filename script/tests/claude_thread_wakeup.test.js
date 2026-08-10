@@ -174,6 +174,8 @@ test("completion text tells Agent not to auto-fire another claude_message", () =
   assert.match(text, /Do NOT auto-fire another claude_message/);
   assert.match(text, /m-1/);
   assert.match(text, /artifact written/);
+  assert.match(text, /Conversation: claude:wake-parity/);
+  assert.match(text, /claude_message with conversation_id/);
 
   const empty = wakeup.formatCompletionForAgent(
     { status: "completed_without_reply", reply: "", durationMs: 10 },

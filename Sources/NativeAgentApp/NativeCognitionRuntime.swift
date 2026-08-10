@@ -73,6 +73,16 @@ struct NativeSubconsciousRuntimeState: Sendable, Equatable {
     let organismEnabled: Bool
 }
 
+struct NativeReflectionRouteStatus: Sendable, Equatable {
+    let model: String
+    let providerID: String
+    let providerReady: Bool
+    let modelKnown: Bool?
+    let detail: String
+
+    var isReady: Bool { providerReady && modelKnown != false }
+}
+
 struct NativeFrozenMindRead: Sendable {
     let fixedAt: Date
     let cognition: CognitiveFrozenRead
@@ -1770,6 +1780,6 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
     private static let reflectionKey = "cognitiveSubstrateReflectionEnabled"
     private static let reflectionBudgetKey = "cognitiveSubstrateDailyReflectionBudget"
     static let organismKernelEnabledKey = "organismKernelEnabled"  // internal for actor extensions (move-only Wave C)
-    private static let reflectionModelKey = "cognitiveSubstrateReflectionModel"
-    private static let reflectionProviderKey = "cognitiveSubstrateReflectionProvider"
+    static let reflectionModelKey = "cognitiveSubstrateReflectionModel"
+    static let reflectionProviderKey = "cognitiveSubstrateReflectionProvider"
 }

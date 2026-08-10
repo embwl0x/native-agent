@@ -776,6 +776,8 @@ function formatCompletionForAgent(result, payload) {
     "",
     deliveryMarker(payload.messageId),
     `Topic: ${payload.topic || DEFAULT_TOPIC}`,
+    `Conversation: claude:${topicSlug(payload.topic)}`,
+    "Continue this same work by calling claude_message with conversation_id set to that exact value. Omit conversation_id for new work.",
     `Priority: ${payload.priority || "info"}`,
     `Status: ${result.status}`,
   ];

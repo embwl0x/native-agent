@@ -159,8 +159,8 @@ private extension NativeResidentWorkContextProjection {
             lines.append("Waiting on: \(bounded(waiting, to: 240))")
         }
         if let execution {
-            lines.append("Workshop child execution: \(bounded(execution.id, to: 128))")
-            lines.append("Workshop status: \(bounded(clean(execution.status), to: 64))")
+            lines.append("Directed execution: \(bounded(execution.id, to: 128))")
+            lines.append("Execution status: \(bounded(clean(execution.status), to: 64))")
             lines.append("Progress: \(execution.stepsCompleted.count)/\(execution.plan.count) steps")
             if !execution.currentStepId.isEmpty {
                 lines.append("Current step: \(bounded(clean(execution.currentStepId), to: 120))")
@@ -174,7 +174,7 @@ private extension NativeResidentWorkContextProjection {
         if let expectedEvidence {
             lines.append("Expected next evidence: \(expectedEvidence)")
         }
-        lines.append("Authority boundary: Desk and Workshop stores own transitions; TrustCenter and approvals still govern actions.")
+        lines.append("Authority boundary: the Desk and its directed execution store own transitions; TrustCenter and approvals still govern actions.")
 
         let body = lines.joined(separator: "\n")
         guard body.utf8.count <= 4 * 1_024,
@@ -264,7 +264,7 @@ private extension NativeResidentWorkContextProjection {
         guard let execution else {
             switch need {
             case .none: return nil
-            case .action: return "a canonical Desk or Workshop transition"
+            case .action: return "a canonical Desk or directed execution transition"
             case .review: return item.status == .blocked ? "the blocking condition changing" : "operator review"
             default: return nil
             }
@@ -272,7 +272,7 @@ private extension NativeResidentWorkContextProjection {
         switch need {
         case .quietWait:
             return execution.status == "queued"
-                ? "a Workshop claim or terminal transition"
+                ? "a directed execution claim or terminal transition"
                 : "a step receipt, approval edge, or terminal transition"
         case .approval:
             return "a canonical approval resolution"

@@ -458,7 +458,7 @@ extension BackgroundLoopsAssembly {
                 stale.append((id: id, title: title, status: status, age: age))
             }
         }
-        let line = "Workshop executions: \(active) active, \(blocked) blocked on approval."
+        let line = "Desk executions: \(active) active, \(blocked) blocked on approval."
         guard !stale.isEmpty else { return (line, nil) }
         let rows = stale.prefix(5).map {
             "\($0.title) [\($0.status), \(FullMacExpiry.compactInterval($0.age)) old]"
@@ -468,14 +468,14 @@ extension BackgroundLoopsAssembly {
             line + " Stale: " + rows + ".",
             HeartbeatIssue(
                 id: "execution-stuck", // compatibility wire ID: persisted in heartbeat status/dedup state
-                summary: "\(stale.count) Workshop execution(s) look stuck.",
-                detail: "\(stale.count) Workshop execution(s) have been queued/running/blocked longer than \(Int(heartbeatExecutionStuckAge / 3600))h: \(rows).",
+                summary: "\(stale.count) Desk execution(s) look stuck.",
+                detail: "\(stale.count) Desk execution(s) have been queued/running/blocked longer than \(Int(heartbeatExecutionStuckAge / 3600))h: \(rows).",
                 priority: 35,
                 actions: hasBlocked
                     ? [HeartbeatNoticeAction(
                         id: "open_approvals",
                         label: "Open Approvals",
-                        description: "Review approvals blocking Workshop tasks"
+                        description: "Review approvals blocking Desk tasks"
                     )]
                     : []
             )

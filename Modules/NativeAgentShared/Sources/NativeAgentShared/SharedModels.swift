@@ -128,6 +128,15 @@ public struct ChatSession: Identifiable, Codable, Hashable, Sendable {
     public var messageCount: Int?
     public var lastMessagePreview: String?
     public var summary: String?
+    /// Optional lineage/project metadata stored on the canonical session row.
+    /// These fields never create another transcript or session store.
+    public var parentSessionId: String? = nil
+    public var rootSessionId: String? = nil
+    public var forkedAtMessageId: String? = nil
+    public var projectSpaceId: String? = nil
+    public var worktreePath: String? = nil
+    public var providerId: String? = nil
+    public var modelId: String? = nil
 }
 
 public extension ChatSession {

@@ -81,6 +81,45 @@ import Testing
     #expect(NoNetworkURLProtocol.requestCount == 0)
 }
 
+@Test func OpenRouterModelCatalog_onlyFreshLiveCacheCanRejectAPin() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("openrouter-availability-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let providers = root.appendingPathComponent("providers", isDirectory: true)
+    try FileManager.default.createDirectory(at: providers, withIntermediateDirectories: true)
+    let cache = providers.appendingPathComponent("openrouter-models-cache.json")
+
+    func write(updatedAt: Date) throws {
+        let payload: [String: Any] = [
+            "schema_version": 1,
+            "updated_at": ISO8601DateFormatter().string(from: updatedAt),
+            "source": OpenRouterModelCatalog.endpoint.absoluteString,
+            "models": [[
+                "id": "anthropic/claude-sonnet-5",
+                "name": "Claude Sonnet 5",
+                "context_length": 1_000_000,
+            ]],
+        ]
+        try JSONSerialization.data(withJSONObject: payload).write(to: cache)
+    }
+
+    #expect(OpenRouterModelCatalog.cachedAvailability(
+        of: "retired/model", dataRoot: root
+    ) == .unknown)
+    try write(updatedAt: Date())
+    #expect(OpenRouterModelCatalog.cachedAvailability(
+        of: "anthropic/claude-sonnet-5", dataRoot: root
+    ) == .available)
+    #expect(OpenRouterModelCatalog.cachedAvailability(
+        of: "retired/model", dataRoot: root
+    ) == .unavailable)
+
+    try write(updatedAt: Date().addingTimeInterval(-25 * 60 * 60))
+    #expect(OpenRouterModelCatalog.cachedAvailability(
+        of: "retired/model", dataRoot: root
+    ) == .unknown)
+}
+
 @Test func OpenRouterModelCatalog_parseModelsResponse_sortsByProviderThenModel() throws {
     let data = Data("""
     {

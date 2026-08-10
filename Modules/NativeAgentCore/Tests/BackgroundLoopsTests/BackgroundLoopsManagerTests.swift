@@ -245,6 +245,29 @@ struct BackgroundLoopsManagerTests {
         await manager.stop()
     }
 
+    @Test("status distinguishes an active tick from a merely registered loop")
+    func statusReportsActiveExecution() async throws {
+        let probe = SuspendedTickProbe()
+        let loop = AsyncStubLoop("long_lived_tick") { await probe.tick() }
+        let manager = BackgroundLoopsManager()
+        await manager.start(loops: [loop])
+
+        let tick = Task { await manager.runTickOnce(loopId: loop.loopId) }
+        await probe.waitUntilStarted()
+        let active = try #require(await manager.status().first { $0.name == loop.loopId })
+        #expect(active.running)
+        #expect(active.executing)
+        #expect(active.executionStartedAt != nil)
+
+        await probe.release()
+        _ = await tick.value
+        let idle = try #require(await manager.status().first { $0.name == loop.loopId })
+        #expect(idle.running)
+        #expect(!idle.executing)
+        #expect(idle.executionStartedAt == nil)
+        await manager.stop()
+    }
+
     @Test("a cancelled coalesced join resumes instead of leaking behind a wedged tick")
     func cancelledCoalescedJoinResumes() async throws {
         // 2026-07-21 audit (MED): pre-fix, cancelling the joining Task left its

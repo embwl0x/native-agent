@@ -227,6 +227,49 @@ struct NamespacedModelUnconfiguredOpenRouterTests {
         #expect(codex.calls.isEmpty)
     }
 
+    @Test func freshCatalogExclusionBlocksPinnedModelWithoutFallback() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("openrouter-retired-pin-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let providers = root.appendingPathComponent("providers", isDirectory: true)
+        try FileManager.default.createDirectory(at: providers, withIntermediateDirectories: true)
+        let cache: [String: Any] = [
+            "schema_version": 1,
+            "updated_at": ISO8601DateFormatter().string(from: Date()),
+            "source": OpenRouterModelCatalog.endpoint.absoluteString,
+            "models": [[
+                "id": "anthropic/claude-sonnet-5",
+                "name": "Claude Sonnet 5",
+                "context_length": 1_000_000,
+            ]],
+        ]
+        try JSONSerialization.data(withJSONObject: cache).write(
+            to: providers.appendingPathComponent("openrouter-models-cache.json")
+        )
+
+        let codex = TripwireCodexAdapter()
+        let openRouter = RecordingOpenRouter()
+        let client = SwiftNativeLLMClient(
+            router: NoActiveProviderRouter(),
+            codex: codex,
+            anthropic: UnreachableAdapter("anthropic"),
+            openAI: UnreachableAdapter("openai"),
+            openRouter: openRouter,
+            moonshotCatalogDataRoot: root
+        )
+        await #expect(throws: LLMError.modelUnavailable(
+            provider: "openrouter",
+            model: Self.namespacedModel
+        )) {
+            _ = try await client.complete(
+                prompt: "hi", system: nil, model: Self.namespacedModel,
+                surface: "swarms", tools: nil
+            )
+        }
+        #expect(openRouter.models.isEmpty)
+        #expect(codex.calls.isEmpty)
+    }
+
     /// Guard against over-reach #2: a NON-namespaced id that no first-party
     /// rule claims still falls through to Codex, which is the correct default.
     @Test func plainModelId_stillFallsThroughToCodex() async throws {

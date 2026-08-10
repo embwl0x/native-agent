@@ -4,6 +4,45 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ---
 
+## 0.3.9 — trust, quiet, and a denser cockpit (2026-08-10)
+
+Credential trust: a fresh install no longer silently adopts an existing
+Codex CLI sign-in — Providers now shows a one-click "Use it / Ignore" offer,
+the sign-in badge names the adopted source and account, sign-out revokes the
+consent, and in-app authentication always outranks an adopted session.
+Malformed consent records surface as corrupt with an explicit, byte-safe
+repair instead of silently reading as signed out.
+
+Quiet: self-opened pursuits announce themselves exactly once (the repeated
+push storm is fixed), near-duplicate pursuit proposals are refused, and a
+pursuit that exhausts its session budget closes itself per its own abandon
+condition instead of occupying a slot forever. Background telemetry no
+longer emits false Slack or "waiting on you" warnings, and GitHub decision
+labels route to the actual responsible contributor.
+
+The optional Native Experience route ships complete and fully reversible:
+Journey presentation, Project Spaces, resumable builder conversations,
+conversation lineage/comparison/export, a native Workbench, shared
+Capability Kits, and confirm-gated trusted remote effect nodes over system
+SSH — every surface behind its own key, with Return to Classic changing
+presentation only. Desk is restored as the canonical work system.
+
+Polish and speed: the chat sessions sidebar shows one-line rows with a
+pinned section and in-place rename; a persistent update notice survives a
+dismissed update prompt; retired OpenRouter model ids are refused with a
+typed error instead of a silent 404; app-side subprocess handling
+consolidates onto one owner; idle CloudKit cursors advance; large canonical
+JSON serializes in linear time; interactive remote chat turns outrank
+background transport work; and the resident agent's voice gains
+organ-level anti-rut tissue (closing-vocative awareness plus a persona-led
+natural expression cue) with no vocabulary bans or output rewriting.
+
+## 0.3.8 — reliability and polish (2026-08-06)
+
+Identity-document hygiene (USER.md carries only facts about the user), ⌘K
+palette focus fix, budget-capped chat compaction, sync completion-marker
+retention, and installer hardening. Full notes: GitHub release v0.3.8.
+
 ## 0.3.7 — installed builder round trips and real project roots (2026-08-03)
 
 Public installations now ship the complete Codex and Claude Code bridge

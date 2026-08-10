@@ -44,7 +44,7 @@ extension AppDelegate {
         } catch {
             let alert = NSAlert()
             alert.alertStyle = .critical
-            alert.messageText = "Workshop storage migration failed"
+            alert.messageText = "Desk execution storage migration failed"
             alert.informativeText = "NativeAgent stopped before starting background work so no task state is lost. \(error.localizedDescription)"
             alert.addButton(withTitle: "Quit")
             alert.runModal()

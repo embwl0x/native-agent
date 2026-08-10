@@ -113,35 +113,3 @@ struct ListPendingMemoryProposalsIntent: AppIntent {
         }
     }
 }
-
-struct MemoryShortcuts: AppShortcutsProvider {
-    static var appShortcuts: [AppShortcut] {
-        AppShortcut(
-            intent: QueryMemoryIntent(),
-            phrases: [
-                "Ask the assistant what it knows about \(\.$query)",
-                "Ask \(.applicationName) what it knows about \(\.$query)",
-            ],
-            shortTitle: "Query Memory",
-            systemImageName: "brain"
-        )
-        AppShortcut(
-            intent: StoreMemoryIntent(),
-            phrases: [
-                "Tell the assistant to remember \(\.$content)",
-                "Tell \(.applicationName) to remember \(\.$content)",
-            ],
-            shortTitle: "Remember",
-            systemImageName: "pencil.and.list.clipboard"
-        )
-        AppShortcut(
-            intent: ListPendingMemoryProposalsIntent(),
-            phrases: [
-                "List the assistant's pending memory proposals",
-                "List \(.applicationName) pending memory proposals",
-            ],
-            shortTitle: "Pending Proposals",
-            systemImageName: "tray.full"
-        )
-    }
-}

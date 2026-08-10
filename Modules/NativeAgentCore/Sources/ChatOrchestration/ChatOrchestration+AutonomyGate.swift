@@ -257,6 +257,10 @@ extension SwiftNativeTrustCenter: OriginAwareAutonomyResolver {
             "self_install",
             "evolution_propose",
             "evolution_status",
+            // A trusted remote node is a separate effect domain. Full-Mac
+            // posture on this Mac must never silently authorize execution on
+            // that host; the exact command keeps its explicit approval floor.
+            "remote_node_execute",
         ].contains(normalized) {
             return true
         }

@@ -1117,7 +1117,7 @@ public enum DeskOpBody: Sendable, Equatable {
     /// token to nil and SKIPS it — so an old writer can never see a pursuit as
     /// an ordinary user project, mutate it past the cap, or drop its fields on
     /// reserialize. origin is implicitly .agent, kind implicitly .project.
-    case openPursuit(alias: String, project: String, title: String, summary: String?, pursuit: Pursuit)
+    case openPursuit(alias: String, project: String, title: String, summary: String?, pursuit: Pursuit, notify: NotifyPolicy)
     case setStatus(status: DeskStatus, blockedReason: String?, waitingOn: String?)
     case updateTitle(title: String?, summary: String?)
     case addRef(ref: DeskRef)
@@ -1195,12 +1195,13 @@ public struct DeskOp: Sendable, Equatable {
             // BYTE-IDENTICAL; pursuit emitted only for an origin=agent create.
             if origin != .owner { obj["origin"] = .string(origin.rawValue) }
             if let pursuit { obj["pursuit"] = pursuit.toJSON() }
-        case let .openPursuit(alias, project, title, summary, pursuit):
+        case let .openPursuit(alias, project, title, summary, pursuit, notify):
             obj["alias"] = .string(alias)
             obj["project"] = .string(project)
             obj["title"] = .string(title)
             put("summary", summary)
             obj["pursuit"] = pursuit.toJSON()
+            if notify != NotifyPolicy() { obj["notify"] = notify.toJSON() }
         case let .setStatus(status, blockedReason, waitingOn):
             obj["status"] = .string(status.rawValue)
             put("blockedReason", blockedReason)
@@ -1273,8 +1274,14 @@ public struct DeskOp: Sendable, Equatable {
                   let project = jsonString(obj, "project"),
                   let title = jsonString(obj, "title"),
                   let pursuitVal = obj["pursuit"] else { return nil }
-            body = .openPursuit(alias: alias, project: project, title: title,
-                                summary: jsonString(obj, "summary"), pursuit: Pursuit.fromJSON(pursuitVal))
+            body = .openPursuit(
+                alias: alias,
+                project: project,
+                title: title,
+                summary: jsonString(obj, "summary"),
+                pursuit: Pursuit.fromJSON(pursuitVal),
+                notify: obj["notify"].map { NotifyPolicy.fromJSON($0) } ?? NotifyPolicy()
+            )
         case "set_status":
             guard let statusRaw = jsonString(obj, "status"), let status = DeskStatus(rawValue: statusRaw) else { return nil }
             body = .setStatus(status: status, blockedReason: jsonString(obj, "blockedReason"), waitingOn: jsonString(obj, "waitingOn"))

@@ -227,6 +227,34 @@ func slackLoop_stopCancelsAndAwaitsInFlightHandling() async throws {
 }
 
 @Test
+func slackHumanTurnPromotesBackgroundSocketWorkToUserInitiated() async throws {
+    let root = try makeLifecycleRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let priority = SlackTaskPriorityCapture()
+    let recorder = OutboundRecorder()
+    let loop = SlackSocketModeLoop(
+        config: makeConfig(),
+        dataRoot: root,
+        outbound: outbound(recorder),
+        chatHandler: { _ in
+            await priority.record(Task.currentPriority)
+            return SlackSocketModeReply(text: "reply")
+        }
+    )
+
+    // Observe the handler before awaiting the background driver so await-side
+    // priority donation cannot make an inherited-priority implementation pass.
+    let driver = Task.detached(priority: .background) {
+        await loop.spawnInboundHandling(makeInbound())
+    }
+    let observed = await priority.wait()
+    #expect(observed?.rawValue ?? 0 >= TaskPriority.userInitiated.rawValue)
+    await driver.value
+    await loop.cancelAndWaitInFlightHandling()
+}
+
+@Test
 func slackInFlightHandlers_registrationRacingCompletionDoesNotLeak() async {
     let handlers = SlackInFlightHandlers()
     let id = UUID()
@@ -368,5 +396,19 @@ private actor SlackTestSignal {
         while !fired, Date() < deadline {
             try? await Task.sleep(nanoseconds: 2_000_000)
         }
+    }
+}
+
+private actor SlackTaskPriorityCapture {
+    private var value: TaskPriority?
+
+    func record(_ priority: TaskPriority) { value = priority }
+
+    func wait(timeout: TimeInterval = 15) async -> TaskPriority? {
+        let deadline = Date().addingTimeInterval(timeout)
+        while value == nil, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        return value
     }
 }

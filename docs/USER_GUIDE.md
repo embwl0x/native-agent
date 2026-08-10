@@ -9,7 +9,7 @@ limitations, see [../PROJECT_STATUS.md](../PROJECT_STATUS.md).
 
 NativeAgent is one Mac-owned agent runtime with several surfaces. The Mac app
 owns provider calls, persona, MemoryV2, Fluid Context, tools, permissions,
-Workshop, receipts, and background work. Mac chat, detached chats, iPhone and
+Desk, receipts, and background work. Mac chat, detached chats, iPhone and
 iPad, Telegram, Slack, and authenticated local bridges all return to that same
 runtime. The mobile app is a secure companion, not a second agent.
 
@@ -19,7 +19,7 @@ runtime. The mobile app is a secure companion, not a second agent.
    newer, then complete onboarding.
 2. Open **Providers**, connect at least one provider, and choose the provider,
    model, Think level, and Fast preference for ordinary chat. Provider choices
-   for Telegram, Slack, Workshop, dreams, and swarms can be set independently.
+   for Telegram, Slack, Desk execution, dreams, and swarms can be set independently.
 3. Open **Trust** and choose the least authority that fits the work. Trust mode
    controls what the agent may attempt; it does not replace macOS permission
    prompts, connector authorization, or protected safety floors.
@@ -59,14 +59,14 @@ write canonical user facts, approve actions, or bypass TrustCenter.
 | Page | Use it for |
 |---|---|
 | **Chat** | Conversations, attachments, screen context, voice, provider/model controls, pinned sessions, detached windows, stop, send-next, and steering. |
-| **Activity** | Notifications, approvals, proposals, recent work, and items waiting for the user. |
+| **Activity** | Notifications, approvals, proposals, recent work, and items waiting for the user. Optionally, Journey presents learning, context receipts, workspaces, schedules, and capability readiness from their existing owners. |
 | **Memories** | Search, review, edit, pin, delete, consolidate, and inspect durable MemoryV2 facts. |
-| **Workshop** | Create and follow multi-step tasks, agent pursuits, checkpoints, approvals, verification, and outcomes. |
+| **Desk** | Line up large projects, dependencies, bridge work, schedules, research, agent pursuits, approvals, progress, verification, and outcomes. |
 | **Skills & Tools** | Switch between reusable procedures and the current trust-aware tool catalog. Skills guide behavior; tools perform gated actions. |
 | **Providers** | Connect accounts and set provider, model, Think, and Fast choices per surface. |
-| **Trust** | Select autonomy, Full Mac windows, Developer Mode, Workshop permissions, and protected action policy. |
+| **Trust** | Select autonomy, Full Mac windows, Developer Mode, Desk execution permissions, and protected action policy. |
 | **Mac Integration** | Request macOS consent and control read/write access for individual Mac capabilities. |
-| **Settings** | Pair mobile devices, configure Telegram, appearance, shortcut, chat compaction, embeddings, Subconscious, updates, and help. |
+| **Settings** | Pair mobile devices, configure Telegram, appearance, shortcut, chat compaction, embeddings, Subconscious, updates, help, and the presentation-only Journey switch. Return to Classic hides Journey without changing Fluid Context, the subconscious, memory, tools, trust, or schedules. |
 
 The **Advanced** disclosure always includes **Personality** and **Connectors**.
 With **Show Developer Surfaces** enabled it also exposes **Capabilities**,
@@ -121,7 +121,7 @@ patch, and build work is:
 ```
 
 A verified source-backed developer install uses the checkout's `workspace/`.
-Every chat surface and Workshop resolves the same canonical workspace for
+Every chat surface and the Desk resolves the same canonical workspace for
 relative paths and ordinary trust modes. With Full Mac YOLO active, the agent
 may explicitly select an existing absolute project elsewhere on the Mac for
 native shell/build work or a Codex/Claude Code handoff. NativeAgent validates
@@ -160,11 +160,11 @@ If approval is requested, resolve the exact item in **Activity**. A pressed
 Approve button is not success until the action produces its terminal receipt
 and, where applicable, domain verification.
 
-## Workshop, background work, and swarms
+## Desk, background work, and swarms
 
-- Put durable multi-step work in **Workshop**. One Desk identity follows the
+- Put durable multi-step work on the **Desk**. One Desk identity follows the
   task through planning, execution, pauses, verification, and completion.
-- The agent's own pursuits use a restricted Workshop membrane rather than an
+- The agent's own pursuits use a restricted Desk work membrane rather than an
   unrestricted hidden chat.
 - Background loops handle event-driven maintenance, messaging, snapshots,
   notifications, dreams, memory hygiene, and scheduled work. Quiet operation
@@ -183,7 +183,7 @@ and, where applicable, domain verification.
 4. Enable NativeAgent notifications in iOS Settings.
 
 Mobile supports chat, sessions and pins, attachments, model controls, Activity,
-approvals, Workshop, memories, Skills & Tools, runtime status, organism status,
+approvals, Desk, memories, Skills & Tools, runtime status, organism status,
 signed remote actions, and lock-screen notifications. The Mac must remain
 available to run provider turns and tools. See
 [mobile_companion.md](mobile_companion.md) for transport detail.
@@ -271,14 +271,14 @@ the verified result returns to that same mind.
    whole catalog into context.
 3. Use only same-turn `context_expand` pointers when deeper Fluid Context is
    truly needed.
-4. Put work products in the canonical workspace and use Workshop for durable
+4. Put work products in the canonical workspace and use Desk for durable
    multi-step execution.
 5. Respect the originating surface, session, TrustCenter policy, approvals,
    connector proof, and effect-time checks.
 6. Verify outcomes through the domain that owns reality. A model statement,
    tool envelope, MCP response, HTTP success, queued push, or approval click is
    not automatically a completed external effect.
-7. Convert a repeated successful procedure into a reviewed skill or Workshop
+7. Convert a repeated successful procedure into a reviewed skill or Desk
    procedure, never into silently expanded authority.
 
 ## Health and troubleshooting

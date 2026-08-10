@@ -21,7 +21,7 @@ struct ChatView: View {
     @Environment(\.scenePhase) private var scenePhase
     // chat-smoothness phase 6: respect Reduce Motion on the bubble entrance.
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @StateObject private var store = ChatStore()
+    @EnvironmentObject private var store: ChatStore
     @StateObject private var sync = iCloudSyncEngine.shared
     @AppStorage("chatModel") private var selectedModel = "gpt-5.6-sol"
     @AppStorage("chatReasoningEffort") private var selectedReasoningEffort = "high"
@@ -362,6 +362,9 @@ struct ChatView: View {
                     await sync.refreshProviderControlsSnapshot()
                     await sync.refreshChatSessionListSnapshot()
                     adoptMainSessionFromSnapshots()
+                    reconcileExternallyRemovedPinnedSession(
+                        afterPinnedIDs: Set(sync.pinnedChatSessions.map(\.id))
+                    )
                     store.refresh(using: bridgeClient, fallbackMessages: currentSnapshotMessages())
                     await MainActor.run { seedProviderIfNeeded() }
                 }
@@ -375,6 +378,9 @@ struct ChatView: View {
                         await bridgeClient.pollICloudRepliesNow()
                         await sync.refreshChatSessionListSnapshot()
                         adoptMainSessionFromSnapshots()
+                        reconcileExternallyRemovedPinnedSession(
+                            afterPinnedIDs: Set(sync.pinnedChatSessions.map(\.id))
+                        )
                         store.refresh(using: bridgeClient, fallbackMessages: currentSnapshotMessages())
                     }
                 } else {
@@ -1144,6 +1150,7 @@ struct ChatView: View {
         await sync.refreshChatSessionListSnapshot()
         adoptMainSessionFromSnapshots()
         let afterPinnedIds = sync.pinnedChatSessions.map(\.id)
+        reconcileExternallyRemovedPinnedSession(afterPinnedIDs: Set(afterPinnedIds))
         if let selectedForFallback,
            beforePinnedIds != afterPinnedIds || sync.transcriptRecords(for: selectedForFallback) == nil {
             await sync.refreshChatTranscriptsSnapshot()
@@ -1151,6 +1158,18 @@ struct ChatView: View {
         if store.messages.isEmpty {
             store.refresh(using: bridgeClient, fallbackMessages: currentSnapshotMessages())
         }
+    }
+
+    private func reconcileExternallyRemovedPinnedSession(afterPinnedIDs: Set<String>) {
+        guard ChatStore.shouldReturnToMainSession(
+            selectedSessionID: store.selectedSessionID,
+            mainSessionID: effectiveMainSessionID,
+            availablePinnedSessionIDs: afterPinnedIDs
+        ) else { return }
+        store.switchToMainSession(
+            using: bridgeClient,
+            fallbackMessages: snapshotMessages(for: effectiveMainSessionID)
+        )
     }
 
     private func startChatSessionSnapshotLoop() {

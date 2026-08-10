@@ -97,7 +97,7 @@ struct WorkshopPumpLoopRunner: EventDeadlineLoopRunner {
     func tickOutcome() async -> LoopTickOutcome {
         switch await pump.tick() {
         case .disabled:
-            return .skipped(reason: "Workshop autonomy disabled")
+            return .skipped(reason: "Desk autonomy disabled")
         case .postureNotNormal:
             return .skipped(reason: "organism posture not normal")
         case .resourcePressure:
@@ -107,9 +107,9 @@ struct WorkshopPumpLoopRunner: EventDeadlineLoopRunner {
         case .leaseHeld:
             return .skipped(reason: "background-work lease held")
         case .reservationRefused:
-            return .skipped(reason: "Workshop reservation refused")
+            return .skipped(reason: "Desk reservation refused")
         case .ran(let status):
-            return .completed(result: "Workshop session \(status.rawValue)")
+            return .completed(result: "Desk work session \(status.rawValue)")
         }
     }
 }

@@ -85,6 +85,7 @@ extension SwiftNativeSecurityCenter {
         "self_install",
         "evolution_propose",
         "evolution_status",
+        "remote_node_execute",
         "gmail.send",
         "email.send",
         "agentmail.send",

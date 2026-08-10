@@ -80,8 +80,9 @@ extension SwiftToolDispatcher {
                 dataRootOverride: dataRoot,
                 telemetryDataRootOverride: dataRoot
             ),
-            openRouter: OpenRouterAdapter(),
-            lifecycleObserver: providerLifecycleObserver
+            openRouter: OpenRouterAdapter(dataRootOverride: dataRoot),
+            lifecycleObserver: providerLifecycleObserver,
+            moonshotCatalogDataRoot: dataRoot
         )
         let workerTools = AgentSwarmInheritedToolScope(inner: self)
         let workerClient = makeChatOrchestrationClient(

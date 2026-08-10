@@ -209,6 +209,16 @@ extension SwiftToolDispatcher {
                 return Self.builderFullMacRequiredEnvelope(tool: "swift_test")
             }
             return await Self.impl_swift_test(input: input, dataRoot: dataRoot)
+        case "remote_node_list":
+            if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
+                return Self.builderFullMacRequiredEnvelope(tool: "remote_node_list")
+            }
+            return try await impl_remote_node_list()
+        case "remote_node_execute":
+            if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
+                return Self.builderFullMacRequiredEnvelope(tool: "remote_node_execute")
+            }
+            return try await impl_remote_node_execute(input: input)
         case "install_app":
             if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
                 return Self.builderFullMacRequiredEnvelope(tool: "install_app")

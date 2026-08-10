@@ -105,11 +105,16 @@ extension NativeClient {
     // (MemoryV2+Storage.swift:286) with the same tombstone gate the daemon ran.
     // The `layer` parameter is preserved on the round-tripped shared record
     // (Core may omit it; the shared decoder requires it).
-    func addMemory(text: String, layer: String = "semantic") async throws -> MemoryRecord {
+    func addMemory(
+        text: String,
+        layer: String = "semantic",
+        source: String = "mac.slash-remember",
+        metadata: JSONValue? = nil
+    ) async throws -> MemoryRecord {
         let core = try await SwiftNativeMemoryV2.shared.store(
             content: text,
-            source: "mac.slash-remember",
-            metadata: nil
+            source: source,
+            metadata: metadata
         )
         var obj: [String: JSONValue] = [
             "id": .string(core.id),

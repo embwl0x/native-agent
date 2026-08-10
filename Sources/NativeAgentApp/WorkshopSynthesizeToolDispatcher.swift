@@ -49,7 +49,7 @@ struct WorkshopSynthesizeReadOnlyToolDispatcher: ToolDispatchClient {
         guard Self.allowed.contains(tool) else {
             throw NSError(domain: "WorkshopSynthesize", code: 403, userInfo: [
                 NSLocalizedDescriptionKey:
-                    "tool '\(tool)' is not permitted in a Workshop synthesis step "
+                    "tool '\(tool)' is not permitted in a Desk synthesis step "
                     + "(read-only surface: \(Self.allowed.sorted().joined(separator: ", ")))",
             ])
         }

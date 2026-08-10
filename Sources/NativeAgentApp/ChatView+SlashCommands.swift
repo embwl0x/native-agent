@@ -21,7 +21,7 @@ extension ChatView {
         if trimmed.hasPrefix("/") {
             let firstToken = trimmed.dropFirst().components(separatedBy: .whitespacesAndNewlines).first ?? ""
             let firstTokenLC = firstToken.lowercased()
-            if knownSlashCommands.contains(firstTokenLC) {
+            if ChatSlashCommandRegistry.commandNames.contains(firstTokenLC) {
                 handleSlashCommand(String(trimmed.dropFirst()))
                 // handleSlashCommand clears `text` itself; clear pending attachments too
                 pendingAttachments = []
@@ -75,28 +75,35 @@ extension ChatView {
         let arg = parts.dropFirst().joined(separator: " ")
         text = ""
         appModel.commitChatDraft("", sessionId: appModel.activeChatSessionId)
-        switch cmd {
-        case "clear":
+        let showDeveloperSurfaces = UserDefaults.standard.bool(forKey: "showDeveloperSurfaces")
+        let builtIn = ChatSlashCommandRegistry.descriptor(named: cmd)
+        if builtIn?.developerOnly == true, !showDeveloperSurfaces {
+            showToast("Unknown command /\(cmd). Type /help for the list.")
+            return
+        }
+        switch builtIn?.route {
+        case .clear:
             showClearConfirm = true
-        case "compact":
-            // ui-honesty 2026-06-10: compactActiveChat is fire-and-forget void
-            // and reports via appModel.statusText ("Session compacted" /
-            // "Compact failed: …"). Await it and toast the RESULT — previously
-            // a failed compact was completely silent on this surface.
+        case .compact:
+            // Await and present the typed mutation result so a failed compact
+            // is never reported as success on this surface.
             if appModel.activeChatSessionId.isEmpty {
                 showToast("No active session to compact")
             } else {
                 Task {
-                    await appModel.compactActiveChat()
-                    await MainActor.run { showToast(appModel.statusText) }
+                    let result = await appModel.compactActiveChat()
+                    await MainActor.run { showToast(result.userMessage) }
                 }
             }
-        case "model":
+        case .model:
             if !arg.isEmpty {
                 appModel.chatModel = arg
-                Task { @MainActor in await appModel.saveChatBrainDefaults() }
+                Task { @MainActor in
+                    let result = await appModel.saveChatBrainDefaults()
+                    showToast(result.userMessage)
+                }
             }
-        case "think":
+        case .think:
             let effort = arg.lowercased()
             let valid = reasoningOptions(from: appModel.modelCatalog, model: appModel.chatModel)
                 .map(\.id)
@@ -105,8 +112,11 @@ extension ChatView {
                 return
             }
             appModel.chatReasoningEffort = effort
-            Task { @MainActor in await appModel.saveChatBrainDefaults() }
-        case "fast":
+            Task { @MainActor in
+                let result = await appModel.saveChatBrainDefaults()
+                showToast(result.userMessage)
+            }
+        case .fast:
             guard appModel.chatModel.lowercased().hasPrefix("gpt-") else {
                 showToast("Fast mode is only available for GPT models")
                 return
@@ -118,30 +128,27 @@ extension ChatView {
                 showToast("Usage: /fast <on|off>")
                 return
             }
-            Task { @MainActor in await appModel.saveChatBrainDefaults() }
-        case "persona":
-            if !arg.isEmpty { appModel.chatPersona = arg }
-        case "remember":
-            guard !arg.isEmpty else { showToast("/remember requires a fact"); return }
-            // ui-honesty 2026-06-10: previously fired-and-forgot then toasted
-            // success unconditionally. addMemoryFact is void and reports via
-            // statusText ("Memory saved" / "Remember failed: …") — await it
-            // and toast the actual result.
-            Task {
-                await appModel.addMemoryFact(arg)
-                await MainActor.run { showToast(appModel.statusText) }
+            Task { @MainActor in
+                let result = await appModel.saveChatBrainDefaults()
+                showToast(result.userMessage)
             }
-        case "note":
+        case .persona:
+            if !arg.isEmpty { appModel.chatPersona = arg }
+        case .remember:
+            guard !arg.isEmpty else { showToast("/remember requires a fact"); return }
+            Task {
+                let result = await appModel.addMemoryFact(arg)
+                await MainActor.run { showToast(result.userMessage) }
+            }
+        case .note:
             // PATCH-Phase1a-dispatcher: /note <text> — POST /v1/notes → Dispatcher.run(commit_memory)
             // Both /note and the agent's commit_memory tool call go through the same Dispatcher.run() path.
             guard !arg.isEmpty else { showToast("/note requires some text"); return }
-            // ui-honesty 2026-06-10: same as /remember — toast the result
-            // ("Note committed" / "Note failed: …"), not a blind success.
             Task {
-                await appModel.addNote(arg)
-                await MainActor.run { showToast(appModel.statusText) }
+                let result = await appModel.addNote(arg)
+                await MainActor.run { showToast(result.userMessage) }
             }
-        case "scratch":
+        case .scratch:
             // PATCH-phase-3c: /scratch <key> <value...> — POST /v1/scratch → Dispatcher.run(scratchpad_write)
             // First whitespace-separated token is the key; everything after is the value string.
             let scratchParts = arg.split(separator: " ", maxSplits: 1).map(String.init)
@@ -153,28 +160,28 @@ extension ChatView {
             let scratchValue = scratchParts[1]
             showToast("Writing scratch \(scratchKey)...")
             Task {
-                let ok = await appModel.writeScratch(key: scratchKey, value: scratchValue)
+                let result = await appModel.writeScratch(key: scratchKey, value: scratchValue)
                 await MainActor.run {
-                    showToast(ok ? "Scratch \(scratchKey) set" : "Scratch \(scratchKey) failed")
+                    showToast(result.userMessage)
                 }
             }
-        case "help":
+        case .help:
             let helpMsg = ChatMessage(role: "system", content:
-                "Slash commands:\n/clear — wipe session messages\n/compact — compact context\n/model <id> — set model\n/think <low|medium|high|xhigh|max|ultra> — reasoning effort\n/fast <on|off> — GPT priority processing\n/persona <name> — set persona\n/remember <fact> — save a memory\n/note <text> — commit a note to agent memory\n/scratch <key> <value> — write ephemeral session scratchpad key\n/tools — open Tools inside Skills & Tools\n\(UserDefaults.standard.bool(forKey: "showDeveloperSurfaces") ? "/nextgen — open Capabilities\n" : "")/export — export this chat to Downloads\n/help — this list\n\nAvailable registered tool names also work as slash commands."
+                ChatSlashCommandRegistry.helpText(showDeveloperSurfaces: showDeveloperSurfaces)
             )
             appModel.chatMessages.append(helpMsg)
         // One tool catalog owner: /tools opens the Tools page in the shared tab.
-        case "tools":
+        case .tools:
             NativeAgentAppCoordinator.shared.request(.skillsTools(.tools))
         // PATCH-2026-05-09: nextgen-surface — navigate sidebar to Capabilities (NextGen panel)
-        case "nextgen":
+        case .nextgen:
             NativeAgentAppCoordinator.shared.request(.sidebar(.capabilities))
             showToast("Navigating to NextGen in Capabilities\u{2026}")
         // PATCH-2026-06-06: chat-upgrades — /export dumps the current session
         // transcript as Markdown into ~/Downloads.
-        case "export":
+        case .export:
             exportCurrentChatToDownloads()
-        default:
+        case nil:
             // PATCH-Phase7b: if cmd matches a known, available capability tool → dispatch it.
             if let cap = capabilitiesStore.tools.first(where: { $0.name == cmd }), cap.availableNow {
                 Task {

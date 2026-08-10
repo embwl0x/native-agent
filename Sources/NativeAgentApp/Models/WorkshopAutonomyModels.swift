@@ -6,6 +6,7 @@ import PersistenceCore
 struct WorkshopExecutionRecord: Identifiable, Codable, Hashable {
     var id: String
     var deskHandle: String?
+    var projectSpaceId: String?
     var title: String
     var objective: String
     var status: String
@@ -26,11 +27,11 @@ struct WorkshopExecutionRecord: Identifiable, Codable, Hashable {
     // gives queue executions a sensible default phase, so the dashboard
     // doesn't silently go empty after a queue submission.
     enum CodingKeys: String, CodingKey {
-        case id, title, objective, status, phase, priority, deskHandle
+        case id, title, objective, status, phase, priority, deskHandle, projectSpaceId
         case autonomyLevel, permissionProfile, summary
         case createdAt, updatedAt, completedAt, receiptCount
         // snake_case fallbacks
-        case created_at, updated_at, completed_at, desk_handle
+        case created_at, updated_at, completed_at, desk_handle, project_space_id
         case autonomy_level, permission_profile, receipt_count
     }
 
@@ -39,6 +40,8 @@ struct WorkshopExecutionRecord: Identifiable, Codable, Hashable {
         self.id        = try c.decode(String.self, forKey: .id)
         self.deskHandle = try c.decodeIfPresent(String.self, forKey: .deskHandle)
                         ?? c.decodeIfPresent(String.self, forKey: .desk_handle)
+        self.projectSpaceId = try c.decodeIfPresent(String.self, forKey: .projectSpaceId)
+                           ?? c.decodeIfPresent(String.self, forKey: .project_space_id)
         self.title     = try c.decodeIfPresent(String.self, forKey: .title) ?? ""
         self.objective = try c.decodeIfPresent(String.self, forKey: .objective) ?? ""
         self.status    = try c.decodeIfPresent(String.self, forKey: .status) ?? "queued"
@@ -69,6 +72,7 @@ struct WorkshopExecutionRecord: Identifiable, Codable, Hashable {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(id, forKey: .id)
         try c.encodeIfPresent(deskHandle, forKey: .deskHandle)
+        try c.encodeIfPresent(projectSpaceId, forKey: .projectSpaceId)
         try c.encode(title, forKey: .title)
         try c.encode(objective, forKey: .objective)
         try c.encode(status, forKey: .status)
@@ -94,6 +98,7 @@ extension WorkshopExecutionRecord {
     init(
         id: String,
         deskHandle: String? = nil,
+        projectSpaceId: String? = nil,
         title: String = "",
         objective: String = "",
         status: String = "queued",
@@ -109,6 +114,7 @@ extension WorkshopExecutionRecord {
     ) {
         self.id = id
         self.deskHandle = deskHandle
+        self.projectSpaceId = projectSpaceId
         self.title = title
         self.objective = objective
         self.status = status

@@ -23,6 +23,9 @@ struct LoopHealthObservation: Equatable, Sendable {
     let nextRun: Date?
     let lastError: String?
     let running: Bool
+    let executing: Bool
+    let executionStartedAt: Date?
+    let executionTimeout: TimeInterval
     /// Sweep R4 item 3: event-listener liveness. nil for loops with no event
     /// lane at all — which is NOT the same as a loop whose listener is down.
     let eventListener: LoopEventListenerHealth?
@@ -33,6 +36,9 @@ struct LoopHealthObservation: Equatable, Sendable {
         nextRun: Date?,
         lastError: String?,
         running: Bool,
+        executing: Bool = false,
+        executionStartedAt: Date? = nil,
+        executionTimeout: TimeInterval = 300,
         eventListener: LoopEventListenerHealth? = nil
     ) {
         self.loopId = loopId
@@ -40,6 +46,9 @@ struct LoopHealthObservation: Equatable, Sendable {
         self.nextRun = nextRun
         self.lastError = lastError
         self.running = running
+        self.executing = executing
+        self.executionStartedAt = executionStartedAt
+        self.executionTimeout = executionTimeout
         self.eventListener = eventListener
     }
 
@@ -50,6 +59,9 @@ struct LoopHealthObservation: Equatable, Sendable {
             nextRun: status.nextRun,
             lastError: status.lastError,
             running: status.running,
+            executing: status.executing,
+            executionStartedAt: status.executionStartedAt,
+            executionTimeout: status.executionTimeout,
             eventListener: status.eventListener
         )
     }
@@ -220,6 +232,18 @@ enum DoctorLoopHealth {
 
         guard observation.running else {
             return verdict(.fail, "Not running: registered, but no scheduler task is active. \(lastTickPhrase)")
+        }
+        if observation.executing {
+            let age = observation.executionStartedAt
+                .map { max(0, now.timeIntervalSince($0)) }
+            if let age, age > observation.executionTimeout + overdueTolerance(for: observation) {
+                return verdict(
+                    .fail,
+                    "Active tick exceeded its \(describeAge(observation.executionTimeout)) watchdog. \(lastTickPhrase)"
+                )
+            }
+            let agePhrase = age.map { " for \(describeAge($0))" } ?? ""
+            return verdict(.ok, "Active tick in progress\(agePhrase).")
         }
         guard let nextRun = observation.nextRun else {
             return verdict(.fail, "Not scheduled: running, but no next tick is planned. \(lastTickPhrase)")

@@ -42,7 +42,7 @@ struct InboxSettingsView: View {
                                 Task { await saveMaster(enabled: val) }
                             }
 
-                        Text("When enabled, \(agentDisplayName) can surface observations, file changes, completed Workshop tasks, and check-ins without being asked.")
+                        Text("When enabled, \(agentDisplayName) can surface observations, file changes, completed Desk tasks, and check-ins without being asked.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
 
@@ -78,7 +78,7 @@ struct InboxSettingsView: View {
                                     trigger: trigger,
                                     watchedPaths: trigger.name == "file_watch" ? $watchedPaths : .constant(""),
                                     onToggle: { enabled in await setTriggerEnabled(trigger.name, enabled: enabled) },
-                                    onFireNow: { Task { await fireTriggerNow(trigger.name) } }
+                                    onFireNow: { Task { await fireTriggerNow(trigger) } }
                                 )
                                 if trigger != triggers.last { Divider() }
                             }
@@ -200,11 +200,15 @@ struct InboxSettingsView: View {
         }
     }
 
-    func fireTriggerNow(_ name: String) async {
+    func fireTriggerNow(_ trigger: InboxTriggerConfig) async {
+        guard trigger.supportsRealManualFire else {
+            statusText = "Test is unavailable until this trigger can produce real evidence-backed content."
+            return
+        }
         do {
             // Post-rebuild (2026-07-09): time/idle fires carry REAL content now —
             // the label follows the returned truth instead of assuming stub.
-            let fired = try await client.inboxTriggerFireNow(name, stub: true)
+            let fired = try await client.inboxTriggerFireNow(trigger.name, stub: true)
             let head = (fired.itemId ?? "").prefix(8)
             let label = fired.wasStub ? "Fired (stub)" : "Fired"
             statusText = head.isEmpty ? "\(label)." : "\(label) — item: \(head)..."
@@ -282,6 +286,10 @@ struct TriggerRowView: View {
                 .buttonStyle(.bordered)
                 .controlSize(.mini)
                 .font(.caption)
+                .disabled(!trigger.supportsRealManualFire)
+                .help(trigger.supportsRealManualFire
+                    ? "Create one real trigger item now"
+                    : "Unavailable until this trigger has real evidence-backed content")
 
             Toggle("", isOn: $isEnabled)
                 .labelsHidden()

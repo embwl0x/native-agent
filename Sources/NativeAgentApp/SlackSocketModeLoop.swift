@@ -509,7 +509,11 @@ struct SlackSocketModeLoop: LoopRunner {
     /// swallowed by a "seen" entry that never produced a reply.
     func spawnInboundHandling(_ inbound: SlackInboundMessage) async {
         let id = UUID()
-        let task = Task {
+        // Socket receipt is background transport work; handling an accepted
+        // human message is not. Keep the tracked cancellation/delivery owner,
+        // but do not let the chat turn inherit the utility-priority socket
+        // loop and starve behind unrelated local builds.
+        let task = Task(priority: .userInitiated) {
             let delivered = await handleInbound(inbound)
             if delivered {
                 await deduper.confirmDelivered(inbound.eventId)

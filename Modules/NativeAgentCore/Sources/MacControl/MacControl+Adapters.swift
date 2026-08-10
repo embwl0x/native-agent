@@ -29,11 +29,22 @@ public struct ProcessRunResult: Sendable, Equatable {
     public let stdout: String
     public let stderr: String
     public let timedOut: Bool
-    public init(exitCode: Int32, stdout: String, stderr: String, timedOut: Bool = false) {
+    public let stdoutTruncated: Bool
+    public let stderrTruncated: Bool
+    public init(
+        exitCode: Int32,
+        stdout: String,
+        stderr: String,
+        timedOut: Bool = false,
+        stdoutTruncated: Bool = false,
+        stderrTruncated: Bool = false
+    ) {
         self.exitCode = exitCode
         self.stdout = stdout
         self.stderr = stderr
         self.timedOut = timedOut
+        self.stdoutTruncated = stdoutTruncated
+        self.stderrTruncated = stderrTruncated
     }
 }
 
@@ -207,15 +218,40 @@ public final class SystemProcessAdapter: ProcessAdapter {
     ) {
         self.timeoutSnapshotInstalledObserver = timeoutSnapshotInstalledObserver
     }
-    // Serial queue gating mutations to the per-run accumulators so the
-    // background readabilityHandler callbacks can append safely without an
-    // actor hop. Swift 6: the buffers themselves are local to run() but the
-    // handler closures capture them — wrap in a reference-class box guarded
-    // by `bufferQueue` for race-free appends.
-    private static let bufferQueue = DispatchQueue(label: "macctl.SystemProcessAdapter.buffers")
-
     private final class _Buffer: @unchecked Sendable {
-        var data = Data()
+        private let lock = NSLock()
+        private let byteLimit: Int?
+        private var data = Data()
+        private var droppedBytes = 0
+
+        init(byteLimit: Int?) {
+            self.byteLimit = byteLimit.map { max(0, $0) }
+        }
+
+        func append(_ chunk: Data) {
+            guard !chunk.isEmpty else { return }
+            lock.lock()
+            if let byteLimit {
+                let room = max(0, byteLimit - data.count)
+                if room > 0 { data.append(chunk.prefix(room)) }
+                droppedBytes += max(0, chunk.count - room)
+            } else {
+                data.append(chunk)
+            }
+            lock.unlock()
+        }
+
+        func snapshot() -> Data {
+            lock.lock()
+            defer { lock.unlock() }
+            return data
+        }
+
+        var truncated: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return droppedBytes > 0
+        }
     }
 
     /// Bridges Process.terminationHandler to async/await without blocking a
@@ -460,11 +496,11 @@ public final class SystemProcessAdapter: ProcessAdapter {
         private var cancelled = false
         private var worker: Thread?
 
-        func start(seconds: Int, action: @escaping @Sendable () -> Void) {
-            let bounded = max(1, seconds)
+        func start(seconds: TimeInterval, action: @escaping @Sendable () -> Void) {
+            let boundedMilliseconds = max(1, Int((max(0.001, seconds) * 1_000).rounded(.up)))
             let thread = Thread { [weak self] in
                 guard let self else { return }
-                let result = wake.wait(timeout: .now() + .seconds(bounded))
+                let result = wake.wait(timeout: .now() + .milliseconds(boundedMilliseconds))
                 lock.lock()
                 let shouldFire = result == .timedOut && !cancelled
                 lock.unlock()
@@ -487,29 +523,56 @@ public final class SystemProcessAdapter: ProcessAdapter {
     }
 
     public func run(executable: String, arguments: [String], timeoutSeconds: Int) async throws -> ProcessRunResult {
+        try await run(
+            executable: executable,
+            arguments: arguments,
+            currentDirectory: nil,
+            environment: nil,
+            standardInput: nil,
+            timeoutSeconds: TimeInterval(timeoutSeconds),
+            outputByteLimit: nil
+        )
+    }
+
+    /// Shared event-driven subprocess seam for app and core callers that need
+    /// a working directory, an exact environment, or stdin. This remains the
+    /// same lifecycle owner as the `ProcessAdapter` entry point above: pipe
+    /// draining, cancellation, timeout escalation, and process-tree reaping
+    /// must not be reimplemented by each feature.
+    public func run(
+        executable: String,
+        arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String]?,
+        standardInput: Data?,
+        timeoutSeconds: TimeInterval,
+        outputByteLimit: Int? = nil
+    ) async throws -> ProcessRunResult {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: executable)
         proc.arguments = arguments
+        proc.currentDirectoryURL = currentDirectory
+        proc.environment = environment
         let outPipe = Pipe()
         let errPipe = Pipe()
         proc.standardOutput = outPipe
         proc.standardError = errPipe
+        let inputPipe = standardInput.map { _ in Pipe() }
+        proc.standardInput = inputPipe ?? FileHandle.nullDevice
 
-        let outBuf = _Buffer()
-        let errBuf = _Buffer()
-        let q = Self.bufferQueue
-
+        let outBuf = _Buffer(byteLimit: outputByteLimit)
+        let errBuf = _Buffer(byteLimit: outputByteLimit)
         // Drain pipes concurrently with waitUntilExit so subprocesses
         // producing > 64KB of output don't deadlock on a full pipe buffer.
         outPipe.fileHandleForReading.readabilityHandler = { handle in
             let chunk = handle.availableData
             if chunk.isEmpty { return }
-            q.sync { outBuf.data.append(chunk) }
+            outBuf.append(chunk)
         }
         errPipe.fileHandleForReading.readabilityHandler = { handle in
             let chunk = handle.availableData
             if chunk.isEmpty { return }
-            q.sync { errBuf.data.append(chunk) }
+            errBuf.append(chunk)
         }
 
         let completion = _ProcessCompletion()
@@ -521,6 +584,18 @@ public final class SystemProcessAdapter: ProcessAdapter {
             outPipe.fileHandleForReading.readabilityHandler = nil
             errPipe.fileHandleForReading.readabilityHandler = nil
             throw MacControlError.ioFailure("Process.run() failed: \(error)")
+        }
+        if let inputPipe, let standardInput {
+            // A helper may accept a payload larger than the pipe buffer. Feed
+            // it off-thread so the event-driven termination path remains able
+            // to enforce its deadline if the child stops reading.
+            let handle = inputPipe.fileHandleForWriting
+            let writer = Thread {
+                try? handle.write(contentsOf: standardInput)
+                try? handle.close()
+            }
+            writer.qualityOfService = .utility
+            writer.start()
         }
         ProcessTreeReaper.ensureChildLeadsOwnProcessGroup(proc.processIdentifier)
         let termination = _ProcessTermination(
@@ -551,11 +626,10 @@ public final class SystemProcessAdapter: ProcessAdapter {
         errPipe.fileHandleForReading.readabilityHandler = nil
         let tailOut = outPipe.fileHandleForReading.readDataToEndOfFile()
         let tailErr = errPipe.fileHandleForReading.readDataToEndOfFile()
-        let (outData, errData) = q.sync { () -> (Data, Data) in
-            if !tailOut.isEmpty { outBuf.data.append(tailOut) }
-            if !tailErr.isEmpty { errBuf.data.append(tailErr) }
-            return (outBuf.data, errBuf.data)
-        }
+        outBuf.append(tailOut)
+        errBuf.append(tailErr)
+        let outData = outBuf.snapshot()
+        let errData = errBuf.snapshot()
         if Task.isCancelled {
             throw CancellationError()
         }
@@ -563,7 +637,9 @@ public final class SystemProcessAdapter: ProcessAdapter {
             exitCode: proc.terminationStatus,
             stdout: String(data: outData, encoding: .utf8) ?? "",
             stderr: String(data: errData, encoding: .utf8) ?? "",
-            timedOut: termination.didTimeOut
+            timedOut: termination.didTimeOut,
+            stdoutTruncated: outBuf.truncated,
+            stderrTruncated: errBuf.truncated
         )
     }
 

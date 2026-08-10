@@ -51,6 +51,7 @@ struct ProviderSettingsView: View {
         let defaultReasoningEffort: String
         let supportedReasoningEfforts: [String]
         let supportsFast: Bool
+        let isUnavailable: Bool
     }
 
     private struct SurfaceBrainSelection {
@@ -68,7 +69,8 @@ struct ProviderSettingsView: View {
                     defaultReasoningEffort: $0.default_reasoning_effort ?? "high",
                     supportedReasoningEfforts: $0.supported_reasoning_efforts
                         ?? ["low", "medium", "high", "xhigh"],
-                    supportsFast: $0.supports_fast == true
+                    supportsFast: $0.supports_fast == true,
+                    isUnavailable: false
                 )
             }
         }
@@ -79,7 +81,8 @@ struct ProviderSettingsView: View {
                 defaultReasoningEffort: $0.defaultReasoningEffort ?? "high",
                 supportedReasoningEfforts: $0.supportedReasoningEfforts
                     ?? ["low", "medium", "high", "xhigh"],
-                supportsFast: $0.supportsFast == true
+                supportsFast: $0.supportsFast == true,
+                isUnavailable: false
             )
         }
     }
@@ -87,7 +90,21 @@ struct ProviderSettingsView: View {
     /// Models offered for a surface, scoped to the provider selected for it.
     private func modelsForSurface(_ surface: String) -> [SurfaceModelChoice] {
         let pid = activeSurface[surface] ?? "codex"
-        return modelsForProvider(pid)
+        var choices = modelsForProvider(pid)
+        let current = surfaceModel[surface] ?? ""
+        if pid == "openrouter", !current.isEmpty,
+           !choices.contains(where: { $0.id == current }),
+           OpenRouterModelCatalog.cachedAvailability(of: current) == .unavailable {
+            choices.insert(SurfaceModelChoice(
+                id: current,
+                name: "\(current) — Unavailable",
+                defaultReasoningEffort: surfaceReasoningEffort[surface] ?? "high",
+                supportedReasoningEfforts: [surfaceReasoningEffort[surface] ?? "high"],
+                supportsFast: false,
+                isUnavailable: true
+            ), at: 0)
+        }
+        return choices
     }
 
     private func reconciledBrainForProvider(surface: String, providerId: String) -> SurfaceBrainSelection? {
@@ -402,7 +419,9 @@ struct ProviderSettingsView: View {
                                     }
                                     .pickerStyle(.menu)
                                     .frame(width: ProviderSurfaceRowLayout.reasoningPickerWidth)
-                                    .disabled(supportedEfforts.isEmpty || savingSurfaceModels.contains(surface))
+                                    .disabled(selectedChoice?.isUnavailable == true
+                                        || supportedEfforts.isEmpty
+                                        || savingSurfaceModels.contains(surface))
                                     .accessibilityLabel("\(surfaceLabel(surface)) reasoning effort")
 
                                     Toggle("Fast", isOn: Binding(
@@ -415,7 +434,9 @@ struct ProviderSettingsView: View {
                                     .controlSize(.small)
                                     .fixedSize(horizontal: true, vertical: false)
                                     .frame(width: ProviderSurfaceRowLayout.fastToggleWidth)
-                                    .disabled(selectedChoice?.supportsFast != true || savingSurfaceModels.contains(surface))
+                                    .disabled(selectedChoice?.isUnavailable == true
+                                        || selectedChoice?.supportsFast != true
+                                        || savingSurfaceModels.contains(surface))
                                     .accessibilityLabel("\(surfaceLabel(surface)) Fast mode")
                                     .help(selectedChoice?.supportsFast == true
                                         ? "Use the account-advertised priority service tier for this surface."
@@ -734,7 +755,7 @@ struct ProviderSettingsView: View {
         switch surface {
         case "chat":      return "Chat"
         case "ios":       return "iPhone"
-        case "workshop", "missions":  return "Workshop"
+        case "workshop", "missions":  return "Desk"
         case "training":  return "Training"
         case "dream":     return "Dream"
         case "telegram":  return "Telegram"

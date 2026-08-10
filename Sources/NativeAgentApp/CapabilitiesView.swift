@@ -687,7 +687,7 @@ struct CapabilitiesView: View {
             if let graph = appModel.agentGraph {
                 NativePanel(title: "Skill Memory Graph", systemImage: "point.3.filled.connected.trianglepath.dotted") {
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 10)], spacing: 10) {
-                        CapabilityMetricCard(title: "Nodes", value: "\(graph.summary.nodes)", detail: "memories, runs, Workshop tasks, capabilities", systemImage: "circle.grid.cross")
+                        CapabilityMetricCard(title: "Nodes", value: "\(graph.summary.nodes)", detail: "memories, runs, Desk tasks, capabilities", systemImage: "circle.grid.cross")
                         CapabilityMetricCard(title: "Edges", value: "\(graph.summary.edges)", detail: "produced and used links", systemImage: "point.3.connected.trianglepath.dotted")
                         CapabilityMetricCard(title: "Capabilities", value: "\(graph.summary.capabilities ?? 0)", detail: "indexed objects", systemImage: "shippingbox")
                     }

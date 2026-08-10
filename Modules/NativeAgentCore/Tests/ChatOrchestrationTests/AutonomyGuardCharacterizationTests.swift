@@ -368,7 +368,8 @@ private final class ReachInnerStub: ToolDispatchClient, @unchecked Sendable {
 private func composedChain(
     policy: JSONValue?,
     telegramConfig: JSONValue? = nil,
-    verifiedSessionId: String? = nil
+    verifiedSessionId: String? = nil,
+    approvedReplay: ApprovedChatToolReplay? = nil
 ) async throws -> any ToolDispatchClient {
     let root = try agcTempRoot()
     let persistence = SwiftNativePersistenceCore()
@@ -386,7 +387,8 @@ private func composedChain(
         gate: gate,
         securityCenter: SwiftNativeSecurityCenter(dataRoot: root, persistence: persistence),
         hasFiler: false,
-        verifiedSessionId: verifiedSessionId
+        verifiedSessionId: verifiedSessionId,
+        approvedReplay: approvedReplay
     )
 }
 
@@ -421,6 +423,89 @@ private func yoloInstallConfirmPolicy(developerMode: Bool = false) -> JSONValue 
             "restart_app": .string("confirm"),
         ]),
     ])
+}
+
+@Test func AutonomyGuardCharacterization_COMPOSED_exactApprovedPersonaReplay_reachesInner() async throws {
+    let input: [String: JSONValue] = [
+        "kind": .string("soul"),
+        "title": .string("Bounded note"),
+        "content": .string("An exact user-approved persona addition."),
+    ]
+    let replay = ApprovedChatToolReplay(
+        approvalID: "approval-exact",
+        tool: "persona_append_section",
+        surface: "chat",
+        input: input,
+        verifiedSessionID: "session-exact",
+        verifiedChatID: nil,
+        verifiedUserID: nil
+    )
+    let chain = try await composedChain(
+        policy: personalPolicy(),
+        verifiedSessionId: "session-exact",
+        approvedReplay: replay
+    )
+
+    #expect(await dispatched(chain, "persona_append_section", input: input))
+}
+
+@Test func AutonomyGuardCharacterization_COMPOSED_changedPersonaReplay_failsClosed() async throws {
+    let approvedInput: [String: JSONValue] = [
+        "kind": .string("soul"),
+        "title": .string("Bounded note"),
+        "content": .string("The approved content."),
+    ]
+    let replay = ApprovedChatToolReplay(
+        approvalID: "approval-mismatch",
+        tool: "persona_append_section",
+        surface: "chat",
+        input: approvedInput,
+        verifiedSessionID: "session-mismatch",
+        verifiedChatID: nil,
+        verifiedUserID: nil
+    )
+    let chain = try await composedChain(
+        policy: personalPolicy(),
+        verifiedSessionId: "session-mismatch",
+        approvedReplay: replay
+    )
+    var changedInput = approvedInput
+    changedInput["content"] = .string("Different content must require a fresh approval.")
+
+    #expect(!(await dispatched(chain, "persona_append_section", input: changedInput)))
+    let changedOriginDispatched = await ChatToolSessionContext.$verifiedUserId.withValue("different-user") {
+        await dispatched(chain, "persona_append_section", input: approvedInput)
+    }
+    #expect(!changedOriginDispatched)
+}
+
+@Test func AutonomyGuardCharacterization_COMPOSED_approvedPersonaReplay_doesNotBypassSecurityBlock() async throws {
+    let input: [String: JSONValue] = [
+        "kind": .string("soul"),
+        "title": .string("Bounded note"),
+        "content": .string("This exact content was approved."),
+    ]
+    let replay = ApprovedChatToolReplay(
+        approvalID: "approval-security-block",
+        tool: "persona_append_section",
+        surface: "chat",
+        input: input,
+        verifiedSessionID: "session-security-block",
+        verifiedChatID: nil,
+        verifiedUserID: nil
+    )
+    var blockedPolicy = personalPolicy()
+    if case .object(var policy) = blockedPolicy {
+        policy["securityPolicy"] = .object(["killSwitchEnabled": .bool(true)])
+        blockedPolicy = .object(policy)
+    }
+    let chain = try await composedChain(
+        policy: blockedPolicy,
+        verifiedSessionId: "session-security-block",
+        approvedReplay: replay
+    )
+
+    #expect(!(await dispatched(chain, "persona_append_section", input: input)))
 }
 
 @Test func AutonomyGuardCharacterization_GitHub_mutation_fails_closed_without_filer_even_in_yolo() async throws {

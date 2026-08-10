@@ -517,11 +517,26 @@ private func deltaEntity(
     checks: String,
     stale: Bool,
     signals: [String] = [],
+    humanDecisionOwner: String? = nil,
     detailFetchedAt: String? = DeskClock.nowISO()
 ) -> JSONValue {
     // Carry requires a PROVEN-quiet prior observation (empty signals): the
     // fixture embeds one in the entity's Codable observation payload.
-    .object([
+    var observation: [String: JSONValue] = [
+        "repository": .string("owner/repo"), "number": .int(Int64(number)),
+        "kind": .string("pull_request"), "title": .string("Make Hermes sturdier"),
+        "isOpen": .bool(state == "open"), "isMerged": .bool(false),
+        "observedVersion": .string("observed-\(updatedAt)"),
+        "signals": .array(signals.map { .string($0) }),
+        "waitingKind": .string("review"), "isStale": .bool(stale),
+    ]
+    if let humanDecisionOwner {
+        observation["humanDecision"] = .object([
+            "detail": .string("A decision is required."),
+            "owner": .string(humanDecisionOwner),
+        ])
+    }
+    return .object([
         "key": .string(key), "repository": .string("owner/repo"), "number": .int(Int64(number)),
         "kind": .string("pull_request"), "title": .string("Make Hermes sturdier"),
         "state": .string(state), "updatedAt": .string(updatedAt),
@@ -529,14 +544,7 @@ private func deltaEntity(
         "reviewState": .string("approved"), "checks": .string(checks),
         "needsUser": .bool(false), "blocked": .bool(false), "stale": .bool(stale),
         "detailFetchedAt": detailFetchedAt.map { JSONValue.string($0) } ?? .null,
-        "commandObservation": .object([
-            "repository": .string("owner/repo"), "number": .int(Int64(number)),
-            "kind": .string("pull_request"), "title": .string("Make Hermes sturdier"),
-            "isOpen": .bool(state == "open"), "isMerged": .bool(false),
-            "observedVersion": .string("observed-\(updatedAt)"),
-            "signals": .array(signals.map { .string($0) }),
-            "waitingKind": .string("review"), "isStale": .bool(stale),
-        ]),
+        "commandObservation": .object(observation),
     ])
 }
 
@@ -602,6 +610,16 @@ private func deltaEntity(
         prior: prior, searchUpdatedAt: "2026-07-15T10:00:00Z", staleHours: 100_000
     )
     #expect(value == .object(["decision": .string("fetch")]))
+}
+
+@Test func githubDeltaReFetchesLegacyGenericDecisionOwnership() {
+    let prior = deltaEntity(
+        state: "open", updatedAt: "2026-07-15T10:00:00Z", checks: "passing",
+        stale: false, humanDecisionOwner: "Repository owner"
+    )
+    #expect(GitHubConnectorActions.testDeltaCarryDecision(
+        prior: prior, searchUpdatedAt: "2026-07-15T10:00:00Z", staleHours: 100_000
+    ) == .object(["decision": .string("fetch")]))
 }
 
 @Test func githubDeltaCarryIsAgeBounded() {

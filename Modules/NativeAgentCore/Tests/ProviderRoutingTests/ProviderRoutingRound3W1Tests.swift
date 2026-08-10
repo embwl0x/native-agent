@@ -348,18 +348,19 @@ struct OpenRouterStreamingStatusTests {
         #expect(provider == "openrouter")
     }
 
-    @Test func streaming_4xx_other_stays_invalidResponse() async throws {
+    @Test func streaming_404_refreshesCatalogAndReportsSelectedModelUnavailable() async throws {
         OpenRouterW1StubURLProtocol.reset()
         OpenRouterW1StubURLProtocol.status = 404
         let adapter = OpenRouterAdapter(session: openRouterW1Session(), apiKeyOverride: "or-key")
         let err = try #require(await collect(
             adapter.stream(prompt: "p", system: nil, model: "anthropic/claude-opus-4-8")
         ) as? LLMError)
-        guard case .invalidResponse(let status) = err else {
-            Issue.record("expected .invalidResponse for other 4xx, got \(err)")
+        guard case .modelUnavailable(let provider, let model) = err else {
+            Issue.record("expected typed model-unavailable for 404, got \(err)")
             return
         }
-        #expect(status == 404)
+        #expect(provider == "openrouter")
+        #expect(model == "anthropic/claude-opus-4-8")
     }
 }
 

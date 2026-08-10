@@ -263,6 +263,18 @@ struct OperationalSettingsPresentationTests {
         #expect(lifecycle.contains("loadProcessedIds()"))
     }
 
+    @Test func snapshotProjectionWaitsForDriveTransportSelection() throws {
+        let bridge = try AppSourceScraping.appSource("iCloudBridge.swift")
+        let call = "MacSyncEngine.shared.startCloudKitSnapshotProjection()"
+        #expect(bridge.components(separatedBy: call).count - 1 == 1)
+
+        let fallback = try #require(bridge.range(of: "guard let containerURL else"))
+        let projection = try #require(bridge.range(of: call))
+        let drive = try #require(bridge.range(of: "MacSyncEngine.shared.start(docsURL: docsURL)"))
+        #expect(projection.lowerBound > fallback.lowerBound)
+        #expect(projection.lowerBound < drive.lowerBound)
+    }
+
     // Source readers (appSource / repositoryRoot) live in the shared
     // AppSourceScraping enum.
 }

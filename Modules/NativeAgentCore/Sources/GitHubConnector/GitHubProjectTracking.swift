@@ -573,7 +573,11 @@ private struct TrackingEntity: Sendable, Equatable {
     var detailFetchedAt: String? = nil
 
     var signature: String {
-        [state, updatedAt, reviewState ?? "", checks ?? "", mergeable ?? "", needsUser ? "user" : "", blocked ? "blocked" : "", stale ? "stale" : ""].joined(separator: "|")
+        // "needs_user" is an internal fingerprint token (never persisted —
+        // signature recomputes from fields on both sides of every compare),
+        // renamed from a personal name for public-identity neutrality
+        // (release-polish item 9, last residue).
+        [state, updatedAt, reviewState ?? "", checks ?? "", mergeable ?? "", needsUser ? "needs_user" : "", blocked ? "blocked" : "", stale ? "stale" : ""].joined(separator: "|")
     }
 
     /// Fingerprint for the CADENCE LEARNER, which counts "this differs from last
@@ -1098,7 +1102,9 @@ private enum GitHubProjectTracker {
         // actor's answer must not re-arm needs_user).
         var latestIssueCommentAuthor: String? = nil
         let issueCommentCount = GitHubCommandObservationBuilder.issueCommentCount(pull: pull)
-        if issueCommentCount > 0, GitHubCommandObservationBuilder.labelDecisionArmed(pull: pull) {
+        if issueCommentCount > 0, GitHubCommandObservationBuilder.labelDecisionArmed(
+            pull: pull, repository: repo, actor: actor
+        ) {
             let lastPage = (issueCommentCount + 9) / 10
             let latest = try await GitHubConnectorActions.call(
                 path: "repos/\(repo)/issues/\(number)/comments",
@@ -1214,6 +1220,12 @@ private enum GitHubProjectTracker {
               // tracked set, so the savings survive; blocked ones always get
               // fresh detail + GraphQL evidence.
               prior.commandObservation.map(\.signals.isEmpty) ?? false,
+              // Builds before the ownership-boundary fix could encode a
+              // repository-wide label as a user decision with this generic
+              // owner. Never carry that legacy classification across an
+              // upgrade: one detail read rewrites it under the current rule,
+              // after which ordinary bounded carry resumes.
+              prior.commandObservation?.humanDecision?.owner != "Repository owner",
               // Bounded staleness: no stamp (pre-delta snapshot) or an expired
               // stamp forces a real re-read. The stamp is PRESERVED on carry,
               // so age accrues and the bound is a hard ceiling, not a lease
@@ -1658,7 +1670,7 @@ private func issueEntity(_ row: [String: Any], repo: String, staleHours: Int, ac
     let state = row["state"] as? String ?? "unknown"
     let updated = row["updated_at"] as? String ?? ""
     let observation = GitHubCommandObservationBuilder.issue(
-        repository: repo, row: row, staleAfterHours: staleHours
+        repository: repo, row: row, actor: actor, staleAfterHours: staleHours
     )
     return TrackingEntity(
         key: "\(repo.lowercased())#issue#\(number)", repo: repo, number: number, kind: "issue",

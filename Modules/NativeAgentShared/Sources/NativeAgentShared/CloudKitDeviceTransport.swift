@@ -432,6 +432,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     private func drainIncomingBody() async -> Int {
         let (handler, since) = loadHandlerAndCursor()
         guard let handler else { return 0 }
+        let queryStartedAt = Date()
 
         let inbound = role.inboundDirection.rawValue
         let fetched: [(fields: NAChatMessageFields, modDate: Date?)]
@@ -495,11 +496,45 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
                 halted = true                     // do not advance past this record
             }
         }
-        // 30s overlap for peer clock-skew (matches the memory framework).
-        if let adv = cursorAdvance {
-            setLastPullDate(adv.addingTimeInterval(-30))
+        // Keep a sliding 30s overlap (matches the memory framework). An idle
+        // successful query must still move an established cursor forward;
+        // otherwise a quiet bridge re-queries from the date of its last record
+        // forever. A halted delivery never advances past the rejected row.
+        if let nextCursor = Self.nextPullCursor(
+            previousCursor: since,
+            queryStartedAt: queryStartedAt,
+            safeRecordDate: cursorAdvance,
+            halted: halted
+        ) {
+            setLastPullDate(nextCursor)
         }
         return dispatched
+    }
+
+    static func nextPullCursor(
+        previousCursor: Date?,
+        queryStartedAt: Date,
+        safeRecordDate: Date?,
+        halted: Bool
+    ) -> Date? {
+        let overlap: TimeInterval = 30
+
+        if halted {
+            guard let safeRecordDate else { return previousCursor }
+            let candidate = safeRecordDate.addingTimeInterval(-overlap)
+            guard let previousCursor else { return candidate }
+            return max(previousCursor, candidate)
+        }
+
+        // On a first-ever empty pull, retain nil so the next attempt still
+        // performs a complete bootstrap read. Once a durable cursor exists (or
+        // this pull saw a record), successful emptiness is an observed high
+        // watermark and can slide the overlap window forward safely.
+        guard previousCursor != nil || safeRecordDate != nil else { return nil }
+        let highWatermark = max(queryStartedAt, safeRecordDate ?? queryStartedAt)
+        let candidate = highWatermark.addingTimeInterval(-overlap)
+        guard let previousCursor else { return candidate }
+        return max(previousCursor, candidate)
     }
 
     // MARK: pairing

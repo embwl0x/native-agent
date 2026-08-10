@@ -29,7 +29,7 @@ trust, transcript, and receipt rules converge on the same orchestration path.
 | Memory | MemoryV2 provides SQLite-backed durable memory, lexical and semantic recall, a knowledge graph, reviewed proposals, hygiene, consolidation, and a generated user-profile projection. |
 | Cognitive substrate | Optional bounded continuity, affect, mood, thought seeds, standing views, self-exemplar voice, reflection receipts, and felt context. |
 | Organism Kernel | Optional body state derived from real runtime events and health: chemistry, body schema, predictions, dream repair, review-gated reflexes, and pressure-aware background posture. |
-| Workshop | One work surface for user-directed tasks and the agent's own pursuits, with Desk identity, multi-step planning/execution, checkpoints, approvals, receipts, and terminal lifecycle synchronization. |
+| Desk | One durable work system for user-directed tasks and the agent's own pursuits, with large-project breakdowns, dependencies, bridge references, schedules, research, multi-step execution, checkpoints, approvals, receipts, and verified completion. |
 | Tools and skills | Lazy, policy-aware tools cover files, shell, Mac apps, browser, memory, research, GitHub, workflows, notifications, images, MCP, and more. A compact skill manifest is always visible; one relevant procedure body is loaded only when needed, and the agent creates or updates procedures through the canonical skill writer rather than private files. Swarm workers default to read-only reasoning and may inherit the same gated tool path for real work without gaining new authority. Skills can guide behavior but never grant tools, permissions, approval bypasses, or safety authority. |
 | Surfaces | Mac chat, detached chat windows, iPhone/iPad, Telegram, Slack, local Codex/Claude Code bridges, and background work share the same agent factory and policy boundaries. |
 | Providers | ChatGPT OAuth, Codex CLI, OpenAI API, Anthropic OAuth/API, xAI OAuth, Moonshot API, and OpenRouter have distinct model/capability contracts. Current verified catalogs include GPT-5.6 variants, Claude 5/Fable/Opus, Grok 4.5, and Kimi K3. Moonshot keys stay Mac-local and refresh the account-visible Kimi model list. Swarms default to the provider/model selected for the Swarms surface; the agent may choose explicit worker models when useful. |
@@ -77,7 +77,7 @@ Mac / iPhone / Telegram / Slack / local bridge
   -> model + lazy tool loop
   -> TrustCenter / approvals / file and Mac gates
   -> transcript, receipts, memory, cognition, organism feedback
-  -> Workshop, notifications, and cross-surface delivery
+  -> Desk, notifications, and cross-surface delivery
 ```
 
 The architectural rule is simple: durable identity stays in persona and
@@ -105,7 +105,7 @@ native tool / MCP / webhook / connector
 This is a translation contract, not a universal integration owner. A received
 MCP response or HTTP `200` proves that a protocol exchange occurred; it does
 not by itself prove that a message was delivered, a file changed, or an
-external action settled. Workshop, Browser, Mac Control, messaging, GitHub, and
+external action settled. Desk execution, Browser, Mac Control, messaging, GitHub, and
 other domains retain authority over their own state and verification.
 Completion callbacks are correlation evidence, not settlement: for example,
 GitHub Command binds work to the observed actionable event and accepts only a
@@ -220,7 +220,7 @@ install can appear in Privacy & Security and request the correct access level.
 ## iPhone and iPad
 
 The companion is a real remote cockpit rather than a web wrapper. It supports
-signed chat and actions, streamed progress, session continuity, Workshop,
+signed chat and actions, streamed progress, session continuity, Desk,
 approvals, activity, memory, skills, provider controls, organism status, and
 APNS notifications.
 
@@ -260,7 +260,7 @@ swift test --package-path Modules/NativeAgentCore --no-parallel
 ```
 
 The test suite covers provider routing, chat/session transactions, memory,
-context generations, tools, approvals, Workshop execution, cognitive and
+context generations, tools, approvals, Desk execution, cognitive and
 organism bounds, iCloud/CloudKit transport, release privacy, and architectural
 drift.
 
@@ -269,8 +269,8 @@ drift.
 | Path | Purpose |
 |---|---|
 | `persona/` | Private identity, voice, growth, and generated user profile |
-| `data/` | Chat, MemoryV2, context generations, cognition, Workshop, receipts, provider state, and local runtime ledgers |
-| `workspace/` (source install) or `~/Library/Application Support/NativeAgent/workspace` (app-only install) | Canonical safe default for drafts, projects, exports, and agent work product shared by every chat surface and Workshop. Full Mac YOLO may explicitly target another existing project directory for native shell/build or Codex/Claude Code work; ordinary modes remain workspace-scoped. |
+| `data/` | Chat, MemoryV2, context generations, cognition, Desk/execution state, receipts, provider state, and local runtime ledgers |
+| `workspace/` (source install) or `~/Library/Application Support/NativeAgent/workspace` (app-only install) | Canonical safe default for drafts, projects, exports, and agent work product shared by every chat surface and the Desk. Full Mac YOLO may explicitly target another existing project directory for native shell/build or Codex/Claude Code work; ordinary modes remain workspace-scoped. |
 | `.runtime/` | Build, evaluation, and transient runtime artifacts |
 
 NativeAgent is local-first, but local does not mean unguarded. OAuth tokens,
@@ -289,7 +289,7 @@ and support boundaries.
 
 ```text
 Sources/NativeAgentApp/           macOS SwiftUI app and runtime assembly
-Modules/NativeAgentCore/          agent, memory, tools, trust, cognition, Workshop
+Modules/NativeAgentCore/          agent, memory, tools, trust, cognition, Desk execution
 Modules/NativeAgentShared/        Mac/iOS wire models and device transport
 iOS/NativeAgentMobile/            iPhone and iPad companion
 Resources/                        app resources

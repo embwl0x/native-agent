@@ -1412,7 +1412,7 @@ extension SwiftToolDispatcher {
             ),
             requestedSchema(
                 name: "claude_message",
-                description: "Send a message to Claude (Claude Code CLI running locally) AND wake her to work on it now. The message is durably queued in the bridge inbox at ~/.config/claude-bridge/claude-inbox.jsonl, then a headless Claude Code session is started with it as the turn input — no human keystroke required. Claude's final reply comes back to you asynchronously (minutes, not seconds) as a '[claude-wake] Automated completion event' bridge message. That completion is a RECEIPT, not a conversational turn: do not auto-send another claude_message in response to it unless you have genuinely new work for her. Repeated wakes on the same topic are rate-limited, and the message stays in the durable inbox even when a wake is suppressed.",
+                description: "Send a message to Claude (Claude Code CLI running locally) AND wake her to work on it now. The message is durably queued, then a headless Claude Code session works it and returns a '[claude-wake] Automated completion event'. The first send returns conversationId. To answer her question, request a change, or continue the same work with full Claude context, call claude_message again with that exact value in conversation_id. Omit conversation_id only for genuinely new work. Completion receipts should not trigger reflexive acknowledgments.",
                 parametersJSON: params(
                     properties: [
                         ("text", strSchema("The message to Claude — full prose, no markdown headers needed. Be specific about the requested work or review.")),
@@ -1426,6 +1426,7 @@ extension SwiftToolDispatcher {
                             ("description", .string("How prominently to surface this to Claude. 'info' = goes in the digest. 'important' = highlighted. 'urgent' = surfaces with a 🚨 tag.")),
                         ])),
                         ("topic", strSchema("Optional short topic tag (e.g. 'bug-music-tcc', 'review-needed') so Claude can group related messages.")),
+                        ("conversation_id", strSchema("Exact claude:… conversationId from an earlier claude_message. Passing it resumes that same Claude Code session; omit it to start a new conversation.")),
                         ("working_directory", strSchema("Optional existing absolute project directory for this Claude Code session. Canonical NativeAgent workspace/source paths work normally; any other directory requires active Full Mac YOLO with outside-workspace access allowed. Use the real target project for coding work instead of leaving Claude in NativeAgent's scratch workspace.")),
                         ("timeout_seconds", intSchema("Optional wall-clock budget for Claude's spawned session, clamped 60-3600. Default 900. Build-sized work orders (multi-file Swift changes, test suites) MUST pass a larger value: 900s has killed real sessions mid-build.")),
                     ],
@@ -1434,7 +1435,7 @@ extension SwiftToolDispatcher {
             ),
             requestedSchema(
                 name: "omp_message",
-                description: "Send an asynchronous task to the local OMP CLI harness (Kimi K3). The message is durably queued under ~/.config/omp-bridge/, a per-topic OMP session is started or resumed, and the final reply or honest failure/timeout receipt returns to this Agent session as an '[omp-wake] Automated completion event.",
+                description: "Send an asynchronous task to the local OMP CLI harness (Kimi K3). The message is durably queued and the final reply or honest failure/timeout receipt returns as an '[omp-wake] Automated completion event'. The first send returns conversationId. To continue the same work with full OMP context, call omp_message again with that exact value in conversation_id. Omit conversation_id only for genuinely new work.",
                 parametersJSON: params(
                     properties: [
                         ("text", strSchema("The complete task or question for OMP.")),
@@ -1444,6 +1445,7 @@ extension SwiftToolDispatcher {
                             ("description", .string("Receipt prominence.")),
                         ])),
                         ("topic", strSchema("Short stable topic tag. Reusing it resumes the same OMP session.")),
+                        ("conversation_id", strSchema("Exact omp:… conversationId from an earlier omp_message. Passing it resumes that same OMP session; omit it to start a new conversation.")),
                         ("working_directory", strSchema("Optional existing absolute project directory. External paths require Full Mac YOLO with outside-workspace access allowed.")),
                         ("timeout_seconds", intSchema("OMP wall-clock guard, clamped 60-3600 seconds. Default 900.")),
                     ],
@@ -1497,7 +1499,7 @@ extension SwiftToolDispatcher {
             ),
             requestedSchema(
                 name: "codex_message",
-                description: "Send an asynchronous note/task to Codex. The message lands in the NativeAgent Codex bridge inbox, NativeAgent attempts a local Mac notification, starts or queues a Codex app-server wakeup turn, and watches that turn so Codex's final answer is delivered back through the local bridge. Use for status, questions, or larger Codex work where the assistant can continue the exchange by sending another codex_message.",
+                description: "Send an asynchronous note/task to Codex. NativeAgent durably queues it, starts or queues a Codex app-server turn, and returns Codex's final answer through the local bridge. The first successful wake returns conversationId. To answer Codex's question, request a change, or continue the same work with the exact Codex thread context, call codex_message again with that value in conversation_id. Omit conversation_id only for genuinely new work.",
                 parametersJSON: params(
                     properties: [
                         ("text", strSchema("The message to Codex. Include enough context to be useful in a later Codex session.")),
@@ -1511,6 +1513,7 @@ extension SwiftToolDispatcher {
                             ("description", .string("How prominently to surface this in the Codex bridge inbox.")),
                         ])),
                         ("topic", strSchema("Optional short topic tag, e.g. 'nativeagent-build' or 'review-needed'.")),
+                        ("conversation_id", strSchema("Exact codex:… conversationId from an earlier codex_message. Passing it resumes that exact Codex app-server thread; omit it to start a new conversation.")),
                         ("model", obj([
                             ("type", .string("string")),
                             ("enum", .array([
@@ -1792,7 +1795,7 @@ extension SwiftToolDispatcher {
             // implementation before mission_* is removed.
             requestedSchema(
                 name: "workshop_submit",
-                description: "Exact workspace byte copy: set operation=copy_workspace_file with source and destination. When the locally reviewed deterministic procedure is active, Workshop skips its planner; otherwise it falls back before admission. Use procedure=local_file_copy_v1 only for explicit/manual compatibility. Every other objective creates a user-directed Workshop task. Returns Desk and execution status; use workshop_status to follow queued work.",
+                description: "Run a user-directed task from the Desk's execution lane (the workshop_* name is retained for compatibility). Exact workspace byte copy: set operation=copy_workspace_file with source and destination. When the locally reviewed deterministic procedure is active, the execution lane skips its planner; otherwise it falls back before admission. Use procedure=local_file_copy_v1 only for explicit/manual compatibility. Every other objective creates a user-directed Desk task. Returns Desk identity and execution status; use workshop_status to follow queued work.",
                 parametersJSON: params(
                     properties: [
                         ("text", strSchema("The task objective — what the user wants done (required).")),
@@ -1807,10 +1810,10 @@ extension SwiftToolDispatcher {
             ),
             requestedSchema(
                 name: "workshop_status",
-                description: "Read Workshop task execution status. Without an id: list active and recent work. With an execution id: return detail and step receipts. Read-only.",
+                description: "Read the Desk's directed task execution status (the workshop_* name is retained for compatibility). Without an id: list active and recent work. With an execution id: return detail and step receipts. Read-only.",
                 parametersJSON: params(
                     properties: [
-                        ("id", strSchema("Optional compatibility execution id. Omit to list active and recent Workshop tasks.")),
+                        ("id", strSchema("Optional compatibility execution id. Omit to list active and recent Desk tasks.")),
                     ],
                     required: []
                 )
@@ -2236,6 +2239,24 @@ extension SwiftToolDispatcher {
                             ("disable_swiftpm_sandbox", boolSchema("Optional. Defaults true so SwiftPM does not invoke its own sandbox-exec inside our outer wrapper (profiles cannot nest). Leave it true; setting it false makes the build fail at manifest compile.")),
                         ],
                         required: []
+                    )
+                ),
+                requestedSchema(
+                    name: "remote_node_list",
+                    description: "List explicitly configured MacControl trusted remote effect nodes, their pinned host-key fingerprints, enablement, and executable allowlists. This is a read-only inventory; remote nodes never own chat, memory, context, or schedules.",
+                    parametersJSON: params(properties: [], required: [])
+                ),
+                requestedSchema(
+                    name: "remote_node_execute",
+                    description: "Run one argv-shaped command on an explicitly enabled trusted remote node. The node is re-read at effect time, the executable must exactly match its allowlist, SSH host identity is pinned, output is bounded, and a durable receipt is written. This remains behind Trust Center Full Mac and the normal autonomy/approval gate.",
+                    parametersJSON: params(
+                        properties: [
+                            ("node_id", strSchema("Required node id from remote_node_list.")),
+                            ("executable", strSchema("Required absolute executable path; must exactly match the node allowlist.")),
+                            ("arguments", stringArraySchema("Optional argv values. Values are individually shell-quoted; multiline/NUL arguments are rejected.")),
+                            ("timeout_seconds", intSchema("Optional. Default 60, clamped 1...300.")),
+                        ],
+                        required: ["node_id", "executable"]
                     )
                 ),
                 requestedSchema(

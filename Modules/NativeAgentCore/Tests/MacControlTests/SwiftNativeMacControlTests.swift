@@ -302,6 +302,50 @@ private func _processIdentityIsRunning(_ identity: ProcessTreeIdentity) -> Bool 
     )
 }
 
+@Test func systemProcessAdapterSharedSeamPreservesDirectoryEnvironmentAndInput() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("macctl-shared-process-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let adapter = SystemProcessAdapter()
+    let result = try await adapter.run(
+        executable: "/bin/sh",
+        arguments: ["-c", "printf '%s|%s|' \"$PWD\" \"$NATIVE_AGENT_PROCESS_TEST\"; /bin/cat"],
+        currentDirectory: root,
+        environment: ["NATIVE_AGENT_PROCESS_TEST": "ready"],
+        standardInput: Data("payload".utf8),
+        timeoutSeconds: 2.5
+    )
+
+    #expect(!result.timedOut)
+    #expect(result.exitCode == 0)
+    #expect(result.stdout.hasSuffix("/\(root.lastPathComponent)|ready|payload"))
+    #expect(result.stderr.isEmpty)
+}
+
+@Test func systemProcessAdapterSharedSeamDrainsButBoundsBothOutputPipes() async throws {
+    let result = try await SystemProcessAdapter().run(
+        executable: "/bin/sh",
+        arguments: [
+            "-c",
+            "/usr/bin/yes stdout | /usr/bin/head -c 4096; /usr/bin/yes stderr | /usr/bin/head -c 4096 >&2",
+        ],
+        currentDirectory: nil,
+        environment: nil,
+        standardInput: nil,
+        timeoutSeconds: 2,
+        outputByteLimit: 512
+    )
+
+    #expect(!result.timedOut)
+    #expect(result.exitCode == 0)
+    #expect(result.stdout.utf8.count == 512)
+    #expect(result.stderr.utf8.count == 512)
+    #expect(result.stdoutTruncated)
+    #expect(result.stderrTruncated)
+}
+
 @Test func systemProcessAdapterCancellationEscalatesActiveTimeoutGraceWindow() async throws {
     let marker = FileManager.default.temporaryDirectory
         .appendingPathComponent("macctl-timeout-cancel-\(UUID().uuidString)")

@@ -513,7 +513,8 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
                 objective: objectiveTrunc,
                 triggerSource: spec.triggerSource,
                 trustRequired: spec.trustRequired,
-                deskHandle: spec.deskHandle
+                deskHandle: spec.deskHandle,
+                projectSpaceId: spec.projectSpaceId
             )
         )
         let exactPlanningProviderCallCount: Int? = enableAutonomy
@@ -574,6 +575,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         let record = WorkshopExecutionRecord(
             id: id,
             deskHandle: spec.deskHandle,
+            projectSpaceId: spec.projectSpaceId,
             title: titleTrunc,
             objective: objectiveTrunc,
             createdAt: nowStr,
@@ -1244,6 +1246,10 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
             id: s("id", ""),
             deskHandle: {
                 let value = s("desk_handle", "").trimmingCharacters(in: .whitespacesAndNewlines)
+                return value.isEmpty ? nil : value
+            }(),
+            projectSpaceId: {
+                let value = s("project_space_id", "").trimmingCharacters(in: .whitespacesAndNewlines)
                 return value.isEmpty ? nil : value
             }(),
             title: s("title", ""),

@@ -19,8 +19,15 @@ import Foundation
 // content change. The cooldown is a second floor against rapid re-fire.
 //
 // v1 scope: fires on ANY content change to a direct/urgent active item. The
-// notify.on event filter (blocked/unblocked/due/explicit/…) is captured on the
-// item but not yet enforced here — a documented refinement, not a silent gap.
+// notify.on event filter (blocked/unblocked/due/…) is captured on the item but
+// not yet fully enforced here — a documented refinement, not a silent gap —
+// with ONE enforced exception (2026-08-08, the "opened a self-pursuit" storm):
+// an item whose `on` is exactly ["explicit"] is a one-time announcement. It
+// pings once and never again from bare updatedAt churn — the Workshop pump's
+// own work-session ops advance updatedAt every couple of hours, and before
+// this rule each advance replayed the frozen open-time notifyReason at the
+// user (28 pushes for 2 pursuits in 4 days). Re-pings on OTHER filters also
+// stop replaying the open-time reason: a re-ping describes the change.
 
 public enum DeskNotifyEvaluator {
 
@@ -34,13 +41,26 @@ public enum DeskNotifyEvaluator {
         /// version (CAS) so a content change landing during the tick isn't
         /// swallowed (it pings on the next tick instead).
         public let observedUpdatedAt: String
+        /// True for `on == ["explicit"]` one-time announcements. The loop
+        /// stamps these UNCONDITIONALLY (no updatedAt CAS): fired is fired,
+        /// and a content change landing mid-tick must not resurrect the
+        /// announcement as a fresh "first ping" (gpt-5.5 review 2026-08-08).
+        public let oneTimeAnnouncement: Bool
 
-        public init(handle: String, title: String, body: String, level: NotifyLevel, observedUpdatedAt: String) {
+        public init(
+            handle: String,
+            title: String,
+            body: String,
+            level: NotifyLevel,
+            observedUpdatedAt: String,
+            oneTimeAnnouncement: Bool = false
+        ) {
             self.handle = handle
             self.title = title
             self.body = body
             self.level = level
             self.observedUpdatedAt = observedUpdatedAt
+            self.oneTimeAnnouncement = oneTimeAnnouncement
         }
     }
 
@@ -68,6 +88,10 @@ public enum DeskNotifyEvaluator {
             guard item.notify.level == .direct || item.notify.level == .urgent,
                   !item.status.isTerminal
             else { return nil }
+            // A one-time announcement that already fired can never ping again,
+            // so it must not generate wake deadlines either (a deadline for a
+            // ping `decision` will refuse would spin the loop).
+            if item.notify.lastNotifiedAt != nil, isExplicitOnly(item) { return nil }
             // Parked: the only thing that can unblock this item is the park
             // ending — but wake for it ONLY if a ping actually follows, so the
             // park end is a deadline for items with something to say, not for
@@ -112,7 +136,13 @@ public enum DeskNotifyEvaluator {
         // which `nextMeaningfulDeadline` above now schedules exactly.
         guard !DeskSequencing.isDeferred(item, now: now) else { return nil }
 
+        var isRePing = false
         if let lastRaw = item.notify.lastNotifiedAt, let last = DeskClock.parseISO(lastRaw) {
+            // One-time announcements never re-ping: `on == ["explicit"]` means
+            // the opener asked for exactly one shoulder-tap, and routine
+            // machine churn (work logs, session receipts) advancing updatedAt
+            // must not replay it.
+            guard !isExplicitOnly(item) else { return nil }
             // Already pinged once: re-ping only on a REAL change since then
             // (markNotified doesn't bump updatedAt, so the stamp itself can't
             // re-trigger) …
@@ -120,21 +150,37 @@ public enum DeskNotifyEvaluator {
             // … and only past the cooldown floor.
             let cooldown = item.notify.cooldown.flatMap(parseDuration) ?? defaultCooldown
             guard now.timeIntervalSince(last) >= cooldown else { return nil }
+            isRePing = true
         }
         // (lastNotifiedAt nil ⇒ never pinged ⇒ fire on this first eligible tick.)
 
-        let reason = trimmedNonEmpty(item.notify.notifyReason)
-            ?? "\(item.project) · \(item.title) — now \(item.status.rawValue)"
+        // notifyReason describes the moment the policy was SET (e.g. "opened a
+        // self-pursuit"). It is first-ping copy only; a re-ping describes the
+        // current state instead of replaying the stale announcement.
+        let reason = isRePing
+            ? "\(item.project) · \(item.title) — now \(item.status.rawValue)"
+            : (trimmedNonEmpty(item.notify.notifyReason)
+                ?? "\(item.project) · \(item.title) — now \(item.status.rawValue)")
         return Decision(
             handle: item.handle,
             title: "Desk · \(item.project)",
             body: reason,
             level: item.notify.level,
-            observedUpdatedAt: item.updatedAt
+            observedUpdatedAt: item.updatedAt,
+            oneTimeAnnouncement: isExplicitOnly(item)
         )
     }
 
     // MARK: helpers
+
+    /// True when the item's `on` filter is exactly the one-time announcement:
+    /// ping once, then stay silent regardless of content churn.
+    static func isExplicitOnly(_ item: DeskItem) -> Bool {
+        let filters = Set(item.notify.on.map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }).subtracting([""])
+        return filters == ["explicit"]
+    }
 
     static func trimmedNonEmpty(_ s: String?) -> String? {
         guard let t = s?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty else { return nil }

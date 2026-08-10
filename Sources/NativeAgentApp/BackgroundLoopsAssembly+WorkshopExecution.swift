@@ -107,7 +107,7 @@ extension BackgroundLoopsAssembly {
             )
             guard let providerCallCount = response.providerCallCount else {
                 throw NSError(domain: "WorkshopExecutor", code: 500, userInfo: [
-                    NSLocalizedDescriptionKey: "Workshop synthesis completed without exact provider accounting",
+                    NSLocalizedDescriptionKey: "Desk task synthesis completed without exact provider accounting",
                 ])
             }
             return WorkshopStepLLMCompletion(
@@ -311,10 +311,10 @@ extension BackgroundLoopsAssembly {
             "source": .string("workshop"),
             "severity": .string("actionable"),
             "title": .string(req.title),
-            "summary": .string("Workshop execution \(req.executionId) is blocked on step \(req.stepId) (\(req.tool))."),
+            "summary": .string("Desk execution \(req.executionId) is blocked on step \(req.stepId) (\(req.tool))."),
             "detail": .string(
-                "Approve to execute the blocked step and continue the Workshop task; "
-                + "deny to reject the step and fail the Workshop task.\n\n\(req.reason)"),
+                "Approve to execute the blocked step and continue the Desk task; "
+                + "deny to reject the step and fail the Desk task.\n\n\(req.reason)"),
             "related_mission_id": .string(req.executionId),
             "related_approval_id": .string(approvalId),
             "related_paths": .array([
@@ -327,9 +327,9 @@ extension BackgroundLoopsAssembly {
                 .object(["id": .string("view"), "label": .string("View"),
                          "description": .string("See full detail")]),
                 .object(["id": .string("approve"), "label": .string("Approve"),
-                         "description": .string("Execute the blocked step and continue the Workshop task")]),
+                         "description": .string("Execute the blocked step and continue the Desk task")]),
                 .object(["id": .string("reject"), "label": .string("Deny"),
-                         "description": .string("Reject the step and fail the Workshop task")]),
+                         "description": .string("Reject the step and fail the Desk task")]),
                 .object(["id": .string("dismiss"), "label": .string("Dismiss"),
                          "description": .string("Dismiss this card")]),
             ]),
@@ -353,7 +353,7 @@ extension BackgroundLoopsAssembly {
                 dataRoot: dataRoot,
                 itemId: approvalId,
                 title: req.title,
-                summary: "Workshop execution \(req.executionId) is blocked on step \(req.stepId) (\(req.tool)).",
+                summary: "Desk execution \(req.executionId) is blocked on step \(req.stepId) (\(req.tool)).",
                 source: "workshop",
                 severity: "actionable"
             )
@@ -456,7 +456,7 @@ private struct WorkshopExecutorDrainRunner: EventDeadlineLoopRunner {
 
     func tickOutcome() async -> LoopTickOutcome {
         await executor.drainOnce()
-        if Task.isCancelled { return .skipped(reason: "Workshop executor canceled") }
-        return .completed(result: "Workshop execution drain completed")
+        if Task.isCancelled { return .skipped(reason: "Desk executor canceled") }
+        return .completed(result: "Desk execution drain completed")
     }
 }

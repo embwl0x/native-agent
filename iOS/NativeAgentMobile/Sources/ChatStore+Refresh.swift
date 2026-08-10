@@ -138,12 +138,14 @@ extension ChatStore {
             copy.isStreaming = false
             return copy
         }
-        if let data = try? JSONEncoder().encode(Array(capped)) {
-            let key = transcriptStorageKey(for: selectedSessionID ?? mainSessionID)
-            UserDefaults.standard.set(data, forKey: key)
-            if key == transcriptKey {
-                UserDefaults.standard.set(data, forKey: transcriptKey)
-            }
+        let ownerSessionID = Self.cleanSessionID(selectedSessionID ?? mainSessionID)
+        let envelope = CachedTranscript(
+            schemaVersion: 2,
+            sessionID: ownerSessionID,
+            messages: Array(capped)
+        )
+        if let data = try? JSONEncoder().encode(envelope) {
+            defaults.set(data, forKey: transcriptStorageKey(for: ownerSessionID))
         }
     }
 }

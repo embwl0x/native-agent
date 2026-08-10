@@ -1,8 +1,151 @@
 # NativeAgent Project Status
 
-Last updated: 2026-08-06
+Last updated: 2026-08-09
 
 ## Summary
+
+The private `main` branch contains an unreleased 0.3.9 stabilization pile;
+`VERSION` intentionally remains `0.3.8`. A 2026-08-08 fine-tooth sweep is
+implemented and verified locally. It repairs
+last-writer-wins chat-brain persistence, checked recovery for malformed Codex
+CLI adoption-consent records, persistent/HTTPS-only update notices, typed refusal of
+freshly retired OpenRouter models without changing the user's LLM, exact
+Subconscious route readiness, iPhone session/cache/queue ownership, terminal
+CloudKit failure receipts, atomic pursuit notification policy, evidence-honest
+trigger testing, authenticated transactional installer rollback, consolidated
+slash-command ownership, and duplicate App Intents shortcut-provider metadata.
+The architecture map and focused regression suites cover the new boundaries.
+The canonical repository gate, iOS continuity suites, and Xcode App Intents
+metadata extraction pass. These changes are now installed on User's Mac from
+the final clean private Native Experience hardening head;
+they remain private and have not been published or released.
+
+A 2026-08-09 canonical Telegram-session audit verifies 26 of 26 completed
+turns, Fluid Context on every turn, cognitive/organism context on every model
+call, seven successful tool executions, and 26 delivered Telegram replies with
+no session-time transport error. It also found that accepted Telegram work
+could inherit the utility priority of its long-poll loop and become locally
+starved during heavy unrelated whole-Mac compilation. Human Telegram and Slack
+turns now promote only their interactive task to user-initiated priority while
+retaining the same coordinator, cancellation, trust, context, model, tool, and
+delivery paths. Direct regressions, the 142-test Telegram suite, the 13-test
+Slack lifecycle suite, and the complete Mac/Core/iOS gate pass. The source fix
+is not installed; the live app was audited but not restarted.
+
+The agent's work surface is Desk again. Desk is the canonical visible route,
+project system, and task owner; retired Workshop, Missions, Executions, Work,
+and Command Center routes normalize into it so existing saved state and deep
+links remain valid. The bounded `WorkshopExecution` module, `data/workshop`
+storage, and `workshop_*` tool names remain compatibility implementation seams
+behind Desk's directed execution lane. No execution, bridge, scheduling,
+approval, provenance, verification, Fluid Context, or organism capability was
+removed.
+
+The latest private source also repairs resolved persona approval replay. A
+Telegram or other chat approval now authorizes only its exact persisted tool,
+content, surface, session, chat, and user; the replay does not ask the dynamic
+persona guard for the same confirmation twice, while every hard effect-time
+check remains authoritative. The known historical pre-dispatch failure shape
+is safely recoverable and its one conversation receipt is healed to the final
+execution truth. The complete Mac/Core/iOS gate passes. The clean development
+build is now installed; launch reconciliation
+recovered the existing approved card, appended its requested persona section
+exactly once, and replaced the stale failed transcript receipt with one
+successful receipt. Authenticated live proof shows chat ready, active Fluid
+Context with matching generations and zero degraded sources, and the organism
+enabled.
+
+The latest source also closes a self-exemplar voice blind spot that let a
+repeated closing word survive when every reply opened differently. Sound now
+checks only the conversational edges of the 12 newest assistant turns and can
+surface a small, unnamed "more range" cue after a distinctive word repeats
+across at least three turns. Quoted content is excluded; the cue cools after
+varied replies and adds no model call, store, banned-word rule, transcript
+trimming, or output rewrite. Focused voice regressions, the complete 5,583-test
+Core run, and the canonical Mac/Core/iOS gate pass. Clean runtime commit
+`e1faf9ce` is now installed and running. Its real provider context carried the
+unnamed range cue for the previously observed pattern; Agent answered naturally
+without repeating or being shown the worn word. Authenticated proof shows exact
+source identity, chat ready, matching active Fluid Context generations with no
+degraded sources, and the organism enabled under nominal resource pressure.
+
+The unreleased source now also gives every install a small always-on,
+persona-led natural-expression layer in the shared chat context, independent
+of whether Subconscious is enabled. One short positive sentence follows the
+persona in the stable cached prefix. A pure bounded read of the six newest
+assistant replies can stage a temporary response-shape cue, which the existing
+turn planner admits only for chat/personality conversation and naturally
+clears when the latest reply varies. Structured/code-heavy work is excluded.
+This adds no model call,
+output rewrite, provider change, store, personality engine, randomizer, or word
+ban; one constructor setting removes both additions without changing durable
+state. Focused persona-order, surface-parity, trigger/cooling, false-positive,
+cache-invariant, and rollback tests pass. The canonical repository gate also
+passes all release/privacy/architecture guards, every Core shard, Mac tests,
+and the iOS simulator suite.
+
+Clean commit `c5e85f8c` is now installed and running. A 12-turn, one-session
+conversation on Claude Fable 5 moved through baseline, distance, correction,
+repair, warmth, and neutral carryover with no failed turns or tool calls. The
+reply shape varied from one to four paragraphs, including four replies under
+25 words; an initially polished cadence accepted correction and relaxed into
+short, direct speech without losing continuity. Exact traces prove the stable
+prefix grew by 137 characters—the 135-character guidance plus its separator—
+and every turn carried Fluid Context, CognitiveSubstrate Sound, Body, and
+Organism posture. Fluid Context stayed active with matching generation 1752,
+40 sources, zero degraded sources, and normal pressure. Subconscious completed
+25 of 25 scheduled microcycles with no failures; organism chemistry changed on
+all 12 turns and posture moved from careful to reviewing. Post-run Doctor
+passes the exact build, providers, tools, approvals, memory, persistence, and
+iOS projection. A subsequent real paired-iPhone notification was accepted by
+APNS with HTTP 200, queued through the iCloud bridge, and confirmed visible by
+User; the organism immediately restored notification-path health. The remaining
+whole-Mac resource-pressure warning stays honest, while NativeAgent itself
+sampled at 0.0% quiet CPU and about 192 MB resident. It is installed privately
+but not pushed or released.
+
+The private 0.3.9 tree now includes the complete reversible Native Experience
+inside Activity. Focused native pages cover the learning trail, Fluid Context
+receipt economics and read-only turn diagnostics, Project Spaces and exact
+conversation forks/comparison/export, seven idempotent Scheduler/Desk
+blueprints, shared capability readiness and conversation-scoped Kits, a native
+Workbench, bounded skill version/archive/restore evidence, and host-key-pinned
+trusted remote effects. It reuses canonical owners throughout: no second store,
+memory, scheduler, executor, cognition path, approval membrane, provider router,
+or prompt was added. Remote execution has an explicit non-YOLO approval floor,
+exact executable allowlists, effect-time configuration revalidation, bounded
+process I/O/deadlines, and durable receipts. It is off by default; Settings can
+enable individual sections or Return to Classic in one action. That rollback
+changes only `nativeagent.experience.*` presentation preferences and cannot gate
+chat, the selected LLM, MemoryV2, Fluid Context, the subconscious, Organism,
+TrustCenter, tools, background work, canonical data, or installed schedules.
+
+The concentration pass replaces the former 621-line experience page with a
+150-line shell and focused page owners, and extracts app-chat surface policy and
+detached relay plumbing from the dispatcher. The complete `script/test.sh` gate
+passes after architecture, timer, capability-name, and sibling autonomy-path
+audits; it includes all Core shards, Mac tests, and the iOS simulator suite.
+These changes remain private, unpushed, unpublished, and unreleased. The Native
+Experience presentation is enabled on User's development install and can return
+to Classic from Settings without changing canonical state.
+
+A ten-turn same-session live conversation on Claude Fable 5 passed with no
+runtime warnings, coherent correction/repair/carryover, and bounded organism
+change on every turn. Post-restart bridge proof showed chat ready, Fluid Context
+active with matching generations and zero degraded sources, and the organism
+enabled. Classic and enabled black-box UI passes each returned 103 pass / 0 warn
+/ 0 fail. The evaluator now has conditional deep coverage for all eight Native
+Experience pages; completing that click-through on this desktop requires first
+clearing a repeatedly presented Keychain dialog from the unrelated
+`Continuum-debug.app` process.
+
+Async builder handoffs now support explicit conversation continuation.
+`codex_message`, `claude_message`, and `omp_message` return an agent-scoped
+`conversationId`; supplying it as `conversation_id` on a later call resumes
+the exact Codex thread or existing Claude/OMP session pointer. This is routing
+tissue over the builders' canonical histories, not a new transcript, memory,
+agent, or scheduler. Wrong-worker and malformed references fail before durable
+queueing. The change is locally verified and remains uninstalled/unreleased.
 
 Release `0.3.8` (2026-08-06) is the current public build: notarized DMG on
 the releases page, Sparkle feed serving it to installed 0.3.7 clients, and
@@ -23,7 +166,7 @@ The public repository now uses the teal Living Core product icon consistently
 across its README, checked-in Mac iconset, packaged Mac icon, and iOS/App Store
 identity. `docs/USER_GUIDE.md` is the compact user-and-agent operating map for
 setup, every visible surface, Subconscious/Organism activation, Fluid Context,
-trust, tools/skills, Workshop, connectors, mobile continuity, verification,
+trust, tools/skills, Desk, connectors, mobile continuity, verification,
 and diagnostics; `docs/CAPABILITIES.md` remains the deeper capability tour.
 
 Public app-only installs now keep the authenticated Codex/Claude Code/OMP return
@@ -277,7 +420,14 @@ persisted conversation route; Telegram retains inline approval controls, while
 Mac, detached, Slack, iOS-forwarded, and bridge-message chat use the same
 nonblocking app-owned projection. There is no approval poller, and raw
 noninteractive callers still fail closed without suggesting that a model edit
-TrustCenter policy. Registered Mail, Messages, Notes, and Contacts connector
+TrustCenter policy. Resolved persona-write approvals now carry exact bounded
+replay evidence, so the dynamic persona guard does not demand the same approval
+again on a no-filer executor. The replay still reruns hard SecurityCenter,
+file, origin, and persona checks; any changed tool, content, surface, session,
+chat, or user fails closed. Launch reconciliation retries only the historical
+pre-dispatch double-confirmation failure (where no effect could have run), and
+heals its single conversation receipt from failed to succeeded after the write.
+Registered Mail, Messages, Notes, and Contacts connector
 actions now have executors, with Mail/Notes setup absence distinguished from a
 legitimate empty read. Screenshot evidence reaches typed browser receipts,
 browser domain configuration is explicitly risk tiering rather than authority,
@@ -856,11 +1006,11 @@ unchanged. This is production integration, not a shadow latency controller.
 | Area | Status | Notes |
 |---|---|---|
 | Mac app runtime | Real | SwiftUI app plus in-process Swift runtime services. |
-| Chat orchestration | Real | Streaming and non-streaming provider paths, Swift tool loop, turn planning, compact context, same-turn lazy schema activation, action receipts, an exact provider-backed Mac context meter with separate provider input, transcript growth, per-turn delta, and visible compaction threshold, bounded transcript/tool-result projections (12,000 provider-facing UTF-8 bytes for GitHub and blocking delegation; 32,000 elsewhere), lossless same-turn paging of oversized redacted results, finite tool-dispatch watchdogs on every surface, exact no-progress loop recovery, authoritative turn-trace inspection, fail-closed compaction, and a strict shared session-index mutation boundary. Mac and iOS chat accept additional messages while Agent is working into a visible, per-session, bounded FIFO; natural completion sends next, Stop pauses without discarding, and Steer promotes a selected message through an ordered cancellation boundary. Queued turns remain out of the transcript/provider context until execution starts and are intentionally process-local rather than restart-durable. Mac chat turns are user-initiated on dev installs; the one exception is the first-run welcome greeting, which fires exactly once on a fresh public-release install (gated on `isPublicReleaseBundle` at both the onboarding marker write and the fire path). |
+| Chat orchestration | Real | Streaming and non-streaming provider paths, Swift tool loop, turn planning, compact context, same-turn lazy schema activation, action receipts, an exact provider-backed Mac context meter with separate provider input, transcript growth, per-turn delta, and visible compaction threshold, bounded transcript/tool-result projections (12,000 provider-facing UTF-8 bytes for GitHub and blocking delegation; 32,000 elsewhere), lossless same-turn paging of oversized redacted results, finite tool-dispatch watchdogs on every surface, exact no-progress loop recovery, authoritative turn-trace inspection, fail-closed compaction, and a strict shared session-index mutation boundary. One scene-active vnode subscription now rereads only that canonical session index after bridge/iOS/Slack/Telegram/Mac mutations, coalesces bursts, suppresses equal observed writes, and updates Chat, detached-window titles, Status, command search, and project/session lineage with no idle polling. Mac and iOS chat accept additional messages while Agent is working into a visible, per-session, bounded FIFO; natural completion sends next, Stop pauses without discarding, and Steer promotes a selected message through an ordered cancellation boundary. Queued turns remain out of the transcript/provider context until execution starts and are intentionally process-local rather than restart-durable. Mac chat turns are user-initiated on dev installs; the one exception is the first-run welcome greeting, which fires exactly once on a fresh public-release install (gated on `isPublicReleaseBundle` at both the onboarding marker write and the fire path). |
 | First-party model routing | Real | One verified catalog now drives public OpenAI, ChatGPT OAuth, Codex CLI, Anthropic API-key/OAuth, xAI OAuth, and Moonshot API across Mac/iOS/Telegram/Slack. Preferences and active providers publish through one crash-recoverable transaction; every central provider call and every accepted Telegram/Slack turn consumes one checked reconciled snapshot, so corrupt saved routing cannot silently borrow defaults, mix generations, or invoke a surface-local effort classifier. GPT-5.6 Sol remains the canonical account-backed default; persisted exact GPT-5.5 selections are upgraded at both preference migration and route normalization, so no executable fallback silently downgrades a turn. Public GPT-5.6 exposes None-through-Max while account-backed Sol/Terra retain Low-through-Ultra and Luna Low-through-Max; signed cache data overlays an account-verified fallback. Direct ChatGPT OAuth maps the account Max/Ultra presets to its deepest accepted `xhigh` wire effort, while Codex CLI retains the literal client preset. Its ordinary, streaming, structured-tool, OAuth authorization, and image routes share one accepted Codex-backend identity with NativeAgent build attribution; current nested SSE failures are decoded truthfully, and only explicit capacity failure before any output receives one token-preserving retry. The Claude catalog includes Sonnet 5/Fable 5/Opus 4.8 with exact model effort levels, xAI exposes live-proven Grok 4.5 with Low/Medium/High plus priority Fast, and Moonshot exposes an authenticated live model catalog with a documented offline Kimi baseline. Kimi K3 preserves provider reasoning state across structured tool loops, forces its required Max reasoning control, streams without exposing hidden reasoning, and supports native vision/tool payloads. Moonshot keys remain Mac-local and never traverse iCloud. Providers exposes provider/model/Think/Fast for every canonical task/chat surface, successful saves update an already-open Mac chat immediately, provider-scoped rows override stale/global duplicates, and the corresponding controls reach each provider's real request body. |
 | Cognitive substrate / organism | Experimental/default-off, live-gated | `CognitiveSubstrate` now has bounded events, fail-closed SQLite bundle restore with typed ready/degraded health, workspace/spreading activation, provenance-backed capsule injection with need classification, affect decay, thought suggestions, Dream/REM replay lineage, reflection proposal receipts, research exports, reproducible experiments, welfare bounds, and Observatory controls. Its complete maintenance transition is atomic across nodes, thought seeds, affect, emotional consolidation, standing-view cleanup, lineage, receipts, and pruning. Continuous reads are analytic; maintenance exposes one exact next boundary for emotional consolidation, thought-seed physical expiry, and proposed-view retirement instead of relying on a five-minute checkpoint heartbeat. The consumerless cue-authoring lane is retired from runtime, provider routing, persistence families, and package sources; legacy cue receipts and inert node metadata drain idempotently at store open. The fast microcycle is resident and event-coalesced; resident sensory admission defers durability to one existing canonical transaction covering nodes, affect, thought seeds, pruning, and its receipt. Rebuildable owner-local token and defensive-turn-kind indexes remove repeated node-prose compilation from activation/workspace scoring. Deterministic analytic-time proof now covers fourteen idle days, exact decay/deadlines, residual repair wake without a cross-owner cognitive poke, payload-free chat timing, restart parity, and lossless burst coalescing. CognitiveSubstrate and OrganismKernel publish bounded immutable attention after owner transitions; ordinary turns merge that with resident pursuit intent through one lock-backed read and enter no owner actor or persistence path. Owner-published, payload-free runtime invalidations refresh visible cognition/living-state projections after events, microcycles, maintenance, replay, reflection, controls, and provider lifecycle changes without a view polling heartbeat. Semantic appraisal remains the sole owner of conversational meaning: somatic chat signals carry topology/intensity without lexically re-appraising text, routine assistant speech earns no synthetic coherence/confidence reward, and typed evidence/freshness/uncertainty beliefs drive operational posture. The live default-root runtime self-collects bounded installed physiology from existing events only—no sampling heartbeat—and `chat-drive physiology-soak-report` keeps real elapsed evidence distinct from generated proof. Event rows separate total, substrate, somatic, and residual-scheduling admission time. The current v3 epoch requires explicit turn class: live+system form the production resident population, live alone forms the ordinary population, and debug/verification rows are retained but excluded. Each resident and ordinary admission/microcycle population requires twenty samples and `<25 ms` p95; ordinary chat latency independently requires twenty live samples. Multi-day qualification also rejects saturated retention, quiet CPU at or above 0.5%, and process wakes at or above 18,000/hour. A fresh `runtime_started` row with both native counter families available is required to open a qualifying evidence window; older rows remain retained but cannot contaminate the current comparable latency/restart population. Committed Dream/REM evidence wakes replay immediately; a daily pass remains only as missed-event/crash integrity fallback, and failed immediate replay leaves a durable reconciliation receipt plus one deadline retry. The Organism Kernel adds somatic signals, body schema, plastic field, prediction, dream repair with bounded field/evidence receipts, reflex candidates with approve/hold/permanent-reject review, durable who/when/what receipts, approved low-risk posture bias, behavior posture coupling, real-time elapsed settlement, bounded decayed continuity under `data/cognition/organism_state.json`, deterministic loop skip/defer receipts, Dream/REM somatic integration, signed iOS reflex review controls, iOS living-status snapshots, phone-origin somatic pulses from signed iOS actions, and longitudinal eval metadata. Paired and time-compressed longitudinal ablations prove mechanisms without relabeling generated elapsed time as personal/installed evidence. Cognitive/organism state still cannot write MemoryV2 facts, mutate persona files, bypass TrustCenter, dispatch tools/actions directly, or send notifications directly. Blueprint completion is tracked row-by-row in `docs/COGNITIVE_SUBSTRATE_TRACEABILITY.md` plus the organism roadmap docs. |
 | Memory | Real | Swift MemoryV2, lifecycle/confidence hygiene, semantic/lexical recall, skill-hint diversity that preserves ordinary facts in bounded top-K results, opportunistic no-wait semantic Context queries when MiniLM is already warm, exact-only generated-USER deduplication, user-authored-only adaptive extraction, review-only one-turn preferences/goals, narrow structured-fact auto-save, acceptance-time quality revalidation, honest proposal evidence, active semantic-fragment/duplicate hygiene through the approval-gated consolidation swap, and Fluid Context projection quarantine. One immutable embedding epoch binds backend, model/vocabulary artifacts, preprocessing, pooling, normalization, dimensions, and sequence length across memories, proposals, tombstones, Context atoms, and query vectors; unknown/mismatched spaces never receive cosine or semantic-tombstone authority. Full re-embedding activates atomically with prior-vector rollback, never as a mixed or active-only migration. One pure record-disclosure policy governs persona, privacy, surface aliases, lifecycle, and status for automatic projection, explicit recall, and legacy failover while TrustCenter remains separate authority. Nullable `validFrom`, `validTo`, `observedAt`, and evidence retain provenance without invented dates. A frozen-copy `memory-eval` composes explicit MemoryV2 probes with the production Context selector and cannot mutate live use counts. An approved swap is not terminal until `USER.md`, Spotlight, the exact MemoryV2-owned knowledge graph, and Fluid Context have converged from canonical memory; projection failure retains the candidate and retries after restart without repeating the swap. Corrected facts retract prior indexer-owned KG claims while manual/legacy graph content remains intact. Once the MemoryV2 SQLite graph exists it is the sole graph read and mutation owner for Mac panels, tools, iCloud/iOS projections, forget, and Dream/REM growth distillation. Reads are checked and bounded; unreadable SQLite fails closed, and legacy JSON is pre-SQLite migration/compatibility only. Readable SQLite remains authoritative even when empty, so stale compatibility JSON cannot resurrect after migration. |
-| Workshop / directed work | Real | Workshop is the single Mac/iPhone work surface. Desk owns canonical identity and lifecycle for Agent pursuits and user-directed tasks; directed tasks retain the bounded multi-step `WorkshopExecution` planner/executor, checkpoint approvals, trigger scheduling, terminal Desk synchronization, and unified receipts. Terminal records carry a domain-owned verification result: exact text criteria and bounded local `write_file` bytes can be proven without an LLM, mismatches fail the execution, and unsupported external effects remain explicitly unverified. A completed execution closes Desk only when verification is `satisfied`; otherwise the durable commitment stays blocked awaiting domain verification. ContextFlow projects bounded Desk/linked-child status, verification, decision need, and expected evidence into later relevant turns, wakes from exact file edges, rebuilds after restart, and never owns action authority. Provider accounting is exact across the planner, ephemeral tool loop, and final synthesis. One locally reviewed `read_file -> write_file` shape has an immutable deterministic artifact with canonical Workshop execution, checked TrustCenter reads, exact timeline replay, domain verification, zero provider calls, and stable-key idempotency. Manual invocation remains available. After twelve distinct verified zero-provider executions, one exact implementation-bound, local-only approval activated `workshop_submit(operation: copy_workspace_file)` through a replaceable pointer; the first natural GPT-5.6 invocation is canonically verified. There is no prose matcher, broad learned selector, permission authority, new scheduler, or ordinary-chat preflight. Missing activation falls back before admission; malformed exact input fails closed; admitted work never duplicates; pointer rollback waits for in-flight consequence and closes later admission. Cancellation and procedure race observation use kqueue-backed events rather than subsecond polling. The Mac cockpit refreshes from store invalidation tokens and kqueue file events with burst coalescing and visibility gating. Active state lives under `data/workshop`; launch performs a fail-loud, receipt-backed one-way migration of legacy `data/missions` state. |
+| Desk / directed work | Real | Desk is the single Mac/iPhone work surface and canonical identity/lifecycle owner for agent pursuits and user-directed tasks. It lines up large projects, dependency edges, bridge references, scheduled work, research, approvals, progress receipts, and verified completion. Directed tasks retain the bounded multi-step `WorkshopExecution` planner/executor as an execution lane inside Desk, with checkpoint approvals, trigger scheduling, terminal Desk synchronization, and unified receipts. Terminal records carry a domain-owned verification result: exact text criteria and bounded local `write_file` bytes can be proven without an LLM, mismatches fail the execution, and unsupported external effects remain explicitly unverified. A completed execution closes Desk only when verification is `satisfied`; otherwise the durable commitment stays blocked awaiting domain verification. ContextFlow projects bounded Desk/linked-child status, verification, decision need, and expected evidence into later relevant turns, wakes from exact file edges, rebuilds after restart, and never owns action authority. Provider accounting is exact across the planner, ephemeral tool loop, and final synthesis. One locally reviewed `read_file -> write_file` shape has an immutable deterministic artifact with canonical execution, checked TrustCenter reads, exact timeline replay, domain verification, zero provider calls, and stable-key idempotency. Manual invocation remains available. After twelve distinct verified zero-provider executions, one exact implementation-bound, local-only approval activated the compatibility wire `workshop_submit(operation: copy_workspace_file)` through a replaceable pointer; the first natural GPT-5.6 invocation is canonically verified. There is no prose matcher, broad learned selector, permission authority, new scheduler, or ordinary-chat preflight. Missing activation falls back before admission; malformed exact input fails closed; admitted work never duplicates; pointer rollback waits for in-flight consequence and closes later admission. Cancellation and procedure race observation use kqueue-backed events rather than subsecond polling. The Mac Desk refreshes from store invalidation tokens and kqueue file events with burst coalescing and visibility gating. Compatibility execution state lives under `data/workshop`; launch performs a fail-loud, receipt-backed one-way migration of legacy `data/missions` state. |
 | iOS companion | Real | CloudKit chat, inbox/activity, approvals, settings/read snapshots, APNS registration, and remote action responses. Timed-out chat resumes observation of the original signed event instead of sending a duplicate turn, and its active fallback drains the selected transport rather than a retired Drive lane. Public Mac snapshots travel as bounded, compressed, digest-checked status groups and retain the existing file/read-model contracts in a rebuildable iOS cache; Mac remains the sole canonical owner. Signed action envelopes reuse the CloudKit message transport while MacSyncEngine retains HMAC/freshness, idempotency, TrustCenter/router, receipt, and signed-response authority. Snapshot reads fail closed when iCloud cannot prove the replica current; partial refreshes retain last-proven fields without advancing full-sync freshness. Mac body reachability derives from the latest HMAC- and freshness-validated iOS chat/action receipt; push-token state proves notification configuration only. The retired unsigned `mobile/pairing.json` token surface cannot configure the body or imply peer presence; pairing is owned by the signed PairingSecretManager/iCloud transport. One payload-free device-event digest correlates APNS, iCloud-bridge, and snapshot-local notification projections; APNS and the visual CloudKit route use it as the collapse identity. CloudKit query subscriptions are exact user-level private-database rows shared by the user's devices, not duplicate Mac/iPhone role rows; setup fetches before create and never accepts a production rejection as proof of existence. General chat/state sync retains its silent content-available subscription, while explicit notification records use a filtered Apple-presented visual subscription because silent wakes may be coalesced. Once that visual route is registered, the later signed record drain absorbs the event without scheduling a duplicate local copy. |
 | Scheduler/background loops | Real | App-owned jobs for notifications, dreams/REM, improvements, and proactive scans. Cognition's fast dirty microcycle is event-coalesced in the resident runtime; its retired 30-second factory is gone. Cognition maintenance is likewise exact-deadline driven by the same runtime, with a daily integrity fallback instead of a five-minute rewrite cadence. Canonical Dream/REM commits signal replay immediately; the replay registration is a daily integrity fallback rather than an hourly cognitive heartbeat. Trigger scheduling is invalidation-driven and sleeps until its exact next time/idle threshold with Core as the sole owner. Codex completion and pending-queue drain now suspend on app-server/vnode evidence and retain one exact deadline/durable reread instead of polling rollout state every two seconds. Residual sleep wakes only the real local-repair lane and no longer schedules an unrelated cognitive microcycle; operational-consolidation and identity-dream diagnostic deadlines do not wake production because they have no production consumer. The orphan harness-learning runtime and write-only trigger mirror are removed. Reflection retains its distinct budget/deadline cadence. |
 | Policy/trust | Real | Unified policy receipts, shared Full Mac / Developer Mode boundaries, default-off multimodal gates such as OpenAI image generation, and one canonical conversation-surface profile shared by planning, policy, and approval execution so aliases cannot drift across trust seams. Shared chat composition authenticates the exact origin and makes one autonomy/approval decision; its inner app dispatcher still runs SecurityCenter hard checks without contradicting that decision, while direct/raw app clients retain their own autonomy gate. Full Mac YOLO therefore follows authenticated Telegram/Slack/iOS conversation identity for ordinary tools, never a claimed surface label, and cannot silently authorize self-modification, money, external sends, bad signatures, or prompt injection. Once the already-policy-filtered inventory proves Full Mac, native file, shell, Git, patch, build, Mac-control, restart, and evolution schemas are supplied immediately on the next turn without a lazy-load detour or app restart; ordinary chat remains lazy, and schema availability grants no new safety authority. Existing TrustCenter policy, capability sources/roots, Mac Integration permissions, and local capability signing keys are checked authority: only missing state bootstraps defaults; corrupt saved state is byte-preserved, unavailable, and fail-closed for reads, mutations, SecurityCenter, command execution, Mac integration dispatch/preload, and backup restore. ApprovalInbox is authoritative safety state: missing means empty, while corrupt/unreadable/malformed state fails closed and cannot be overwritten by a new approval. |

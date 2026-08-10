@@ -230,6 +230,7 @@ struct InboxActionRecord: Codable, Hashable {
 struct InboxTriggerConfig: Identifiable, Codable, Hashable {
     let name: String
     var enabled: Bool
+    let kind: String?
     // config is dynamic — stored as [String: String] for watched paths access
     var config: [String: String]?   // only string-valued keys used in UI
     let description: String?
@@ -239,13 +240,14 @@ struct InboxTriggerConfig: Identifiable, Codable, Hashable {
     // Custom decoder to tolerate any config value types (arrays, bools, ints)
     // by only capturing string-valued keys
     enum CodingKeys: String, CodingKey {
-        case name, enabled, config, description
+        case name, enabled, kind, config, description
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         name = try c.decode(String.self, forKey: .name)
         enabled = (try? c.decode(Bool.self, forKey: .enabled)) ?? false
+        kind = try? c.decode(String.self, forKey: .kind)
         description = try? c.decode(String.self, forKey: .description)
         // config may have mixed types; use global AnyCodable to capture string-valued keys
         if let raw = try? c.decode([String: AnyCodable].self, forKey: .config) {
@@ -271,16 +273,22 @@ struct InboxTriggerConfig: Identifiable, Codable, Hashable {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(name, forKey: .name)
         try c.encode(enabled, forKey: .enabled)
+        try c.encodeIfPresent(kind, forKey: .kind)
         try c.encodeIfPresent(description, forKey: .description)
         try c.encodeIfPresent(config, forKey: .config)
     }
 
     // Memberwise initializer for non-Codable paths
-    init(name: String, enabled: Bool, config: [String: String]? = nil, description: String? = nil) {
+    init(name: String, enabled: Bool, kind: String? = nil, config: [String: String]? = nil, description: String? = nil) {
         self.name = name
         self.enabled = enabled
+        self.kind = kind
         self.config = config
         self.description = description
+    }
+
+    var supportsRealManualFire: Bool {
+        kind == "time" || kind == "idle" || name == "morning_brief" || name == "idle_checkin"
     }
 
     var displayName: String {
@@ -289,7 +297,7 @@ struct InboxTriggerConfig: Identifiable, Codable, Hashable {
         case "idle_checkin":     return "Idle Check-In"
         case "morning_brief":    return "Morning Brief"
         case WorkshopCompletionTrigger.canonicalName,
-             WorkshopCompletionTrigger.legacyName: return "Workshop Follow-up"
+             WorkshopCompletionTrigger.legacyName: return "Desk Follow-up"
         case "stuck_pattern":    return "Stuck Pattern"
         default:                 return name
         }

@@ -11,14 +11,68 @@ import NativeAgentShared
 @MainActor
 final class ChatStoreMergeTests: XCTestCase {
 
+    private func isolatedDefaults(_ label: String = #function) -> UserDefaults {
+        let suite = "NativeAgentMobileTests.\(label).\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        defaults.set(true, forKey: "NativeAgent.unifiedSession.v1")
+        return defaults
+    }
+
     private func msg(_ role: ChatMessage.Role, _ text: String, id: UUID = UUID()) -> ChatMessage {
         ChatMessage(id: id, role: role, text: text)
     }
 
     private func makeStore(_ messages: [ChatMessage]) -> ChatStore {
-        let store = ChatStore()
+        let store = ChatStore(restoreQueuedSends: false)
         store.messages = messages
         return store
+    }
+
+    func test_corruptExactTranscriptNeverFallsThroughToUnownedGlobalCache() throws {
+        let defaults = isolatedDefaults()
+        let sessionID = "pinned-session"
+        defaults.set(sessionID, forKey: "NativeAgentMobile.chatSessionID")
+        defaults.set(Data("not-json".utf8), forKey: "NativeAgentMobile.chatMessages.session.\(sessionID)")
+        defaults.set(
+            try JSONEncoder().encode([msg(.assistant, "wrong conversation")]),
+            forKey: "NativeAgentMobile.chatMessages"
+        )
+
+        let store = ChatStore(defaults: defaults, restoreQueuedSends: false)
+
+        XCTAssertTrue(store.messages.isEmpty)
+        XCTAssertNotNil(store.errorBanner)
+    }
+
+    func test_sessionOwnedGlobalEnvelopeMigratesToExactCacheOnce() throws {
+        let defaults = isolatedDefaults()
+        let sessionID = "owned-main"
+        defaults.set(sessionID, forKey: "NativeAgentMobile.chatSessionID")
+        let expected = msg(.assistant, "owned transcript")
+        let envelope = ChatStore.CachedTranscript(
+            schemaVersion: 2,
+            sessionID: sessionID,
+            messages: [expected]
+        )
+        defaults.set(try JSONEncoder().encode(envelope), forKey: "NativeAgentMobile.chatMessages")
+
+        let store = ChatStore(defaults: defaults, restoreQueuedSends: false)
+
+        XCTAssertEqual(store.messages.map(\.id), [expected.id])
+        XCTAssertNotNil(defaults.data(forKey: store.transcriptStorageKey(for: sessionID)))
+    }
+
+    func test_queueRestoresFromOneAppOwnedStoreWithoutProcessLatch() {
+        let defaults = isolatedDefaults()
+        let owner = ChatStore(defaults: defaults, restoreQueuedSends: false)
+        owner.setSelectedSessionID("queue-owner")
+        owner.isLoading = true
+        _ = owner.send(text: "survive relaunch", client: MacBridgeClient())
+
+        let restored = ChatStore(defaults: defaults)
+
+        XCTAssertEqual(restored.queuedSends.map(\.text), ["survive relaunch"])
     }
 
     private func session(
@@ -55,8 +109,31 @@ final class ChatStoreMergeTests: XCTestCase {
         XCTAssertEqual(tabs.last?.kind, .pinned("pin-1"))
     }
 
+    func test_externalUnpinRequiresSelectedPinnedSessionToReturnToMain() {
+        XCTAssertTrue(ChatStore.shouldReturnToMainSession(
+            selectedSessionID: "removed-pin",
+            mainSessionID: "phone-main",
+            availablePinnedSessionIDs: ["other-pin"]
+        ))
+        XCTAssertFalse(ChatStore.shouldReturnToMainSession(
+            selectedSessionID: "kept-pin",
+            mainSessionID: "phone-main",
+            availablePinnedSessionIDs: ["kept-pin"]
+        ))
+        XCTAssertFalse(ChatStore.shouldReturnToMainSession(
+            selectedSessionID: "phone-main",
+            mainSessionID: "phone-main",
+            availablePinnedSessionIDs: []
+        ))
+        XCTAssertFalse(ChatStore.shouldReturnToMainSession(
+            selectedSessionID: "ios-main-awaiting-adoption",
+            mainSessionID: nil,
+            availablePinnedSessionIDs: []
+        ))
+    }
+
     func test_timedOutRetryResumesOriginalSignedEventWithoutNewCorrelation() throws {
-        let store = ChatStore()
+        let store = ChatStore(restoreQueuedSends: false)
         let eventID = "signed-device-event"
         var placeholder = msg(.assistant, "(reply timed out)")
         placeholder.isStreaming = false
@@ -86,7 +163,7 @@ final class ChatStoreMergeTests: XCTestCase {
     }
 
     func test_sendWhileLoadingQueuesFIFOWithoutAppendingTranscriptRows() {
-        let store = ChatStore()
+        let store = ChatStore(restoreQueuedSends: false)
         let client = MacBridgeClient()
         let originalSessionID = store.selectedSessionID
         defer { store.setSelectedSessionID(originalSessionID) }
@@ -108,7 +185,7 @@ final class ChatStoreMergeTests: XCTestCase {
     }
 
     func test_queuePromotionAndMigrationPreserveSessionOwnership() throws {
-        let store = ChatStore()
+        let store = ChatStore(restoreQueuedSends: false)
         let client = MacBridgeClient()
         let originalSessionID = store.selectedSessionID
         defer { store.setSelectedSessionID(originalSessionID) }
@@ -170,7 +247,7 @@ final class ChatStoreMergeTests: XCTestCase {
     }
 
     func test_unmatchedLateCancellationCannotStopANewerTurn() {
-        let store = ChatStore()
+        let store = ChatStore(restoreQueuedSends: false)
         store.isLoading = true
         store.receiveICloudReply(.make(
             sender: "mac",
@@ -462,7 +539,7 @@ final class ChatStoreMergeTests: XCTestCase {
     }
 
     func test_newChatRejectsLateDeltaFinalAndCancelFromPreviousSession() throws {
-        let store = ChatStore()
+        let store = ChatStore(restoreQueuedSends: false)
         let originalSessionID = store.selectedSessionID
         let originalMainSessionID = store.mainSessionID
         let oldSessionID = "old-ios-session"
@@ -561,7 +638,7 @@ final class ChatStoreMergeTests: XCTestCase {
     // fell through to failPendingReply and the message was permanently dropped
     // on exactly the stale-secret event this path exists to heal.
     func test_signatureSelfHeal_retrySendRunsAfterKVSRefresh() async {
-        let store = ChatStore()
+        let store = ChatStore(restoreQueuedSends: false)
         let client = MacBridgeClient()   // held strong — pendingRetryClient is weak
         let pairing = PairingStore()     // held strong — pairingStoreRef is weak
         store.pendingRetryClient = client

@@ -491,8 +491,8 @@ extension NativeClient {
             return
         }
         for rec in resolved where chatToolApprovalReplay(from: rec) != nil {
-            if rec.executedAction == nil {
-                NSLog("[approvalReconcile] reconciling unexecuted resolved chat tool approval "
+            if chatToolApprovalReplayNeedsExecution(rec) {
+                NSLog("[approvalReconcile] reconciling eligible resolved chat tool approval "
                     + "\(rec.id) action=\(rec.action) decision=\(rec.decision ?? "?")")
                 await applyResolvedChatToolApproval(from: rec, dataRoot: dataRoot)
             }
@@ -504,6 +504,25 @@ extension NativeClient {
                 await ensureChatToolApprovalOutcomeReceipt(from: refreshed, dataRoot: dataRoot)
             }
         }
+    }
+
+    /// Recover only the historical failure where a resolved persona approval
+    /// was rejected before the inner tool ran because replay asked the dynamic
+    /// persona guard for a second approval without a filer. Other failed side
+    /// effects remain terminal: blindly retrying those could duplicate work.
+    private static func chatToolApprovalReplayNeedsExecution(_ rec: ApprovalRecord) -> Bool {
+        if rec.executedAction == nil { return true }
+        guard rec.status == "resolved",
+              rec.decision == "approved",
+              let replay = chatToolApprovalReplay(from: rec),
+              replay.toolName == "persona_write" || replay.toolName == "persona_append_section",
+              case .object(let executed)? = rec.executedAction,
+              executed["op"] == .string("chat_tool_approval_replay"),
+              executed["status"] == .string("failed"),
+              case .string(let error)? = executed["error"]
+        else { return false }
+        return error.contains("approval required, no filer is available on this noninteractive surface")
+            && error.contains("source=\(PersonaWriteGuard.autonomySource)")
     }
 
     static func applyResolvedChatToolApproval(
@@ -547,7 +566,8 @@ extension NativeClient {
             let tools = makeNativeAgentAppToolDispatchClient(
                 includeEvolutionBridge: !isRemoteChatApprovalSurface(replay.surface),
                 denyExternalMcp: false,
-                enforceAppAutonomy: false
+                enforceAppAutonomy: false,
+                dataRoot: dataRoot
             )
             let trust = SingleApprovedToolAutonomyResolver(
                 dataRoot: dataRoot,
@@ -558,8 +578,18 @@ extension NativeClient {
                 tools: tools,
                 fileAccess: "auto",
                 approvalFiler: nil,
+                dataRoot: dataRoot,
                 trust: trust,
-                verifiedSessionId: replay.sessionId
+                verifiedSessionId: replay.sessionId,
+                approvedReplay: ApprovedChatToolReplay(
+                    approvalID: rec.id,
+                    tool: replay.toolName,
+                    surface: replay.surface,
+                    input: replay.input,
+                    verifiedSessionID: replay.sessionId,
+                    verifiedChatID: replay.telegramChatId,
+                    verifiedUserID: replay.verifiedUserId
+                )
             )
             let result = try await ChatToolSessionContext.$commandSignatureVerified.withValue(true) {
                 try await ChatToolSessionContext.$verifiedChatId.withValue(replay.telegramChatId) {
@@ -644,24 +674,27 @@ extension NativeClient {
         do {
             try await persistence.withFileLock(path) {
                 let rows = (try? await persistence.readJSONL(path)) ?? []
-                let alreadyPresent = rows.contains { row in
+                let existingIndex = rows.firstIndex { row in
                     guard case .object(let object) = row,
                           case .object(let metadata)? = object["metadata"],
                           case .string(let approvalID)? = metadata["approvalId"]
                     else { return false }
                     return approvalID == rec.id
                 }
-                guard !alreadyPresent else { return }
                 let now = ISO8601DateFormatter().string(from: Date())
                 let inputJSON = (try? JSONValue.object([
                     "approvalId": .string(rec.id),
                 ]).serialize(pretty: false)) ?? "{}"
+                let priorObject: [String: JSONValue] = existingIndex.flatMap { index in
+                    guard case .object(let object) = rows[index] else { return nil }
+                    return object
+                } ?? [:]
                 let row: JSONValue = .object([
-                    "id": .string(UUID().uuidString.lowercased()),
+                    "id": priorObject["id"] ?? .string(UUID().uuidString.lowercased()),
                     "sessionId": .string(safeSessionID),
                     "role": .string("tool"),
                     "content": .string(""),
-                    "createdAt": .string(now),
+                    "createdAt": priorObject["createdAt"] ?? .string(now),
                     "source": .string(replay.surface),
                     "runId": .string("approval-\(rec.id)"),
                     "metadata": .object([
@@ -674,7 +707,19 @@ extension NativeClient {
                         "postApproval": .bool(true),
                     ]),
                 ])
-                try await persistence.appendJSONL(row, to: path)
+                if let existingIndex {
+                    // A narrowly recoverable pre-dispatch failure can later
+                    // succeed. Keep one canonical receipt, but replace its
+                    // stale failure result so conversation continuity agrees
+                    // with the approval store's latest execution truth.
+                    if rows[existingIndex] != row {
+                        var updated = rows
+                        updated[existingIndex] = row
+                        try await persistence.replaceJSONL(updated, to: path)
+                    }
+                } else {
+                    try await persistence.appendJSONL(row, to: path)
+                }
             }
         } catch {
             NSLog("[approvals] outcome receipt persist failed for \(rec.id): \(error)")
@@ -781,7 +826,7 @@ extension NativeClient {
             try? await Self.annotateApprovalExecution(
                 id: rec.id,
                 executedAction: .object(["error": .string("missing execution_id/step_id")]),
-                detail: "Workshop step \(decision) FAILED: payload carries no execution_id/step_id")
+                detail: "Desk step \(decision) FAILED: payload carries no execution_id/step_id")
             return
         }
         // Prefer the SAME executor INSTANCE the background drain loop uses
@@ -829,7 +874,7 @@ extension NativeClient {
                         "stepId": .string(stepId),
                         "missionStatus": .string(record.status),
                     ]),
-                    detail: "Workshop step approved — executed; Workshop execution now \(record.status)")
+                    detail: "Desk step approved — executed; Desk execution now \(record.status)")
             case "denied":
                 let record = try await executor.resumeAfterApproval(
                     executionId: executionId, stepId: stepId, approved: false, approvalId: rec.id)
@@ -841,7 +886,7 @@ extension NativeClient {
                         "stepId": .string(stepId),
                         "missionStatus": .string(record.status),
                     ]),
-                    detail: "Workshop step denied — step rejected; Workshop execution now \(record.status)")
+                    detail: "Desk step denied — step rejected; Desk execution now \(record.status)")
             default: // canceled — leave the Workshop execution blocked; clear the claim
                 // so a later executor pass can re-stage a fresh approval.
                 await Self.clearWorkshopStepApprovalClaim(executionId: executionId, stepId: stepId)
@@ -852,7 +897,7 @@ extension NativeClient {
                         "missionId": .string(executionId),
                         "stepId": .string(stepId),
                     ]),
-                    detail: "Workshop step approval canceled — claim cleared; Workshop execution stays blocked")
+                    detail: "Desk step approval canceled — claim cleared; Desk execution stays blocked")
             }
         } catch WorkshopExecutionError.staleApproval(let detail) {
             // gpt-5.5 executor-port blocker #3 (2026-06-10): stale card —
@@ -869,7 +914,7 @@ extension NativeClient {
                     "missionId": .string(executionId),
                     "stepId": .string(stepId),
                 ]),
-                detail: "Workshop step \(decision) — \(detail)")
+                detail: "Desk step \(decision) — \(detail)")
         } catch {
             NSLog("[workshopStep] \(decision) failed for \(executionId)/\(stepId): \(error)")
             // The approval record is already terminal; a stamped-but-
@@ -884,7 +929,7 @@ extension NativeClient {
                     "stepId": .string(stepId),
                     "error": .string("\(error)"),
                 ]),
-                detail: "Workshop step \(decision) FAILED: \(error.localizedDescription) — "
+                detail: "Desk step \(decision) FAILED: \(error.localizedDescription) — "
                     + "claim cleared; a later executor pass can re-stage it")
         }
     }

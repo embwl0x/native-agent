@@ -758,6 +758,10 @@ extension SwiftNativeTurnEngine {
                 provider: sessionDigest ?? SessionDigestProvider(dataRoot: historyReader.dataRoot)
             )
         }
+        let naturalExpressionCue = naturalExpressionGuidanceEnabled
+            ? NaturalExpressionGuidance.pendingRutCue(from: prior)
+            : nil
+        trace.setFlag("expression.rhythmCuePending", naturalExpressionCue != nil)
         // Sweep R4 W3: the ONLY production caller of the history renderer, and
         // the first place in prompt assembly where the admitted model for this
         // turn is known (`buildTurnContext` resolved it above). That makes this
@@ -825,24 +829,28 @@ extension SwiftNativeTurnEngine {
         guard let historyBlock else {
             let runtimeStartNs = DispatchTime.now().uptimeNanoseconds
             let clockedBase = await contextByAppendingCurrentTurnFacts(base)
+            let finalBase = Self.contextBySettingNaturalExpressionCue(
+                clockedBase,
+                cue: naturalExpressionCue
+            )
             trace.record("context.clock_runtime", since: runtimeStartNs)
-            trace.setCount("system.stableChars", clockedBase.systemSegments?.stable.count ?? 0)
-            trace.setCount("system.dynamicChars", clockedBase.systemSegments?.dynamic.count ?? 0)
-            trace.setCount("system.combinedChars", clockedBase.systemPrompt?.count ?? 0)
-            trace.setCount("userMessageChars", clockedBase.userMessage.count)
-            trace.setCount("toolSchemaCount", clockedBase.toolSchemas.count)
+            trace.setCount("system.stableChars", finalBase.systemSegments?.stable.count ?? 0)
+            trace.setCount("system.dynamicChars", finalBase.systemSegments?.dynamic.count ?? 0)
+            trace.setCount("system.combinedChars", finalBase.systemPrompt?.count ?? 0)
+            trace.setCount("userMessageChars", finalBase.userMessage.count)
+            trace.setCount("toolSchemaCount", finalBase.toolSchemas.count)
             trace.emit(kind: "context.history.summary", surface: surface)
             // Turn Inspector W2: emit assembly.stage for the no-history case
             // too (a session's FIRST turn renders no history) — SIZES ONLY.
             Self.fireAssemblyStageEvent(
                 surface: surface,
-                segments: clockedBase.systemSegments,
-                combinedSystemPrompt: clockedBase.systemPrompt,
+                segments: finalBase.systemSegments,
+                combinedSystemPrompt: finalBase.systemPrompt,
                 historyBlock: nil,
-                userMessage: clockedBase.userMessage,
-                recalledCount: clockedBase.recalled.count
+                userMessage: finalBase.userMessage,
+                recalledCount: finalBase.recalled.count
             )
-            return clockedBase
+            return finalBase
         }
         // CACHING CONTRACT (U1 step 2, 2026-06-10): segment order is
         // STABLE → SEMI-STABLE → DYNAMIC. Provider prompt caches are prefix
@@ -898,12 +906,16 @@ extension SwiftNativeTurnEngine {
         )
         let runtimeStartNs = DispatchTime.now().uptimeNanoseconds
         let clocked = await contextByAppendingCurrentTurnFacts(contextWithHistory)
+        let finalContext = Self.contextBySettingNaturalExpressionCue(
+            clocked,
+            cue: naturalExpressionCue
+        )
         trace.record("context.clock_runtime", since: runtimeStartNs)
-        trace.setCount("system.stableChars", clocked.systemSegments?.stable.count ?? 0)
-        trace.setCount("system.dynamicChars", clocked.systemSegments?.dynamic.count ?? 0)
-        trace.setCount("system.combinedChars", clocked.systemPrompt?.count ?? 0)
-        trace.setCount("userMessageChars", clocked.userMessage.count)
-        trace.setCount("toolSchemaCount", clocked.toolSchemas.count)
+        trace.setCount("system.stableChars", finalContext.systemSegments?.stable.count ?? 0)
+        trace.setCount("system.dynamicChars", finalContext.systemSegments?.dynamic.count ?? 0)
+        trace.setCount("system.combinedChars", finalContext.systemPrompt?.count ?? 0)
+        trace.setCount("userMessageChars", finalContext.userMessage.count)
+        trace.setCount("toolSchemaCount", finalContext.toolSchemas.count)
         trace.emit(kind: "context.history.summary", surface: surface)
         // Turn Inspector W2: observe the per-turn system prompt that was just
         // assembled and fire ONE assembly.stage event carrying segment SIZES
@@ -913,13 +925,13 @@ extension SwiftNativeTurnEngine {
         // / `segments` / `historyBlock` AFTER they are built.
         Self.fireAssemblyStageEvent(
             surface: surface,
-            segments: clocked.systemSegments,
-            combinedSystemPrompt: clocked.systemPrompt,
+            segments: finalContext.systemSegments,
+            combinedSystemPrompt: finalContext.systemPrompt,
             historyBlock: historyBlock,
-            userMessage: clocked.userMessage,
-            recalledCount: clocked.recalled.count
+            userMessage: finalContext.userMessage,
+            recalledCount: finalContext.recalled.count
         )
-        return clocked
+        return finalContext
     }
 
     /// Turn Inspector W2 — assembly.stage emitter (SIZES AND COUNTS ONLY).

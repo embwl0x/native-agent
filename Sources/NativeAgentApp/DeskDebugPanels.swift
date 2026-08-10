@@ -20,7 +20,7 @@ struct DeskDebugPanels: View {
     var body: some View {
         NativePanel(title: "Desk (debug)", systemImage: "tablecells", tint: .gray) {
             VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                Text("The Workshop bench, as raw state — the compact projection the agent reads in-context and the underlying records with their aliases and handles.")
+                Text("The Desk, as raw state — the compact projection the agent reads in-context and the underlying records with their aliases and handles.")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                 agentViewDisclosure

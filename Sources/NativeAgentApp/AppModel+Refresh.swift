@@ -315,7 +315,13 @@ extension AppModel {
         await loadProvidersForChat()
         await loadChatState(api: api)
         let fetchedCompiledPersonality = await decodeLogged("getCompiledPersonality") { try await api.getCompiledPersonality(surface: "chat") }
-        let fetchedPrivacyMap = await decodeLogged("getPrivacyMap") { try await api.getPrivacyMap() }
+        // The map's names, paths, and export policy are cheap and sufficient
+        // for a global/status refresh. Recursive file counts are intentionally
+        // lazy: Trust and Settings request them when those surfaces open, while
+        // launch Doctor no longer walks every data subtree during refreshAll.
+        let fetchedPrivacyMap = await decodeLogged("getPrivacyMap") {
+            try await api.getPrivacyMap(includeInventory: false)
+        }
         let fetchedConfig = await decodeLogged("getConfig", { try await api.getConfig() })
         // No `await` from here to the end of the function: one MainActor turn.
         setIfChanged(\.compiledPersonality, fetchedCompiledPersonality)

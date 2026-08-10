@@ -225,7 +225,7 @@ extension NativeClient {
         catalog.append(contentsOf: [
             rec("shortcuts", "Apple Shortcuts", "macos", "not_required", "ready", "system_surface",
                 ["run_intent"], ["run"],
-                "System automation surface for Workshop tasks, Doctor, status, and chat."),
+                "System automation surface for Desk tasks, Doctor, status, and chat."),
             rec("telegram", "Telegram", "messaging", "needs_auth", "needs_auth", "external_send",
                 ["send_message", "receive_message"], ["reply"],
                 "Remote chat bridge through an allowlisted bot. Add a bot token in Telegram settings to connect."),

@@ -19,7 +19,8 @@
 #   4. ONLY NOW tear down any prior retired external-runtime agent + quit the
 #      running NativeAgent.app instance.
 #   5. Atomically swap the temp bundle into ~/Applications/NativeAgent.app.
-#   6. Launch the app.
+#   6. Launch and prove authenticated chat/source readiness; only then delete
+#      the previous bundle. Failed readiness restores the prior install.
 #
 # After this, you double-click ~/Applications/NativeAgent.app to start. The
 # app stays in the menu bar.
@@ -58,6 +59,18 @@ done
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=lib/provisioning_profile_contract.sh
 source "$ROOT/script/lib/provisioning_profile_contract.sh"
+
+# Keep the installer's final signing identity aligned with build_and_run.sh.
+# That builder already loads this ignored, machine-local file before it stamps
+# the bundle. Without loading it here too, a private development build can be
+# created correctly and then rejected by the installer because its second
+# signing pass falls back to the public bundle identifier.
+LOCAL_ENV="$ROOT/local/nativeagent.local.env"
+if [[ -f "$LOCAL_ENV" ]]; then
+    # Local Apple/iCloud identifiers are intentionally gitignored.
+    # shellcheck source=/dev/null
+    source "$LOCAL_ENV"
+fi
 APP_NAME="NativeAgent"
 APP_DEST="$HOME/Applications/$APP_NAME.app"
 FORCE_CHECKOUT_SWITCH="${FORCE_CHECKOUT_SWITCH:-0}"
@@ -434,12 +447,9 @@ if [ -d "$APP_DEST" ]; then
     ' EXIT ERR INT TERM HUP
 fi
 mv "$TEMP_BUNDLE" "$APP_DEST"
-# CRITICAL: clear the rollback trap NOW. From this point on the install is
-# committed; any later non-fatal step (open, launchd-163, etc) must not undo it.
+# Clear only the mid-swap trap. The previous bundle stays recoverable until
+# the replacement proves its authenticated runtime identity and chat readiness.
 trap - EXIT ERR INT TERM HUP
-# Clean up the .old aside — fresh bundle is in place; if it's broken the user
-# can re-run install_app.sh from a working commit.
-rm -rf "$APP_OLD" 2>/dev/null || true
 
 # N37: rotate legacy runtime log files if they exceed 5 MB. Keep up to 3 rotated copies
 # (.1, .2, .3) so a single install can never destroy the previous two logs.
@@ -456,11 +466,10 @@ _rotate_log "$DATA/logs/daemon.err.log"
 _rotate_log "$DATA/logs/daemon.out.log"
 
 # 6. Launch
-# HOTFIX 2026-06-03 Swift runtime cutover: the old verify probed the
-# retired loopback health endpoint, which no longer answers, so this
-# step rolled back to the OLD bundle on every install — that's why fresh
-# bundles were never landing in ~/Applications. New verify just checks that
-# the NativeAgentApp process is alive after `open`.
+# Readiness is proven through the authenticated local bridge and the exact
+# build identity stamped above. A process existing is necessary but not a
+# usable runtime: chat must be ready and the running revision/dirty bit must
+# match the replacement bundle.
 #
 # HOTFIX 2026-06-03 launchd-163: `/usr/bin/open` exits 1 on launchd-163
 # ("Launchd job spawn failed", RBSRequestErrorDomain=5) which is an OS-level
@@ -479,25 +488,35 @@ if [[ "$OPEN_OK" != "1" ]]; then
   # Direct binary spawn — bypasses launchd's bundle-ID cache.
   ( "$APP_DEST/Contents/MacOS/NativeAgentApp" >/dev/null 2>&1 & ) || true
 fi
-echo "Swift runtime install — verifying NativeAgentApp process is up..."
-sleep 3
-APP_PID="$(pgrep -fxn "$APP_DEST/Contents/MacOS/NativeAgentApp" || true)"
-if [[ -z "$APP_PID" ]]; then
-  # Fallback: any NativeAgentApp from this bundle path
-  APP_PID="$(pgrep -f "$APP_DEST/Contents/MacOS/NativeAgentApp" | head -n 1 || true)"
-fi
-if [[ -n "$APP_PID" ]]; then
-  echo "OK — NativeAgentApp running (pid=$APP_PID)."
+echo "Swift runtime install — verifying authenticated readiness and source identity..."
+if "$ROOT/script/verify_installed_runtime_ready.sh" \
+    "$APP_DEST" "$INSTALL_SOURCE_REVISION" "$INSTALL_SOURCE_DIRTY" 20; then
+  APP_PID="$(pgrep -fxn "$APP_DEST/Contents/MacOS/NativeAgentApp" || true)"
+  echo "OK — NativeAgentApp ready (pid=$APP_PID)."
   trap - EXIT ERR INT TERM HUP
   rm -rf "$APP_OLD" 2>/dev/null || true
   exit 0
 fi
-echo "NativeAgentApp didn't show up after open + direct-exec fallback."
-echo "Bundle IS installed at $APP_DEST — manually launch via:"
-echo "  $APP_DEST/Contents/MacOS/NativeAgentApp &"
-echo "Or check codesign:"
-echo "  spctl --assess --verbose $APP_DEST"
-echo "  codesign -dv $APP_DEST"
-echo "[install_app.sh] NOT rolling back — fresh bundle is in place for inspection."
+
+echo "[install_app.sh] replacement failed authenticated readiness verification." >&2
+osascript -e 'tell application "NativeAgent" to quit' 2>/dev/null || true
+rollback_deadline=$((SECONDS + 5))
+while pgrep -fx "$APP_DEST/Contents/MacOS/NativeAgentApp" >/dev/null 2>&1 \
+    && (( SECONDS < rollback_deadline )); do
+  sleep 0.1
+done
+pkill -fx "$APP_DEST/Contents/MacOS/NativeAgentApp" 2>/dev/null || true
+if [[ -d "$APP_OLD" ]]; then
+  FAILED_APP="${APP_DEST}.failed.$(date +%Y%m%d-%H%M%S)"
+  mv "$APP_DEST" "$FAILED_APP"
+  mv "$APP_OLD" "$APP_DEST"
+  if ! /usr/bin/open "$APP_DEST" 2>/dev/null; then
+    ( "$APP_DEST/Contents/MacOS/NativeAgentApp" >/dev/null 2>&1 & ) || true
+  fi
+  echo "[install_app.sh] restored the previous bundle; failed replacement retained at:" >&2
+  echo "  $FAILED_APP" >&2
+else
+  echo "[install_app.sh] no previous bundle existed; failed fresh install retained at $APP_DEST." >&2
+fi
 trap - EXIT ERR INT TERM HUP
 exit 1
