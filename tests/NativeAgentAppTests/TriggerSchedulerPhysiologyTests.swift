@@ -139,7 +139,11 @@ struct TriggerSchedulerPhysiologyTests {
         let root = try triggerPhysiologyRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let jobs = root.appendingPathComponent("scheduler/jobs.json")
-        try writeJSONObject([], to: root.appendingPathComponent("inbox/trigger_config.json"))
+        // Seed the NEW config home directly: this test asserts EXACT reconcile
+        // counts, and seeding the legacy inbox/ location would add one file
+        // event when the lazy migration copies the config into the watched
+        // triggers/ path during the startup reconcile.
+        try writeJSONObject([], to: root.appendingPathComponent("triggers/trigger_config.json"))
         try writeJSONObject([], to: root.appendingPathComponent("workshop/triggers.json"))
         try writeJSONObject([], to: jobs)
 
@@ -229,7 +233,7 @@ struct TriggerSchedulerPhysiologyTests {
         let occurrenceCount = firedNames.filter { $0 == "once-only" }.count
         #expect(occurrenceCount == 1)
         let state = try Data(contentsOf: root.appendingPathComponent(
-            "inbox/trigger_state.json"
+            "triggers/trigger_state.json"
         ))
         let object = try #require(
             JSONSerialization.jsonObject(with: state) as? [String: Any]

@@ -3480,12 +3480,23 @@ func swiftToolDispatcher_iOSFullMacRequiresRemoteIOSPolicy() async throws {
     }
     #expect(localObj["ok"] == .bool(true))
 
+    // YOLO cutover 2026-08-12 (9023d24d, 84fb8201): perimeter gates entry,
+    // execution ungated. OLD CONTRACT: with remote_from_ios_allowed=false the
+    // AUTONOMY gate also refused to auto-allow write_file on the "ios" surface,
+    // as a second layer behind the file-ops gate. NEW CONTRACT: the untrusted
+    // remote origin still fails the Full-Mac branch, but the fall-through lands
+    // on the `default: auto` catch-all, so the autonomy layer returns .allow on
+    // both surfaces. The enforcement that actually stops the remote write is
+    // the MacControl file-ops gate asserted above — the write throws and the
+    // file does not exist. Autonomy is no longer a second layer here.
     let gate = AutonomyGate(trust: SwiftNativeTrustCenter(dataRoot: dataRoot))
-    let remoteDecision = try await gate.decide(toolName: "write_file", surface: "ios")
-    if case .allow = remoteDecision {
-        Issue.record("expected iOS autonomy gate not to auto-allow Full Mac when remote_from_ios_allowed=false")
-    }
+    #expect(try await gate.decide(toolName: "write_file", surface: "ios") == .allow)
     #expect(try await gate.decide(toolName: "write_file", surface: "chat") == .allow)
+    // TEETH: the gate is not blanket-allow — a surviving floor still requires
+    // approval on the same root.
+    if case .allow = try await gate.decide(toolName: "self_install", surface: "ios") {
+        Issue.record("self_install kept its floor — it must not map to allow")
+    }
 }
 
 @Test
@@ -5724,7 +5735,7 @@ func chatClient_fileAccess_none_blocks_fs_prefixed_tools() async throws {
 }
 
 @Test
-func chatClient_fileAccess_readOnly_blocks_writes_and_actions_but_keeps_reads() async throws {
+func chatClient_fileAccess_readOnly_blocks_writes_but_keeps_reads_and_macControl() async throws {
     let schemaJSON = Data(#"{"type":"object","properties":{},"additionalProperties":false}"#.utf8)
     let schemas = [
         LLMToolSchema(name: "read_file", description: "read", parametersJSON: schemaJSON),
@@ -5764,7 +5775,17 @@ func chatClient_fileAccess_readOnly_blocks_writes_and_actions_but_keeps_reads() 
     let personaRead = try await gated.dispatch(tool: "persona_read", input: [:], surface: "chat")
     #expect(personaRead == .string("persona read"))
 
-    for blockedTool in ["write_file", "shell.exec", "mac_quit_app", "persona_write", "persona_append_section"] {
+    // YOLO cutover 2026-08-12 (9023d24d, 84fb8201): perimeter gates entry,
+    // execution ungated. OLD CONTRACT: `mac_quit_app` was blocked and unlisted
+    // in read-only mode along with the file/persona writes. NEW CONTRACT: it
+    // was removed from readOnlyBlockedExact — quitting an app is not a file
+    // write, and the Trust Center accessibility category is its gate. The mode
+    // still means read-only for everything that touches the filesystem or the
+    // persona, which is what the rest of this row pins.
+    let quit = try await gated.dispatch(tool: "mac_quit_app", input: [:], surface: "chat")
+    #expect(quit == .string("quit"), "mac_quit_app passes read-only mode post-cutover")
+
+    for blockedTool in ["write_file", "shell.exec", "persona_write", "persona_append_section"] {
         var blocked = false
         do {
             _ = try await gated.dispatch(tool: blockedTool, input: [:], surface: "chat")
@@ -5785,7 +5806,7 @@ func chatClient_fileAccess_readOnly_blocks_writes_and_actions_but_keeps_reads() 
     #expect(!names.contains("persona_write"))
     #expect(!names.contains("persona_append_section"))
     #expect(!names.contains("shell.exec"))
-    #expect(!names.contains("mac_quit_app"))
+    #expect(names.contains("mac_quit_app"), "mac_quit_app is listed in read-only mode post-cutover")
 
     let schemaNames = try await gated.listAvailableToolSchemas().map(\.name)
     #expect(schemaNames.contains("read_file"))
@@ -5795,7 +5816,7 @@ func chatClient_fileAccess_readOnly_blocks_writes_and_actions_but_keeps_reads() 
     #expect(!schemaNames.contains("persona_write"))
     #expect(!schemaNames.contains("persona_append_section"))
     #expect(!schemaNames.contains("shell.exec"))
-    #expect(!schemaNames.contains("mac_quit_app"))
+    #expect(schemaNames.contains("mac_quit_app"))
 }
 
 @Test
@@ -5913,8 +5934,17 @@ func alternateRootDefaultChatFactoryFailsClosedBeforeProviderCredentials() async
 func gatedToolFactoryReadsAutonomyFromInjectedRoot() async throws {
     let root = try makeTempRoot("gated-factory-root")
     defer { try? FileManager.default.removeItem(at: root) }
+    // YOLO cutover 2026-08-12 (9023d24d, 84fb8201): perimeter gates entry,
+    // execution ungated. This row's INTENT is unchanged — prove the factory
+    // reads autonomy from the INJECTED dataRoot and not the live one — but the
+    // probe had to move: `autonomyDefault: deny` no longer denies, because the
+    // merged Trust Center defaults now carry `toolAutonomy["default"] = "auto"`
+    // and an override table entry outranks the bare default. An explicit
+    // USER-SET per-tool block is the remaining lever that still bites (it
+    // outranks even an active Full Mac posture), so the probe uses that.
     try writeTrustPolicy(root, .object([
         "autonomyDefault": .string("deny"),
+        "toolAutonomy": .object(["echo": .string("blocked")]),
     ]))
     let inner = MockToolDispatchClient(scripted: ["echo": .string("must-not-run")])
     let gated = makeGatedToolDispatchClient(

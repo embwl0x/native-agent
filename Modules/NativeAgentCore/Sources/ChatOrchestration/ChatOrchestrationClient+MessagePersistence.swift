@@ -409,13 +409,25 @@ extension SwiftNativeChatOrchestrationClient {
             throw ChatOrchestrationError.underlying("invalid chat session id")
         }
         let messageSource = Self.messageSource(for: source)
+        // W2/W3-FIX-R2 2/3 — this row is PERSISTED to the transcript and read
+        // back by every surface (Mac, iOS, Telegram, bridge). For an injection
+        // tool `inputJSON` is the literal characters about to be typed and
+        // `resultSummary` can echo the value an `ax_act` wrote;
+        // `boundedRedactedToolReceipt` only catches secret-SHAPED strings, and
+        // a password is not shaped like anything. Redact by TOOL first.
         let safeInputJSON = Self.boundedRedactedToolReceipt(
-            inputJSON,
+            Self.injectionRedactedArgJSON(tool: toolName, json: inputJSON),
             maximumCharacters: Self.persistedToolInputMaximumCharacters,
             label: "tool input"
         )
+        // W3.5-FIX 3 — and for `mac_view` the RESULT is a base64 screenshot of
+        // the whole window. The persisted transcript is read back by every
+        // surface and syncs; the pixels come out here and leave the digest.
         let safeResultSummary = Self.boundedRedactedToolReceipt(
-            resultSummary,
+            Self.injectionRedactedResultJSON(
+                tool: toolName,
+                json: Self.screenViewRedactedResultJSON(tool: toolName, json: resultSummary)
+            ),
             maximumCharacters: Self.persistedToolResultMaximumCharacters,
             label: "tool result"
         )
@@ -1151,7 +1163,14 @@ extension SwiftNativeChatOrchestrationClient {
             // lifecycle. A generic start here cannot be correlated with that
             // terminal state and would leave false pending physiology.
             guard !ChatToolOutcome.hasCanonicalMotorOwner(safeName) else { return }
-            let inputPreview = Self.compactCognitiveJSON(input, maxCharacters: 240)
+            // W2/W3-FIX-R2 2 — cognitive events are persisted physiology, so
+            // the same by-tool redaction applies before the preview is cut.
+            // (Injection tools take the canonical-motor-owner early return
+            // above today; this must not depend on that staying true.)
+            let inputPreview = Self.compactCognitiveJSON(
+                MacInjectionArgRedaction.redactedPayload(tool: safeName, payload: input),
+                maxCharacters: 240
+            )
             var metadata: [String: JSONValue] = [
                 "sessionId": .string(sessionId),
                 "toolName": .string(safeName),
@@ -1183,7 +1202,13 @@ extension SwiftNativeChatOrchestrationClient {
             )
             guard cognitiveResult != .unknown else { return }
             let ok = cognitiveResult == .succeeded
-            let outputPreview = Self.compactCognitiveJSON(output, maxCharacters: 300)
+            let outputPreview = Self.compactCognitiveJSON(
+                MacInjectionResultRedaction.redacted(
+                    tool: safeName,
+                    result: MacScreenViewResultRedaction.redacted(tool: safeName, result: output)
+                ),
+                maxCharacters: 300
+            )
             var metadata: [String: JSONValue] = [
                 "sessionId": .string(sessionId),
                 "toolName": .string(safeName),
@@ -1239,6 +1264,57 @@ extension SwiftNativeChatOrchestrationClient {
 
     nonisolated private static func dateFromISO8601(_ raw: String) -> Date? {
         ISO8601DateFormatter().date(from: raw)
+    }
+
+    /// W2/W3-FIX-R2 — redact an injection tool's ARGUMENT json before it is
+    /// persisted or previewed. Works on the serialized string because that is
+    /// what this layer is handed. A body that will not parse is dropped
+    /// entirely for a secret-bearing tool: an unparseable payload we cannot
+    /// redact is not a payload worth keeping.
+    nonisolated static func injectionRedactedArgJSON(tool: String, json: String) -> String {
+        guard MacInjectionArgRedaction.carriesSecretArgs(tool: tool) else { return json }
+        guard let parsed = try? JSONValue.parse(Data(json.utf8)),
+              case .object = parsed,
+              let out = try? MacInjectionArgRedaction
+                .redactedPayload(tool: tool, payload: parsed)
+                .serialize(pretty: false) else {
+            return "[redacted: \(tool) arguments]"
+        }
+        return out
+    }
+
+    /// Same, for an injection tool's RESULT (an `ax_act` re-reads and returns
+    /// the value it just wrote).
+    nonisolated static func injectionRedactedResultJSON(tool: String, json: String) -> String {
+        guard MacInjectionToolNames.isInjectionTool(tool)
+            || MacInjectionArgRedaction.carriesSecretArgs(tool: tool) else { return json }
+        guard let parsed = try? JSONValue.parse(Data(json.utf8)),
+              let out = try? MacInjectionResultRedaction
+                .redacted(tool: tool, result: parsed)
+                .serialize(pretty: false) else {
+            // A non-JSON summary from an injection tool cannot be inspected for
+            // the written value, so it is not kept verbatim.
+            return json.contains("\"") || json.contains("{")
+                ? "[redacted: \(tool) result]"
+                : json
+        }
+        return out
+    }
+
+    /// W3.5-FIX 3 — strip `mac_view`'s base64 picture out of a serialized
+    /// RESULT before it is persisted or previewed. Unlike the injection
+    /// redactors this cannot fall back to "[redacted]" on a parse failure: a
+    /// summary that will not parse also cannot contain a JSON `image` key we
+    /// put there, and blanking every unparseable read result would destroy the
+    /// transcript. A parse failure therefore leaves the (image-free) text.
+    nonisolated static func screenViewRedactedResultJSON(tool: String, json: String) -> String {
+        guard MacScreenViewResultRedaction.carriesImage(tool: tool) else { return json }
+        guard let parsed = try? JSONValue.parse(Data(json.utf8)) else { return json }
+        let stripped = MacScreenViewResultRedaction.redacted(tool: tool, result: parsed)
+        guard let out = try? stripped.serialize(pretty: false) else {
+            return "[redacted: \(tool) result]"
+        }
+        return out
     }
 
     nonisolated private static func compactCognitiveJSON(_ value: JSONValue, maxCharacters: Int) -> String {

@@ -308,7 +308,6 @@ final class AppModel {
     /// initial paint. (gpt-5.5 review NEEDS_FIX 4)
     var chatToolCatalogLoadFailed: Bool = false
     var capabilitySummary: CapabilitySummaryResponse?
-    var capabilityFoundry: CapabilityFoundrySummary?
     var routePlan: IntentRoutePlan?
     var workflows: [WorkflowRecord] = []
     var workflowRuns: [WorkflowRun] = []
@@ -351,7 +350,6 @@ final class AppModel {
     var nativePower: NativePowerSummary?
     var nativeActions: [NativeActionRecord] = []
     var nativeActionReceipts: [NativeActionReceipt] = []
-    var nativeIntentRegistry: NativeIntentRegistry?
     var notificationStatus: NotificationRuntimeStatus?
     var browserRuntimeStatus: BrowserRuntimeStatus?
     var memoryVectorStatus: MemoryVectorStatus?
@@ -605,8 +603,16 @@ final class AppModel {
         approvals.filter { $0.status.lowercased() == "pending" }.count
     }
 
+    /// W6/G12: the badge counts the "For you" lane ONLY.
+    ///
+    /// The badge is an interrupt — it is the app claiming something needs User.
+    /// System-health notices (background_loop, disk_hygiene, heartbeat, the
+    /// self-referential proactive kinds) are readable in the System lane and
+    /// still surfaced by Doctor; none of them should light up a count that
+    /// means "you are needed". Lane membership is defined once on
+    /// `InboxItemRecord` (`InboxView.swift`) and read here and by the list.
     var pendingInboxCount: Int {
-        inboxItems.filter(\.isActivityPending).count
+        inboxItems.filter { $0.isActivityPending && $0.isForYouLane }.count
     }
 
     var pendingTrainingProposalCount: Int {

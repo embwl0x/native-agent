@@ -28,8 +28,6 @@ public protocol MemoryV2Storage: Sendable {
     func memoryExists(id: String) async throws -> Bool
     func insertMemory(_ record: MemoryRecord, embedding: [Float]) async throws
     func upsertMemory(_ record: MemoryRecord, embedding: [Float]) async throws -> Bool
-    func proposalExists(id: String) async throws -> Bool
-    func insertProposal(id: String, raw: JSONValue) async throws
     func deleteProposal(id: String) async throws -> Bool
     func tombstoneExists(_ key: String) async throws -> Bool
     func insertTombstone(_ key: String) async throws
@@ -99,35 +97,6 @@ public actor RealMemoryStorage: MemoryV2Storage {
         return false
     }
 
-    public func proposalExists(id: String) async throws -> Bool {
-        let all = try await storage.listProposals(status: nil)
-        return all.contains { $0.id == id }
-    }
-
-    public func insertProposal(id: String, raw: JSONValue) async throws {
-        let content: String = {
-            if case .object(let obj) = raw {
-                if case .string(let s)? = obj["content"] { return s }
-                if case .string(let s)? = obj["text"] { return s }
-                if case .string(let s)? = obj["fact_text"] { return s }
-            }
-            return ""
-        }()
-        let p = StoredProposal(
-            id: id,
-            content: content,
-            personaId: Self.proposalPersona(from: raw),
-            source: nil,
-            stagedAt: MemoryStorage.nowISO8601(),
-            status: "pending",
-            resolvedAt: nil,
-            rejectionReason: nil,
-            embedding: nil,
-            metadata: raw
-        )
-        _ = try await storage.insertProposal(p)
-    }
-
     public func deleteProposal(id: String) async throws -> Bool {
         try await storage.deleteProposal(id: id)
     }
@@ -149,17 +118,6 @@ public actor RealMemoryStorage: MemoryV2Storage {
         return MemoryV2Defaults.personaID
     }
 
-    private static func proposalPersona(from raw: JSONValue) -> String {
-        if case .object(let obj) = raw {
-            for key in ["persona", "persona_id", "personaId"] {
-                if case .string(let persona)? = obj[key] {
-                    let trimmed = persona.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !trimmed.isEmpty { return trimmed }
-                }
-            }
-        }
-        return MemoryV2Defaults.personaID
-    }
 }
 
 // MARK: - MigrationReport

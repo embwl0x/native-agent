@@ -95,7 +95,11 @@ extension SwiftNativeTrustCenter: OriginAwareAutonomyResolver {
             originTrusted: originTrusted,
             policy: policy
         ) {
-            return "auto"
+            // Even this branch goes through the floor. It cannot return "auto"
+            // for an injection tool today (the YOLO exclusion above stops it),
+            // but a floor that trusts an upstream exclusion to stay correct is
+            // exactly the shape of the bug this fix exists to close.
+            return MacInjectionToolNames.clampedAutonomyLevel(toolName: toolName, resolved: "auto")
         }
         // SwiftNativeTrustCenter stores tool autonomy under `toolAutonomy`;
         // autonomyForTool reads overrides from `autonomyOverrides`. Bridge.
@@ -106,7 +110,16 @@ extension SwiftNativeTrustCenter: OriginAwareAutonomyResolver {
         if case .string(let def)? = policy["autonomyDefault"] {
             bundle["autonomyDefault"] = .string(def)
         }
-        return self.autonomyForTool(toolName, policy: bundle)
+        // W2/W3-FIX 3 — HARD MINIMUM APPROVAL FLOOR, applied after EVERY policy
+        // input (defaults, exact overrides, glob overrides, YOLO). A saved
+        // `toolAutonomy` entry of "mac_keystroke": "auto", or a "mac_*" glob,
+        // used to resolve to auto right here and then fire unattended. It now
+        // clamps to send_approval. Overrides can still make these tools
+        // stricter; nothing in policy data can make them looser.
+        return MacInjectionToolNames.clampedAutonomyLevel(
+            toolName: toolName,
+            resolved: self.autonomyForTool(toolName, policy: bundle)
+        )
     }
 
     private nonisolated static func fullMacPolicyAllows(
@@ -253,6 +266,28 @@ extension SwiftNativeTrustCenter: OriginAwareAutonomyResolver {
 
     private nonisolated static func isFullMacYoloAutonomyExcludedTool(_ toolName: String) -> Bool {
         let normalized = normalizedFullMacToolName(toolName)
+        // W2/W3-FIX 3 — INPUT INJECTION keeps its approval floor even under an
+        // active Full Mac YOLO window. The names come from the single shared
+        // vocabulary rather than a fourth hand-maintained copy.
+        //
+        // This is the ONE place the injection tools deliberately diverge from
+        // mac_focus_app/mac_quit_app, which resolve to "auto" under YOLO via
+        // the category branch below. Focusing an app is visible and trivially
+        // undone; synthesizing keystrokes into whatever app happens to be
+        // frontmost can send a message, empty a field, or confirm a dialog,
+        // with no undo and no record of what the target app did with it.
+        //
+        // NOTE this exclusion is no longer load-bearing ON ITS OWN — the
+        // post-resolution floor in `autonomyLevel` catches anything that gets
+        // past it. Both stay: this one keeps the resolution path honest, the
+        // floor makes the outcome unconditional.
+        // USER 2026-08-12 — YOLO: "Nothing should be approval gated for her.
+        // Nothing." The injection exclusion is REMOVED at his explicit direction.
+        // Full Mac + accessibility category + the TCC grant remain the gates;
+        // under an active Full Mac YOLO window every Mac motor action resolves
+        // auto, like the reads. Per-call approval made them dead on exactly the
+        // surfaces (bridge, while he is away) where he needs her to act.
+        // if MacInjectionToolNames.isInjectionTool(normalized) { return true }
         if [
             "self_install",
             "evolution_propose",
@@ -305,6 +340,35 @@ extension SwiftNativeTrustCenter: OriginAwareAutonomyResolver {
             return "system"
         case "mac_focus_app", "mac_quit_app":
             return "accessibility"
+        // W1b — READ-ONLY AX perception. Same gate category as the app-control
+        // pair (there is one `accessibility_allowed` key), but these mutate
+        // nothing, so they carry no approval floor above this branch: with the
+        // category on they resolve to auto, exactly like mac.spotlight_search.
+        case "mac_ax_status", "mac_ax_tree", "mac_ax_find",
+             "mac.ax_status", "mac.ax_tree", "mac.ax_find",
+             // W3.5 — the fused view. Same category, same read tier: it draws
+             // numbers on a picture of the screen and acts on nothing.
+             "mac_view", "mac.view",
+             // W7 — mac_nudge. Same category, same read-tier treatment: with
+             // the category on it resolves to auto with no approval floor,
+             // exactly like mac_ax_status. It is absent from
+             // MacInjectionToolNames, which is what keeps the injection floor
+             // and the YOLO exclusion off it — one bare mouse move mutates no
+             // app state, so there is nothing for a human to approve.
+             "mac_nudge", "mac.nudge":
+            return "accessibility"
+        // W7 — activity_query. BOTH spellings, because this switch is asked
+        // about the model-tool name while the connector registry and any
+        // approval card speak the action id; mapping one alone leaves the other
+        // falling through to `default` and resolving under a different rule.
+        //
+        // Its own category, NOT "accessibility": an active Full Mac window
+        // grants the right to read the live screen, and that must not silently
+        // imply the right to read a month of recorded activity. The category
+        // is informational here — the real gate is the Trust Center capture
+        // toggle, re-read and refused on inside impl_activity_query_tool.
+        case "activity_query", "activity.query":
+            return "activity"
         default:
             return nil
         }
@@ -391,6 +455,29 @@ public actor AutonomyGate {
         timeoutSeconds: Double = 300,
         reason: String? = nil
     ) async throws -> AutonomyDecision {
+        try await resolveWithApprovalDetailed(
+            toolName: toolName,
+            surface: surface,
+            requestPayload: requestPayload,
+            timeoutSeconds: timeoutSeconds,
+            reason: reason
+        ).decision
+    }
+
+    /// Same flow, but also hands back the APPROVAL RECORD ID.
+    ///
+    /// W2/W3-FIX 1/2 need it: a `MacInjectionCapability` is minted from a
+    /// specific resolved approval, and "which approval authorized this
+    /// keystroke" has to be answerable from the capability itself, not inferred.
+    /// `resolveWithApproval` above keeps its original signature so no existing
+    /// caller changes.
+    public func resolveWithApprovalDetailed(
+        toolName: String,
+        surface: String,
+        requestPayload: JSONValue,
+        timeoutSeconds: Double = 300,
+        reason: String? = nil
+    ) async throws -> (decision: AutonomyDecision, approvalID: String?) {
         guard let filer else {
             throw AutonomyGateError.noApprovalInboxWired
         }
@@ -412,7 +499,7 @@ public actor AutonomyGate {
         }
 
         let nanos = UInt64(max(0, timeoutSeconds) * 1_000_000_000)
-        return await withTaskGroup(of: AutonomyDecision?.self) { group in
+        let decision = await withTaskGroup(of: AutonomyDecision?.self) { group in
             group.addTask {
                 do {
                     let decision = try await filer.awaitResolution(id: id)
@@ -436,6 +523,7 @@ public actor AutonomyGate {
             group.cancelAll()
             return result
         }
+        return (decision, id)
     }
 
     // MARK: - level mapping

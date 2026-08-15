@@ -34,7 +34,7 @@ struct ResearchView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            DisclosureGroup("Search service", isExpanded: $showingSearchConfiguration) {
+            DisclosureGroup(isExpanded: $showingSearchConfiguration) {
                 HStack {
                     TextField("SearXNG URL", text: Bindable(appModel).searxngBaseURL)
                         .textFieldStyle(.roundedBorder)
@@ -54,6 +54,9 @@ struct ResearchView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
+            } label: {
+                Text("Search service")
+                    .togglesDisclosure($showingSearchConfiguration)
             }
 
             HStack {

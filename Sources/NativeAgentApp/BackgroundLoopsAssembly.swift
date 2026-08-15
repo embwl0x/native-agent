@@ -390,6 +390,11 @@ enum BackgroundLoopsAssembly {
             // above — it reads desk state and pings User, never touching the
             // CognitiveSubstrate. Self-gating (no-op unless an item is marked).
             makeDeskNotifyLoop(dataRoot: dataRoot),
+            // W2b (upgrade campaign Track A): delegation terminal-transition
+            // cards. Reads the two wake-job stores through the same projector
+            // `delegation_status` uses and files ONE card per newly-terminal
+            // job, keyed off a durable cursor so a job cards exactly once.
+            makeDelegationOutcomeLoop(dataRoot: dataRoot),
             // Configured GitHub projects flow into durable Desk refs/items.
             // The runner is due-driven and change-idempotent; no config or no
             // material remote change means no state write and no notification.

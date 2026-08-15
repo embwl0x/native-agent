@@ -84,6 +84,28 @@ public enum ToolCausalBoundary {
             return (.browser, ["runId", "run_id", "id"])
         case "mac_focus_app", "mac_quit_app":
             return (.macControl, ["operationId", "operation_id"])
+        // W2/W3 — INJECTION. These DO bind, unlike the AX reads: each one sets
+        // a real external effect (a key went into an app, a button was pressed)
+        // that MacControl's operation store owns and can be asked about later.
+        // W6 — mac_wake binds for the same reason: it posted a real HID event.
+        // That the same call also returns a perception result does not make it
+        // a read; the mouse move it emitted is the external effect.
+        case "mac_keystroke", "mac_click", "mac_scroll", "mac_ax_act", "mac_wake":
+            return (.macControl, ["operationId", "operation_id"])
+        // W7 — mac_nudge is deliberately ABSENT too, and it is the one motor
+        // tool here that is. A motor binding claims some domain owner can
+        // later be asked whether the effect settled; a bare cursor move sets
+        // no such effect — nothing was clicked, typed or changed, so there is
+        // no consequence for MacControl's operation store to own. Binding it
+        // would manufacture one and, worse, would make an unapprovable tool
+        // look like it had an external effect worth approving.
+        //
+        // W1b/W3.5 — mac_ax_status / mac_ax_tree / mac_ax_find / mac_view are
+        // deliberately ABSENT from this table. A motor binding claims a tool set an
+        // external effect some domain owner can later prove settled; the AX
+        // reads set no effect at all (no CGEvent, no AXUIElementPerformAction,
+        // no attribute write), so they have no motor owner to reference.
+        // Binding them would manufacture a consequence that never happened.
         case "external_send", "slack_post_message", "agentmail_send":
             return (.externalSend, ["approvalId", "approval_id"])
         default:

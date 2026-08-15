@@ -734,3 +734,29 @@ func deGreetedPreviewKeepsShortRepliesAndLongFirstSentencesWhole() {
     let bare = "quiet board tonight nothing moving"
     #expect(SessionDigestProvider.deGreetedPreview(bare) == bare)
 }
+
+// 2026-08-11 humanizer-v2 live-gap repro: the bridge probe showed
+// expression.rhythmCuePending=false on a wrapped social serve that the unit
+// classifier accepts — this drives the REAL builder end-to-end to find which
+// rung drops the cue.
+@Test
+func buildTurnContextWithHistory_socialServe_setsServeCue() async throws {
+    let root = try makeTempRoot("serve-cue")
+    let json = """
+    [{"id": "s-serve", "createdAt": "2026-08-11T09:00:00Z",
+      "updatedAt": "2026-08-11T09:00:00Z", "title": "Serve"}]
+    """
+    try write(json, to: root.appendingPathComponent("chat/sessions.json"))
+    let personaDir = try makeTempRoot("persona-serve")
+    try write("PERSONA-SERVE", to: personaDir.appendingPathComponent("SOUL.md"))
+    let engine = makeDigestEngine(personaRoot: personaDir)
+    let reader = SessionHistoryReader(dataRoot: root)
+    let ctx = try await engine.buildTurnContextWithHistory(
+        surface: "chat",
+        userMessage: "[from: claude, via bridge] goodnight silly \u{1F49C}",
+        sessionId: "s-serve",
+        historyLimit: 8, historyReader: reader,
+        personaOverride: nil, sessionDigest: nil
+    )
+    #expect(ctx.naturalExpressionCue == NaturalExpressionGuidance.serveCue)
+}

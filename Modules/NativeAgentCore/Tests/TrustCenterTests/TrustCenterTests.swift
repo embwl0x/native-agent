@@ -680,7 +680,14 @@ struct SwiftNativeTrustPolicyTests {
     #expect(ta["codex_message"] == .string("auto"))
     #expect(ta["invoke_claude"] == .string("auto"))
     #expect(ta["invoke_codex"] == .string("auto"))
-    #expect(ta["mac.shell"] == .string("send_approval"))
+    // YOLO cutover 2026-08-12 (9023d24d, 84fb8201): perimeter gates entry,
+    // execution ungated. OLD CONTRACT: mac.shell sat at send_approval as the
+    // contrast against the easy bridge helpers above. NEW CONTRACT: the whole
+    // mac.* family is auto in the defaults; the contrast row moves to a tier
+    // that survived, so this test still cannot pass on a blanket-auto table.
+    #expect(ta["mac.shell"] == .string("auto"))
+    #expect(ta["self_install"] == .string("confirm"))
+    #expect(ta["restart_app"] == .string("confirm"))
 }
 
 @Test func loadTrustPolicy_normalizes_invalid_autonomyDefault_to_supervised() async throws {

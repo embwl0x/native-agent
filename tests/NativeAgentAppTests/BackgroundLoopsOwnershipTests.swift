@@ -125,7 +125,7 @@ struct BackgroundLoopsOwnershipTests {
             ($0.name, $0.runCount)
         })
 
-        #expect(await facade.restartLoop(id: "telegram_poll"))
+        #expect(await facade.restartLoop(id: "telegram_poll") == .restarted(loopId: "telegram_poll"))
 
         let after = Dictionary(uniqueKeysWithValues: await core.status().map {
             ($0.name, $0.runCount)
@@ -163,7 +163,7 @@ struct BackgroundLoopsOwnershipTests {
         let cognitionCount = await core.status()
             .first { $0.name == "cognition_microcycle" }?.runCount
 
-        #expect(await facade.restartLoop(id: "slack_socket_mode"))
+        #expect(await facade.restartLoop(id: "slack_socket_mode") == .restarted(loopId: "slack_socket_mode"))
 
         #expect(Set(await core.registered()) == ["cognition_microcycle", "slack_socket_mode"])
         #expect(
@@ -227,7 +227,7 @@ struct BackgroundLoopsOwnershipTests {
         let heartbeatCount = await core.status()
             .first { $0.name == "heartbeat" }?.runCount
 
-        #expect(await facade.restartLoop(id: "doctor_auto_run"))
+        #expect(await facade.restartLoop(id: "doctor_auto_run") == .restarted(loopId: "doctor_auto_run"))
         #expect(await core.status().first { $0.name == "heartbeat" }?.runCount == heartbeatCount)
         await core.runTickOnce(loopId: "doctor_auto_run")
         #expect(await oldDoctor.value == 0)

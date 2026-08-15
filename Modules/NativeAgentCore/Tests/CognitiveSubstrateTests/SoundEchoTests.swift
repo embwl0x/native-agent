@@ -329,7 +329,7 @@ struct SoundEchoTests {
             CognitiveSubstrate.soundEchoShouldSpeak(seed: 10_000_000 - Double($0))
         }.count
         let rate = Double(speaking) / Double(samples)
-        let expected = 1.0 / Double(CognitiveSubstrate.soundEchoDutyCycle)
+        let expected = 1.0 / Double(CognitiveSubstrate.defaultDynamics.soundEchoDutyCycle)
         // The tic this fixes was an echo on EVERY turn; the guard that matters
         // is that it is meaningfully less than always.
         #expect(rate < 0.5, "echo must not be near-constant: \(rate)")

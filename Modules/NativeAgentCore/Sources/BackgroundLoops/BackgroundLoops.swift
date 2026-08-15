@@ -1053,6 +1053,18 @@ public actor SwiftNativeLoopScheduler {
         }
     }
 
+    /// L4-15: ids of loops that were deliberately DE-REGISTERED (assembly
+    /// comments explain why for each) and must not haunt the durable state
+    /// file forever. Entries normally outlive `unregister` on purpose (a
+    /// hot-reload must not reset a weekly clock), so retirement needs this
+    /// explicit tombstone: dropped at load, therefore absent from the next
+    /// flush. If a listed loop is ever re-registered, REMOVE its id here or
+    /// its due clock restarts from scratch on the next launch.
+    /// NOT listed: `mission_executor` — that is a live wire id (kept through
+    /// the de-mission rename fence), still registered by
+    /// BackgroundLoopsAssembly+WorkshopExecution.
+    static let retiredLoopIds: Set<String> = ["golden_eval", "stale_artifact_sweep"]
+
     /// A missing/corrupt file simply yields no persisted history, which
     /// degrades to the pre-LOOPS-4 behavior rather than blocking startup.
     private static func readLoopState(_ path: URL?) async -> [String: Date] {
@@ -1064,6 +1076,7 @@ public actor SwiftNativeLoopScheduler {
         let iso = ISO8601DateFormatter()
         var result: [String: Date] = [:]
         for (id, raw) in loops {
+            guard !retiredLoopIds.contains(id) else { continue }
             guard case .string(let stamp) = raw, let date = iso.date(from: stamp) else { continue }
             result[id] = date
         }
@@ -1268,9 +1281,55 @@ public actor SwiftNativeLoopScheduler {
         }
     }
 
+    /// W1(b) upgrade campaign (L4-02): a closed lid is not a broken agent.
+    /// 556 of 2,064 failure receipts over 32 days were literally "the
+    /// internet is offline" — they polluted the durable receipt file, counted
+    /// toward Doctor's persistent-failure threshold, and manufactured the
+    /// ok→fail transitions that re-paged User about his own wifi. Definitely-
+    /// offline errors mint no receipt, count no streak, fire no push.
+    /// Deliberately EXCLUDES plain timeouts (-1001 / "timed out"): the
+    /// github_tracking 120s-timeout defect (L4-03) surfaces as timeouts, and
+    /// classifying those as offline would bury a real bug.
+    static func isOfflineError(_ error: String) -> Bool {
+        let e = error.lowercased()
+        if e.contains("internet connection appears to be offline") { return true }
+        if e.contains("network connection was lost") { return true }
+        if e.contains("socket is not connected") { return true }
+        if e.contains("telegram long poll: unavailable") { return true }
+        if e.contains("nsurlerrordomain") {
+            for code in ["-1009", "-1005", "-1003"]
+            where e.contains("code=\(code)") || e.contains("code \(code)") {
+                return true
+            }
+        }
+        if e.contains("nsposixerrordomain"),
+           e.contains("code=57") || e.contains("code=60")
+            || e.contains("code 57") || e.contains("code 60") {
+            return true
+        }
+        return false
+    }
+
+    /// L4-13: an error whose `localizedDescription` is empty ("The operation
+    /// couldn't be completed" with no reason, or a custom Error with an empty
+    /// message) produced receipts whose `error` field was blank — a failure row
+    /// that says nothing. Loops should build strings via
+    /// `Self.describeLoopError(_:)`; this guard is the backstop for any string
+    /// that arrives empty anyway.
+    static func describeLoopError(_ error: any Error) -> String {
+        let described = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !described.isEmpty { return described }
+        let ns = error as NSError
+        return "\(type(of: error)) (\(ns.domain) code \(ns.code))"
+    }
+
     private func appendFailureReceipt(loopId: String, error: String) async {
         guard let failureReceiptsPath else { return }
-        let boundedError = String(error.prefix(2_000))
+        guard !Self.isOfflineError(error) else { return }
+        let trimmed = error.trimmingCharacters(in: .whitespacesAndNewlines)
+        let boundedError = trimmed.isEmpty
+            ? "unspecified failure (empty error description)"
+            : String(trimmed.prefix(2_000))
         let receipt: JSONValue = .object([
             "id": .string(UUID().uuidString.lowercased()),
             "kind": .string("background_loop.failure"),
@@ -1307,6 +1366,10 @@ public actor SwiftNativeLoopScheduler {
     private func maybePushFailureStreak(
         loopId: String, error: String, now: Date
     ) async {
+        // W1(b): offline blips neither count toward the streak nor push —
+        // and they don't RESET it either, so a real outage bracketed by
+        // wifi flaps keeps its accumulated evidence.
+        guard !Self.isOfflineError(error) else { return }
         let streak = (consecutiveFailures[loopId] ?? 0) + 1
         consecutiveFailures[loopId] = streak
         if streak == 1 { failureStreakStartedAt[loopId] = now }

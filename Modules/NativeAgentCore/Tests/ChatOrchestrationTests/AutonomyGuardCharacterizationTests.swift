@@ -152,14 +152,24 @@ private func scEvaluate(_ center: SwiftNativeSecurityCenter, _ tool: String) asy
     #expect(env.decision == .allow, "SC LOCKED read_file expected allow, got \(env.decision.rawValue) — \(env.reasons)")
 }
 
-@Test func AutonomyGuardCharacterization_SC_locked_shell_class_block_developer_mode() async throws {
+/// YOLO cutover 2026-08-12 (9023d24d, 84fb8201): perimeter gates entry,
+/// execution ungated.
+///
+/// OLD CONTRACT: with no policy.json at all (LOCKED), the shell class was
+/// BLOCKED by SecurityCenter's `criticalRequiresDeveloperMode` gate, with a
+/// "Developer Mode" reason. NEW CONTRACT: that default flipped to `false`
+/// (84fb8201, item 6) along with `toolSigningRequired` (item 5), so a LOCKED
+/// local caller is ALLOWED — Developer Mode is no longer a wall in front of
+/// execution. What still gates is the perimeter: a caller that never passed
+/// the local window / bridge token / Telegram allowlist never reaches here.
+@Test func AutonomyGuardCharacterization_SC_locked_shell_class_allows_noDeveloperModeBlock() async throws {
     let center = try await scCenter(personal: false)
     for tool in ["shell", "bash", "git", "apply_patch", "run_tests", "swift_build", "swift_test", "restart_app", "install_app"] {
         let env = await scEvaluate(center, tool)
-        #expect(env.decision == .block, "SC LOCKED \(tool) expected block, got \(env.decision.rawValue) — \(env.reasons)")
-        #expect(env.allowed == false, "SC LOCKED \(tool) expected allowed=false")
-        #expect(env.reasons.contains { $0.contains("Developer Mode") },
-                "SC LOCKED \(tool) expected a Developer Mode reason, got \(env.reasons)")
+        #expect(env.decision == .allow, "SC LOCKED \(tool) expected allow, got \(env.decision.rawValue) — \(env.reasons)")
+        #expect(env.allowed, "SC LOCKED \(tool) expected allowed=true")
+        #expect(!env.reasons.contains { $0.contains("Developer Mode") },
+                "SC LOCKED \(tool) must carry no Developer Mode block reason, got \(env.reasons)")
     }
 }
 
@@ -621,25 +631,28 @@ private func yoloInstallConfirmPolicy(developerMode: Bool = false) -> JSONValue 
     #expect(!ok, "COMPOSED untrusted Telegram install_app must block before autonomy/yolo can elevate it")
 }
 
-@Test func AutonomyGuardCharacterization_COMPOSED_locked_shell_throws_read_dispatches() async throws {
+/// YOLO cutover 2026-08-12 (9023d24d, 84fb8201): perimeter gates entry,
+/// execution ungated.
+///
+/// OLD CONTRACT: through the full composed chain, LOCKED `shell` threw a
+/// SecurityCenter "security block … Developer Mode". NEW CONTRACT: with
+/// `criticalRequiresDeveloperMode` and `toolSigningRequired` both defaulting
+/// false, and the autonomy catch-all at `auto`, a LOCKED local `shell` runs all
+/// the way to the inner dispatcher — no security block, no autonomy clamp, no
+/// approval filed.
+@Test func AutonomyGuardCharacterization_COMPOSED_locked_shell_and_read_both_dispatch() async throws {
     let chain = try await composedChain(policy: nil)  // LOCKED
-    // gpt-5.5 review fix: `throws: any Error` is too weak — a fileAccess block or
-    // an autonomy-no-filer throw would also satisfy it, masking a moved Developer-
-    // Mode gate. Pin the SECURITY-layer signature. NOTE: the composed throw
-    // surfaces SecurityCenter's first actionable reason (skipping the generic
-    // "autonomy: <level>" readout), so this should name Developer Mode directly.
-    // That distinguishes a SecurityCenter block from a fileAccess block
-    // ("fileAccess=...") or a no-filer confirm throw ("approval required, no filer").
-    do {
-        _ = try await chain.dispatch(tool: "shell", input: [:], surface: "chat")
-        Issue.record("COMPOSED LOCKED shell expected to throw (SecurityCenter block), but dispatched")
-    } catch {
-        let desc = String(describing: error)
-        #expect(desc.contains("security block") && desc.contains("Developer Mode"),
-                "COMPOSED LOCKED shell expected a Developer Mode security block, got: \(desc)")
-    }
+    let shellOk = await dispatched(chain, "shell", input: ["command": .string("echo hi")])
+    #expect(shellOk, "COMPOSED LOCKED shell expected DISPATCHED post-cutover (reached_inner)")
     let readOk = await dispatched(chain, "read_file")
     #expect(readOk, "COMPOSED LOCKED read_file expected DISPATCHED (reached_inner)")
+    // TEETH: the chain is NOT a pass-through. The perimeter-shaped block — an
+    // unverified remote origin — still stops a call dead in the same chain, so
+    // this test cannot pass on a chain that lost its gates entirely. (The
+    // dedicated row for that case is
+    // AutonomyGuardCharacterization_COMPOSED_untrustedTelegram_yoloInstall_blocks.)
+    let remoteOk = await dispatched(chain, "install_app", surface: "telegram")
+    #expect(!remoteOk, "COMPOSED LOCKED install_app from an unverified telegram origin must still block")
 }
 
 @Test func AutonomyGuardCharacterization_COMPOSED_locked_codexMessage_dispatches_with_secret_shaped_text() async throws {

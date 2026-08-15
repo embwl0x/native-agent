@@ -1,4 +1,5 @@
 // swift-tools-version:6.0
+import Foundation
 import PackageDescription
 
 let subsystems: [String] = [
@@ -41,7 +42,22 @@ let subsystems: [String] = [
     "XConnector",
     "GitHubConnector",
     "SlackConnector",
-    "MacIntegration"
+    "MacIntegration",
+    // Ambient activity watcher (W7/W8, 2026-08-14). Was fenced behind
+    // NATIVEAGENT_DEV_ACTIVITY_PROBE=1 for the dev-only v0; the fence is LIFTED
+    // now that the feature ships in-app. The compile-time guarantee it provided
+    // ("this code cannot exist in a build") is replaced by a RUNTIME one that
+    // is structurally enforced rather than conventional:
+    //   * `ActivityWatcher.start()` installs no AX observer, no NSWorkspace
+    //     observer and no lock observer, and opens no span, unless the Trust
+    //     Center policy's `captureEnabled` is true;
+    //   * the policy defaults to false and an unreadable/missing policy file
+    //     decodes to false, so a fresh install captures nothing;
+    //   * a policy flipped to false at runtime tears the observers down on the
+    //     next capture-thread hop rather than at the next restart.
+    // ActivityWatchArchitectureTests pins all of that, plus the egress
+    // enumeration (no context assembly, no memory promotion, no sync/backup).
+    "ActivityWatch",
 ]
 
 let products: [Product] =
@@ -50,6 +66,8 @@ let products: [Product] =
     + [
         .executable(name: "chat-drive", targets: ["ChatDrive"]),
         .executable(name: "task-ledger", targets: ["TaskLedgerCLI"]),
+        .executable(name: "ContextSelectionABHarness", targets: ["ContextSelectionABHarness"]),
+        .executable(name: "activity-probe", targets: ["ActivityProbeCLI"]),
     ]
 
 // Per-subsystem extra dependencies on other subsystem libraries. Most
@@ -71,7 +89,15 @@ let extraDeps: [String: [String]] = [
     // R9: ToolExecution so chat dispatch can route registry custom tools
     // through the sandboxed run engine (no cycle — ToolExecution depends only
     // on PersistenceCore/TrustCenter/ToolRegistry).
-    "ChatOrchestration": ["PersistenceCore", "PersonaEngine", "MemoryV2", "ProviderRouting", "TrustCenter", "DreamREMCycle", "ApprovalInbox", "MCPDispatcher", "KnowledgeGraph", "Dispatcher", "MacControl", "Context", "SwarmRuns", "XConnector", "GitHubConnector", "SlackConnector", "MacIntegration", "WorkshopExecution", "SystemOps", "CognitiveSubstrate", "ToolExecution", "Skills"],
+    // W7 (2026-08-14): ActivityWatch so the `activity_query` tool has an
+    // implementation to route to. ONE file may import it —
+    // SwiftToolDispatcher+Sandbox.swift, the tool impl — and
+    // ActivityWatchArchitectureTests pins that: the dependency exists so an
+    // EXPLICIT tool call can read the rollups, never so context assembly,
+    // recall, or memory promotion can. The arrow only points this way;
+    // ActivityWatch imports nothing from ChatOrchestration, which is what
+    // keeps the module unable to reach a turn on its own.
+    "ChatOrchestration": ["PersistenceCore", "PersonaEngine", "MemoryV2", "ProviderRouting", "TrustCenter", "DreamREMCycle", "ApprovalInbox", "MCPDispatcher", "KnowledgeGraph", "Dispatcher", "MacControl", "Context", "SwarmRuns", "XConnector", "GitHubConnector", "SlackConnector", "MacIntegration", "WorkshopExecution", "SystemOps", "CognitiveSubstrate", "ToolExecution", "Skills", "ActivityWatch"],
     "CognitiveSubstrate": ["PersistenceCore"],
     "XConnector": ["PersistenceCore"],
     "GitHubConnector": ["PersistenceCore"],
@@ -135,6 +161,14 @@ let extraDeps: [String: [String]] = [
     // Notifications / Spotlight / Scheduler surface. PersistenceCore for
     // flocked atomic JSON IO of mac_integration_permissions.json.
     "MacIntegration": ["PersistenceCore"],
+    // Ambient activity watcher — PersistenceCore for defaultDataRoot() and
+    // atomic policy IO; MacControl for MacScreenViewTextRedaction, the SHARED
+    // secret redactor every captured window title passes through (W5). We reuse
+    // it rather than writing a second redactor: two copies drift, and the copy
+    // that drifts is the one nobody re-reviews. No cycle — MacControl depends
+    // only on PersistenceCore, and nothing in the tree depends on ActivityWatch
+    // except its own CLI.
+    "ActivityWatch": ["PersistenceCore", "MacControl"],
 ]
 
 // Per-subsystem external (Swift Package) product dependencies.
@@ -148,6 +182,7 @@ let externalDeps: [String: [Target.Dependency]] = [
     // tables added by the v2_knowledge_graph migration). One-time JSON import
     // from <root>/memory/knowledge_graph.json is gated by a sentinel.
     "KnowledgeGraph": [.product(name: "GRDB", package: "GRDB.swift")],
+    "ActivityWatch": [.product(name: "GRDB", package: "GRDB.swift")],
 ]
 
 let subsystemTargets: [Target] = subsystems.flatMap { name -> [Target] in
@@ -167,12 +202,21 @@ let subsystemTargets: [Target] = subsystems.flatMap { name -> [Target] in
         .process("Resources/minilm_vocab.txt"),
         .copy("Resources/minilm.mlpackage"),
     ] : nil
+    // WorkshopExecution persists content-addressed identities (procedure
+    // shape/schema digests). Transitively visible extension members — e.g.
+    // GRDB's SQL interpolation via MemoryV2 — must never participate in type
+    // inference there: an inference flip silently hashes an unstable debug
+    // description instead of the intended string (2026-08-05 preflight bug).
+    let targetSwiftSettings: [SwiftSetting]? = (name == "WorkshopExecution")
+        ? [.enableUpcomingFeature("MemberImportVisibility")]
+        : nil
     return [
         .target(
             name: name,
             dependencies: deps,
             path: "Sources/\(name)",
-            resources: targetResources
+            resources: targetResources,
+            swiftSettings: targetSwiftSettings
         ),
         .testTarget(
             name: "\(name)Tests",
@@ -248,12 +292,35 @@ let package = Package(
             ],
             path: "Sources/TaskLedgerCLI"
         ),
+        // Offline A/B for the selection score rebalance — reads a sqlite
+        // .backup copy of a context store through the production
+        // ContextSQLiteStore + selection-index path. See
+        // docs/build_plans/selection-score-rebalance.md.
+        .executableTarget(
+            name: "ContextSelectionABHarness",
+            dependencies: [
+                .target(name: "Context"),
+            ],
+            path: "Sources/ContextSelectionABHarness"
+        ),
         .executableTarget(
             name: "DeskSweepCLI",
             dependencies: [
                 .target(name: "PersistenceCore"),
             ],
             path: "Sources/DeskSweepCLI"
-        )
+        ),
+        // Activity watcher probe/simulator CLI. Unconditional since the W7/W8
+        // in-app wiring: it is the headless harness the ground-truth
+        // simulation runs through, and it drives the SAME engine + store the
+        // live capture path does.
+        .executableTarget(
+            name: "ActivityProbeCLI",
+            dependencies: [
+                .target(name: "ActivityWatch"),
+                .target(name: "PersistenceCore"),
+            ],
+            path: "Sources/ActivityProbeCLI"
+        ),
     ] + subsystemTargets
 )

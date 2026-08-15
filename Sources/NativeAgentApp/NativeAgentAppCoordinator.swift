@@ -239,6 +239,13 @@ final class NativeAgentAppCoordinator {
         observe(.openApprovalsRequest) { _ in .activity(.approvals) }
         observe(.openTelegramRequest) { _ in .sidebar(.telegram) }
         observe(.openTrustMultimodalRequest) { _ in .sidebar(.trust) }
+        // Inbox act → chat draft: the coordinator only activates the window and
+        // lands on Chat; ContentView's receiver does the draft injection.
+        observe(.openChatDraftRequest) { _ in .sidebar(.chat) }
+        // L5 G6, same shape: her message is already persisted, so the
+        // coordinator's only job is window activation + landing on Chat.
+        // ContentView's receiver reloads the transcript.
+        observe(.openSpokenChatRequest) { _ in .sidebar(.chat) }
         observe(.openCommandRouteRequest) { note in
             NativeAgentNavigationDestination.route(note.object as? String)
         }

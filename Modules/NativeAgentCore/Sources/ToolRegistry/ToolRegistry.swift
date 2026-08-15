@@ -355,7 +355,7 @@ public actor SwiftNativeToolRegistry: ToolRegistryProtocol {
             // `<registryPath>.lock` flock. Without this
             // wrap, the Swift promote would be the one-sided mutator.
             // Order: process-local serialize (runSerialized) FIRST, then
-            // cross-process flock INSIDE — mirrors the Wave 6 JSONLEmbeddingStore
+            // cross-process flock INSIDE — the Wave 6 JSONL-store locking
             // pattern. EVERY conformer takes the flock — see below.
             // Uniform locking (L7, 2026-08-01): `withFileLock` is a
             // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so

@@ -38,10 +38,36 @@ enum NativeAgentScheduledProactiveScan {
         }
     }
 
+    // MARK: - W6/G5 — a project-shaped opportunity
+
+    /// Days a `now`/`next` Desk item may sit untouched before the scan asks
+    /// about it. Five is deliberately about a working week: shorter and it nags
+    /// on work that is simply in progress.
+    static let defaultDeskStaleDays = 5
+
+    /// Desk items the scan is allowed to ask about. `now`/`next` only — these
+    /// are the statuses that CLAIM to be the current front of the work, so an
+    /// untouched one is a real question. `watch`/`todo` are backlog by
+    /// definition and asking about them would be nagging.
+    static let deskOpportunityStatuses: Set<DeskStatus> = [.now, .next]
+
+    // MARK: - W6/G9 — reading the outcome ledger
+
+    /// Times a kind must be dismissed inside the window before the scan stops
+    /// surfacing it.
+    static let outcomeSuppressionThreshold = 3
+    static let outcomeWindowDays = 30
+    /// Applied to a kind with dismissals below the drop threshold. Enough to
+    /// lose a tie against a kind User has never rejected, not enough to bury a
+    /// genuinely urgent card.
+    static let outcomeScorePenalty = 0.15
+
     static func evaluate(
         dataRoot: URL,
         payload: [String: JSONValue],
-        persistence: SwiftNativePersistenceCore = SwiftNativePersistenceCore()
+        persistence: SwiftNativePersistenceCore = SwiftNativePersistenceCore(),
+        now: Date = Date(),
+        deskItemsProvider: (@Sendable (URL) async -> [DeskItem])? = nil
     ) async -> Result {
         let limit = max(1, min(int(payload["limit"], default: 10), 50))
         let surfaceLimit = max(0, min(int(payload["surfaceLimit"] ?? payload["surface_limit"], default: 4), 12))
@@ -64,24 +90,48 @@ enum NativeAgentScheduledProactiveScan {
             .appendingPathComponent("approvals", isDirectory: true)
             .appendingPathComponent("requests.json")
 
+        let outcomesPath = dataRoot
+            .appendingPathComponent("nextgen", isDirectory: true)
+            .appendingPathComponent("proactive", isDirectory: true)
+            .appendingPathComponent("outcomes.jsonl")
+
         let opportunityRows = (try? await persistence.readJSONL(opportunitiesPath)) ?? []
         let inboxRows = (try? await persistence.readJSONL(inboxPath)) ?? []
         let schedulerRaw = await persistence.readJSON(schedulerPath, defaultValue: .array([]))
         let approvalsRaw = await persistence.readJSON(approvalsPath, defaultValue: .array([]))
+        // G9: the ledger has been write-only since the learning loop that read
+        // it went down with the daemon. This is the one reader.
+        let outcomeRows = (try? await persistence.readJSONL(outcomesPath)) ?? []
+        let feedback = outcomeFeedback(rows: outcomeRows, now: now)
+
+        let deskStaleDays = max(1, int(payload["staleDays"] ?? payload["stale_days"], default: defaultDeskStaleDays))
+        let deskItems: [DeskItem]
+        if let deskItemsProvider {
+            deskItems = await deskItemsProvider(dataRoot)
+        } else {
+            deskItems = (try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState().items) ?? []
+        }
 
         let surfacedIDs = alreadySurfacedOpportunityIDs(inboxRows)
         var opportunities = latestLedgerOpportunities(opportunityRows, opportunitiesPath: opportunitiesPath)
-        let live = liveOpportunities(
+        var live = liveOpportunities(
             inboxRows: inboxRows,
             schedulerRaw: schedulerRaw,
             approvalsRaw: approvalsRaw,
             dataRoot: dataRoot
         )
+        live.append(contentsOf: deskOpportunities(
+            items: deskItems,
+            staleDays: deskStaleDays,
+            now: now,
+            dataRoot: dataRoot
+        ))
         opportunities.append(contentsOf: live)
         opportunities = latestByID(opportunities)
 
         let eligible = opportunities
-            .filter(isEligible)
+            .filter { isEligible($0) && !feedback.dropped.contains($0.kind.lowercased()) }
+            .map { feedback.applyingPenalty(to: $0) }
             .sorted { lhs, rhs in
                 if lhs.score != rhs.score { return lhs.score > rhs.score }
                 return lhs.title < rhs.title
@@ -224,6 +274,146 @@ enum NativeAgentScheduledProactiveScan {
         }
 
         return opportunities
+    }
+
+    // MARK: - G5: the first non-self-referential producer
+
+    /// A `now`/`next` Desk item that has not moved in `staleDays`.
+    ///
+    /// Every other kind this scan produces reads the app's own state files —
+    /// inbox.jsonl, jobs.json, requests.json — and asks User to tidy the app
+    /// that generated the card. This one reads his actual work and asks a
+    /// question only he can answer: the item claims to be the current front of
+    /// a project and nothing has happened to it for a week.
+    ///
+    /// Deliberately excluded: `deferUntil` items (parked ON PURPOSE — half of
+    /// Agent's "stale" complaints were these), terminal items, and pursuits
+    /// (agent-authored; asking User about the agent's own project is the exact
+    /// self-referential shape G5 is trying to leave behind).
+    static func deskOpportunities(
+        items: [DeskItem],
+        staleDays: Int,
+        now: Date,
+        dataRoot: URL
+    ) -> [Opportunity] {
+        let cutoff = now.addingTimeInterval(-Double(staleDays) * 86_400)
+        return items.compactMap { item -> Opportunity? in
+            guard deskOpportunityStatuses.contains(item.status), !item.status.isTerminal else { return nil }
+            guard !item.isPursuit else { return nil }
+            // A parked item is not stale. `deferUntil` is either `yyyy-MM-dd` or
+            // a full ISO stamp; either way its presence means "not now, and
+            // that is intentional".
+            guard (item.deferUntil ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            guard let updated = parseDeskInstant(item.updatedAt), updated < cutoff else { return nil }
+
+            let project = item.project.trimmingCharacters(in: .whitespacesAndNewlines)
+            let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !title.isEmpty else { return nil }
+            let label = project.isEmpty ? title : "\(project) · \(title)"
+            let since = staleSinceLabel(updated, now: now)
+            let days = max(staleDays, Int(now.timeIntervalSince(updated) / 86_400))
+
+            // Seeded on the handle AND the updatedAt stamp: the moment the item
+            // moves, the id changes, so a card for the OLD stall never
+            // resurrects and a genuinely re-stalled item gets a fresh one.
+            let id = stableID(kind: "desk_stale", seed: "\(item.handle)|\(item.updatedAt)")
+            return Opportunity(
+                id: id,
+                kind: "desk_stale",
+                title: label,
+                summary: "\(label) hasn't moved since \(since) — still the right next thing?",
+                detail: "This item is marked \(item.status.rawValue) and its last update was \(item.updatedAt) (\(days) day(s) ago). If it is still the next thing, it needs a step; if it is not, it should move off now/next.",
+                source: source(kind: "desk_stale", id: id),
+                severity: "important",
+                score: 0.66,
+                relatedPaths: [dataRoot.appendingPathComponent("desk").path]
+            )
+        }
+    }
+
+    /// Desk stamps are ISO-8601, sometimes with fractional seconds.
+    static func parseDeskInstant(_ raw: String) -> Date? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let withFractional = ISO8601DateFormatter()
+        withFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let parsed = withFractional.date(from: trimmed) { return parsed }
+        return ISO8601DateFormatter().date(from: trimmed)
+    }
+
+    /// "Tuesday" while the weekday is still unambiguous, an explicit date once
+    /// it is not. A card that says "hasn't moved since Tuesday" about something
+    /// three weeks old would be a small lie.
+    static func staleSinceLabel(_ updated: Date, now: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone.current
+        if now.timeIntervalSince(updated) < 7 * 86_400 {
+            formatter.dateFormat = "EEEE"
+        } else {
+            formatter.dateFormat = "MMMM d"
+        }
+        return formatter.string(from: updated)
+    }
+
+    // MARK: - G9: the outcome-ledger reader
+
+    /// What the ledger tail says about each kind. Pure over the rows — no
+    /// store, no loop, one predicate applied at the eligibility filter.
+    struct OutcomeFeedback: Sendable, Equatable {
+        /// Kinds dismissed at or past the threshold inside the window. Dropped
+        /// outright: User has said no three times, the scan stops asking.
+        var dropped: Set<String> = []
+        /// Kinds with SOME dismissals but below the threshold — scored down so
+        /// they lose ties, not silenced.
+        var penalized: Set<String> = []
+
+        func applyingPenalty(to opportunity: Opportunity) -> Opportunity {
+            guard penalized.contains(opportunity.kind.lowercased()) else { return opportunity }
+            return Opportunity(
+                id: opportunity.id,
+                kind: opportunity.kind,
+                title: opportunity.title,
+                summary: opportunity.summary,
+                detail: opportunity.detail,
+                source: opportunity.source,
+                severity: opportunity.severity,
+                score: max(0, opportunity.score - NativeAgentScheduledProactiveScan.outcomeScorePenalty),
+                relatedPaths: opportunity.relatedPaths
+            )
+        }
+    }
+
+    static func outcomeFeedback(rows: [JSONValue], now: Date) -> OutcomeFeedback {
+        let cutoff = now.addingTimeInterval(-Double(outcomeWindowDays) * 86_400)
+        var dismissalsByKind: [String: Int] = [:]
+        for row in rows {
+            guard case .object(let obj) = row,
+                  let kind = nonEmptyString(obj["kind"])?.lowercased() else { continue }
+            // `useful == false` is precisely the dismiss write
+            // (ProactiveOutcomeLedger: archive => true, dismiss => false).
+            // A null `useful` is an observation, not a judgement — it must not
+            // count against the kind.
+            guard case .bool(false)? = obj["useful"] else { continue }
+            // A row with an unparseable stamp is counted: the alternative is
+            // letting a malformed timestamp launder a dismissal out of the
+            // window. Only rows PROVABLY older than 30 days are excluded.
+            if let created = nonEmptyString(obj["createdAt"]),
+               let stamp = parseDeskInstant(created),
+               stamp < cutoff {
+                continue
+            }
+            dismissalsByKind[kind, default: 0] += 1
+        }
+        var feedback = OutcomeFeedback()
+        for (kind, count) in dismissalsByKind {
+            if count >= outcomeSuppressionThreshold {
+                feedback.dropped.insert(kind)
+            } else {
+                feedback.penalized.insert(kind)
+            }
+        }
+        return feedback
     }
 
     private static func isAttentionWorthyInboxBacklogItem(_ obj: [String: JSONValue]) -> Bool {

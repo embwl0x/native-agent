@@ -24,7 +24,14 @@ public extension SwiftNativeWorkshopRunner {
         let schemaSource = record.plan.prefix(16).map {
             procedureArgumentShape($0.args)
         }.joined(separator: ">")
-        let shapeSource = record.plan.prefix(16).map { step in
+        // GRDB is transitively visible in this module (via MemoryV2), and its
+        // `SQL` string-interpolation + `joined(separator:)` overloads can win
+        // type inference over plain String for an unannotated interpolating
+        // closure. That hashes an unstable SQL debug description (it embeds a
+        // per-process context address) instead of the token string, making the
+        // identity nondeterministic. The explicit `-> String` return annotation
+        // is load-bearing; the pinned-identity test fences the exact digest.
+        let shapeSource = record.plan.prefix(16).map { step -> String in
             let tool = procedureToken(step.toolOrAction, maximum: 80) ?? "unknown"
             let autonomy = procedureToken(step.autonomy, maximum: 40) ?? "unknown"
             return "\(tool)|\(autonomy)"

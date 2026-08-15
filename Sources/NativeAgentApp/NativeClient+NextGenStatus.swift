@@ -173,20 +173,6 @@ extension NativeClient {
         return tailJSONL(path: Self.nativeActionReceiptsPath(), limit: 50)
     }
 
-    func getNativeIntentRegistry() async throws -> NativeIntentRegistry {
-        // residue/R5 Swift-native cutover: GET /v1/native/intents retired. No SwiftNative
-        // intent registry yet — return an empty envelope.
-        return NativeIntentRegistry(
-            status: "unavailable",
-            source: nil,
-            intentCount: 0,
-            actionsAvailable: [],
-            intents: [],
-            receipts: [],
-            createdAt: ISO8601DateFormatter().string(from: Date())
-        )
-    }
-
     func getNotificationStatus() async throws -> NotificationRuntimeStatus {
         // Subsystem #25b wave 38 W20 (2026-06-02): when .notificationStatus is ON,
         // the in-process SwiftNativeNotificationStatus reads the co-located

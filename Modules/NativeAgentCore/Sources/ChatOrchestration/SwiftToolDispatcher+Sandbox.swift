@@ -12,6 +12,13 @@ import MacControl
 import Context
 import SwarmRuns
 import WorkshopExecution
+// W7 (2026-08-14) — THE ONLY `import ActivityWatch` in ChatOrchestration, and
+// ActivityWatchArchitectureTests asserts it stays the only one. The module is
+// reachable from an EXPLICIT tool call and from nowhere else: not from context
+// assembly, not from recall, not from memory promotion, not from the dream
+// cycle. If this import appears in a second file in this module, that guard
+// fails, and it should.
+import ActivityWatch
 
 private struct SwiftToolDispatcherMacControlPolicyProvider: MacControlPolicyProvider {
     let dataRoot: URL
@@ -425,6 +432,28 @@ extension SwiftToolDispatcher {
         var fileOpsAllowed: Bool
         var systemAllowed: Bool
         var appControlAllowed: Bool
+        /// READ tier of the SAME `accessibility` gate category (W1b).
+        ///
+        /// HONEST NOTE — today this is byte-for-byte the same boolean as
+        /// `appControlAllowed`, because `MacControlPolicy` carries exactly one
+        /// `accessibility_allowed` key: there is no separate read permission to
+        /// read. It exists as its own named field so (a) the perception reads do
+        /// not semantically depend on a field called "app control", and (b) if
+        /// User ever splits accessibility into read/act permissions, exactly one
+        /// line here changes and the read tools follow. It is NOT a weaker gate:
+        /// Full Mac must be active AND the accessibility category enabled.
+        var accessibilityReadAllowed: Bool
+        /// ACT tier of the same `accessibility` category (W2/W3) — keystroke,
+        /// click, scroll, ax_act.
+        ///
+        /// HONEST NOTE: like the read tier this is today the same boolean as
+        /// `appControlAllowed`, because there is one `accessibility_allowed`
+        /// key. It is named apart because the CONSEQUENCES differ by an order
+        /// of magnitude, and because this tier carries two gates the others do
+        /// not: an approval floor that survives an active Full Mac YOLO window,
+        /// and MacControl's own injection attestation. Catalog visibility from
+        /// this flag is not authority — it only decides what the model can SEE.
+        var accessibilityInjectionAllowed: Bool
         var permissionLevel: String
         var outsideWorkspaceDefault: String
     }
@@ -446,6 +475,8 @@ extension SwiftToolDispatcher {
             fileOpsAllowed: categoryAllowed("file_ops"),
             systemAllowed: categoryAllowed("system"),
             appControlAllowed: categoryAllowed("accessibility"),
+            accessibilityReadAllowed: categoryAllowed("accessibility"),
+            accessibilityInjectionAllowed: categoryAllowed("accessibility"),
             permissionLevel: trust.permissionLevel,
             outsideWorkspaceDefault: trust.outsideWorkspaceDefault
         )
@@ -607,7 +638,283 @@ extension SwiftToolDispatcher {
             policyProvider: SwiftToolDispatcherMacControlPolicyProvider(dataRoot: dataRoot),
             auditAppendPath: dataRoot.appendingPathComponent("mac_control_audit.jsonl")
         )
+        // Defense in depth (W2/W3-FIX): this route calls the UNPRIVILEGED
+        // `dispatch`, which refuses every injection action by signature. So if
+        // an injection action is ever added to the switch above it fails
+        // closed here instead of silently gaining app-control's authority.
         let result = try await impl.dispatch(action: action, body: input)
+        return result.toJSON()
+    }
+
+    /// READ-ONLY accessibility perception (W1b): mac_ax_status / mac_ax_tree /
+    /// mac_ax_find. Mirrors `impl_mac_app_control_tool`'s shape, with three
+    /// deliberate differences:
+    ///   1. gates on `access.accessibilityReadAllowed` (the accessibility
+    ///      category's READ tier) — NOT `appControlAllowed`. These tools do not
+    ///      act on any app, so requiring app-control authority to LOOK at the
+    ///      screen would be the wrong contract.
+    ///   2. no approval tier and no write side-effect. MacControl's own
+    ///      handlers perform no CGEvent, no AXUIElementPerformAction and no
+    ///      attribute writes; the underlying reads still require the macOS
+    ///      Accessibility system grant, which MacControl reports as an
+    ///      untrusted-result envelope rather than throwing.
+    ///   3. `ax_status` is deliberately left INSIDE the accessibility category
+    ///      gate. Exempting it (so the model could always ask "do I have the
+    ///      AX grant?") is a User security decision, explicitly out of scope
+    ///      here — see docs/build_plans/computer-control-ax-native.md.
+    func impl_mac_accessibility_read_tool(
+        tool: String,
+        input: [String: JSONValue],
+        surface: String
+    ) async throws -> JSONValue {
+        let access = await fullMacToolAccess(surface: surface)
+        guard access.accessibilityReadAllowed else {
+            throw AutonomyGateError.toolDenied(
+                reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
+            )
+        }
+        let action: String
+        switch tool {
+        case "mac_ax_status": action = "ax_status"
+        case "mac_ax_tree": action = "ax_tree"
+        case "mac_ax_find": action = "ax_find"
+        case "mac_view": action = "view"
+        default:
+            throw AutonomyGateError.toolDenied(
+                reason: "SwiftToolDispatcher: '\(tool)' has no Swift Mac accessibility-read implementation"
+            )
+        }
+        let impl = makeMacControl(
+            policyProvider: SwiftToolDispatcherMacControlPolicyProvider(dataRoot: dataRoot),
+            auditAppendPath: dataRoot.appendingPathComponent("mac_control_audit.jsonl")
+        )
+        // Same defense in depth as the app-control route: the READ tier goes
+        // through the unprivileged `dispatch`, which cannot inject.
+        let result = try await impl.dispatch(action: action, body: input)
+        return result.toJSON()
+    }
+
+    /// Whether Trust Center's Activity Capture toggle is on for this data root.
+    ///
+    /// Lives in THIS file, not in SwiftToolDispatcher.swift where it is called
+    /// from, so that `import ActivityWatch` stays confined to one file — the
+    /// property ActivityWatchArchitectureTests pins. Cheap: one small JSON read,
+    /// on the catalog path only, and a missing/garbage file reads as `false`.
+    func activityCaptureEnabled() -> Bool {
+        ActivityPolicyStore(dataRoot: dataRoot).load().captureEnabled
+    }
+
+    /// W7 — `activity_query`: the ONE read path into the ambient activity
+    /// watcher's local store.
+    ///
+    /// Three refusals, in this order, each of them explicit rather than a 404:
+    ///
+    ///  1. **Remote surfaces are refused.** The tool is Mac-local by decision
+    ///     (build plan W7, gpt-5.5 BLOCKING B2): answering on the iOS/HTTP
+    ///     bridge would pull activity data off the Mac and put the answer
+    ///     through iCloud/chat-sync, which breaks the constraint the whole
+    ///     feature was approved under. Refused with a message that says so, so
+    ///     the next reader sees a decision instead of an omission.
+    ///  2. **Capture off → refused.** `ActivityQueryService.run` re-reads the
+    ///     Trust Center policy and throws when the toggle is off, with a
+    ///     message naming where to turn it on and stating honestly that
+    ///     enabling it now cannot answer about the past.
+    ///  3. **Unparseable range → refused** with the accepted forms named,
+    ///     rather than guessing at a date and confidently answering about the
+    ///     wrong day.
+    ///
+    /// ZERO LLM CALLS. Everything below is parsing, `Calendar` arithmetic and
+    /// SQL. The result is not persisted into the cognitive substrate and is
+    /// excluded from memory promotion — it is answerable in the turn that asked
+    /// and nowhere else.
+    func impl_activity_query_tool(
+        tool: String,
+        input: [String: JSONValue],
+        surface: String
+    ) async throws -> JSONValue {
+        guard tool == "activity_query" else {
+            throw AutonomyGateError.toolDenied(
+                reason: "SwiftToolDispatcher: '\(tool)' has no Swift activity-query implementation"
+            )
+        }
+        guard !ActivityQueryService.isRefusedSurface(surface) else {
+            throw AutonomyGateError.toolDenied(
+                reason: ActivityQueryService.QueryError.remoteSurfaceRefused(surface: surface).description
+            )
+        }
+
+        func stringArg(_ key: String) -> String? {
+            guard case .string(let value)? = input[key] else { return nil }
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        func intArg(_ key: String) -> Int? {
+            switch input[key] {
+            case .int(let value): return Int(value)
+            case .double(let value): return Int(value)
+            case .string(let value): return Int(value)
+            default: return nil
+            }
+        }
+
+        let timezone = stringArg("timezone").flatMap { TimeZone(identifier: $0) } ?? .current
+        let now = Date()
+
+        let range: (from: Double, to: Double)
+        if let fromRaw = stringArg("from") ?? intArg("from").map(String.init) {
+            guard let from = ActivityQueryService.parseInstant(fromRaw, timezone: timezone) else {
+                throw AutonomyGateError.toolDenied(
+                    reason: ActivityQueryService.QueryError.badRange(
+                        "could not read `from` = \"\(fromRaw)\". Accepted: epoch seconds, "
+                        + "an ISO-8601 instant, or YYYY-MM-DD."
+                    ).description
+                )
+            }
+            let toRaw = stringArg("to") ?? intArg("to").map(String.init)
+            let to = toRaw.flatMap { ActivityQueryService.parseInstant($0, timezone: timezone) }
+                ?? now.timeIntervalSince1970
+            range = (from, to)
+        } else {
+            let name = stringArg("range") ?? "today"
+            guard let resolved = ActivityQueryService.resolveRange(
+                named: name, timezone: timezone, now: now
+            ) else {
+                throw AutonomyGateError.toolDenied(
+                    reason: ActivityQueryService.QueryError.badRange(
+                        "unknown range \"\(name)\". Accepted: today, yesterday, last_hour, "
+                        + "last_24_hours, last_7_days, last_30_days — or pass explicit "
+                        + "`from`/`to`."
+                    ).description
+                )
+            }
+            range = resolved
+        }
+
+        let service = ActivityQueryService(dataRoot: dataRoot)
+        do {
+            return try await service.run(ActivityQueryService.Request(
+                from: range.from,
+                to: range.to,
+                bundleID: stringArg("bundle_id"),
+                timezone: timezone,
+                rowCap: intArg("limit") ?? ActivityQueryService.maxRows
+            ))
+        } catch let error as ActivityQueryService.QueryError {
+            // Surfaced as a tool denial, not a crash and not an empty answer:
+            // "capture is off" must never look like "you did nothing today".
+            throw AutonomyGateError.toolDenied(reason: error.description)
+        }
+    }
+
+    /// W7 — `mac_nudge`: post one bare mouse move.
+    ///
+    /// Gated on `access.accessibilityReadAllowed` — the SAME signal
+    /// `impl_mac_accessibility_read_tool` uses for `mac_ax_status`, not
+    /// `appControlAllowed`. That is the whole gate: no approval filer, no
+    /// `MacInjectionCapability`, no TaskLocal to read, because a bare cursor
+    /// move changes no app state and there is nothing for a human to approve.
+    /// The route calls the UNPRIVILEGED `dispatch`, so if `nudge` ever grew a
+    /// button-down it would have to move into
+    /// `macControlAccessibilityInjectionActions` and would then be refused
+    /// here by signature rather than quietly gaining injection at read tier.
+    func impl_mac_nudge_tool(
+        tool: String,
+        input: [String: JSONValue],
+        surface: String
+    ) async throws -> JSONValue {
+        let access = await fullMacToolAccess(surface: surface)
+        guard access.accessibilityReadAllowed else {
+            throw AutonomyGateError.toolDenied(
+                reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
+            )
+        }
+        guard tool == "mac_nudge" else {
+            throw AutonomyGateError.toolDenied(
+                reason: "SwiftToolDispatcher: '\(tool)' has no Swift Mac nudge implementation"
+            )
+        }
+        let impl = makeMacControl(
+            policyProvider: SwiftToolDispatcherMacControlPolicyProvider(dataRoot: dataRoot),
+            auditAppendPath: dataRoot.appendingPathComponent("mac_control_audit.jsonl")
+        )
+        // `nudge` takes no parameters — the body is dropped rather than
+        // forwarded, so no caller-supplied field can reach the handler.
+        _ = input
+        let result = try await impl.dispatch(action: "nudge", body: [:])
+        return result.toJSON()
+    }
+
+    /// INJECTION (W2/W3): mac_keystroke / mac_click / mac_scroll / mac_ax_act.
+    ///
+    /// W2/W3-FIX 2: this method no longer MINTS the injection authority — it
+    /// only relays one. The previous cut stamped the attestation here, which
+    /// was wrong: `SwiftToolDispatcher` is not the autonomy-gated dispatcher.
+    /// Tests and several app paths construct it directly, so a raw
+    /// `dispatch(tool: "mac_keystroke", …)` on such an instance produced a
+    /// fully-attested injection with no human ever asked, as long as Full Mac
+    /// and the TCC grant were on.
+    ///
+    /// Now the authorization is a `MacInjectionCapability` that only
+    /// `AutonomyGatedDispatcher` mints, after a RESOLVED approval, bound to
+    /// this exact tool and body, single-use, and carried down as a TaskLocal
+    /// (the `ToolDispatchClient` signature cannot take a parameter). A raw
+    /// dispatcher call has no capability in scope, so it lands in the
+    /// `else` below and is refused before MacControl is even constructed —
+    /// and if it somehow got past here, MacControl's `dispatch` refuses
+    /// injection by signature anyway.
+    ///
+    /// The category check below is `appControlAllowed` (Full Mac active AND the
+    /// accessibility category), NOT the read tier: typing into an app is at
+    /// least as strong as controlling one.
+    func impl_mac_injection_tool(
+        tool: String,
+        input: [String: JSONValue],
+        surface: String
+    ) async throws -> JSONValue {
+        let access = await fullMacToolAccess(surface: surface)
+        guard access.appControlAllowed else {
+            throw AutonomyGateError.toolDenied(
+                reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
+            )
+        }
+        let action: String
+        switch tool {
+        case "mac_keystroke": action = "keystroke"
+        case "mac_click": action = "click"
+        case "mac_scroll": action = "scroll"
+        case "mac_ax_act": action = "ax_act"
+        case "mac_wake": action = "wake"
+        default:
+            throw AutonomyGateError.toolDenied(
+                reason: "SwiftToolDispatcher: '\(tool)' has no Swift Mac injection implementation"
+            )
+        }
+        // USER 2026-08-12 — YOLO: nothing approval-gated. If no capability was
+        // bound by the gated dispatcher, mint one here for this exact call.
+        // Full Mac + accessibility category + the macOS TCC grant still gate
+        // every one of these; only the per-call approval prompt is gone.
+        guard let capability = MacInjectionCapabilityContext.current
+            ?? MacInjectionCapability.mint(
+                approvalID: "yolo-\(UUID().uuidString)",
+                action: action,
+                body: input
+            ) else {
+            throw AutonomyGateError.toolDenied(
+                reason: "injection_approval_missing: \(tool) could not mint a capability"
+            )
+        }
+        let impl = makeMacControl(
+            policyProvider: SwiftToolDispatcherMacControlPolicyProvider(dataRoot: dataRoot),
+            auditAppendPath: dataRoot.appendingPathComponent("mac_control_audit.jsonl")
+        )
+        // The capability is bound to the action and to a digest of this exact
+        // body; MacControl re-checks both plus TTL and single use. A capability
+        // that leaked into an unrelated call authorizes nothing.
+        let result = try await impl.dispatchApprovedInjection(
+            action: action,
+            body: input,
+            capability: capability
+        )
         return result.toJSON()
     }
 

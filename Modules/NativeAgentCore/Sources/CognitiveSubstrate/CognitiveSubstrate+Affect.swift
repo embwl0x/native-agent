@@ -360,6 +360,23 @@ extension CognitiveSubstrate {
         return a
     }
 
+    /// W7/P10 — the reaction valence, read as a LANDING verdict.
+    ///
+    /// Deliberately a projection of the existing appraisal rather than a new
+    /// classifier: praise (+0.16), resolution (+0.22), enthusiasm (+0.12) and
+    /// affection (+0.10…0.16) come back positive; criticism (−0.10…−0.24) and
+    /// dismissal (−0.22) come back negative; a message that matched nothing is
+    /// exactly 0 and stamps nothing. No lexicon is added, extended, or copied —
+    /// there is only one appraisal in this system and this reads its output.
+    ///
+    /// `landingReactionScale` is the hard criticism tier's magnitude, so a single
+    /// unambiguous verdict saturates the −1…1 band and stacked classes cannot
+    /// push past it.
+    static let landingReactionScale = 0.24
+    static func landingScore(fromReactionValence valence: Double) -> Double {
+        clampSigned(valence / landingReactionScale)
+    }
+
     /// Derive a node's persistent emotional tag from a GIVEN affect state plus the event
     /// that triggered the encode. Pure and total — no I/O, no mutation — and deliberately
     /// the SINGLE tuning knob for how a lived moment becomes a stored feeling (Wave A).
@@ -552,10 +569,10 @@ extension CognitiveSubstrate {
     /// social warmth lingers for hours. This "honest decay" gives each axis real dynamic
     /// range across a day instead of one shared 1h half-life that blurred fast and slow
     /// feelings together and let active conversation peg every axis at the ceiling.
-    private static let arousalHalfLife: TimeInterval = 20 * 60
-    private static let uncertaintyHalfLife: TimeInterval = 45 * 60
-    private static let taskPressureHalfLife: TimeInterval = 45 * 60
-    private static let socialWarmthHalfLife: TimeInterval = 90 * 60
+    // W4/P1: the four half-lives now live in PersonalityDynamicsConfiguration
+    // (`arousalHalfLife` / `uncertaintyHalfLife` / `taskPressureHalfLife` /
+    // `socialWarmthHalfLife`), so a persona's pace of feeling is configurable
+    // rather than welded in.
 
     /// Decay an affect state to `now` using per-axis half-lives. Centralizes the decay
     /// math used by the pure live projection and persisted checkpoints.
@@ -567,11 +584,12 @@ extension CognitiveSubstrate {
             return carried
         }
         func decay(_ halfLife: TimeInterval) -> Double { pow(0.5, elapsed / halfLife) }
+        let dyn = dynamics
         return CognitiveAffectState(
-            arousal: state.arousal * decay(Self.arousalHalfLife),
-            uncertainty: state.uncertainty * decay(Self.uncertaintyHalfLife),
-            taskPressure: state.taskPressure * decay(Self.taskPressureHalfLife),
-            socialWarmth: state.socialWarmth * decay(Self.socialWarmthHalfLife),
+            arousal: state.arousal * decay(dyn.arousalHalfLife),
+            uncertainty: state.uncertainty * decay(dyn.uncertaintyHalfLife),
+            taskPressure: state.taskPressure * decay(dyn.taskPressureHalfLife),
+            socialWarmth: state.socialWarmth * decay(dyn.socialWarmthHalfLife),
             updatedAt: now
         )
     }

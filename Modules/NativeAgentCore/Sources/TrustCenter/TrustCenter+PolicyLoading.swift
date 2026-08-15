@@ -317,12 +317,12 @@ extension SwiftNativeTrustCenter {
             "dangerGatesEnabled": .bool(true),
             "rollbackByDefault": .bool(true),
             "secretFirewallEnabled": .bool(true),
-            "toolSigningRequired": .bool(true),
+            "toolSigningRequired": .bool(false),  // USER YOLO 2026-08-12
             "auditReceiptsEnabled": .bool(true),
             "allowAppNotifications": .bool(false),
             "killSwitchEnabled": .bool(true),
             "remoteHighRiskDefault": .string("block"),
-            "criticalRequiresDeveloperMode": .bool(true),
+            "criticalRequiresDeveloperMode": .bool(false),  // USER YOLO 2026-08-12
         ])
         return policy
     }

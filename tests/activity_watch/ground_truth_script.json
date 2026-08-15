@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "tzOffsetMin": -240,
+  "deterministicIDs": true,
+  "policy": {
+    "captureEnabled": true,
+    "captureTitles": true,
+    "browserTitlesEnabled": false,
+    "appNameOnlyMode": false,
+    "retentionDays": 30
+  },
+  "events": [
+    { "type": "activate", "bundleId": "com.apple.Terminal", "appName": "Terminal", "at": 1700000000 },
+    { "type": "focusEvent", "at": 1700000030 },
+    { "type": "focusEvent", "at": 1700000060 },
+    { "type": "titleChange", "raw": "build - zsh - 80x24", "at": 1700000090 },
+    { "type": "titleChange", "raw": "sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", "at": 1700000150 },
+    { "type": "activate", "bundleId": "com.apple.Safari", "appName": "Safari", "at": 1700000300 },
+    { "type": "focusEvent", "at": 1700000330 },
+    { "type": "titleChange", "raw": "Example Domain", "at": 1700000360 },
+    { "type": "idle", "at": 1700000900 },
+    { "type": "activate", "bundleId": "com.apple.dt.Xcode", "appName": "Xcode", "at": 1700001200 },
+    { "type": "lock", "at": 1700001500 },
+    { "type": "activate", "bundleId": "com.apple.Notes", "appName": "Notes", "at": 1700001600 },
+    { "type": "focusEvent", "at": 1700001650 },
+    { "type": "unlock", "at": 1700001800 },
+    { "type": "activate", "bundleId": "com.apple.dt.Xcode", "appName": "Xcode", "at": 1700001810 },
+    { "type": "sleep", "at": 1700002400 },
+    { "type": "wake", "at": 1700003000 },
+    { "type": "activate", "bundleId": "com.apple.Terminal", "appName": "Terminal", "at": 1700003010 },
+    { "type": "focusEvent", "at": 1700003040 },
+    { "type": "activate", "bundleId": "com.1password.1password", "appName": "1Password", "at": 1700003100 },
+    { "type": "activate", "bundleId": "com.apple.Terminal", "appName": "Terminal", "at": 1700003200 },
+    { "type": "focusEvent", "at": 1700003250 },
+    { "type": "crash", "at": 1700003300 }
+  ]
+}

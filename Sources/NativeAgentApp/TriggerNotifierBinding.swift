@@ -205,6 +205,13 @@ enum TriggerNotifierBinding {
     /// configure) keeps the plain `makeTriggerScheduler()`: they never fire, so
     /// they must never carry a sender.
     static func makeNotifyingTriggerScheduler() -> any TriggerSchedulerClient {
-        makeTriggerScheduler(notifier: pairedDevicePush)
+        // L5 G3: manual "fire now" is a FIRE site, so it gets the same brief a
+        // scheduled fire gets — synthesized lead over deterministic evidence.
+        // A "fire now" that produced a visibly different brief from the 8am one
+        // would make the button useless for checking what the 8am one will say.
+        makeTriggerScheduler(
+            notifier: pairedDevicePush,
+            morningBriefSynthesizer: BackgroundLoopsAssembly.makeMorningBriefSynthesizer()
+        )
     }
 }

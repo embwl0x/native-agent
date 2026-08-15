@@ -113,6 +113,15 @@ struct TrustCenterView: View {
 
                 MacControlPermissionsView()
 
+                // W8 (2026-08-14) — the ambient activity watcher's consent
+                // surface. Its own top-level panel rather than a cell in the
+                // Feature Permissions grid: this is the only feature in the app
+                // that records what the human does when they are not talking to
+                // the agent, its controls do not fit a four-line card, and
+                // burying the honest limits on title redaction inside a grid
+                // cell would be the wrong kind of tidy.
+                ActivityCapturePermissionsView()
+
                 advancedSection
 
                 Text(appModel.statusText)
@@ -121,8 +130,13 @@ struct TrustCenterView: View {
                     .textSelection(.enabled)
             }
             .padding()
+            // Taste pass 2026-08-11 (User: "spread out... not centered with
+            // eachother... sloppy"): pin the page to one readable column and
+            // center it, so every panel shares the same left/right edges
+            // instead of stretching controls across the full window width.
+            .frame(maxWidth: 1040, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .center)
         }
-        .padding()
         .navigationTitle("Trust")
         .task {
             if let policy = appModel.trustPolicy {
@@ -185,9 +199,12 @@ struct TrustCenterView: View {
                     .font(.caption)
                     .foregroundStyle(agentAccessMode == "full" ? .red : .secondary)
 
-                DisclosureGroup("What each mode allows", isExpanded: $showPolicyMap) {
+                DisclosureGroup(isExpanded: $showPolicyMap) {
                     PolicyMapView(policy: appModel.trustPolicy, activeMode: agentAccessMode)
                         .padding(.top, 8)
+                } label: {
+                    Text("What each mode allows")
+                        .togglesDisclosure($showPolicyMap)
                 }
 
                 Divider()
@@ -334,6 +351,7 @@ struct TrustCenterView: View {
                 }
                 Spacer()
             }
+            .togglesDisclosure($showAdvancedTrust)
         }
         .padding(NativeAgentSpacing.lg)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous))
@@ -667,6 +685,15 @@ struct TrustCenterView: View {
             if selectedMode == "full" || preset == .safe || preset == .work {
                 await appModel.saveAgentAccessMode(selectedMode, developerMode: false)
             } else {
+                // W1(a) 2026-08-11 (upgrade campaign; boarded 2026-07-23 as
+                // F5-H1): .builder previously saved ONLY the trust knobs.
+                // saveTrustPolicy writes no macControlPolicy block and the
+                // server merge is deep, so Full Mac -> Builder silently kept
+                // applescript/jxa/accessibility authority and an empty
+                // approval_required_for behind a "Power tools gated" label.
+                // Write the ABSOLUTE access-mode policy for the preset's mode
+                // first, then the remaining trust knobs.
+                await appModel.saveAgentAccessMode(selectedMode, developerMode: false)
                 await appModel.saveTrustPolicy(
                     permissionLevel: permissionLevel,
                     autonomyDefault: autonomyDefault,

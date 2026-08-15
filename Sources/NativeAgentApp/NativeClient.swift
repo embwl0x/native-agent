@@ -255,6 +255,17 @@ struct NativeClient {
             Spec(id: "memory", title: "Memory", relativePath: "memory", detail: "semantic memories, recall indexes, and knowledge graph state", exportable: true),
             Spec(id: "chat", title: "Chat", relativePath: "chat", detail: "chat sessions, messages, context receipts, and session state", exportable: true),
             Spec(id: "activity", title: "Activity", relativePath: "activity", detail: "activity events, traces, receipts, and runtime audit rows", exportable: true),
+            // W8 (2026-08-14) — the ambient activity watcher's store. A
+            // SEPARATE directory from `activity/` above, and `exportable:
+            // false`, both on purpose. `activity/` is the app's own event feed
+            // and it is exported, backed up and shipped in support bundles;
+            // putting a record of every window the human looked at inside it
+            // would have opted this feature into three egress paths by
+            // filename collision alone. Nothing copies `activity_watch` —
+            // not backups, not exports, not support bundles, not the iCloud
+            // snapshot — and ActivityWatchArchitectureTests reads those lists
+            // and fails if that changes.
+            Spec(id: "activity_watch", title: "Activity Capture", relativePath: "activity_watch", detail: "locally-recorded app usage spans (app name, duration, redacted window title where enabled) — never exported, backed up, or synced", exportable: false),
             Spec(id: "approvals", title: "Approvals", relativePath: "workflows/approvals", detail: "approval requests and resolved decisions", exportable: true),
             Spec(id: "connectors", title: "Connectors", relativePath: "connectors", detail: "connector registry, workspace records, and action receipts", exportable: true),
             Spec(id: "oauth_tokens", title: "OAuth Tokens", relativePath: "oauth_tokens", detail: "connector OAuth token material", exportable: false),
@@ -527,20 +538,6 @@ struct NativeClient {
     }
 }
 
-extension String {
-    func appendLine(to url: URL) throws {
-        let data = Data(self.utf8)
-        if FileManager.default.fileExists(atPath: url.path) {
-            let handle = try FileHandle(forWritingTo: url)
-            defer { try? handle.close() }
-            try handle.seekToEnd()
-            try handle.write(contentsOf: data)
-        } else {
-            try data.write(to: url)
-        }
-    }
-}
-
 struct SearchResponse: Codable {
     var results: [ResearchResult]
 }
@@ -621,7 +618,7 @@ struct DispatchOutput: Decodable {
     // `content`) instead of dropping it to nil. The module-side
     // `Dispatcher.DispatchOutput.value` (a JSONValue) is serialized to a JSON
     // string here, matching the shape `init(from:)` produces for an object/array
-    // on the HTTP path so `_decodeDispatchOutput` parses it identically.
+    // on the HTTP path so raw-string consumers parse it identically.
     init(rawString: String) {
         self.rawString = rawString
     }

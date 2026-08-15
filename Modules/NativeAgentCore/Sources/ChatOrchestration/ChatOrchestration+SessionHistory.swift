@@ -39,6 +39,10 @@ public struct SessionHistoryReadStats: Sendable, Equatable {
     public let linesRead: Int
     public let decodedCount: Int
     public let returnedCount: Int
+    /// L4-04: rows skipped because they belong to the CURRENT run. This is
+    /// the number that separates "fresh session, nothing to load" from
+    /// "history existed and decoded to nothing" in the turn trace.
+    public let excludedByRunId: Int
     public let truncated: Bool
 
     public init(
@@ -47,6 +51,7 @@ public struct SessionHistoryReadStats: Sendable, Equatable {
         bytesRead: Int64 = 0,
         linesRead: Int = 0,
         decodedCount: Int = 0,
+        excludedByRunId: Int = 0,
         returnedCount: Int = 0,
         truncated: Bool = false
     ) {
@@ -55,6 +60,7 @@ public struct SessionHistoryReadStats: Sendable, Equatable {
         self.bytesRead = bytesRead
         self.linesRead = linesRead
         self.decodedCount = decodedCount
+        self.excludedByRunId = excludedByRunId
         self.returnedCount = returnedCount
         self.truncated = truncated
     }
@@ -208,10 +214,11 @@ public actor SessionHistoryReader {
             truncatedRead = false
             mode = "full"
         }
-        var msgs = Self.decodeMessages(
+        let decodeResult = Self.decodeMessages(
             from: lines,
             excludingRunId: shouldExcludeRun ? excludedRunId : nil
         )
+        var msgs = decodeResult.messages
         let decodedCount = msgs.count
         var truncated = truncatedRead
         if let limit, limit >= 0, msgs.count > limit {
@@ -226,6 +233,7 @@ public actor SessionHistoryReader {
                 bytesRead: bytesRead,
                 linesRead: lines.count,
                 decodedCount: decodedCount,
+                excludedByRunId: decodeResult.excludedByRunId,
                 returnedCount: msgs.count,
                 truncated: truncated
             )
@@ -290,10 +298,11 @@ public actor SessionHistoryReader {
             minimumLineCount: max(64, tailLimit),
             maximumBytes: Self.promptTailMaximumBytes
         )
-        let decoded = Self.decodeMessages(
+        let decodeResult = Self.decodeMessages(
             from: head.lines + tail.lines,
             excludingRunId: shouldExcludeRun ? excludedRunId : nil
         )
+        let decoded = decodeResult.messages
         var seen: Set<String> = []
         var out: [ChatMessage] = []
         for msg in decoded {
@@ -310,6 +319,7 @@ public actor SessionHistoryReader {
                 bytesRead: head.bytesRead + tail.bytesRead,
                 linesRead: head.lines.count + tail.lines.count,
                 decodedCount: decoded.count,
+                excludedByRunId: decodeResult.excludedByRunId,
                 returnedCount: out.count,
                 truncated: head.truncated || tail.truncated || decoded.count != out.count
             )
@@ -359,10 +369,11 @@ public actor SessionHistoryReader {
             )
             mode = "relevance_sampled"
         }
-        let decoded = Self.decodeMessages(
+        let decodeResult = Self.decodeMessages(
             from: lineRead.lines,
             excludingRunId: shouldExcludeRun ? excludedRunId : nil
         )
+        let decoded = decodeResult.messages
         var seen: Set<String> = []
         var out: [ChatMessage] = []
         out.reserveCapacity(decoded.count)
@@ -379,6 +390,7 @@ public actor SessionHistoryReader {
                 bytesRead: lineRead.bytesRead,
                 linesRead: lineRead.lines.count,
                 decodedCount: decoded.count,
+                excludedByRunId: decodeResult.excludedByRunId,
                 returnedCount: out.count,
                 truncated: lineRead.truncated || decoded.count != out.count
             )
@@ -579,8 +591,9 @@ public actor SessionHistoryReader {
     private nonisolated static func decodeMessages(
         from lines: [String],
         excludingRunId: String?
-    ) -> [ChatMessage] {
+    ) -> (messages: [ChatMessage], excludedByRunId: Int) {
         var msgs: [ChatMessage] = []
+        var excludedCount = 0
         msgs.reserveCapacity(lines.count)
         for line in lines {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -590,6 +603,7 @@ public actor SessionHistoryReader {
             guard case .object(let obj) = parsed else { continue }
             if let excludingRunId,
                message(parsed, hasRunId: excludingRunId) {
+                excludedCount += 1
                 continue
             }
             var role: String? = nil
@@ -607,7 +621,7 @@ public actor SessionHistoryReader {
                 extras: parsed
             ))
         }
-        return msgs
+        return (msgs, excludedCount)
     }
 
     private nonisolated static func message(_ value: JSONValue, hasRunId runId: String) -> Bool {
@@ -684,8 +698,20 @@ extension SwiftNativeTurnEngine {
         personaOverride: String?,
         excludeHistoryRunId: String? = nil,
         sessionDigest: SessionDigestProvider? = nil,
-        imageBlocks: [LLMContentBlock] = []
+        imageBlocks: [LLMContentBlock] = [],
+        // Raw user text for relevance consumers (recall query, expression
+        // cues, and the selection/embedding inputs downstream) when
+        // `userMessage` carries turn-scoped wire riders (text-compat
+        // tool-routing hint). nil → `userMessage`.
+        queryUserMessage: String? = nil,
+        // Turn-start instant for the clock line (see buildTurnContext) —
+        // tool loops pass the same value every iteration.
+        clockNowOverride: Date? = nil
     ) async throws -> TurnContext {
+        // Non-nil queryUserMessage is authoritative EVEN WHEN BLANK — an
+        // attachment-only text-compat turn must not fall back to the hinted
+        // wire message (gpt-5.5 review 2026-08-13, NEEDS-FIX #1).
+        let queryMessage = queryUserMessage ?? userMessage
         var trace = ContextStageTrace()
         let prior: [ChatMessage]
         let middleCandidates: [ChatMessage]
@@ -729,7 +755,7 @@ extension SwiftNativeTurnEngine {
         }
         let expandedRecallQuery = await trace.measure("history.recall_query") {
             SessionHistoryPromptRenderer.recallQuery(
-                userMessage: userMessage,
+                userMessage: queryMessage,
                 messages: prior
             )
         }
@@ -744,7 +770,8 @@ extension SwiftNativeTurnEngine {
                 recallQueryOverride: expandedRecallQuery,
                 includeClockContext: false,
                 sessionID: sessionId,
-                recentTurns: prior.suffix(4).map(\.content)
+                recentTurns: prior.suffix(4).map(\.content),
+                queryUserMessage: queryMessage
             )
             trace.record("context.base", since: baseStartNs)
         } catch {
@@ -759,7 +786,7 @@ extension SwiftNativeTurnEngine {
             )
         }
         let naturalExpressionCue = naturalExpressionGuidanceEnabled
-            ? NaturalExpressionGuidance.pendingRutCue(from: prior)
+            ? NaturalExpressionGuidance.pendingCues(from: prior, userMessage: queryMessage)
             : nil
         trace.setFlag("expression.rhythmCuePending", naturalExpressionCue != nil)
         // Sweep R4 W3: the ONLY production caller of the history renderer, and
@@ -794,6 +821,7 @@ extension SwiftNativeTurnEngine {
         trace.setCount("history.prompt.bytesRead", priorStats.bytesRead)
         trace.setCount("history.prompt.linesRead", priorStats.linesRead)
         trace.setCount("history.prompt.decoded", priorStats.decodedCount)
+        trace.setCount("history.prompt.excludedByRunId", priorStats.excludedByRunId)
         trace.setCount("history.prompt.returned", priorStats.returnedCount)
         trace.setFlag("history.prompt.truncated", priorStats.truncated)
         if let middleStats {
@@ -828,7 +856,8 @@ extension SwiftNativeTurnEngine {
         // digest always reads the same store the history comes from.
         guard let historyBlock else {
             let runtimeStartNs = DispatchTime.now().uptimeNanoseconds
-            let clockedBase = await contextByAppendingCurrentTurnFacts(base)
+            let clockedBase = await contextByAppendingCurrentTurnFacts(
+                base, clockNowOverride: clockNowOverride)
             let finalBase = Self.contextBySettingNaturalExpressionCue(
                 clockedBase,
                 cue: naturalExpressionCue
@@ -905,7 +934,8 @@ extension SwiftNativeTurnEngine {
             fluidContextTurn: base.fluidContextTurn
         )
         let runtimeStartNs = DispatchTime.now().uptimeNanoseconds
-        let clocked = await contextByAppendingCurrentTurnFacts(contextWithHistory)
+        let clocked = await contextByAppendingCurrentTurnFacts(
+            contextWithHistory, clockNowOverride: clockNowOverride)
         let finalContext = Self.contextBySettingNaturalExpressionCue(
             clocked,
             cue: naturalExpressionCue

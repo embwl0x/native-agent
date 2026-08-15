@@ -107,34 +107,4 @@ extension NativeClient {
             throw URLError(.resourceUnavailable)
         }
     }
-    func searchKG(q: String) async throws -> KGSearchResponse {
-        // Empty query keeps the old empty-results contract.
-        if q.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return KGSearchResponse(results: [])
-        }
-        let reader = makeKnowledgeGraphReader()
-        let env = try await reader.searchChecked(q: q)
-        let data = try env.serializedData(pretty: false)
-        return try JSONDecoder.nativeAgent.decode(KGSearchResponse.self, from: data)
-    }
-    // Forget writes run in-process against the co-located data root. The
-    // client selects authoritative memory.sqlite whenever it exists and uses
-    // JSON only for a true pre-SQLite store.
-    func forgetKGEntity(id: String, reason: String) async throws -> [String: Any] {
-        // Reject an empty entity id before any graph mutation setup.
-        if id.isEmpty {
-            throw NSError(domain: "NativeAgent", code: 400,
-                          userInfo: [NSLocalizedDescriptionKey: "entity_id required"])
-        }
-        let impl = makeKnowledgeGraphForgetClient(
-            graphPath: SwiftNativeKnowledgeGraphReader.defaultPath()
-        )
-        let result = try await impl.forgetEntity(entityId: id, reason: reason)
-        let data = try result.serializedData(pretty: false)
-        guard let dict = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw NSError(domain: "NativeAgent", code: -4,
-                          userInfo: [NSLocalizedDescriptionKey: "KG forget native response was not a JSON object"])
-        }
-        return dict
-    }
 }

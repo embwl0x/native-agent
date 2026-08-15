@@ -25,8 +25,6 @@ actor InMemoryMemoryStorageStub: MemoryV2Storage {
         memories[record.id] = (record, embedding)
         return inserted
     }
-    func proposalExists(id: String) async throws -> Bool { proposals[id] != nil }
-    func insertProposal(id: String, raw: JSONValue) async throws { proposals[id] = raw }
     func deleteProposal(id: String) async throws -> Bool {
         proposals.removeValue(forKey: id) != nil
     }

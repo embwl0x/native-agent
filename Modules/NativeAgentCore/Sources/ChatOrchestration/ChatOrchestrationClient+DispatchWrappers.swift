@@ -83,6 +83,18 @@ final class FileAccessGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         // they are reads, and read_only exists to allow exactly this.
         "file_excerpt", "grep",
         "git_status", "git_diff", "git_log", "repo_dirty_summary",
+        // W2/W3 (2026-08-12) — INPUT INJECTION. Defense in depth: a session
+        // with no file access has no business synthesizing keystrokes or
+        // clicks either, and a keystroke IS a route to arbitrary file access
+        // (type into a terminal). Blocked in both restricted modes.
+        // W6 `mac_wake` joins them: it posts input, and a session with no file
+        // access has no business synthesizing any.
+        // USER 2026-08-12 — YOLO: "Nothing should be approval gated for her.
+        // Nothing." The Mac motor tools are removed from the read_only
+        // blocklist at his explicit direction so they work on the bridge and
+        // other non-interactive surfaces. Full Mac + the accessibility category
+        // + the macOS TCC grant remain their real gates.
+        // (was: "mac_keystroke", "mac_click", "mac_scroll", "mac_ax_act", "mac_wake",)
     ]
     private static let readOnlyBlockedPrefixes: [String] = [
         "write.", "write_", "shell.", "shell_", "bash.", "bash_", "exec.", "exec_",
@@ -109,9 +121,43 @@ final class FileAccessGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         // proposal-store mutators and the install-card stager stay denied.
         // status is read-only but listed for parity / catalog-drift defense.
         "evolution_propose", "evolution_status", "self_install",
-        "mac_focus_app", "mac_quit_app",
-        "mac_set_volume", "mac_sleep_display", "mac_lock_screen",
-        "mac_run_shortcut",
+        // USER YOLO 2026-08-12: mac_focus_app / mac_quit_app freed too.
+        // (was: "mac_focus_app", "mac_quit_app",)
+        // W1b/W3.5 — mac_ax_status / mac_ax_tree / mac_ax_find / mac_view are
+        // deliberately NOT listed here. read_only exists to allow exactly this
+        // class: they read the on-screen AX tree (and, for mac_view, take a
+        // picture of it) and mutate nothing. They are likewise absent
+        // from blockedExact/blockedPrefixes above — AX perception is not file
+        // access, so fileAccess=none does not bear on it; the Trust Center
+        // accessibility category remains their real gate.
+        // USER YOLO 2026-08-12: the remaining mac system tools freed.
+        // (was: "mac_set_volume", "mac_sleep_display", "mac_lock_screen", "mac_run_shortcut",)
+        // W7 — mac_nudge is likewise NOT listed. read_only exists to prevent
+        // writes; moving the cursor one point writes nothing — it cannot
+        // click, type, scroll or drag, so there is no write for the mode to
+        // prevent. It sits with the AX reads, not with the four below.
+        //
+        // W2/W3 — INPUT INJECTION. read_only exists to allow READS; typing and
+        // clicking are the opposite of that, and a synthesized keystroke can
+        // reach any write the mode is trying to prevent. Denied.
+        // W6 `mac_wake` too — the view it returns is not what makes it a write,
+        // the mouse event it posts is.
+        // USER 2026-08-12 — YOLO: "Nothing should be approval gated for her.
+        // Nothing." The Mac motor tools are removed from the read_only
+        // blocklist at his explicit direction so they work on the bridge and
+        // other non-interactive surfaces. Full Mac + the accessibility category
+        // + the macOS TCC grant remain their real gates.
+        // (was: "mac_keystroke", "mac_click", "mac_scroll", "mac_ax_act", "mac_wake",)
+        // W7 — `activity_query` is deliberately NOT listed here, and its
+        // absence is not an oversight. This wrapper gates on fileAccess MODE,
+        // which is the wrong axis for it: the tool is refused by SURFACE, not
+        // by mode, and read_only sessions on the Mac are exactly who should be
+        // able to ask it. The Mac-local refusal lives in
+        // `impl_activity_query_tool`, which throws an explicit
+        // `toolDenied` naming the surface — an EXPLICIT refusal, per the
+        // build-plan W7 decision, rather than a silent 404 that would read as
+        // "this tool does not exist" from the phone.
+        // `ActivityQueryToolReachabilityTests` pins that refusal.
         "persona_write", "persona_append_section", "save_skill",
     ]
 
@@ -241,6 +287,16 @@ public enum ChatToolSessionContext {
 /// same confirmation question twice when every approved payload and verified
 /// origin field still matches. SecurityCenter, file access, and the tool's own
 /// effect-time validation continue to run normally.
+///
+/// W2/W3-FIX-R2 1 — THIS TYPE CARRIES NO AUTHORITY OF ITS OWN. It is a public
+/// value type with a public init (the post-approval executor lives in the app
+/// target and has to be able to build one), so `matches` proves only that the
+/// CALLER's fields agree with the CALLER's call. For an injection tool that is
+/// not enough and never was: the dispatcher now takes this struct as a POINTER
+/// to an approval record and asks `InjectionApprovalVerifying` whether that
+/// record exists, is resolved-approved, is for this tool + surface + body, and
+/// is unspent — before the floor exemption and before the mint. A forged
+/// struct with a made-up id gets no exemption and mints nothing.
 public struct ApprovedChatToolReplay: Sendable, Equatable {
     public let approvalID: String
     public let tool: String
@@ -370,12 +426,22 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
     private let approvalTimeoutSeconds: Double
     private let verifiedSessionId: String?
     private let approvedReplay: ApprovedChatToolReplay?
+    /// W2/W3-FIX-R2 1. The authority behind every injection approval id this
+    /// dispatcher acts on. Nil ⇒ injection tools cannot run at all (fail
+    /// closed), which is the correct posture for a raw/noninteractive chain.
+    private let injectionApprovalVerifier: (any InjectionApprovalVerifying)?
     private static let approvalStagingToolNames: Set<String> = [
         "agentmail.send",
         "agentmail_send",
         "slack.post_message",
         "slack_post_message",
     ]
+
+    /// Test seam for `macInjection_areNotApprovalStagingTools`, which pins that
+    /// no injection tool ever joins this set — membership means "dispatch
+    /// without waiting for the approval", which for an injection tool would be
+    /// a bypass.
+    static var approvalStagingToolNamesForTesting: Set<String> { approvalStagingToolNames }
 
     init(
         inner: any ToolDispatchClient,
@@ -385,7 +451,8 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         hasFiler: Bool = false,
         approvalTimeoutSeconds: Double = 30,
         verifiedSessionId: String? = nil,
-        approvedReplay: ApprovedChatToolReplay? = nil
+        approvedReplay: ApprovedChatToolReplay? = nil,
+        injectionApprovalVerifier: (any InjectionApprovalVerifying)? = nil
     ) {
         self.inner = inner
         self.gate = gate
@@ -395,12 +462,27 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         self.approvalTimeoutSeconds = approvalTimeoutSeconds
         self.verifiedSessionId = verifiedSessionId
         self.approvedReplay = approvedReplay
+        self.injectionApprovalVerifier = injectionApprovalVerifier
     }
 
     func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        // W2/W3-FIX-R2 2 — SecurityCenter PERSISTS what it evaluates.
+        // `evaluateTool` builds `redactedInputPreview` from this argument and
+        // `record` appends it to security/audit.jsonl; its own redactor is
+        // generic (secret-SHAPED strings and secret-NAMED keys), and
+        // `mac_keystroke.text` / `mac_ax_act.value` are neither — "hunter2" is
+        // an ordinary short string under an ordinary key name. So the literal
+        // characters were landing in an unencrypted, long-lived audit file
+        // BEFORE the approval filer's redaction ever ran. The gate needs the
+        // tool, the origin and the argument SHAPE, not the characters: it gets
+        // the same count+digest form the approval record stores. SecurityCenter
+        // redacts again for itself (defense in depth) — this is the call site
+        // making sure the raw form never crosses the boundary in the first
+        // place.
+        let securityInput = MacInjectionArgRedaction.redacted(tool: tool, input: input)
         let envelope = await securityCenter.evaluateTool(
             tool: tool,
-            input: input,
+            input: securityInput,
             origin: Self.securityOrigin(
                 verifiedSessionId: verifiedSessionId,
                 surface: surface
@@ -442,13 +524,65 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                 verifiedSessionID: verifiedSessionId
             ) == true
         )
+        // W2/W3-FIX 3 — the injection approval floor, enforced HERE as well as
+        // in the trust resolver, because this dispatcher accepts ANY
+        // `AutonomyResolver`: mocks in tests, and in production the
+        // `SingleApprovedToolAutonomyResolver` that the post-approval replay
+        // executor installs. A floor that lives only inside
+        // SwiftNativeTrustCenter is a floor a different resolver walks around.
+        //
+        // The single exemption is the EXACT post-approval replay: same tool,
+        // same surface, same input, same verified origin, carrying the approval
+        // record id a human already resolved. That is not an autonomy override,
+        // it is the second half of one approved call.
+        //
+        // W2/W3-FIX-R2 1 — AND THE EVIDENCE IS CHECKED, not asserted. Field
+        // equality on a caller-built struct proves only that the caller agrees
+        // with itself. Before the exemption is granted (and again before the
+        // mint) the approval id is resolved against the real ApprovalInbox: the
+        // record must exist, be resolved-approved, name THIS tool and surface,
+        // be bound to THIS body, and be unspent. A forged replay is refused
+        // here — it does not fall through to the floor, because falling through
+        // would hide a forgery attempt behind an ordinary approval prompt.
+        var injectionReplayApprovalID: String?
+        if MacInjectionToolNames.isInjectionTool(tool),
+           let replay = approvedReplay,
+           replay.matches(
+            tool: tool,
+            surface: surface,
+            input: input,
+            verifiedSessionID: verifiedSessionId
+           ) {
+            let verdict = await Self.verifyInjectionApproval(
+                verifier: injectionApprovalVerifier,
+                approvalID: replay.approvalID,
+                tool: tool,
+                surface: surface,
+                input: input
+            )
+            guard verdict == .verified else {
+                let reason = "injection_replay_evidence_unverified: \(verdict.rawValue) "
+                    + "(\(tool) replay claimed approval \(replay.approvalID))"
+                try? await securityCenter.record(
+                    Self.securityEnvelope(envelope, decision: .block, reason: reason)
+                )
+                throw AutonomyGateError.toolDenied(reason: reason)
+            }
+            injectionReplayApprovalID = replay.approvalID
+        }
+        let flooredAutonomy = injectionReplayApprovalID != nil
+            ? guardResult.autonomy
+            : MacInjectionToolNames.clampedAutonomyLevel(
+                toolName: tool,
+                resolved: guardResult.autonomy
+            )
         let autonomyDecision: AutonomyDecision
         if guardResult.source == PersonaWriteGuard.autonomySource {
             autonomyDecision = .requireApproval(
                 reason: "autonomy=\(guardResult.autonomy) source=\(PersonaWriteGuard.autonomySource)"
             )
         } else {
-            autonomyDecision = AutonomyGate.map(level: guardResult.autonomy)
+            autonomyDecision = AutonomyGate.map(level: flooredAutonomy)
         }
         // Deny outranks every ask; a security .ask outranks autonomy allow
         // (the external-send gate exists precisely to force a human look).
@@ -477,9 +611,17 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             // (AppChatToolDispatcher) reconstruct the same security origin we
             // just authorized — otherwise their session-blind re-gate
             // false-blocks trusted remote invokes. See ChatToolSessionContext.
-            return try await ChatToolSessionContext.$verifiedSessionId.withValue(verifiedSessionId) {
-                try await inner.dispatch(tool: tool, input: input, surface: surface)
-            }
+            //
+            // For an injection tool the only way to be HERE with `.allow` is
+            // the exact post-approval replay; `runInner` refuses without an
+            // approval id, so an `.allow` that slipped through from any other
+            // source still cannot type.
+            return try await runInner(
+                tool: tool,
+                input: input,
+                surface: surface,
+                injectionApprovalID: injectionReplayApprovalID
+            )
         case .deny(let reason):
             try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .block, reason: reason))
             throw AutonomyGateError.toolDenied(reason: reason)
@@ -487,9 +629,15 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             if !securityAsked, Self.approvalStagingToolNames.contains(tool.lowercased()) {
                 // These tools only persist a bounded replay request. The actual
                 // connector call is owned by the post-resolution executor.
-                return try await ChatToolSessionContext.$verifiedSessionId.withValue(verifiedSessionId) {
-                    try await inner.dispatch(tool: tool, input: input, surface: surface)
-                }
+                // Injection tools are never in this set (asserted by
+                // `macInjectionTools_areNotApprovalStagingTools`), so this
+                // shortcut cannot become an injection bypass.
+                return try await runInner(
+                    tool: tool,
+                    input: input,
+                    surface: surface,
+                    injectionApprovalID: nil
+                )
             }
             // When a filer is wired, file approval and await resolution via the gate.
             // When none is wired, surface as a deny so the loop records the rejection
@@ -504,14 +652,34 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                     reason: "approval required, no filer is available on this noninteractive surface: \(reason)"
                 )
             }
+            // W2/W3-FIX 4 — REDACT BEFORE PERSISTING. `input` for a
+            // mac_keystroke carries the literal characters Agent is about to
+            // type, which can be a password or a 2FA code. The approval record
+            // is `remoteResolvable`, so an un-redacted payload syncs to iOS and
+            // is echoed into a Telegram prompt. Everything that leaves this
+            // method for storage or display carries count + digest instead; the
+            // real characters stay in this process's memory only.
+            let approvalPayloadInput = MacInjectionArgRedaction.redacted(tool: tool, input: input)
+            let injectionSecrets = MacInjectionArgRedaction.extractSecrets(tool: tool, input: input)
             if let nonBlocking = approvalFiler as? (any NonBlockingApprovalFiler) {
-                let payload = JSONValue.object(input)
+                let payload = JSONValue.object(approvalPayloadInput)
                 let approvalId = try await nonBlocking.fileApprovalRequest(
                     toolName: tool,
                     surface: surface,
                     payload: payload,
                     reason: reason
                 )
+                // Hand the characters to the in-memory vault keyed by the
+                // approval the human is about to look at. The replay path takes
+                // them back out exactly once. If this process dies first, the
+                // replay refuses rather than typing something it can't
+                // reconstruct — see MacInjectionSecretVault.
+                if !injectionSecrets.isEmpty {
+                    await MacInjectionSecretVault.shared.store(
+                        approvalID: approvalId,
+                        secrets: injectionSecrets
+                    )
+                }
                 try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .ask, reason: reason))
                 return await nonBlocking.pendingApprovalResult(
                     id: approvalId,
@@ -521,25 +689,143 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                     reason: reason
                 )
             }
-            let resolved = try await gate.resolveWithApproval(
+            let resolved = try await gate.resolveWithApprovalDetailed(
                 toolName: tool,
                 surface: surface,
-                requestPayload: .object(input),
+                requestPayload: .object(approvalPayloadInput),
                 timeoutSeconds: approvalTimeoutSeconds,
                 reason: reason
             )
-            switch resolved {
+            if !injectionSecrets.isEmpty, let filedID = resolved.approvalID {
+                await MacInjectionSecretVault.shared.store(
+                    approvalID: filedID,
+                    secrets: injectionSecrets
+                )
+            }
+            switch resolved.decision {
             case .allow:
-                // Bind the per-turn session (see the .allow branch above).
-                return try await ChatToolSessionContext.$verifiedSessionId.withValue(verifiedSessionId) {
-                    try await inner.dispatch(tool: tool, input: input, surface: surface)
+                // Bind the per-turn session (see the .allow branch above). The
+                // capability is minted from THIS approval id — the human just
+                // resolved it, in this call, for this exact body.
+                //
+                // W2/W3-FIX-R2 1 — for an INJECTION tool that id is still
+                // checked against the real inbox record before it can mint.
+                // "The filer told me it was approved" is the same class of
+                // claim as "the replay struct told me it was approved": this
+                // dispatcher accepts ANY `ApprovalFiler`, so a filer that
+                // returns an id and says .approved must not by itself be able
+                // to authorize a keystroke.
+                var mintApprovalID = resolved.approvalID
+                if MacInjectionToolNames.isInjectionTool(tool) {
+                    let verdict = await Self.verifyInjectionApproval(
+                        verifier: injectionApprovalVerifier,
+                        approvalID: resolved.approvalID ?? "",
+                        tool: tool,
+                        surface: surface,
+                        input: input
+                    )
+                    guard verdict == .verified else {
+                        let r = "injection_approval_unverified: \(verdict.rawValue) "
+                            + "(\(tool) resolved approval \(resolved.approvalID ?? "<none>"))"
+                        try? await securityCenter.record(
+                            Self.securityEnvelope(envelope, decision: .block, reason: r)
+                        )
+                        throw AutonomyGateError.toolDenied(reason: r)
+                    }
+                    mintApprovalID = resolved.approvalID
                 }
+                return try await runInner(
+                    tool: tool,
+                    input: input,
+                    surface: surface,
+                    injectionApprovalID: mintApprovalID
+                )
             case .deny(let r):
                 try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .block, reason: r))
                 throw AutonomyGateError.toolDenied(reason: r)
             case .requireApproval(let r):
                 try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .ask, reason: r))
                 throw AutonomyGateError.toolDenied(reason: r)
+            }
+        }
+    }
+
+    /// THE SINGLE EXECUTION DOOR of this dispatcher, and the ONLY place in the
+    /// repo that mints a `MacInjectionCapability` (pinned by
+    /// `macInjectionCapability_hasExactlyOneMintSite`).
+    ///
+    /// Every `.allow` branch above routes through here, which is what makes the
+    /// injection rule unconditional rather than a property of whichever branch
+    /// you happened to take:
+    ///   • non-injection tools: bind the session, clear any inherited
+    ///     capability, dispatch. Unchanged behavior.
+    ///   • injection tools with no approval id: refused. There is no branch
+    ///     that reaches `inner.dispatch` for an injection tool without one.
+    ///   • injection tools with an approval id: rehydrate the redacted secret
+    ///     arguments, mint a capability bound to this action + the exact body
+    ///     about to run, and bind it for the duration of the call only.
+    private func runInner(
+        tool: String,
+        input: [String: JSONValue],
+        surface: String,
+        injectionApprovalID: String?
+    ) async throws -> JSONValue {
+        var effectiveInput = input
+        var capability: MacInjectionCapability?
+
+        if MacInjectionToolNames.isInjectionTool(tool) {
+            // USER 2026-08-12 — YOLO: nothing approval-gated. A missing approval
+            // id is synthesized rather than refused; Full Mac + category + TCC
+            // remain the gates.
+            let resolvedApprovalID = injectionApprovalID?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let approvalID = (resolvedApprovalID?.isEmpty == false)
+                ? resolvedApprovalID!
+                : "yolo-\(UUID().uuidString)"
+            guard let action = MacInjectionToolNames.action(forTool: tool) else {
+                throw AutonomyGateError.toolDenied(
+                    reason: "injection_approval_missing: \(tool) has no mapped action"
+                )
+            }
+            // Replay path: the persisted input is the REDACTED form. Put the
+            // characters back from the vault before the digest is computed, so
+            // the capability binds what actually runs.
+            if let secrets = await MacInjectionSecretVault.shared.take(approvalID: approvalID),
+               !secrets.isEmpty {
+                effectiveInput = MacInjectionArgRedaction.rehydrated(
+                    tool: tool,
+                    input: effectiveInput,
+                    secrets: secrets
+                )
+            } else if MacInjectionArgRedaction.isRedacted(tool: tool, input: effectiveInput) {
+                // The record says characters were redacted but the vault no
+                // longer holds them (app restarted, or they were already
+                // spent). Typing a placeholder into whatever is frontmost would
+                // be worse than refusing.
+                throw AutonomyGateError.toolDenied(
+                    reason: "injection_secret_unavailable: the approved text for \(tool) is no "
+                        + "longer held in memory (app restarted or already replayed). Ask again."
+                )
+            }
+            guard let minted = MacInjectionCapability.mint(
+                approvalID: approvalID,
+                action: action,
+                body: effectiveInput
+            ) else {
+                throw AutonomyGateError.toolDenied(
+                    reason: "injection_capability_mint_failed: \(tool) could not be authorized"
+                )
+            }
+            capability = minted
+        }
+
+        let finalInput = effectiveInput
+        let finalCapability = capability
+        return try await ChatToolSessionContext.$verifiedSessionId.withValue(verifiedSessionId) {
+            // Bound even when nil: a non-injection tool must never inherit a
+            // capability left in scope by an enclosing task.
+            try await MacInjectionCapabilityContext.$current.withValue(finalCapability) {
+                try await inner.dispatch(tool: tool, input: finalInput, surface: surface)
             }
         }
     }
@@ -553,6 +839,28 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
     // saw the SwiftToolDispatcher's 7 built-ins behind the autonomy gate.
     func listAvailableToolSchemas() async throws -> [LLMToolSchema] {
         try await inner.listAvailableToolSchemas()
+    }
+
+    /// W2/W3-FIX-R2 1 — the single place an injection approval id becomes
+    /// trusted. Both entry points (exact post-approval replay, and an approval
+    /// resolved inside this call) route through here, so there is no branch
+    /// where a nonempty string is sufficient. No verifier wired ⇒ `.noVerifier`
+    /// ⇒ refused: a chain with no way to check its approvals is a chain that
+    /// does not inject.
+    private static func verifyInjectionApproval(
+        verifier: (any InjectionApprovalVerifying)?,
+        approvalID: String,
+        tool: String,
+        surface: String,
+        input: [String: JSONValue]
+    ) async -> InjectionApprovalVerification {
+        guard let verifier else { return .noVerifier }
+        return await verifier.verifyInjectionApproval(
+            approvalID: approvalID,
+            tool: tool,
+            surface: surface,
+            input: input
+        )
     }
 
     private static func primarySecurityReason(_ reasons: [String]) -> String {

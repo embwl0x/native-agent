@@ -116,6 +116,135 @@ private func writeFile(_ url: URL, bytes: Int) throws {
     #expect(DataRootDiskHygiene.defaultMaxDepth == 7)
 }
 
+// MARK: - Cleanup (user-initiated)
+
+// The default single-file tripwire sits at 1GB (raised 2026-08-11 from 64MB,
+// which permanently false-alarmed on the 86.7MB MiniLM embedder blob).
+@Test func defaultSingleFileThresholdIsOneGB() {
+    #expect(DataRootDiskHygiene.defaultSingleFileThreshold == 1024 * 1024 * 1024)
+}
+
+@Test func cleanupTrashesARegularFileAndReportsFreedBytes() throws {
+    let root = hygieneTempDir()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try writeFile(root.appendingPathComponent("logs/huge.jsonl"), bytes: 2000)
+    var trashedURLs: [URL] = []
+    let result = DataRootDiskHygiene.cleanup(
+        dataRoot: root,
+        relativePaths: ["logs/huge.jsonl"],
+        trash: { trashedURLs.append($0) }
+    )
+    #expect(trashedURLs.map(\.lastPathComponent) == ["huge.jsonl"])
+    #expect(result.trashed.count == 1)
+    #expect(result.skipped.isEmpty)
+    #expect(result.freedBytes == 2000)
+}
+
+@Test func cleanupRefusesPathTraversalOutsideDataRoot() throws {
+    let root = hygieneTempDir()
+    defer { try? FileManager.default.removeItem(at: root) }
+    // A sibling file the traversal would reach if containment failed.
+    let sibling = root.deletingLastPathComponent()
+        .appendingPathComponent("hygiene-victim-\(UUID().uuidString).txt")
+    try Data("do not touch".utf8).write(to: sibling)
+    defer { try? FileManager.default.removeItem(at: sibling) }
+    var trashedURLs: [URL] = []
+    let result = DataRootDiskHygiene.cleanup(
+        dataRoot: root,
+        relativePaths: ["../\(sibling.lastPathComponent)", "/etc/hosts"],
+        trash: { trashedURLs.append($0) }
+    )
+    #expect(trashedURLs.isEmpty)
+    #expect(result.trashed.isEmpty)
+    #expect(result.skipped.count == 2)
+    #expect(result.skipped.allSatisfy { $0.skippedReason == "outside the data directory" })
+}
+
+@Test func cleanupRefusesProtectedModelCache() throws {
+    let root = hygieneTempDir()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let rel = "extras/hf_cache/hub/models--x/blobs/deadbeef"
+    try writeFile(root.appendingPathComponent(rel), bytes: 2000)
+    var trashedURLs: [URL] = []
+    let result = DataRootDiskHygiene.cleanup(
+        dataRoot: root, relativePaths: [rel], trash: { trashedURLs.append($0) })
+    #expect(trashedURLs.isEmpty)
+    #expect(result.trashed.isEmpty)
+    #expect(result.skipped.first?.skippedReason?.contains("protected store") == true)
+}
+
+@Test func cleanupSkipsMissingFilesDirectoriesAndSymlinks() throws {
+    let root = hygieneTempDir()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try FileManager.default.createDirectory(
+        at: root.appendingPathComponent("a-directory"), withIntermediateDirectories: true)
+    try writeFile(root.appendingPathComponent("real.bin"), bytes: 100)
+    try FileManager.default.createSymbolicLink(
+        at: root.appendingPathComponent("a-link"),
+        withDestinationURL: root.appendingPathComponent("real.bin"))
+    var trashedURLs: [URL] = []
+    let result = DataRootDiskHygiene.cleanup(
+        dataRoot: root,
+        relativePaths: ["gone.bin", "a-directory", "a-link"],
+        trash: { trashedURLs.append($0) })
+    #expect(trashedURLs.isEmpty)
+    #expect(result.trashed.isEmpty)
+    #expect(result.skipped.count == 3)
+    // The real file was never touched through the symlink.
+    #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("real.bin").path))
+}
+
+// gpt-5.5 review BLOCKING regression: a symlinked PARENT directory under the
+// data root must not smuggle the real target outside it.
+@Test func cleanupRefusesFileReachedThroughSymlinkedParentEscapingRoot() throws {
+    let root = hygieneTempDir()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let outside = hygieneTempDir()
+    defer { try? FileManager.default.removeItem(at: outside) }
+    try writeFile(outside.appendingPathComponent("victim.bin"), bytes: 700)
+    // root/logs -> outside; "logs/victim.bin" is lexically inside the root
+    // but resolves outside it.
+    try FileManager.default.createSymbolicLink(
+        at: root.appendingPathComponent("logs"), withDestinationURL: outside)
+    var trashedURLs: [URL] = []
+    let result = DataRootDiskHygiene.cleanup(
+        dataRoot: root, relativePaths: ["logs/victim.bin"], trash: { trashedURLs.append($0) })
+    #expect(trashedURLs.isEmpty)
+    #expect(result.trashed.isEmpty)
+    #expect(result.skipped.first?.skippedReason == "outside the data directory")
+    #expect(FileManager.default.fileExists(atPath: outside.appendingPathComponent("victim.bin").path))
+}
+
+// gpt-5.5 review: APFS is typically case-insensitive, so a case-varied spelling
+// of the protected prefix addresses the same store and must also be refused.
+@Test func cleanupRefusesProtectedModelCacheCaseInsensitively() throws {
+    let root = hygieneTempDir()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try writeFile(root.appendingPathComponent("extras/hf_cache/hub/blob"), bytes: 2000)
+    var trashedURLs: [URL] = []
+    let result = DataRootDiskHygiene.cleanup(
+        dataRoot: root,
+        relativePaths: ["Extras/HF_Cache/hub/blob"],
+        trash: { trashedURLs.append($0) })
+    #expect(trashedURLs.isEmpty)
+    #expect(result.trashed.isEmpty)
+    // On a case-sensitive volume the varied spelling simply doesn't exist;
+    // either way nothing under the protected store may move.
+    #expect(result.skipped.count == 1)
+}
+
+@Test func cleanupReportsATrashFailureAsSkippedNotTrashed() throws {
+    let root = hygieneTempDir()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try writeFile(root.appendingPathComponent("stubborn.bin"), bytes: 500)
+    struct Boom: Error {}
+    let result = DataRootDiskHygiene.cleanup(
+        dataRoot: root, relativePaths: ["stubborn.bin"], trash: { _ in throw Boom() })
+    #expect(result.trashed.isEmpty)
+    #expect(result.freedBytes == 0)
+    #expect(result.skipped.first?.skippedReason?.contains("could not move to Trash") == true)
+}
+
 // MARK: - Loop
 
 @Test func diskHygiene_tickFilesNoticeWhenTripped() async throws {
@@ -173,4 +302,26 @@ private func writeFile(_ url: URL, bytes: Int) throws {
     let outcome = await loop.tickOutcome()
     if case .completed = outcome {} else { Issue.record("expected .completed, got \(outcome)") }
     #expect(recorder.reports.isEmpty)
+}
+
+// MARK: - W1(b) upgrade campaign: offline blips are not failures (L4-02)
+
+@Test func offlineErrorsClassifyAsOffline() {
+    #expect(SwiftNativeLoopScheduler.isOfflineError(
+        "Error Domain=NSURLErrorDomain Code=-1009 \"The Internet connection appears to be offline.\""))
+    #expect(SwiftNativeLoopScheduler.isOfflineError(
+        "Error Domain=NSURLErrorDomain Code=-1005 \"The network connection was lost.\""))
+    #expect(SwiftNativeLoopScheduler.isOfflineError(
+        "Error Domain=NSPOSIXErrorDomain Code=57 \"Socket is not connected\""))
+    #expect(SwiftNativeLoopScheduler.isOfflineError("Telegram long poll: unavailable"))
+}
+
+@Test func realFailuresDoNotClassifyAsOffline() {
+    // Timeouts stay REAL: the github_tracking 120s defect must not be buried.
+    #expect(!SwiftNativeLoopScheduler.isOfflineError("timeout after 120s"))
+    #expect(!SwiftNativeLoopScheduler.isOfflineError(
+        "Error Domain=NSURLErrorDomain Code=-1001 \"The request timed out.\""))
+    #expect(!SwiftNativeLoopScheduler.isOfflineError(
+        "GitHub API rejected the request: No server is currently available"))
+    #expect(!SwiftNativeLoopScheduler.isOfflineError("decode failed: missing field 'id'"))
 }

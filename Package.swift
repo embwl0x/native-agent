@@ -139,7 +139,20 @@ let package = Package(
                 // The chat tool dispatcher calls
                 // MacIntegrationPermissionStore.shared.allows(id, mode:) before
                 // executing any integration-bound side effect.
-                .product(name: "MacIntegration", package: "NativeAgentCore")
+                .product(name: "MacIntegration", package: "NativeAgentCore"),
+                // ActivityWatch (W7/W8, 2026-08-14) — the ambient activity
+                // watcher. The app links it for exactly two jobs, both of them
+                // user-facing: `ActivityWatchController` owns the capture
+                // lifecycle behind the Trust Center toggle, and the Trust
+                // Center panel + menu-bar indicator render its state.
+                //
+                // The old architecture guard asserted this dependency did NOT
+                // exist (v0 was dev-only and fenced at compile time). That
+                // fence is replaced by a RUNTIME one — capture cannot run
+                // unless the toggle is explicitly on — and the guard now
+                // asserts the runtime property plus the egress enumeration
+                // instead. See ActivityWatchArchitectureTests.
+                .product(name: "ActivityWatch", package: "NativeAgentCore")
             ],
             path: "Sources/NativeAgentApp",
             // R10-N22: bundle docs/data-bounds.md so AboutView (or any in-app viewer)
@@ -182,6 +195,10 @@ let package = Package(
                 // U5 W-D fix-round (2026-06-11): assembled-loop tick-timeout
                 // override pin needs `any LoopRunner` in scope.
                 .product(name: "BackgroundLoops", package: "NativeAgentCore"),
+                // W8 (2026-08-14): the Trust Center capture panel and the
+                // menu-bar indicator are driven by ActivityPolicy, so the app
+                // tests need the type in scope to pin default-OFF behaviour.
+                .product(name: "ActivityWatch", package: "NativeAgentCore"),
             ],
             path: "tests/NativeAgentAppTests"
         )

@@ -219,40 +219,4 @@ struct AdaptiveCausalLearningGateTests {
         #expect(!result.readyForShadowTraining)
         #expect(result.blockers == [.longitudinalDriftEvidenceMissing])
     }
-
-    @Test("personal evidence accounting reports sampled parity without inventing drift or control")
-    func personalEvidenceAccounting() {
-        let now = Date(timeIntervalSince1970: 1_800_000_000)
-        let formatter = ISO8601DateFormatter()
-        let rows = (0..<250).map { index in
-            CausalTransitionEvidence(
-                domain: "github_command",
-                operationId: CausalTransitionEvidence.opaqueIdentity("operation-\(index)"),
-                occurredAt: formatter.string(from: now.addingTimeInterval(Double(index))),
-                itemIdentity: CausalTransitionEvidence.opaqueIdentity("item-\(index)"),
-                kind: "settled",
-                beforeState: "verifying",
-                afterState: "resolved",
-                expectedNextEvidence: nil,
-                outcome: "state_changed"
-            )
-        }
-        let report = AdaptiveCausalEvidenceAccountingReport.evaluate(
-            transitions: rows,
-            evaluatedAt: now.addingTimeInterval(250),
-            transitionSchemaVersion: "causal.transition.v1",
-            validatedPrivacyClassificationVersion: "privacy.v1",
-            validatedRollbackArtifactReady: true,
-            personalTraceLearningApproved: false
-        )
-        #expect(report.transitionCount == 250)
-        #expect(report.outcomeClassification.outcomeCoverage == 1)
-        #expect(report.assessmentKind == .sampledParity)
-        #expect(report.distributionAssessment.status == .withinLimit)
-        #expect(report.holdoutMechanism == "sha256_operation_bucket_v1")
-        #expect(report.readiness.blockers == [.userApprovalMissing])
-        #expect(report.readiness.sampleSufficiencyUsed)
-        #expect(report.payloadFree)
-        #expect(!report.controlAuthority)
-    }
 }

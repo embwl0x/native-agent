@@ -203,56 +203,6 @@ extension NativeClient {
         return ["ok": true, "key": key, "namespace": safeSid, "full_key": "\(safeSid):\(key)"]
     }
 
-    // WAVE 34 W20 — adapt a DispatchResult back to the `[String: Any]` shape
-    // callers expect ({ok, id, path}). The slash-command caller
-    // (`AppModel.addNote`) discards the body, but we preserve the shape so any future
-    // body-reading caller sees parity.
-    //
-    // The commit_memory tool's output payload ({id, path}) rides in the dispatch
-    // envelope's `output` field. On the HTTP `_dispatchRaw` path that field is decoded
-    // (DispatchOutput.rawString holds the JSON), so we parse id/path back out for true
-    // parity with `/v1/notes`. On the in-process `_swiftDispatch` seam `output` is nil
-    // (see _swiftDispatch) — there we fall back to the trace/run identifiers, which is
-    // enough for callers that only check `ok`.
-    private static func _noteResponseFromDispatch(_ result: DispatchResult) -> [String: Any] {
-        var out: [String: Any] = ["ok": result.ok]
-        let payload = _decodeDispatchOutput(result.output)
-        if let id = payload["id"] { out["id"] = id }
-        if let path = payload["path"] { out["path"] = path }
-        // Fallbacks when the tool output wasn't surfaced (Swift seam → output == nil).
-        if out["id"] == nil, let te = result.traceEventId, !te.isEmpty { out["id"] = te }
-        if !result.runId.isEmpty { out["run_id"] = result.runId }
-        return out
-    }
-
-    // WAVE 34 W20 — adapt a DispatchResult back to the `/v1/scratch` shape
-    // ({ok, namespace, key, full_key}). The scratchpad_write tool output
-    // ({namespace, key, full_key}) rides in the dispatch envelope's `output` field —
-    // parsed back out on the HTTP path. The caller (`AppModel.writeScratch`) checks only
-    // the boolean return of its own wrapper, but we preserve the shape for parity.
-    private static func _scratchResponseFromDispatch(_ result: DispatchResult, key: String) -> [String: Any] {
-        var out: [String: Any] = ["ok": result.ok, "key": key]
-        let payload = _decodeDispatchOutput(result.output)
-        if let ns = payload["namespace"] { out["namespace"] = ns }
-        if let fk = payload["full_key"] { out["full_key"] = fk }
-        if let k = payload["key"] { out["key"] = k }   // tool may echo a normalized key
-        if let te = result.traceEventId, !te.isEmpty { out["id"] = te }
-        if !result.runId.isEmpty { out["run_id"] = result.runId }
-        return out
-    }
-
-    // WAVE 34 W20 — best-effort decode of a DispatchOutput's JSON payload back into a
-    // dictionary. DispatchOutput captures the tool output as a raw JSON string; the
-    // commit_memory / scratchpad_write tools both return a flat object. Returns [:] when
-    // output is absent (Swift seam) or not a JSON object.
-    private static func _decodeDispatchOutput(_ output: DispatchOutput?) -> [String: Any] {
-        guard let raw = output?.rawString,
-              let data = raw.data(using: .utf8),
-              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        else { return [:] }
-        return obj
-    }
-
     // PATCH-Phase7b: POST /v1/dispatch — invoke a dispatcher tool from the Mac UI.
     // Convenience overload for callers that already have a [String: Any] dict.
 }

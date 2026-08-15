@@ -43,6 +43,7 @@ struct DeskDebugPanels: View {
         } label: {
             Label("\(appModel.agentDisplayName)'s view (the compact projection used in context)", systemImage: "eye")
                 .font(.callout).foregroundStyle(.secondary)
+                .togglesDisclosure($showAgentView)
         }
         .padding(.top, 8)
     }
@@ -66,6 +67,7 @@ struct DeskDebugPanels: View {
         } label: {
             Label("All items (debug — raw records with numbers)", systemImage: "tablecells")
                 .font(.callout).foregroundStyle(.secondary)
+                .togglesDisclosure($showAllItems)
         }
         .padding(.top, 2)
     }

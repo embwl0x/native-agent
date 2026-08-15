@@ -126,6 +126,7 @@ struct ContentView: View {
                         } label: {
                             Label("Advanced", systemImage: "chevron.right.2")
                                 .foregroundStyle(.secondary)
+                                .togglesDisclosure($showAdvanced)
                         }
                     }
                 }
@@ -336,6 +337,28 @@ struct ContentView: View {
             if appModel.chatDrafts[appModel.activeChatSessionId]?.isEmpty != false {
                 appModel.injectChatDraft(starter, sessionId: appModel.activeChatSessionId)
             }
+        }
+        // Inbox "Act" on a chat-shaped item — same shape as skillBuildRequest
+        // above: switch to Chat, prefill only when the composer is empty so a
+        // half-typed message is never clobbered.
+        .onReceive(NotificationCenter.default.publisher(for: .openChatDraftRequest)) { note in
+            selectionRaw = SidebarItem.chat.rawValue
+            guard let draft = note.object as? String, !draft.isEmpty else { return }
+            if appModel.activeChatSessionId.isEmpty { return }
+            if appModel.chatDrafts[appModel.activeChatSessionId]?.isEmpty != false {
+                appModel.injectChatDraft(draft, sessionId: appModel.activeChatSessionId)
+            }
+        }
+        // L5 G6 — the inversion. Her message is already persisted (the act
+        // handler posted it through the proactive-speech seam before posting
+        // this). All that's left is to land User in the session and pull the new
+        // row in. NOTHING is written to the composer: an empty composer with
+        // her message above it is the whole point of the change.
+        .onReceive(NotificationCenter.default.publisher(for: .openSpokenChatRequest)) { _ in
+            selectionRaw = SidebarItem.chat.rawValue
+            let sessionId = appModel.activeChatSessionId
+            guard !sessionId.isEmpty else { return }
+            Task { await appModel.refreshChatMessagesAfterTurn(sessionId: sessionId) }
         }
     }
 
@@ -609,39 +632,6 @@ struct ActivityRow: View {
     }
 }
 
-struct WorkshopTaskRow: View {
-    var execution: WorkshopExecutionRecord
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text(execution.title)
-                    .font(NativeAgentFont.section)
-                    .lineLimit(1)
-                Spacer()
-                StatusBadge(text: execution.status, status: execution.status)
-            }
-            Text(execution.objective)
-                .font(NativeAgentFont.body)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-            HStack {
-                Label(execution.phase, systemImage: "arrow.triangle.2.circlepath")
-                if let autonomy = execution.autonomyLevel {
-                    Label(autonomy, systemImage: "wand.and.stars")
-                }
-                if let permission = execution.permissionProfile {
-                    Label(permission, systemImage: "lock.shield")
-                }
-            }
-            .font(NativeAgentFont.tag)
-            .foregroundStyle(.tertiary)
-        }
-        .textSelection(.enabled)
-    }
-}
-
-
 enum NativeScreenCapture {
     enum CaptureError: LocalizedError {
         case permissionRequired
@@ -814,6 +804,15 @@ extension Notification.Name {
     /// NavigationPath and pushes the matching destination.
     static let openActivitySectionRequest = Notification.Name("NativeAgent.openActivitySectionRequest")
     static let openActivityRootRequest = Notification.Name("NativeAgent.openActivityRootRequest")
+    /// Inbox "Act" on a chat-shaped item (morning brief, idle check-in, …):
+    /// switch to Chat and prefill the composer with the object string via
+    /// AppModel.injectChatDraft — same idiom as skillBuildRequest.
+    static let openChatDraftRequest = Notification.Name("NativeAgent.openChatDraftRequest")
+    /// L5 G6: Act on a card SHE authored — her message is ALREADY in the
+    /// transcript by the time this posts. Switch to Chat and reload; the
+    /// composer is deliberately left untouched, because User is answering her,
+    /// not writing to himself.
+    static let openSpokenChatRequest = Notification.Name("NativeAgent.openSpokenChatRequest")
 }
 
 

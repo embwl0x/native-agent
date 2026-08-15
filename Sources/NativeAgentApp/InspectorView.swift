@@ -149,6 +149,7 @@ private struct TurnCardView: View {
                 .padding(.top, NativeAgentSpacing.xs)
             } label: {
                 summaryLine
+                    .togglesDisclosure($expanded)
             }
         }
         .padding(NativeAgentSpacing.md)

@@ -200,7 +200,7 @@ public struct HeartbeatLoop: LoopRunner {
             // dropped card is recorded instead of silently lost.
             FileHandle.standardError.write(Data(
                 "HeartbeatLoop: notice staging failed: \(error)\n".utf8))
-            return .failed(error: "heartbeat notice staging: \(error.localizedDescription)")
+            return .failed(error: "heartbeat notice staging: \(SwiftNativeLoopScheduler.describeLoopError(error))")
         }
         return .completed(result: "heartbeat notice surfaced")
     }

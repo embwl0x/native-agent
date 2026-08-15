@@ -279,7 +279,8 @@ public typealias TriggerNotifier = @Sendable (TriggerNotification) async -> JSON
 // MARK: - Protocol
 
 public protocol TriggerSchedulerClient: Sendable {
-    // Inbox (proactive) triggers — backed by <root>/inbox/trigger_config.json
+    // Inbox (proactive) triggers — backed by <root>/triggers/trigger_config.json
+    // (relocated 2026-08-13 from the legacy <root>/inbox/ silo; lazy migration)
     func listInboxTriggers() async throws -> [TriggerConfig]
     func enableInboxTrigger(name: String) async throws -> TriggerStatus
     func disableInboxTrigger(name: String) async throws -> TriggerStatus
@@ -319,8 +320,10 @@ public protocol TriggerSchedulerClient: Sendable {
 ///   - The auto-disable / consecutive-failure tracking is in-memory inside
 ///     the daemon's scheduler instances; Swift only touches persisted state.
 ///
-/// Persistence file paths (must stay byte-equivalent to daemon):
-///   - Inbox:    <root>/inbox/trigger_config.json
+/// Persistence file paths:
+///   - Inbox:    <root>/triggers/trigger_config.json  (2026-08-13: relocated
+///     from the daemon-era <root>/inbox/trigger_config.json with a lazy
+///     copy-forward migration; the file FORMAT stays byte-equivalent)
 ///   - Executions: <root>/missions/triggers.json
 ///
 /// Both are JSON arrays of trigger dicts. Atomic write + cross-process flock
@@ -343,6 +346,12 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     /// the production default; tests point it at a temp file so a brief built
     /// under a bare temp root is genuinely empty. Same role as `now` / `uuid`.
     let worklogPath: URL?
+    /// L5 G3/G1 seam: the tool-capable turn that supplies the morning brief's
+    /// synthesized lead. nil — every test root, every non-live root, and any
+    /// call site that only lists/enables/configures — keeps the deterministic
+    /// counts brief byte-for-byte. See MorningBriefSynthesis.swift for why this
+    /// is a closure rather than a direct ChatOrchestration call.
+    let morningBriefSynthesizer: MorningBriefSynthesizer?
     private var mutationTail: Task<Void, Never>? = nil
 
     /// `workshopRunner` is the wave-21 execution-fire seam. Defaults to a
@@ -358,7 +367,8 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         uuid: @escaping @Sendable () -> String = { UUID().uuidString.lowercased() },
         connectorActionIDs: Set<String>? = nil,
         notifier: TriggerNotifier? = nil,
-        worklogPath: URL? = nil
+        worklogPath: URL? = nil,
+        morningBriefSynthesizer: MorningBriefSynthesizer? = nil
     ) {
         let resolvedPersistence = persistence ?? SwiftNativePersistenceCore()
         self.root = root
@@ -374,11 +384,16 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         self.connectorActionIDs = connectorActionIDs
         self.notifier = notifier
         self.worklogPath = worklogPath
+        self.morningBriefSynthesizer = morningBriefSynthesizer
     }
 
+    /// `<root>/triggers/trigger_config.json`. Relocated 2026-08-13 out of the
+    /// legacy `<root>/inbox/` silo (the retired Python daemon's notification
+    /// inbox dir, now frozen). Existing installs are migrated lazily —
+    /// see `migrateLegacyInboxTriggerFilesIfNeeded()`.
     public nonisolated var inboxPath: URL {
         root
-            .appendingPathComponent("inbox", isDirectory: true)
+            .appendingPathComponent("triggers", isDirectory: true)
             .appendingPathComponent("trigger_config.json")
     }
 
@@ -398,9 +413,11 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     // reads last_fired_at and sees a time trigger already fired today.
     // Inbox and execution trigger names can collide ("morning_brief" exists in
     // both surfaces), so each surface gets its own state file.
+    /// `<root>/triggers/trigger_state.json` (same 2026-08-13 relocation and lazy
+    /// migration as `inboxPath`).
     public nonisolated var inboxStatePath: URL {
         root
-            .appendingPathComponent("inbox", isDirectory: true)
+            .appendingPathComponent("triggers", isDirectory: true)
             .appendingPathComponent("trigger_state.json")
     }
     public nonisolated var workshopExecutionStatePath: URL {
@@ -436,10 +453,71 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         (workshopRunner as? SwiftNativeWorkshopRunner)?._testPlannerTypeName
     }
 
+    // MARK: legacy-path migration (2026-08-13)
+
+    /// Set once BOTH inbox-surface files are settled at their new home (either
+    /// migrated, already present, or fresh-install absent), so steady state pays
+    /// one boolean check per access instead of file stats.
+    private var legacyInboxTriggerMigrationDone = false
+
+    /// One-shot lazy relocation of the inbox-surface trigger files out of the
+    /// legacy `<root>/inbox/` silo (the retired Python daemon's notification-
+    /// inbox dir, frozen since the daemon decommission) into `<root>/triggers/`.
+    ///
+    /// Read-old-write-new: if the new file is absent and the legacy one exists,
+    /// copy the legacy bytes to the new home BEFORE the caller reads or writes —
+    /// so a live install's trigger config and last-fired liveness state survive
+    /// the move (losing trigger_state.json would re-fire time triggers that
+    /// already fired today; see the W3c note above). The legacy files are left
+    /// in place, frozen — nothing reads them once the new files exist.
+    ///
+    /// Failure is LOUD, FAIL-CLOSED, and non-latching (gpt-5.5 review BLOCKING,
+    /// 2026-08-13): when a legacy file exists but its copy-forward fails, this
+    /// THROWS and the guarded entry point aborts. Proceeding would let a
+    /// mutation seed built-in DEFAULTS at the new home — after which the
+    /// exists-check here would skip the legacy file forever, silently losing
+    /// the user's config or `last_fired_at` (whose loss re-fires time triggers).
+    /// The surface stays dormant-until-repaired — same posture as corrupt
+    /// state — and the unset done-flag retries on the next access.
+    /// The copy runs under the LEGACY file's flock so it cannot snapshot a
+    /// mid-write file, and re-checks the destination inside the lock so a
+    /// concurrent interleaved call (actor methods yield at await) cannot
+    /// double-copy.
+    private func migrateLegacyInboxTriggerFilesIfNeeded() async throws {
+        if legacyInboxTriggerMigrationDone { return }
+        let legacyDir = root.appendingPathComponent("inbox", isDirectory: true)
+        let pairs: [(legacy: URL, new: URL)] = [
+            (legacyDir.appendingPathComponent("trigger_config.json"), inboxPath),
+            (legacyDir.appendingPathComponent("trigger_state.json"), inboxStatePath),
+        ]
+        for (legacy, new) in pairs {
+            if FileManager.default.fileExists(atPath: new.path) { continue }
+            guard FileManager.default.fileExists(atPath: legacy.path) else { continue }
+            do {
+                try FileManager.default.createDirectory(
+                    at: new.deletingLastPathComponent(), withIntermediateDirectories: true
+                )
+                try await persistence.withFileLock(legacy) {
+                    if !FileManager.default.fileExists(atPath: new.path) {
+                        try FileManager.default.copyItem(at: legacy, to: new)
+                    }
+                }
+                Self.logger.notice("migrated legacy \(legacy.lastPathComponent, privacy: .public) from inbox/ to triggers/")
+            } catch {
+                Self.logger.error("FAILED to migrate legacy \(legacy.lastPathComponent, privacy: .public) from inbox/ to triggers/: \(String(describing: error), privacy: .public) — inbox trigger surface stays DORMANT until repaired; will retry on next access")
+                throw TriggerSchedulerError.persistenceFailure(
+                    "legacy trigger-file migration failed for \(legacy.lastPathComponent): \(String(describing: error))"
+                )
+            }
+        }
+        legacyInboxTriggerMigrationDone = true
+    }
+
     // MARK: list
 
     public func listInboxTriggers() async throws -> [TriggerConfig] {
-        try await Self._readList(path: inboxPath, persistence: persistence, defaultValue: Self._defaultInboxConfigs)
+        try await migrateLegacyInboxTriggerFilesIfNeeded()
+        return try await Self._readList(path: inboxPath, persistence: persistence, defaultValue: Self._defaultInboxConfigs)
     }
 
     public func listWorkshopTriggers() async throws -> [TriggerConfig] {
@@ -488,6 +566,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     private func _setEnabledInbox(name: String, enabled: Bool) async throws -> TriggerStatus {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { throw TriggerSchedulerError.invalidRequest("empty name") }
+        try await migrateLegacyInboxTriggerFilesIfNeeded()
         return try await runSerialized { [persistence, inboxPath] in
             let work: @Sendable () async throws -> TriggerStatus = {
                 try await Self._setEnabledImpl(
@@ -592,6 +671,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         guard case .object(let newCfg) = config else {
             throw TriggerSchedulerError.invalidRequest("config must be a JSON object")
         }
+        try await migrateLegacyInboxTriggerFilesIfNeeded()
         return try await runSerialized { [persistence, inboxPath] in
             let work: @Sendable () async throws -> TriggerStatus = {
                 // M4: same read-then-write destruction as _setEnabledImpl — a
@@ -646,6 +726,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     public func fireInboxTrigger(name: String, isStub: Bool) async throws -> TriggerFireResult {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { throw TriggerSchedulerError.invalidRequest("empty name") }
+        try await migrateLegacyInboxTriggerFilesIfNeeded()
 
         // Look up the trigger row.
         let configs: [TriggerConfig]
@@ -1567,7 +1648,13 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         case "time":
             // REAL content. Desk + worklog + Workshop executions + unread + last session,
             // every section fail-open. Title keeps its "%A, %B %-d" label.
-            let built = await content.morningBrief()
+            //
+            // L5 G3 + G1: when a synthesizer is injected (live root only), the
+            // brief LEADS with the tool-capable turn's read and keeps these
+            // deterministic sections below it as the evidence layer. The turn
+            // failing is not the trigger failing — `morningBrief(synthesizer:)`
+            // returns the deterministic brief unchanged on any nil.
+            let built = await content.morningBrief(synthesizer: morningBriefSynthesizer)
             source = "trigger:morning_brief"
             severity = "important"
             title = built.title
@@ -1661,8 +1748,16 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     // MARK: defaults — must stay byte-equivalent to daemon defaults
 
     /// Mirrors the retired daemon::_DEFAULT_TRIGGER_CONFIGS (L789-L825).
-    /// Keep these in sync — the file gets seeded with this exact list on first
-    /// write (daemon `_ensure_config`).
+    /// The file gets seeded with this exact list on first write (daemon
+    /// `_ensure_config`).
+    ///
+    /// ONE DELIBERATE DIVERGENCE from the daemon shape: `morning_brief` ships
+    /// `enabled: true` (L5 G2). The daemon is retired, so "byte-equivalent to
+    /// the daemon" is no longer a live compatibility constraint — it is
+    /// history. Every OTHER field, and the order, still matches, because
+    /// existing installs' `trigger_config.json` is merged against this list by
+    /// name. An install that already wrote the file keeps whatever the user
+    /// chose; only a fresh seed gets the brief lit.
     nonisolated static let _defaultInboxConfigs: [JSONValue] = [
         .object([
             "name": .string("file_watch"),
@@ -1688,7 +1783,26 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         .object([
             "name": .string("morning_brief"),
             "kind": .string("time"),
-            "enabled": .bool(false),
+            // L5 G2: ON by default. An assistant that never speaks first on a
+            // fresh install is a chat window with tabs — and `notify: true`
+            // below was dead config for as long as this stayed false. This is
+            // the ONE proactive lane that ships lit; file_watch, idle_checkin
+            // and stuck_pattern stay opt-in (two are stubs, and the idle lane
+            // fires on silence rather than on a schedule User can predict).
+            //
+            // TODO(onboarding, L5 G2 second half): the "Should I check in on
+            // you? — morning brief / when you go quiet / neither" question
+            // still needs a home. EXACT INSERTION POINT, verified 2026-08-11:
+            // `Sources/NativeAgentApp/OnboardingWizard.swift`, `ConfirmStep`
+            // (:710-738) — one row inside the existing `NativePanel` beside the
+            // `ConfirmRow` entries, bound to new `OnboardingWizardState` fields
+            // and applied on build via `enableInboxTrigger` /
+            // `disableInboxTrigger` for `morning_brief` and `idle_checkin`.
+            // Deliberately NOT built here: this wave's fence is the trigger +
+            // chat-seam path, and the spec forbids new onboarding UI. Until it
+            // lands, this default IS the answer — she checks in, and Settings →
+            // Inbox Policy is the off switch.
+            "enabled": .bool(true),
             "config": .object([
                 "hour": .int(8),
                 "minute": .int(0),
@@ -1920,10 +2034,20 @@ public actor ProactiveInboxStore {
 /// `notifier` is nil by default: the list / enable / disable / configure call
 /// sites never fire, so they must never carry a push sender. ONLY the two fire
 /// sites (the event/deadline due-work runner and manual "fire now") pass one in.
+///
+/// `morningBriefSynthesizer` follows the same rule for the same reason: only
+/// the fire sites can produce a brief, so only they carry the seam that gives
+/// the brief its synthesized lead (L5 G3/G1).
 public func makeTriggerScheduler(
     notifier: TriggerNotifier? = nil,
-    dataRoot: URL = PersistenceCore.defaultDataRoot()
+    dataRoot: URL = PersistenceCore.defaultDataRoot(),
+    morningBriefSynthesizer: MorningBriefSynthesizer? = nil
 ) -> any TriggerSchedulerClient {
     let runner = makeWorkshopRunner(dataRoot: dataRoot)
-    return SwiftNativeTriggerScheduler(root: dataRoot, workshopRunner: runner, notifier: notifier)
+    return SwiftNativeTriggerScheduler(
+        root: dataRoot,
+        workshopRunner: runner,
+        notifier: notifier,
+        morningBriefSynthesizer: morningBriefSynthesizer
+    )
 }

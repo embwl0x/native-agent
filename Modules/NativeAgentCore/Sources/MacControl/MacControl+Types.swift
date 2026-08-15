@@ -4,6 +4,9 @@ import PersistenceCore
 #if canImport(CryptoKit)
 import CryptoKit
 #endif
+#if canImport(CoreGraphics)
+import CoreGraphics
+#endif
 #if canImport(AppKit)
 import AppKit
 #endif
@@ -161,6 +164,47 @@ public protocol MacControlClient: MotorActionReadModelProviding, Sendable {
     /// payload shape — see the retired daemon–53747).
     func dispatch(action: String, body: [String: JSONValue]) async throws -> MacControlResult
     func cancel(operationId: String) async throws -> MacControlCancellationResult
+
+    /// The privileged injection entry point (W2/W3-FIX 1). Separate from
+    /// `dispatch` so that the UNPRIVILEGED signature — the one the HTTP/iOS
+    /// bridge, the app's direct callers and every raw dispatcher use — has no
+    /// parameter capable of carrying an authorization.
+    ///
+    /// Defaulted below to a REFUSAL, so a conformer that does not deliberately
+    /// implement injection cannot accidentally acquire it.
+    func dispatchApprovedInjection(
+        action: String,
+        body: [String: JSONValue],
+        capability: MacInjectionCapability
+    ) async throws -> MacControlResult
+}
+
+extension MacControlClient {
+    /// Fail-closed default: a MacControlClient that has not implemented the
+    /// privileged path does not inject, it refuses. Adding a new conformer
+    /// therefore cannot widen the injection surface by omission.
+    public func dispatchApprovedInjection(
+        action: String,
+        body: [String: JSONValue],
+        capability: MacInjectionCapability
+    ) async throws -> MacControlResult {
+        _ = capability
+        _ = body
+        return MacControlResult(
+            ok: false,
+            action: action,
+            output: .object([
+                "ok": .bool(false),
+                "status": .string("blocked"),
+                "error": .string("injection_unsupported_client"),
+            ]),
+            error: "injection_unsupported_client: this MacControl client does not implement "
+                + "approved injection",
+            durationMs: 0,
+            viaSwift: true,
+            httpStatus: 403
+        )
+    }
 }
 
 // MARK: - Sub-action classification
@@ -178,6 +222,13 @@ public let macControlNativePortedActions: Set<String> = [
     "quit_app",
     "spotlight",
     "shell",
+    // W2 (2026-08-12): the physical input executor landed, so these two moved
+    // out of `macControlUnsupportedActions` (where they 501'd) and into the
+    // ported set. `macControlAllActions` — the daemon-parity inventory a test
+    // pins byte-for-byte — is unchanged by the move, because it is the UNION
+    // of the two buckets.
+    "keystroke",
+    "click",
 ]
 
 /// Known MacControl actions that are intentionally not implemented in Swift
@@ -186,8 +237,6 @@ public let macControlUnsupportedActions: Set<String> = [
     "jxa",
     "shortcut",
     "shortcut/run",
-    "keystroke",
-    "click",
     "system",
     "self_test",
 ]
@@ -197,6 +246,463 @@ public let macControlUnsupportedActions: Set<String> = [
 /// the retired daemon–53747.
 public let macControlAllActions: Set<String> =
     macControlNativePortedActions.union(macControlUnsupportedActions)
+
+/// Swift-native READ-ONLY accessibility perception actions (W1). These have
+/// NO daemon ancestor — the daemon never exposed an AX-tree route — so they
+/// are deliberately kept OUT of `macControlAllActions`, which is the
+/// daemon-parity inventory a test pins byte-for-byte. Adding them there would
+/// have made that parity assertion lie about what the retired daemon exposed.
+///
+/// They are perception only: no CGEvent, no AXUIElementPerformAction, no
+/// attribute writes. Gate category is `accessibility` (same category as
+/// keystroke/click) but they are READ tier — no approval, mirroring how
+/// `spotlight` reads are gated but unapproved.
+public let macControlAccessibilityReadActions: Set<String> = [
+    "ax_status",
+    "ax_tree",
+    "ax_find",
+    // W3.5 — the FUSED view (picture + AX structure, elements numbered). Read
+    // tier for the same reason as the three above: it looks and changes
+    // nothing. It needs one extra SYSTEM grant the others do not (Screen
+    // Recording, a separate TCC permission from Accessibility), which it
+    // reports honestly rather than failing opaque — but a system grant is not
+    // a policy tier, so this stays read tier.
+    "view",
+]
+
+/// Swift-native INJECTION actions with no daemon ancestor (W2/W3). Same
+/// reasoning as the read set above: they are kept OUT of `macControlAllActions`
+/// so the daemon-parity inventory keeps telling the truth about what the
+/// retired daemon exposed.
+///
+/// `keystroke` and `click` are NOT here — they DO have daemon ancestors and
+/// live in `macControlNativePortedActions`. Use
+/// `macControlAccessibilityInjectionActions` below for the security predicate;
+/// this set exists only for the inventory bookkeeping.
+public let macControlAccessibilityActActions: Set<String> = [
+    "scroll",
+    "ax_act",
+    // W6 — `wake`. It posts a HID nudge (a one-point mouse move, optionally a
+    // modifier tap) to dismiss a NON-LOCKED screensaver or wake a sleeping
+    // display, then re-captures the fused view so the caller lands on the real
+    // screen in one call. The nudge is the smallest injection in the module and
+    // it is still injection: it goes in the act set, not the read set.
+    "wake",
+]
+
+/// EVERY action that synthesizes input or mutates another app's UI state.
+/// This is the set the three-gate injection predicate keys off:
+/// master + accessibility category (via `macControlGateCategory`), an ACTIVE
+/// Full Mac trust window, AND a live, body-bound, single-use
+/// `MacInjectionCapability` presented through `dispatchApprovedInjection`.
+/// Adding an action here is what makes it injection; forgetting to would let a
+/// new act slip in at read tier.
+public let macControlAccessibilityInjectionActions: Set<String> = [
+    "keystroke",
+    "click",
+    "scroll",
+    "ax_act",
+    // W6 — `wake` posts real HID events. A tool that dismisses a screensaver
+    // is a convenience, but the mechanism is a synthesized mouse move at the
+    // same tap `click` uses, so it clears the SAME three gates: accessibility
+    // category, an ACTIVE Full Mac window, and a live body-bound single-use
+    // `MacInjectionCapability`. There is deliberately no wake-shaped bypass.
+    "wake",
+]
+
+/// W7 — `nudge`, and it is deliberately in NEITHER of the two sets above.
+///
+/// It posts ONE bare `mouseMoved` CGEvent: no button, no key, no scroll, no AX
+/// mutation. A bare cursor move cannot click, cannot type and cannot bypass a
+/// lock — the worst it can do on a locked screen is what a human bumping the
+/// mouse does, which is show the login field. So it carries neither the read
+/// set's "no CGEvent" contract (it does post one) nor the injection set's
+/// approval capability (there is nothing to approve: it changes no app state).
+///
+/// Its own set exists so both of those contracts keep telling the truth:
+/// `macControlAccessibilityReadActions` stays "perception only, no CGEvent",
+/// and `macControlAccessibilityInjectionActions` stays "everything that
+/// synthesizes input or mutates another app's UI state" — the predicate that
+/// demands a `MacInjectionCapability`. Adding `nudge` to the latter is what a
+/// future action that grows a button-down MUST do; see `handleNudge`, whose
+/// move-only emission is pinned by a test that greps the emitted events.
+///
+/// GATE: identical to the AX reads — `accessibility` category + an ACTIVE Full
+/// Mac window (the pre-flight below names this set alongside the read set), no
+/// approval filer, no capability.
+public let macControlAccessibilityNudgeActions: Set<String> = [
+    "nudge",
+]
+
+/// Everything `SwiftNativeMacControl.dispatch` will accept: the daemon-parity
+/// inventory plus the Swift-native accessibility reads, acts and the nudge.
+public let macControlDispatchableActions: Set<String> =
+    macControlAllActions
+        .union(macControlAccessibilityReadActions)
+        .union(macControlAccessibilityActActions)
+        // W7 — `nudge` must be here or the HTTP/iOS-remote bridge route in
+        // NativeClient+CutoverSeams 404s it as an unknown action.
+        .union(macControlAccessibilityNudgeActions)
+
+// MARK: - W6 login-session state (the mac_wake safety line)
+
+/// The system's IDLE screen-lock POLICY — "require a password after the
+/// screensaver starts" — as reported by `sysadminctl -screenLock status`.
+///
+/// NAMED FOR WHAT IT IS, and reported as diagnostics only. It is NOT "will this
+/// lock UI ask for a password": a MANUALLY locked screen (Ctrl-Cmd-Q, Apple menu
+/// ▸ Lock Screen) demands the account password regardless of this policy. The
+/// wake guard therefore never treats `notRequired` as permission to act on a
+/// locked screen; see `MacWakeGuard`.
+public enum MacSessionPasswordRequirement: String, Sendable, Equatable {
+    /// The idle policy is off. Says nothing about a manual lock.
+    case notRequired = "not_required"
+    case required
+    case unknown
+}
+
+/// A read-only snapshot of the login session and display, taken immediately
+/// before and immediately after a wake nudge.
+///
+/// STEP-0 FINDING (verified live on this Mac, 2026-08-12): the CoreGraphics
+/// session key `CGSSessionScreenIsLocked` is **1 while an ordinary non-locked
+/// screensaver is showing** — it was 1 at the same moment
+/// `sysadminctl -screenLock status` reported `screenLock is off` and the
+/// frontmost app was `com.apple.loginwindow`.
+///
+/// ROUND-2 FINDING, and the one that decides the safety line: that cuts BOTH
+/// ways, and the dangerous direction is the other one. The flag is also 1 for a
+/// real password lock, and macOS publishes no point-in-time signal for "the lock
+/// UI in front of me needs a password" — so a set flag is an AMBIGUOUS reading,
+/// not a screensaver reading. `MacWakeGuard` resolves that ambiguity by
+/// refusing. See the guard for the discriminators that were tried and why each
+/// one fails.
+public struct MacSessionState: Sendable, Equatable {
+    /// `CGSSessionScreenIsLocked` — true for a password lock AND for a plain
+    /// screensaver, with nothing in the session dictionary separating them.
+    /// True therefore means REFUSE; see `MacWakeGuard`.
+    public let screenIsLocked: Bool
+    /// `kCGSSessionOnConsoleKey` — false when another user owns the display.
+    public let onConsole: Bool
+    /// `CGDisplayIsAsleep(CGMainDisplayID())`.
+    public let displayAsleep: Bool
+    /// The IDLE lock policy, carried for the human reading a refusal. It is
+    /// never permission to act on a locked screen.
+    public let passwordRequirement: MacSessionPasswordRequirement
+    /// False when the probe could not actually READ the login session —
+    /// `CGSessionCopyCurrentDictionary()` returned nil, or came back without the
+    /// keys this decision rests on. An unreadable session is not an unlocked
+    /// one, so the guard refuses on it before it looks at anything else.
+    public let sessionReadable: Bool
+    public let frontmostBundleID: String?
+    /// `CGEventSource.secondsSinceLastEventType` — the orthogonal observer.
+    /// A successful HID post resets it to ~0, so before/after readings are
+    /// EVIDENCE that the event landed rather than a claim that it was sent.
+    public let idleSeconds: Double?
+    public let cursorX: Double?
+    public let cursorY: Double?
+
+    public init(
+        screenIsLocked: Bool,
+        onConsole: Bool,
+        displayAsleep: Bool,
+        passwordRequirement: MacSessionPasswordRequirement,
+        sessionReadable: Bool = true,
+        frontmostBundleID: String? = nil,
+        idleSeconds: Double? = nil,
+        cursorX: Double? = nil,
+        cursorY: Double? = nil
+    ) {
+        self.screenIsLocked = screenIsLocked
+        self.onConsole = onConsole
+        self.displayAsleep = displayAsleep
+        self.passwordRequirement = passwordRequirement
+        self.sessionReadable = sessionReadable
+        self.frontmostBundleID = frontmostBundleID
+        self.idleSeconds = idleSeconds
+        self.cursorX = cursorX
+        self.cursorY = cursorY
+    }
+
+    /// True when the screen was in a state a nudge could plausibly clear.
+    public var obstructed: Bool {
+        screenIsLocked || displayAsleep || frontmostBundleID == MacWakeGuard.loginWindowBundleID
+    }
+
+    public func toJSON() -> JSONValue {
+        .object([
+            "screen_is_locked": .bool(screenIsLocked),
+            "on_console": .bool(onConsole),
+            "display_asleep": .bool(displayAsleep),
+            // Named as the POLICY it is, so no reader mistakes it for "this lock
+            // will not ask for a password".
+            "idle_password_policy": .string(passwordRequirement.rawValue),
+            "session_readable": .bool(sessionReadable),
+            "frontmost": frontmostBundleID.map { .string($0) } ?? .null,
+            "idle_seconds": idleSeconds.map { .double(($0 * 10).rounded() / 10) } ?? .null,
+        ])
+    }
+}
+
+/// The probe seam. Production reads CoreGraphics/AppKit; tests inject a fake so
+/// the refusal is pinned with no window server and no real screensaver.
+public protocol MacSessionStateSource: Sendable {
+    /// False when this build/platform cannot read the session at all — which
+    /// includes a live macOS build whose session dictionary comes back nil or
+    /// without the keys the decision rests on. It must reflect a real read, not
+    /// a constant: the wake handler refuses rather than nudging blind, and a
+    /// source that lies here removes the only evidence there was.
+    var isAvailable: Bool { get }
+    func currentState() -> MacSessionState
+}
+
+/// THE SAFETY LINE, as one pure function so it can be tested directly and read
+/// in one place. `mac_wake` dismisses a screensaver; it never touches a lock.
+///
+/// THE RULE: `CGSSessionScreenIsLocked == false` ⇒ proceed. `true` ⇒ REFUSE.
+/// Unreadable ⇒ REFUSE. There is no third branch, because there is nothing
+/// trustworthy to branch on.
+///
+/// WHY THERE IS NO SCREENSAVER-POSITIVE BRANCH. The earlier build proceeded when
+/// the flag was set and `sysadminctl -screenLock status` said `off`. That is
+/// wrong, and it is wrong in the direction that photographs a locked Mac. Every
+/// candidate discriminator was examined:
+///
+/// - `sysadminctl -screenLock status` reads `askForPassword` /
+///   `askForPasswordDelay` — the IDLE policy, i.e. "after the screensaver
+///   starts, demand a password". A MANUAL lock (Ctrl-Cmd-Q, Apple menu ▸ Lock
+///   Screen) demands the account password *regardless of that policy*, and it
+///   sets the very same `CGSSessionScreenIsLocked == 1`. So `off` + locked is
+///   exactly a manual lock's fingerprint. This was BLOCKING #1.
+/// - The session dictionary carries no auth flag. Live dump while the flag was
+///   set: `CGSSessionScreenIsLocked`, `CGSSessionScreenLockedTime`,
+///   `CGSSessionUniqueSessionUUID`, `kCGSSessionAuditIDKey`, GroupID,
+///   `kCGSSessionLoginwindowSafeLogin`, `kCGSSessionOnConsoleKey`,
+///   SystemSafeBoot, UserID, UserName, `kCGSessionLoginDoneKey`,
+///   LongUserName, `kSCSecuritySessionID`. Nothing says "password required now".
+/// - "Is the screensaver running" (a `ScreenSaverEngine` / `legacyScreenSaver`
+///   process, the `com.apple.screensaver.didstart` notification) is not a
+///   discriminator EVEN IF READ PERFECTLY: lock manually, then wait, and the
+///   idle timer starts the saver ON TOP of a password-required lock. Saver
+///   running and password required are not mutually exclusive, so a
+///   saver-positive signal cannot license a nudge. It would also need a live
+///   subscription to catch a notification a one-shot tool call already missed.
+/// - `CGSSessionScreenLockedTime` vs `secondsSinceLastEventType` can *suggest*
+///   which came first (a manual lock leaves idle ≈ time-since-lock; an
+///   idle-triggered saver leaves idle ≈ time-since-lock + the saver delay). It
+///   is a timing heuristic that needs the saver delay from a
+///   `com.apple.screensaver` domain which does not exist on this Mac when the
+///   setting is off, and any input reaching the lock UI resets the idle clock.
+///   A heuristic is not a safety line.
+///
+/// So the honest answer is that a set flag CANNOT be cleared, and the cost is
+/// accepted deliberately: refusing a dismissable saver costs User one mouse
+/// movement, while proceeding on a real lock nudges and photographs a screen the
+/// OS is holding shut. `mac_wake`'s remaining reach is a sleeping display and an
+/// unlocked-but-obstructed screen — narrower than the wave hoped, and correct.
+public enum MacWakeGuard {
+    public static let loginWindowBundleID = "com.apple.loginwindow"
+
+    public static let lockedRefusal =
+        "screen_locked: cannot bypass a password lock. This Mac is asking for a password, "
+        + "so only you can unlock it — mac_wake dismisses a screensaver, it never defeats a lock."
+
+    public static let unknownLockRefusal =
+        "screen_locked: cannot bypass a password lock. The screen is locked and this Mac would "
+        + "not say whether a password is required, so mac_wake refuses rather than guess."
+
+    /// The locked-flag-plus-idle-policy-off case. It is NOT proof of a
+    /// dismissable saver — a manual lock reads exactly this way — so it refuses,
+    /// and says why in terms the human can act on.
+    public static let lockedIndeterminateRefusal =
+        "screen_locked: cannot bypass a password lock. The screen reports locked. This Mac's "
+        + "IDLE policy says no password after the screensaver, but a screen locked by hand "
+        + "(Ctrl-Cmd-Q) still needs your password and looks identical from here — macOS exposes "
+        + "no way to tell them apart, so mac_wake refuses rather than nudge or photograph a "
+        + "locked screen. If it is just the screensaver, move the mouse and ask me again."
+
+    public static let sessionUnreadableRefusal =
+        "session_unreadable: this Mac would not report its login session state, and an "
+        + "unreadable session is not an unlocked one, so mac_wake refuses rather than nudge blind."
+
+    public static let notOnConsoleRefusal =
+        "session_not_on_console: another login session owns the display, so a nudge from this "
+        + "session would not reach it."
+
+    /// Non-nil ⇒ REFUSE, and post nothing at all.
+    public static func refusalReason(for state: MacSessionState) -> String? {
+        // Ambiguity resolves to refusal, and "I could not read it" is the
+        // deepest ambiguity there is — so it is checked first.
+        guard state.sessionReadable else { return sessionUnreadableRefusal }
+        guard state.onConsole else { return notOnConsoleRefusal }
+        guard state.screenIsLocked else { return nil }
+        // LOCKED ⇒ REFUSE, unconditionally. The policy below only chooses which
+        // true sentence to hand back; it can never turn into a proceed.
+        switch state.passwordRequirement {
+        case .required: return lockedRefusal
+        case .unknown: return unknownLockRefusal
+        case .notRequired: return lockedIndeterminateRefusal
+        }
+    }
+}
+
+#if canImport(CoreGraphics) && os(macOS)
+
+/// Live session probe.
+public struct SystemMacSessionStateSource: MacSessionStateSource {
+    public init() {}
+
+    /// REAL readability, not a hardcoded `true`. `isAvailable` used to say yes
+    /// unconditionally while a nil session dictionary silently became `[:]` and
+    /// every flag fell back to its default — the tool then "proceeded" on no
+    /// evidence at all. It now answers by actually reading, and
+    /// `currentState().sessionReadable` carries the same verdict inline so a
+    /// session that becomes unreadable mid-call is caught by the guard too.
+    public var isAvailable: Bool { Self.readSession() != nil }
+
+    /// The keys this decision rests on. A dictionary that comes back without
+    /// them is unreadable for our purposes even though it is non-nil: it cannot
+    /// tell us who owns the console, so it cannot license input.
+    static let requiredSessionKeys = ["kCGSSessionOnConsoleKey"]
+
+    private static func readSession() -> [String: Any]? {
+        guard let session = CGSessionCopyCurrentDictionary() as? [String: Any] else { return nil }
+        guard requiredSessionKeys.allSatisfy({ session[$0] != nil }) else { return nil }
+        return session
+    }
+
+    public func currentState() -> MacSessionState {
+        // FAIL CLOSED. An unreadable session yields a state that the guard
+        // refuses on — locked, off-console, unreadable — never an empty
+        // dictionary whose defaults read as "unlocked and on console".
+        guard let session = Self.readSession() else {
+            return MacSessionState(
+                screenIsLocked: true,
+                onConsole: false,
+                displayAsleep: false,
+                passwordRequirement: .unknown,
+                sessionReadable: false,
+                idleSeconds: Self.idleSeconds()
+            )
+        }
+        func flag(_ key: String, default def: Bool) -> Bool {
+            if let number = session[key] as? NSNumber { return number.boolValue }
+            if let value = session[key] as? Bool { return value }
+            return def
+        }
+        // Absent `CGSSessionScreenIsLocked` means "not locked" — macOS publishes
+        // the key while the lock/saver UI is up. The console key is not allowed
+        // to be absent at all: its absence made the dictionary unreadable above,
+        // rather than defaulting to a permissive `true`.
+        let locked = flag("CGSSessionScreenIsLocked", default: false)
+        let onConsole = flag("kCGSSessionOnConsoleKey", default: false)
+        var frontmost: String?
+        #if canImport(AppKit)
+        frontmost = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        #endif
+        return MacSessionState(
+            screenIsLocked: locked,
+            onConsole: onConsole,
+            displayAsleep: CGDisplayIsAsleep(CGMainDisplayID()) != 0,
+            // Diagnostics for the refusal text only — the guard refuses on
+            // `locked` whatever this says — so only pay for the subprocess when
+            // there is a refusal to explain.
+            passwordRequirement: locked ? Self.passwordRequirement() : .notRequired,
+            sessionReadable: true,
+            frontmostBundleID: frontmost,
+            idleSeconds: Self.idleSeconds(),
+            cursorX: CGEvent(source: nil)?.location.x.native,
+            cursorY: CGEvent(source: nil)?.location.y.native
+        )
+    }
+
+    private static func idleSeconds() -> Double? {
+        guard let anyEvent = CGEventType(rawValue: ~0) else { return nil }
+        let value = CGEventSource.secondsSinceLastEventType(
+            .hidSystemState,
+            eventType: anyEvent
+        )
+        return value.isFinite ? value : nil
+    }
+
+    /// Reads the IDLE lock POLICY, and nothing more. `sysadminctl -screenLock
+    /// status` is Apple's own supported reader (it prints to STDERR); the modern
+    /// setting is not in a readable `com.apple.screensaver` domain, which does
+    /// not even exist on this Mac while the setting is off. There is no public
+    /// API for the question that would actually matter — "does the lock UI now
+    /// on screen require a password" — which is precisely why the guard refuses
+    /// on `locked` instead of consulting this. Kept for the refusal text and the
+    /// session JSON; `.unknown` on anything unparseable.
+    private static func passwordRequirement() -> MacSessionPasswordRequirement {
+        let path = "/usr/sbin/sysadminctl"
+        guard FileManager.default.isExecutableFile(atPath: path) else { return .unknown }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = ["-screenLock", "status"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        process.standardInput = FileHandle.nullDevice
+        do { try process.run() } catch { return .unknown }
+
+        // BOUNDED. This runs inside an approved injection call; a helper that
+        // never exits must not wedge it. Read on a dedicated thread (not the
+        // GCD pool, which starves under concurrent subprocess load) and give up
+        // as `.unknown` — which refuses — rather than wait.
+        final class Box: @unchecked Sendable {
+            private let lock = NSLock()
+            private var data = Data()
+            func set(_ value: Data) { lock.lock(); data = value; lock.unlock() }
+            func get() -> Data { lock.lock(); defer { lock.unlock() }; return data }
+        }
+        let box = Box()
+        let done = DispatchSemaphore(value: 0)
+        Thread.detachNewThread {
+            box.set(pipe.fileHandleForReading.readDataToEndOfFile())
+            done.signal()
+        }
+        if done.wait(timeout: .now() + 2.0) == .timedOut {
+            process.terminate()
+            return .unknown
+        }
+        let text = String(decoding: box.get(), as: UTF8.self).lowercased()
+        guard text.contains("screenlock") else { return .unknown }
+        // "screenLock is off" ⇒ no password on wake. Every other form it prints
+        // ("screenLock is immediate", "screenLock delay is N seconds") means a
+        // password IS eventually demanded; a grace period is still a lock, and
+        // conservative is the correct direction here.
+        if text.contains("screenlock is off") { return .notRequired }
+        if text.contains("immediate") || text.contains("second") || text.contains("delay") {
+            return .required
+        }
+        return .unknown
+    }
+}
+
+#endif
+
+/// Platform fallback: honest unavailability, never a fabricated "unlocked".
+public struct UnavailableMacSessionStateSource: MacSessionStateSource {
+    public init() {}
+    public var isAvailable: Bool { false }
+    public func currentState() -> MacSessionState {
+        MacSessionState(
+            screenIsLocked: true,
+            onConsole: false,
+            displayAsleep: false,
+            passwordRequirement: .unknown,
+            sessionReadable: false
+        )
+    }
+}
+
+public func defaultMacSessionStateSource() -> any MacSessionStateSource {
+    #if canImport(CoreGraphics) && os(macOS)
+    return SystemMacSessionStateSource()
+    #else
+    return UnavailableMacSessionStateSource()
+    #endif
+}
 
 // MARK: - Sub-action → gate category map (wave 30 W01)
 
@@ -225,6 +731,14 @@ public func macControlGateCategory(forAction action: String) -> String? {
     case "jxa":                                           return "jxa"
     case "shortcut", "shortcut/run":                      return "shortcuts"
     case "focus_app", "quit_app", "keystroke", "click":   return "accessibility"
+    case "ax_status", "ax_tree", "ax_find", "view":       return "accessibility"
+    // W2/W3 Swift-native injection: same category as keystroke/click above,
+    // which is where the daemon put every accessibility-mediated act.
+    // W6 `wake` joins them: it posts HID events and re-reads the screen.
+    case "scroll", "ax_act", "wake":                      return "accessibility"
+    // W7 `nudge` — same category as the AX reads it is gated like. A bare
+    // cursor move is accessibility-mediated whether or not it is injection.
+    case "nudge":                                         return "accessibility"
     case "system":                                        return "system"
     case "file/read", "file/write", "file/list",
          "file/move", "file/trash":                       return "file_ops"

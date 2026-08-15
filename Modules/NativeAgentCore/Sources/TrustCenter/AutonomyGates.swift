@@ -226,21 +226,27 @@ public func checkTrustPolicyForAction(
         return .denied(reason: "autonomy disabled in Trust Center — enable it in Settings")
     }
     if let perAction = action.perActionEnabled(policy), !perAction {
+        // L3#15 (2026-08-11): this deny copy used to close by promising that a
+        // numbered future phase would add a full approval-request flow for the
+        // action. No such phase exists in any current plan, and no
+        // approval-request flow exists for these actions —
+        // the trust setting IS the only way to allow them. Deny copy states the
+        // requirement and stops there; it does not promise a roadmap.
         return .denied(reason:
             "\(action.label) requires \(action.perActionPolicyPath)=true (default false). " +
-            "Enable it in Trust Center to allow \(action.label). " +
-            "Phase 13 will add a full approval-request flow for this action."
+            "Enable it in Trust Center to allow \(action.label); there is no per-request " +
+            "approval path for this action."
         )
     }
     return .allowed
 }
 
-/// Public port of `_autonomy_approval_gate`. Today the gate is the same
-/// composite as `checkTrustPolicyForAction` (the daemon has not yet wired
-/// the full approval-receipt flow into `system_rebuild` / `git_stash_recover`
-/// — TODO at L45118 / L45124). The function is exposed separately so
-/// future approval-flow integration (wave-9+) can return
-/// `requiresApproval(id:)` without rewriting every SwiftNative caller.
+/// Public port of `_autonomy_approval_gate`. This gate is exactly the same
+/// composite as `checkTrustPolicyForAction` — there is no approval-request
+/// flow behind `system_rebuild` / `git_stash_recover`, and none is planned;
+/// the Trust Center per-action setting is the whole decision. The function
+/// stays a separate symbol only so its two callers keep a stable name if an
+/// approval flow is ever built; it makes no promise that one will be.
 public func autonomyApprovalGate(
     action: AutonomyGatedAction,
     daemonAutonomy: Bool,

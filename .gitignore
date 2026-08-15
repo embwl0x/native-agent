@@ -145,3 +145,4 @@ data.backup.*/
 
 # Hermes/codex agent job workspaces parked in the repo root (foreign embedded repos)
 .hermes-*/
+tests/activity_watch/verify_ground_truth.py

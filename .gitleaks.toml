@@ -4,3 +4,11 @@ title = "NativeAgent gitleaks config"
 
 [extend]
 useDefault = true
+
+[allowlist]
+description = "Test fixtures that are key-shaped fakes by design."
+paths = [
+  # mac_view secret-redaction suite: proves key-shaped strings are redacted
+  # before the agent sees them, so its fixtures deliberately look like keys.
+  '''Modules/NativeAgentCore/Tests/MacControlTests/MacScreenViewTests\.swift$''',
+]

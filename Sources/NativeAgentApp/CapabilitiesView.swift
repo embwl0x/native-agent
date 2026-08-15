@@ -100,6 +100,7 @@ struct CapabilitiesView: View {
                     StatusBadge(text: attentionBadge, status: "warn")
                 }
             }
+            .togglesDisclosure(isExpanded)
         }
         .padding(NativeAgentSpacing.lg)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous))
@@ -111,7 +112,12 @@ struct CapabilitiesView: View {
 
     private var overview: some View {
         VStack(alignment: .leading, spacing: 16) {
-            capabilityFoundry
+            // L3#7 (2026-08-11): the "Capability Foundry" panel is deleted.
+            // E-1 already stripped its fake counters; what was left was a
+            // status badge and 2-3 lane tiles over a subsystem that was never
+            // ported (no auto-implementation ledger, no review pipeline). The
+            // CapabilityFoundry module stays for its MCP metadata consumer;
+            // the panel claimed a workshop that does not exist.
 
             collapsedCard(
                 title: "Next-Gen Runtime",
@@ -157,55 +163,6 @@ struct CapabilitiesView: View {
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
-            }
-        }
-    }
-
-    private var capabilityFoundry: some View {
-        NativePanel(title: "Capability Foundry", systemImage: "hammer") {
-            if let foundry = appModel.capabilityFoundry {
-                // NO "self-built" / "review" pills (removed 2026-08-02, E-1).
-                // `summary.autoCreated` and `summary.review` are hardcoded 0 in
-                // SwiftNativeCapabilityFoundryClient — the auto-implementation
-                // ledger and the review pipeline are unported. A counter pill
-                // reading "0 review" claims a live queue that is empty; there is
-                // no queue. NORTHSTAR clause 2: every button works or doesn't
-                // exist. Both fields stay in the envelope for the MCP metadata
-                // consumer; nothing renders them until they count something.
-                HStack(spacing: 8) {
-                    StatusBadge(text: foundry.status.uppercased(), status: foundry.status)
-                    InfoPill(text: foundry.hotPathContract?.chatInjection ?? "compact index", systemImage: "bolt")
-                    Spacer()
-                }
-
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 165), spacing: 10)], spacing: 10) {
-                    ForEach(foundry.lanes) { lane in
-                        CapabilityFoundryLaneCard(lane: lane)
-                    }
-                }
-
-                // NO "Review" / "Recent Builds" columns (removed 2026-08-02, E-1).
-                // `capabilityFoundrySummary()` returns `reviewQueue: []` and
-                // `recentArtifacts: []` UNCONDITIONALLY — the review pipeline and
-                // the artifact ledger were never ported. These were two headed
-                // columns waiting on arrays that can never fill: lifecycle
-                // furniture around an empty system.
-
-                if let contract = foundry.hotPathContract {
-                    Divider()
-                    HStack(spacing: 8) {
-                        InfoPill(text: contract.bodiesLoaded ?? "routed load", systemImage: "shippingbox")
-                        if let pluginPolicy = contract.pluginPolicy {
-                            InfoPill(text: pluginPolicy, systemImage: "puzzlepiece.extension")
-                        }
-                        if let risky = contract.riskyPermissionsPresent, !risky.isEmpty {
-                            InfoPill(text: risky.prefix(3).joined(separator: ", "), systemImage: "exclamationmark.shield")
-                        }
-                        Spacer()
-                    }
-                }
-            } else {
-                NativeEmptyState(title: "Foundry summary unavailable", detail: "Refresh when the native runtime is ready.", systemImage: "hammer")
             }
         }
     }
@@ -261,10 +218,17 @@ struct CapabilitiesView: View {
         return combined.filter { seen.insert($0.id).inserted }
     }
 
+    /// L3#6 (2026-08-11): the catalog (`nextgen_phases.json`) is a data file and
+    /// can list any action id; the read-only executor is a fixed switch. Only
+    /// ids that switch actually has a case for get a button — everything else
+    /// resolves to `default:` → 410 "not backed by a Swift read-only executor
+    /// yet", which is a button that cannot do its job. One set intersection.
     private var nextGenActions: [NextGenAction] {
         var seen = Set<String>()
         let combined = (appModel.nextGenSummary?.actions ?? []) + nextGenLoadedPhases.flatMap { $0.actions ?? [] }
-        return combined.filter { seen.insert($0.id).inserted }
+        return combined
+            .filter { NativeClient.isNextGenActionBacked($0.id) }
+            .filter { seen.insert($0.id).inserted }
     }
 
     private var nextGenRuntime: some View {
@@ -800,8 +764,8 @@ struct CapabilitiesView: View {
                 // `nativePower.surfaces` list and the "App Intents" tile were
                 // removed — getNativePower() is a DAEMON-KILL P1 stub that
                 // returns surfaces: [] forever, and /v1/native/intents was
-                // retired with no SwiftNative successor (refreshAll pins
-                // nativeIntentRegistry = nil), so both rendered permanent
+                // retired with no SwiftNative successor (the dead intent-registry
+                // chain was fully deleted 2026-08-14), so both rendered permanent
                 // empty/"Loading" furniture. The remaining tiles and action
                 // rows below are fed by live readers.
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 180), spacing: 10)], spacing: 10) {
@@ -977,70 +941,6 @@ struct CapabilityMetricCard: View {
     }
 }
 
-struct CapabilityFoundryLaneCard: View {
-    var lane: CapabilityFoundryLane
-
-    var body: some View {
-        // 2026-06-07 ui-taste-sweep #84: titles like "MCP Servers" /
-        // "On-Demand" / "Capabilities" were truncating to "MCP Se..." /
-        // "On-De..." / "Capabi..." because they shared a single HStack with
-        // the StatusBadge inside a 165pt-min adaptive grid cell. Two changes:
-        // (1) drop the badge to its own row so the title gets the full card
-        // width; (2) allow up to 2 lines of wrap. .help(lane.title) is the
-        // belt-and-suspenders fallback so hover still surfaces the full
-        // name if a future title is long enough to wrap past 2 lines.
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .top, spacing: 6) {
-                Image(systemName: icon)
-                    .foregroundStyle(NativeAgentTheme.statusColor(lane.status))
-                Text(lane.title)
-                    .font(.caption.weight(.semibold))
-                    .lineLimit(2)
-                    .minimumScaleFactor(0.85)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .help(lane.title)
-            }
-            HStack(spacing: 6) {
-                StatusBadge(text: lane.status.uppercased(), status: lane.status)
-                Spacer()
-            }
-            Text("\(lane.count)")
-                .font(.title3.monospacedDigit().weight(.semibold))
-            HStack(spacing: 6) {
-                InfoPill(text: "\(lane.reviewCount) review", systemImage: "checkmark.shield")
-                if let hotPath = lane.hotPath {
-                    InfoPill(text: hotPath, systemImage: "bolt")
-                }
-            }
-            if let gate = lane.policyGate {
-                Text(gate)
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
-                    .help(gate)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .frame(minHeight: 104)
-        .padding(10)
-        .background(.quaternary.opacity(0.28), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-    }
-
-    private var icon: String {
-        switch lane.id {
-        case "skill": "text.book.closed"
-        case "tool": "wrench.and.screwdriver"
-        case "workflow": "point.topleft.down.curvedto.point.bottomright.up"
-        case "mcp": "externaldrive.connected.to.line.below"
-        case "panel": "rectangle.grid.2x2"
-        case "plugin": "puzzlepiece.extension"
-        case "catalog": "shippingbox"
-        default: "hammer"
-        }
-    }
-}
-
 struct CapabilityRow: View {
     var capability: CapabilityRecord
     var compact = false
@@ -1088,7 +988,10 @@ struct NextGenPhaseRow: View {
                 systemImage: phase.ready == true ? "checkmark.circle" : "circle.dashed"
             )
             Spacer()
-            if let actionId = phase.primaryDryRunActionId {
+            // L3#6: a phase's primaryDryRunActionId comes from the catalog data
+            // file and may name an id the read-only executor has no case for.
+            // Render the probe only when an executor backs it.
+            if let actionId = phase.primaryDryRunActionId, NativeClient.isNextGenActionBacked(actionId) {
                 Button("Probe", systemImage: "play.circle") {
                     runProbe(actionId)
                 }

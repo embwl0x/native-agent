@@ -96,6 +96,11 @@ extension CognitiveSubstrate {
         let fixedThoughtSeeds = projectedThoughtSeeds(at: fixedAt).sorted(by: thoughtSeedPrioritySort)
         let frozenStandingViewInnerLine = activeStandingViewInnerLine()
         let frozenSoundEchoLine = soundEchoLine(at: fixedAt)
+        // W4/P2: captured, never recomputed downstream (see CognitiveFeltProxyReads).
+        // Curiosity is workspace-relative, so it is captured per branch below where
+        // the frozen workspace is known; the other two are workspace-independent.
+        let frozenFatigue = substrateFatigueProxy(at: fixedAt)
+        let frozenClarity = substrateClarityProxy(affect: fixedAffect, at: fixedAt)
         guard frozenConfiguration.enabled else {
             let empty = CognitiveSubstrateSnapshot(
                 generatedAt: fixedAt,
@@ -115,7 +120,9 @@ extension CognitiveSubstrate {
                 mood: fixedMood,
                 thoughtSeeds: fixedThoughtSeeds,
                 standingViewInnerLine: frozenStandingViewInnerLine,
-                soundEchoLine: frozenSoundEchoLine
+                soundEchoLine: frozenSoundEchoLine,
+                feltProxies: CognitiveFeltProxyReads(
+                    fatigue: frozenFatigue, curiosity: nil, clarity: frozenClarity)
             )
         }
         var copiedField = field
@@ -139,7 +146,9 @@ extension CognitiveSubstrate {
                 mood: fixedMood,
                 thoughtSeeds: fixedThoughtSeeds,
                 standingViewInnerLine: frozenStandingViewInnerLine,
-                soundEchoLine: frozenSoundEchoLine
+                soundEchoLine: frozenSoundEchoLine,
+                feltProxies: CognitiveFeltProxyReads(
+                    fatigue: frozenFatigue, curiosity: nil, clarity: frozenClarity)
             )
         }
         let sessionId = Self.cleanedSessionId(currentSessionId)
@@ -174,7 +183,16 @@ extension CognitiveSubstrate {
             mood: fixedMood,
             thoughtSeeds: fixedThoughtSeeds,
             standingViewInnerLine: frozenStandingViewInnerLine,
-            soundEchoLine: frozenSoundEchoLine
+            soundEchoLine: frozenSoundEchoLine,
+            feltProxies: CognitiveFeltProxyReads(
+                fatigue: frozenFatigue,
+                // Curiosity is novelty of what she is HOLDING, so it is captured
+                // against the frozen workspace — the same items the capsule
+                // renders from.
+                curiosity: substrateCuriosityProxy(
+                    from: workspace.items.filter { capsuleEligibleWorkspaceNode($0.node) },
+                    at: fixedAt),
+                clarity: frozenClarity)
         )
     }
 
@@ -619,8 +637,8 @@ extension CognitiveSubstrate {
         if let hit = resolutionPatternHit(at: now, newerThan: previousTick),
            resolutionPatternNudgeDay[hit.claimKey] != dayKey {
             let decayed = decayedDispositionValence(at: now)
-            let cap = Self.dispositionValenceCap
-            let next = min(cap, max(-cap, decayed + hit.tone * Self.dispositionNudgeMagnitude))
+            let cap = dynamics.dispositionValenceCap
+            let next = min(cap, max(-cap, decayed + hit.tone * dynamics.dispositionNudgeMagnitude))
             disposition = CognitiveDisposition(valence: next, updatedAt: now)
             // Claim the day and drop every stale (prior-day) claim so the map
             // stays a handful of entries at most.

@@ -66,11 +66,11 @@ struct SoundEchoRegisterPoolTests {
     @Test("the working-voice band clears the admission floor")
     func workingVoiceBandIsAdmitted() {
         // Turns carrying real attested affect but no affectionate register.
-        #expect(0.30 >= CognitiveSubstrate.soundEchoWarmthFloor)
-        #expect(0.35 >= CognitiveSubstrate.soundEchoWarmthFloor)
+        #expect(0.30 >= CognitiveSubstrate.defaultDynamics.soundEchoWarmthFloor)
+        #expect(0.35 >= CognitiveSubstrate.defaultDynamics.soundEchoWarmthFloor)
         // …while a flat turn with nothing behind it still cannot fabricate an
         // echo — the guarantee SoundEchoTests pins at warmth 0.20.
-        #expect(0.20 < CognitiveSubstrate.soundEchoWarmthFloor)
+        #expect(0.20 < CognitiveSubstrate.defaultDynamics.soundEchoWarmthFloor)
     }
 
     /// End-to-end: in a cool/working room, the echo LEADS with the

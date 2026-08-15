@@ -236,9 +236,11 @@ public protocol ApprovalInboxProtocol: Sendable {
 /// in-flight mutations against the same on-disk file can't clobber each
 /// other's writes.
 public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
-    private let root: URL
-    private let persistence: any PersistenceCoreProtocol
-    private let clock: @Sendable () -> Date
+    // Module-internal (not private) so `ApprovalInbox+InjectionSpend.swift`
+    // can build the durable spend marker against the same root/persistence.
+    let root: URL
+    let persistence: any PersistenceCoreProtocol
+    let clock: @Sendable () -> Date
     /// Serializes mutating ops (resolve/archive) against actor reentrancy:
     /// each new mutation chains after the prior one so two concurrent
     /// resolve calls can't interleave their read→mutate→write sequence.

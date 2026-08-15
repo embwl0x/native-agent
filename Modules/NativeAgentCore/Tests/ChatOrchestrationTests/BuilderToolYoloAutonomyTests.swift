@@ -109,15 +109,31 @@ struct BuilderToolYoloAutonomyTests {
         }
     }
 
-    // MARK: builder tools NOT auto outside yolo
+    // MARK: builder tools are auto even OUTSIDE yolo (post-cutover catch-all)
 
-    @Test func builderTools_notAuto_whenYoloInactive() async throws {
+    /// YOLO cutover 2026-08-12 (9023d24d, 84fb8201): perimeter gates entry,
+    /// execution ungated. The `toolAutonomy["default"]` catch-all flipped
+    /// `send_approval` → `auto`, so a builder tool no longer needs the yolo
+    /// window to resolve auto — with no window at all it falls through to the
+    /// catch-all and still resolves auto.
+    ///
+    /// OLD CONTRACT: builder tools were confirm-class without an active yolo
+    /// window. NEW CONTRACT: the autonomy layer is not a gate for them at all;
+    /// the Trust Center categories, Full Mac and the macOS TCC grant are.
+    @Test func builderTools_autoEvenWithYoloInactive_catchAllIsAuto() async throws {
         let root = tempRoot("off")
         try seedYoloInactive(root)
         let tc = SwiftNativeTrustCenter(dataRoot: root)
         for tool in builderTools {
             let level = try await tc.autonomyLevel(forTool: tool, surface: "chat")
-            #expect(level != "auto", "\(tool) must NOT be auto with no yolo window (got \(level))")
+            #expect(level == "auto", "\(tool) resolves auto via the catch-all with no yolo window (got \(level))")
+        }
+        // TEETH: the catch-all is not blanket-auto. The deliberate floors that
+        // SURVIVED the cutover still resolve confirm in the same fixture, so
+        // this test cannot pass on an "everything is auto" resolver.
+        for tool in ["self_install", "evolution_propose", "remote_node_execute"] {
+            let level = try await tc.autonomyLevel(forTool: tool, surface: "chat")
+            #expect(level == "confirm", "\(tool) keeps its floor post-cutover (got \(level))")
         }
     }
 
@@ -137,7 +153,19 @@ struct BuilderToolYoloAutonomyTests {
         }
     }
 
-    @Test func builderTools_notAuto_fromUntrustedTelegramLabelEvenInYolo() async throws {
+    /// YOLO cutover 2026-08-12 (9023d24d, 84fb8201): perimeter gates entry,
+    /// execution ungated. An untrusted Telegram LABEL still fails the
+    /// `originTrusted` check inside `fullMacPolicyAllows`, so it does not take
+    /// the yolo branch — but the per-tool fall-through now lands on the
+    /// `default: auto` catch-all, so the resolved level is auto anyway.
+    ///
+    /// OLD CONTRACT: an unauthenticated remote label was held at confirm by the
+    /// autonomy layer. NEW CONTRACT: the autonomy layer no longer discriminates
+    /// by origin trust for builder tools — the PERIMETER does. A Telegram sender
+    /// who is not in `allowed_chat_ids` / `allowed_user_ids` is dropped in
+    /// TelegramPollLoop before any turn runs (not_allowlisted receipt), so no
+    /// untrusted sender ever reaches this resolver in production.
+    @Test func builderTools_autoFromUntrustedTelegramLabel_perimeterIsTheBoundary() async throws {
         let root = tempRoot("tg-untrusted")
         try seedYoloActive_shellFlagOff(root)
         let tc = SwiftNativeTrustCenter(dataRoot: root)
@@ -147,8 +175,15 @@ struct BuilderToolYoloAutonomyTests {
                 surface: "telegram",
                 originTrusted: false
             )
-            #expect(level != "auto", "\(tool) from an untrusted telegram label must not auto (got \(level))")
+            #expect(level == "auto", "\(tool) resolves auto via the catch-all (got \(level))")
         }
+        // TEETH: origin trust still changes a REAL outcome elsewhere — the
+        // deliberate floors do not move for a trusted origin either, and the
+        // catch-all is not blanket-auto.
+        let remote = try await tc.autonomyLevel(
+            forTool: "remote_node_execute", surface: "telegram", originTrusted: false
+        )
+        #expect(remote == "confirm", "remote effects keep their floor (got \(remote))")
     }
 
     @Test func appLifecycleTools_resolveAuto_fromAllKnownChatSurfaces_whenYoloActive() async throws {
@@ -180,14 +215,24 @@ struct BuilderToolYoloAutonomyTests {
         #expect(level == "auto", "shell from a trusted iOS origin must auto in yolo (got \(level))")
     }
 
-    @Test func builderTools_notAuto_fromUnknownSurface_evenInYolo() async throws {
+    /// YOLO cutover 2026-08-12 (9023d24d, 84fb8201): perimeter gates entry,
+    /// execution ungated. An unrecognized surface string still fails
+    /// `isYoloEligibleSurface`, so it does not take the yolo branch — and the
+    /// per-tool fall-through now lands on `default: auto`.
+    ///
+    /// OLD CONTRACT: an unknown surface fail-safed to confirm. NEW CONTRACT:
+    /// the catch-all is auto; a surface label is not a security boundary at
+    /// all, because nothing reaches this resolver that did not already pass the
+    /// perimeter (local Mac window, bridge token, or the Telegram allowlist).
+    @Test func builderTools_autoFromUnknownSurface_catchAllIsAuto() async throws {
         let root = tempRoot("unknown")
         try seedYoloActive_shellFlagOff(root)
         let tc = SwiftNativeTrustCenter(dataRoot: root)
-        // Fail-safe: a surface string the gate doesn't recognize must default to
-        // confirm, never auto.
         let level = try await tc.autonomyLevel(forTool: "shell", surface: "some-future-surface")
-        #expect(level != "auto", "shell from an unknown surface must NOT auto in yolo (got \(level))")
+        #expect(level == "auto", "shell from an unknown surface resolves auto via the catch-all (got \(level))")
+        // TEETH: the surviving floors do not follow it.
+        let evo = try await tc.autonomyLevel(forTool: "self_install", surface: "some-future-surface")
+        #expect(evo == "confirm", "self_install keeps its floor on any surface (got \(evo))")
     }
 
     // MARK: the firewall — self-modification tools never elevate

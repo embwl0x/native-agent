@@ -81,14 +81,17 @@ extension NativeClient {
     /// struct; `loadTrustPolicyJSON()` produces the canonical compact snapshot.
     /// Other unported snapshot paths return nil in the Swift-only runtime.
     /// See CUTOVER_PLAN.md §6.241.
-    func getRawSnapshotData(path: String, timeout: TimeInterval = 30) async -> Data? {
-        if path == "/v1/trust" {
-            return try? await SwiftNativeTrustCenter().loadTrustPolicyJSON()
-        }
-        // Best-effort snapshot read for unported routes is now nil; no HTTP
-        // fallback exists.
-        NSLog("[NativeClient] getRawSnapshotData(\(path)) returns nil - native snapshot reader is not wired for this path")
-        return nil
+    /// L3#12 (2026-08-11): collapsed to what it is. The `path` parameter
+    /// accepted anything and served exactly one route; every other value hit an
+    /// NSLog that read like a live wiring defect in the logs and was not one.
+    /// The body is now the trust-snapshot reader, and the one non-trust
+    /// possibility is a programmer error, logged as such rather than as a
+    /// missing feature.
+    ///
+    /// Returns nil if the trust policy cannot be serialized (snapshot writes
+    /// are best-effort; a single missing file must not abort the batch).
+    func trustSnapshotData() async -> Data? {
+        try? await SwiftNativeTrustCenter().loadTrustPolicyJSON()
     }
 
     // --- Trust / inbox policy ----------------------------------------------
@@ -222,7 +225,14 @@ extension NativeClient {
         }()
         if bodyIsObjectOrEmpty,
            let action = Self.macControlActionFromPath(path) {
-            guard macControlAllActions.contains(action) else {
+            // W1b: the bridge route must accept every action
+            // SwiftNativeMacControl.dispatch will accept — that is
+            // `macControlDispatchableActions` (daemon-parity inventory ∪ the
+            // Swift-native accessibility reads), NOT the daemon-parity set
+            // alone. Gating on macControlAllActions here 404'd ax_status /
+            // ax_tree / ax_find on the HTTP/iOS-remote path even though
+            // dispatch implements them.
+            guard macControlDispatchableActions.contains(action) else {
                 let dict: [String: Any] = ["error": "unknown_action", "action": action]
                 let raw = (try? JSONSerialization.data(withJSONObject: dict)) ?? Data()
                 return MacControlRunResult(statusCode: 404, json: dict, rawData: raw)
@@ -242,6 +252,28 @@ extension NativeClient {
                 bodyDict = [:]
             }
             do {
+                // W2/W3-FIX INJECTION FENCE. This route is the HTTP /
+                // iOS-remote bridge: the request body comes from OFF this
+                // process, and nothing on this path has run the AutonomyGate or
+                // filed an approval. It calls the UNPRIVILEGED
+                // `dispatch(action:body:)`, whose signature has no way to carry
+                // a `MacInjectionCapability` and which refuses
+                // keystroke/click/scroll/ax_act/wake outright (403
+                // approval_not_granted). W6 `wake` is reachable on this route
+                // as a NAME (it is in `macControlDispatchableActions`, so it
+                // 403s honestly instead of 404ing as unknown) and refused as a
+                // CALL, exactly like the other four — the phone can ask, and
+                // the answer is no. W7 `nudge` is different on purpose: it is
+                // NOT in `macControlAccessibilityInjectionActions`, so the
+                // unprivileged dispatch RUNS it. That is not a widening — the
+                // phone still needs the accessibility category and an ACTIVE
+                // Full Mac window (the pre-flight names the nudge set alongside
+                // the reads), and what it buys is one bare mouse move that
+                // cannot click, type or unlock. Waking a slept display from the
+                // phone is the entire point of the tool. Remote injection is therefore
+                // impossible by TYPE, not by remembering to strip a key from
+                // the body — which is what the first cut of this wave relied
+                // on. The AX reads keep working from the phone as before.
                 let result = try await impl.dispatch(action: action, body: bodyDict)
                 if macControlNativePortedActions.contains(action) {
                     // Receipt-shape mirror of daemon's make_receipt. The status

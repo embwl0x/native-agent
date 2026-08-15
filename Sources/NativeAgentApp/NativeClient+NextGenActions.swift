@@ -49,6 +49,16 @@ extension NativeClient {
                 NSLocalizedDescriptionKey: "NextGen action id is empty."
             ])
         }
+        // W6 fix-round (gpt-5.5 BLOCKING): an unbacked id previously sailed
+        // into the dryRun branch and wrote a green "dry_run" receipt — a
+        // success record for an action with no executor. Refuse EVERY entry
+        // path for unbacked ids, not just the render filter.
+        guard Self.isNextGenActionBacked(trimmed) else {
+            throw NSError(domain: "NativeAgentNextGen", code: 410, userInfo: [
+                NSLocalizedDescriptionKey:
+                    "NextGen action \(trimmed) has no Swift executor; nothing was run or recorded."
+            ])
+        }
         let resolved = try await resolveNextGenAction(id: trimmed)
         if resolved.action?.requiresApproval == true, !dryRun {
             let approval = try await Self.createNextGenActionApproval(id: trimmed, resolved: resolved)
@@ -115,6 +125,36 @@ extension NativeClient {
             }
         }
         return ResolvedNextGenAction(action: nil, phase: nil)
+    }
+
+    /// The exact id set `nextGenReadOnlyActionOutput(id:resolved:)` has a case
+    /// for. L3#6 (2026-08-11): `nextgen_phases.json` is a data file, so the
+    /// catalog's action list is unbounded while this executor is fixed — every
+    /// id outside this set falls through to the `default:` 410 below. The
+    /// rendered button set is intersected with this at the UI layer
+    /// (`CapabilitiesView.nextGenActions` / `NextGenPhaseRow`) so the panel
+    /// cannot offer a probe there is no executor for.
+    ///
+    /// Any new `case` in the switch MUST be added here — `nextGenBackedIDsCoverSwitch`
+    /// in `tests/NativeAgentAppTests/NextGenBackedActionFilterTests.swift` pins
+    /// the pairing.
+    static let nextGenBackedActionIDs: Set<String> = [
+        "ops.health.snapshot",
+        "connector.oauth.check", "connector.keychain.oauth.preflight",
+        "tool.lazy.index",
+        "planner.decompose", "context.route.preview", "capability.graph.route",
+        "memory.explain",
+        "truth.audit", "privacy.trust.audit", "mac.control.policy.audit",
+        "personality.drift.audit",
+        "release.gate",
+        "execution.durable.checkpoint",
+        "trace.failure.rootcause", "traces.grade",
+        "capability.marketplace.audit", "capability.signature.verify",
+        "browser.capture", "browser.receipt.capture",
+    ]
+
+    static func isNextGenActionBacked(_ id: String) -> Bool {
+        nextGenBackedActionIDs.contains(id.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     func nextGenReadOnlyActionOutput(id: String, resolved: ResolvedNextGenAction) async throws -> JSONValue {

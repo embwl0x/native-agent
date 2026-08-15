@@ -192,30 +192,6 @@ struct NativeActionReceipt: Identifiable, Codable, Hashable {
     var linksPreview: [BrowserLink]?
 }
 
-struct NativeIntentRegistry: Codable, Hashable {
-    var status: String
-    var source: String?
-    var intentCount: Int
-    var actionsAvailable: [String]?
-    var intents: [NativeIntentRecord]
-    var receipts: [NativeIntentReceipt]?
-    var createdAt: String?
-}
-
-struct NativeIntentRecord: Identifiable, Codable, Hashable {
-    var id: String
-    var name: String
-    var actionId: String?
-    var risk: String?
-    var returns: String?
-}
-
-struct NativeIntentReceipt: Identifiable, Codable, Hashable {
-    var id: String
-    var intentId: String
-    var status: String
-    var createdAt: String?
-}
 
 struct NotificationRuntimeStatus: Codable, Hashable {
     var status: String

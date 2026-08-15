@@ -124,7 +124,6 @@ extension AppModel {
         let fetchedSkills = await decodeLogged("getSkills", default: []) { try await api.getSkills() }
         let fetchedTools = await decodeLogged("getTools", default: []) { try await api.getTools() }
         let fetchedCapabilitySummary = await decodeLogged("getCapabilities") { try await api.getCapabilities() }
-        let fetchedCapabilityFoundry = await decodeLogged("getCapabilityFoundry") { try await api.getCapabilityFoundry() }
         let fetchedWorkflows = await decodeLogged("getWorkflows", default: []) { try await api.getWorkflows() }
         let fetchedWorkflowRuns = await decodeLogged("getWorkflowRuns", default: []) { try await api.getWorkflowRuns() }
         let fetchedApprovals = await decodeLogged("getApprovals", { try await api.getApprovals() })
@@ -144,7 +143,6 @@ extension AppModel {
         setIfChanged(\.skills, fetchedSkills)
         setIfChanged(\.tools, fetchedTools)
         setIfChanged(\.capabilitySummary, fetchedCapabilitySummary)
-        setIfChanged(\.capabilityFoundry, fetchedCapabilityFoundry)
         setIfChanged(\.workflows, fetchedWorkflows)
         setIfChanged(\.workflowRuns, fetchedWorkflowRuns)
         if let freshApprovals = fetchedApprovals {
@@ -244,8 +242,6 @@ extension AppModel {
         // handlers wired through this app.
         setIfChanged(\.nativeActions, fetchedNativeActions)
         setIfChanged(\.nativeActionReceipts, fetchedNativeActionReceipts)
-        // DAEMON-KILL refreshAll: /v1/native/intents retired.
-        setIfChanged(\.nativeIntentRegistry, nil)
         setIfChanged(\.notificationStatus, fetchedNotificationStatus)
         setIfChanged(\.browserRuntimeStatus, fetchedBrowserRuntimeStatus)
         setIfChanged(\.memoryVectorStatus, fetchedMemoryVectorStatus)

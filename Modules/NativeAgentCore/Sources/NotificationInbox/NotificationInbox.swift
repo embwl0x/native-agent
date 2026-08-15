@@ -57,7 +57,10 @@
 //
 // The status-transition writes (read/archive/dismiss) ARE ported because they
 // only mutate index.json. Swift takes the same file lock target used by other
-// NativeAgent processes before writing — see SwiftNativeNotificationInbox.markStatus.
+// NativeAgent processes before writing — see NotificationInboxStore.updateStatusLocked.
+// (The reader that once fronted these writes — SwiftNativeNotificationInbox /
+// makeNotificationInbox — was deleted 2026-08-13: verified zero production
+// callers; the store + ProactiveOutcomeLedger remain as the parity record.)
 
 import Foundation
 import NativeAgentCore
@@ -214,9 +217,10 @@ public struct NotificationInboxItem: Sendable, Equatable {
 /// RETIRED SILO — **not the production write path, and not a production read
 /// path either.** This is a pure file-backed view over `<dataRoot>/inbox/`
 /// (`items.jsonl` + `index.json`), the storage the decommissioned Python daemon
-/// owned. That store is frozen: as of the 2026-08-01 sweep, no code outside
-/// this module and its tests constructs a `NotificationInboxStore` or a
-/// `SwiftNativeNotificationInbox` (only the `nowISO()` static is borrowed).
+/// owned. That store is frozen: as of the 2026-08-13 sweep, no code outside
+/// this module and its tests constructs a `NotificationInboxStore` (only the
+/// `nowISO()` static is borrowed by `NativeClient+ExportWorkshopInbox`). The
+/// reader that once fronted it (`SwiftNativeNotificationInbox`) is deleted.
 ///
 /// THE LIVE INBOX IS `<dataRoot>/notifications/inbox.jsonl` — the append-only
 /// event log the macOS/iOS UI reads, written by

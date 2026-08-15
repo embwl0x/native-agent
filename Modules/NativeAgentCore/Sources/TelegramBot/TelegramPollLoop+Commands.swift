@@ -78,15 +78,22 @@ extension TelegramPollLoop {
 
     func handleModelSelectionCallback(update: TelegramUpdate, callback: JSONValue) async -> Bool {
         guard let parsed = TelegramModelSelectionCallback(callback) else { return false }
+        // Fail-closed perimeter, same contract as the message gate (2026-08-13
+        // gpt-5.5 BLOCKING: callbacks dispatched BEFORE the message gate, so an
+        // empty allowlist accepted stale/forged inline-button callbacks while
+        // the front door was supposedly closed).
         let hasAllowlist = !allowedChatIds.isEmpty || !allowedUserIds.isEmpty
-        if hasAllowlist {
-            let chatOk = allowedChatIds.contains(Int64(parsed.chatId))
-            let userOk = parsed.fromUserId.map { allowedUserIds.contains(Int64($0)) } ?? false
-            guard chatOk || userOk else {
-                await recordBlocked(reason: "not_allowlisted", update: update, message: nil, text: nil)
-                try? await answerCallbackQuery(token, parsed.callbackId, "This Telegram chat is not allowlisted.")
-                return true
-            }
+        guard hasAllowlist else {
+            await recordBlocked(reason: "allowlist_empty_fail_closed", update: update, message: nil, text: nil)
+            try? await answerCallbackQuery(token, parsed.callbackId, "Telegram allowlist is empty — add an approved sender in settings.")
+            return true
+        }
+        let chatOk = allowedChatIds.contains(Int64(parsed.chatId))
+        let userOk = parsed.fromUserId.map { allowedUserIds.contains(Int64($0)) } ?? false
+        guard chatOk || userOk else {
+            await recordBlocked(reason: "not_allowlisted", update: update, message: nil, text: nil)
+            try? await answerCallbackQuery(token, parsed.callbackId, "This Telegram chat is not allowlisted.")
+            return true
         }
 
         guard let menu = await bot.telegramModelMenuForSurface("telegram") else {

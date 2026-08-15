@@ -1724,11 +1724,14 @@ func appChatToolFactoryPersistsLazyLoadOnlyUnderInjectedRoot() async throws {
     let blocked = try await dispatcher.dispatch(
         tool: "restart_app", input: [:], surface: "chat"
     )
-    // The app-owned, root-scoped SecurityCenter remains in front of the Core
-    // confinement guard, so a critical lifecycle action is denied before the
-    // dispatcher can reach any process-global owner.
-    #expect(jsonString(blocked, key: "status") == "blocked")
-    #expect(jsonString(blocked, key: "reason") == "critical action requires Developer Mode")
+    // REBASELINED for the settled YOLO gate model (947c6a7c, USER YOLO
+    // 2026-08-12): criticalRequiresDeveloperMode is false by design, so the
+    // Developer-Mode refusal no longer fires. The guarantee this test pins is
+    // unchanged — a bare chat dispatch of a critical lifecycle action is
+    // REFUSED before reaching any process-global owner — the refusal now
+    // comes from the canonical-body confinement one layer deeper.
+    #expect(jsonString(blocked, key: "status") == "failed")
+    #expect(jsonString(blocked, key: "reason") == "canonical_body_unavailable")
 }
 
 @Test

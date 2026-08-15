@@ -29,8 +29,12 @@ private func makeClient(root: URL) -> SwiftNativeTriggerScheduler {
     )
 }
 
+/// The ACTIVE config home (`<root>/triggers/`, since the 2026-08-13 relocation
+/// out of the legacy `inbox/` silo). These tests seed here directly: they pin
+/// the steady-state corrupt/missing/healthy semantics, not the migration —
+/// LegacyTriggerFileMigrationSuite covers the copy-forward.
 private func inboxConfigPath(_ root: URL) -> URL {
-    root.appendingPathComponent("inbox", isDirectory: true)
+    root.appendingPathComponent("triggers", isDirectory: true)
         .appendingPathComponent("trigger_config.json")
 }
 

@@ -145,6 +145,62 @@ struct InboxItemRecord: Identifiable, Codable, Hashable {
         }
     }
 
+    // MARK: - W6/G12 — "For you" vs "System"
+
+    /// Sources whose vocabulary is OPERATIONS, not work.
+    ///
+    /// G12's finding is a ratio problem, not a producer problem: count the
+    /// producers and the machine-health lanes outnumber the human-shaped ones,
+    /// so User opens his day to *Background loop "heartbeat" started failing ·
+    /// Disk hygiene · Review scheduler errors*. This predicate is the whole
+    /// split — no producer changes, no new store, no new card shape.
+    ///
+    /// The seven named in the L5 evidence, plus the operational sources found
+    /// in the live feed that the doc's enumeration predates (`provider_vitals`,
+    /// the `memory_*` maintenance jobs, `self_test`). Every one of them reports
+    /// on the app's own machinery.
+    static let systemLaneSources: Set<String> = [
+        "background_loop",
+        "disk_hygiene",
+        "doctor",
+        "heartbeat",
+        "provider_vitals",
+        "self_test",
+        "memory_consolidation",
+        "memory_repair",
+        "memory_kind_backfill",
+    ]
+
+    /// Proactive-scan kinds that are self-referential housekeeping. These
+    /// arrive as `proactive_autonomy:<kind>:<opportunityId>`, so the lane test
+    /// has to read the KIND component — matching on the raw source would put
+    /// every proactive card in one lane regardless of what it is about.
+    static let systemLaneProactiveKinds: Set<String> = [
+        "scheduler_health",
+        "approval_backlog",
+        "inbox_digest",
+    ]
+
+    var isSystemLane: Bool {
+        let lower = source.lowercased()
+        if Self.systemLaneSources.contains(lower) { return true }
+        if lower.hasPrefix("proactive_autonomy:") {
+            let parts = lower.split(separator: ":", omittingEmptySubsequences: false)
+            if parts.count >= 2, Self.systemLaneProactiveKinds.contains(String(parts[1])) {
+                return true
+            }
+        }
+        // `loop-failure:*` and the maintenance producers prefix rather than
+        // match exactly.
+        if lower.hasPrefix("background_loop") || lower.hasPrefix("loop-failure:") { return true }
+        return false
+    }
+
+    /// Everything else — deliberately the DEFAULT. An unrecognized source is a
+    /// card nobody has classified yet; putting it in front of User is the
+    /// recoverable error, hiding it in a lane he does not open is not.
+    var isForYouLane: Bool { !isSystemLane }
+
     var sourceIcon: String {
         if hasLinkedApproval { return "checkmark.shield.fill" }
         if source.hasPrefix("proactive_autonomy") { return "lightbulb.fill" }
@@ -622,6 +678,29 @@ struct InboxItemDetailSheet: View {
 
 // MARK: - Full inbox list (accessible from chat header or settings)
 
+/// W6/G12 — the two reading lanes. Not a filter over severity or status: a
+/// filter over *who the card is addressed to*.
+enum InboxLane: String, CaseIterable, Identifiable {
+    case forYou
+    case system
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .forYou: return "For you"
+        case .system: return "System"
+        }
+    }
+
+    func matches(_ item: InboxItemRecord) -> Bool {
+        switch self {
+        case .forYou: return item.isForYouLane
+        case .system: return item.isSystemLane
+        }
+    }
+}
+
 struct InboxView: View {
     @Environment(AppModel.self) private var appModel
 
@@ -630,6 +709,9 @@ struct InboxView: View {
     @State private var errorText: String?
     @State private var showAll = false
     @State private var groupFilter: InboxRelatedGroup?
+    // G12: defaults to the human lane. The operations feed is one click away,
+    // it is just no longer the thing User's day opens with.
+    @State private var lane: InboxLane = .forYou
 
     // R22: source the client from AppModel's canonical `client`.
     private var client: NativeClient { appModel.client }
@@ -654,6 +736,19 @@ struct InboxView: View {
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
+
+            // G12: the segmented control. Unread counts live ON the segments so
+            // the System lane is never a silent hiding place — User can see it
+            // has three things in it without switching to it.
+            Picker("Lane", selection: $lane) {
+                ForEach(InboxLane.allCases) { candidate in
+                    Text(laneLabel(candidate)).tag(candidate)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .padding(.horizontal, 16)
+            .padding(.bottom, 8)
 
             if let err = errorText {
                 Text(err).font(NativeAgentFont.label).foregroundStyle(NativeAgentTheme.fail).padding(.horizontal)
@@ -680,10 +775,13 @@ struct InboxView: View {
 
             Divider()
 
-            if items.isEmpty && !isLoading {
+            // Lane-aware: an empty "For you" lane with a full System lane must
+            // not render a blank List. It says which lane is empty and, when
+            // the other one has something, points at it.
+            if displayItems.isEmpty && !isLoading {
                 NativeEmptyState(
-                    title: "Nothing here yet",
-                    detail: "When \(appModel.personality?.name ?? "your agent") notices something useful, it will appear here.",
+                    title: lane == .forYou ? "Nothing for you right now" : "No system notices",
+                    detail: emptyStateDetail,
                     systemImage: "tray",
                     actionTitle: nil, actionImage: nil, action: nil
                 )
@@ -710,9 +808,28 @@ struct InboxView: View {
     }
 
     private var displayItems: [InboxItemRecord] {
-        let base = showAll ? items : items.filter { !$0.isHiddenFromDefaultInbox }
+        let base = (showAll ? items : items.filter { !$0.isHiddenFromDefaultInbox })
+            .filter { lane.matches($0) }
         guard let groupFilter else { return base }
         return base.filter { groupFilter.matches($0) }
+    }
+
+    private var emptyStateDetail: String {
+        let other: InboxLane = lane == .forYou ? .system : .forYou
+        let otherCount = items.filter { other.matches($0) && !$0.isHiddenFromDefaultInbox }.count
+        if otherCount > 0 {
+            return "\(otherCount) item(s) are waiting in \(other.title)."
+        }
+        return "When \(appModel.personality?.name ?? "your agent") notices something useful, it will appear here."
+    }
+
+    /// Unread count per lane, over the same visibility rules the list uses —
+    /// a dismissed card must not inflate the segment it sits behind.
+    private func laneLabel(_ candidate: InboxLane) -> String {
+        let unread = items.filter {
+            candidate.matches($0) && $0.isUnread && !$0.isHiddenFromDefaultInbox
+        }.count
+        return unread > 0 ? "\(candidate.title) (\(unread))" : candidate.title
     }
 
     func load() async {

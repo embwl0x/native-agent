@@ -238,6 +238,32 @@ extension SwiftNativeTurnEngine {
         // behavior for callers that don't thread an active-tools set.
         providerIDOverride: String? = nil,
         turnActiveTools: Set<String>? = nil,
+        // turn-context-iteration-cache (2026-08-13): when non-nil, the lazy
+        // tool filter uses THIS set instead of re-reading ActiveToolsStore —
+        // the text-compat loop passes its turn-start set on every iteration
+        // so a mid-turn tool_load cannot mutate the stable system segment's
+        // tool catalog and bust the prompt-cache prefix. nil = today's
+        // behavior (fresh store read), used by all other callers.
+        pinnedActiveTools: Set<String>? = nil,
+        // Sibling of pinnedActiveTools: turn-start instant for the dynamic
+        // segment's clock line, passed identically on every iteration of a
+        // tool loop so a minute boundary can't churn the cache mid-turn.
+        clockNowOverride: Date? = nil,
+        // Full per-turn context reuse (turn-context-iteration-cache, third
+        // churn source): on the live app the ContextFlow PACKET rides the
+        // dynamic segment, and the turn's own tool results move her
+        // attention, so a per-iteration re-prepare reshuffles packet bytes
+        // and busts the prompt cache mid-turn — a source the tool-set and
+        // clock pins cannot cover. A tool loop passes iteration 1's built
+        // context back in on iterations 2+; the build (and its ContextFlow
+        // prepare) then runs ONCE per turn, native-loop parity
+        // (resolveToolLoopContext precedent). Reuse of the SAME TurnContext
+        // object is lease/outcome-safe: ContextPreparedTurn.recordOutcome is
+        // latched idempotent and deinit releases the generation lease once.
+        preBuiltContext: TurnContext? = nil,
+        // Fires exactly once, after a fresh build completes (never on the
+        // preBuiltContext path) — the tool loop's capture hook.
+        onContextBuilt: (@Sendable (TurnContext) -> Void)? = nil,
         imageBlocks: [LLMContentBlock] = [],
         // NATIVE TOOL LANE (kimi-code only — NativeToolCapability).
         // docs/build_plans/kimi-native-tools.md P2. When true, this turn ships
@@ -256,7 +282,11 @@ extension SwiftNativeTurnEngine {
         // eval harnesses) for a signal only the text-compat loop consumes.
         // The sink is awaited inline in the consumption loop, so calls arrive
         // in wire order and strictly before `.final`.
-        nativeToolCallSink: (@Sendable (LLMStreamToolCall) async -> Void)? = nil
+        nativeToolCallSink: (@Sendable (LLMStreamToolCall) async -> Void)? = nil,
+        // Raw user text for relevance consumers (selection queryText, memory
+        // recall, query embedding) when `userMessage` carries turn-scoped wire
+        // riders — the text-compat tool-routing hint. nil → `userMessage`.
+        queryUserMessage: String? = nil
     ) -> AsyncThrowingStream<TurnStreamEvent, Error> {
         AsyncThrowingStream { continuation in
             let startNs = DispatchTime.now().uptimeNanoseconds
@@ -302,6 +332,9 @@ extension SwiftNativeTurnEngine {
                     return
                 }
                 let ctx: TurnContext
+                if let preBuiltContext {
+                    ctx = preBuiltContext
+                } else {
                 do {
                     // Wave 16: when a sessionId is supplied, thread prior
                     // conversation history through the context so streaming
@@ -320,14 +353,18 @@ extension SwiftNativeTurnEngine {
                             historyReader: historyReader,
                             personaOverride: personaOverride,
                             excludeHistoryRunId: excludeHistoryRunId,
-                            imageBlocks: imageBlocks
+                            imageBlocks: imageBlocks,
+                            queryUserMessage: queryUserMessage,
+                            clockNowOverride: clockNowOverride
                         )
                     } else {
                         rawCtx = try await self.buildTurnContext(
                             surface: surface,
                             userMessage: userMessage,
                             personaOverride: personaOverride,
-                            imageBlocks: imageBlocks
+                            imageBlocks: imageBlocks,
+                            queryUserMessage: queryUserMessage,
+                            clockNowOverride: clockNowOverride
                         )
                     }
                     let plannedCtx = Self.contextByAppendingTurnPlanHint(
@@ -344,12 +381,18 @@ extension SwiftNativeTurnEngine {
                     // filter the structured tool loop applies so this surface
                     // doesn't ship the full eager catalog. Empty/nil sessionId
                     // falls closed to alwaysOnCore + MCP only. (C3 shared helper.)
-                    ctx = await self.lazyFilteredTurnContext(runtimeCtx, sessionId: sessionId)
+                    ctx = await self.lazyFilteredTurnContext(
+                        runtimeCtx,
+                        sessionId: sessionId,
+                        pinnedActiveTools: pinnedActiveTools
+                    )
                 } catch {
                     let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
                     continuation.yield(.error(message))
                     continuation.finish()
                     return
+                }
+                onContextBuilt?(ctx)
                 }
                 if Task.isCancelled {
                     continuation.finish()

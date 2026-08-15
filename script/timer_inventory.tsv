@@ -14,7 +14,7 @@ Modules/NativeAgentCore/Sources/Dispatcher/Actions/FileSystemActions.swift	*	2	t
 Modules/NativeAgentCore/Sources/MCPDispatcher/MCPHTTPTransport.swift	*	1	timeout_retry_deadline	MCPHTTPRetryBackoff
 Modules/NativeAgentCore/Sources/MCPDispatcher/MCPSubprocess+Pool.swift	*	1	event_deadline	MCPSubprocessPool.idleDeadline
 Modules/NativeAgentCore/Sources/MCPDispatcher/MCPSubprocess+Process.swift	*	1	timeout_retry_deadline	MCPSubprocessProcess
-Modules/NativeAgentCore/Sources/MacControl/MacControl+Client.swift	*	3	timeout_retry_deadline	MacControlOperationOwner
+Modules/NativeAgentCore/Sources/MacControl/MacControl+Client.swift	*	4	timeout_retry_deadline	MacControlOperationOwner
 Modules/NativeAgentCore/Sources/MacControl/TrustedRemoteEffectNodes.swift	*	2	timeout_retry_deadline	TrustedRemoteEffectNodeProcessDeadline
 Modules/NativeAgentCore/Sources/NativeAgentCore/ProcessTreeReaper.swift	*	1	timeout_retry_deadline	ProcessTreeReaper
 Modules/NativeAgentCore/Sources/MemoryV2/MemoryV2+CloudKit.swift	*	2	external_protocol_poll	MemoryCloudKitTransport
@@ -106,3 +106,7 @@ Modules/NativeAgentCore/Sources/NativeAgentCore/LifecyclePrimitives.swift	try aw
 Modules/NativeAgentCore/Sources/Context/ContextTurnRuntime.swift	timeoutNanoseconds	1	timeout_retry_deadline	ContextTurnRuntime.ticketTimeout
 Sources/NativeAgentApp/DeskView.swift	20_000_000	1	visible_ui	DeskView.noteFieldFocusDefer
 Sources/NativeAgentApp/TurnInspectorStore.swift	cardsDebounceSeconds	1	visible_ui	TurnInspectorStore.cardsDebounce
+Sources/NativeAgentApp/BackgroundLoopsAssembly+TriggerScheduler.swift	UInt64(morningBriefSynthesisTimeout * 1_000_000_000)	1	timeout_retry_deadline	BackgroundLoopsAssembly.withBoundedMorningBriefTurn
+Modules/NativeAgentCore/Sources/ActivityProbeCLI/main.swift	DispatchSource.makeTimerSource(queue: .main)	1	visible_ui	ActivityProbeCLI.runStatusTicker
+Modules/NativeAgentCore/Sources/ActivityWatch/ActivityWatcher.swift	Task.sleep(nanoseconds: 5_000_000_000)	1	timeout_retry_deadline	ActivityWatcher.stopShutdownWatchdog
+Sources/NativeAgentApp/ActivityWatchController.swift	Task.sleep(nanoseconds: 250_000_000)	1	visible_ui	ActivityWatchController.refreshCapturingFlagAfterTeardown

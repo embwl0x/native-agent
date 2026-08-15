@@ -323,6 +323,20 @@ extension AppDelegate {
         // BackgroundLoopsManager and NSBackgroundActivityScheduler must not
         // register an unattended dream loop.
 
+        // W8 (2026-08-14) — the ambient activity watcher.
+        //
+        // Called UNCONDITIONALLY, and that is deliberate. The decision about
+        // whether to capture lives in exactly one place: the policy read inside
+        // `ActivityWatcher.start()`, which installs no AX observer, no
+        // workspace observer and no lock observer, and opens no span, when the
+        // Trust Center toggle is off. A second `if` here would be a second gate
+        // that can disagree with the first, and the outer one is always the one
+        // a later refactor forgets. Default is OFF, and an unreadable policy
+        // file decodes to OFF, so a fresh install captures nothing.
+        Task { @MainActor in
+            ActivityWatchController.shared.startAtLaunch()
+        }
+
         // PATCH-2026-05-06: wkwebview-browser Start browser IPC server, preferring port 8766.
         Task { @MainActor in
             BrowserWindowController.shared.startIPCServer()

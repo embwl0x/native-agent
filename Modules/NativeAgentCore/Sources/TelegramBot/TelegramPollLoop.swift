@@ -241,22 +241,30 @@ public struct TelegramPollLoop: LoopRunner {
                 continue
             }
             // Allowlist enforcement applies BEFORE slash dispatch so commands
-            // from unauthorized users can't run either. When both sets are
-            // empty, no allowlist is active (back-compat: accept all). When
-            // either set is non-empty, the message must match at least one:
-            // chat.id ∈ allowedChatIds OR from.id ∈ allowedUserIds.
+            // from unauthorized users can't run either. The allowlist is the
+            // ONLY perimeter in front of execution (YOLO removed the inner
+            // gates 2026-08-12), so an EMPTY allowlist FAILS CLOSED: every
+            // message drops with an allowlist_empty receipt until the owner
+            // adds an approved sender or group. The old back-compat branch
+            // (both sets empty → accept all) meant one config wipe silently
+            // opened the front door — User's call, 2026-08-13: "if they don't
+            // put something in there, have it fail closed."
+            // Match rule: chat.id ∈ allowedChatIds OR from.id ∈ allowedUserIds.
             let hasAllowlist = !allowedChatIds.isEmpty || !allowedUserIds.isEmpty
-            if hasAllowlist {
-                let chatOk = allowedChatIds.contains(Int64(msg.chatId))
-                let userOk: Bool = {
-                    guard let fid = msg.fromUserId else { return false }
-                    return allowedUserIds.contains(Int64(fid))
-                }()
-                if !chatOk && !userOk {
-                    FileHandle.standardError.write(Data("TelegramPollLoop: dropping update \(update.updateId) — chat_id \(msg.chatId) / from \(msg.fromUserId ?? 0) not allowlisted\n".utf8))
-                    await recordBlocked(reason: "not_allowlisted", update: update, message: msg, text: textFromMessage)
-                    continue
-                }
+            if !hasAllowlist {
+                FileHandle.standardError.write(Data("TelegramPollLoop: dropping update \(update.updateId) — allowlist is EMPTY (fail-closed); add an approved sender/group in Telegram settings\n".utf8))
+                await recordBlocked(reason: "allowlist_empty_fail_closed", update: update, message: msg, text: textFromMessage)
+                continue
+            }
+            let chatOk = allowedChatIds.contains(Int64(msg.chatId))
+            let userOk: Bool = {
+                guard let fid = msg.fromUserId else { return false }
+                return allowedUserIds.contains(Int64(fid))
+            }()
+            if !chatOk && !userOk {
+                FileHandle.standardError.write(Data("TelegramPollLoop: dropping update \(update.updateId) — chat_id \(msg.chatId) / from \(msg.fromUserId ?? 0) not allowlisted\n".utf8))
+                await recordBlocked(reason: "not_allowlisted", update: update, message: msg, text: textFromMessage)
+                continue
             }
             let text: String
             let receiptKind: String
@@ -308,15 +316,21 @@ public struct TelegramPollLoop: LoopRunner {
                         }
                     }
                     let transcription = try await voiceTranscriber.transcribe(downloaded)
-                    let transcript = transcription.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !transcript.isEmpty else {
+                    let rawTranscript = transcription.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !rawTranscript.isEmpty else {
                         throw TelegramVoiceTranscriptionError.malformedResponse
                     }
+                    // W5 L1#11: domain-noun correction runs ONLY here, on the
+                    // transcript lane. Typed Telegram text never passes through
+                    // it. The original stays in the receipt row.
+                    let correction = TelegramTranscriptTermCorrection.correct(rawTranscript)
+                    let transcript = correction.text
                     await recordVoiceTranscription(
                         update: update,
                         message: msg,
                         attachment: downloaded,
-                        transcription: transcription
+                        transcription: transcription,
+                        correction: correction
                     )
                     text = """
                     [Telegram voice message]

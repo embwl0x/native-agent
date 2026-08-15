@@ -479,6 +479,26 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
                         signals,
                         publishedAt: publishedAt
                     )
+                },
+                // W4/P1 fix-round (gpt-5.5 BLOCKING): without this closure the
+                // substrate always used `.default`, leaving the whole
+                // traits→dynamics derivation dead in production — the exact
+                // "eight dials nothing consumes" finding recreated one layer
+                // up. Same re-read-per-call shape as `userName` above, so a
+                // persona trait edit takes effect on the next capsule; any
+                // read failure degrades to `.default`.
+                dynamics: {
+                    let traits = PersonaCompiler.loadProfile(dataRoot: root).traits
+                    return .derived(from: PersonalityTraitDials(
+                        warmth: traits.warmth,
+                        directness: traits.directness,
+                        humor: traits.humor,
+                        proactivity: traits.proactivity,
+                        rigor: traits.rigor,
+                        autonomy: traits.autonomy,
+                        creativity: traits.creativity,
+                        brevity: traits.brevity
+                    ))
                 }
             ),
             store: store
@@ -956,6 +976,14 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
                let line = Self.bodyLine(inCapsuleDynamicContext: capsule.dynamicContext) {
                 lastInjectedBodyLine = line
                 lastInjectedBodyLineAt = projection.fixedAt
+            }
+            // W7/P6 — the envelope stash rides the same certification: this
+            // request served a real live turn. The frozen capsule compile is a
+            // pure rendering and cannot own it; previews and bridges (non-live
+            // kinds) never reach here.
+            if request.mode == .inject {
+                await substrate.stashDeliveryEnvelopeForCommittedTurn(
+                    request, at: projection.fixedAt)
             }
         }
     }

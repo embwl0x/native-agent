@@ -298,11 +298,71 @@ public struct ContextCandidateScoreFeatures: Codable, Equatable, Sendable {
     public let recency: Double
     public let usefulness: Double
     public let decay: Double
+    /// Share of the CURRENT message's tokens the atom covers (0…1). Added
+    /// 2026-08-13 (selection-score-rebalance); absent in receipts persisted
+    /// before then, so decoding tolerates a missing key as 0.
+    public let messageCoverage: Double
     public let diversityBonus: Double
     public let redundancyPenalty: Double
     public let conflictPenalty: Double
     public let characterCostPenalty: Double
     public let total: Double
+
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        lexicalExact = try c.decode(Double.self, forKey: .lexicalExact)
+        tokenOverlap = try c.decode(Double.self, forKey: .tokenOverlap)
+        semanticCosine = try c.decode(Double.self, forKey: .semanticCosine)
+        sharedIdentifiers = try c.decode(Double.self, forKey: .sharedIdentifiers)
+        activation = try c.decode(Double.self, forKey: .activation)
+        authority = try c.decode(Double.self, forKey: .authority)
+        confidence = try c.decode(Double.self, forKey: .confidence)
+        recency = try c.decode(Double.self, forKey: .recency)
+        usefulness = try c.decode(Double.self, forKey: .usefulness)
+        decay = try c.decode(Double.self, forKey: .decay)
+        messageCoverage = try c.decodeIfPresent(Double.self, forKey: .messageCoverage) ?? 0
+        diversityBonus = try c.decode(Double.self, forKey: .diversityBonus)
+        redundancyPenalty = try c.decode(Double.self, forKey: .redundancyPenalty)
+        conflictPenalty = try c.decode(Double.self, forKey: .conflictPenalty)
+        characterCostPenalty = try c.decode(Double.self, forKey: .characterCostPenalty)
+        total = try c.decode(Double.self, forKey: .total)
+    }
+
+    init(
+        lexicalExact: Double,
+        tokenOverlap: Double,
+        semanticCosine: Double,
+        sharedIdentifiers: Double,
+        activation: Double,
+        authority: Double,
+        confidence: Double,
+        recency: Double,
+        usefulness: Double,
+        decay: Double,
+        messageCoverage: Double,
+        diversityBonus: Double,
+        redundancyPenalty: Double,
+        conflictPenalty: Double,
+        characterCostPenalty: Double,
+        total: Double
+    ) {
+        self.lexicalExact = lexicalExact
+        self.tokenOverlap = tokenOverlap
+        self.semanticCosine = semanticCosine
+        self.sharedIdentifiers = sharedIdentifiers
+        self.activation = activation
+        self.authority = authority
+        self.confidence = confidence
+        self.recency = recency
+        self.usefulness = usefulness
+        self.decay = decay
+        self.messageCoverage = messageCoverage
+        self.diversityBonus = diversityBonus
+        self.redundancyPenalty = redundancyPenalty
+        self.conflictPenalty = conflictPenalty
+        self.characterCostPenalty = characterCostPenalty
+        self.total = total
+    }
 
     fileprivate func reranked(
         diversityBonus: Double,
@@ -320,6 +380,7 @@ public struct ContextCandidateScoreFeatures: Codable, Equatable, Sendable {
             recency: recency,
             usefulness: usefulness,
             decay: decay,
+            messageCoverage: messageCoverage,
             diversityBonus: diversityBonus,
             redundancyPenalty: redundancyPenalty,
             conflictPenalty: conflictPenalty,
@@ -510,6 +571,80 @@ public enum ContextSelectionError: Error, Equatable, Sendable {
     case mandatoryBudgetExceeded(required: Int, limit: Int)
 }
 
+/// Every ranking weight in one place. Defaults are EXACTLY the literals that
+/// lived inline in `score()`/the rerank loop through 2026-08-13, so
+/// `ContextScoreWeights()` is byte-identical to the pre-seam selector — pinned
+/// by `defaultScoreWeightsMatchTheHistoricalLiterals`. The seam exists for the
+/// selection-score-rebalance A/B (docs/build_plans/selection-score-rebalance.md):
+/// tuning happens by SHIPPING new defaults after the offline eval, never by
+/// per-call-site overrides scattered through production code.
+public struct ContextScoreWeights: Equatable, Sendable {
+    public let lexicalExact: Double
+    public let tokenOverlap: Double
+    public let semanticCosine: Double
+    public let sharedIdentifiers: Double
+    public let activation: Double
+    public let authority: Double
+    public let confidence: Double
+    public let recency: Double
+    public let usefulness: Double
+    public let decay: Double
+    public let redundancyPenalty: Double
+    public let characterCostPenaltyCap: Double
+    /// Weight for the `messageCoverage` feature: how much of the CURRENT user
+    /// message's token set the atom covers. Default 1.5 — shipped 2026-08-13
+    /// from the offline A/B in docs/build_plans/selection-score-rebalance.md
+    /// (60 real queries, live store gen 1962: mean pairwise Jaccard of dynamic
+    /// selections 0.324 → 0.242 vs weight 0, top-pick coverage 0.151 → 0.296,
+    /// mandatory sets identical, dynamic count unchanged). 2.5 scored
+    /// marginally better lexically but was rejected: measured WITHOUT the
+    /// semantic feature, it risks drowning semantics on production turns.
+    /// 0 disables the feature (score() still computes it for receipts).
+    public let messageCoverage: Double
+    /// Rank penalty applied while an atom's conflict group is unresolved.
+    public let conflictPenalty: Double
+    /// Rerank bonus for the first atom from a not-yet-selected source.
+    public let diversityNewSourceBonus: Double
+    /// Rerank bonus for the first atom of a not-yet-selected kind.
+    public let diversityNewKindBonus: Double
+
+    public init(
+        lexicalExact: Double = 2.4,
+        tokenOverlap: Double = 1.7,
+        semanticCosine: Double = 1.2,
+        sharedIdentifiers: Double = 1.5,
+        activation: Double = 1.2,
+        authority: Double = 1.0,
+        confidence: Double = 0.8,
+        recency: Double = 0.5,
+        usefulness: Double = 0.7,
+        decay: Double = 0.5,
+        redundancyPenalty: Double = 1.1,
+        characterCostPenaltyCap: Double = 0.35,
+        messageCoverage: Double = 1.5,
+        conflictPenalty: Double = 0.12,
+        diversityNewSourceBonus: Double = 0.14,
+        diversityNewKindBonus: Double = 0.10
+    ) {
+        self.lexicalExact = lexicalExact
+        self.tokenOverlap = tokenOverlap
+        self.semanticCosine = semanticCosine
+        self.sharedIdentifiers = sharedIdentifiers
+        self.activation = activation
+        self.authority = authority
+        self.confidence = confidence
+        self.recency = recency
+        self.usefulness = usefulness
+        self.decay = decay
+        self.redundancyPenalty = redundancyPenalty
+        self.characterCostPenaltyCap = characterCostPenaltyCap
+        self.messageCoverage = messageCoverage
+        self.conflictPenalty = conflictPenalty
+        self.diversityNewSourceBonus = diversityNewSourceBonus
+        self.diversityNewKindBonus = diversityNewKindBonus
+    }
+}
+
 public struct ContextSelectionConfiguration: Equatable, Sendable {
     public let maximumCandidates: Int
     public let maximumDynamicAtoms: Int
@@ -517,6 +652,7 @@ public struct ContextSelectionConfiguration: Equatable, Sendable {
     public let maximumAtomsPerSource: Int
     public let maximumAtomsPerKind: Int
     public let minimumRelevance: Double
+    public let weights: ContextScoreWeights
 
     public init(
         maximumCandidates: Int = 256,
@@ -524,7 +660,8 @@ public struct ContextSelectionConfiguration: Equatable, Sendable {
         maximumPointers: Int = 8,
         maximumAtomsPerSource: Int = 2,
         maximumAtomsPerKind: Int = 4,
-        minimumRelevance: Double = 0.05
+        minimumRelevance: Double = 0.05,
+        weights: ContextScoreWeights = ContextScoreWeights()
     ) {
         self.maximumCandidates = max(1, maximumCandidates)
         self.maximumDynamicAtoms = max(0, maximumDynamicAtoms)
@@ -532,6 +669,7 @@ public struct ContextSelectionConfiguration: Equatable, Sendable {
         self.maximumAtomsPerSource = max(1, maximumAtomsPerSource)
         self.maximumAtomsPerKind = max(1, maximumAtomsPerKind)
         self.minimumRelevance = max(0, minimumRelevance)
+        self.weights = weights
     }
 }
 
@@ -719,7 +857,8 @@ public struct ContextSelector: Sendable {
                         sourceCounts: sourceCounts,
                         kindCounts: kindCounts
                     )
-                    let value = original.total + diversity - (1.1 * redundancy)
+                    let value = original.total + diversity
+                        - (configuration.weights.redundancyPenalty * redundancy)
                     scores[atom.draft.id] = original.reranked(
                         diversityBonus: diversity,
                         redundancyPenalty: redundancy,
@@ -865,6 +1004,12 @@ private extension ContextSelector {
         let normalizedMessage: String?
         let identifiers: Set<String>
         let contextualTokens: Set<String>
+        /// Tokens of the CURRENT user message alone (post-4f4b9445 this is the
+        /// raw message, no wire riders) — the `messageCoverage` feature's
+        /// denominator. Distinct from `queryTokens`, which folds in carried
+        /// context (recent turns, attention terms, tool groups) and therefore
+        /// dilutes any single source.
+        let messageTokens: Set<String>
     }
 
     struct ConflictGroup {
@@ -958,19 +1103,39 @@ private extension ContextSelector {
             ?? atom.draft.recentUsefulness
         let decay = need.feedbackDecayOverrides[atom.draft.id]
             ?? atom.draft.decayState
-        let conflictPenalty = hasUnresolvedConflict ? 0.12 : 0
+        let w = configuration.weights
+        let conflictPenalty = hasUnresolvedConflict ? w.conflictPenalty : 0
         let costRatio = Double(atom.draft.body.count) / Double(max(1, need.characterBudget))
-        let costPenalty = min(0.35, costRatio * 0.35)
-        let total = (2.4 * exact)
-            + (1.7 * overlap)
-            + (1.2 * semantic)
-            + (1.5 * shared)
-            + (1.2 * activation)
-            + (1.0 * authority)
-            + (0.8 * confidence)
-            + (0.5 * recency)
-            + (0.7 * usefulness)
-            + (0.5 * decay)
+        let costPenalty = min(w.characterCostPenaltyCap, costRatio * w.characterCostPenaltyCap)
+        // How much of the CURRENT message's own vocabulary this atom covers.
+        // Unlike tokenOverlap (denominator = the full carried-context query),
+        // this feature cannot be diluted by recent turns or attention terms —
+        // it is the one signal that tracks what the user just said.
+        //
+        // Short-message damp: on a 1-3 token message coverage is quantized so
+        // coarsely (one shared token = 0.33-1.0) that it can out-vote the
+        // semantic feature on paraphrase queries — the exact regression the
+        // semanticQueryRecoversAParaphrase pin caught at weight 1.5. Scale by
+        // min(1, tokens/4) so tiny queries lean on semantics/overlap while
+        // 4+-token messages get the full evidenced weight.
+        let messageCoverage: Double = {
+            guard !context.messageTokens.isEmpty else { return 0 }
+            let hit = context.messageTokens.intersection(lexicalEntry.searchableTokens)
+            let raw = Double(hit.count) / Double(context.messageTokens.count)
+            let lengthDamp = min(1.0, Double(context.messageTokens.count) / 4.0)
+            return raw * lengthDamp
+        }()
+        let total = (w.lexicalExact * exact)
+            + (w.tokenOverlap * overlap)
+            + (w.semanticCosine * semantic)
+            + (w.sharedIdentifiers * shared)
+            + (w.activation * activation)
+            + (w.authority * authority)
+            + (w.confidence * confidence)
+            + (w.recency * recency)
+            + (w.usefulness * usefulness)
+            + (w.decay * decay)
+            + (w.messageCoverage * messageCoverage)
             - conflictPenalty
             - costPenalty
         return ContextCandidateScoreFeatures(
@@ -984,6 +1149,7 @@ private extension ContextSelector {
             recency: recency,
             usefulness: usefulness,
             decay: decay,
+            messageCoverage: messageCoverage,
             diversityBonus: 0,
             redundancyPenalty: 0,
             conflictPenalty: conflictPenalty,
@@ -1021,7 +1187,8 @@ private extension ContextSelector {
             queryTokens: Self.tokens(queryText(need)),
             normalizedMessage: trimmedMessage.isEmpty ? nil : need.message.lowercased(),
             identifiers: identifiers,
-            contextualTokens: Set(contextualIDs.flatMap { Self.tokens($0) })
+            contextualTokens: Set(contextualIDs.flatMap { Self.tokens($0) }),
+            messageTokens: Self.tokens(need.message)
         )
     }
 
@@ -1039,8 +1206,13 @@ private extension ContextSelector {
 
     func relevance(of score: ContextCandidateScoreFeatures?) -> Double {
         guard let score else { return 0 }
+        // messageCoverage enters WEIGHTED (unlike the historical unweighted
+        // terms) so a zero weight reproduces the pre-seam threshold pass-set
+        // exactly; with the shipped 1.5 default it widens the pass-set only
+        // for atoms that speak the current message's vocabulary.
         return score.lexicalExact + score.tokenOverlap + score.semanticCosine
             + score.sharedIdentifiers + score.activation
+            + (configuration.weights.messageCoverage * score.messageCoverage)
     }
 
     func rankedBefore(
@@ -1153,8 +1325,10 @@ private extension ContextSelector {
         sourceCounts: [ContextSourceID: Int],
         kindCounts: [ContextAtomKind: Int]
     ) -> Double {
-        (sourceCounts[atom.draft.sourceID, default: 0] == 0 ? 0.14 : 0)
-            + (kindCounts[atom.draft.kind, default: 0] == 0 ? 0.10 : 0)
+        (sourceCounts[atom.draft.sourceID, default: 0] == 0
+            ? configuration.weights.diversityNewSourceBonus : 0)
+            + (kindCounts[atom.draft.kind, default: 0] == 0
+                ? configuration.weights.diversityNewKindBonus : 0)
     }
 
     func maximumTokenSimilarity(

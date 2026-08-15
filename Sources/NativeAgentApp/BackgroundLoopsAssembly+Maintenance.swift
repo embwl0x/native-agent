@@ -161,8 +161,10 @@ extension BackgroundLoopsAssembly {
     /// Daily disk-hygiene watchdog (tightness round 2, item 6 — User: "make sure
     /// we dont pile up logs like that again burning tons of hard disk" after a
     /// 194MB dead-daemon log was found). Walks `dataRoot` once per day and, when a
-    /// single file exceeds 64MB or the tree exceeds 2GB, files ONE notification
-    /// card listing the offenders. NEVER deletes anything. Dependency-clean: the
+    /// single file exceeds 1GB or the tree exceeds 2GB, files ONE notification
+    /// card listing the offenders. The loop itself NEVER deletes anything — the
+    /// card's "Clean Up" action (user click, `cleanUpDiskHygiene`) is the only
+    /// path that moves files, and only to the Trash. Dependency-clean: the
     /// inbox write is an injected closure wired to the same `notifications/inbox.jsonl`
     /// upsert path HeartbeatLoop uses.
     static func makeDataRootDiskHygieneLoop(
@@ -200,15 +202,35 @@ extension BackgroundLoopsAssembly {
 
     // MARK: - Disk-hygiene notification
 
+    static let diskHygieneCardId = "disk-hygiene"
+
     /// Upsert ONE stable disk-hygiene card to `notifications/inbox.jsonl`, keyed
     /// by a fixed id so the daily re-check updates one card instead of stacking
-    /// duplicates. Mirrors `upsertHeartbeatNoticeCard`. NEVER deletes anything —
-    /// the card just lists the offenders and their sizes for a human to act on.
-    private static func fileDiskHygieneNotice(dataRoot: URL, report: DiskHygieneReport) async -> Bool {
-        let inboxPath = dataRoot
-            .appendingPathComponent("notifications", isDirectory: true)
-            .appendingPathComponent("inbox.jsonl")
-        let cardId = "disk-hygiene"
+    /// duplicates. Mirrors `upsertHeartbeatNoticeCard`. The scan never deletes
+    /// anything — the card carries a "Clean Up" action so the human has the
+    /// lever, and an archived card STAYS archived while the finding is
+    /// unchanged (an identical daily re-scan must not resurrect it; a changed
+    /// report should).
+    // Internal (not private) so the sticky-archive contract test can drive the
+    // real upsert path — the tooth for "an unchanged re-scan must not
+    // resurrect an archived card."
+    static func fileDiskHygieneNotice(dataRoot: URL, report: DiskHygieneReport) async -> Bool {
+        // Re-validate before writing (gpt-5.5 review: a user-initiated Clean Up
+        // can land between this tick's scan and this write; a card listing
+        // already-trashed files would sit stale for a day). Offenders that no
+        // longer exist are dropped; if nothing actionable remains, skip the
+        // write entirely and keep whatever card is already there.
+        let report = DiskHygieneReport(
+            largeFiles: report.largeFiles.filter {
+                FileManager.default.fileExists(
+                    atPath: dataRoot.appendingPathComponent($0.relativePath).path)
+            },
+            totalBytes: report.totalBytes,
+            totalOverBudget: report.totalOverBudget,
+            truncated: report.truncated,
+            depthTruncated: report.depthTruncated
+        )
+        guard report.tripped else { return true }
         let now = ISO8601DateFormatter().string(from: Date())
         var lines: [String] = []
         if report.totalOverBudget {
@@ -222,19 +244,111 @@ extension BackgroundLoopsAssembly {
             lines.append("(scan hit its file budget — totals may undercount; largest offenders shown)")
         }
         let detail = ("Large files under the app data directory (nothing was deleted):\n"
-            + lines.joined(separator: "\n"))
+            + lines.joined(separator: "\n")
+            + "\n\nClean Up moves these files to the Trash (recoverable).")
         let summary = report.totalOverBudget
             ? "data/ is \(DataRootDiskHygiene.humanSize(report.totalBytes)); "
                 + "\(report.largeFiles.count) large file(s)"
             : "\(report.largeFiles.count) large file(s) in data/"
         let card: JSONValue = .object([
-            "id": .string(cardId),
+            "id": .string(diskHygieneCardId),
             "created_at": .string(now),
             "source": .string("disk_hygiene"),
             "severity": .string("actionable"),
             "title": .string("Disk usage is piling up"),
             "summary": .string(String(summary.prefix(500))),
             "detail": .string(detail),
+            "related_mission_id": .null,
+            "related_approval_id": .null,
+            "related_paths": .array(report.largeFiles.prefix(20).map {
+                .string(dataRoot.appendingPathComponent($0.relativePath).path)
+            }),
+            "related_groups": .array([]),
+            "actions": .array([
+                .object(["id": .string("act"), "label": .string("Clean Up"),
+                         "description": .string("Move these files to the Trash")]),
+                .object(["id": .string("archive"), "label": .string("Archive"),
+                         "description": .string("Archive this card")]),
+                .object(["id": .string("dismiss"), "label": .string("Dismiss"),
+                         "description": .string("Dismiss this card")]),
+            ]),
+            "status": .string("unread"),
+            "read_at": .null,
+        ])
+        guard let inserted = await upsertDiskHygieneCard(
+            dataRoot: dataRoot, card: card, preserveStatusWhenDetailUnchanged: true)
+        else { return false }
+        if inserted {
+            await InboxPushNotifier.notifyIfAttentionWorthy(
+                dataRoot: dataRoot,
+                itemId: diskHygieneCardId,
+                title: "Disk usage is piling up",
+                summary: String(summary.prefix(500)),
+                source: "disk_hygiene",
+                severity: "actionable"
+            )
+        }
+        return true
+    }
+
+    /// User clicked "Clean Up" on the disk-hygiene card. Re-scans `dataRoot`
+    /// (the card may be up to a day stale), moves the CURRENT offenders to the
+    /// Trash via `DataRootDiskHygiene.cleanup` (reversible; protected stores
+    /// and anything outside the data root are refused), then rewrites the card
+    /// with the results, marked read. Throws when there were offenders but
+    /// nothing could be moved, so the button surfaces failure instead of a
+    /// silent green. This is the ONLY deletion path — no loop calls it.
+    static func cleanUpDiskHygiene(
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) async throws -> String {
+        let report = DataRootDiskHygiene.scan(dataRoot: dataRoot)
+        let now = ISO8601DateFormatter().string(from: Date())
+        var lines: [String] = []
+        var summary: String
+        var nothingMovedError: NSError?
+        if report.largeFiles.isEmpty {
+            summary = "Nothing to clean — no oversized files right now"
+            lines.append("A fresh scan found no oversized files"
+                + (report.totalOverBudget
+                    ? ", but data/ total is \(DataRootDiskHygiene.humanSize(report.totalBytes)) "
+                        + "(over the 2GB budget) from many smaller files — worth a look by hand."
+                    : "; data/ total is \(DataRootDiskHygiene.humanSize(report.totalBytes))."))
+        } else {
+            let result = DataRootDiskHygiene.cleanup(
+                dataRoot: dataRoot,
+                relativePaths: report.largeFiles.map(\.relativePath))
+            for outcome in result.trashed {
+                lines.append("• Moved to Trash: \(outcome.relativePath) — "
+                    + DataRootDiskHygiene.humanSize(outcome.sizeBytes))
+            }
+            for outcome in result.skipped {
+                lines.append("• Skipped: \(outcome.relativePath) — "
+                    + (outcome.skippedReason ?? "unknown reason"))
+            }
+            if result.trashed.isEmpty {
+                // Still rewrite the card below with the skip reasons before
+                // throwing (gpt-5.5 review: throwing first left the stale
+                // actionable card up with only an error toast to explain).
+                summary = "Cleanup couldn't move anything — "
+                    + "\(result.skipped.count) file(s) skipped"
+                nothingMovedError = NSError(
+                    domain: "NativeAgentSwiftOnly", code: -424,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "Disk cleanup could not move anything to the Trash: "
+                        + lines.joined(separator: "; ")])
+            } else {
+                summary = "Cleaned up \(result.trashed.count) file(s), freed "
+                    + DataRootDiskHygiene.humanSize(result.freedBytes) + " (in the Trash)"
+            }
+        }
+        let card: JSONValue = .object([
+            "id": .string(diskHygieneCardId),
+            "created_at": .string(now),
+            "source": .string("disk_hygiene"),
+            "severity": .string("info"),
+            "title": .string("Disk cleanup"),
+            "summary": .string(String(summary.prefix(500))),
+            "detail": .string("Disk cleanup ran at your request:\n" + lines.joined(separator: "\n")),
             "related_mission_id": .null,
             "related_approval_id": .null,
             "related_paths": .array([]),
@@ -245,57 +359,74 @@ extension BackgroundLoopsAssembly {
                 .object(["id": .string("dismiss"), "label": .string("Dismiss"),
                          "description": .string("Dismiss this card")]),
             ]),
-            "status": .string("unread"),
-            "read_at": .null,
+            "status": .string("read"),
+            "read_at": .string(now),
         ])
+        // Best-effort card rewrite — the cleanup itself already happened, so a
+        // failed write must not surface as a failed cleanup.
+        _ = await upsertDiskHygieneCard(
+            dataRoot: dataRoot, card: card, preserveStatusWhenDetailUnchanged: false)
+        if let nothingMovedError { throw nothingMovedError }
+        return summary
+    }
+
+    /// Shared locked upsert for the single disk-hygiene card. Returns nil on
+    /// write failure, else whether the card was newly inserted (true = new
+    /// row appended, false = existing row replaced). With
+    /// `preserveStatusWhenDetailUnchanged`, an existing row whose `detail`
+    /// matches the new card keeps its `status`/`read_at` — the sticky-archive
+    /// contract: identical finding, no resurrection.
+    private static func upsertDiskHygieneCard(
+        dataRoot: URL,
+        card: JSONValue,
+        preserveStatusWhenDetailUnchanged: Bool
+    ) async -> Bool? {
+        let inboxPath = dataRoot
+            .appendingPathComponent("notifications", isDirectory: true)
+            .appendingPathComponent("inbox.jsonl")
         let persistence = SwiftNativePersistenceCore()
         do {
             let inserted = try await persistence.withFileLock(inboxPath) { () async throws -> Bool in
-                let rows = try await persistence.tailJSONL(inboxPath, limit: Int.max, maxBytes: nil)
-                guard InboxRewriteGuard.rewriteIsSafe(rows: rows, path: inboxPath) else {
+                let lines = try InboxRewriteGuard.readLines(inboxPath)
+                guard InboxRewriteGuard.rewriteIsSafe(lines: lines, path: inboxPath) else {
                     InboxRewriteGuard.refuse("DiskHygieneLoop", path: inboxPath)
                     return false
                 }
-                var mutated: [JSONValue] = []
-                mutated.reserveCapacity(rows.count + 1)
+                var mutated: [Data] = []
+                mutated.reserveCapacity(lines.count + 1)
                 var found = false
-                for row in rows {
-                    guard case .object(let obj) = row,
+                for line in lines {
+                    guard case .object(let obj)? = line.row,
                           case .string(let id)? = obj["id"],
-                          id == cardId else {
-                        mutated.append(row)
+                          id == diskHygieneCardId else {
+                        // Other rows AND undecodable lines: verbatim.
+                        mutated.append(line.raw)
                         continue
                     }
-                    mutated.append(card)
+                    var replacement = card
+                    if preserveStatusWhenDetailUnchanged,
+                       case .object(var newObj) = card,
+                       case .string(let newDetail)? = newObj["detail"],
+                       case .string(let oldDetail)? = obj["detail"],
+                       newDetail == oldDetail {
+                        newObj["status"] = obj["status"] ?? .string("unread")
+                        newObj["read_at"] = obj["read_at"] ?? .null
+                        replacement = .object(newObj)
+                    }
+                    mutated.append(Data(try replacement.serialize(pretty: false).utf8))
                     found = true
                 }
-                if !found { mutated.append(card) }
-                let serialized = try mutated.map { try $0.serialize(pretty: false) }
-                try FileManager.default.createDirectory(
-                    at: inboxPath.deletingLastPathComponent(), withIntermediateDirectories: true)
-                let payload = Data((serialized.joined(separator: "\n")
-                    + (serialized.isEmpty ? "" : "\n")).utf8)
-                try payload.write(to: inboxPath, options: [.atomic])
-                _ = chmod(inboxPath.path, 0o600)
+                if !found { mutated.append(Data(try card.serialize(pretty: false).utf8)) }
+                try InboxRewriteGuard.writeLines(mutated, to: inboxPath)
                 return !found
             }
-            if inserted {
-                await InboxPushNotifier.notifyIfAttentionWorthy(
-                    dataRoot: dataRoot,
-                    itemId: cardId,
-                    title: "Disk usage is piling up",
-                    summary: String(summary.prefix(500)),
-                    source: "disk_hygiene",
-                    severity: "actionable"
-                )
-            }
-            return true
+            return inserted
         } catch {
-            // A failed upsert must report false so the loop rolls back the
+            // A failed upsert must report failure so the loop rolls back the
             // daily reservation and retries delivery on the next tick.
             FileHandle.standardError.write(Data(
                 "DataRootDiskHygieneCheck: notice upsert failed: \(error)\n".utf8))
-            return false
+            return nil
         }
     }
 }

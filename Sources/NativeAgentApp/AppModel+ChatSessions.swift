@@ -254,7 +254,6 @@ extension AppModel {
             async let nextSkills = try? api.getSkills()
             async let nextTools = try? api.getTools()
             async let nextCapabilitySummary = try? api.getCapabilities()
-            async let nextCapabilityFoundry = try? api.getCapabilityFoundry()
             async let nextWorkflows = try? api.getWorkflows()
             async let nextWorkflowRuns = try? api.getWorkflowRuns()
             async let nextMCPServers = try? api.getMCPServers()
@@ -269,7 +268,6 @@ extension AppModel {
                 skillRows,
                 toolRows,
                 capabilityRow,
-                foundryRow,
                 workflowRows,
                 workflowRunRows,
                 mcpRows,
@@ -284,7 +282,6 @@ extension AppModel {
                 nextSkills,
                 nextTools,
                 nextCapabilitySummary,
-                nextCapabilityFoundry,
                 nextWorkflows,
                 nextWorkflowRuns,
                 nextMCPServers,
@@ -299,7 +296,6 @@ extension AppModel {
             skills = fresh("skills", skillRows) ?? skills
             tools = fresh("tools", toolRows) ?? tools
             capabilitySummary = fresh("capability summary", capabilityRow) ?? capabilitySummary
-            capabilityFoundry = fresh("capability foundry", foundryRow) ?? capabilityFoundry
             workflows = fresh("workflows", workflowRows) ?? workflows
             workflowRuns = fresh("workflow runs", workflowRunRows) ?? workflowRuns
             mcpServers = fresh("mcp servers", mcpRows) ?? mcpServers

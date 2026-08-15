@@ -49,7 +49,7 @@ extension CognitiveSubstrate {
     /// Only nodes re-activated within this window feed the mood integral.
     static let moodActivationWindow: TimeInterval = 24 * 60 * 60
     /// Recency weighting half-life for the mood integral.
-    static let moodRecencyHalfLife: TimeInterval = 6 * 60 * 60
+    // `moodRecencyHalfLife` — W4/P1: now PersonalityDynamicsConfiguration.
     /// Blend of the tag integral vs. the current-affect proxy when basis > 0.
     static let moodTagBlendWeight: Double = 0.6
     static let moodAffectBlendWeight: Double = 0.4
@@ -65,12 +65,12 @@ extension CognitiveSubstrate {
 
     /// Day-scale half-life: a settled morning reflection still colors the evening
     /// and has honestly faded by tomorrow night. (Fast affect axes: 20–90 min.)
-    static let dispositionHalfLife: TimeInterval = 30 * 60 * 60
+    // `dispositionHalfLife` — W4/P1: now PersonalityDynamicsConfiguration.
     /// Per-write nudge (≤2 reflections + 1 dream + rare approvals per day × 0.08,
     /// capped below): a gentle standing tone, structurally unable to ratchet.
-    static let dispositionNudgeMagnitude = 0.08
+    // `dispositionNudgeMagnitude` — W4/P1: now PersonalityDynamicsConfiguration.
     /// Hard cap on the disposition's reach — an undertone, never the mood itself.
-    static let dispositionValenceCap = 0.35
+    // `dispositionValenceCap` — W4/P1: now PersonalityDynamicsConfiguration.
     /// Weight of the disposition term inside derivedMood.
     static let dispositionMoodWeight = 0.15
     /// A standing view formed inside this neutral mood band carries no felt sign —
@@ -138,7 +138,7 @@ extension CognitiveSubstrate {
             ) != nil else { continue }
             let age = now.timeIntervalSince(node.lastActivatedAt)
             guard age >= 0, age <= Self.moodActivationWindow else { continue }
-            let weight = pow(0.5, age / Self.moodRecencyHalfLife)
+            let weight = pow(0.5, age / dynamics.moodRecencyHalfLife)
             weightedSum += weight * node.emotionalValence
             weightTotal += weight
             basis += 1
@@ -163,7 +163,7 @@ extension CognitiveSubstrate {
     func decayedDispositionValence(at now: Date) -> Double {
         let elapsed = max(0, now.timeIntervalSince(disposition.updatedAt))
         guard elapsed > 0 else { return disposition.valence }
-        return disposition.valence * pow(0.5, elapsed / Self.dispositionHalfLife)
+        return disposition.valence * pow(0.5, elapsed / dynamics.dispositionHalfLife)
     }
 
     /// The SIGNED felt tone of a considered outcome — the ONE lexicon shared by every
@@ -258,8 +258,8 @@ extension CognitiveSubstrate {
     func integrateDisposition(tone: Double, at now: Date) async {
         guard configuration.enabled, configuration.affectEnabled, tone != 0 else { return }
         let decayed = decayedDispositionValence(at: now)
-        let cap = Self.dispositionValenceCap
-        let next = min(cap, max(-cap, decayed + tone * Self.dispositionNudgeMagnitude))
+        let cap = dynamics.dispositionValenceCap
+        let next = min(cap, max(-cap, decayed + tone * dynamics.dispositionNudgeMagnitude))
         disposition = CognitiveDisposition(valence: next, updatedAt: now)
         await persistArtifact(
             kind: "disposition",
@@ -363,7 +363,7 @@ extension CognitiveSubstrate {
         guard case .object(let object)? = payloads.first,
               let updatedAt = dateValue(object["updatedAt"]),
               let valence = doubleValue(object["valence"]) else { return }
-        let cap = Self.dispositionValenceCap
+        let cap = dynamics.dispositionValenceCap
         disposition = CognitiveDisposition(
             valence: min(cap, max(-cap, valence)),
             updatedAt: updatedAt

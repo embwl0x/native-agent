@@ -108,6 +108,11 @@ public actor BackgroundLoopsManager {
         let cardId = "loop-failure:\(loopId)"
         let now = ISO8601DateFormatter().string(from: Date())
         let summary = "Background loop \"\(loopId)\" started failing."
+        // W1(c) upgrade campaign (L4-01): the card is sticky. A dismissed
+        // card for the SAME failing condition stays dismissed and never
+        // re-pushes; a genuinely NEW error class resurrects it. The signature
+        // is the error head, not the full text (timestamps/addresses churn).
+        let errorSignature = String(error.prefix(200))
         let detail = "The \"\(loopId)\" background loop transitioned from healthy to "
             + "failing. Latest error:\n\n\(String(error.prefix(1_500)))\n\n"
             + "It will keep retrying on its normal cadence; this card updates in place."
@@ -129,43 +134,66 @@ public actor BackgroundLoopsManager {
                 .object(["id": .string("dismiss"), "label": .string("Dismiss"),
                          "description": .string("Dismiss this card")]),
             ]),
+            "error_signature": .string(errorSignature),
             "status": .string("unread"),
             "read_at": .null,
         ])
         let persistence = SwiftNativePersistenceCore()
         do {
-            _ = try await persistence.withFileLock(inboxPath) { () async throws -> Bool in
-                let rows = try await persistence.tailJSONL(inboxPath, limit: Int.max, maxBytes: nil)
-                guard InboxRewriteGuard.rewriteIsSafe(rows: rows, path: inboxPath) else {
+            let shouldPush = try await persistence.withFileLock(inboxPath) { () async throws -> Bool in
+                let lines = try InboxRewriteGuard.readLines(inboxPath)
+                guard InboxRewriteGuard.rewriteIsSafe(lines: lines, path: inboxPath) else {
                     InboxRewriteGuard.refuse("BackgroundLoopsManager[\(loopId)]", path: inboxPath)
                     return false
                 }
-                var mutated: [JSONValue] = []
-                mutated.reserveCapacity(rows.count + 1)
+                var mutated: [Data] = []
+                mutated.reserveCapacity(lines.count + 1)
                 var found = false
-                for row in rows {
-                    guard case .object(let obj) = row,
+                var pushWorthy = true
+                for line in lines {
+                    guard case .object(let obj)? = line.row,
                           case .string(let id)? = obj["id"],
                           id == cardId else {
-                        mutated.append(row)
+                        // Other rows AND undecodable lines: verbatim.
+                        mutated.append(line.raw)
                         continue
                     }
-                    mutated.append(card)
+                    var replacement = card
+                    // Legacy rows (pre-signature) match when their stored
+                    // detail already contains this error head — otherwise
+                    // every dismissed pre-patch card would resurrect once
+                    // (gpt-5.5 review SHOULD-FIX).
+                    let signatureMatches: Bool = {
+                        if case .string(let oldSig)? = obj["error_signature"] {
+                            return oldSig == errorSignature
+                        }
+                        if case .string(let oldDetail)? = obj["detail"] {
+                            return oldDetail.contains(errorSignature)
+                        }
+                        return false
+                    }()
+                    if signatureMatches,
+                       case .string(let oldStatus)? = obj["status"],
+                       oldStatus != "unread",
+                       case .object(var newObj) = card {
+                        // Same condition, already seen/dismissed: keep User's
+                        // status, refresh only the detail/timestamp, no knock.
+                        newObj["status"] = obj["status"] ?? .string("unread")
+                        newObj["read_at"] = obj["read_at"] ?? .null
+                        replacement = .object(newObj)
+                        pushWorthy = false
+                    }
+                    mutated.append(Data(try replacement.serialize(pretty: false).utf8))
                     found = true
                 }
-                if !found { mutated.append(card) }
-                let serialized = try mutated.map { try $0.serialize(pretty: false) }
-                try FileManager.default.createDirectory(
-                    at: inboxPath.deletingLastPathComponent(), withIntermediateDirectories: true)
-                let payload = Data((serialized.joined(separator: "\n")
-                    + (serialized.isEmpty ? "" : "\n")).utf8)
-                try payload.write(to: inboxPath, options: [.atomic])
-                _ = chmod(inboxPath.path, 0o600)
-                return !found
+                if !found { mutated.append(Data(try card.serialize(pretty: false).utf8)) }
+                try InboxRewriteGuard.writeLines(mutated, to: inboxPath)
+                return pushWorthy
             }
-            // The scheduler already gated this to one push per transition/6h, so
-            // knock every time we get here (unlike disk-hygiene's insert-only
-            // gate, which dedups a daily re-scan of the SAME condition).
+            // The scheduler already gated this to one push per transition/6h.
+            // W1(c): additionally, a dismissed card whose error signature is
+            // unchanged suppresses the knock entirely — User said "seen".
+            guard shouldPush else { return }
             await InboxPushNotifier.notifyIfAttentionWorthy(
                 dataRoot: dataRoot,
                 itemId: cardId,
@@ -208,16 +236,73 @@ public actor BackgroundLoopsManager {
         return await coreManager.runTickOnce(loopId: loopId)
     }
 
+    /// Loop ids this facade can rebuild in place. Everything else is bound to
+    /// state captured at assembly time and only re-reads its config on launch.
+    static let hotReloadableLoopIDs: Set<String> = [
+        "telegram_poll", "slack_socket_mode", "doctor_auto_run",
+    ]
+
     /// Rebuilds one config-bound chat-surface registration. Core cancels and
     /// drains only the requested target before replacement, leaving every
     /// other loop task and status counter intact.
+    ///
+    /// L4-06 (2026-08-11): this used to return `Bool`, and for any id outside
+    /// `hotReloadableLoopIDs` it returned `registered().contains(id)` — i.e.
+    /// `true`, "restarted", having done nothing. Callers (and any UI reading
+    /// them) reported success while the config change silently waited on an
+    /// app relaunch. The tri-state below cannot claim that: a loop that was
+    /// not rebuilt reports `.requiresRelaunch`, and an id this manager does
+    /// not own at all reports `.unknown`.
     @discardableResult
-    public func restartLoop(id: String) async -> Bool {
-        guard id == "telegram_poll" || id == "slack_socket_mode" || id == "doctor_auto_run" else {
-            return await coreManager.registered().contains(id)
+    public func restartLoop(id: String) async -> LoopRestartOutcome {
+        let registered = await coreManager.registered().contains(id)
+        guard Self.hotReloadableLoopIDs.contains(id) else {
+            return registered ? .requiresRelaunch(loopId: id) : .unknown(loopId: id)
         }
         await coreManager.restartLoop(id: id, newLoop: replacementLoop(id))
+        // A hot-reload that leaves the id unregistered did not restart it;
+        // saying so is the whole point of this enum.
         return await coreManager.registered().contains(id)
+            ? .restarted(loopId: id)
+            : .unknown(loopId: id)
+    }
+}
+
+/// Honest result of `BackgroundLoopsManager.restartLoop(id:)`.
+///
+/// `.restarted` is the only outcome that means the running loop now reflects
+/// the config on disk. `.requiresRelaunch` means the loop is alive but still
+/// running its launch-time configuration. `.unknown` means this manager has no
+/// such loop registered (or the rebuild left it unregistered) — nothing can be
+/// promised about it either way.
+public enum LoopRestartOutcome: Sendable, Equatable {
+    case restarted(loopId: String)
+    case requiresRelaunch(loopId: String)
+    case unknown(loopId: String)
+
+    public var didRestart: Bool {
+        if case .restarted = self { return true }
+        return false
+    }
+
+    public var loopId: String {
+        switch self {
+        case .restarted(let id), .requiresRelaunch(let id), .unknown(let id):
+            return id
+        }
+    }
+
+    /// User-facing sentence for a surface that just asked for a restart.
+    /// `nil` when the restart actually happened and there is nothing to say.
+    public var surfaceMessage: String? {
+        switch self {
+        case .restarted:
+            return nil
+        case .requiresRelaunch(let id):
+            return "The \(id) loop keeps its launch-time settings until you relaunch NativeAgent."
+        case .unknown(let id):
+            return "No running \(id) loop to reconfigure — relaunch NativeAgent to pick up the change."
+        }
     }
 }
 

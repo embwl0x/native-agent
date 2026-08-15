@@ -13,6 +13,9 @@ public enum MemoryCandidateQuality {
         if isIncompleteSemanticFragment(normalized, kind: kind) {
             return "incomplete semantic fragment is not durable memory"
         }
+        if isIncompleteThought(normalized, source: source) {
+            return "mid-thought fragment is not durable memory"
+        }
         if isConversationalVapor(normalized, kind: kind) {
             return "low-quality conversational fragment is not durable memory"
         }
@@ -91,6 +94,80 @@ public enum MemoryCandidateQuality {
             "session_id:",
         ]
         return prefixes.contains { text.hasPrefix($0) }
+    }
+
+    /// 2026-08-14 proposal-hygiene fix: kind-INDEPENDENT fragment gate. The
+    /// existing checks below are prefix- and kind-guarded (identity/location/
+    /// employment candidates bypassed every one of them), and their open-tail
+    /// patterns only catch preposition/verb stubs — so word-safe but
+    /// meaning-dead captures like "user wants agent", "user likes how
+    /// sometimes she", and "user's design review is now" all reached the
+    /// review queue. A durable fact never ENDS on a function word, and a
+    /// verb-form capture whose object is a single bare token is a clipped
+    /// sentence, not a fact — whatever its kind claims.
+    /// Closed-class words that essentially never end a durable sentence, for
+    /// ANY source — articles, prepositions, conjunctions, aux/copulas,
+    /// wh-words, possessive determiners. "user's design review is" or
+    /// "user wants out of" is clipped no matter who wrote it.
+    private static let hardTailStopwords: Set<String> = [
+        "a", "an", "the", "this", "these", "those", "some", "any",
+        "my", "your", "their", "our",
+        "is", "are", "was", "were", "be", "been", "being", "am",
+        "do", "does", "have", "has", "had",
+        "can", "could", "will", "would", "shall", "should", "may", "might",
+        "must",
+        "to", "of", "in", "on", "at", "by", "for", "with", "without",
+        "about", "into", "onto", "over", "under", "between", "through",
+        "from", "as", "than",
+        "and", "or", "but", "nor", "because", "since", "if", "while",
+        "when", "where", "how", "which", "whom", "why",
+        "whether",
+    ]
+    // "his"/"her"/"who" are deliberately NOT hard tails: pronoun records
+    // ("user's pronouns are she/her") and proper names ("The Who") are
+    // legitimate deliberate stores. They reject only for automatic sources.
+
+    /// Additional tails rejected only for AUTOMATIC extraction sources: bare
+    /// pronouns and dangling adverbs. Deliberate stores may legitimately end
+    /// on these ("...and User loved it"); a regex capture ending there is a
+    /// clipped sentence ("user likes how sometimes she").
+    private static let automaticTailStopwords: Set<String> = [
+        "i", "me", "we", "us", "you", "he", "him", "she", "they", "them",
+        "it", "its", "mine", "yours", "hers", "theirs", "ours", "that",
+        "his", "her", "who",
+        "now", "then", "just", "still", "yet", "very", "really", "quite",
+        "too", "also", "sometimes", "often", "always", "never", "not",
+        "no", "yes", "so", "what",
+    ]
+
+    private static let verbLeadIns = [
+        "user wants ", "user likes ", "user needs ", "user prefers ",
+        "user dislikes ", "user values ", "user would like ", "user is ",
+        "user has ",
+    ]
+
+    private static func isIncompleteThought(_ text: String, source: String?) -> Bool {
+        let words = text.split { !($0.isLetter || $0.isNumber || $0 == "'") }
+            .map(String.init)
+        guard let last = words.last?.lowercased() else { return true }
+        if hardTailStopwords.contains(last) { return true }
+        // A copula followed by a bare adverb/yes/no is a missing complement
+        // for any source ("user's design review is now", "user's answer is
+        // no") — the adverb alone is only suspicious after the copula.
+        if matches(text, #"\b(?:is|are|was|were|be|been|being)\s+(?:now|then|still|yet|often|sometimes|always|never|really|very|quite|too|also|no|yes)$"#) {
+            return true
+        }
+        guard isAutomaticExtractionSource(source) else { return false }
+        if automaticTailStopwords.contains(last) { return true }
+        // Verb-form captures need a real object: after the lead-in, a single
+        // remaining token ("agent", "coffee") is a clipped sentence.
+        for lead in verbLeadIns where text.hasPrefix(lead) {
+            let payload = String(text.dropFirst(lead.count))
+            let payloadWords = payload
+                .split { !($0.isLetter || $0.isNumber || $0 == "'") }
+            if payloadWords.count < 2 { return true }
+        }
+        return false
     }
 
     private static func isIncompleteSemanticFragment(_ text: String, kind: String?) -> Bool {

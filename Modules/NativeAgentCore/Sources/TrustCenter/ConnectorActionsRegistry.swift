@@ -950,24 +950,170 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac.keystroke", connectorId: "mac", connector: "mac",
             name: "Mac Keystroke",
-            description: "Send keystrokes via accessibility (typing, key combos). Requires approval.",
+            description: "Type text and/or press key combinations on this Mac, as if from the physical keyboard. The keystrokes go to whatever app is frontmost. Requires approval.",
             risk: "high", dryRunAvailable: false, requiresApproval: true,
             category: "accessibility",
             inputSchema: schema([
+                ("text", prop("string")),
                 ("keys", prop("string")),
-            ], required: ["keys"])
+            ])
         ),
         ConnectorActionDescriptor(
             id: "mac.click", connectorId: "mac", connector: "mac",
             name: "Mac Click",
-            description: "Click at screen coordinates via accessibility. Requires approval.",
+            description: "Click, double-click, right-click or drag at screen coordinates, as if from the physical mouse. Requires approval.",
             risk: "high", dryRunAvailable: false, requiresApproval: true,
             category: "accessibility",
             inputSchema: schema([
                 ("x", prop("integer")),
                 ("y", prop("integer")),
+                ("button", prop("string")),
+                ("count", prop("integer")),
                 ("double", prop("boolean")),
-            ], required: ["x", "y"])
+                ("from", prop("object")),
+                ("to", prop("object")),
+                ("mark", prop("integer")),
+                ("view", prop("string")),
+            ])
+        ),
+        // W2/W3 injection surface (2026-08-12). Same `accessibility` category,
+        // same high risk and approval tier as the two above — these synthesize
+        // real input. `mac.ax_act` is the semantic one: it targets an element by
+        // the path mac.ax_tree/mac.ax_find returned, so the app runs its own
+        // handler instead of a coordinate being guessed at.
+        ConnectorActionDescriptor(
+            id: "mac.scroll", connectorId: "mac", connector: "mac",
+            name: "Mac Scroll",
+            description: "Scroll the view under the pointer, as if from the physical mouse wheel or trackpad. Requires approval.",
+            risk: "high", dryRunAvailable: false, requiresApproval: true,
+            category: "accessibility",
+            inputSchema: schema([
+                ("dx", prop("integer")),
+                ("dy", prop("integer")),
+                ("x", prop("integer")),
+                ("y", prop("integer")),
+                ("units", prop("string")),
+            ])
+        ),
+        // W6 (2026-08-12). Same category, same approval tier: it posts a real
+        // mouse event. It refuses outright when the screen is password-locked.
+        ConnectorActionDescriptor(
+            id: "mac.wake", connectorId: "mac", connector: "mac",
+            name: "Mac Wake Screen",
+            description: "Dismiss a screensaver or wake a sleeping display with a one-point mouse nudge, then return a fresh view of the real screen. Refuses when the Mac is password-locked — it never bypasses a lock. Requires approval.",
+            risk: "high", dryRunAvailable: false, requiresApproval: true,
+            category: "accessibility",
+            inputSchema: schema([
+                ("key_tap", prop("boolean")),
+                ("settle_ms", prop("integer")),
+                ("full_screen", prop("boolean")),
+            ])
+        ),
+        ConnectorActionDescriptor(
+            id: "mac.ax_act", connectorId: "mac", connector: "mac",
+            name: "Mac Accessibility Act",
+            description: "Act on one UI element of the frontmost window, addressed by the path from mac.ax_tree or mac.ax_find: press it, or set its value. Runs the app's own accessibility handler; falls back to a synthesized click at the element's centre when the element exposes no usable action. Requires approval.",
+            risk: "high", dryRunAvailable: false, requiresApproval: true,
+            category: "accessibility",
+            inputSchema: schema([
+                ("path", prop("array")),
+                ("action", prop("string")),
+                ("value", prop("string")),
+                ("mark", prop("integer")),
+                ("view", prop("string")),
+            ])
+        ),
+        // W1 accessibility perception organ — READ-ONLY. These read the
+        // AXUIElement tree (structured UI data) instead of screenshotting
+        // pixels. No input injection: risk low, no approval, same read tier as
+        // mac.spotlight_search, under the existing `accessibility` gate.
+        ConnectorActionDescriptor(
+            id: "mac.ax_status", connectorId: "mac", connector: "mac",
+            name: "Mac Accessibility Status",
+            description: "Check whether NativeAgent has macOS Accessibility permission. Read-only. Returns trusted:true/false plus how to grant it.",
+            risk: "low", dryRunAvailable: true, requiresApproval: false,
+            category: "accessibility",
+            inputSchema: emptySchema()
+        ),
+        // W7 — the NUDGE. Low risk and no approval, alongside the reads rather
+        // than the injection actions: it posts one bare mouse move, which
+        // clicks nothing, types nothing and unlocks nothing. Same
+        // `accessibility` gate category as everything else in this organ.
+        ConnectorActionDescriptor(
+            id: "mac.nudge", connectorId: "mac", connector: "mac",
+            name: "Mac Nudge",
+            description: "Post a single bare mouse move (one point) to wake a sleeping display or dismiss a screensaver — the software equivalent of bumping the mouse. It cannot click, type, scroll, drag or unlock; on a locked Mac it only brings up the login field. Takes no arguments.",
+            risk: "low", dryRunAvailable: true, requiresApproval: false,
+            category: "accessibility",
+            inputSchema: emptySchema()
+        ),
+        ConnectorActionDescriptor(
+            id: "mac.ax_tree", connectorId: "mac", connector: "mac",
+            name: "Mac Accessibility Tree",
+            description: "Read the frontmost app's frontmost window as a structured accessibility tree (role, title, value, enabled, frame, available actions, path). Read-only; bounded to 400 nodes / depth 12 and reports honestly when truncated.",
+            risk: "low", dryRunAvailable: true, requiresApproval: false,
+            category: "accessibility",
+            inputSchema: schema([
+                ("max_nodes", prop("integer")),
+                ("max_depth", prop("integer")),
+            ])
+        ),
+        // W3.5 — the FUSED view: the screenshot and the AX structure in one
+        // object, with every actionable element numbered on the image so she
+        // acts by name instead of guessing a coordinate. Read tier like the
+        // three above; the picture half additionally needs the macOS Screen
+        // Recording grant, which the result reports rather than hiding.
+        ConnectorActionDescriptor(
+            id: "mac.view", connectorId: "mac", connector: "mac",
+            name: "Mac Fused View",
+            description: "See the frontmost window as one fused view: a screenshot with every clickable and scrollable element outlined and numbered, plus a legend tying each number to that element's real role, label, frame and accessibility path. Read-only. Needs macOS Screen Recording permission for the picture; without it the numbered legend still comes back.",
+            risk: "low", dryRunAvailable: true, requiresApproval: false,
+            category: "accessibility",
+            inputSchema: schema([
+                ("full_screen", prop("boolean")),
+                ("max_marks", prop("integer")),
+                ("max_text_items", prop("integer")),
+                ("max_image_bytes", prop("integer")),
+                ("max_nodes", prop("integer")),
+                ("max_depth", prop("integer")),
+            ])
+        ),
+        ConnectorActionDescriptor(
+            id: "mac.ax_find", connectorId: "mac", connector: "mac",
+            name: "Mac Accessibility Find",
+            description: "Find UI elements in the frontmost window by role, title substring (case-insensitive), and/or value. Read-only; returns up to 20 matches ranked by match quality with their frame and path.",
+            risk: "low", dryRunAvailable: true, requiresApproval: false,
+            category: "accessibility",
+            inputSchema: schema([
+                ("role", prop("string")),
+                ("title", prop("string")),
+                ("value", prop("string")),
+                ("limit", prop("integer")),
+            ])
+        ),
+        // W7 (2026-08-14) — the ambient activity watcher's ONLY read path.
+        //
+        // Its own `activity` category rather than `accessibility`: the two are
+        // unrelated gates. Accessibility governs reading/driving the LIVE
+        // screen; this reads a local rollup of app+duration metadata the user
+        // separately opted into recording, and its real gate is the Trust
+        // Center capture toggle, which the impl re-checks and refuses on.
+        // Low risk, no approval — it is a read of the user's own local data.
+        // MAC-LOCAL: the impl refuses this action on any remote surface.
+        ConnectorActionDescriptor(
+            id: "activity.query", connectorId: "activity", connector: "activity",
+            name: "Activity Query",
+            description: "Summarise which apps were in use over a time range, from the locally-recorded activity log (app name + duration, and a secret-redacted window title only where the user enabled titles). Read-only, deterministic, Mac-local: refused on iPhone/Telegram/Slack surfaces. Returns rollup rows plus a few example spans, capped at 50 rows with any truncation stated. Refused entirely when Activity Capture is off in Trust Center.",
+            risk: "low", dryRunAvailable: true, requiresApproval: false,
+            category: "activity",
+            inputSchema: schema([
+                ("range", prop("string")),
+                ("from", prop("string")),
+                ("to", prop("string")),
+                ("bundle_id", prop("string")),
+                ("timezone", prop("string")),
+                ("limit", prop("integer")),
+            ])
         ),
         ConnectorActionDescriptor(
             id: "mac.move_file", connectorId: "mac", connector: "mac",

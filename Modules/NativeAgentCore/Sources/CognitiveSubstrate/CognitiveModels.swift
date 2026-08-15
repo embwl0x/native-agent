@@ -189,6 +189,28 @@ public struct CognitiveSubstrateSnapshot: Sendable, Equatable {
 
 /// A fixed-time read that settles a copy of the continuity field. The live
 /// actor's decay anchors, capacity, dirty state, and persistence are untouched.
+/// The three substrate-native felt proxies (W4/P2), CAPTURED at freeze time.
+///
+/// They must ride in the frozen read rather than be recomputed: they are derived
+/// from live actor state (`field` timestamps, `pendingCompletion`, the live
+/// configuration), so a frozen re-render that recomputed them would drift from
+/// the capsule it is supposed to reproduce byte for byte — which is exactly what
+/// "a frozen capsule retains every captured render input" exists to catch.
+/// nil means the proxy had no honest evidence, and stays absent.
+public struct CognitiveFeltProxyReads: Sendable, Equatable {
+    public var fatigue: Double?
+    public var curiosity: Double?
+    public var clarity: Double?
+
+    public init(fatigue: Double? = nil, curiosity: Double? = nil, clarity: Double? = nil) {
+        self.fatigue = fatigue
+        self.curiosity = curiosity
+        self.clarity = clarity
+    }
+
+    public static let absent = CognitiveFeltProxyReads()
+}
+
 public struct CognitiveFrozenRead: Sendable, Equatable {
     public let fixedAt: Date
     public let stateRevision: UInt64
@@ -201,6 +223,7 @@ public struct CognitiveFrozenRead: Sendable, Equatable {
     public let thoughtSeeds: [CognitiveThoughtSeed]
     public let standingViewInnerLine: String?
     public let soundEchoLine: String?
+    public let feltProxies: CognitiveFeltProxyReads
 
     public init(
         fixedAt: Date,
@@ -213,7 +236,8 @@ public struct CognitiveFrozenRead: Sendable, Equatable {
         mood: CognitiveMoodReading = CognitiveMoodReading(valence: 0, basis: 0),
         thoughtSeeds: [CognitiveThoughtSeed] = [],
         standingViewInnerLine: String? = nil,
-        soundEchoLine: String? = nil
+        soundEchoLine: String? = nil,
+        feltProxies: CognitiveFeltProxyReads = .absent
     ) {
         self.fixedAt = fixedAt
         self.stateRevision = stateRevision
@@ -226,6 +250,7 @@ public struct CognitiveFrozenRead: Sendable, Equatable {
         self.thoughtSeeds = thoughtSeeds
         self.standingViewInnerLine = standingViewInnerLine
         self.soundEchoLine = soundEchoLine
+        self.feltProxies = feltProxies
     }
 }
 

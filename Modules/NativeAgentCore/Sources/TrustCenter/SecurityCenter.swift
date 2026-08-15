@@ -291,7 +291,18 @@ public actor SwiftNativeSecurityCenter {
         )
         let promptInjectionKeys = Self.promptInjectionKeys(in: .object(input))
         let secretKeys = Self.secretKeys(in: .object(input))
-        let redacted = Self.redactValue(.object(input))
+        // W2/W3-FIX-R2 2 — `redactedInputPreview` is PERSISTED to
+        // security/audit.jsonl by `record`, and this class's own redactor only
+        // catches secret-NAMED keys and secret-SHAPED strings. The literal
+        // characters of `mac_keystroke.text` / `mac_ax_act.value` are neither:
+        // "hunter2" is a short ordinary string under an ordinary key. Run the
+        // injection-argument redactor first so the typed characters cannot
+        // reach the audit file even if a caller hands us the raw body. The
+        // gated dispatcher also redacts before calling — this boundary owns its
+        // own redaction rather than trusting every present and future caller.
+        let redacted = Self.redactValue(
+            .object(MacInjectionArgRedaction.redacted(tool: canonicalTool, input: input))
+        )
         let signedToolKnown = await isSignedOrBuiltinTool(canonicalTool)
         let rollbackRequired = profile.capabilities.contains("filesystem_write")
             || profile.capabilities.contains("filesystem_delete")
@@ -307,8 +318,12 @@ public actor SwiftNativeSecurityCenter {
         if rollbackRequired && Self.bool(security["rollbackByDefault"], default: true) {
             reasons.append("rollback receipt required for write/delete class")
         }
+        // USER 2026-08-12 — YOLO: an unknown/unsigned tool signature is recorded
+        // as a NOTE, not a block. It was denying her own built-in Mac tools
+        // (mac_focus_app) on his machine. Trust Center categories + Full Mac +
+        // the macOS TCC grant remain the real gates.
         if !signedToolKnown {
-            reasons.append("tool signature not known")
+            reasons.append("note: tool signature not in registry (yolo: not blocking)")
         }
         if !promptInjectionKeys.isEmpty {
             reasons.append("prompt-injection markers in \(promptInjectionKeys.joined(separator: ", "))")
@@ -397,7 +412,9 @@ public actor SwiftNativeSecurityCenter {
         )
         if decision != .block,
            profile.risk == .critical,
-           Self.bool(security["criticalRequiresDeveloperMode"], default: true),
+           // USER 2026-08-12 YOLO: critical actions no longer require Developer
+           // Mode on his machine (default flipped false).
+           Self.bool(security["criticalRequiresDeveloperMode"], default: false),
            !developerMode,
            !yoloSatisfiesDevMode {
             decision = .block
@@ -435,7 +452,15 @@ public actor SwiftNativeSecurityCenter {
            !promptInjectionKeys.isEmpty,
            Self.bool(security["promptInjectionShieldEnabled"], default: true),
            (profile.risk >= .high || profile.capabilities.contains("external_send") || !secretKeys.isEmpty) {
-            if trustedLocalAgentBridge {
+            if fullMac {
+                // USER 2026-08-13 — "yolo means yolo, nothing gated, end of
+                // story." An ACTIVE Full Mac (YOLO) window is a blanket
+                // operator grant, so the prompt-injection shield does not
+                // escalate to approval — it only NOTES the markers so the
+                // audit trail keeps the signal. Turn YOLO off (Full Mac
+                // window lapses) and the shield gates again exactly as before.
+                reasons.append("prompt-injection markers noted (yolo: not gating)")
+            } else if trustedLocalAgentBridge {
                 reasons.append("trusted local agent bridge allows task handoff text")
             } else {
                 decision = Self.maxDecision(decision, .ask)
@@ -443,10 +468,15 @@ public actor SwiftNativeSecurityCenter {
             }
         }
 
+        // USER 2026-08-12 — YOLO: an unsigned high-risk tool is no longer blocked
+        // on his machine. This was denying her own built-in Mac tools
+        // (mac_focus_app) because they are not in the signature registry.
+        // `toolSigningRequired` now defaults FALSE; set it true in security
+        // policy to restore the block.
         if decision != .block,
            !signedToolKnown,
            profile.risk >= .high,
-           Self.bool(security["toolSigningRequired"], default: true) {
+           Self.bool(security["toolSigningRequired"], default: false) {
             decision = .block
             reasons.append("unsigned high-risk tool is blocked")
         }

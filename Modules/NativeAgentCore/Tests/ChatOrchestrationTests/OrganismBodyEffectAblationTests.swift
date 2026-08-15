@@ -115,8 +115,16 @@ struct OrganismBodyEffectAblationTests {
         print("[organism-body-ablation] delivery=\(describe(deliveryEffect))")
     }
 
-    @Test("nil and neutral projections are byte-identical; disabled posture is absent")
+    @Test("organism authority vs substrate proxies at the projection boundary; disabled posture is absent")
     func neutralProjectionAndDisabledPostureAreNoOpAtProjectionBoundaries() async throws {
+        // CONTRACT CHANGE (W4/P2, 2026-08-11): before P2, a nil projection and a
+        // neutral one were byte-identical because absent chemistry fell back to
+        // the same constants a neutral organism supplies. P2 makes absence
+        // honest: with the organism NIL the substrate's own proxies own
+        // fatigue/curiosity/clarity, so a low-uncertainty fixture legitimately
+        // reads "clear-headed". With the organism PRESENT — even neutral — its
+        // values are authoritative and the proxies must NOT fire. Both sides
+        // are pinned exactly so neither authority can silently annex the other.
         let substrate = makeSubstrate()
         let withoutProjection = await capsule(substrate: substrate, projection: nil)
         let neutralProjection = await capsule(
@@ -124,8 +132,12 @@ struct OrganismBodyEffectAblationTests {
             projection: OrganismProjection(generatedAt: now)
         )
 
-        #expect(neutralProjection == withoutProjection)
-        #expect(neutralProjection.combined.utf8.elementsEqual(withoutProjection.combined.utf8))
+        #expect(neutralProjection.stableKernel == withoutProjection.stableKernel)
+        // Organism present + neutral: clarity 0.5 silences the overlay.
+        #expect(neutralProjection.dynamicContext == "quiet")
+        // Organism absent: the substrate clarity proxy (low uncertainty in this
+        // fixture) honestly reads clear-headed.
+        #expect(withoutProjection.dynamicContext == "quiet, clear-headed")
         #expect(OrganismBehaviorPosture.from(snapshot: snapshot(enabled: false)) == nil)
 
         let disabledRuntime = runtimeContext(capsule: withoutProjection, posture: nil)

@@ -424,7 +424,11 @@ public enum FoundationModelsRuleFallback {
             .filter { !$0.isEmpty }
 
         for line in lines {
-            if let m = match(line, pattern: #"(?i)\bmy name is\s+([A-Z][\w'\-]{1,40}(?:\s+[A-Z][\w'\-]{1,40}){0,2})"#) {
+            // Case-SENSITIVE capture: capitalization is the name signal.
+            // Under (?i), [A-Z] matched anything and "my name is the user and
+            // I prefer…" captured "the user and" — a fragment the durable-
+            // memory gate rightly rejects. Only the lead-in is case-tolerant.
+            if let m = match(line, pattern: #"\b[Mm]y name is\s+([A-Z][\w'\-]{1,40}(?:\s+[A-Z][\w'\-]{1,40}){0,2})"#) {
                 append(ExtractedFact(content: "Name: \(m)", confidence: 0.9, category: "identity"))
                 continue
             }

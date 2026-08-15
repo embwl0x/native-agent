@@ -477,20 +477,38 @@ _rotate_log "$DATA/logs/daemon.out.log"
 # `set -e` was killing the script there, never reaching the pgrep fallback,
 # so installs reported exit 1 even when the bundle landed cleanly. Make `open`
 # non-fatal; if launchd refuses to spawn, exec the binary directly as fallback.
+#
+# HOTFIX 2026-08-14 stale-LS-unit: `open` can also exit ZERO and launch
+# NOTHING. The atomic mv in step 5 invalidates the LaunchServices unit for
+# $APP_DEST; `open` then resolves the path to the dead unit, logs
+# "Failed to get unit NNNNN from store" + "LAUNCH: Asking CSUI to launch 0
+# items", and returns success. Observed 2026-08-14 16:18:06 — runningboardd
+# recorded ZERO launch jobs for the bundle in the following 20s, so readiness
+# failed on "installed executable is not running" and a perfectly good build
+# was rolled back. Exit status of `open` is therefore NOT proof of a launch:
+# re-register the swapped-in bundle first, then prove a process appeared and
+# fall back to direct exec if it did not.
 INSTALL_VERIFY_STARTED="$(date +%s)"
-OPEN_OK=0
-/usr/bin/open "$APP_DEST" 2>&1 && OPEN_OK=1 || true
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+[ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$APP_DEST" >/dev/null 2>&1 || true
+/usr/bin/open "$APP_DEST" 2>&1 || true
 echo
 echo "Installed $APP_DEST"
-if [[ "$OPEN_OK" != "1" ]]; then
-  echo "[install_app.sh] /usr/bin/open returned non-zero (launchd-163 / OS cache);"
-  echo "[install_app.sh] bundle IS in place + valid — falling back to direct exec."
-  # Direct binary spawn — bypasses launchd's bundle-ID cache.
+launch_deadline=$((SECONDS + 10))
+while ! pgrep -fx "$APP_DEST/Contents/MacOS/NativeAgentApp" >/dev/null 2>&1 \
+    && (( SECONDS < launch_deadline )); do
+  sleep 0.25
+done
+if ! pgrep -fx "$APP_DEST/Contents/MacOS/NativeAgentApp" >/dev/null 2>&1; then
+  echo "[install_app.sh] no NativeAgentApp process 10s after /usr/bin/open"
+  echo "[install_app.sh] (launchd-163 or stale LaunchServices unit — bundle IS in"
+  echo "[install_app.sh] place + valid); falling back to direct exec."
+  # Direct binary spawn — bypasses launchd's bundle-ID cache entirely.
   ( "$APP_DEST/Contents/MacOS/NativeAgentApp" >/dev/null 2>&1 & ) || true
 fi
 echo "Swift runtime install — verifying authenticated readiness and source identity..."
 if "$ROOT/script/verify_installed_runtime_ready.sh" \
-    "$APP_DEST" "$INSTALL_SOURCE_REVISION" "$INSTALL_SOURCE_DIRTY" 20; then
+    "$APP_DEST" "$INSTALL_SOURCE_REVISION" "$INSTALL_SOURCE_DIRTY" 45; then
   APP_PID="$(pgrep -fxn "$APP_DEST/Contents/MacOS/NativeAgentApp" || true)"
   echo "OK — NativeAgentApp ready (pid=$APP_PID)."
   trap - EXIT ERR INT TERM HUP
@@ -510,7 +528,18 @@ if [[ -d "$APP_OLD" ]]; then
   FAILED_APP="${APP_DEST}.failed.$(date +%Y%m%d-%H%M%S)"
   mv "$APP_DEST" "$FAILED_APP"
   mv "$APP_OLD" "$APP_DEST"
-  if ! /usr/bin/open "$APP_DEST" 2>/dev/null; then
+  # Same stale-LaunchServices-unit hazard as the install launch above: this mv
+  # invalidates the unit too, and `open` can exit 0 having launched nothing.
+  # Prove a process appeared rather than trusting the exit status — a rollback
+  # that silently leaves User with no running app is the worst outcome here.
+  [ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$APP_DEST" >/dev/null 2>&1 || true
+  /usr/bin/open "$APP_DEST" 2>/dev/null || true
+  restore_deadline=$((SECONDS + 10))
+  while ! pgrep -fx "$APP_DEST/Contents/MacOS/NativeAgentApp" >/dev/null 2>&1 \
+      && (( SECONDS < restore_deadline )); do
+    sleep 0.25
+  done
+  if ! pgrep -fx "$APP_DEST/Contents/MacOS/NativeAgentApp" >/dev/null 2>&1; then
     ( "$APP_DEST/Contents/MacOS/NativeAgentApp" >/dev/null 2>&1 & ) || true
   fi
   echo "[install_app.sh] restored the previous bundle; failed replacement retained at:" >&2

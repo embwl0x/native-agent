@@ -112,7 +112,7 @@ echo "[test] NativeAgentCore Swift Testing shards"
 # Modules/NativeAgentCore --no-parallel`; do not use the bare parallel helper
 # path as the broad gate.
 CORE_SWIFT_TEST_SHARDS=(
-  "ApprovalInboxTests|BackgroundLoopsTests|BrowserTests|CapabilityFoundryTests|ChatOrchestrationTests"
+  "ActivityWatchTests|ApprovalInboxTests|BackgroundLoopsTests|BrowserTests|CapabilityFoundryTests|ChatOrchestrationTests"
   # Keep this family split: on Xcode 26 the combined helper can exit after
   # emitting every passing event while `swift test` remains asleep on a zombie
   # child. Smaller exact-target shards avoid that SwiftPM pipe/reap failure.

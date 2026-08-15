@@ -16,9 +16,9 @@ struct FeltWarmthRangeTests {
 
     /// Mirrors the production expression in feltSignals(...).
     private func felt(raw: Double, uncertainty: Double) -> Double {
-        min(1, max(0, CognitiveSubstrate.feltWarmthRest
-            + raw * CognitiveSubstrate.feltWarmthEarnedSpan
-            - uncertainty * CognitiveSubstrate.feltWarmthUncertaintyCooling))
+        min(1, max(0, CognitiveSubstrate.defaultDynamics.feltWarmthRest
+            + raw * CognitiveSubstrate.defaultDynamics.feltWarmthEarnedSpan
+            - uncertainty * CognitiveSubstrate.defaultDynamics.feltWarmthUncertaintyCooling))
     }
 
     // Live gates from feltFamilyWords.
@@ -69,7 +69,7 @@ struct FeltWarmthRangeTests {
         // Agent's finding: fatigue/curiosity fell back to 0, so without the
         // organism she structurally could not read tired or curious — the same
         // pegging defect as the warmth ceiling, pointed the other way.
-        #expect(CognitiveSubstrate.feltWarmthRest > 0)
-        #expect(CognitiveSubstrate.feltWarmthRest < 0.70)
+        #expect(CognitiveSubstrate.defaultDynamics.feltWarmthRest > 0)
+        #expect(CognitiveSubstrate.defaultDynamics.feltWarmthRest < 0.70)
     }
 }

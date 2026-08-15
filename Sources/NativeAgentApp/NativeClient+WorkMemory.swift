@@ -307,59 +307,6 @@ extension NativeClient {
         return try Self.readLocalJSON(url, fallbackJSON: fallback)
     }
 
-    func getHarnessLearningReceipts(limit: Int = 50) async throws -> [HarnessLearningReceipt] {
-        // DAEMON-DEAD PORT (2026-06-03): read the harness learning receipt
-        // ledger directly. The file is append-only JSONL and already matches
-        // HarnessLearningReceipt's camelCase model shape.
-        let path = PersistenceCore.defaultDataRoot()
-            .appendingPathComponent("harness", isDirectory: true)
-            .appendingPathComponent("learning_receipts.jsonl")
-        let cap = max(1, min(limit, 200))
-        let persistence = SwiftNativePersistenceCore()
-        // U5 W-A item 1 (:6384): propagate — a swallowed read rendered as
-        // "no learning receipts" (healthy-empty) instead of the real error.
-        let rows = try await persistence.tailJSONL(path, limit: cap, maxBytes: nil)
-        var receipts: [HarnessLearningReceipt] = []
-        let decoder = JSONDecoder.nativeAgent
-        for row in rows {
-            guard let data = try? row.serializedData(pretty: false),
-                  let receipt = try? decoder.decode(HarnessLearningReceipt.self, from: data) else {
-                continue
-            }
-            receipts.append(receipt)
-        }
-        return receipts.sorted { $0.createdAt > $1.createdAt }
-    }
-
-    func getHarnessLearningProposals(limit: Int = 50) async throws -> [HarnessLearningProposal] {
-        // Swift-native cutover port P2: was GET /v1/harness/learning/proposals. Read
-        // `<dataRoot>/improvements/proposals.jsonl` directly — newest-last
-        // append-only file. Decode one record per line and apply `limit` from
-        // the tail (the daemon route's pagination semantics).
-        let url = PersistenceCore.defaultDataRoot()
-            .appendingPathComponent("improvements", isDirectory: true)
-            .appendingPathComponent("proposals.jsonl")
-        guard FileManager.default.fileExists(atPath: url.path),
-              let data = try? Data(contentsOf: url),
-              let text = String(data: data, encoding: .utf8) else {
-            return []
-        }
-        let decoder = JSONDecoder.nativeAgent
-        var rows: [HarnessLearningProposal] = []
-        for raw in text.split(separator: "\n", omittingEmptySubsequences: true) {
-            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty { continue }
-            guard let lineData = trimmed.data(using: .utf8) else { continue }
-            if let row = try? decoder.decode(HarnessLearningProposal.self, from: lineData) {
-                rows.append(row)
-            }
-        }
-        let cap = max(1, min(limit, 200))
-        if rows.count > cap {
-            rows = Array(rows.suffix(cap))
-        }
-        return rows
-    }
 
     // Swift-native config aggregate. The daemon-era bridge file is retired:
     // each feature is read only from its owned per-feature path.

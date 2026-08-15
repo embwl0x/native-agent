@@ -480,9 +480,15 @@ extension SwiftNativeChatOrchestrationClient {
         // the ORIGINAL user message every iteration instead of the
         // tool-result-polluted grown prompt (which also keeps the system
         // prompt byte-stable across iterations — the cache precondition).
-        // Per-iteration context REBUILD is preserved on both shapes: the
-        // lazy tool_load round-trip (store re-read -> next iteration's
-        // system tool list) works identically.
+        // turn-context-iteration-cache (2026-08-13): the append-only marker
+        // lane now builds the turn context ONCE (iteration 1) and REUSES it
+        // for every later iteration — catalog, clock line, and ContextFlow
+        // packet all pin for the turn, native-structured-loop parity. The
+        // per-iteration rebuild survives ONLY on the legacy grown-prompt
+        // shape (its transcript rides ctx.userMessage) and the kimi native
+        // lane (its provider tools array is its only call channel). Mid-turn
+        // tool_load stays usable everywhere via schemas_added in its result
+        // + the store-reading dispatch gate.
         // NATIVE TOOL LANE (kimi-code only). Resolved ONCE per turn — the
         // provider cannot change mid-turn, and re-resolving per iteration would
         // add a routing-snapshot read to every provider call.
@@ -514,6 +520,34 @@ extension SwiftNativeChatOrchestrationClient {
             ? [.user(routedComposed)]
             : [.userWithImages(routedComposed, images: imageBlocks)]
         var emittedProviderFirstDelta = false
+        // Sibling of the catalog pin: the clock line renders into the dynamic
+        // system segment, and a turn crossing a minute boundary re-rendered
+        // it mid-turn — byte-diff-proven cache bust. The turn is one moment:
+        // freeze its instant here and pass it to every iteration's build.
+        let turnClockNow = Date()
+        // Third pin (see streamTurn.preBuiltContext): iteration 1's fully
+        // built context is captured and reused for every later iteration, so
+        // ContextFlow prepares ONCE per turn and the packet bytes cannot
+        // reshuffle mid-turn as her attention moves with tool results.
+        // Kimi native lane exempt (its per-iteration tools-array refresh is
+        // load-bearing). Box is @unchecked Sendable: written once inside
+        // iteration 1's stream (before its first yield), read only after
+        // that stream completes — sequential access by construction.
+        final class TurnContextBox: @unchecked Sendable {
+            private let lock = NSLock()
+            private var value: TurnContext?
+            func set(_ ctx: TurnContext) { lock.lock(); if value == nil { value = ctx }; lock.unlock() }
+            func get() -> TurnContext? { lock.lock(); defer { lock.unlock() }; return value }
+        }
+        let turnContextBox = TurnContextBox()
+        // Reuse ONLY on the append-only messages transport: the legacy
+        // grown-prompt shape carries the growing transcript INSIDE
+        // ctx.userMessage, so it structurally requires a fresh build per
+        // iteration (QA2/QA3/QA6 pin that carrier byte-for-byte). Kimi
+        // native lane exempt for its tools-array refresh.
+        let reuseTurnContext = !ridesNativeTools && appendOnlyEligible
+        let onTurnContextBuilt: (@Sendable (TurnContext) -> Void)? =
+            reuseTurnContext ? { @Sendable ctx in turnContextBox.set(ctx) } : nil
 
         toolLoop: for iteration in 0..<maxToolIterations {
             providerCallCount += 1
@@ -526,6 +560,7 @@ extension SwiftNativeChatOrchestrationClient {
             if let nativeCollector {
                 nativeSink = { @Sendable call in await nativeCollector.append(call) }
             }
+            let reusedTurnContext = reuseTurnContext ? turnContextBox.get() : nil
             // MEMORY-SAFETY (2026-07-04): pass turnActiveTools EXPLICITLY so
             // streamTurn binds it inside its own child Task. The old sync
             // `LLMCallContext.$turnActiveTools.withValue { engine.streamTurn(…) }`
@@ -533,6 +568,18 @@ extension SwiftNativeChatOrchestrationClient {
             // Task still referenced it → task-allocator LIFO violation ("freed
             // pointer was not the last allocation"), the deterministic release
             // crash on first chat (reproduced headlessly via chat-drive).
+            // turn-context-iteration-cache (2026-08-13): pin the advertised
+            // tool catalog to the turn-start set for the whole turn. Without
+            // this, a mid-turn tool_load grew the catalog inside the STABLE
+            // cache-breakpointed system segment on the next iteration's
+            // rebuild — byte-diff-proven prefix kill (369k cache-creation
+            // tokens on live turn 47ee5b6d). Dispatch still honors the store
+            // per call and tool_load returns schemas_added, so a just-loaded
+            // tool is usable THIS turn. The kimi native lane keeps the fresh
+            // store read: its provider tools array is the only channel its
+            // model can call a tool through, so next-iteration refresh is
+            // load-bearing there (and its providers don't use Anthropic
+            // prefix caching).
             let stream = engine.streamTurn(
                 surface: surface,
                 userMessage: appendOnlyEligible ? routedComposed : currentUserMessage,
@@ -551,9 +598,18 @@ extension SwiftNativeChatOrchestrationClient {
                 runtimeContext: cognitiveRuntimeContext,
                 providerIDOverride: nil,
                 turnActiveTools: turnActiveTools,
+                pinnedActiveTools: ridesNativeTools ? nil : turnActiveTools,
+                clockNowOverride: turnClockNow,
+                preBuiltContext: reusedTurnContext,
+                onContextBuilt: onTurnContextBuilt,
                 imageBlocks: imageBlocks,
                 nativeTools: ridesNativeTools,
-                nativeToolCallSink: nativeSink
+                nativeToolCallSink: nativeSink,
+                // Relevance consumers see the RAW message; the tool-routing
+                // hint (and any loop nudges grown onto currentUserMessage)
+                // stay wire-only. Without this, the hint's tool names are
+                // selection-query vocabulary on every text-compat turn.
+                queryUserMessage: message
             )
             do {
                 for try await event in stream {

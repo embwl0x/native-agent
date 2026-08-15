@@ -366,6 +366,39 @@ extension GitHubConnectorActions {
         ])
     }
 
+    /// W6/L4-03 test hook — drives the bounded, per-repo-isolated sweep with an
+    /// injected clock so "a slow repo cannot eat the whole tick" is provable
+    /// without a network or a wall-clock sleep.
+    static func testRepositoryPass(
+        _ repositories: [String],
+        budgetSeconds: TimeInterval,
+        startedAt: Date,
+        clock: @escaping @Sendable () -> Date,
+        body: (String) async throws -> Void
+    ) async -> (completed: [String], failed: [String], skippedForBudget: [String]) {
+        let outcome = await GitHubProjectTracker.runRepositoryPass(
+            repositories,
+            budget: GitHubProjectTracker.RefreshBudget(
+                seconds: budgetSeconds,
+                startedAt: startedAt,
+                clock: clock
+            ),
+            name: { $0 },
+            body: body
+        )
+        return (outcome.completed, outcome.failed.map(\.repo), outcome.skippedForBudget)
+    }
+
+    /// W6/L4-03 test hook — the data-loss guard that pairs with the pass: a
+    /// degraded repo's prior rows must come back, or Desk archives live work.
+    static func testCarryForwardRepositories(
+        _ repositories: [String],
+        previous: [JSONValue]
+    ) -> [String] {
+        let entities = previous.compactMap { TrackingEntity.fromJSON($0) }
+        return GitHubProjectTracker.carryForwardEntities(for: repositories, from: entities).map(\.key)
+    }
+
     static func testLinkedIssueNumbers(_ body: String, repository: String) -> [Int] {
         linkedIssueNumbers(in: body, repository: repository).sorted()
     }
@@ -783,6 +816,112 @@ private enum GitHubProjectTracker {
         )
     }
 
+    /// W6/L4-03 — wall-clock budget for one refresh pass.
+    ///
+    /// The 2026-07 fix for the 120s tick timeout was to raise the timeout to
+    /// 600s (`BackgroundLoopsAssembly+GitHubTracking.swift:49`). That moved the
+    /// wall, it did not bound the pass: the loop is still ONE sequential sweep
+    /// of every tracked repository, each repo costing a search page plus a
+    /// per-open-PR detail fan-out (pull + reviews + review-comments + check-runs
+    /// + status, each with a 30s per-request ceiling). Cost is
+    /// `sum over repos`, unbounded above, so a single slow or 5xx-flapping
+    /// repository still walks the whole tick into the timeout — and when the
+    /// tick is cancelled mid-pass NOTHING is written, so every other
+    /// repository's work is discarded too. Live receipts:
+    /// `timeout after 600s` on 2026-07-30 and again 2026-08-11.
+    ///
+    /// This budget makes the pass end on its own terms and PERSIST what it got.
+    /// Deliberately well under the 600s tick ceiling so the snapshot write,
+    /// command-store observe and Desk upsert that follow the pass all still fit.
+    static let defaultRefreshBudgetSeconds: TimeInterval = 300
+
+    struct RefreshBudget: Sendable {
+        let deadline: Date
+        private let clock: @Sendable () -> Date
+
+        init(
+            seconds: TimeInterval = GitHubProjectTracker.defaultRefreshBudgetSeconds,
+            startedAt: Date = Date(),
+            clock: @escaping @Sendable () -> Date = { Date() }
+        ) {
+            self.deadline = startedAt.addingTimeInterval(seconds)
+            self.clock = clock
+        }
+
+        var isExhausted: Bool { clock() >= deadline }
+    }
+
+    /// Outcome of one bounded, per-repository-isolated pass. `failed` and
+    /// `skippedForBudget` are what makes the degradation legible instead of
+    /// silent — a partial refresh that logged nothing would read exactly like a
+    /// clean one.
+    struct RepositoryPassOutcome: Sendable, Equatable {
+        var completed: [String] = []
+        var failed: [(repo: String, error: String)] = []
+        var skippedForBudget: [String] = []
+
+        var isPartial: Bool { !failed.isEmpty || !skippedForBudget.isEmpty }
+        /// Repos whose current-cycle work did not land, in either lane. Their
+        /// prior entities must be carried forward or the snapshot would report
+        /// them as vanished and Desk would archive live work.
+        var degraded: [String] { failed.map(\.repo) + skippedForBudget }
+
+        static func == (lhs: RepositoryPassOutcome, rhs: RepositoryPassOutcome) -> Bool {
+            lhs.completed == rhs.completed
+                && lhs.skippedForBudget == rhs.skippedForBudget
+                && lhs.failed.map(\.repo) == rhs.failed.map(\.repo)
+                && lhs.failed.map(\.error) == rhs.failed.map(\.error)
+        }
+    }
+
+    /// Runs `body` once per repository, isolating BOTH failure modes that
+    /// currently let one repository eat the whole tick:
+    ///
+    ///  * a throw (the live 404/502/504 receipts) aborts only that repository,
+    ///    not the sweep — previously `try await` inside the `for repo in` loop
+    ///    propagated straight out of `refresh()` and lost every repo's work;
+    ///  * an exhausted wall-clock budget stops the sweep at a repository
+    ///    boundary, so the remaining repos are recorded as skipped and the pass
+    ///    returns normally instead of being killed mid-flight by the tick
+    ///    timeout.
+    static func runRepositoryPass<R>(
+        _ repositories: [R],
+        budget: RefreshBudget,
+        name: (R) -> String,
+        body: (R) async throws -> Void
+    ) async -> RepositoryPassOutcome {
+        var outcome = RepositoryPassOutcome()
+        for repository in repositories {
+            let label = name(repository)
+            // Checked BEFORE the repo's work, never mid-repo: a repository is
+            // the unit that carries forward cleanly.
+            if budget.isExhausted {
+                outcome.skippedForBudget.append(label)
+                continue
+            }
+            do {
+                try await body(repository)
+                outcome.completed.append(label)
+            } catch {
+                outcome.failed.append((repo: label, error: error.localizedDescription))
+            }
+        }
+        return outcome
+    }
+
+    /// Prior-snapshot entities belonging to a repository whose current-cycle
+    /// work was skipped or failed. Carrying these forward is the difference
+    /// between "we could not refresh this repo this tick" and "this repo's PRs
+    /// no longer exist".
+    static func carryForwardEntities(
+        for repositories: [String],
+        from previousEntities: [TrackingEntity]
+    ) -> [TrackingEntity] {
+        guard !repositories.isEmpty else { return [] }
+        let wanted = Set(repositories.map { $0.lowercased() })
+        return previousEntities.filter { wanted.contains($0.repo.lowercased()) }
+    }
+
     static func refresh(dataRoot: URL, force: Bool) async throws -> TrackingSnapshot {
         let config = try loadConfig(dataRoot: dataRoot)
         if !force, let prior = try? await loadSnapshot(dataRoot: dataRoot),
@@ -808,7 +947,8 @@ private enum GitHubProjectTracker {
             )
         }
         let actor = try await GitHubConnectorActions.authenticatedLogin(dataRoot: dataRoot)
-        let built: (entities: [TrackingEntity], detailFetched: Int, carriedForward: Int)
+        let budget = RefreshBudget()
+        let built: (entities: [TrackingEntity], detailFetched: Int, carriedForward: Int, pass: RepositoryPassOutcome)
         switch config.mode {
         case .contributions:
             guard let contributor = config.contributorLogin,
@@ -822,13 +962,16 @@ private enum GitHubProjectTracker {
                 contributor: contributor,
                 previousEntities: previous?.entities ?? [],
                 previousReviewThreads: previousReviewThreads,
+                budget: budget,
                 dataRoot: dataRoot
             )
         case .repository:
             built = try await repositoryEntities(
                 config: config,
                 actor: actor,
+                previousEntities: previous?.entities ?? [],
                 previousReviewThreads: previousReviewThreads,
+                budget: budget,
                 dataRoot: dataRoot
             )
         }
@@ -839,6 +982,19 @@ private enum GitHubProjectTracker {
             "[github-tracking] refresh %@: detail-fetched=%d carried-forward=%d entities=%d",
             config.project, built.detailFetched, built.carriedForward, built.entities.count
         )
+        // W6/L4-03: a partial pass must never read as a clean one. Repos whose
+        // work failed or was budget-skipped had their prior entities carried
+        // forward inside the builders, so the snapshot below is complete —
+        // this line is what makes the degradation attributable in the log.
+        if built.pass.isPartial {
+            NSLog(
+                "[github-tracking] refresh %@ PARTIAL: completed=%d failed=%@ budget-skipped=%@",
+                config.project,
+                built.pass.completed.count,
+                built.pass.failed.map { "\($0.repo)(\($0.error))" }.joined(separator: ", "),
+                built.pass.skippedForBudget.joined(separator: ", ")
+            )
+        }
         var sortedEntities = built.entities
         sortedEntities.sort { $0.updatedAt > $1.updatedAt }
         let existingCommandIDs = Set((try await commandStore.liveState()).items.map(\.itemId))
@@ -888,18 +1044,23 @@ private enum GitHubProjectTracker {
     private static func repositoryEntities(
         config: TrackingConfig,
         actor: String,
+        previousEntities: [TrackingEntity],
         previousReviewThreads: [String: [GitHubCommandReviewThreadEvidence]],
+        budget: RefreshBudget,
         dataRoot: URL
-    ) async throws -> (entities: [TrackingEntity], detailFetched: Int, carriedForward: Int) {
+    ) async throws -> (entities: [TrackingEntity], detailFetched: Int, carriedForward: Int, pass: RepositoryPassOutcome) {
         var entities: [TrackingEntity] = []
         var detailedPullRequests: [GitHubTrackedPullRequest] = []
         var remainingPRBudget = 25
-        for repo in config.repositories {
+        // W6/L4-03: the issue-list call now throws INTO the per-repo isolator
+        // instead of out of refresh(). A 404 on one archived/renamed repo used
+        // to discard every other repo's rows for the whole tick.
+        let pass = await runRepositoryPass(config.repositories, budget: budget, name: \.fullName) { repo in
             guard let rows = try await GitHubConnectorActions.call(
                 path: "repos/\(repo.fullName)/issues",
                 params: ["state": "all", "sort": "updated", "direction": "desc", "per_page": "100", "page": "1"],
                 dataRoot: dataRoot
-            ) as? [[String: Any]] else { continue }
+            ) as? [[String: Any]] else { return }
             for row in rows {
                 let isPR = row["pull_request"] != nil
                 if isPR && remainingPRBudget > 0, let number = row["number"] as? Int {
@@ -915,24 +1076,46 @@ private enum GitHubProjectTracker {
                 }
             }
         }
-        let evidence = try await GitHubConnectorActions.reviewThreadEvidence(
-            for: detailedPullRequests,
-            previous: previousReviewThreads,
-            dataRoot: dataRoot
-        )
-        for pullRequest in detailedPullRequests {
-            entities.append(try await detailedPREntity(
-                repo: pullRequest.repository,
-                number: pullRequest.number,
-                staleHours: config.staleAfterHours,
-                actor: actor,
-                reviewThreads: evidence[pullRequest.itemId] ?? [],
+        // Thread evidence is a single batched GraphQL call for the whole pass.
+        // Degrade to the prior snapshot's evidence rather than failing the
+        // refresh: stale threads are recoverable next tick, a lost pass is not.
+        let evidence: [String: [GitHubCommandReviewThreadEvidence]]
+        do {
+            evidence = try await GitHubConnectorActions.reviewThreadEvidence(
+                for: detailedPullRequests,
+                previous: previousReviewThreads,
                 dataRoot: dataRoot
-            ))
+            )
+        } catch {
+            NSLog("[github-tracking] review-thread evidence failed, reusing prior: %@", error.localizedDescription)
+            evidence = previousReviewThreads
         }
-        // Repository mode is already bounded by its PR budget; only the return
-        // shape changed so refresh() can log fetch counts uniformly.
-        return (entities, detailedPullRequests.count, 0)
+        var detailFetched = 0
+        for pullRequest in detailedPullRequests {
+            if budget.isExhausted { break }
+            do {
+                entities.append(try await detailedPREntity(
+                    repo: pullRequest.repository,
+                    number: pullRequest.number,
+                    staleHours: config.staleAfterHours,
+                    actor: actor,
+                    reviewThreads: evidence[pullRequest.itemId] ?? [],
+                    dataRoot: dataRoot
+                ))
+                detailFetched += 1
+            } catch {
+                // One unreachable PR is not a reason to lose the pass. Its prior
+                // row (if any) is carried forward with the rest below.
+                NSLog(
+                    "[github-tracking] detail fetch failed %@#%d: %@",
+                    pullRequest.repository, pullRequest.number, error.localizedDescription
+                )
+            }
+        }
+        let carried = carryForwardEntities(for: pass.degraded, from: previousEntities)
+            .filter { prior in !entities.contains { $0.key == prior.key } }
+        entities.append(contentsOf: carried)
+        return (entities, detailFetched, carried.count, pass)
     }
 
     private static func contributionEntities(
@@ -940,8 +1123,9 @@ private enum GitHubProjectTracker {
         contributor: String,
         previousEntities: [TrackingEntity],
         previousReviewThreads: [String: [GitHubCommandReviewThreadEvidence]],
+        budget: RefreshBudget,
         dataRoot: URL
-    ) async throws -> (entities: [TrackingEntity], detailFetched: Int, carriedForward: Int) {
+    ) async throws -> (entities: [TrackingEntity], detailFetched: Int, carriedForward: Int, pass: RepositoryPassOutcome) {
         var entities: [TrackingEntity] = []
         var detailFetched = 0
         var carriedForward = 0
@@ -949,7 +1133,8 @@ private enum GitHubProjectTracker {
         var repositoryRows: [(repository: TrackedRepository, authored: [[String: Any]], linked: Set<Int>)] = []
         var openPullRequests: [GitHubTrackedPullRequest] = []
         var freshPRKeys: Set<String> = []
-        for repo in config.repositories {
+        // W6/L4-03 phase 1 — search pages, isolated and budgeted per repository.
+        let searchPass = await runRepositoryPass(config.repositories, budget: budget, name: \.fullName) { repo in
             let rows = try await contributionPullRequestRows(repo: repo.fullName, login: contributor, dataRoot: dataRoot)
             let authored = GitHubConnectorActions.contributionRows(rows, login: contributor)
             // Linked issues belong to the contributor's durable body of work,
@@ -977,13 +1162,25 @@ private enum GitHubProjectTracker {
                 }
             }
         }
-        let evidence = try await GitHubConnectorActions.reviewThreadEvidence(
-            for: openPullRequests,
-            previous: previousReviewThreads,
-            dataRoot: dataRoot
-        )
-        for (repo, authored, linkedNumbers) in repositoryRows {
+        let evidence: [String: [GitHubCommandReviewThreadEvidence]]
+        do {
+            evidence = try await GitHubConnectorActions.reviewThreadEvidence(
+                for: openPullRequests,
+                previous: previousReviewThreads,
+                dataRoot: dataRoot
+            )
+        } catch {
+            NSLog("[github-tracking] review-thread evidence failed, reusing prior: %@", error.localizedDescription)
+            evidence = previousReviewThreads
+        }
+        // W6/L4-03 phase 2 — the detail fan-out, the expensive half. Same
+        // isolation and same budget: a repository that 404s or runs the clock
+        // out here loses only itself, and its prior entities are carried
+        // forward below so nothing looks deleted.
+        let detailPass = await runRepositoryPass(repositoryRows, budget: budget, name: { $0.repository.fullName }) { entry in
+            let (repo, authored, linkedNumbers) = entry
             for row in authored {
+                if budget.isExhausted { break }
                 guard let number = row["number"] as? Int else { continue }
                 let state = row["state"] as? String ?? "unknown"
                 if state == "open" {
@@ -1022,6 +1219,7 @@ private enum GitHubProjectTracker {
                 }
             }
             for number in linkedNumbers.sorted() {
+                if budget.isExhausted { break }
                 guard let row = try await GitHubConnectorActions.call(
                     path: "repos/\(repo.fullName)/issues/\(number)",
                     dataRoot: dataRoot
@@ -1034,22 +1232,49 @@ private enum GitHubProjectTracker {
         // returned as a closed history row) still needs its closure observed.
         // Detail-fetch it once so the merge/close settles instead of silently
         // disappearing. Closed PRs still returned by search settle via basicPREntity.
+        //
+        // Budget-aware: an unsettled closure is carried forward as its prior
+        // (still-open) row and retried next tick — strictly better than losing
+        // the whole pass to the tick timeout while chasing it.
         for prior in priorOpenKeysMissing(from: previousEntities, freshKeys: freshPRKeys) {
-            let entity = try await detailedPREntity(
-                repo: prior.repo,
-                number: prior.number,
-                staleHours: config.staleAfterHours,
-                actor: contributor,
-                reviewThreads: previousReviewThreads[
-                    GitHubCommandObservation.itemId(repository: prior.repo, number: prior.number)
-                ] ?? [],
-                dataRoot: dataRoot
-            )
-            detailFetched += 1
-            entities.append(entity)
+            if budget.isExhausted { break }
+            do {
+                let entity = try await detailedPREntity(
+                    repo: prior.repo,
+                    number: prior.number,
+                    staleHours: config.staleAfterHours,
+                    actor: contributor,
+                    reviewThreads: previousReviewThreads[
+                        GitHubCommandObservation.itemId(repository: prior.repo, number: prior.number)
+                    ] ?? [],
+                    dataRoot: dataRoot
+                )
+                detailFetched += 1
+                entities.append(entity)
+            } catch {
+                NSLog(
+                    "[github-tracking] closure settle failed %@#%d: %@",
+                    prior.repo, prior.number, error.localizedDescription
+                )
+            }
         }
+        // Union of both phases: a repo degraded in EITHER the search or the
+        // detail phase needs its prior rows back, or upsertDesk would see it as
+        // vanished and archive live work.
+        var pass = RepositoryPassOutcome(
+            completed: searchPass.completed.filter { detailPass.completed.contains($0) },
+            failed: searchPass.failed + detailPass.failed,
+            skippedForBudget: Array(Set(searchPass.skippedForBudget + detailPass.skippedForBudget)).sorted()
+        )
+        // A repo skipped in phase 1 never reached phase 2, so it is not in
+        // detailPass at all — keep it named exactly once.
+        pass.skippedForBudget = pass.skippedForBudget.filter { !pass.failed.map(\.repo).contains($0) }
+        let carried = carryForwardEntities(for: pass.degraded, from: previousEntities)
+        entities.append(contentsOf: carried)
+        // Dedup keeps the FIRST row per key, and carried rows are appended last,
+        // so a freshly fetched entity always wins over its carried-forward prior.
         let deduped = Dictionary(grouping: entities, by: \.key).compactMap { $0.value.first }
-        return (deduped, detailFetched, carriedForward)
+        return (deduped, detailFetched, carriedForward + carried.count, pass)
     }
 
     private static func contributionPullRequestRows(repo: String, login: String, dataRoot: URL) async throws -> [[String: Any]] {

@@ -189,6 +189,13 @@ public actor AdaptiveMemoryPromoter {
         sessionId: String
     ) async -> [ProposalRecord] {
         guard let memory else { return [] }
+        // 2026-08-14 proposal-hygiene fix: on bridge sessions the "user" seat
+        // is another AGENT (claude/codex/wake runners), machine-tagged with
+        // the "[from: <sender>, via bridge]" prefix that ClaudeBridge/
+        // codex-bridge affix at their single entry points. Extracting "user
+        // ..." facts from agent shop-talk minted proposals like "user is a
+        // language model" about the human. Agent-seat turns never extract.
+        if Self.isAgentSeatUserMessage(userMessage) { return [] }
         let candidates = await extractor.extract(
             userMessage: userMessage,
             assistantMessage: assistantMessage
@@ -263,6 +270,18 @@ public actor AdaptiveMemoryPromoter {
             }
         }
         return accepted
+    }
+
+    /// True when the turn's user-seat text was machine-tagged as coming from
+    /// another agent over a local bridge. The prefix is affixed at the single
+    /// bridge entry points (ClaudeBridge / codex bridge), same convention
+    /// StructuredChat's trusted-bridge-envelope detection relies on.
+    static func isAgentSeatUserMessage(_ text: String) -> Bool {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return t.range(
+            of: #"^\[from: [^\]]{1,64}, via bridge\]"#,
+            options: .regularExpression
+        ) != nil
     }
 
     /// Test/inspection hook: run the configured extractor without proposing

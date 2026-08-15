@@ -42,7 +42,7 @@ struct DispositionTests {
 
         await s.integrateDisposition(tone: 1, at: clock.now())
         let up = await s.decayedDispositionValence(at: clock.now())
-        #expect(abs(up - CognitiveSubstrate.dispositionNudgeMagnitude) < 0.0001,
+        #expect(abs(up - CognitiveSubstrate.defaultDynamics.dispositionNudgeMagnitude) < 0.0001,
                 "one settled reflection = one gentle nudge: \(up)")
 
         await s.integrateDisposition(tone: -1, at: clock.now())
@@ -60,7 +60,7 @@ struct DispositionTests {
             await s.integrateDisposition(tone: 1, at: clock.now())
         }
         let v = await s.decayedDispositionValence(at: clock.now())
-        #expect(v <= CognitiveSubstrate.dispositionValenceCap + 0.0001, "cap must hold: \(v)")
+        #expect(v <= CognitiveSubstrate.defaultDynamics.dispositionValenceCap + 0.0001, "cap must hold: \(v)")
     }
 
     /// It is SLOW: after 30h (one half-life) half remains; the fast affect axes
@@ -71,11 +71,11 @@ struct DispositionTests {
         await s.integrateDisposition(tone: 1, at: clock.now())
         let fresh = await s.decayedDispositionValence(at: clock.now())
 
-        clock.advance(CognitiveSubstrate.dispositionHalfLife)
+        clock.advance(CognitiveSubstrate.defaultDynamics.dispositionHalfLife)
         let halved = await s.decayedDispositionValence(at: clock.now())
         #expect(abs(halved - fresh / 2) < 0.001, "one half-life → half: \(halved) vs \(fresh)")
 
-        clock.advance(CognitiveSubstrate.dispositionHalfLife * 6)
+        clock.advance(CognitiveSubstrate.defaultDynamics.dispositionHalfLife * 6)
         let gone = await s.decayedDispositionValence(at: clock.now())
         #expect(abs(gone) < 0.01, "a week later it has honestly faded: \(gone)")
     }
@@ -89,7 +89,7 @@ struct DispositionTests {
         await s.integrateDisposition(tone: 1, at: clock.now())
         let after = await s.derivedMood(at: clock.now()).valence
         #expect(after > before, "a settled reflection should lift mood: \(before) → \(after)")
-        let expected = CognitiveSubstrate.dispositionMoodWeight * CognitiveSubstrate.dispositionNudgeMagnitude
+        let expected = CognitiveSubstrate.dispositionMoodWeight * CognitiveSubstrate.defaultDynamics.dispositionNudgeMagnitude
         #expect(abs((after - before) - expected) < 0.001,
                 "the lift is the weighted undertone, nothing more: \(after - before)")
     }
@@ -190,13 +190,13 @@ struct DispositionTests {
         let warm = makeSubstrate(clock)
         await warm.integrateDreamDisposition(moodLine: "quiet, settled, warm", at: clock.now())
         let up = await warm.decayedDispositionValence(at: clock.now())
-        #expect(abs(up - CognitiveSubstrate.dispositionNudgeMagnitude) < 0.0001,
+        #expect(abs(up - CognitiveSubstrate.defaultDynamics.dispositionNudgeMagnitude) < 0.0001,
                 "a settled dream = one gentle nudge up: \(up)")
 
         let strained = makeSubstrate(clock)
         await strained.integrateDreamDisposition(moodLine: "heavy and uneasy", at: clock.now())
         let down = await strained.decayedDispositionValence(at: clock.now())
-        #expect(abs(down + CognitiveSubstrate.dispositionNudgeMagnitude) < 0.0001,
+        #expect(abs(down + CognitiveSubstrate.defaultDynamics.dispositionNudgeMagnitude) < 0.0001,
                 "a strained dream = one gentle nudge down: \(down)")
     }
 
@@ -220,7 +220,7 @@ struct DispositionTests {
         let s = makeSubstrate(clock)
         for _ in 0..<20 { await s.integrateDreamDisposition(moodLine: "settled, warm", at: clock.now()) }
         let v = await s.decayedDispositionValence(at: clock.now())
-        #expect(v <= CognitiveSubstrate.dispositionValenceCap + 0.0001, "the shared cap must hold: \(v)")
+        #expect(v <= CognitiveSubstrate.defaultDynamics.dispositionValenceCap + 0.0001, "the shared cap must hold: \(v)")
     }
 
     // MARK: - Writer 3: a standing view User settles by approving it (U2b, 2026-07-09)
@@ -258,14 +258,14 @@ struct DispositionTests {
         let warmId = await seedProposedView(positive, moodValenceAtFormation: 0.6, at: clock.now())
         _ = await positive.resolveStandingView(id: warmId, approved: true)
         let up = await positive.decayedDispositionValence(at: clock.now())
-        #expect(abs(up - CognitiveSubstrate.dispositionNudgeMagnitude) < 0.0001,
+        #expect(abs(up - CognitiveSubstrate.defaultDynamics.dispositionNudgeMagnitude) < 0.0001,
                 "a settled positive view = one gentle nudge up: \(up)")
 
         let negative = makeSubstrate(clock)
         let heavyId = await seedProposedView(negative, moodValenceAtFormation: -0.6, at: clock.now())
         _ = await negative.resolveStandingView(id: heavyId, approved: true)
         let down = await negative.decayedDispositionValence(at: clock.now())
-        #expect(abs(down + CognitiveSubstrate.dispositionNudgeMagnitude) < 0.0001,
+        #expect(abs(down + CognitiveSubstrate.defaultDynamics.dispositionNudgeMagnitude) < 0.0001,
                 "a settled negative view = one gentle nudge down: \(down)")
     }
 

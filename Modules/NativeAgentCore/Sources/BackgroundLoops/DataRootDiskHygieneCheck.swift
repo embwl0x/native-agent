@@ -56,8 +56,11 @@ public struct DiskHygieneReport: Sendable, Equatable {
 /// disk" after a 194MB dead-daemon log was found). NEVER deletes anything — it
 /// only measures and reports so a human decides.
 public enum DataRootDiskHygiene {
-    /// A single file this large trips a notification (default 64 MB).
-    public static let defaultSingleFileThreshold: Int64 = 64 * 1024 * 1024
+    /// A single file this large trips a notification (default 1 GB). Raised from
+    /// 64 MB (2026-08-11, User: "push the tripwire closer to our 2gb limit") —
+    /// the old bound permanently flagged the 86.7 MB MiniLM embedder blob, a
+    /// wanted file nobody should delete, so the card was a daily false alarm.
+    public static let defaultSingleFileThreshold: Int64 = 1024 * 1024 * 1024
     /// Total `dataRoot` bytes this large trips a notification (default 2 GB).
     public static let defaultTotalThreshold: Int64 = 2 * 1024 * 1024 * 1024
 
@@ -156,6 +159,130 @@ public enum DataRootDiskHygiene {
             return entry.lastPathComponent
         }
         return entryParts.dropFirst(rootParts.count).joined(separator: "/")
+    }
+
+    // MARK: - Cleanup (user-initiated only)
+
+    /// Relative-path prefixes the cleanup pass refuses to touch even when a
+    /// file under them trips the size threshold. These are wanted permanent
+    /// stores — trashing the MiniLM embedder blob would only force a
+    /// re-download.
+    public static let protectedRelativePrefixes = ["extras/hf_cache"]
+
+    /// What happened to one requested path during a cleanup pass.
+    public struct CleanupOutcome: Sendable, Equatable {
+        public let relativePath: String
+        public let sizeBytes: Int64
+        /// nil = moved to the Trash; non-nil = skipped, with the reason.
+        public let skippedReason: String?
+
+        public init(relativePath: String, sizeBytes: Int64, skippedReason: String?) {
+            self.relativePath = relativePath
+            self.sizeBytes = sizeBytes
+            self.skippedReason = skippedReason
+        }
+    }
+
+    /// The result of one user-initiated cleanup pass.
+    public struct CleanupResult: Sendable, Equatable {
+        public let outcomes: [CleanupOutcome]
+
+        public init(outcomes: [CleanupOutcome]) { self.outcomes = outcomes }
+
+        public var trashed: [CleanupOutcome] { outcomes.filter { $0.skippedReason == nil } }
+        public var skipped: [CleanupOutcome] { outcomes.filter { $0.skippedReason != nil } }
+        public var freedBytes: Int64 { trashed.reduce(0) { $0 + $1.sizeBytes } }
+    }
+
+    /// Move the given dataRoot-relative files to the Trash (reversible — never a
+    /// hard delete). ONLY ever called from an explicit user action (the inbox
+    /// card's "Clean Up" button); no background loop invokes this. Guards:
+    /// a path that resolves outside `dataRoot`, a protected store, a missing
+    /// file, or anything that isn't a regular file is skipped with a reason,
+    /// never trashed. `trash` is injectable for tests; the default is
+    /// `FileManager.trashItem`.
+    public static func cleanup(
+        dataRoot: URL,
+        relativePaths: [String],
+        trash: (URL) throws -> Void = { url in
+            try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+        }
+    ) -> CleanupResult {
+        let fm = FileManager.default
+        let rootParts = dataRoot.standardizedFileURL.pathComponents
+        // Symlink-resolved root for the second containment check below. (On
+        // macOS the temp/home trees are full of benign aliases like
+        // /var → /private/var, so BOTH sides must be resolved consistently.)
+        let resolvedRootParts = dataRoot.standardizedFileURL
+            .resolvingSymlinksInPath().pathComponents
+        var outcomes: [CleanupOutcome] = []
+        for rel in relativePaths {
+            let candidate = dataRoot.appendingPathComponent(rel).standardizedFileURL
+            let size = (try? candidate.resourceValues(forKeys: [.fileSizeKey]).fileSize)
+                .map(Int64.init) ?? 0
+            func skip(_ reason: String) {
+                outcomes.append(CleanupOutcome(
+                    relativePath: rel, sizeBytes: size, skippedReason: reason))
+            }
+            // Containment, twice (gpt-5.5 review BLOCKING): (1) lexically —
+            // refuse absolute inputs outright (appendPathComponent would
+            // splice them INSIDE the root, silently changing the target) and
+            // `..` traversal; (2) symlink-resolved — a symlinked PARENT
+            // component under dataRoot must not smuggle the real target
+            // outside it. The trash below operates on the resolved path, so
+            // what was verified is what moves. Residual check-to-move race is
+            // accepted: the inputs come from our own scan of the app's own
+            // data root, and an actor who can swap directories for symlinks
+            // there already owns the data outright.
+            let parts = candidate.pathComponents
+            guard !rel.hasPrefix("/"),
+                  parts.count > rootParts.count,
+                  Array(parts.prefix(rootParts.count)) == rootParts else {
+                skip("outside the data directory")
+                continue
+            }
+            // Leaf symlink check on the UNRESOLVED path — after resolution the
+            // link is indistinguishable from its target, and trashing a link's
+            // target is not what "skip symlinks" means.
+            if (try? candidate.resourceValues(forKeys: [.isSymbolicLinkKey]))?
+                .isSymbolicLink == true {
+                skip("not a regular file")
+                continue
+            }
+            let resolved = candidate.resolvingSymlinksInPath()
+            let resolvedParts = resolved.pathComponents
+            guard resolvedParts.count > resolvedRootParts.count,
+                  Array(resolvedParts.prefix(resolvedRootParts.count)) == resolvedRootParts else {
+                skip("outside the data directory")
+                continue
+            }
+            // Case-folded protected-prefix compare (gpt-5.5 review: APFS is
+            // typically case-insensitive, so `Extras/HF_Cache/…` addresses the
+            // protected store while dodging a case-sensitive prefix match).
+            let normalizedRel = parts.dropFirst(rootParts.count)
+                .joined(separator: "/").lowercased()
+            if protectedRelativePrefixes.contains(where: {
+                let p = $0.lowercased()
+                return normalizedRel == p || normalizedRel.hasPrefix(p + "/")
+            }) {
+                skip("protected store (model cache — would just re-download)")
+                continue
+            }
+            let values = try? resolved.resourceValues(forKeys: [.isRegularFileKey])
+            guard values?.isRegularFile == true else {
+                skip(fm.fileExists(atPath: resolved.path)
+                    ? "not a regular file" : "already gone")
+                continue
+            }
+            do {
+                try trash(resolved)
+                outcomes.append(CleanupOutcome(
+                    relativePath: rel, sizeBytes: size, skippedReason: nil))
+            } catch {
+                skip("could not move to Trash: \(error.localizedDescription)")
+            }
+        }
+        return CleanupResult(outcomes: outcomes)
     }
 
     /// A human-readable byte size (e.g. "194.0 MB").

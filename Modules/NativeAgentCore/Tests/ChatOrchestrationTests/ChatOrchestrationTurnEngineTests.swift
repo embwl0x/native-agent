@@ -472,7 +472,75 @@ func turnEngine_clockContext_formats_local_and_central_time() async throws {
         localTimeZone: TimeZone(identifier: "America/Los_Angeles")!
     )
 
-    #expect(rendered == "Current time: Wed 2026-06-17 04:31 PDT (America/Los_Angeles); Central: Wed 2026-06-17 06:31 CDT (America/Chicago).")
+    // W5 L1#6: human wall-clock, not a machine stamp. Weekday spelled out and
+    // AM/PM explicit — the model was calling 9:29 AM "afternoon" off the old
+    // 24-hour rendering.
+    #expect(rendered == "Local time: Wednesday, June 17, 2026 at 4:31 AM PDT (America/Los_Angeles). Central: Wednesday, June 17, 2026 at 6:31 AM CDT (America/Chicago).")
+}
+
+@Test
+func turnEngine_clockContext_omits_central_when_local_is_central() async throws {
+    var utc = Calendar(identifier: .gregorian)
+    utc.timeZone = TimeZone(secondsFromGMT: 0)!
+    let now = try #require(utc.date(from: DateComponents(
+        year: 2026, month: 8, day: 11, hour: 14, minute: 29
+    )))
+
+    let rendered = SwiftNativeTurnEngine.renderClockContext(
+        now: now,
+        localTimeZone: TimeZone(identifier: "America/Chicago")!
+    )
+
+    #expect(rendered == "Local time: Tuesday, August 11, 2026 at 9:29 AM CDT (America/Chicago).")
+    #expect(!rendered.contains("Central:"))
+    #expect(!rendered.contains("Quiet hours:"))
+}
+
+@Test
+func turnEngine_clockContext_states_quiet_hours_window_when_configured() async throws {
+    var utc = Calendar(identifier: .gregorian)
+    utc.timeZone = TimeZone(secondsFromGMT: 0)!
+    let chicago = TimeZone(identifier: "America/Chicago")!
+    let window = try #require(TurnQuietHoursWindow(startHour: 19, endHour: 3))
+
+    // 09:29 local — outside a 7 PM → 3 AM window.
+    let morning = try #require(utc.date(from: DateComponents(
+        year: 2026, month: 8, day: 11, hour: 14, minute: 29
+    )))
+    let morningLine = SwiftNativeTurnEngine.renderClockContext(
+        now: morning, localTimeZone: chicago, quietHours: window)
+    #expect(morningLine.contains("Quiet hours: 7:00 PM–3:00 AM local (right now: outside that window)."))
+
+    // 01:00 local — inside the wrapped window.
+    let night = try #require(utc.date(from: DateComponents(
+        year: 2026, month: 8, day: 11, hour: 6, minute: 0
+    )))
+    let nightLine = SwiftNativeTurnEngine.renderClockContext(
+        now: night, localTimeZone: chicago, quietHours: window)
+    #expect(nightLine.contains("(right now: inside that window)."))
+
+    // The window is one line, not a second block.
+    #expect(!morningLine.contains("\n"))
+}
+
+@Test
+func turnQuietHoursWindow_reads_user_prefs_and_degrades_to_nil() throws {
+    let dir = try makeTempDir("quiethours")
+    #expect(TurnQuietHoursWindow.read(dataRoot: dir) == nil) // no file
+
+    try writeFile(
+        dir.appendingPathComponent("user_prefs.json"),
+        #"{"quiet_hours": {"start": 19, "end": 3}}"#
+    )
+    #expect(TurnQuietHoursWindow.read(dataRoot: dir)
+        == TurnQuietHoursWindow(startHour: 19, endHour: 3))
+
+    // Out-of-range / equal hours mean "not configured", never "always quiet".
+    try writeFile(
+        dir.appendingPathComponent("user_prefs.json"),
+        #"{"quiet_hours": {"start": 5, "end": 5}}"#
+    )
+    #expect(TurnQuietHoursWindow.read(dataRoot: dir) == nil)
 }
 
 @Test
@@ -491,10 +559,15 @@ func turnEngine_buildTurnContext_appends_clock_context_to_dynamic_segment() asyn
     let ctx = try await engine.buildTurnContext(surface: "chat", userMessage: "hi")
     let seg = try #require(ctx.systemSegments)
 
+    // The clock line changes EVERY turn, so it must never land in the stable
+    // (cacheable) segment — a per-turn byte in the stable prefix would churn
+    // the provider cache for the whole session.
     #expect(seg.stable.contains("CLOCK-STABLE-PERSONA"))
+    #expect(!seg.stable.contains("Local time:"))
     #expect(!seg.stable.contains("Current time:"))
-    #expect(seg.dynamic.contains("Current time:"))
-    #expect(seg.dynamic.contains("Central:"))
+    #expect(seg.dynamic.contains("Local time:"))
+    // The zone identifier rides along so the model never has to guess it.
+    #expect(seg.dynamic.contains("(\(TimeZone.current.identifier))"))
     #expect(ctx.systemPrompt == seg.combined)
 }
 
@@ -522,7 +595,7 @@ func turnEngine_buildTurnContext_appends_runtime_context_to_dynamic_segment() as
 
     let ctx = try await engine.buildTurnContext(surface: "telegram", userMessage: "what model are you on?")
     let seg = try #require(ctx.systemSegments)
-    let clock = try #require(seg.dynamic.range(of: "Current time:"))
+    let clock = try #require(seg.dynamic.range(of: "Local time:"))
     let runtime = try #require(seg.dynamic.range(of: "Current runtime:"))
 
     #expect(seg.stable.contains("RUNTIME-STABLE-PERSONA"))

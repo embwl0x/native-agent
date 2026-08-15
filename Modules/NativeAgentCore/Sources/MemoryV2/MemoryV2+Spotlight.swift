@@ -7,8 +7,8 @@ import CoreSpotlight
 //
 // Carves:
 //   * QUERYING Spotlight from within the app (CSUserQuery / CSSearchQuery)
-//     is OUT OF SCOPE here — in-app queries still go through
-//     JSONLEmbeddingStore.search. System Spotlight (cmd+space) surfaces
+//     is OUT OF SCOPE here — in-app recall goes through
+//     SwiftNativeMemoryV2.recall. System Spotlight (cmd+space) surfaces
 //     items automatically once they're indexed.
 //   * On platforms without CoreSpotlight (Linux / CI), the system backend
 //     is unavailable; tests use MockSpotlightIndexClient.

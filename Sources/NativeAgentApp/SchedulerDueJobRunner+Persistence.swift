@@ -189,21 +189,43 @@ extension SchedulerDueJobRunner {
     func archiveOlderDreamInboxItems(keeping keepItemId: String) async throws -> Int {
         let inboxPath = notificationInboxPath
         return try await persistence.withFileLock(inboxPath) { () async throws -> Int in
-            let rows = try await persistence.readJSONL(inboxPath)
+            // 2026-08-11: raw-preserving read — a malformed line among valid
+            // rows survives the rewrite verbatim instead of being dropped.
+            let lines = try InboxRewriteGuard.readLines(inboxPath)
+            let decoded = lines.compactMap(\.row)
             let result = NativeAgentDreamNotificationInboxPolicy.archiveOlderDreamRows(
-                rows,
+                decoded,
                 keeping: keepItemId
             )
             guard result.archivedCount > 0 else { return 0 }
-            let payload = try result.rows
-                .map { try $0.serialize(pretty: false) }
-                .joined(separator: "\n")
-            try FileManager.default.createDirectory(
-                at: inboxPath.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            try Data((payload + "\n").utf8).write(to: inboxPath, options: [.atomic])
-            _ = chmod(inboxPath.path, 0o600)
+            // The policy maps rows 1:1 in order, so walk its output alongside
+            // the decoded lines; unchanged rows keep their original bytes.
+            // If the policy ever stops being 1:1 the zip-back below would
+            // misalign rows — refuse the rewrite loudly instead.
+            guard result.rows.count == decoded.count else {
+                throw NSError(
+                    domain: "NativeAgentSwiftOnly", code: -431,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "archiveOlderDreamRows returned \(result.rows.count) rows "
+                        + "for \(decoded.count) decoded — refusing misaligned rewrite"])
+            }
+            var mutated: [Data] = []
+            mutated.reserveCapacity(lines.count)
+            var rowIndex = 0
+            for line in lines {
+                guard let row = line.row else {
+                    mutated.append(line.raw)
+                    continue
+                }
+                let rewritten = result.rows[rowIndex]
+                rowIndex += 1
+                if rewritten == row {
+                    mutated.append(line.raw)
+                } else {
+                    mutated.append(Data(try rewritten.serialize(pretty: false).utf8))
+                }
+            }
+            try InboxRewriteGuard.writeLines(mutated, to: inboxPath)
             return result.archivedCount
         }
     }

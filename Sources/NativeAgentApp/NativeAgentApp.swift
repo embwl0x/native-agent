@@ -301,8 +301,62 @@ struct NativeAgentApp: App {
                 Text(health.ok ? "Native runtime online" : "Native runtime unavailable")
             }
         }
+
+        // W8 (2026-08-14) — THE LIVE CAPTURE INDICATOR.
+        //
+        // A SECOND, separate menu-bar item rather than a line inside the one
+        // above, and that is the whole point: Apple's mic/camera dot works
+        // because its presence is the signal. Something you have to open a menu
+        // to see is not an indicator, it is a log entry. This item exists in
+        // the menu bar if and only if the watcher currently has observers
+        // installed, so "is it recording right now" is answerable from across
+        // the room without clicking anything.
+        //
+        // `isInserted` is bound to the controller's `isCapturing`, which is
+        // read off the watcher itself rather than mirrored — it cannot say
+        // "not recording" while capture is live, because it holds no belief of
+        // its own to be wrong about.
+        MenuBarExtra(
+            "Activity capture is recording",
+            systemImage: "record.circle",
+            isInserted: activityCaptureIndicatorBinding
+        ) {
+            ActivityCaptureMenuBarContent()
+        }
     }
 
+    /// Read-write binding because `MenuBarExtra(isInserted:)` demands one; the
+    /// setter is deliberately inert. SwiftUI never writes to it (there is no UI
+    /// affordance to remove a menu-bar item), and if it ever did, honouring the
+    /// write would let the indicator be dismissed while capture kept running —
+    /// which is precisely the failure this control exists to prevent.
+    private var activityCaptureIndicatorBinding: Binding<Bool> {
+        Binding(
+            get: { ActivityWatchController.shared.isCapturing },
+            set: { _ in }
+        )
+    }
+}
+
+/// The indicator's menu. Deliberately tiny: it states what is being recorded in
+/// one line and offers the one action a person reaching for this actually wants
+/// — stop.
+private struct ActivityCaptureMenuBarContent: View {
+    @State private var controller = ActivityWatchController.shared
+
+    var body: some View {
+        Text("Recording which apps you use — app name and duration"
+             + (controller.policy.captureTitles && !controller.policy.appNameOnlyMode
+                ? ", plus window titles." : ", no window titles."))
+        Divider()
+        Button("Stop Recording", systemImage: "stop.circle") {
+            controller.setCaptureEnabled(false)
+        }
+        Button("Activity Settings…", systemImage: "gear") {
+            NSApp.activate(ignoringOtherApps: true)
+            NativeAgentAppCoordinator.shared.request(.sidebar(.trust))
+        }
+    }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {

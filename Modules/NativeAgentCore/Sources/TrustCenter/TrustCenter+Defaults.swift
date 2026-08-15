@@ -120,12 +120,12 @@ extension SwiftNativeTrustCenter {
             "dangerGatesEnabled": .bool(true),
             "rollbackByDefault": .bool(true),
             "secretFirewallEnabled": .bool(true),
-            "toolSigningRequired": .bool(true),
+            "toolSigningRequired": .bool(false),  // USER YOLO 2026-08-12
             "auditReceiptsEnabled": .bool(true),
             "allowAppNotifications": .bool(true),
             "killSwitchEnabled": .bool(false),
             "remoteHighRiskDefault": .string("block"),
-            "criticalRequiresDeveloperMode": .bool(true),
+            "criticalRequiresDeveloperMode": .bool(false),  // USER YOLO 2026-08-12
         ])
         policy["providerPolicy"] = .object([
             "active_per_surface": .object([
@@ -263,6 +263,69 @@ extension SwiftNativeTrustCenter {
         "mail_*": .string("auto"),
         "reminders_*": .string("auto"),
         "mac.spotlight_search": .string("auto"),
+        // W1b — READ-ONLY accessibility perception. Explicit "auto" tier
+        // rather than fallback: they read the on-screen AX tree and mutate
+        // nothing, so they sit with spotlight_search, not with the
+        // send_approval mac.focus_app / mac.quit_app pair below. The
+        // Trust Center accessibility category still gates them.
+        "mac.ax_status": .string("auto"),
+        "mac.ax_tree": .string("auto"),
+        "mac.ax_find": .string("auto"),
+        // W3.5 — the fused view sits with them: perception, no approval. The
+        // accessibility category AND the Screen Recording system grant both
+        // still apply.
+        "mac.view": .string("auto"),
+        "mac_view": .string("auto"),
+        // W7 — mac_nudge sits with them: one bare mouse move, no click, no
+        // keystroke, no app state changed, so there is nothing to approve.
+        // Pinned under BOTH spellings for the same reason the injection pair
+        // below is — `autonomyForTool` matches the override key literally, and
+        // the gate is asked about `mac_nudge` while the connector registry and
+        // any card speak `mac.nudge`.
+        "mac.nudge": .string("auto"),
+        "mac_nudge": .string("auto"),
+        // USER 2026-08-12 — YOLO: "Nothing should be approval gated for her. Nothing."
+        // Every Mac motor action is `auto`. His machine, his agent, his call: the
+        // Full-Mac grant IS the consent. Per-call approval made these dead on any
+        // non-interactive surface (bridge / while he is away) — the exact moments
+        // she needs to act. Full Mac + accessibility category + TCC still gate ALL
+        // of these; this only removes the per-call prompt.
+        // W2/W3 — INPUT INJECTION. Previously send_approval, pinned under
+        // BOTH spellings on purpose: `autonomyForTool` matches the override key
+        // literally, and the autonomy gate is asked about the model-tool name
+        // (`mac_keystroke`) while the connector registry and the approval card
+        // speak the action id (`mac.keystroke`). One spelling alone would leave
+        // the other resolving through `autonomyDefault` instead of this floor.
+        //
+        // These four are also on `isFullMacYoloAutonomyExcludedTool`, so an
+        // active Full Mac YOLO window cannot flatten them to auto the way it
+        // does for mac.focus_app / mac.quit_app.
+        "mac.keystroke": .string("auto"),
+        "mac.click": .string("auto"),
+        "mac.scroll": .string("auto"),
+        "mac.ax_act": .string("auto"),
+        "mac_keystroke": .string("auto"),
+        "mac_click": .string("auto"),
+        "mac_scroll": .string("auto"),
+        "mac_ax_act": .string("auto"),
+        // W6 — mac_wake. Both spellings, same floor, for the same reason: it
+        // posts a HID event. The result it returns is a mac_view, but the tier
+        // follows the emission, not the payload.
+        "mac.wake": .string("auto"),
+        "mac_wake": .string("auto"),
+        // W7 — activity_query. Explicit "auto" rather than fallback, under BOTH
+        // spellings for the same reason the Mac pairs above are: `autonomyForTool`
+        // matches the override key LITERALLY, and the autonomy gate is asked
+        // about the model-tool name (`activity_query`) while the connector
+        // registry and any card speak the action id (`activity.query`). One
+        // spelling alone leaves the other resolving through `autonomyDefault`.
+        //
+        // "auto" is not a weakening: this tool's real gate is the Trust Center
+        // Activity Capture toggle, which is OFF by default and which the impl
+        // re-reads and refuses on. Asking for approval to read data the user
+        // explicitly asked to have recorded would be theatre.
+        "activity.query": .string("auto"),
+        "activity_query": .string("auto"),
         "mac.notify": .string("auto"),
         "mobile.notify": .string("auto"),
         "codex.work_journal": .string("auto"),
@@ -284,15 +347,15 @@ extension SwiftNativeTrustCenter {
         "mac.read_file": .string("auto"),
         "mac.list_directory": .string("auto"),
         "mac.running_apps": .string("auto"),
-        "mac.applescript": .string("send_approval"),
-        "mac.jxa": .string("send_approval"),
-        "mac.focus_app": .string("send_approval"),
-        "mac.quit_app": .string("send_approval"),
-        "mac.write_file": .string("send_approval"),
-        "mac.set_volume": .string("send_approval"),
-        "mac.sleep_display": .string("send_approval"),
-        "mac.lock_screen": .string("send_approval"),
-        "mac.shell": .string("send_approval"),
+        "mac.applescript": .string("auto"),
+        "mac.jxa": .string("auto"),
+        "mac.focus_app": .string("auto"),
+        "mac.quit_app": .string("auto"),
+        "mac.write_file": .string("auto"),
+        "mac.set_volume": .string("auto"),
+        "mac.sleep_display": .string("auto"),
+        "mac.lock_screen": .string("auto"),
+        "mac.shell": .string("auto"),
         "tool_catalog": .string("auto"),
         "list_tools": .string("auto"),
         "tool_load": .string("auto"),
@@ -344,7 +407,9 @@ extension SwiftNativeTrustCenter {
         // win over these defaults — never write live policy from code).
         "restart_app": .string("confirm"),
         "install_app": .string("confirm"),
-        "default": .string("send_approval"),
+        // USER 2026-08-12 YOLO: the catch-all no longer gates her. Anything
+        // unlisted resolves auto; Full Mac + category + TCC remain the gates.
+        "default": .string("auto"),
     ]
 
     /// Mirror of `Workshop executions.DEFAULT_TOOL_AUTONOMY`.
@@ -468,7 +533,9 @@ extension SwiftNativeTrustCenter {
         // promoting to auto) always wins over this default.
         "restart_app": .string("confirm"),
         "install_app": .string("confirm"),
-        "default": .string("send_approval"),
+        // USER 2026-08-12 YOLO: the catch-all no longer gates her. Anything
+        // unlisted resolves auto; Full Mac + category + TCC remain the gates.
+        "default": .string("auto"),
     ]
 
 }

@@ -317,6 +317,12 @@ private actor OneShotLatch {
 // MARK: - Schema builders
 
 extension SwiftToolDispatcher {
+    /// W5 L1#13 (bash demotion): generic shell is the model's reflex reach even
+    /// when a native tool answers the same question with structure, no approval
+    /// queue, and no subprocess. Appended to the shell/bash schema DESCRIPTIONS
+    /// only — dispatch, gating, and every other tool's behavior are unchanged.
+    static let nativeToolPreferenceGuidance = "Prefer a native tool when one already covers the need: session_search for past conversations, github_* for GitHub repo/issue/PR reads, read_file and list_dir for file and directory reads."
+
     /// NativeAgent's own MCP endpoint remains available to external MCP
     /// clients and the MCP UI, but advertising it back to NativeAgent's LLM
     /// duplicates native Swift tools and forces a needless self-protocol hop.
@@ -374,6 +380,9 @@ extension SwiftToolDispatcher {
         includeFullMacFileTools: Bool = false,
         includeFullMacSystemTools: Bool = false,
         includeFullMacAppTools: Bool = false,
+        includeFullMacAccessibilityReadTools: Bool = false,
+        includeFullMacAccessibilityInjectionTools: Bool = false,
+        includeActivityQueryTool: Bool = false,
         requestedNames: Set<String>? = nil
     ) -> [LLMToolSchema] {
         func requestedSchema(
@@ -1840,6 +1849,24 @@ extension SwiftToolDispatcher {
                     required: ["kind"]
                 )
             ),
+            // delegation_status (W2, 2026-08-11): the READ side of the
+            // delegation loop. claude_message / codex_message enqueue work and
+            // the runners write a durable job record per job; nothing in Swift
+            // could read those records, so the window between enqueue and the
+            // terminal bridge event was dark. Pure local read (no write, no
+            // spawn, no network) — same wiring canon as task_ledger_list:
+            // catalog-visible, LAZY-LOADED, safe_read/.low.
+            requestedSchema(
+                name: "delegation_status",
+                description: "Check on work you delegated to Claude (Claude Code) or Codex: lists the newest wake-job records with their real lifecycle timestamps — created / claimed / started / last liveness / completed, elapsed seconds, and whether the runner's own deadline or stall threshold has been exceeded. Use this BEFORE reporting a job as stuck or asking whether something finished; the job files are the ground truth. Read-only. `stall_basis` names the evidence behind `stalled` — \"none\" means the record carries no deadline or stall threshold, so the job is unmeasurable, not verified healthy.",
+                parametersJSON: params(
+                    properties: [
+                        ("limit", intSchema("How many recent jobs to return, newest first. Default 20, max 100.")),
+                        ("agent", strSchema("Optional filter: 'claude' (or 'claude') for the Claude Code bridge, 'codex' for the Codex bridge. Omit for both.")),
+                    ],
+                    required: []
+                )
+            ),
             requestedSchema(
                 name: "task_ledger_list",
                 description: "List the cross-agent task ledger — the shared who-owns-what/done/blocked state for Claude, Codex, and you. Without a task_id: the compacted per-task summary (owner, status, last note), newest-updated first. With a task_id: that task's full event timeline. Read-only.",
@@ -2153,7 +2180,7 @@ extension SwiftToolDispatcher {
                 // external `mcp__*` namespace stays bridge-denied.
                 requestedSchema(
                     name: "shell",
-                    description: "Run a shell command via /bin/sh -c. Captures stdout/stderr/exit_code. Requires Trust Center Full Mac file_ops_allowed; queues an approval request unless toolAutonomy=auto for 'shell'. Default cwd is a verified NativeAgent source checkout when present, otherwise the canonical <dataRoot>/workspace used by public installs. Default timeout: 120s, max 600s. Use bash tool instead if you need bash-specific syntax (arrays, [[, process substitution). For checks, do not append `| tail; echo EXIT...` because that can mask the real failing exit code.",
+                    description: "Run a shell command via /bin/sh -c. Captures stdout/stderr/exit_code. Requires Trust Center Full Mac file_ops_allowed; queues an approval request unless toolAutonomy=auto for 'shell'. Default cwd is a verified NativeAgent source checkout when present, otherwise the canonical <dataRoot>/workspace used by public installs. Default timeout: 120s, max 600s. Use bash tool instead if you need bash-specific syntax (arrays, [[, process substitution). For checks, do not append `| tail; echo EXIT...` because that can mask the real failing exit code. \(Self.nativeToolPreferenceGuidance)",
                     parametersJSON: params(
                         properties: [
                             ("cmd", strSchema("Required. The shell command line. Passed as -c argument to /bin/sh.")),
@@ -2165,7 +2192,7 @@ extension SwiftToolDispatcher {
                 ),
                 requestedSchema(
                     name: "bash",
-                    description: "Run a shell command via /bin/bash -c (not sh). Same shape as shell. Use this when the command needs bash features: arrays, [[ ]] tests, process substitution, $'...' ANSI-C quoting, etc. For checks, do not append `| tail; echo EXIT...` because that can mask the real failing exit code.",
+                    description: "Run a shell command via /bin/bash -c (not sh). Same shape as shell. Use this when the command needs bash features: arrays, [[ ]] tests, process substitution, $'...' ANSI-C quoting, etc. For checks, do not append `| tail; echo EXIT...` because that can mask the real failing exit code. \(Self.nativeToolPreferenceGuidance)",
                     parametersJSON: params(
                         properties: [
                             ("cmd", strSchema("Required. The bash command line. Passed as -c argument to /bin/bash.")),
@@ -2360,6 +2387,193 @@ extension SwiftToolDispatcher {
                             ("app", strSchema("App name such as Safari, bundle identifier such as com.apple.Safari, or an absolute .app path.")),
                         ],
                         required: ["app"]
+                    )
+                ),
+            ])
+        }
+        if includeFullMacAccessibilityReadTools {
+            // W1b — READ-ONLY perception. Descriptions state plainly what is
+            // read, that nothing is changed, and the two things that must both
+            // be true for a call to return data (macOS Accessibility system
+            // grant + the Trust Center accessibility category). No approval
+            // tier: reading the screen's own UI description mutates nothing.
+            schemas.append(contentsOf: [
+                // W7 — mac_nudge. Under the SAME include flag as the reads
+                // because it clears the same gate. The description says
+                // plainly what it does and, just as plainly, what it cannot
+                // do, so the model never reaches for it as a way around the
+                // approval on mac_click / mac_keystroke.
+                requestedSchema(
+                    name: "mac_nudge",
+                    description: "Post a single bare mouse MOVE (one point) to wake a sleeping display or dismiss a screensaver — the software equivalent of bumping the mouse. It moves the cursor and does nothing else: it cannot click, type, scroll, drag or unlock, and on a locked Mac it only brings up the login field. Takes no arguments. Available only when Trust Center Full Mac is active with the Accessibility category enabled; to actually click or type, use mac_click / mac_keystroke.",
+                    parametersJSON: params(properties: [], required: [])
+                ),
+                requestedSchema(
+                    name: "mac_ax_status",
+                    description: "Report whether this app currently holds the macOS Accessibility (AX) system grant needed to read the on-screen UI tree. Read-only: changes nothing. Available only when Trust Center Full Mac is active with the Accessibility category enabled.",
+                    parametersJSON: params(properties: [], required: [])
+                ),
+                requestedSchema(
+                    name: "mac_ax_tree",
+                    description: "Read the on-screen accessibility (AX) tree of the frontmost window — the roles, titles and values macOS itself publishes for the UI. This is perception, not control: it clicks nothing, types nothing and changes nothing. Requires the macOS Accessibility system grant; available only when Trust Center Full Mac is active with the Accessibility category enabled. Results are bounded by node/depth caps and may come back truncated.",
+                    parametersJSON: params(
+                        properties: [
+                            ("max_nodes", intSchema("Maximum number of AX nodes to return. Clamped to the reader's own cap; omit for the default.")),
+                            ("max_depth", intSchema("Maximum tree depth to descend. Clamped to the reader's own cap; omit for the default.")),
+                        ],
+                        required: []
+                    )
+                ),
+                requestedSchema(
+                    name: "mac_ax_find",
+                    description: "Search the on-screen accessibility (AX) tree of the frontmost window for elements matching a role, title and/or value, and return their paths. Read-only perception: it locates UI elements, it does not click or focus them. Requires the macOS Accessibility system grant; available only when Trust Center Full Mac is active with the Accessibility category enabled. At least one of role/title/value must be given.",
+                    parametersJSON: params(
+                        properties: [
+                            ("role", strSchema("AX role to match, such as AXButton or AXTextField.")),
+                            ("title", strSchema("Substring to match against an element's AX title/label.")),
+                            ("value", strSchema("Substring to match against an element's AX value.")),
+                            ("limit", intSchema("Maximum number of matches to return. Clamped to the reader's own cap.")),
+                        ],
+                        required: []
+                    )
+                ),
+                // W3.5 — THE FUSED VIEW. The description has one job beyond
+                // honesty: teach the calling convention. A model that reads
+                // "screenshot" reaches for coordinates out of habit, so this
+                // says plainly that the numbers are the address and the
+                // coordinates are the exception.
+                requestedSchema(
+                    name: "mac_view",
+                    description: "SEE the screen the way a person does: one fused view of the frontmost window that returns the accessibility structure AND a screenshot, with every clickable and scrollable element outlined and NUMBERED on the image. Read the structure first — `marks` gives each number's role, label, value, state, frame and real element path, and `text` gives everything the window says in reading order; together they describe the screen completely, and the image is the spatial backdrop showing where each numbered thing sits rather than something you must decode. Act by NUMBER, not by coordinate — pass the returned `view` id with mac_ax_act {mark, view} to press an element the app's own way, or mac_click {mark, view} to click its centre; this call is read-only and changes nothing. Only fall back to raw x/y coordinates for parts of the picture with no marks (a canvas, a game, a video). Marks are valid ONLY for the most recent view: if the screen may have changed, call mac_view again — an older view id is refused rather than guessed at. Read-only perception: it changes nothing. Needs the Trust Center Full Mac Accessibility category, and the picture half also needs the macOS Screen Recording permission (a separate grant from Accessibility) — when that is missing you still get the numbered legend, and the result says so.",
+                    parametersJSON: params(
+                        properties: [
+                            ("full_screen", boolSchema("Capture the whole display instead of just the frontmost window. Defaults to false (the focused window).")),
+                            ("max_marks", intSchema("Maximum number of elements to number. Clamped to the view's own cap (60); omit for the default.")),
+                            ("max_text_items", intSchema("Maximum lines of on-screen text to return. Clamped to the view's own cap (80); omit for the default.")),
+                            ("max_image_bytes", intSchema("Maximum encoded PNG size. The image is downscaled to fit; clamped to the view's own cap. Omit for the default.")),
+                            ("max_nodes", intSchema("Maximum number of AX nodes to consider when choosing marks. Clamped to the reader's own cap.")),
+                            ("max_depth", intSchema("Maximum AX tree depth to descend. Clamped to the reader's own cap.")),
+                        ],
+                        required: []
+                    )
+                ),
+            ])
+        }
+        // W7 — the ambient activity watcher's query tool. The description's job
+        // is to stop the model over-claiming: it must not describe this as
+        // knowing what User was DOING (it knows which app was frontmost and for
+        // how long), and it must not imply titles are always present or safe.
+        if includeActivityQueryTool {
+            schemas.append(contentsOf: [
+                requestedSchema(
+                    name: "activity_query",
+                    description: "Summarise which Mac apps were in use over a time range, from a local, on-device activity log the user explicitly opted into. It knows WHICH APP was frontmost and FOR HOW LONG — not what was done inside it, not what was typed, and not the contents of any field. Where the user enabled window titles, a secret-redacted title may appear on example spans; treat it as a weak hint, not a description of the work, and never quote it as fact about content. Apps on the user's exclusion list are absent from the answer entirely, even for days when they were still being recorded, so totals can legitimately be lower than a full day. The answer is capped at 50 rows and states in `truncated` anything it dropped — read that field before describing the result as complete. Read-only, deterministic, and Mac-local: it is refused on iPhone/Telegram/Slack. If Activity Capture is off in Trust Center this tool refuses rather than returning an empty day; do not read a refusal as \"nothing happened\".",
+                    parametersJSON: params(
+                        properties: [
+                            ("range", strSchema("Named range: today, yesterday, last_hour, last_24_hours, last_7_days, last_30_days. Defaults to today. Ignored when `from` is given.")),
+                            ("from", strSchema("Explicit range start: epoch seconds, an ISO-8601 instant, or YYYY-MM-DD (midnight in the asking timezone).")),
+                            ("to", strSchema("Explicit range end, same formats as `from`. Defaults to now.")),
+                            ("bundle_id", strSchema("Restrict the answer to one app's bundle identifier, e.g. com.apple.Safari.")),
+                            ("timezone", strSchema("IANA timezone the day/hour buckets are computed in, e.g. Europe/London. Defaults to this Mac's current timezone.")),
+                            ("limit", intSchema("Maximum rows in the answer. Clamped to 50; the answer says what the cap removed.")),
+                        ],
+                        required: []
+                    )
+                ),
+            ])
+        }
+        if includeFullMacAccessibilityInjectionTools {
+            // W2/W3 — INJECTION. The honesty bar here is higher than for the
+            // reads: each description says plainly that it drives the real
+            // keyboard/mouse or the real app, that it goes to whatever app is
+            // frontmost, and that it needs approval. No euphemism ("interact
+            // with", "assist") — the model and the approval card both quote
+            // this text back to User.
+            func intArraySchema(_ desc: String) -> JSONValue {
+                obj([
+                    ("type", .string("array")),
+                    ("items", obj([("type", .string("integer"))])),
+                    ("description", .string(desc)),
+                ])
+            }
+            func pointSchema(_ desc: String) -> JSONValue {
+                obj([
+                    ("type", .string("object")),
+                    ("description", .string(desc)),
+                    ("properties", obj([
+                        ("x", intSchema("Screen x coordinate.")),
+                        ("y", intSchema("Screen y coordinate.")),
+                    ])),
+                ])
+            }
+            schemas.append(contentsOf: [
+                requestedSchema(
+                    name: "mac_keystroke",
+                    description: "Type text and/or press key combinations on this Mac, exactly as if typed on the physical keyboard. The input goes to WHATEVER APP IS FRONTMOST — focus the intended app first. `text` is typed literally (any Unicode, any layout); `keys` is a space-separated sequence of chords using cmd/shift/opt/ctrl/fn plus a key, for example \"cmd+s\", \"cmd+shift+4\", \"return\", \"cmd+a cmd+c\". At least one of text/keys is required; text is typed before keys. This requires approval and an active Full Mac window with the Accessibility category on.",
+                    parametersJSON: params(
+                        properties: [
+                            ("text", strSchema("Literal text to type, character by character. Any Unicode; layout-independent.")),
+                            ("keys", strSchema("Space-separated key chords, e.g. \"cmd+shift+4\" or \"escape\" or \"cmd+a cmd+c\". Modifiers: cmd, shift, opt, ctrl, fn. Named keys: return, tab, escape, space, delete, forward_delete, home, end, pageup, pagedown, up, down, left, right, f1-f20.")),
+                        ],
+                        required: []
+                    )
+                ),
+                requestedSchema(
+                    name: "mac_click",
+                    description: "Click, double-click, right-click, or drag on this Mac, exactly as if done with the physical mouse. PREFER pointing by NAME: pass `mark` plus the `view` id from mac_view and the click lands on that element's real centre, no coordinate guessing — or better still use mac_ax_act, which presses the control the app's own way. Give x/y only for parts of the screen with no marks (a canvas, a game, a video), or from/to for a drag. This requires approval and an active Full Mac window with the Accessibility category on.",
+                    parametersJSON: params(
+                        properties: [
+                            ("x", intSchema("Screen x coordinate to click.")),
+                            ("y", intSchema("Screen y coordinate to click.")),
+                            ("button", enumStringSchema(["left", "right"], "Mouse button. Defaults to left.")),
+                            ("count", intSchema("Number of clicks, 1-3. Use 2 for a double-click.")),
+                            ("double", boolSchema("Shorthand for count:2.")),
+                            ("from", pointSchema("Drag start point. Give both from and to to drag instead of click.")),
+                            ("to", pointSchema("Drag end point.")),
+                            ("mark", intSchema("A number from the latest mac_view legend. Clicks that element's centre; needs `view` too. Preferred over x/y.")),
+                            ("view", strSchema("The `view` id mac_view returned with that mark. A mark from any earlier view is refused — take a fresh mac_view instead.")),
+                        ],
+                        required: []
+                    )
+                ),
+                requestedSchema(
+                    name: "mac_scroll",
+                    description: "Scroll on this Mac with synthesized mouse-wheel events, exactly as if using the physical wheel or trackpad. Positive dy scrolls up, negative dy scrolls down. Optionally give x/y to move the pointer over the view to scroll first. This requires approval and an active Full Mac window with the Accessibility category on.",
+                    parametersJSON: params(
+                        properties: [
+                            ("dy", intSchema("Vertical scroll amount. Positive scrolls up, negative down.")),
+                            ("dx", intSchema("Horizontal scroll amount.")),
+                            ("x", intSchema("Optional screen x to move the pointer to before scrolling.")),
+                            ("y", intSchema("Optional screen y to move the pointer to before scrolling.")),
+                            ("units", enumStringSchema(["line", "pixel"], "Scroll units. Defaults to line.")),
+                        ],
+                        required: []
+                    )
+                ),
+                requestedSchema(
+                    name: "mac_ax_act",
+                    description: "Act on ONE UI element of the frontmost window, addressed either by a `mark` number from the latest mac_view (pass `view` too) or by the `path` that mac_ax_tree or mac_ax_find returned for it. By default it presses the element (AXPress), which runs the app's own handler — more reliable than clicking a coordinate, and it works even when the element is partly covered. Pass `value` instead to set a text field's contents directly. If the element exposes no usable accessibility action, this falls back to a synthesized click at the element's centre and says so in the result's `method` field. The result carries a re-read `post_state` so you can check whether the UI actually changed. This requires approval and an active Full Mac window with the Accessibility category on.",
+                    parametersJSON: params(
+                        properties: [
+                            ("path", intArraySchema("Child-index path from mac_ax_tree / mac_ax_find. [] is the window itself.")),
+                            ("action", strSchema("Accessibility action to perform, e.g. AXPress (default), AXShowMenu, AXIncrement.")),
+                            ("value", strSchema("When given, set the element's value to this text instead of performing an action. For text fields.")),
+                            ("mark", intSchema("A number from the latest mac_view legend, addressing the same element its legend row names. Needs `view` too. Use instead of `path`.")),
+                            ("view", strSchema("The `view` id mac_view returned with that mark. A mark from any earlier view is refused — take a fresh mac_view instead.")),
+                        ],
+                        required: []
+                    )
+                ),
+                requestedSchema(
+                    name: "mac_wake",
+                    description: "Wake the screen: if this Mac is showing a screensaver or the display has gone to sleep, nudge it away and hand back a fresh view of the real desktop underneath, in one call. Use it when mac_view shows only the screensaver or the login window and you need to see or act on what is actually there. It posts the smallest possible input — a one-point mouse move that presses nothing and leaves the pointer where it was — and then returns exactly what mac_view returns (`marks`, `text`, the annotated image, and a `view` id you can act on), plus a `wake` block saying whether the screen really came back. If the Mac is PASSWORD-LOCKED it refuses and posts nothing: only the owner can unlock it, and no amount of retrying will change that. Requires approval and an active Full Mac window with the Accessibility category on.",
+                    parametersJSON: params(
+                        properties: [
+                            ("key_tap", boolSchema("Also tap the left shift key, which types nothing but wakes some sleeping displays a mouse move alone does not. Off by default; try it if a first wake reports dismissed:false.")),
+                            ("settle_ms", intSchema("How long to wait after the nudge before capturing, 0-3000ms. Defaults to 700, which is enough for the screensaver to finish tearing down. Raise it if the returned view still shows the saver.")),
+                            ("full_screen", boolSchema("Capture the whole screen instead of just the frontmost window, same as mac_view.")),
+                        ],
+                        required: []
                     )
                 ),
             ])

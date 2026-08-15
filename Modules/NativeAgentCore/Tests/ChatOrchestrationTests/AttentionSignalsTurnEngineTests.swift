@@ -40,6 +40,7 @@ private actor CapturingContextFlow: ContextTurnPreparing {
     enum Stop: Error { case captured }
     private let queryTicket: ContextQueryEmbeddingTicket?
     private(set) var lastRequest: ContextTurnRequest?
+    private(set) var lastQueryEmbeddingText: String?
 
     init(queryTicket: ContextQueryEmbeddingTicket? = nil) {
         self.queryTicket = queryTicket
@@ -48,7 +49,7 @@ private actor CapturingContextFlow: ContextTurnPreparing {
     func contextFlowMode() async -> ContextFlowMode { .active }
 
     func beginQueryEmbedding(_ text: String) async -> ContextQueryEmbeddingTicket? {
-        _ = text
+        lastQueryEmbeddingText = text
         return queryTicket
     }
 
@@ -119,6 +120,77 @@ private func capturedRequest(
             includeClockContext: false
         )
     return try #require(await flow.lastRequest)
+}
+
+// MARK: - queryUserMessage: wire riders stay out of relevance consumers
+
+/// Text-compat appends a turn-scoped tool-routing hint to the WIRE user
+/// message. The relevance consumers (selection request + query embedding)
+/// must see the RAW message when `queryUserMessage` is supplied, while the
+/// TurnContext keeps the hinted wire text.
+@Test func queryUserMessageKeepsWireRidersOutOfRelevanceConsumers() async throws {
+    let raw = "hey, how's your afternoon going?"
+    let hinted = raw + "\n\n[tool routing — loaded and ready for THIS turn: github_search. "
+        + "Act in this reply: emit the <tool_use> marker now.]"
+    let flow = CapturingContextFlow()
+    let ctx = try await attentionEngine(provider: nil, flow: flow, translator: nil)
+        .buildTurnContext(
+            surface: "chat",
+            userMessage: hinted,
+            personaOverride: nil,
+            imageBlocks: [],
+            includeClockContext: false,
+            queryUserMessage: raw
+        )
+
+    let request = try #require(await flow.lastRequest)
+    #expect(request.userMessage == raw)
+    #expect(await flow.lastQueryEmbeddingText == raw)
+    // The wire/persona-visible turn text keeps the rider.
+    #expect(ctx.userMessage == hinted)
+}
+
+/// nil queryUserMessage must be byte-identical to the pre-change behavior:
+/// every consumer sees `userMessage`.
+@Test func absentQueryUserMessageFallsBackToTheWireMessage() async throws {
+    let flow = CapturingContextFlow()
+    _ = try await attentionEngine(provider: nil, flow: flow, translator: nil)
+        .buildTurnContext(
+            surface: "chat",
+            userMessage: "hello",
+            personaOverride: nil,
+            imageBlocks: [],
+            includeClockContext: false,
+            queryUserMessage: nil
+        )
+
+    let request = try #require(await flow.lastRequest)
+    #expect(request.userMessage == "hello")
+    #expect(await flow.lastQueryEmbeddingText == "hello")
+}
+
+/// A BLANK (non-nil) queryUserMessage is authoritative: the attachment-only
+/// text-compat turn has no text query, and falling back to the wire message
+/// would hand the tool-routing hint back to the relevance consumers
+/// (gpt-5.5 review 2026-08-13, NEEDS-FIX #1).
+@Test func blankQueryUserMessageNeverFallsBackToTheHintedWireMessage() async throws {
+    let hinted = "\n\n[tool routing — loaded and ready for THIS turn: github_search.]"
+    let flow = CapturingContextFlow()
+    _ = try await attentionEngine(provider: nil, flow: flow, translator: nil)
+        .buildTurnContext(
+            surface: "chat",
+            userMessage: hinted,
+            personaOverride: nil,
+            imageBlocks: [],
+            includeClockContext: false,
+            queryUserMessage: ""
+        )
+
+    let request = try #require(await flow.lastRequest)
+    #expect(request.userMessage.isEmpty)
+    // Empty relevance text: the embedding lane fail-closes on empty input,
+    // so the captured text must be the empty string, never the hint.
+    #expect(await flow.lastQueryEmbeddingText == "")
 }
 
 @Test func readySemanticQueryEmbeddingFlowsIntoSelectionRequest() async throws {

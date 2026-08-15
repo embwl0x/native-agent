@@ -124,6 +124,11 @@ extension SwiftToolDispatcher {
         // task_ledger_list is a read. Claude/Codex write the same feed via
         // script/task_ledger.sh -> Swift task-ledger.
         "task_ledger_post", "task_ledger_list",
+        // W2 (2026-08-11) — delegation_status: the READ counterpart to
+        // claude_message / codex_message. Catalog-visible + lazy-loaded (NOT
+        // in alwaysOnCoreNames). Pure local read over the two wake-job stores
+        // under ~/.config (roots injectable via agentBridgeConfigRoot).
+        "delegation_status",
         // Agent Desk chat lane (agent-desk). Catalog-visible. desk_read is
         // ALWAYS-ON (also in alwaysOnCoreNames — User's "ask her to update me"
         // pull flow). The nine mutations are lazy-loaded (preload on tracking
@@ -162,6 +167,69 @@ extension SwiftToolDispatcher {
 
     static let fullMacAppToolNames: [String] = [
         "mac_focus_app", "mac_quit_app",
+    ]
+
+    /// READ-ONLY accessibility perception tools (W1b). These share the
+    /// `accessibility` gate CATEGORY with mac_focus_app/mac_quit_app but they
+    /// are a different TIER: they read the on-screen AX tree and mutate
+    /// nothing — no CGEvent, no AXUIElementPerformAction, no attribute write.
+    /// Kept in their own list (not folded into fullMacAppToolNames) for two
+    /// reasons: the tool catalog would otherwise label perception reads
+    /// "app control", and the dispatch route must land on
+    /// `impl_mac_accessibility_read_tool`, which gates on the READ signal
+    /// (`FullMacToolAccess.accessibilityReadAllowed`) rather than
+    /// `appControlAllowed`.
+    /// `mac_view` (W3.5) is here rather than in a list of its own: it is the
+    /// same gate category, the same read TIER, the same route and the same
+    /// no-approval contract as the three AX reads — it just fuses the picture
+    /// onto them. Its one extra requirement, the Screen Recording TCC grant, is
+    /// a SYSTEM permission it reports in its result, not a policy tier, exactly
+    /// as the AX reads report the Accessibility grant.
+    static let fullMacAccessibilityReadToolNames: [String] = [
+        "mac_ax_status", "mac_ax_tree", "mac_ax_find", "mac_view",
+    ]
+
+    /// W7 — `mac_nudge`, the one-mouse-move tool. Its own list because it is
+    /// neither of the two neighbours: it POSTS a CGEvent (so it cannot join the
+    /// read list, whose contract is "no CGEvent"), and it emits only a bare
+    /// move — no button, no key — so it changes no app state and there is
+    /// nothing for a human to approve (so it must not join the injection list,
+    /// which is the approval-capability predicate).
+    ///
+    /// It is surfaced and gated EXACTLY like `mac_ax_status`: the same
+    /// `FullMacToolAccess.accessibilityReadAllowed` signal, the same catalog
+    /// visibility flag, `auto` autonomy, no approval filer, no
+    /// `MacInjectionCapability`. Anything that would let it click or type
+    /// belongs in `fullMacAccessibilityInjectionToolNames` instead.
+    static let fullMacNudgeToolNames: [String] = ["mac_nudge"]
+
+    /// W7 (2026-08-14) — the ambient activity watcher's query tool.
+    ///
+    /// Its own list, and deliberately NOT under any Full Mac flag: this reads a
+    /// local SQLite rollup, not the live screen, so borrowing the accessibility
+    /// category would tie it to a gate that has nothing to do with it and would
+    /// let an active Full Mac window imply consent the user never gave.
+    ///
+    /// Its gate is `ActivityPolicy.captureEnabled` — the Trust Center toggle,
+    /// OFF by default. `listAvailableTools()` surfaces it only when that toggle
+    /// is on (so the catalog does not advertise a tool that will refuse), and
+    /// `impl_activity_query_tool` re-reads the policy and refuses anyway, so a
+    /// stale catalog cannot become an answer.
+    static let activityQueryToolNames: [String] = ["activity_query"]
+
+    /// INJECTION tools (W2/W3). Same `accessibility` gate category again, but
+    /// the far end of it: these synthesize keyboard/mouse input and drive other
+    /// apps' UI. Their own list because all three of the following differ from
+    /// both lists above — they route to `impl_mac_injection_tool`, they carry an
+    /// approval floor that survives an active Full Mac YOLO window, and they are
+    /// blocked under `fileAccess=read_only`.
+    /// `mac_wake` (W6) is in this list rather than the read list even though
+    /// most of what it RETURNS is a `mac_view` result: it posts a HID mouse
+    /// move first, and the tier is decided by what a tool does, not by what it
+    /// hands back. Read tier for it would have been a bypass with a view-shaped
+    /// result stapled to it.
+    static let fullMacAccessibilityInjectionToolNames: [String] = [
+        "mac_keystroke", "mac_click", "mac_scroll", "mac_ax_act", "mac_wake",
     ]
 
     // Builder tools (agent-builder-tools, 2026-06-08). Gated on Full Mac

@@ -215,9 +215,8 @@ extension NativeClient {
         // persona_read's `content` / `path` / `size_bytes`) instead of dropping
         // it to nil. The HTTP `_dispatchRaw` path decodes the daemon receipt's
         // `output` into DispatchOutput.rawString; the in-process seam must mirror
-        // that so receipt-rendering / _decodeDispatchOutput consumers see parity.
-        // Serialize the module JSONValue compactly (matches the HTTP-path object
-        // shape that _decodeDispatchOutput re-parses).
+        // that so receipt-rendering consumers see parity. Serialize the module
+        // JSONValue compactly (matches the HTTP-path object shape).
         let mappedOutput: DispatchOutput? = result.output.map { mo in
             DispatchOutput(rawString: (try? mo.value.serialize(pretty: false)) ?? "{}")
         }

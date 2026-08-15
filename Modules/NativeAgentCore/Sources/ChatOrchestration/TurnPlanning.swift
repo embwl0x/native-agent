@@ -575,10 +575,18 @@ extension SwiftNativeTurnEngine {
     ) -> TurnContext {
         var additions: [String] = []
         if let hint = turnPlan?.contextHint { additions.append(hint) }
-        if let cue = context.naturalExpressionCue,
-           let goalType = turnPlan?.goalType,
-           goalType == "chat" || goalType == "personality" {
-            additions.append(cue)
+        // W7/P13 — the cue family splits by what it regulates. Serve/rut/register
+        // stay chat-gated (they are about matching a social register). Stance
+        // routes through EVERY goal type: narrating your own performance is the
+        // same defect on a build turn as on a chat turn, and the chat gate is
+        // exactly why the cue never fired on the tic that motivated it.
+        // See `NaturalExpressionGuidance.stanceOnly`.
+        if let cue = context.naturalExpressionCue, let goalType = turnPlan?.goalType {
+            if goalType == "chat" || goalType == "personality" {
+                additions.append(cue)
+            } else if let stance = NaturalExpressionGuidance.stanceOnly(cue) {
+                additions.append(stance)
+            }
         }
         // Always consume the request-scoped candidate here, even for a task
         // turn. It must never leak through a later context transform.

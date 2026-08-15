@@ -582,3 +582,111 @@ func textCompatQA7_formattedToolCallsBounceWithoutDeliveryOrDispatch() async thr
     #expect(!visible.contains("private-plan.txt"))
     #expect(!visible.contains("invented success"))
 }
+
+// MARK: - QA: mid-turn tool_load must NOT mutate the system prompt
+// turn-context-iteration-cache (2026-08-13): pre-fix, iteration N+1's context
+// rebuild re-read ActiveToolsStore after a mid-turn tool_load and the grown
+// tool catalog landed inside the stable cache-breakpointed system segment —
+// byte-diff-proven prompt-cache kill on live turn 47ee5b6d (369k
+// cache-creation tokens). The text-compat loop now pins its turn-start tool
+// set for the whole turn. This test is the mutation-killer for that pin:
+// revert the pin and the system-equality assertions fail.
+
+/// Tools client that (a) exposes a lazily-gated probe schema, (b) simulates
+/// the real impl_tool_load side effect by writing the probe into a HERMETIC
+/// ActiveToolsStore, which the engine adopts via ActiveToolsStoreProviding.
+private final class ToolLoadSimulatingTools: ToolDispatchClient, ActiveToolsStoreProviding, @unchecked Sendable {
+    let activeToolsStore: ActiveToolsStore
+    private let sessionId: String
+    init(root: URL, sessionId: String) {
+        self.activeToolsStore = ActiveToolsStore(dataRoot: root)
+        self.sessionId = sessionId
+    }
+    func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        if tool == "tool_load" {
+            _ = try await activeToolsStore.addLoaded(sessionId: sessionId, names: ["zz_lazy_probe"])
+            return .object([
+                "status": .string("loaded"),
+                "loaded_now": .array([.string("zz_lazy_probe")]),
+                "schemas_added": .array([.object([
+                    "name": .string("zz_lazy_probe"),
+                    "description": .string("probe"),
+                    "parameters": .object(["type": .string("object")]),
+                ])]),
+            ])
+        }
+        if tool == "zz_lazy_probe" { return .string("PROBE-OK") }
+        return .null
+    }
+    func listAvailableTools() async throws -> [String] { ["tool_load", "zz_lazy_probe"] }
+    func listAvailableToolSchemas() async throws -> [LLMToolSchema] {
+        let params = try JSONSerialization.data(withJSONObject: ["type": "object"])
+        return [
+            LLMToolSchema(name: "tool_load", description: "load lazy tools", parametersJSON: params),
+            LLMToolSchema(name: "zz_lazy_probe", description: "lazily gated probe", parametersJSON: params),
+        ]
+    }
+}
+
+@Test
+func textCompatQA_systemPromptStableAcrossMidTurnToolLoad() async throws {
+    let tag = "qa-pin-toolload"
+    let loadMarker = #"<tool_use id="t1" name="tool_load">{"names":["zz_lazy_probe"]}</tool_use>"#
+    let probeMarker = #"<tool_use id="t2" name="zz_lazy_probe">{}</tool_use>"#
+    let scripts = [[loadMarker], [probeMarker], ["all ", "stable"]]
+    let root = try makeTempRoot(tag)
+    try writeOAuthFixture(root)
+    let tools = ToolLoadSimulatingTools(root: root, sessionId: "s-\(tag)")
+
+    let llm = UnusedLLM()
+    let dual = DualTransportScriptedLLM(scripts: scripts)
+    let engine = makeQAEngine(root: root, llm: llm, tools: tools)
+    let client = SwiftNativeChatOrchestrationClient(
+        engine: engine,
+        tools: tools,
+        llm: llm,
+        streamingLLM: dual,
+        history: SessionHistoryReader(dataRoot: root),
+        dataRoot: root,
+        trust: SwiftNativeTrustCenter(dataRoot: root)
+    )
+
+    var toolUses: [String] = []
+    var toolResults: [String] = []
+    var finalReply: String?
+    var errors: [String] = []
+    for try await event in client.chatStream(
+        message: "load the probe tool then run it", sessionId: "s-\(tag)",
+        model: "claude-opus-4-8", reasoningEffort: "high",
+        fileAccess: "workspace", attachments: [], persona: nil,
+        surface: "chat", suppressUserAppend: false
+    ) {
+        switch event {
+        case .toolUse(let name, _): toolUses.append(name)
+        case .toolResult(let name, _): toolResults.append(name)
+        case .final(let r): finalReply = r.reply
+        case .error(let m): errors.append(m)
+        default: break
+        }
+    }
+
+    #expect(errors.isEmpty)
+    #expect(finalReply == "all stable")
+    // The just-loaded tool DISPATCHES this turn (store gate honors the load).
+    #expect(toolUses == ["tool_load", "zz_lazy_probe"])
+    #expect(toolResults == ["tool_load", "zz_lazy_probe"])
+
+    // THE PIN: every iteration's system prompt is byte-identical — the
+    // mid-turn store write must not grow the advertised catalog.
+    let calls = dual.messagesCalls
+    #expect(calls.count == 3)
+    let systems = calls.map { $0.system ?? "" }
+    #expect(Set(systems).count == 1, "system prompt changed across iterations")
+    // And the growth really was suppressed, not absent: the probe's schema
+    // stays OUT of every iteration's system text (it was never turn-start
+    // active; pre-fix it appeared from iteration 2 on).
+    #expect(systems.allSatisfy { !$0.contains("lazily gated probe") })
+    // The store DID grow mid-turn — proves the mutation channel fired.
+    let active = await tools.activeToolsStore.load(sessionId: "s-\(tag)").activeTools
+    #expect(active.contains("zz_lazy_probe"))
+}

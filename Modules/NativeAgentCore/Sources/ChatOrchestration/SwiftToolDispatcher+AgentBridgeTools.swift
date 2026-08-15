@@ -149,6 +149,13 @@ extension SwiftToolDispatcher {
         return canonical.isEmpty ? "general" : canonical
     }
 
+    /// File-internal accessor so the replay guard slugs a topic EXACTLY the way
+    /// the conversation-reference validator above does. A second slug function
+    /// would be a cross-vocabulary seam waiting to silently mismatch.
+    static func builderTopicSlugForReplayGuard(_ raw: String) -> String {
+        builderTopicSlug(raw)
+    }
+
     private static func shortStableBuilderMessageId(_ messageId: String) -> String {
         SHA256.hash(data: Data(messageId.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
     }
@@ -420,6 +427,24 @@ extension SwiftToolDispatcher {
             return await claudeMessageWakeupOverride(payload)
         }
 
+        // L1#14 replay guard. Placed AFTER the test override on purpose: the
+        // guard reads a real directory, and when `agentBridgeConfigRoot` is nil
+        // that directory is the LIVE ~/.config. A test that injects an override
+        // must never be able to reach it. Production sets no override, so the
+        // production order is unchanged — guard, then helper. The guard's own
+        // behaviour is covered directly in WakeupReplayGuardTests.
+        if !WakeupReplayGuard.isDisabled(),
+           let match = WakeupReplayGuard.terminalDuplicate(
+               store: .claude,
+               jobsDirectory: WakeupReplayGuard.jobsDirectory(
+                   for: .claude, configRoot: agentBridgeConfigRoot),
+               topic: topic,
+               text: text,
+               now: Date()
+           ) {
+            return WakeupReplayGuard.receipt(match)
+        }
+
         let disabled = ProcessInfo.processInfo.environment["NATIVE_AGENT_CLAUDE_WAKEUP_DISABLED"]?.lowercased()
         if ["1", "true", "yes"].contains(disabled ?? "") {
             return .object([
@@ -687,6 +712,20 @@ extension SwiftToolDispatcher {
         if !originSessionId.isEmpty { payload["sessionId"] = .string(originSessionId) }
         if let workingDirectory { payload["cwd"] = .string(workingDirectory) }
         if let ompMessageWakeupOverride { return await ompMessageWakeupOverride(payload) }
+        // L1#14 replay guard — see postClaudeThreadWakeup for the four
+        // conditions, why a lost/failed prior run is never suppressed, and why
+        // this sits after the override.
+        if !WakeupReplayGuard.isDisabled(),
+           let match = WakeupReplayGuard.terminalDuplicate(
+               store: .omp,
+               jobsDirectory: WakeupReplayGuard.jobsDirectory(
+                   for: .omp, configRoot: agentBridgeConfigRoot),
+               topic: topic,
+               text: text,
+               now: Date()
+           ) {
+            return WakeupReplayGuard.receipt(match)
+        }
 
         let disabled = ProcessInfo.processInfo.environment["NATIVE_AGENT_OMP_WAKEUP_DISABLED"]?.lowercased()
         if ["1", "true", "yes"].contains(disabled ?? "") {
@@ -1449,6 +1488,24 @@ extension SwiftToolDispatcher {
             if let workingDirectory { payload["workingDirectory"] = .string(workingDirectory) }
             if let executionProfile { payload["executionProfile"] = .string(executionProfile) }
             return await codexMessageWakeupOverride(payload)
+        }
+
+        // L1#14 replay guard. The codex store UNLINKS a delivered reply-job, so
+        // a terminal record still present in reply-jobs/ is one whose work
+        // finished and whose handoff is pending recovery — re-firing would
+        // duplicate the run. `undelivered/` is deliberately not scanned, so an
+        // undeliverable job stays re-askable. After the override for the same
+        // hermeticity reason as postClaudeThreadWakeup.
+        if !WakeupReplayGuard.isDisabled(),
+           let match = WakeupReplayGuard.terminalDuplicate(
+               store: .codex,
+               jobsDirectory: WakeupReplayGuard.jobsDirectory(
+                   for: .codex, configRoot: agentBridgeConfigRoot),
+               topic: topic,
+               text: text,
+               now: Date()
+           ) {
+            return WakeupReplayGuard.receipt(match)
         }
 
         let disabled = ProcessInfo.processInfo.environment["NATIVE_AGENT_CODEX_WAKEUP_DISABLED"]?.lowercased()
@@ -2301,4 +2358,292 @@ extension SwiftToolDispatcher {
         return false
     }
 
+}
+
+// MARK: - Stale-wakeup replay guard (W2b, upgrade campaign 2026-08 Track A)
+//
+// L1#14, in User's words: "the bridge is still replaying old wakeups as if they
+// are new." The shape of that failure is narrow and identifiable — the SAME
+// message text, on the SAME topic, fired again at a runner that already ran it
+// to completion and already handed the answer back. Each replay costs a real
+// spawned session, real tokens, and produces a second copy of an answer nobody
+// asked for twice.
+//
+// This guard reads the target store BEFORE the wakeup spawn and returns a
+// receipt instead of enqueuing, when and only when all four hold:
+//
+//   1. Same topic slug (slugged through the dispatcher's own
+//      `builderTopicSlug`, never a second implementation).
+//   2. Byte-identical payload text. Same topic with DIFFERENT text is normal
+//      follow-up work and must always go through — this is the single most
+//      important non-suppression, because getting it wrong silently strands
+//      real work.
+//   3. The prior job is TERMINAL: it carries a completion stamp or a terminal
+//      status word. An in-flight job is not a replay; the bridges already
+//      serialize per topic and have their own in-flight handling.
+//   4. The prior job's answer was CONFIRMED DELIVERED. A job whose delivery was
+//      lost or unconfirmed is deliberately NOT suppressed — re-asking after an
+//      answer went missing is the correct human action, and blocking it would
+//      strand the work permanently. This is why the guard cannot be "is there a
+//      terminal job with this topic".
+//
+// Plus a recency window (default 24h): an identical request made weeks later is
+// a deliberate re-run, not a replay.
+//
+// WIRE FENCE: nothing here writes, and no script/*.js is touched. The store
+// paths mirror the JS writers' own resolution order (env override, then
+// ~/.config) so the guard can never read a different directory than the writer.
+enum WakeupReplayGuard {
+
+    enum Store {
+        case claude
+        case omp
+        case codex
+    }
+
+    /// Everything the receipt needs to say WHICH prior job matched. Every field
+    /// is read off the record — nothing is inferred.
+    struct Match: Equatable {
+        let jobId: String
+        let topicSlug: String
+        let completedAt: String?
+        let statusWord: String?
+        let storeLabel: String
+    }
+
+    /// How long an identical completed request keeps suppressing a re-fire.
+    static let defaultWindow: TimeInterval = 24 * 60 * 60
+
+    /// Escape hatch. Set to 1/true/yes to force every wakeup through, e.g. when
+    /// deliberately re-running an identical delegated job.
+    static let disableEnvironmentKey = "NATIVE_AGENT_WAKEUP_REPLAY_GUARD_DISABLED"
+
+    static func isDisabled(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        let raw = environment[disableEnvironmentKey]?.lowercased() ?? ""
+        return ["1", "true", "yes"].contains(raw)
+    }
+
+    /// Resolve the jobs directory for a store, mirroring the JS writer's own
+    /// order: an explicit override (tests / `agentBridgeConfigRoot`) wins, then
+    /// the writer's env var, then `~/.config`.
+    static func jobsDirectory(
+        for store: Store,
+        configRoot: URL?,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> URL {
+        func home(_ bridge: String) -> URL {
+            FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".config", isDirectory: true)
+                .appendingPathComponent(bridge, isDirectory: true)
+        }
+        switch store {
+        case .claude:
+            let base = configRoot?.appendingPathComponent("claude-bridge", isDirectory: true)
+                ?? environment["NATIVE_AGENT_CLAUDE_BRIDGE_DIR"].map { URL(fileURLWithPath: $0) }
+                ?? home("claude-bridge")
+            return base.appendingPathComponent("wake-jobs", isDirectory: true)
+        case .omp:
+            let base = configRoot?.appendingPathComponent("omp-bridge", isDirectory: true)
+                ?? environment["NATIVE_AGENT_OMP_BRIDGE_DIR"].map { URL(fileURLWithPath: $0) }
+                ?? home("omp-bridge")
+            return base.appendingPathComponent("wake-jobs", isDirectory: true)
+        case .codex:
+            if let configRoot {
+                return configRoot
+                    .appendingPathComponent("codex-nativeagent-bridge", isDirectory: true)
+                    .appendingPathComponent("reply-jobs", isDirectory: true)
+            }
+            if let override = environment["NATIVE_AGENT_CODEX_REPLY_JOBS_DIR"] {
+                return URL(fileURLWithPath: override)
+            }
+            return home("codex-nativeagent-bridge")
+                .appendingPathComponent("reply-jobs", isDirectory: true)
+        }
+    }
+
+    /// The prior terminal, delivered, identical job — or nil, meaning "post the
+    /// wakeup". Every failure to read is nil: the guard NEVER blocks work
+    /// because a directory was unreadable.
+    static func terminalDuplicate(
+        store: Store,
+        jobsDirectory: URL,
+        topic: String?,
+        text: String,
+        now: Date,
+        window: TimeInterval = defaultWindow
+    ) -> Match? {
+        let wanted = SwiftToolDispatcher.builderTopicSlugForReplayGuard(topic ?? "")
+        guard !text.isEmpty else { return nil }
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: jobsDirectory.path)) ?? []
+        var best: (Match, Date)?
+        for name in names.sorted() where name.hasSuffix(".json") && !name.hasPrefix(".") {
+            let url = jobsDirectory.appendingPathComponent(name)
+            guard let data = try? Data(contentsOf: url),
+                  let parsed = try? JSONValue.parse(data),
+                  case .object(let record) = parsed else { continue }
+            guard let candidate = match(
+                store: store, record: record, url: url,
+                wantedSlug: wanted, text: text, now: now, window: window
+            ) else { continue }
+            // Newest match wins, so the receipt names the most recent run.
+            let stamp = parseISO(candidate.completedAt) ?? .distantPast
+            if best == nil || stamp > best!.1 { best = (candidate, stamp) }
+        }
+        return best?.0
+    }
+
+    private static func match(
+        store: Store,
+        record: [String: JSONValue],
+        url: URL,
+        wantedSlug: String,
+        text: String,
+        now: Date,
+        window: TimeInterval
+    ) -> Match? {
+        switch store {
+        case .claude, .omp:
+            // Both wake-job writers persist the whole request under `payload`.
+            guard case .object(let payload)? = record["payload"],
+                  string(payload, "text") == text else { return nil }
+            // `topicSlug` is written by the claude runner; the OMP record only
+            // carries the raw topic in its payload, so slug that instead. Both
+            // go through the dispatcher's slug function, so both agree.
+            let slug = string(record, "topicSlug")
+                ?? SwiftToolDispatcher.builderTopicSlugForReplayGuard(string(payload, "topic") ?? "")
+            guard slug == wantedSlug else { return nil }
+            let completedAt = string(record, "completedAt")
+            let statusWord = (string(record, "runStatus") ?? string(record, "status"))?.lowercased()
+            guard isTerminal(completedAt: completedAt, statusWord: statusWord) else { return nil }
+            guard succeeded(statusWord: statusWord) else { return nil }
+            guard deliveryConfirmed(record) else { return nil }
+            guard withinWindow(completedAt, now: now, window: window) else { return nil }
+            return Match(
+                jobId: string(record, "messageId") ?? url.deletingPathExtension().lastPathComponent,
+                topicSlug: slug,
+                completedAt: completedAt,
+                statusWord: statusWord,
+                storeLabel: store == .claude ? "claude" : "omp"
+            )
+
+        case .codex:
+            // A DELIVERED codex reply-job is unlinked by the bridge, so a
+            // terminal record still sitting in reply-jobs/ is one whose handoff
+            // is pending recovery — the WORK is done, and re-firing duplicates
+            // it. Records preserved under `undelivered/` are never scanned (the
+            // caller does not descend into it), which is the point: an
+            // undeliverable job must stay re-askable.
+            guard case .array(let entries)? = record["entries"] else { return nil }
+            var matched = false
+            for entry in entries {
+                guard case .object(let e) = entry,
+                      case .object(let payload)? = e["payload"],
+                      string(payload, "text") == text else { continue }
+                let slug = SwiftToolDispatcher.builderTopicSlugForReplayGuard(
+                    string(payload, "topic") ?? "")
+                if slug == wantedSlug { matched = true; break }
+            }
+            guard matched else { return nil }
+            guard case .object(let execution)? = record["completedExecution"],
+                  case .object(let turnResult)? = execution["turnResult"] else { return nil }
+            let completedAt = string(turnResult, "completedAt")
+            let statusWord = string(turnResult, "status")?.lowercased()
+            guard isTerminal(completedAt: completedAt, statusWord: statusWord) else { return nil }
+            guard succeeded(statusWord: statusWord) else { return nil }
+            guard withinWindow(completedAt, now: now, window: window) else { return nil }
+            return Match(
+                jobId: string(record, "id") ?? url.deletingPathExtension().lastPathComponent,
+                topicSlug: wantedSlug,
+                completedAt: completedAt,
+                statusWord: statusWord,
+                storeLabel: "codex"
+            )
+        }
+    }
+
+    static let terminalStatusWords: Set<String> = [
+        "completed", "complete", "succeeded", "success",
+        "failed", "failure", "error", "errored",
+        "timeout", "timed_out", "cancelled", "canceled", "aborted", "spawn_failed",
+    ]
+
+    static let successStatusWords: Set<String> = [
+        "completed", "complete", "succeeded", "success",
+    ]
+
+    static func isTerminal(completedAt: String?, statusWord: String?) -> Bool {
+        if completedAt != nil { return true }
+        if let statusWord, terminalStatusWords.contains(statusWord) { return true }
+        return false
+    }
+
+    /// A FAILED prior run is not a replay to suppress — retrying failed work is
+    /// exactly what a re-send is for.
+    static func succeeded(statusWord: String?) -> Bool {
+        guard let statusWord else { return false }
+        return successStatusWords.contains(statusWord)
+    }
+
+    /// Claude writes `bridgeStatus`; OMP writes a `bridge` object with a
+    /// `status`. Only an explicit "delivered" counts — `deliveryLost` true, an
+    /// unknown bridge status, or no bridge record at all all mean the answer is
+    /// not known to have arrived, so the re-send goes through.
+    static func deliveryConfirmed(_ record: [String: JSONValue]) -> Bool {
+        if case .bool(true)? = record["deliveryLost"] { return false }
+        if let status = string(record, "bridgeStatus") { return status == "delivered" }
+        if case .object(let bridge)? = record["bridge"] {
+            return string(bridge, "status") == "delivered"
+        }
+        return false
+    }
+
+    static func withinWindow(_ completedAt: String?, now: Date, window: TimeInterval) -> Bool {
+        // No completion stamp means we cannot prove recency. Terminal-by-status
+        // with no timestamp is a legacy/hand-edited shape; treat it as OUT of
+        // the window so the wakeup proceeds rather than being blocked by a
+        // record we cannot date.
+        guard let date = parseISO(completedAt) else { return false }
+        return now.timeIntervalSince(date) <= window && date <= now.addingTimeInterval(window)
+    }
+
+    /// The receipt that replaces the wakeup envelope. `status: "skipped"` keeps
+    /// it in the same vocabulary the other non-spawn outcomes already use
+    /// (`disabled_by_environment`, `helper_not_found`, `deduplicated`), so no
+    /// caller needs a new branch to understand it.
+    static func receipt(_ match: Match) -> JSONValue {
+        var obj: [String: JSONValue] = [
+            "status": .string("skipped"),
+            "reason": .string("already_completed"),
+            "jobId": .string(match.jobId),
+            "topicSlug": .string(match.topicSlug),
+            "store": .string(match.storeLabel),
+            "detail": .string("This exact request already ran to completion on this topic and "
+                + "its answer was delivered. The durable inbox row was still written; only the "
+                + "duplicate wake was skipped."),
+            "fix": .string("Change the message text to send new work on this topic, or set "
+                + "\(disableEnvironmentKey)=1 to force an identical re-run."),
+        ]
+        if let completedAt = match.completedAt { obj["completedAt"] = .string(completedAt) }
+        if let statusWord = match.statusWord { obj["priorRunStatus"] = .string(statusWord) }
+        return .object(obj)
+    }
+
+    // MARK: - Local readers (deliberately not shared with the projector: this
+    // guard must keep working if that file changes shape, and the two answer
+    // different questions).
+
+    private static func string(_ obj: [String: JSONValue], _ key: String) -> String? {
+        if case .string(let s)? = obj[key] { return s.isEmpty ? nil : s }
+        return nil
+    }
+
+    static func parseISO(_ iso: String?) -> Date? {
+        guard let iso, !iso.isEmpty else { return nil }
+        let withFraction = ISO8601DateFormatter()
+        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = withFraction.date(from: iso) { return d }
+        return ISO8601DateFormatter().date(from: iso)
+    }
 }

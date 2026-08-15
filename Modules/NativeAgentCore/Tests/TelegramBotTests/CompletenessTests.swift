@@ -588,26 +588,4 @@ struct TelegramBotCompletenessTests {
         #expect(bodyString.contains("voice-webm"))
     }
 
-    // MARK: - MockProgressNoticeChannel
-
-    @Test func MockProgressNoticeChannel_records_emitted_messages() async throws {
-        let channel = MockProgressNoticeChannel()
-        await channel.emit("Task started", correlationId: "abc-123")
-        await channel.emit("Task finished", correlationId: "abc-123")
-        let emitted = channel.emitted
-        #expect(emitted.count == 2)
-        #expect(emitted[0].0 == "Task started")
-        #expect(emitted[0].1 == "abc-123")
-        #expect(emitted[1].0 == "Task finished")
-        #expect(emitted[1].1 == "abc-123")
-    }
-
-    @Test func MockProgressNoticeChannel_correlationId_optional() async throws {
-        let channel = MockProgressNoticeChannel()
-        await channel.emit("No correlation", correlationId: nil)
-        let emitted = channel.emitted
-        #expect(emitted.count == 1)
-        #expect(emitted[0].0 == "No correlation")
-        #expect(emitted[0].1 == nil)
-    }
 }

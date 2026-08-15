@@ -7,7 +7,8 @@ extension TelegramPollLoop {
         update: TelegramUpdate,
         message: TelegramMessage,
         attachment: TelegramMediaAttachment,
-        transcription: TelegramVoiceTranscription
+        transcription: TelegramVoiceTranscription,
+        correction: TelegramTranscriptTermCorrection.Result? = nil
     ) async {
         var row: [String: JSONValue] = [
             "id": .string(UUID().uuidString),
@@ -31,6 +32,17 @@ extension TelegramPollLoop {
         }
         if let preview = _tgPreview(transcription.text) {
             row["transcriptPreview"] = .string(preview)
+        }
+        // W5 L1#11: the ORIGINAL transcript preview and the correction marker
+        // land in the receipt row (metadata), never in the visible message.
+        if let correction, correction.didCorrect {
+            row["transcriptCorrectedCount"] = .int(Int64(correction.correctedCount))
+            if let marker = correction.marker {
+                row["transcriptCorrectionMarker"] = .string(marker)
+            }
+            if let correctedPreview = _tgPreview(correction.text) {
+                row["transcriptCorrectedPreview"] = .string(correctedPreview)
+            }
         }
         try? await appendJSONLCapped(
             .object(row),

@@ -104,36 +104,4 @@ struct U5WGMiscTests {
         let missing = try await bridge.getProposal(id: "absent")
         #expect(missing == nil)
     }
-
-    // MARK: JSONL embedding store corrupt-preserve
-
-    /// Lines that fail to decode on load used to be silently skipped AND
-    /// then destroyed by the next flush() full rewrite. They must now ride
-    /// through the rewrite verbatim.
-    @Test func embeddingStore_flush_preservesUndecodableLines() async throws {
-        let root = tmpRoot()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let path = root.appendingPathComponent("embeddings.jsonl")
-        let validLine = #"{"id":"keep-me","text":"hello","embedding":[0.5]}"#
-        let garbage = "GARBAGE-NOT-JSON-\(UUID().uuidString)"
-        try "\(validLine)\n\(garbage)\n".write(to: path, atomically: true, encoding: .utf8)
-
-        let store = JSONLEmbeddingStore(path: path)
-        // Load path: the valid record survives, garbage is skipped in memory.
-        let loaded = try await store.get(id: "keep-me")
-        #expect(loaded != nil)
-        // Mutation triggers flush() — the full-file rewrite.
-        try await store.upsert(id: "new-row", embedding: [0.25], text: "fresh")
-
-        let rewritten = try String(contentsOf: path, encoding: .utf8)
-        #expect(rewritten.contains(garbage),
-                "flush() must preserve undecodable lines, not destroy them")
-        #expect(rewritten.contains("keep-me"))
-        #expect(rewritten.contains("new-row"))
-
-        // Reload from disk: preserved garbage must not break a fresh store.
-        let store2 = JSONLEmbeddingStore(path: path)
-        let reloaded = try await store2.get(id: "new-row")
-        #expect(reloaded?.text == "fresh")
-    }
 }

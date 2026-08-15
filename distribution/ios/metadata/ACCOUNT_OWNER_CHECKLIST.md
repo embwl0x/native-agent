@@ -40,5 +40,10 @@ and cannot be completed or truthfully verified from source alone.
 - Verify approvals, memories, Workshop, offline/restart behavior, and a fresh
   ordinary Apple-account pairing before submitting for review.
 - Add final screenshots for each required iPhone/iPad display class.
+- For every new-app review, attach a current physical-device walkthrough that
+  begins with app launch and shows the typical paired flow. Keep the seven-part
+  Guideline 2.1 response in `APP_REVIEW_2_1_RESPONSE.md` current with the exact
+  submitted build, tested devices/OS versions, setup path, external services,
+  regional behavior, and regulatory/content status.
 - Submit manually only after App Store Connect reports no missing compliance,
   privacy, export, age-rating, or availability fields.

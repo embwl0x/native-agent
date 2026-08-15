@@ -758,11 +758,11 @@ func buildTurnContextWithHistory_appends_clock_context_after_history_tail() asyn
     )
     let seg = try #require(ctx.systemSegments)
     let history = try #require(seg.dynamic.range(of: "Conversation history:"))
-    let clock = try #require(seg.dynamic.range(of: "Current time:"))
+    let clock = try #require(seg.dynamic.range(of: "Local time:"))
     let runtime = try #require(seg.dynamic.range(of: "Current runtime:"))
 
     #expect(seg.stable.contains("CLOCK-HISTORY-STABLE"))
-    #expect(!seg.stable.contains("Current time:"))
+    #expect(!seg.stable.contains("Local time:"))
     #expect(!seg.stable.contains("Current runtime:"))
     #expect(history.lowerBound < clock.lowerBound)
     #expect(clock.lowerBound < runtime.lowerBound)

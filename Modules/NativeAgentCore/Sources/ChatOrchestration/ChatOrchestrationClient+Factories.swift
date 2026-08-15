@@ -162,7 +162,8 @@ public func makeGatedToolDispatchClient(
     dataRoot: URL = PersistenceCore.defaultDataRoot(),
     trust: (any AutonomyResolver)? = nil,
     verifiedSessionId: String? = nil,
-    approvedReplay: ApprovedChatToolReplay? = nil
+    approvedReplay: ApprovedChatToolReplay? = nil,
+    injectionApprovalVerifier: (any InjectionApprovalVerifying)? = nil
 ) -> any ToolDispatchClient {
     let resolvedTrust: any AutonomyResolver = trust ?? SwiftNativeTrustCenter(dataRoot: dataRoot)
     let gate = AutonomyGate(trust: resolvedTrust, approvalFiler: approvalFiler)
@@ -175,7 +176,13 @@ public func makeGatedToolDispatchClient(
         hasFiler: approvalFiler != nil,
         approvalTimeoutSeconds: approvalTimeoutSeconds,
         verifiedSessionId: verifiedSessionId,
-        approvedReplay: approvedReplay
+        approvedReplay: approvedReplay,
+        // W2/W3-FIX-R2 1 — every chain this factory builds can CHECK an
+        // injection approval id against the canonical inbox on the same data
+        // root. Callers may override for a hermetic inbox; nobody has to
+        // remember to pass one for production to be safe.
+        injectionApprovalVerifier: injectionApprovalVerifier
+            ?? ApprovalInboxInjectionApprovalVerifier(dataRoot: dataRoot)
     )
 }
 

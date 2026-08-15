@@ -60,9 +60,42 @@ struct GeneratedUserFactAtomizationTests {
         #expect(facts.contains { $0.body.contains("refuses anything with hazelnut") })
         // No atom carries two facts.
         #expect(facts.allSatisfy { !$0.body.contains("\n") })
-        // The marker lines remain their own paragraph atoms — the autogen
-        // region boundary is data, not a fact.
-        #expect(compiled.atoms.count == facts.count + 2)
+        // v3: the marker comments are cut boundaries, never atoms. As atoms
+        // they ranked #1-2 of the whole live store by static prior (tiny
+        // body → ~zero cost penalty) while carrying zero content. The ATX
+        // heading is heading-path context, not an atom — so facts are ALL
+        // the atoms this document produces now.
+        #expect(compiled.atoms.count == facts.count)
+        #expect(compiled.atoms.allSatisfy {
+            !$0.body.contains("USER_MD_AUTOGEN")
+        })
+    }
+
+    @Test
+    func autogenMarkerCommentsNeverBecomeAtoms() async throws {
+        let compiler = ContextMarkdownCompiler(embeddingProvider: TokenHashEmbedder())
+        // Markers with a preamble pair too — all four must vanish from the
+        // atom set while the prose between them survives.
+        let document = """
+        \(UserMDAutogenMarkers.preambleStart)
+        Hand-written preamble prose that should stay an atom.
+        \(UserMDAutogenMarkers.preambleEnd)
+
+        \(UserMDAutogenMarkers.bodyStart)
+        - one generated fact
+        \(UserMDAutogenMarkers.bodyEnd)
+        """
+        let compiled = try await compiler.compile(
+            source: document,
+            descriptor: userDescriptor(),
+            updatedAt: updatedAt
+        )
+
+        #expect(compiled.atoms.allSatisfy {
+            !ContextMarkdownCompiler.isAutogenMarkerBlock($0.body)
+        })
+        #expect(compiled.atoms.contains { $0.body.contains("Hand-written preamble prose") })
+        #expect(compiled.atoms.contains { $0.body == "- one generated fact" })
     }
 
     @Test

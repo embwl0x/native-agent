@@ -374,7 +374,7 @@ func turnContextRebuild_reflectsMidTurnToolCatalogChange() async throws {
 // MARK: - LIVE channel 4: the clock
 
 /// `contextByAppendingCurrentTurnFacts` stamps
-/// `Current time: EEE yyyy-MM-dd HH:mm zzz` into the system prompt every
+/// `Local time: EEEE, MMMM d, yyyy at h:mm a zzz` into the system prompt every
 /// build (TurnEngine:1260 → renderClockContext). Minute resolution: any
 /// tool-loop iteration that crosses a minute boundary — a shell/build/test
 /// dispatch routinely does — produces a different context by construction.
@@ -411,6 +411,6 @@ func turnContextRebuild_clockAdvancesAcrossIterations() async throws {
         personaOverride: nil, excludeHistoryRunId: "run-1"
     )
 
-    #expect((iter0.systemPrompt ?? "").contains("Current time:"))
+    #expect((iter0.systemPrompt ?? "").contains("Local time:"))
     #expect(iter0.systemPrompt != iter1.systemPrompt)
 }

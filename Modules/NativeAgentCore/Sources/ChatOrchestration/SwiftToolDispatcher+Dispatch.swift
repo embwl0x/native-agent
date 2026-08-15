@@ -130,6 +130,9 @@ extension SwiftToolDispatcher {
         case "workshop_status": return try await impl_workshop_status(input: input)
         case "task_ledger_post": return try await impl_task_ledger_post(input: input)
         case "task_ledger_list": return try await impl_task_ledger_list(input: input)
+        // delegation_status (W2, 2026-08-11): read-only projection over the
+        // claude/codex wake-job stores. No write, no spawn, no network.
+        case "delegation_status": return try await impl_delegation_status(input: input)
         case "desk_read": return try await impl_desk_read(input: input)
         case "desk_add_item": return try await impl_desk_add_item(input: input)
         case "desk_set_status": return try await impl_desk_set_status(input: input)
@@ -670,6 +673,26 @@ extension SwiftToolDispatcher {
             return try await impl_local_connector_tool(tool: name, input: input, surface: surface)
         case let name where Self.fullMacAppToolNames.contains(name):
             return try await impl_mac_app_control_tool(tool: name, input: input, surface: surface)
+        // W1b — READ-ONLY accessibility perception. Separate route from the
+        // app-control case above: same gate CATEGORY, read TIER, no approval.
+        case let name where Self.fullMacAccessibilityReadToolNames.contains(name):
+            return try await impl_mac_accessibility_read_tool(tool: name, input: input, surface: surface)
+        // W7 — the NUDGE. Its own case, gated on the same read-tier signal:
+        // one bare mouse move, no approval, no capability. It never reaches
+        // impl_mac_injection_tool, and it could not use one if it did.
+        case let name where Self.fullMacNudgeToolNames.contains(name):
+            return try await impl_mac_nudge_tool(tool: name, input: input, surface: surface)
+        // W7 — the ambient activity watcher's query tool. Its own route because
+        // its gate is not a Mac-control category at all: the impl reads the
+        // Trust Center capture toggle and refuses when it is off, and refuses
+        // outright on remote surfaces (the tool is Mac-local by decision).
+        case let name where Self.activityQueryToolNames.contains(name):
+            return try await impl_activity_query_tool(tool: name, input: input, surface: surface)
+        // W2/W3 — INJECTION. Third route under the same gate category: the
+        // impl adds the approval attestation MacControl requires, which the two
+        // routes above deliberately never do.
+        case let name where Self.fullMacAccessibilityInjectionToolNames.contains(name):
+            return try await impl_mac_injection_tool(tool: name, input: input, surface: surface)
         default:
             if let bridged = Self.parseMCPToolName(tool) {
                 return try await impl_mcp_tool(

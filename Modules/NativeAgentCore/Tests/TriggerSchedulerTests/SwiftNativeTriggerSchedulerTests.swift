@@ -14,6 +14,11 @@ private func makeTempRoot() throws -> URL {
     return dir
 }
 
+/// Seeds the LEGACY `<root>/inbox/trigger_config.json` location on purpose:
+/// every test that seeds here also exercises the 2026-08-13 lazy migration
+/// (copy-forward to `<root>/triggers/`) before the behavior under test.
+/// Steady-state reads of the new path are covered implicitly — after the first
+/// scheduler call the file lives at `triggers/` and later calls read it there.
 private func seedInbox(_ records: [JSONValue], root: URL) throws {
     let dir = root.appendingPathComponent("inbox", isDirectory: true)
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -30,9 +35,11 @@ private func seedWorkshopExecutions(_ records: [JSONValue], root: URL) throws {
     try data.write(to: path)
 }
 
+/// Reads the NEW `<root>/triggers/trigger_config.json` home — mutation writes
+/// land there after the relocation.
 private func readInboxRaw(root: URL) throws -> [JSONValue] {
     let url = root
-        .appendingPathComponent("inbox", isDirectory: true)
+        .appendingPathComponent("triggers", isDirectory: true)
         .appendingPathComponent("trigger_config.json")
     let data = try Data(contentsOf: url)
     guard case .array(let arr) = try JSONValue.parse(data) else { return [] }
@@ -214,9 +221,10 @@ struct DefaultsSuite {
         // stuck_pattern.
         #expect(configs.count == 5)
         #expect(configs.map(\.name) == ["file_watch", "idle_checkin", "morning_brief", "execution_followup", "stuck_pattern"])
-        // execution_followup is the only one enabled by default.
+        // Enabled by default: morning_brief (L5 G2 — the one proactive lane
+        // that ships lit) and execution_followup. Everything else is opt-in.
         let enabled = configs.filter(\.enabled).map(\.name)
-        #expect(enabled == ["execution_followup"])
+        #expect(enabled == ["morning_brief", "execution_followup"])
     }
 
     @Test func listWorkshopExecutionsReturnsDefaultsWhenFileMissing() async throws {
@@ -1006,7 +1014,7 @@ struct FactorySuite {
         )
 
         #expect(scheduler.inboxPath == root
-            .appendingPathComponent("inbox", isDirectory: true)
+            .appendingPathComponent("triggers", isDirectory: true)
             .appendingPathComponent("trigger_config.json"))
         #expect(scheduler.workshopExecutionsPath == root
             .appendingPathComponent("workshop", isDirectory: true)
@@ -1209,7 +1217,7 @@ struct PeriodicFireSuite {
         #expect(try readLiveInbox(root: root).count == 1)
 
         // last_fired_at persisted for this trigger.
-        let state = readTriggerState(root: root, surface: "inbox")
+        let state = readTriggerState(root: root, surface: "triggers")
         #expect(state["morning_brief"] != nil)
 
         // 09:30 same day — already fired today → NOT due again.
@@ -1227,6 +1235,10 @@ struct PeriodicFireSuite {
         try seedWorkshopExecutions([timeTrigger(name: "morning_brief", hour: 8, objective: "Read calendar")], root: root)
         let clock = MutableClock(localDate(2026, 3, 5, 9, 0))
         let client = makeClient(root: root, now: { clock.now }, workshopRunner: makeEnqueueCapableRunner(root: root))
+        // The WORKSHOP morning_brief seeded above is the subject; the
+        // default-enabled INBOX morning_brief (L5 G2) shares its name and
+        // would double every fired list.
+        _ = try await client.disableInboxTrigger(name: "morning_brief")
 
         // Day 1, 09:00 — due, fires.
         #expect(await client.evaluateAndFire() == ["morning_brief"])
@@ -1378,7 +1390,7 @@ struct PeriodicFireReviewFixSuite {
         // Exactly one card reached the live inbox through the notifier seam.
         #expect(try readLiveInbox(root: root).count == 1)
         // last_fired_at is stamped to the SCHEDULED instant (08:00), not 09:00.
-        let state = readTriggerState(root: root, surface: "inbox")
+        let state = readTriggerState(root: root, surface: "triggers")
         guard case .object(let entry)? = state["morning_brief"],
               case .string(let ts)? = entry["last_fired_at"] else {
             Issue.record("last_fired_at not stamped"); return
@@ -1480,7 +1492,7 @@ struct PeriodicFireReviewFixSuite {
         // (the scheduled instant), NOT 10:00 (wall-clock at fire). A now()-stamp
         // would ALSO block the rewind below, so this assertion is what actually
         // proves Finding 3's fix rather than an incidental pass.
-        let stateAfter = readTriggerState(root: root, surface: "inbox")
+        let stateAfter = readTriggerState(root: root, surface: "triggers")
         guard case .object(let e)? = stateAfter["morning_brief"],
               case .string(let ts)? = e["last_fired_at"] else {
             Issue.record("last_fired_at not stamped"); return
@@ -1590,6 +1602,10 @@ struct PeriodicFireReviewFixSuite {
         ], root: root)
         let clock = MutableClock(localDate(2026, 3, 5, 9, 0))
         let client = makeClient(root: root, now: { clock.now }, workshopRunner: makeEnqueueCapableRunner(root: root))
+        // This test measures the CAP over the four seeded briefs; the
+        // default-enabled inbox morning_brief (L5 G2) would be a fifth due
+        // trigger at 09:00 and skew both tick counts.
+        _ = try await client.disableInboxTrigger(name: "morning_brief")
 
         // Tick 1: cap of 3 fires 3, the 4th is deferred (not claimed).
         let tick1 = await client.evaluateAndFire()
@@ -1626,6 +1642,9 @@ struct PeriodicFireReviewFixSuite {
         ], root: root)
         let clock = MutableClock(localDate(2026, 3, 5, 9, 0))
         let client = makeClient(root: root, now: { clock.now }, workshopRunner: makeEnqueueCapableRunner(root: root))
+        // Keep the default-enabled inbox morning_brief (L5 G2) out of the
+        // ticks — this test's [] assertions are about bad_brief alone.
+        _ = try await client.disableInboxTrigger(name: "morning_brief")
 
         // Tick 1: claimed (occurrence stamped) but fire fails → nothing fired.
         #expect(await client.evaluateAndFire() == [])
@@ -1868,5 +1887,149 @@ struct TriggerVocabularySeamSuite {
         let result = try await makeClient(root: root)
             .fireInboxTrigger(name: "some_other_trigger", isStub: true)
         #expect(result.status == "not_found")
+    }
+}
+
+// MARK: - 2026-08-13 legacy-path migration (inbox/ → triggers/)
+
+@Suite("SwiftNativeTriggerScheduler: legacy inbox/ file migration")
+struct LegacyTriggerFileMigrationSuite {
+    private func legacyConfigPath(_ root: URL) -> URL {
+        root.appendingPathComponent("inbox", isDirectory: true)
+            .appendingPathComponent("trigger_config.json")
+    }
+    private func legacyStatePath(_ root: URL) -> URL {
+        root.appendingPathComponent("inbox", isDirectory: true)
+            .appendingPathComponent("trigger_state.json")
+    }
+    private func newConfigPath(_ root: URL) -> URL {
+        root.appendingPathComponent("triggers", isDirectory: true)
+            .appendingPathComponent("trigger_config.json")
+    }
+    private func newStatePath(_ root: URL) -> URL {
+        root.appendingPathComponent("triggers", isDirectory: true)
+            .appendingPathComponent("trigger_state.json")
+    }
+
+    @Test func firstAccessCopiesLegacyConfigAndStateForward() async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        // Legacy install shape: config + liveness state under <root>/inbox/.
+        try seedInbox([timeTrigger(name: "morning_brief", hour: 8, enabled: false)], root: root)
+        try Data(#"{"morning_brief": {"last_fired_at": "2026-08-13T08:00:11+00:00"}}"#.utf8)
+            .write(to: legacyStatePath(root))
+
+        let listed = try await makeClient(root: root).listInboxTriggers()
+
+        // The seeded row (not built-in defaults) came through — the read
+        // honored the legacy content via the copy-forward.
+        #expect(listed.contains { $0.name == "morning_brief" && $0.enabled == false })
+        // Both files now live at the new home; the legacy pair is left frozen
+        // in place, byte-identical.
+        #expect(FileManager.default.fileExists(atPath: newConfigPath(root).path))
+        #expect(FileManager.default.fileExists(atPath: newStatePath(root).path))
+        #expect(try Data(contentsOf: legacyStatePath(root)) == Data(contentsOf: newStatePath(root)))
+        #expect(try Data(contentsOf: legacyConfigPath(root)) == Data(contentsOf: newConfigPath(root)))
+    }
+
+    @Test func migratedStateSuppressesRefireOfAlreadyFiredOccurrence() async throws {
+        // THE loss this migration exists to prevent: dropping last_fired_at
+        // would re-fire a time trigger that already fired today.
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try seedInbox([timeTrigger(name: "morning_brief", hour: 8)], root: root)
+        let scheduled = localDate(2026, 3, 5, 8, 0)
+        let iso = ISO8601DateFormatter().string(from: scheduled)
+        try Data(#"{"morning_brief": {"last_fired_at": "\#(iso)"}}"#.utf8)
+            .write(to: legacyStatePath(root))
+        let clock = MutableClock(localDate(2026, 3, 5, 9, 0))
+        let client = makeClient(root: root, now: { clock.now })
+        // 09:00 same day, already stamped at the 08:00 occurrence → no fire.
+        #expect(await client.evaluateAndFire() == [])
+    }
+
+    @Test func existingNewFileWinsOverLegacy() async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        // Legacy row says enabled=true; the NEW home already has enabled=false.
+        try seedInbox([timeTrigger(name: "morning_brief", hour: 8, enabled: true)], root: root)
+        try FileManager.default.createDirectory(
+            at: newConfigPath(root).deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let newRow = try JSONValue.array(
+            [timeTrigger(name: "morning_brief", hour: 8, enabled: false)]
+        ).serializedData(pretty: true)
+        try newRow.write(to: newConfigPath(root))
+
+        let listed = try await makeClient(root: root).listInboxTriggers()
+        // No overwrite: the new-home content is authoritative.
+        #expect(listed.contains { $0.name == "morning_brief" && $0.enabled == false })
+        #expect(!listed.contains { $0.name == "morning_brief" && $0.enabled == true })
+    }
+
+    @Test func freshInstallCreatesNoMigrationArtifacts() async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        // No legacy dir at all → defaults served, nothing copied or created.
+        let listed = try await makeClient(root: root).listInboxTriggers()
+        #expect(!listed.isEmpty)   // built-in defaults
+        #expect(!FileManager.default.fileExists(atPath: newConfigPath(root).path))
+        #expect(!FileManager.default.fileExists(atPath: legacyConfigPath(root).path))
+    }
+
+    @Test func failedMigrationFailsClosedWithoutSeedingDefaults() async throws {
+        // gpt-5.5 review BLOCKING (2026-08-13): if the copy-forward fails,
+        // proceeding would let a mutation write built-in defaults to the new
+        // home — after which the exists-check skips the legacy file forever
+        // (config silently replaced, last_fired_at lost → refire). The guarded
+        // entry points must THROW instead, leaving both homes untouched.
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try seedInbox([timeTrigger(name: "morning_brief", hour: 8, enabled: false)], root: root)
+        let legacyBytesBefore = try Data(contentsOf: legacyConfigPath(root))
+        // Block the migration: a FILE named "triggers" makes createDirectory
+        // (and thus the copy) fail deterministically.
+        try Data("not a directory".utf8).write(
+            to: root.appendingPathComponent("triggers", isDirectory: false)
+        )
+
+        let client = makeClient(root: root)
+        await #expect(throws: TriggerSchedulerError.self) {
+            _ = try await client.listInboxTriggers()
+        }
+        await #expect(throws: TriggerSchedulerError.self) {
+            _ = try await client.enableInboxTrigger(name: "morning_brief")
+        }
+        // Nothing was seeded or overwritten anywhere.
+        #expect(try Data(contentsOf: legacyConfigPath(root)) == legacyBytesBefore)
+        #expect(!FileManager.default.fileExists(atPath: newConfigPath(root).path))
+
+        // Repair the blockage → the non-latched migration retries and succeeds.
+        try FileManager.default.removeItem(at: root.appendingPathComponent("triggers"))
+        let listed = try await client.listInboxTriggers()
+        #expect(listed.contains { $0.name == "morning_brief" && $0.enabled == false })
+    }
+
+    @Test func mutationAfterMigrationWritesNewHomeOnly() async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try seedInbox([timeTrigger(name: "morning_brief", hour: 8, enabled: true)], root: root)
+        let legacyBytesBefore = try Data(contentsOf: legacyConfigPath(root))
+
+        let client = makeClient(root: root)
+        _ = try await client.disableInboxTrigger(name: "morning_brief")
+
+        // New home carries the flip; the frozen legacy file is untouched.
+        let rows = try readInboxRaw(root: root)
+        let brief = rows.first {
+            if case .object(let o) = $0, case .string(let n)? = o["name"] { return n == "morning_brief" }
+            return false
+        }
+        if case .object(let o)? = brief {
+            #expect(o["enabled"] == .bool(false))
+        } else {
+            Issue.record("morning_brief row missing from triggers/trigger_config.json")
+        }
+        #expect(try Data(contentsOf: legacyConfigPath(root)) == legacyBytesBefore)
     }
 }

@@ -363,7 +363,17 @@ enum ProviderToolResultProjection {
     static let defaultMaxUTF8Bytes = 32_000
     static let compactMaxUTF8Bytes = 12_000
 
+    /// tool_load carries schemas_added — with the text-compat catalog pinned
+    /// per turn (turn-context-iteration-cache, 2026-08-13) this result is the
+    /// model's ONLY in-turn source of a just-loaded tool's parameters, so it
+    /// must survive projection whole. Budget sized above the full eager
+    /// catalog (~73KB) so no category load can truncate; still a ceiling.
+    static let toolLoadMaxUTF8Bytes = 96_000
+
     static func maxUTF8Bytes(for toolName: String) -> Int {
+        if toolName == "tool_load" {
+            return toolLoadMaxUTF8Bytes
+        }
         if toolName.hasPrefix("github_")
             || toolName == "invoke_codex"
             || toolName == "invoke_claude"
@@ -1306,15 +1316,34 @@ extension SwiftNativeTurnEngine {
     /// task without an actor hop.
     nonisolated func lazyFilteredTurnContext(
         _ ctx: TurnContext,
-        sessionId: String?
+        sessionId: String?,
+        pinnedActiveTools: Set<String>? = nil
     ) async -> TurnContext {
-        let trimmedSession = (sessionId ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        // pinnedActiveTools (2026-08-13, turn-context-iteration-cache): the
+        // text-compat marker lane rebuilds context per tool iteration, and a
+        // fresh ActiveToolsStore read here after a mid-turn `tool_load` grows
+        // the tool catalog INSIDE the stable cache-breakpointed system
+        // segment — byte-diff-proven to kill the Anthropic prefix cache for
+        // the rest of the turn (369k cache-creation tokens on one live turn).
+        // A caller that pins passes its turn-start set: the advertised
+        // catalog stays byte-stable for the whole turn. Dispatchability is
+        // NOT reduced — the lazy dispatch gate re-reads the store per call,
+        // and tool_load's result already carries the loaded schemas
+        // (schemas_added), so the model can use a just-loaded tool
+        // immediately. Callers that need next-iteration list refresh (the
+        // kimi native-tools lane, whose provider tools array is the only way
+        // its model can call a tool) pass nil and keep the store read.
         let active: Set<String>
-        if !trimmedSession.isEmpty {
-            let persisted = await activeToolsStore.load(sessionId: trimmedSession).activeTools
-            active = persisted.union(LLMCallContext.turnActiveTools ?? [])
+        if let pinnedActiveTools {
+            active = pinnedActiveTools.union(LLMCallContext.turnActiveTools ?? [])
         } else {
-            active = LLMCallContext.turnActiveTools ?? []
+            let trimmedSession = (sessionId ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmedSession.isEmpty {
+                let persisted = await activeToolsStore.load(sessionId: trimmedSession).activeTools
+                active = persisted.union(LLMCallContext.turnActiveTools ?? [])
+            } else {
+                active = LLMCallContext.turnActiveTools ?? []
+            }
         }
         return SwiftNativeChatOrchestrationClient.applyLazyToolFilter(
             to: ctx, activeTools: active

@@ -6,6 +6,112 @@ import Testing
 struct ContextSelectionTests {
     private let now = Date(timeIntervalSince1970: 10_000)
 
+    // MARK: - Score-weight seam (selection-score-rebalance)
+
+    /// Every default is a deliberate, evidenced value: the first twelve are
+    /// the literals that lived inline in score() through 2026-08-13;
+    /// messageCoverage = 1.5 shipped from the offline A/B (60 real queries,
+    /// mean pairwise Jaccard 0.324 → 0.242, mandatory sets unchanged — see
+    /// docs/build_plans/selection-score-rebalance.md). Anyone "tuning" a
+    /// default trips this pin and has to bring new A/B numbers.
+    @Test
+    func defaultScoreWeightsMatchTheEvidencedValues() {
+        let w = ContextScoreWeights()
+        #expect(w.lexicalExact == 2.4)
+        #expect(w.tokenOverlap == 1.7)
+        #expect(w.semanticCosine == 1.2)
+        #expect(w.sharedIdentifiers == 1.5)
+        #expect(w.activation == 1.2)
+        #expect(w.authority == 1.0)
+        #expect(w.confidence == 0.8)
+        #expect(w.recency == 0.5)
+        #expect(w.usefulness == 0.7)
+        #expect(w.decay == 0.5)
+        #expect(w.redundancyPenalty == 1.1)
+        #expect(w.characterCostPenaltyCap == 0.35)
+        #expect(w.messageCoverage == 1.5)
+        #expect(w.conflictPenalty == 0.12)
+        #expect(w.diversityNewSourceBonus == 0.14)
+        #expect(w.diversityNewKindBonus == 0.10)
+    }
+
+    /// The weights seam itself must be a pure parameterization: explicit
+    /// weights equal to the historical literals (messageCoverage 0) must
+    /// select IDENTICALLY to the pre-seam selector's behavior, which the
+    /// other pins in this suite still exercise via explicit configs.
+    @Test
+    func explicitHistoricalWeightsReproduceThePreSeamSelector() throws {
+        let atoms = (0..<8).map { i in
+            atom(
+                "cand\(i)",
+                source: "s\(i)",
+                kind: i % 2 == 0 ? .memory : .fact,
+                body: "candidate \(i) discusses topic \(i) and the atlas rollout step \(i)."
+            )
+        }
+        let generation = generation(atoms)
+        let need = signal("what is the atlas rollout status?", generation: generation)
+
+        let historical = ContextScoreWeights(
+            lexicalExact: 2.4, tokenOverlap: 1.7, semanticCosine: 1.2,
+            sharedIdentifiers: 1.5, activation: 1.2, authority: 1.0,
+            confidence: 0.8, recency: 0.5, usefulness: 0.7, decay: 0.5,
+            redundancyPenalty: 1.1, characterCostPenaltyCap: 0.35,
+            messageCoverage: 0
+        )
+        let a = try ContextSelector(
+            configuration: ContextSelectionConfiguration(weights: historical)
+        ).select(need, from: generation)
+        let b = try ContextSelector(
+            configuration: ContextSelectionConfiguration(weights: historical)
+        ).select(need, from: generation)
+
+        // Deterministic under identical config, and the receipt records the
+        // messageCoverage feature even when its weight is zero.
+        #expect(a.selectedItems == b.selectedItems)
+        #expect(a.receipt.candidateScores.contains { $0.features.messageCoverage > 0 })
+    }
+
+    /// With a positive messageCoverage weight, an atom that speaks the CURRENT
+    /// message's vocabulary must outrank an equally-static atom that only
+    /// matches carried context — the un-dilutable signal the rebalance adds.
+    @Test
+    func positiveMessageCoverageWeightLiftsAtomsMatchingTheCurrentMessage() throws {
+        let onMessage = atom(
+            "dentist",
+            source: "mem-a",
+            kind: .memory,
+            body: "dentist appointment downtown rescheduled for thursday morning."
+        )
+        let offMessage = atom(
+            "espresso",
+            source: "mem-b",
+            kind: .memory,
+            body: "espresso grinder moved to the shelf above the sink last week."
+        )
+        let generation = generation([onMessage, offMessage])
+        // Budget only fits ONE atom's body — the winner is the ranking's choice.
+        let need = signal(
+            "when is the dentist appointment?",
+            generation: generation,
+            budget: 80
+        )
+
+        let boosted = try ContextSelector(
+            configuration: ContextSelectionConfiguration(
+                weights: ContextScoreWeights(messageCoverage: 2.5)
+            )
+        ).select(need, from: generation)
+
+        let ids = boosted.selectedItems.map(\.pointer.atomID)
+        #expect(ids.contains(onMessage.draft.id))
+        #expect(!ids.contains(offMessage.draft.id))
+        let features = boosted.receipt.candidateScores.first {
+            $0.atomID == onMessage.draft.id
+        }?.features
+        #expect((features?.messageCoverage ?? 0) > 0)
+    }
+
     @Test
     func mandatoryCoverageIsCompleteAndOrderedAheadOfDynamicContext() throws {
         let identity = atom(

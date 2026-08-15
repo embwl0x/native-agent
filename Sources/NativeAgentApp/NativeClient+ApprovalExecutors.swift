@@ -607,7 +607,15 @@ extension NativeClient {
                 }
             }
             let status = Self.jsonString(result, "status") ?? "succeeded"
-            let preview = approvalResultPreview(result)
+            // W2/W3-FIX-R2 3 — this preview is written into the APPROVAL
+            // RECORD's executedAction and into the chat receipt, and the record
+            // is `remoteResolvable` (it syncs to iOS and is echoed to Telegram).
+            // An `ax_act` result carries `element.value` / `post_state.value` —
+            // the string that was just typed into the field. Redact by tool
+            // before anything persists it.
+            let preview = approvalResultPreview(
+                MacInjectionResultRedaction.redacted(tool: replay.toolName, result: result)
+            )
             try? await annotateApprovalExecution(
                 id: rec.id,
                 executedAction: .object([

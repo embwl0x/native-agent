@@ -7,13 +7,8 @@ import PersistenceCore
 // keep the most-recent representative of each cluster, remove the older
 // siblings. Intentionally protocol-driven so this loop file does not pull
 // MemoryV2 as a module dependency — callers wire a thin adapter that bridges
-// SwiftNativeMemoryRecaller (or whatever recall surface is in flight) to the
+// the live recall surface (SwiftNativeMemoryV2) to the
 // `MemoryConsolidationRecaller` seam defined here.
-//
-// Wiring note: when SwiftNativeMemoryRecaller grows a `list()` accessor over
-// its underlying EmbeddingStore (Phase B+), an adapter type in the wiring
-// layer makes it conform to `MemoryConsolidationRecaller` in a single small
-// extension — no MemoryV2 / Package.swift surgery needed from this file.
 
 /// A single record visible to the consolidation pass.
 public struct ConsolidationCandidate: Sendable, Equatable {
@@ -32,7 +27,7 @@ public struct ConsolidationCandidate: Sendable, Equatable {
 }
 
 /// The minimal recall surface MemoryConsolidationLoop needs. Defined here
-/// instead of as a method on SwiftNativeMemoryRecaller so this module does
+/// instead of on the MemoryV2 recall surface so this module does
 /// not need to import MemoryV2.
 public protocol MemoryConsolidationRecaller: Sendable {
     func listAllForConsolidation() async throws -> [ConsolidationCandidate]

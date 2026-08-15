@@ -151,7 +151,7 @@ public struct AutonomyPromotionLoop: LoopRunner {
             // proposal/apply-receipt card is recorded rather than silently lost.
             FileHandle.standardError.write(Data(
                 "AutonomyPromotionLoop: staging failed: \(error)\n".utf8))
-            return .failed(error: "autonomy promotion staging: \(error.localizedDescription)")
+            return .failed(error: "autonomy promotion staging: \(SwiftNativeLoopScheduler.describeLoopError(error))")
         }
         return .completed(result: "autonomy promotion reconcile/propose completed")
     }

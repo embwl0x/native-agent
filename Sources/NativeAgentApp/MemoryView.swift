@@ -885,6 +885,7 @@ private struct MemoryV2NativeStackPanel: View {
                         }
                         Spacer()
                     }
+                    .togglesDisclosure($showAdvancedDiagnostics)
                 }
             }
         }

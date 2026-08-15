@@ -63,6 +63,12 @@ extension SwiftNativeSecurityCenter {
         // explicitly and pin the shapes via the dedicated profile branches.
         "task_ledger_post",
         "task_ledger_list",
+        // delegation_status (2026-08-11, W2): read-only projection over the
+        // claude/codex wake-job records under ~/.config. No write, no process
+        // spawn, no network — but "status" would otherwise only pick up the
+        // generic safe_read keyword catcher via the unsigned path, so register
+        // it explicitly and pin the shape in the dedicated branch below.
+        "delegation_status",
         // agent-desk chat lane: desk_read is a low-risk read; the nine
         // mutations are medium ledger-class writes into <dataRoot>/desk/ — NOT
         // a Mac filesystem op and NOT a process spawn. Register explicitly so
@@ -406,6 +412,13 @@ extension SwiftNativeSecurityCenter {
             return ToolProfile(capabilities: capabilities, risk: risk)
         }
         if tool == "task_ledger_list" {
+            add("safe_read", .low)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
+        // delegation_status (2026-08-11, W2): pure read of the on-disk wake-job
+        // records. Explicitly NOT notification-tier — nothing leaves the
+        // machine, so the external_send carve-out must not apply to it.
+        if tool == "delegation_status" {
             add("safe_read", .low)
             return ToolProfile(capabilities: capabilities, risk: risk)
         }

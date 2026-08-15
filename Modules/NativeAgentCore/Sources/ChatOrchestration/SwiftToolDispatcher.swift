@@ -165,11 +165,21 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
         includeFullMacFileTools: Bool,
         includeFullMacSystemTools: Bool,
         includeFullMacAppTools: Bool,
+        includeFullMacAccessibilityReadTools: Bool,
+        includeFullMacAccessibilityInjectionTools: Bool,
+        includeActivityQueryTool: Bool,
         requestedNames: Set<String>? = nil
     ) -> [LLMToolSchema] {
         let accessFlags = (includeFullMacFileTools ? 1 : 0)
             | (includeFullMacSystemTools ? 2 : 0)
             | (includeFullMacAppTools ? 4 : 0)
+            | (includeFullMacAccessibilityReadTools ? 8 : 0)
+            | (includeFullMacAccessibilityInjectionTools ? 16 : 0)
+            // W7 — the activity-capture toggle is part of the cache identity.
+            // Without this bit a catalog built while capture was OFF would be
+            // served after the user turned it ON (and vice versa), which is the
+            // exact class of staleness the toggle exists to prevent.
+            | (includeActivityQueryTool ? 32 : 0)
         let key = BuiltInSchemaCacheKey(
             accessFlags: accessFlags,
             requestedNames: requestedNames.map { $0.sorted() }
@@ -186,6 +196,9 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
             includeFullMacFileTools: includeFullMacFileTools,
             includeFullMacSystemTools: includeFullMacSystemTools,
             includeFullMacAppTools: includeFullMacAppTools,
+            includeFullMacAccessibilityReadTools: includeFullMacAccessibilityReadTools,
+            includeFullMacAccessibilityInjectionTools: includeFullMacAccessibilityInjectionTools,
+            includeActivityQueryTool: includeActivityQueryTool,
             requestedNames: requestedNames
         )
 
@@ -207,7 +220,10 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
         var builtIn = cachedBuiltInToolSchemas(
             includeFullMacFileTools: access.fileOpsAllowed,
             includeFullMacSystemTools: access.systemAllowed,
-            includeFullMacAppTools: access.appControlAllowed
+            includeFullMacAppTools: access.appControlAllowed,
+            includeFullMacAccessibilityReadTools: access.accessibilityReadAllowed,
+            includeFullMacAccessibilityInjectionTools: access.accessibilityInjectionAllowed,
+            includeActivityQueryTool: activityCaptureEnabled()
         )
         if FluidContextToolScope.current?.packet.expandablePointers.isEmpty != false {
             builtIn.removeAll { $0.name == "context_expand" }
@@ -237,6 +253,9 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
             includeFullMacFileTools: access.fileOpsAllowed,
             includeFullMacSystemTools: access.systemAllowed,
             includeFullMacAppTools: access.appControlAllowed,
+            includeFullMacAccessibilityReadTools: access.accessibilityReadAllowed,
+            includeFullMacAccessibilityInjectionTools: access.accessibilityInjectionAllowed,
+            includeActivityQueryTool: activityCaptureEnabled(),
             requestedNames: allowed
         )
         if FluidContextToolScope.current?.packet.expandablePointers.isEmpty != false {
@@ -291,6 +310,34 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
         if access.appControlAllowed {
             let existing = Set(names)
             names.append(contentsOf: Self.fullMacAppToolNames.filter { !existing.contains($0) })
+        }
+        // W1b — READ-ONLY accessibility perception. Same category, read tier;
+        // surfaced under its own access flag so a future read/act split moves
+        // this block without touching app control.
+        if access.accessibilityReadAllowed {
+            let existing = Set(names)
+            names.append(contentsOf: Self.fullMacAccessibilityReadToolNames.filter { !existing.contains($0) })
+            // W7 — mac_nudge rides the SAME access signal deliberately: one
+            // bare mouse move needs the accessibility category and an active
+            // Full Mac window, and nothing above that.
+            names.append(contentsOf: Self.fullMacNudgeToolNames.filter { !existing.contains($0) })
+        }
+        // W2/W3 — INJECTION. Same category, act tier. Catalog visibility here
+        // is not authority: dispatch re-checks the category and MacControl
+        // still requires the active Full Mac window AND the approval
+        // attestation before a single event is emitted.
+        if access.accessibilityInjectionAllowed {
+            let existing = Set(names)
+            names.append(contentsOf: Self.fullMacAccessibilityInjectionToolNames.filter { !existing.contains($0) })
+        }
+        // W7 — activity_query surfaces ONLY when the Trust Center capture
+        // toggle is on. Catalog and dispatch must agree: advertising a tool
+        // whose every call refuses teaches the model to keep trying it, and
+        // advertising it at all when capture is off would tell the model this
+        // Mac records activity when it does not.
+        if activityCaptureEnabled() {
+            let existing = Set(names)
+            names.append(contentsOf: Self.activityQueryToolNames.filter { !existing.contains($0) })
         }
         // Surface configured MCP servers' tools under the bridged
         // `mcp__<server>__<tool>` convention. Dispatch for these names routes
@@ -347,6 +394,10 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
         .union(fullMacFileToolNames)
         .union(fullMacSystemToolNames)
         .union(fullMacAppToolNames)
+        .union(fullMacAccessibilityReadToolNames)
+        .union(fullMacNudgeToolNames)
+        .union(activityQueryToolNames)
+        .union(fullMacAccessibilityInjectionToolNames)
         .union(fullMacBuilderToolNames)
         .union(fullMacRestartToolNames)
         .union(fullMacEvolutionToolNames)

@@ -39,7 +39,12 @@ struct SchedulerFireNowAuditTests {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let client = SwiftNativeTriggerScheduler(root: root)
-        // Default inbox configs include enabled rows (e.g. mission_followup).
+        // morning_brief is default-enabled AND time-conditioned (L5 G2) — on a
+        // real wall clock past 08:00 it fires legitimately, which is not what
+        // this guard measures. Exclude it; the guard is about triggers with NO
+        // ported due-condition.
+        _ = try await client.disableInboxTrigger(name: "morning_brief")
+        // Default inbox configs include enabled rows (e.g. execution_followup).
         let enabledBefore = (try await client.listInboxTriggers()).filter(\.enabled)
         #expect(!enabledBefore.isEmpty, "test needs at least one enabled default trigger")
         let fired = await client.evaluateAndFire()

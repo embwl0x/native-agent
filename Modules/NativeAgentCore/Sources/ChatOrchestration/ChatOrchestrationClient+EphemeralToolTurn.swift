@@ -94,7 +94,11 @@ extension SwiftNativeChatOrchestrationClient {
                 securityCenter: SwiftNativeSecurityCenter(dataRoot: dataRoot),
                 hasFiler: approvalFiler != nil,
                 approvalTimeoutSeconds: approvalTimeoutSeconds,
-                verifiedSessionId: verifiedSessionId
+                verifiedSessionId: verifiedSessionId,
+                // W2/W3-FIX-R2 1 — same inbox-backed injection approval check
+                // as the ordinary chat chain; a narrower resolver must not mean
+                // a weaker approval root.
+                injectionApprovalVerifier: ApprovalInboxInjectionApprovalVerifier(dataRoot: dataRoot)
             )
             gated = ChatToolDispatchTracer(inner: autonomyGated, dataRoot: dataRoot)
         } else {

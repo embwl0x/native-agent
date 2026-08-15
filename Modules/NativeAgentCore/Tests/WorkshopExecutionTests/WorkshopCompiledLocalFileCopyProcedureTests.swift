@@ -39,6 +39,57 @@ struct WorkshopCompiledLocalFileCopyProcedureTests {
         ))
     }
 
+    @Test("persisted contract identities are pinned wire values")
+    func contractIdentitiesArePinnedWireValues() throws {
+        // WIRE FENCE. These digests are persisted inside installed
+        // ProcedureArtifactStore artifacts and exact-activation pointers on
+        // live installs. If this test fails, the code no longer reproduces the
+        // identities that already-approved on-disk artifacts carry, and every
+        // live install's compiled local-file-copy preflight breaks with
+        // artifactShapeMismatch until re-review/re-activation. A deliberate
+        // semantic change must mint a NEW identity + activation, not mutate
+        // these values in place.
+        //
+        // Regression anchor (2026-08-05): an unannotated interpolating closure
+        // in `procedureContractProjection` type-inferred to GRDB's `SQL`
+        // (transitively visible via MemoryV2), hashing an unstable debug
+        // description that embedded a per-process address — identities became
+        // nondeterministic and every preflight failed against the stored
+        // artifact. Self-consistent tests (fresh artifact vs fresh contract)
+        // could not see it; only these pinned constants can.
+        let fixture = try makeFixture("identity-pins")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let planner = try WorkshopCompiledLocalFileCopyPlanner(
+            artifact: try makeFileCopyArtifact(),
+            workspaceRoot: fixture.workspace,
+            sourceRelativePath: "source.txt",
+            destinationRelativePath: "output.txt"
+        )
+        #expect(planner.contract.taskFamily == "workshop.routine")
+        #expect(planner.contract.inputClass == "manual")
+        #expect(planner.contract.parameterSchemaClass == "typed_step_arguments_v1")
+        #expect(planner.contract.authorityClass == "low_risk")
+        #expect(planner.contract.externalEffectClasses
+            == ["local_control", "local_read", "local_write"])
+        #expect(planner.contract.procedureShapeIdentity
+            == "d8623f6ec1d2ad4eed738f99b33ed0ea9119785318987d44b80aaa9f343c8938")
+        #expect(planner.contract.parameterSchemaIdentity
+            == "6aecd17e49040356f3f2892d9e52ecb31f9ecd99b100003d8dab3a07a231c0d1")
+        #expect(WorkshopCompiledLocalFileCopyPlanner.implementationIdentity
+            == "6ebfe918402583a5c282f4b8f4744f2f000ee9ad9095221dbec5fa6acf575d3f")
+        // Determinism guard: the same synthetic plan must project the same
+        // identity within one process (the 2026-08-05 defect varied even
+        // run-to-run because the hashed value embedded a runtime address).
+        let second = try WorkshopCompiledLocalFileCopyPlanner(
+            artifact: try makeFileCopyArtifact(),
+            workspaceRoot: fixture.workspace,
+            sourceRelativePath: "source.txt",
+            destinationRelativePath: "output.txt"
+        )
+        #expect(second.contract.procedureShapeIdentity
+            == planner.contract.procedureShapeIdentity)
+    }
+
     @Test("workspace traversal and oversized inputs fail before Workshop submission")
     func inputBoundary() throws {
         let fixture = try makeFixture("input-boundary")

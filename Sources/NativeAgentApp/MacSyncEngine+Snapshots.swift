@@ -102,7 +102,7 @@ enum MobileToolCatalogProjection {
 extension MacSyncEngine {
     // MARK: - Snapshot writer
     // 2026-05-09 / 2026-05-31: raw snapshot bytes flow through
-    // NativeClient.getRawSnapshotData(path:) — bypasses Codable decode for
+    // NativeClient.trustSnapshotData() — bypasses Codable decode for
     // endpoints whose typed Mac models have non-optional fields with default
     // values that the daemon doesn't emit (developerMode etc). iOS decodes
     // the raw JSON with lenient, fully-optional structs so the failure mode
@@ -265,7 +265,7 @@ extension MacSyncEngine {
             // which Codable still requires — daemon doesn't send it, decode
             // silently fails, file never written).  Pipe raw daemon bytes
             // directly: iOS decodes with its own lenient struct.
-            async let trustData = api.getRawSnapshotData(path: "/v1/trust")
+            async let trustData = api.trustSnapshotData()
             // R25 (2026-07-02): personality now has a native loader —
             // NativeClient.getPersonality() returns the SHARED PersonalityProfile
             // iOS decodes, so the daemon-era `{}` stub is gone. Nil-skip on

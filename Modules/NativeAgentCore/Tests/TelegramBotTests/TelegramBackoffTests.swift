@@ -174,6 +174,9 @@ struct TelegramBackoffPollLoopTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: "TKN123",
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             session: session,
             dataRoot: root,
             offsetURL: offsetURL,
@@ -274,6 +277,9 @@ struct TelegramBackoffPollLoopTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: "TKN123",
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             session: session,
             dataRoot: root,
             offsetURL: offsetURL,

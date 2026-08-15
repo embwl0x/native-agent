@@ -73,6 +73,22 @@ extension SwiftToolDispatcher {
         let lockedBuilderTools = swiftBuilderTools.filter { !names.contains($0) }
         let availableAppTools = Self.fullMacAppToolNames.sorted().filter { names.contains($0) }
         let lockedAppTools = Self.fullMacAppToolNames.sorted().filter { !names.contains($0) }
+        let axReadTools = Self.fullMacAccessibilityReadToolNames.sorted()
+        let availableAXReadTools = axReadTools.filter { names.contains($0) }
+        let lockedAXReadTools = axReadTools.filter { !names.contains($0) }
+        let nudgeTools = Self.fullMacNudgeToolNames.sorted()
+        let availableNudgeTools = nudgeTools.filter { names.contains($0) }
+        let lockedNudgeTools = nudgeTools.filter { !names.contains($0) }
+        // W7 — activity_query. Reported in the discovery surface like every
+        // other gated group, so a model that cannot see the tool can find out
+        // WHY (the Trust Center capture toggle is off) instead of concluding
+        // the capability does not exist.
+        let activityTools = Self.activityQueryToolNames.sorted()
+        let availableActivityTools = activityTools.filter { names.contains($0) }
+        let lockedActivityTools = activityTools.filter { !names.contains($0) }
+        let axActTools = Self.fullMacAccessibilityInjectionToolNames.sorted()
+        let availableAXActTools = axActTools.filter { names.contains($0) }
+        let lockedAXActTools = axActTools.filter { !names.contains($0) }
         let groupIndex = ToolPreloadHeuristics.groupIndex(
             availableToolNames: Set(names)
         )
@@ -126,6 +142,22 @@ extension SwiftToolDispatcher {
             "trusted_workspace_roots": .array(trustedRoots.map { .string($0.path) }),
             "mac_app_available_tools": .array(availableAppTools.map { .string($0) }),
             "mac_app_policy_locked_tools": .array(lockedAppTools.map { .string($0) }),
+            // W1b — read-only AX perception, listed separately from app control
+            // so the discovery surface does not label reads "app control".
+            "mac_accessibility_read_available_tools": .array(availableAXReadTools.map { .string($0) }),
+            "mac_accessibility_read_policy_locked_tools": .array(lockedAXReadTools.map { .string($0) }),
+            // W7 — mac_nudge, listed apart from both again: it posts an event
+            // (so it is not a read) but only a bare move (so it is not an act
+            // the way the four below are), and the discovery surface should
+            // say so rather than let it borrow either label.
+            "mac_nudge_available_tools": .array(availableNudgeTools.map { .string($0) }),
+            "mac_nudge_policy_locked_tools": .array(lockedNudgeTools.map { .string($0) }),
+            // W2/W3 — listed apart from BOTH the reads and app control, so the
+            // discovery surface never lets an injection tool look like a read.
+            "activity_available_tools": .array(availableActivityTools.map { .string($0) }),
+            "activity_policy_locked_tools": .array(lockedActivityTools.map { .string($0) }),
+            "mac_accessibility_act_available_tools": .array(availableAXActTools.map { .string($0) }),
+            "mac_accessibility_act_policy_locked_tools": .array(lockedAXActTools.map { .string($0) }),
             "currently_loaded": .array(currentlyLoaded.map { .string($0) }),
             "turn_active_tools": .array(turnScoped.sorted().map { .string($0) }),
             "discovery_only_tools": .array(discoveryOnly.map { .string($0) }),

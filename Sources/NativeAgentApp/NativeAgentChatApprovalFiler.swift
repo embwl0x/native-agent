@@ -1,6 +1,7 @@
 import Foundation
 import ApprovalInbox
 import ChatOrchestration
+import MacControl
 import NativeAgentCore
 import PersistenceCore
 
@@ -23,6 +24,12 @@ actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
         payload: JSONValue,
         reason: String
     ) async throws -> String {
+        // W2/W3-FIX 4 (defense in depth): redact secret-bearing injection
+        // arguments HERE too, not only in AutonomyGatedDispatcher. This record
+        // is `remoteResolvable` — it syncs to iOS and is echoed into chat — so
+        // the boundary that writes it owns its own redaction rather than
+        // trusting every present and future caller to have redacted first.
+        let payload = MacInjectionArgRedaction.redactedPayload(tool: toolName, payload: payload)
         let route = ChatToolSessionContext.replyRoute
         let origin: JSONValue = .object([
             "sessionId": Self.nonEmptyStringValue(ChatToolSessionContext.verifiedSessionId),

@@ -14,17 +14,25 @@ public struct CognitiveSubstrateDependencies: Sendable {
     /// of this state; the sink receives a bounded immutable projection after a
     /// mutation so turn preparation never has to enter this actor.
     public var attentionProjectionSink: @Sendable (CognitiveAttentionSignals?, Date) -> Void
+    /// W4/P1 — the felt layer's dynamics constants as CONFIGURATION rather than
+    /// compile-time literals, resolved the same way `now()`/`userName()` are.
+    /// A closure rather than a stored value so a persona recompile can change the
+    /// physics without rebuilding the substrate actor. Defaults to
+    /// `.default`, which is byte-for-byte the pre-P1 literals.
+    public var dynamics: @Sendable () -> PersonalityDynamicsConfiguration
 
     public init(
         now: @escaping @Sendable () -> Date = { Date() },
         makeUUID: @escaping @Sendable () -> UUID = { UUID() },
         userName: @escaping @Sendable () -> String = { "" },
-        attentionProjectionSink: @escaping @Sendable (CognitiveAttentionSignals?, Date) -> Void = { _, _ in }
+        attentionProjectionSink: @escaping @Sendable (CognitiveAttentionSignals?, Date) -> Void = { _, _ in },
+        dynamics: @escaping @Sendable () -> PersonalityDynamicsConfiguration = { .default }
     ) {
         self.now = now
         self.makeUUID = makeUUID
         self.userName = userName
         self.attentionProjectionSink = attentionProjectionSink
+        self.dynamics = dynamics
     }
 
     public static let live = CognitiveSubstrateDependencies()
@@ -236,6 +244,112 @@ public actor CognitiveSubstrate {
     /// How long a completion stays open to being re-felt. Past this the next
     /// message is a new beginning, not a verdict on the last thing she said.
     static let pendingCompletionMaxAge: TimeInterval = 10 * 60
+
+    /// W7/P10 — THE LANDING SIGNAL. The echo used to select exemplars by the
+    /// room's temperature and nothing else; the comment above `soundEchoLine`
+    /// is explicit that warmth on her turn is the room at encode, not proof the
+    /// line landed. `pendingCompletion` + `conversationalAppraisal` were already
+    /// built; this is the one number they were missing.
+    ///
+    /// Bounded −1…1, memory-only (a verdict that crosses a relaunch isn't a
+    /// verdict), and keyed by node id so the echo's ranking can read it directly.
+    /// Cleanup is `pruneLandingScores`: entries whose node has left the field are
+    /// dropped, and the newest `landingScoreCapacity` survive a prune.
+    private var landingScores: [UUID: (score: Double, at: Date)] = [:]
+    static let landingScoreCapacity = 256
+
+    /// W7/P5 — consecutive negative-register echoes. See
+    /// `soundEchoNegativeRunLimit`. Memory-only and live-path only.
+    var negativeSoundEchoRun = 0
+
+    /// W7/P6 — TELEMETRY ONLY. The delivery envelope the mechanism WOULD have
+    /// chosen for this turn, stashed at live capsule compile (the one place the
+    /// real felt signals and the real user-turn size are both in hand) and paired
+    /// with the actual reply length when the completion lands. Nothing reads it
+    /// to shape a reply, and no flag exists that could make it do so.
+    ///
+    /// Single slot, overwritten every live compile, consumed on log, dropped on
+    /// `clear()` — the same lifecycle discipline as `pendingCompletion`.
+    var pendingDeliveryEnvelope: PendingDeliveryEnvelope?
+
+    /// The data root this substrate's store lives under, or nil when there is no
+    /// store. `store.databaseURL` is `<dataRoot>/cognition/cognition.sqlite`, so
+    /// the root is two levels up. Deriving it here rather than defaulting to
+    /// `PersistenceCore.defaultDataRoot()` is what keeps every W7 telemetry write
+    /// hermetic: a store-less test substrate simply has nowhere to write.
+    var storeDataRoot: URL? {
+        store?.databaseURL
+            .deletingLastPathComponent()   // …/cognition/
+            .deletingLastPathComponent()   // …/<dataRoot>/
+    }
+
+    /// W7/P10 — the bounded landing verdict for one exemplar node, 0 when the
+    /// node has never been reacted to.
+    func landingScore(forNodeId id: UUID) -> Double {
+        landingScores[id]?.score ?? 0
+    }
+
+    /// Stamp a bounded landing verdict on the node a completion produced.
+    func stampLandingScore(_ score: Double, forNodeId id: UUID, at now: Date) {
+        let bounded = Self.clampSigned(score)
+        if bounded == 0 {
+            // Neutral is NO evidence on a never-stamped node ("the file is at
+            // line 40" says nothing about whether the exemplar landed). But on
+            // a node that already carries a verdict it IS evidence — the
+            // latest completion landed flat, and the stale bias must not keep
+            // re-ranking echoes forever (gpt-5.5 SHOULD-FIX, 2026-08-11).
+            if landingScores[id] != nil { landingScores[id] = (0, now) }
+            return
+        }
+        landingScores[id] = (bounded, now)
+        pruneLandingScores()
+    }
+
+    /// STATE LIFECYCLE. Every add above has its removal here: a landing verdict
+    /// outlives its node only until the next stamp, and the dict can never grow
+    /// past `landingScoreCapacity` no matter how long the process runs.
+    private func pruneLandingScores() {
+        let liveIds = Set(field.peekNodes().map(\.id))
+        landingScores = landingScores.filter { liveIds.contains($0.key) }
+        guard landingScores.count > Self.landingScoreCapacity else { return }
+        let keep = landingScores
+            .sorted { $0.value.at > $1.value.at }
+            .prefix(Self.landingScoreCapacity)
+        landingScores = Dictionary(uniqueKeysWithValues: keep.map { ($0.key, $0.value) })
+    }
+
+    /// W4/P1 — the live dynamics constants. Every felt-layer read goes through
+    /// here rather than a `static let`, so a persona's numbers can drive its
+    /// physics. `.default` reproduces the pre-P1 literals exactly.
+    var dynamics: PersonalityDynamicsConfiguration { dependencies.dynamics() }
+
+    /// W4/P4 — suppress-when-unchanged state for the fingerprint line. An
+    /// identical "How you feel: warm" for forty consecutive turns is a stuck
+    /// gauge and the model will express it, so a family that has not moved for
+    /// `fingerprintFamilyRepeatLimit` capsules goes quiet until the family
+    /// changes or `fingerprintSuppressionWindow` expires.
+    ///
+    /// LIVE-PATH ONLY. `compileFrozenCapsule` is a pure rendering of a captured
+    /// read and must never advance this run (its own doc comment already
+    /// promised "no suppress-when-unchanged mutation").
+    struct FingerprintFamilyRun: Sendable, Equatable {
+        var family: String
+        /// Consecutive capsules that reported this family, including suppressed ones.
+        var count: Int
+        /// When the line last actually SURFACED — the anchor the suppression
+        /// window expires from.
+        var lastSurfacedAt: Date
+    }
+    var fingerprintFamilyRun: FingerprintFamilyRun?
+
+    /// W4/P7 — when a live capsule was last compiled. The gap between this and
+    /// now is what makes a turn "the first turn after a gap"; nothing else in the
+    /// felt layer knows a gap occurred at all. Memory-only: a bridge that fires
+    /// because the app restarted is a bug, not continuity.
+    var lastLiveCapsuleAt: Date?
+    /// The gap the session bridge last spoke for, so one gap yields at most one
+    /// bridge line even if the first turn's capsule is recompiled.
+    var lastSessionBridgeAt: Date?
 
     /// How the agent names the user in her inner voice — resolved from the
     /// configured persona, never hardcoded. Falls back to grammar-safe "you".
@@ -489,6 +603,12 @@ public actor CognitiveSubstrate {
         ablations.removeAll(keepingCapacity: false)
         verificationNodeMayExist = false
         pendingCompletion = nil
+        // W7: the three memory-only slots this wave added clear with the field
+        // they describe — a landing verdict, an echo run, or a delivery envelope
+        // that survived a wipe would be describing nodes that no longer exist.
+        landingScores.removeAll(keepingCapacity: false)
+        negativeSoundEchoRun = 0
+        pendingDeliveryEnvelope = nil
         dirtySince = nil
         lastUserPresenceAt = nil
         lastWarmPresenceAt = nil
@@ -2257,6 +2377,19 @@ public actor CognitiveSubstrate {
             // If a caller ever reverts to per-session subjects, the user turn's own
             // stamp already landed on this node and re-stamping would blend it twice.
             let reactsToItself = outcome?.key == pending.nodeKey
+            // W7/P10 — the same reaction, read a second way. The emotion blend
+            // below asks "how did that turn FEEL in hindsight"; this asks "did
+            // that phrasing LAND", and the echo's ranking is the only consumer.
+            // Same appraisal, same classes, NO new lexicon — praise / enthusiasm
+            // / resolution / affection carry positive valence, dismissal and
+            // criticism carry negative, everything else is exactly zero and
+            // stamps nothing.
+            if !reactsToItself, let landedNode = field.node(forKey: pending.nodeKey) {
+                stampLandingScore(
+                    Self.landingScore(fromReactionValence: reaction),
+                    forNodeId: landedNode.id,
+                    at: now)
+            }
             if reaction != 0, !reactsToItself, let current = field.storedEmotionTag(forKey: pending.nodeKey) {
                 field.stampEmotionTag(
                     key: pending.nodeKey,
@@ -2276,6 +2409,16 @@ public actor CognitiveSubstrate {
                 nodeKey: outcome.key,
                 recordedAt: now,
                 sessionId: event.sessionId
+            )
+            // W7/P6 — TELEMETRY ONLY. The completion is the first moment the
+            // ACTUAL reply length exists, so this is where the envelope stashed
+            // at capsule compile gets paired with what really happened. It writes
+            // a JSONL row and returns; nothing here reads the envelope back into
+            // the turn, and no flag exists that could.
+            consumeDeliveryEnvelopeTelemetry(
+                replyCharacters: event.summary.count,
+                sessionId: event.sessionId,
+                at: now
             )
         }
     }

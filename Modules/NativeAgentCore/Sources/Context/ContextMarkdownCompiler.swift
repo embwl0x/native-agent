@@ -96,7 +96,24 @@ public struct ContextMarkdownCompiler: Sendable {
     /// compiler change alters the ATOMS produced for identical input bytes —
     /// otherwise the coordinator's hash-gated store update drops the new shape
     /// forever. v2 = per-fact USER.md autogen atomization (2026-07-25).
-    static let compilerFormatVersion = "2"
+    /// v3 = autogen marker comments no longer emit atoms (2026-08-13): the two
+    /// pure-HTML-comment paragraphs compiled to adaptive candidates whose
+    /// static priors ranked #1-2 of the whole store — noise competing for
+    /// packet slots.
+    static let compilerFormatVersion = "3"
+
+    /// True when a parsed block's body is exactly one autogen marker comment
+    /// (modulo surrounding whitespace). Such blocks are structural delimiters
+    /// owned by `UserMDAutogenMarkers`; they must never become atoms.
+    /// Internal (not in the private parsing extension) so the atomization
+    /// tests can pin the contract via @testable import.
+    static func isAutogenMarkerBlock(_ body: String) -> Bool {
+        let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed == UserMDAutogenMarkers.bodyStart
+            || trimmed == UserMDAutogenMarkers.bodyEnd
+            || trimmed == UserMDAutogenMarkers.preambleStart
+            || trimmed == UserMDAutogenMarkers.preambleEnd
+    }
     private let embeddingProvider: any ContextMarkdownEmbeddingProvider
     public let limits: ContextMarkdownCompilerLimits
 
@@ -464,6 +481,10 @@ private extension ContextMarkdownCompiler {
                 guard let body = String(data: bodyData, encoding: .utf8) else {
                     throw ContextMarkdownCompilerError.malformedUTF8
                 }
+                // Autogen marker comments are cut boundaries, not content —
+                // as atoms they carried near-top static priors (tiny body →
+                // ~zero cost penalty) while saying nothing. Never emit them.
+                if Self.isAutogenMarkerBlock(body) { continue }
                 guard bodyData.count <= limits.maxAtomUTF8Bytes else {
                     throw ContextMarkdownCompilerError.atomTooLarge(
                         index: blocks.count,

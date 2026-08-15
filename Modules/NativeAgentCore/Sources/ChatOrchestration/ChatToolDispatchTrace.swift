@@ -1,4 +1,5 @@
 import Foundation
+import MacControl
 import MCPDispatcher
 import NativeAgentCore
 import PersistenceCore
@@ -303,10 +304,34 @@ final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Sendable {
             "phase": .string(phase),
             "status": .string(status),
             "argKeys": .array(input.keys.sorted().map { .string($0) }),
-            "args": .string(Self.truncatePreview(.object(input))),
+            // W2/W3-FIX 4: truncation is not redaction. `mac_keystroke.text`
+            // is the literal characters about to be typed and is well under
+            // the 500-char preview cap, so the raw secret rode intact onto the
+            // TurnTrace bus and into the Inspector. Secret-bearing args are
+            // replaced by count + digest BEFORE the preview is built.
+            "args": .string(Self.truncatePreview(
+                .object(MacInjectionArgRedaction.redacted(tool: tool, input: input))
+            )),
         ]
         if let durationMs { payload["durationMs"] = .int(Int64(durationMs)) }
-        if let result { payload["result"] = .string(Self.truncatePreview(result)) }
+        if let result {
+            // W2/W3-FIX-R2 3: redacting the ARGS was half the job. `ax_act`
+            // re-reads the element it wrote and returns `element.value` +
+            // `post_state.value`, so a password set into a field came back out
+            // through the RESULT preview — the same bus, the same Inspector,
+            // the same 500-char cap that never truncates a short secret.
+            // W3.5-FIX 3 — `mac_view` returns a base64 screenshot of whatever
+            // was on screen. The injection redactor above only knows about
+            // secret-shaped VALUES, so the picture rode into the bus payload
+            // (and from there the Inspector) intact. The full image still goes
+            // to the live model call; only this preview loses the pixels.
+            payload["result"] = .string(Self.truncatePreview(
+                MacInjectionResultRedaction.redacted(
+                    tool: tool,
+                    result: MacScreenViewResultRedaction.redacted(tool: tool, result: result)
+                )
+            ))
+        }
         TurnTraceBus.fireFromContext(
             kind: "tool.dispatch",
             sessionId: traceSessionID(input),

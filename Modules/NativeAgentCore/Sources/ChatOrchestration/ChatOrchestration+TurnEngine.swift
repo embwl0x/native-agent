@@ -55,7 +55,7 @@ func memoryRecallPersonaFilter(_ slotID: String?) -> String? {
 //
 // This module wires together the Swift pieces needed to assemble a turn:
 //   - PersonaEngine.listPersonaDocs()           — persona doc surface
-//   - SwiftNativeMemoryRecaller.recall()        — embedding-backed recall
+//   - MemoryRecalling.recall()                  — memory recall boundary
 //   - ProviderRouting.checkedRoutingSnapshot()  — one per-turn route admission
 //   - TrustCenter.autonomyForTool()             — autonomy resolution
 //   - LLMClient                                 — the LLM call boundary
@@ -152,8 +152,6 @@ public extension MemoryRecalling {
     func recordServedContextHits(ids: [String]) async {}
 }
 
-extension SwiftNativeMemoryRecaller: MemoryRecalling {}
-
 // MARK: - MemoryPromoting
 //
 // After-turn hook for adaptive memory promotion. The real implementation
@@ -216,46 +214,6 @@ struct TurnRouteAdmission: Sendable, Equatable {
     let reasoningEffort: String
     let providerId: String?
     let serviceTier: String?
-}
-
-// MARK: - MockToolDispatchClient
-
-/// Scripted-response mock. Tracks every dispatch behind an NSLock so it can be
-/// shared across async tasks. Returns `.null` for any tool name not in the
-/// scripted map. `listAvailableTools` returns the script keys in sorted order.
-public final class MockToolDispatchClient: ToolDispatchClient, @unchecked Sendable {
-    public struct Dispatch: Sendable, Equatable {
-        public let tool: String
-        public let input: [String: JSONValue]
-        public let surface: String
-    }
-
-    private let scripted: [String: JSONValue]
-    private let lock = NSLock()
-    private var _dispatches: [Dispatch] = []
-
-    public init(scripted: [String: JSONValue] = [:]) {
-        self.scripted = scripted
-    }
-
-    public var dispatches: [Dispatch] {
-        lock.lock(); defer { lock.unlock() }
-        return _dispatches
-    }
-
-    public func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        recordDispatch(Dispatch(tool: tool, input: input, surface: surface))
-        return scripted[tool] ?? .null
-    }
-
-    private func recordDispatch(_ d: Dispatch) {
-        lock.lock(); defer { lock.unlock() }
-        _dispatches.append(d)
-    }
-
-    public func listAvailableTools() async throws -> [String] {
-        return scripted.keys.sorted()
-    }
 }
 
 // MARK: - TurnContext
@@ -631,7 +589,18 @@ public actor SwiftNativeTurnEngine {
         recallQueryOverride: String? = nil,
         includeClockContext: Bool = true,
         sessionID: String? = nil,
-        recentTurns: [String] = []
+        recentTurns: [String] = [],
+        // The raw user text for RELEVANCE consumers (selection queryText,
+        // memory recall, query embedding) when `userMessage` carries
+        // turn-scoped wire riders — e.g. the text-compat tool-routing hint,
+        // which otherwise makes tool names query vocabulary on every turn.
+        // nil → `userMessage` (byte-identical for callers without riders).
+        // `userMessage` stays the wire/persona-visible turn text.
+        queryUserMessage: String? = nil,
+        // Turn-start instant for the clock line; a multi-iteration tool loop
+        // passes the same value every iteration so the dynamic segment's
+        // time line can't churn the cache mid-turn. nil = clock() per build.
+        clockNowOverride: Date? = nil
     ) async throws -> TurnContext {
         // P2-3, one bridge for the whole turn: fold the surface ONCE here, so
         // every downstream comparison (routing, ContextSurface, autonomy,
@@ -645,12 +614,22 @@ public actor SwiftNativeTurnEngine {
         {
             throw TurnEngineError.emptyMessage
         }
+        // The relevance-facing view of the turn text. A non-nil
+        // queryUserMessage is AUTHORITATIVE even when blank: an
+        // attachment-only turn has no text query, and falling back to the
+        // wire message there would hand the tool-routing hint to the
+        // relevance consumers — the exact pollution this seam removes
+        // (gpt-5.5 review 2026-08-13, NEEDS-FIX #1). Blank relevance text is
+        // safe: beginQueryEmbedding fail-closes on empty input and selection
+        // rides attention terms/entities alone.
+        let queryMessage = queryUserMessage ?? userMessage
+        trace.setCount("contextFlow.queryMessageChars", queryMessage.count)
         // Start the existing MiniLM query lane before the bounded attention
         // read. The ticket is read after that already-required work, and the
         // read is bounded by `queryEmbeddingWarmupWaitNanos` — so semantic
         // recall can add at most that much turn wait, and only when the
         // embedder is still cold.
-        let queryEmbeddingTicket = await contextFlow?.beginQueryEmbedding(userMessage)
+        let queryEmbeddingTicket = await contextFlow?.beginQueryEmbedding(queryMessage)
 
         // Mind-into-circulation: feed Fluid Context's dormant NeedSignal inputs
         // from her current attention BEFORE the request is built. The read is
@@ -701,7 +680,7 @@ public actor SwiftNativeTurnEngine {
         let contextFlowRequest = ContextTurnRequest(
             surface: ContextSurface(rawValue: surface),
             origin: Self.contextOrigin(for: surface),
-            userMessage: userMessage,
+            userMessage: queryMessage,
             personaIDHint: personaOverride,
             sessionID: sessionID,
             recentTurns: recentTurns,
@@ -925,7 +904,7 @@ public actor SwiftNativeTurnEngine {
         } else if let memory {
             let recallQuery = recallQueryOverride?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            let effectiveRecallQuery = (recallQuery?.isEmpty == false) ? recallQuery! : userMessage
+            let effectiveRecallQuery = (recallQuery?.isEmpty == false) ? recallQuery! : queryMessage
             do {
                 recalled = try await memory.recall(
                     effectiveRecallQuery,
@@ -1037,7 +1016,8 @@ public actor SwiftNativeTurnEngine {
         if includeClockContext {
             let runtimeStartNs = DispatchTime.now().uptimeNanoseconds
             finalContext = await contextByAppendingCurrentTurnFacts(
-                baseContext
+                baseContext,
+                clockNowOverride: clockNowOverride
             )
             trace.record("context.clock_runtime", since: runtimeStartNs)
         } else {
@@ -1328,9 +1308,22 @@ public actor SwiftNativeTurnEngine {
     }
 
     func contextByAppendingCurrentTurnFacts(
-        _ context: TurnContext
+        _ context: TurnContext,
+        clockNowOverride: Date? = nil
     ) async -> TurnContext {
-        let withClock = Self.contextByAppendingClockContext(context, now: clock())
+        // Quiet hours are read per turn from the SAME dataRoot the REM pins
+        // come from; nil root (legacy/test callers) → time-and-zone only.
+        let quietHours = remPinsDataRoot.flatMap(TurnQuietHoursWindow.read(dataRoot:))
+        // clockNowOverride (turn-context-iteration-cache follow-up,
+        // 2026-08-13): the clock line renders into the DYNAMIC system
+        // segment, and a multi-iteration tool turn that crosses a minute
+        // boundary re-renders it differently mid-turn — byte-diff-proven
+        // prompt-cache bust (run2 body3→4: "5:59 PM"→"6:00 PM" was the ONLY
+        // changed byte). A tool loop passes its turn-start instant on every
+        // iteration so the turn reads as one moment; nil = per-build clock()
+        // (single-shot turns, unchanged).
+        let withClock = Self.contextByAppendingClockContext(
+            context, now: clockNowOverride ?? clock(), quietHours: quietHours)
         guard let runtimeContext = await renderRuntimeContext(
             surface: withClock.surface,
             modelId: withClock.modelId,
@@ -1596,9 +1589,11 @@ public actor SwiftNativeTurnEngine {
     nonisolated static func segmentsByAppendingClockContext(
         _ segments: SystemPromptSegments,
         now: Date,
-        localTimeZone: TimeZone = .current
+        localTimeZone: TimeZone = .current,
+        quietHours: TurnQuietHoursWindow? = nil
     ) -> SystemPromptSegments {
-        let clockContext = renderClockContext(now: now, localTimeZone: localTimeZone)
+        let clockContext = renderClockContext(
+            now: now, localTimeZone: localTimeZone, quietHours: quietHours)
         guard !clockContext.isEmpty else { return segments }
         let dynamic = segments.dynamic.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? clockContext
@@ -1609,9 +1604,11 @@ public actor SwiftNativeTurnEngine {
     nonisolated static func contextByAppendingClockContext(
         _ context: TurnContext,
         now: Date,
-        localTimeZone: TimeZone = .current
+        localTimeZone: TimeZone = .current,
+        quietHours: TurnQuietHoursWindow? = nil
     ) -> TurnContext {
-        let clockContext = renderClockContext(now: now, localTimeZone: localTimeZone)
+        let clockContext = renderClockContext(
+            now: now, localTimeZone: localTimeZone, quietHours: quietHours)
         guard !clockContext.isEmpty else { return context }
 
         let segments: SystemPromptSegments?
@@ -1620,7 +1617,8 @@ public actor SwiftNativeTurnEngine {
             segments = segmentsByAppendingClockContext(
                 existingSegments,
                 now: now,
-                localTimeZone: localTimeZone
+                localTimeZone: localTimeZone,
+                quietHours: quietHours
             )
             systemPrompt = segments?.combined
         } else {
@@ -1694,14 +1692,36 @@ public actor SwiftNativeTurnEngine {
         )
     }
 
+    /// ONE line, human wall-clock, in the DYNAMIC segment (it changes every
+    /// turn — putting it in the stable segment would churn the cache prefix).
+    ///
+    /// W5 L1#6 "time as a fact": the old rendering was machine-shaped
+    /// (`Wed 2026-06-17 04:31 PDT`) and the model kept mis-reading it —
+    /// calling 9:29 AM "afternoon", inferring sleep from a bare number.
+    /// Weekday name + 12-hour clock with AM/PM is the format a human states
+    /// time in, and the quiet-hours window (when configured) replaces the
+    /// sleep INFERENCE with a stated fact.
     nonisolated static func renderClockContext(
         now: Date,
         localTimeZone: TimeZone = .current,
-        centralTimeZone: TimeZone = TimeZone(identifier: "America/Chicago") ?? TimeZone(secondsFromGMT: -6 * 60 * 60)!
+        centralTimeZone: TimeZone = TimeZone(identifier: "America/Chicago") ?? TimeZone(secondsFromGMT: -6 * 60 * 60)!,
+        quietHours: TurnQuietHoursWindow? = nil
     ) -> String {
         let local = formatClockDate(now, timeZone: localTimeZone)
-        let central = formatClockDate(now, timeZone: centralTimeZone)
-        return "Current time: \(local) (\(localTimeZone.identifier)); Central: \(central) (America/Chicago)."
+        var line = "Local time: \(local) (\(localTimeZone.identifier))."
+        if localTimeZone.identifier != centralTimeZone.identifier {
+            let central = formatClockDate(now, timeZone: centralTimeZone)
+            line += " Central: \(central) (\(centralTimeZone.identifier))."
+        }
+        if let quietHours {
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = localTimeZone
+            let hour = calendar.component(.hour, from: now)
+            let inside = quietHours.contains(hour: hour)
+            line += " Quiet hours: \(formatHour(quietHours.startHour))–\(formatHour(quietHours.endHour))"
+                + " local (right now: \(inside ? "inside" : "outside") that window)."
+        }
+        return line
     }
 
     nonisolated static func renderRuntimeContext(
@@ -1712,12 +1732,21 @@ public actor SwiftNativeTurnEngine {
         "Current runtime: surface=\(surface); provider=\(provider); model=\(model). If asked what model or provider you are using, answer from Current runtime; do not guess."
     }
 
+    /// "Tuesday, August 11, 2026 at 9:29 AM CDT" — weekday and AM/PM spelled
+    /// out so the time-of-day word never has to be inferred from a 24h number.
     private nonisolated static func formatClockDate(_ date: Date, timeZone: TimeZone) -> String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.calendar = Calendar(identifier: .gregorian)
         formatter.timeZone = timeZone
-        formatter.dateFormat = "EEE yyyy-MM-dd HH:mm zzz"
+        formatter.dateFormat = "EEEE, MMMM d, yyyy 'at' h:mm a zzz"
         return formatter.string(from: date)
+    }
+
+    private nonisolated static func formatHour(_ hour: Int) -> String {
+        let normalized = ((hour % 24) + 24) % 24
+        let suffix = normalized < 12 ? "AM" : "PM"
+        let display = normalized % 12 == 0 ? 12 : normalized % 12
+        return "\(display):00 \(suffix)"
     }
 }

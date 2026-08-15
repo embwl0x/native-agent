@@ -925,9 +925,23 @@ extension SwiftNativeMemoryV2 {
         // confidence keeps the max, and the canonical row's id is returned
         // so the auto-accept lane still fires on it. Resolved proposals are
         // untouched — their rows are audit trail.
-        let newContentHash = MemoryStorage.contentHash(content)
+        // 2026-08-14 proposal-hygiene fix: fold articles before hashing so
+        // extractor variants of one fact ("user is a AI assistant" vs "user
+        // is AI assistant") dedupe instead of double-staging. Folding is
+        // LOCAL to this comparison — both sides are folded at compare time
+        // and no folded hash is ever stored, so stored contentHash uses
+        // (KG memory index, kind backfill) are untouched.
+        func dedupKey(_ s: String) -> String {
+            let folded = s.replacingOccurrences(
+                of: #"(?i)\b(?:a|an|the)\s+"#,
+                with: "",
+                options: .regularExpression
+            )
+            return MemoryStorage.contentHash(folded)
+        }
+        let newContentHash = dedupKey(content)
         if let existing = try await storage.listProposals(status: "pending")
-            .first(where: { MemoryStorage.contentHash($0.content) == newContentHash }) {
+            .first(where: { dedupKey($0.content) == newContentHash }) {
             var merged: [String: JSONValue]
             if case .object(let m)? = existing.metadata { merged = m } else { merged = [:] }
             var sessionSet = Set<String>()

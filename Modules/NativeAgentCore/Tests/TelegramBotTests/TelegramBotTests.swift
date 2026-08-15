@@ -481,6 +481,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             bot: SwiftNativeTelegramBot(dataRoot: hermeticTelegramDataRoot()),
             session: session,
             offsetURL: tmp,
@@ -513,6 +516,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             bot: SwiftNativeTelegramBot(dataRoot: root),
             session: session,
             dataRoot: root,
@@ -561,6 +567,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             bot: bot,
             session: session,
             offsetURL: tmp,
@@ -598,6 +607,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             bot: SwiftNativeTelegramBot(dataRoot: hermeticTelegramDataRoot()),
             session: session,
             offsetURL: tmp,
@@ -640,6 +652,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             bot: SwiftNativeTelegramBot(dataRoot: hermeticTelegramDataRoot()),
             session: session,
             offsetURL: tmp,
@@ -691,6 +706,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             bot: SwiftNativeTelegramBot(dataRoot: hermeticTelegramDataRoot()),
             session: session,
             offsetURL: tmp,
@@ -752,6 +770,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             bot: bot,
             session: session,
             offsetURL: tmp,
@@ -816,6 +837,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             bot: bot,
             session: session,
             offsetURL: tmp,
@@ -873,6 +897,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             bot: bot,
             session: session,
             offsetURL: tmp,
@@ -937,6 +964,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             session: session,
             offsetURL: tmp,
             sendMessage: { _, _, text in await capture.send(text) },
@@ -984,6 +1014,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             session: session,
             dataRoot: root,
             offsetURL: offset,
@@ -1026,6 +1059,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             session: session,
             dataRoot: root,
             offsetURL: offset,
@@ -1085,6 +1121,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             session: session,
             dataRoot: root,
             offsetURL: offset,
@@ -1139,6 +1178,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             session: session,
             dataRoot: root,
             offsetURL: offset,
@@ -1188,6 +1230,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             session: session,
             dataRoot: root,
             offsetURL: offset,
@@ -1262,6 +1307,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             session: session,
             dataRoot: root,
             offsetURL: offset,
@@ -1359,6 +1407,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             session: session,
             dataRoot: root,
             offsetURL: offset,
@@ -1432,6 +1483,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             session: session,
             dataRoot: root,
             offsetURL: offset,
@@ -1503,6 +1557,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [1, 5, 9, 77],
             bot: bot,
             session: session,
             offsetURL: tmp,
@@ -1544,6 +1601,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             session: session,
             dataRoot: root,
             offsetURL: offset,
@@ -1598,6 +1658,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             session: session,
             dataRoot: root,
             offsetURL: offset,
@@ -1675,6 +1738,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             session: session,
             dataRoot: root,
             offsetURL: offset,
@@ -1756,6 +1822,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             session: session,
             dataRoot: root,
             offsetURL: offset,
@@ -1807,6 +1876,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             session: session,
             dataRoot: root,
             offsetURL: offset,
@@ -1832,7 +1904,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
         #expect(sent.map { $0.1 } == ["Transcribing voice message", "voice reply"])
         #expect(handlerTexts.count == 1)
         #expect(handlerTexts.first?.contains("[Telegram voice message]") == true)
-        #expect(handlerTexts.first?.contains("hey agent this came from a voice message") == true)
+        #expect(handlerTexts.first?.contains("hey Agent this came from a voice message") == true)
 
         let receipts = try readTelegramJSONL(root, "receipts.jsonl")
         #expect(receipts.count == 2)
@@ -1878,6 +1950,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             session: session,
             dataRoot: root,
             offsetURL: offset,
@@ -1938,6 +2013,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             session: session,
             dataRoot: root,
             offsetURL: offset,
@@ -1988,6 +2066,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             session: session,
             dataRoot: root,
             offsetURL: offset,
@@ -2024,6 +2105,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             session: session,
             dataRoot: root,
             offsetURL: teleDir.appendingPathComponent("last_offset.json"),
@@ -2066,6 +2150,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
+            // fail-closed allowlist (2026-08-13): empty = drop-all, so message-flow
+            // fixtures must allowlist their chat ids explicitly.
+            allowedChatIds: [5, 9, 77],
             bot: SwiftNativeTelegramBot(dataRoot: hermeticTelegramDataRoot()),
             session: session,
             offsetURL: tmp,
@@ -2448,7 +2535,7 @@ struct TelegramPhotoIngestTests {
         let imageBytes = Data("PNGDATA".utf8)
 
         let loop = TelegramPollLoop(
-            interval: 60, token: tokenStr, session: session, dataRoot: root, offsetURL: offset,
+            interval: 60, token: tokenStr, allowedChatIds: [77], session: session, dataRoot: root, offsetURL: offset,
             sendMessage: { _, _, text in await cap.note(text) },
             sendChatAction: { _, _, _ in },
             attachmentChatHandler: { _, text, atts, _, _ in
@@ -2495,7 +2582,7 @@ struct TelegramPhotoIngestTests {
         let cap = Capture()
 
         let loop = TelegramPollLoop(
-            interval: 60, token: tokenStr, session: session, dataRoot: root, offsetURL: offset,
+            interval: 60, token: tokenStr, allowedChatIds: [77], session: session, dataRoot: root, offsetURL: offset,
             sendMessage: { _, _, _ in },
             sendChatAction: { _, _, _ in },
             attachmentChatHandler: { _, text, atts, _, _ in await cap.handler(text, atts); return "ok" },
@@ -2531,7 +2618,7 @@ struct TelegramPhotoIngestTests {
         let cap = Capture()
 
         let loop = TelegramPollLoop(
-            interval: 60, token: tokenStr, session: session, dataRoot: root, offsetURL: offset,
+            interval: 60, token: tokenStr, allowedChatIds: [77], session: session, dataRoot: root, offsetURL: offset,
             sendMessage: { _, _, text in await cap.note(text) },
             sendChatAction: { _, _, _ in },
             attachmentChatHandler: { _, _, _, _, _ in await cap.markHandler(); return "should not run" },
@@ -2583,7 +2670,7 @@ struct TelegramPhotoIngestTests {
         let cap = Capture()
 
         let loop = TelegramPollLoop(
-            interval: 60, token: tokenStr, session: session, dataRoot: root, offsetURL: offset,
+            interval: 60, token: tokenStr, allowedChatIds: [77], session: session, dataRoot: root, offsetURL: offset,
             sendMessage: { _, _, text in await cap.note(text) },
             sendChatAction: { _, _, _ in },
             attachmentChatHandler: { _, _, _, _, _ in "should not run" },
@@ -2629,7 +2716,7 @@ struct TelegramPhotoIngestTests {
         let cap = Capture()
 
         let loop = TelegramPollLoop(
-            interval: 60, token: tokenStr, session: session, dataRoot: root, offsetURL: offset,
+            interval: 60, token: tokenStr, allowedChatIds: [77], session: session, dataRoot: root, offsetURL: offset,
             sendMessage: { _, _, text in await cap.note(text) },
             sendChatAction: { _, _, _ in },
             attachmentChatHandler: { _, _, _, _, _ in "should not run" },
@@ -2654,4 +2741,46 @@ struct TelegramPhotoIngestTests {
         #expect(!notice.contains("AAH-secret_Token123"))
         #expect(notice.contains("couldn't process that image"))
     }
+}
+
+// MARK: - Fail-closed empty allowlist (User directive 2026-08-13)
+
+/// An EMPTY allowlist drops every inbound message before dispatch — the
+/// allowlist is the ONLY perimeter in front of ungated YOLO execution, so
+/// "nothing configured" must mean "nobody gets in", never "everybody does".
+/// The old back-compat (empty = accept all) meant one config wipe silently
+/// opened the front door.
+@Test func telegramPollLoop_emptyAllowlist_failsClosed_dropsAllMessages() async throws {
+    let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("telegram_failclosed_\(UUID().uuidString).json")
+    defer { try? FileManager.default.removeItem(at: tmp) }
+
+    let raw = #"""
+    {"ok":true,"result":[{"update_id":91,"message":{"message_id":1,"chat":{"id":9},"from":{"id":11},"text":"hello","date":1}}]}
+    """#
+    let session = mockSession { req in
+        (makeResponse(req.url!, 200), Data(raw.utf8))
+    }
+    actor Flag { var called = false; func mark() { called = true }; func read() -> Bool { called } }
+    let flag = Flag()
+    let loop = TelegramPollLoop(
+        interval: 60,
+        token: tokenStr,
+        // Deliberately NO allowedChatIds / allowedUserIds: fail-closed path.
+        bot: SwiftNativeTelegramBot(dataRoot: hermeticTelegramDataRoot()),
+        session: session,
+        offsetURL: tmp,
+        sendMessage: { _, _, _ in },
+        chatHandler: { _, _ in
+            await flag.mark()
+            return "reply"
+        }
+    )
+    await loop.tick()
+
+    // The handler must never fire, and the offset still advances so the
+    // dropped update is not re-fetched forever.
+    #expect(await flag.read() == false)
+    let data = try Data(contentsOf: tmp)
+    #expect(String(data: data, encoding: .utf8)?.contains("92") == true)
 }

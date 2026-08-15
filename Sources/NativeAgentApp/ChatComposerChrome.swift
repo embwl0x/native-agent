@@ -199,6 +199,9 @@ struct NextGenActionChipsRow: View {
         let all = appModel.nextGenSummary?.actions ?? []
         return all.filter {
             $0.dryRunAvailable == true && $0.status?.lowercased() != "completed"
+                // W6 fix-round (gpt-5.5 BLOCKING): no chips for ids with no
+                // executor — same rule the Capabilities panel now applies.
+                && NativeClient.isNextGenActionBacked($0.id)
         }
     }
 

@@ -353,6 +353,7 @@ struct MacControlPermissionsView: View {
                         StatusBadge(text: "Unsaved", status: "warn")
                     }
                 }
+                .togglesDisclosure($showAdvancedMacControls)
             }
             .padding(NativeAgentSpacing.lg)
             .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous))

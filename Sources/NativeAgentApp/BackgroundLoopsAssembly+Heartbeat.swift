@@ -692,26 +692,27 @@ extension BackgroundLoopsAssembly {
         let persistence = SwiftNativePersistenceCore()
         do {
             let inserted = try await persistence.withFileLock(inboxPath) { () async throws -> Bool in
-                let rows = try await persistence.tailJSONL(inboxPath, limit: Int.max, maxBytes: nil)
-                guard InboxRewriteGuard.rewriteIsSafe(rows: rows, path: inboxPath) else {
+                let lines = try InboxRewriteGuard.readLines(inboxPath)
+                guard InboxRewriteGuard.rewriteIsSafe(lines: lines, path: inboxPath) else {
                     InboxRewriteGuard.refuse("HeartbeatLoop", path: inboxPath)
                     return false
                 }
-                var mutated: [JSONValue] = []
-                mutated.reserveCapacity(rows.count + 1)
+                var mutated: [Data] = []
+                mutated.reserveCapacity(lines.count + 1)
                 var found = false
-                for row in rows {
-                    guard case .object(let obj) = row,
+                for line in lines {
+                    guard case .object(let obj)? = line.row,
                           case .string(let id)? = obj["id"],
                           id == cardId else {
-                        mutated.append(row)
+                        // Other rows AND undecodable lines: verbatim.
+                        mutated.append(line.raw)
                         continue
                     }
-                    mutated.append(card)
+                    mutated.append(Data(try card.serialize(pretty: false).utf8))
                     found = true
                 }
-                if !found { mutated.append(card) }
-                try writeHeartbeatJSONLRows(mutated, to: inboxPath)
+                if !found { mutated.append(Data(try card.serialize(pretty: false).utf8)) }
+                try InboxRewriteGuard.writeLines(mutated, to: inboxPath)
                 return !found
             }
             if inserted {
@@ -740,18 +741,19 @@ extension BackgroundLoopsAssembly {
         let now = heartbeatISO(Date())
         do {
             try await persistence.withFileLock(inboxPath) { () async throws -> Void in
-                let rows = try await persistence.tailJSONL(inboxPath, limit: Int.max, maxBytes: nil)
-                guard !rows.isEmpty else { return }
+                let lines = try InboxRewriteGuard.readLines(inboxPath)
+                guard !lines.isEmpty else { return }
                 var changed = false
-                var mutated: [JSONValue] = []
-                mutated.reserveCapacity(rows.count)
-                for row in rows {
-                    guard case .object(var obj) = row,
+                var mutated: [Data] = []
+                mutated.reserveCapacity(lines.count)
+                for line in lines {
+                    guard case .object(var obj)? = line.row,
                           case .string(let source)? = obj["source"],
                           source == "heartbeat",
                           case .string(let id)? = obj["id"],
                           id.hasPrefix("heartbeat-") else {
-                        mutated.append(row)
+                        // Other rows AND undecodable lines: verbatim.
+                        mutated.append(line.raw)
                         continue
                     }
                     let conditionID: String
@@ -761,7 +763,7 @@ extension BackgroundLoopsAssembly {
                         conditionID = String(id.dropFirst("heartbeat-".count))
                     }
                     if activeConditionIDs.contains(conditionID) {
-                        mutated.append(row)
+                        mutated.append(line.raw)
                         continue
                     }
                     let status: String
@@ -771,16 +773,16 @@ extension BackgroundLoopsAssembly {
                         status = "unread"
                     }
                     if status == "archived" || status == "dismissed" {
-                        mutated.append(row)
+                        mutated.append(line.raw)
                         continue
                     }
                     obj["status"] = .string("archived")
                     obj["read_at"] = .string(now)
-                    mutated.append(.object(obj))
+                    mutated.append(Data(try JSONValue.object(obj).serialize(pretty: false).utf8))
                     changed = true
                 }
                 guard changed else { return }
-                try writeHeartbeatJSONLRows(mutated, to: inboxPath)
+                try InboxRewriteGuard.writeLines(mutated, to: inboxPath)
             }
         } catch {
             FileHandle.standardError.write(Data(
@@ -807,17 +809,6 @@ extension BackgroundLoopsAssembly {
             "label": .string(action.label),
             "description": .string(action.description ?? action.label),
         ])
-    }
-
-    private static func writeHeartbeatJSONLRows(_ rows: [JSONValue], to path: URL) throws {
-        let serialized = try rows.map { try $0.serialize(pretty: false) }
-        try FileManager.default.createDirectory(
-            at: path.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        let payload = Data((serialized.joined(separator: "\n") + (serialized.isEmpty ? "" : "\n")).utf8)
-        try payload.write(to: path, options: [.atomic])
-        _ = chmod(path.path, 0o600)
     }
 
     static func repairHeartbeatInboxItem(
@@ -1054,18 +1045,65 @@ extension BackgroundLoopsAssembly {
 
 // MARK: - Inbox whole-file rewrite guard
 //
-// The notification inbox upserts read the whole file with `tailJSONL` and then
-// rewrite it in place. That read is LOSSY by design: it decodes non-UTF8 bytes
-// with replacement and `compactMap`s away every line it cannot parse. So a torn
-// or corrupted inbox comes back as `[]`, and rewriting from that silently wipes
-// every pending card the user had not seen yet.
+// The notification inbox upserts read the whole file and rewrite it in place.
+// The old read (`tailJSONL`) was LOSSY: it decoded non-UTF8 bytes with
+// replacement and `compactMap`ed away every line it could not parse, so a
+// single malformed row among valid rows was silently dropped on rewrite, and a
+// fully torn inbox came back as `[]` — rewriting from that wiped every pending
+// card the user had not seen yet.
 //
-// Zero rows is only legitimate when the file genuinely holds nothing on disk —
-// which must still allow the very first card to be appended.
+// The honest shape: `readLines` returns every PHYSICAL line with its original
+// bytes, decoded when possible. Rewrite sites mutate only the rows they own
+// and pass every other line — decoded or not — through `writeLines` verbatim,
+// so corruption is preserved rather than amplified. A trailing torn line
+// (crash residue; the flock serializes live appenders) keeps its bytes and
+// gains only a terminating newline.
 enum InboxRewriteGuard {
-    /// True when it is safe to rewrite `path` from `rows`.
-    static func rewriteIsSafe(rows: [JSONValue], path: URL) -> Bool {
-        if !rows.isEmpty { return true }
+    /// One physical line of the inbox file. `row` is nil when the line does
+    /// not parse as JSON; such lines must be carried through rewrites as
+    /// `raw`, byte-identical.
+    struct Line {
+        let raw: Data
+        let row: JSONValue?
+    }
+
+    /// Whole-file read that loses nothing: every physical line comes back,
+    /// with its decoded row when it parses. Interior blank lines are kept
+    /// (as empty `raw`) so the rewrite preserves them too.
+    static func readLines(_ path: URL) throws -> [Line] {
+        guard FileManager.default.fileExists(atPath: path.path) else { return [] }
+        let data = try Data(contentsOf: path)
+        guard !data.isEmpty else { return [] }
+        let slices: [Data] = data.split(separator: 0x0A, omittingEmptySubsequences: false)
+        // Copy each slice: Data slices keep parent byte offsets, and parsers
+        // must see zero-based bytes.
+        var parts = slices.map { Data($0) }
+        if parts.last?.isEmpty == true { parts.removeLast() }
+        return parts.map { Line(raw: $0, row: try? JSONValue.parse($0)) }
+    }
+
+    /// Atomic whole-file replacement from physical lines. An empty array
+    /// truncates the file (matches the old serializer's behavior).
+    static func writeLines(_ lines: [Data], to path: URL) throws {
+        try FileManager.default.createDirectory(
+            at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+        var payload = Data()
+        payload.reserveCapacity(lines.reduce(0) { $0 + $1.count + 1 })
+        for line in lines {
+            payload.append(line)
+            payload.append(0x0A)
+        }
+        try payload.write(to: path, options: [.atomic])
+        _ = chmod(path.path, 0o600)
+    }
+
+    /// True when it is safe to rewrite `path` from `lines`. With `readLines`
+    /// a non-empty file always yields at least one line, so a refusal here
+    /// means the read and the file disagree — refuse rather than risk wiping
+    /// cards. Zero lines is only legitimate when the file genuinely holds
+    /// nothing on disk, which must still allow the very first card.
+    static func rewriteIsSafe(lines: [Line], path: URL) -> Bool {
+        if !lines.isEmpty { return true }
         guard FileManager.default.fileExists(atPath: path.path) else { return true }
         guard let size = (try? FileManager.default.attributesOfItem(
             atPath: path.path
@@ -1079,7 +1117,7 @@ enum InboxRewriteGuard {
     /// Logs the refusal on the way out so a skipped upsert is never silent.
     static func refuse(_ label: String, path: URL) {
         FileHandle.standardError.write(Data(
-            ("\(label): inbox read returned no rows for a non-empty file at "
+            ("\(label): inbox read returned no lines for a non-empty file at "
              + "\(path.path) — skipping whole-file rewrite to avoid wiping "
              + "pending cards\n").utf8))
     }

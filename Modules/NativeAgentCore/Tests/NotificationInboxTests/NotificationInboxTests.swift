@@ -248,80 +248,39 @@ private func field(_ v: JSONValue, _ key: String) -> JSONValue? {
     #expect(field(payload, "status") == .string("unread"))
 }
 
-// MARK: - SwiftNative reader + enrichment fallback
+// MARK: - locked status write (cross-process flock path)
 
-@Test func swiftNativeListServesPureTriggerInbox() async throws {
-    let dir = try makeInboxDir(itemsLines: [
-        line(id: "t1", createdAt: "2026-06-01T10:00:00Z", source: "trigger:file_watch:x"),
-        line(id: "m1", createdAt: "2026-06-01T11:00:00Z", source: "mission_complete:abc"),
-    ])
-    let reader = SwiftNativeNotificationInbox(inboxDir: dir)
-    let listed = await reader.list(unreadOnly: false)
-    #expect(listed != nil)
-    #expect(idsOf(listed!) == ["m1", "t1"])  // newest first
-}
-
-@Test func swiftNativeListDeclinesProactiveCard() async throws {
-    // ANY proactive_autonomy:* item declines the local list (nil), because those
-    // cards still need a richer enrichment path.
-    let dir = try makeInboxDir(itemsLines: [
-        line(id: "t1", createdAt: "2026-06-01T10:00:00Z", source: "trigger:file_watch:x"),
-        line(id: "p1", createdAt: "2026-06-01T11:00:00Z", source: "proactive_autonomy:code_review:op1"),
-    ])
-    let reader = SwiftNativeNotificationInbox(inboxDir: dir)
-    let listed = await reader.list(unreadOnly: false)
-    #expect(listed == nil)
-}
-
-@Test func swiftNativeGetNotFoundAndDeclinedEnrichment() async throws {
-    let dir = try makeInboxDir(itemsLines: [
-        line(id: "ok", createdAt: "2026-06-01T10:00:00Z", source: "idle_checkin"),
-        line(id: "pc", createdAt: "2026-06-01T11:00:00Z", source: "proactive_autonomy:k:o"),
-    ])
-    let reader = SwiftNativeNotificationInbox(inboxDir: dir)
-
-    // missing id -> .notFound (reproduces daemon 404).
-    if case .notFound? = await reader.get(id: "missing") {} else { Issue.record("expected notFound") }
-
-    // pure source -> .found.
-    if case .found(let v)? = await reader.get(id: "ok") {
-        #expect(field(v, "id") == .string("ok"))
-    } else { Issue.record("expected found") }
-
-    // proactive card -> nil (native enrichment not implemented here).
-    #expect(await reader.get(id: "pc") == nil)
-}
-
-@Test func statusWritesNativeByDefault() async throws {
-    // Wave 32 W16: defaults flipped ON (flock + ledger prereqs closed). All three
-    // writes now serve natively for a NON-proactive item (no ledger entry made).
+@Test func updateStatusLockedFlipsStatusUnderLock() async throws {
+    // The flock-wrapped twin of updateStatus: same overlay result, but the
+    // read-modify-write runs inside withFileLock(items.jsonl). This was
+    // previously exercised only through the retired SwiftNativeNotificationInbox
+    // reader (deleted 2026-08-13); the locked path itself is kept, so it keeps a
+    // direct test.
     let dir = try makeInboxDir(itemsLines: [ line(id: "g", createdAt: "2026-06-01T10:00:00Z", source: "idle_checkin") ])
-    let reader = SwiftNativeNotificationInbox(inboxDir: dir)
-    #expect(await reader.markRead(id: "g") == true)
-    #expect(await reader.markArchived(id: "g") == true)
-    #expect(await reader.dismiss(id: "g") == true)
-    // Final overlay reflects the last write (dismiss).
-    #expect(NotificationInboxStore(inboxDir: dir).get("g")!.status == "dismissed")
+    let store = NotificationInboxStore(inboxDir: dir)
+    let persistence = SwiftNativePersistenceCore()
+    #expect(await store.updateStatusLocked("g", status: .read, readAt: "2026-06-01T13:00:00Z", persistence: persistence))
+    #expect(await store.updateStatusLocked("g", status: .dismissed, persistence: persistence))
+    let reloaded = NotificationInboxStore(inboxDir: dir).get("g")!
+    #expect(reloaded.status == "dismissed")
+    // read_at survives the later write that passed readAt=nil (leave-untouched).
+    #expect(reloaded.readAt == "2026-06-01T13:00:00Z")
 }
 
-@Test func statusWritesForcedToHTTPWhenDisabled() async throws {
-    // The rollback knob: passing FALSE forces a write surface back to HTTP
-    // (nil sentinel) without changing the read owner.
-    let dir = try makeInboxDir(itemsLines: [ line(id: "g", createdAt: "2026-06-01T10:00:00Z", source: "idle_checkin") ])
-    let writesOff = SwiftNativeNotificationInbox(inboxDir: dir, statusWritesEnabled: false)
-    #expect(await writesOff.markRead(id: "g") == nil)
-    #expect(await writesOff.markArchived(id: "g") == nil)
-    #expect(await writesOff.dismiss(id: "g") == nil)
+// MARK: - proactive-outcome ledger (the wave 32 W16 port)
+//
+// The retired reader's archive/dismiss were the last in-module callers of
+// maybeRecordInboxOutcome; the ledger is KEPT as the parity record of the
+// daemon's outcome slice, so these tests drive it directly.
 
-    // markRead is allowed even with outcome OFF (no ledger dep); archive/dismiss
-    // require BOTH flags (they fire the ledger).
-    let outcomeOff = SwiftNativeNotificationInbox(inboxDir: dir, statusWritesEnabled: true, proactiveOutcomeWired: false)
-    #expect(await outcomeOff.markRead(id: "g") == true)
-    #expect(await outcomeOff.markArchived(id: "g") == nil)
-    #expect(await outcomeOff.dismiss(id: "g") == nil)
+/// Fresh temp data root for ledger tests (the dir that holds nextgen/ +
+/// activity/).
+private func makeLedgerRoot() throws -> URL {
+    let base = FileManager.default.temporaryDirectory
+        .appendingPathComponent("naitest-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+    return base
 }
-
-// MARK: - proactive-outcome ledger wiring (the wave 32 W16 port)
 
 /// Read the parsed records of `<root>/nextgen/proactive/outcomes.jsonl`.
 private func readOutcomes(root: URL) -> [JSONValue] {
@@ -334,13 +293,11 @@ private func readOutcomes(root: URL) -> [JSONValue] {
 }
 
 @Test func archiveProactiveCardRecordsUsefulOutcome() async throws {
-    let dir = try makeInboxDir(itemsLines: [
-        line(id: "pc", createdAt: "2026-06-01T10:00:00Z", source: "proactive_autonomy:code_review:opp42"),
-    ])
-    let root = dir.deletingLastPathComponent()
-    let reader = SwiftNativeNotificationInbox(inboxDir: dir)
-    #expect(await reader.markArchived(id: "pc") == true)
-
+    let root = try makeLedgerRoot()
+    let ledger = ProactiveOutcomeLedger(root: root, persistence: SwiftNativePersistenceCore())
+    await ledger.maybeRecordInboxOutcome(
+        itemSource: "proactive_autonomy:code_review:opp42", itemId: "pc", action: "archive"
+    )
     let outcomes = readOutcomes(root: root)
     #expect(outcomes.count == 1)
     let rec = outcomes[0]
@@ -350,64 +307,41 @@ private func readOutcomes(root: URL) -> [JSONValue] {
     #expect(field(rec, "outcome") == .string("archive"))
     #expect(field(rec, "useful") == .bool(true))     // archive => useful
     #expect(field(rec, "source") == .string("inbox"))
-    // status flipped too.
-    #expect(NotificationInboxStore(inboxDir: dir).get("pc")!.status == "archived")
 }
 
 @Test func dismissProactiveCardRecordsNotUseful() async throws {
-    let dir = try makeInboxDir(itemsLines: [
-        line(id: "pc", createdAt: "2026-06-01T10:00:00Z", source: "proactive_autonomy:idea:o9"),
-    ])
-    let root = dir.deletingLastPathComponent()
-    let reader = SwiftNativeNotificationInbox(inboxDir: dir)
-    #expect(await reader.dismiss(id: "pc") == true)
+    let root = try makeLedgerRoot()
+    let ledger = ProactiveOutcomeLedger(root: root, persistence: SwiftNativePersistenceCore())
+    await ledger.maybeRecordInboxOutcome(
+        itemSource: "proactive_autonomy:idea:o9", itemId: "pc", action: "dismiss"
+    )
     let outcomes = readOutcomes(root: root)
     #expect(outcomes.count == 1)
     #expect(field(outcomes[0], "outcome") == .string("dismiss"))
     #expect(field(outcomes[0], "useful") == .bool(false))   // dismiss => not useful
 }
 
-@Test func nonProactiveCardRecordsNoOutcome() async throws {
-    // mark_archived on a NON-proactive item must NOT write the ledger (the
-    // daemon's maybe_record_* early-returns when source isn't proactive_autonomy:).
-    let dir = try makeInboxDir(itemsLines: [
-        line(id: "n", createdAt: "2026-06-01T10:00:00Z", source: "mission_complete:abc"),
-    ])
-    let root = dir.deletingLastPathComponent()
-    let reader = SwiftNativeNotificationInbox(inboxDir: dir)
-    #expect(await reader.markArchived(id: "n") == true)
-    #expect(readOutcomes(root: root).isEmpty)
-    #expect(NotificationInboxStore(inboxDir: dir).get("n")!.status == "archived")
-}
-
-@Test func markReadNeverRecordsOutcome() async throws {
-    // mark_read is a bare status flip in the daemon — no ledger entry even for a
-    // proactive card.
-    let dir = try makeInboxDir(itemsLines: [
-        line(id: "pc", createdAt: "2026-06-01T10:00:00Z", source: "proactive_autonomy:code_review:opp1"),
-    ])
-    let root = dir.deletingLastPathComponent()
-    let reader = SwiftNativeNotificationInbox(inboxDir: dir)
-    #expect(await reader.markRead(id: "pc") == true)
+@Test func nonProactiveSourceRecordsNoOutcome() async throws {
+    // maybe_record_* early-returns when source isn't proactive_autonomy: —
+    // no ledger record for any other card kind.
+    let root = try makeLedgerRoot()
+    let ledger = ProactiveOutcomeLedger(root: root, persistence: SwiftNativePersistenceCore())
+    await ledger.maybeRecordInboxOutcome(
+        itemSource: "mission_complete:abc", itemId: "n", action: "archive"
+    )
     #expect(readOutcomes(root: root).isEmpty)
 }
 
 @Test func ledgerDedupsSecondOutcomeForSameItem() async throws {
     // _proactive_outcome_exists_for_item: a second archive/dismiss for an item
-    // that already has an outcome must NOT append a duplicate ledger record (but
-    // the status write still proceeds).
-    let dir = try makeInboxDir(itemsLines: [
-        line(id: "pc", createdAt: "2026-06-01T10:00:00Z", source: "proactive_autonomy:k:o"),
-    ])
-    let root = dir.deletingLastPathComponent()
-    let reader = SwiftNativeNotificationInbox(inboxDir: dir)
-    #expect(await reader.markArchived(id: "pc") == true)
-    #expect(await reader.dismiss(id: "pc") == true)   // second outcome — deduped
+    // that already has an outcome must NOT append a duplicate ledger record.
+    let root = try makeLedgerRoot()
+    let ledger = ProactiveOutcomeLedger(root: root, persistence: SwiftNativePersistenceCore())
+    await ledger.maybeRecordInboxOutcome(itemSource: "proactive_autonomy:k:o", itemId: "pc", action: "archive")
+    await ledger.maybeRecordInboxOutcome(itemSource: "proactive_autonomy:k:o", itemId: "pc", action: "dismiss")
     let outcomes = readOutcomes(root: root)
     #expect(outcomes.count == 1)                       // only the first recorded
     #expect(field(outcomes[0], "outcome") == .string("archive"))
-    // status still advanced to dismissed.
-    #expect(NotificationInboxStore(inboxDir: dir).get("pc")!.status == "dismissed")
 }
 
 @Test func sourcePartsParsing() {
@@ -424,12 +358,9 @@ private func readOutcomes(root: URL) -> [JSONValue] {
 @Test func ledgerWritesActivityEcho() async throws {
     // record_proactive_outcome echoes a record_activity("proactive", ...) event;
     // verify the activity/events.jsonl entry lands with the expected shape.
-    let dir = try makeInboxDir(itemsLines: [
-        line(id: "pc", createdAt: "2026-06-01T10:00:00Z", source: "proactive_autonomy:k:o"),
-    ])
-    let root = dir.deletingLastPathComponent()
-    let reader = SwiftNativeNotificationInbox(inboxDir: dir)
-    #expect(await reader.markArchived(id: "pc") == true)
+    let root = try makeLedgerRoot()
+    let ledger = ProactiveOutcomeLedger(root: root, persistence: SwiftNativePersistenceCore())
+    await ledger.maybeRecordInboxOutcome(itemSource: "proactive_autonomy:k:o", itemId: "pc", action: "archive")
     let actPath = root
         .appendingPathComponent("activity", isDirectory: true)
         .appendingPathComponent("events.jsonl")
@@ -441,15 +372,4 @@ private func readOutcomes(root: URL) -> [JSONValue] {
     #expect(field(events[0], "title") == .string("Proactive outcome recorded"))
     #expect(field(events[0], "status") == .string("ok"))
     #expect(field(events[0], "detail") == .string("archive"))
-}
-
-// MARK: - factory gating
-
-@Test func factoryReturnsSwiftNative() async throws {
-    let dir = try makeInboxDir(itemsLines: [ line(id: "f", createdAt: "2026-06-01T10:00:00Z", source: "idle_checkin") ])
-    let reader = makeNotificationInbox(inboxDir: dir)
-    #expect(reader is SwiftNativeNotificationInbox)
-    let listed = await reader.list(unreadOnly: false)
-    #expect(listed != nil)
-    #expect(idsOf(listed!) == ["f"])
 }
