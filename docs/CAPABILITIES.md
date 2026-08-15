@@ -215,6 +215,45 @@ doctor/repair, backup/restore, skills, tool registry, MCP, and local agent
 handoffs. Availability depends on policy, credentials, platform permissions,
 and live account proof.
 
+### Mac computer control
+
+- A read-only accessibility perception organ walks the frontmost window's
+  AX tree as structured data under hard node/depth/length bounds and reports
+  truncation honestly (`ax_status`, `ax_tree`, `ax_find`).
+- `mac_view` fuses one screenshot with the AX walk into a numbered scene:
+  the agent acts by mark reference (`mac_click{mark}`, `mac_ax_act{mark}`),
+  never by model-guessed coordinates. Marks expire; a stale view is refused
+  rather than reinterpreted.
+- Keyboard, mouse, scroll, and semantic AX actions require three gates: the
+  accessibility category, an active Full Mac trust window, and a one-time
+  capability bound by digest to the exact approved body — non-forgeable,
+  non-replayable, durable across crashes.
+- Displayed secrets are redacted at the source by SHAPE (one-time codes,
+  high-entropy tokens, card numbers with Luhn, recovery phrases, secret-labeled
+  captions in all three geometries) before any model, trace, or synced sink
+  sees the screen. Typed secret arguments reduce to count+digest everywhere
+  they persist.
+- `mac_wake` and `mac_nudge` dismiss a non-locked screensaver or wake a
+  sleeping display; any readable lock evidence refuses, fail-closed, and a
+  refusal carries no image or text.
+
+### Ambient activity watcher
+
+- Off by default and structurally consent-gated: with the Trust Center toggle
+  off, no observers install and no store file exists on disk. External policy
+  writes can only make capture less permissive; enabling goes through Trust
+  Center only.
+- Captures metadata only — app, bundle id, redacted window title, span
+  start/end — no screenshots, no OCR, no model calls, event-driven at ~0% CPU.
+- The store lives in its own directory, excluded from every export, backup,
+  support bundle, and sync path. A small allowlist of surfaces may read it;
+  new transports fail closed until deliberately admitted.
+- `activity_query` answers "what was I working on yesterday" with query-time
+  rollups; capture-off is an explicit refusal, not an empty result. Results
+  are excluded from memory promotion and the cognitive substrate: the agent
+  can look when asked and build helpful artifacts, but never retains the
+  trail.
+
 ### One causal language across protocols
 
 Native tools and external protocols do not need separate meanings for action

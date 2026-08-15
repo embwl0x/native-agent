@@ -54,6 +54,19 @@ The Subconscious and Organism are advisory. They can shape attention, voice,
 carefulness, and bounded background posture, but cannot grant permissions,
 write canonical user facts, approve actions, or bypass TrustCenter.
 
+## Turn on Mac computer control and the activity watcher
+
+- Computer control (see, click, type): grant macOS **Accessibility** (and
+  **Screen Recording** for `mac_view`'s picture) to NativeAgent, then open an
+  active Full Mac window in Trust Center. Each injected action still requires
+  its own one-time approval unless you enable full autonomy. Displayed
+  secrets are redacted before the model sees the screen either way.
+- Activity watcher: Trust Center -> capture tab -> enable. It records app and
+  redacted window-title spans locally, nothing else, and only while enabled.
+  Ask the agent "what was I working on yesterday" to use it. Disabling stops
+  capture instantly; the data never leaves your Mac and the agent never
+  memorizes it.
+
 ## Main Mac pages
 
 | Page | Use it for |
