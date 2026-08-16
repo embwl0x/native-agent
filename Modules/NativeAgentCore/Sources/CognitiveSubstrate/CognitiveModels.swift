@@ -211,11 +211,57 @@ public struct CognitiveFeltProxyReads: Sendable, Equatable {
     public static let absent = CognitiveFeltProxyReads()
 }
 
+/// Immutable presentation-only inputs captured with a frozen cognition epoch.
+/// This is not durable cognition: it only prevents previews or failed provider
+/// calls from consuming cadence, continuity, or Sound-brake state.
+public struct CognitiveCapsulePresentationState: Sendable, Equatable {
+    public var fingerprintFamily: String?
+    public var fingerprintCount: Int
+    public var fingerprintLastSurfacedAt: Date?
+    public var lastLiveCapsuleAt: Date?
+    public var lastSessionBridgeAt: Date?
+    public var negativeSoundEchoRun: Int
+
+    public init(
+        fingerprintFamily: String? = nil,
+        fingerprintCount: Int = 0,
+        fingerprintLastSurfacedAt: Date? = nil,
+        lastLiveCapsuleAt: Date? = nil,
+        lastSessionBridgeAt: Date? = nil,
+        negativeSoundEchoRun: Int = 0
+    ) {
+        self.fingerprintFamily = fingerprintFamily
+        self.fingerprintCount = max(0, fingerprintCount)
+        self.fingerprintLastSurfacedAt = fingerprintLastSurfacedAt
+        self.lastLiveCapsuleAt = lastLiveCapsuleAt
+        self.lastSessionBridgeAt = lastSessionBridgeAt
+        self.negativeSoundEchoRun = max(0, negativeSoundEchoRun)
+    }
+}
+
+/// One frozen standing-view line plus the exact concern vocabulary captured
+/// for it. Selection can therefore use the current turn without rereading live
+/// standing views or concern state.
+public struct CognitiveStandingViewCapsuleCandidate: Sendable, Equatable {
+    public let id: UUID
+    public let line: String
+    public let concernKeywords: [String]
+    public let updatedAt: Date
+
+    public init(id: UUID, line: String, concernKeywords: [String], updatedAt: Date) {
+        self.id = id
+        self.line = line
+        self.concernKeywords = concernKeywords
+        self.updatedAt = updatedAt
+    }
+}
+
 public struct CognitiveFrozenRead: Sendable, Equatable {
     public let fixedAt: Date
     public let stateRevision: UInt64
     public let thoughtSeedRevision: UInt64
     public let configuration: CognitiveConfiguration
+    public let personalityDynamics: PersonalityDynamicsConfiguration
     public let snapshot: CognitiveSubstrateSnapshot
     public let workspace: CognitiveWorkspaceSnapshot
     public let affect: CognitiveAffectState
@@ -224,12 +270,17 @@ public struct CognitiveFrozenRead: Sendable, Equatable {
     public let standingViewInnerLine: String?
     public let soundEchoLine: String?
     public let feltProxies: CognitiveFeltProxyReads
+    public let standingViewCapsuleCandidates: [CognitiveStandingViewCapsuleCandidate]
+    public let soundLandingScores: [UUID: Double]
+    public let capsulePresentationState: CognitiveCapsulePresentationState
+    public let pendingCompletionOpen: Bool
 
     public init(
         fixedAt: Date,
         stateRevision: UInt64,
         thoughtSeedRevision: UInt64,
         configuration: CognitiveConfiguration,
+        personalityDynamics: PersonalityDynamicsConfiguration = .default,
         snapshot: CognitiveSubstrateSnapshot,
         workspace: CognitiveWorkspaceSnapshot,
         affect: CognitiveAffectState = CognitiveAffectState(),
@@ -237,12 +288,17 @@ public struct CognitiveFrozenRead: Sendable, Equatable {
         thoughtSeeds: [CognitiveThoughtSeed] = [],
         standingViewInnerLine: String? = nil,
         soundEchoLine: String? = nil,
-        feltProxies: CognitiveFeltProxyReads = .absent
+        feltProxies: CognitiveFeltProxyReads = .absent,
+        standingViewCapsuleCandidates: [CognitiveStandingViewCapsuleCandidate] = [],
+        soundLandingScores: [UUID: Double] = [:],
+        capsulePresentationState: CognitiveCapsulePresentationState = CognitiveCapsulePresentationState(),
+        pendingCompletionOpen: Bool = false
     ) {
         self.fixedAt = fixedAt
         self.stateRevision = stateRevision
         self.thoughtSeedRevision = thoughtSeedRevision
         self.configuration = configuration
+        self.personalityDynamics = personalityDynamics
         self.snapshot = snapshot
         self.workspace = workspace
         self.affect = affect
@@ -251,6 +307,10 @@ public struct CognitiveFrozenRead: Sendable, Equatable {
         self.standingViewInnerLine = standingViewInnerLine
         self.soundEchoLine = soundEchoLine
         self.feltProxies = feltProxies
+        self.standingViewCapsuleCandidates = standingViewCapsuleCandidates
+        self.soundLandingScores = soundLandingScores
+        self.capsulePresentationState = capsulePresentationState
+        self.pendingCompletionOpen = pendingCompletionOpen
     }
 }
 

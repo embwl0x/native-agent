@@ -237,7 +237,7 @@ struct CognitionObservatoryView: View {
                     }
                     // Standing Views + Schema Proposals are APPROVAL-shaped and
                     // moved to the Activity surface (B2.4); Identity Proposals was
-                    // deleted (inert — `proposeIdentity` has no production caller).
+                    // retired after its experimental producer proved inert.
                     // This segment is the read-only observational core.
                     collapsible("timeline", title: "Developmental Timeline", systemImage: "timeline.selection", tint: .pink,
                                 count: detail.developmentalTimeline.count) {

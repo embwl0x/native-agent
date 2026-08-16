@@ -352,15 +352,8 @@ actor NativeContextFlowRuntime: ContextTurnPreparing {
             let memory: SwiftNativeMemoryV2
             if let memoryOverride {
                 memory = memoryOverride
-            } else if usesLiveAppBody {
-                memory = .shared
-            } else if let storage = try? MemoryStorage(dataRoot: dataRoot) {
-                memory = SwiftNativeMemoryV2(
-                    embedder: ManagedEmbeddingProvider(dataRoot: dataRoot),
-                    storage: MemoryStorageBridge(storage: storage)
-                )
             } else {
-                throw CocoaError(.fileWriteUnknown)
+                memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
             }
             guard let embeddingEpoch = await memory.embeddingEpoch()?.rawValue else {
                 throw MemoryV2Error.storageUnavailable

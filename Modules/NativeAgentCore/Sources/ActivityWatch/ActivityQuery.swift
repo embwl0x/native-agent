@@ -21,6 +21,8 @@ public struct ActivityQueryService: Sendable {
 
     public enum QueryError: Error, CustomStringConvertible, Equatable {
         case captureDisabled
+        case modelAccessDisabled
+        case policyUnavailable(String)
         case remoteSurfaceRefused(surface: String)
         case badRange(String)
 
@@ -33,11 +35,15 @@ public struct ActivityQueryService: Sendable {
                 was off, so enabling it now starts from this moment — it cannot answer about \
                 the past.
                 """
+            case .modelAccessDisabled:
+                return "Activity history is local-only until you enable Trust Center → Activity Capture → Agent Access."
+            case .policyUnavailable(let detail):
+                return "activity_query refused because the saved activity policy is unavailable: \(detail)"
             case .remoteSurfaceRefused(let surface):
                 return """
                 activity_query is Mac-local and is refused on the '\(surface)' surface by \
-                design. Activity data never leaves this Mac: answering here would put it \
-                through the iCloud/chat-sync path the feature exists to avoid. Ask on the Mac.
+                design. The activity store is never exposed through iCloud, chat sync, phone, \
+                or bridge transports. Ask on the Mac; model access is separately consented there.
                 """
             case .badRange(let detail):
                 return "activity_query: \(detail)"
@@ -89,10 +95,19 @@ public struct ActivityQueryService: Sendable {
     /// is off — the tool must never answer from rows recorded before a user
     /// turned capture off, and must never imply it has data it does not have.
     public func run(_ request: Request) async throws -> JSONValue {
-        let policy = ActivityPolicyStore(dataRoot: dataRoot).load()
+        let policy: ActivityPolicy
+        do {
+            policy = try ActivityPolicyStore(dataRoot: dataRoot).loadChecked()
+        } catch {
+            throw QueryError.policyUnavailable(error.localizedDescription)
+        }
         guard policy.captureEnabled else { throw QueryError.captureDisabled }
-        guard request.to > request.from else {
+        guard policy.allowModelAccess else { throw QueryError.modelAccessDisabled }
+        guard request.from.isFinite, request.to.isFinite, request.to > request.from else {
             throw QueryError.badRange("the end of the range must be after its start")
+        }
+        guard request.to - request.from <= Self.maximumRangeSeconds else {
+            throw QueryError.badRange("the requested range is longer than 366 days; ask for a shorter range")
         }
 
         let store = try ActivitySpanStore(dataRoot: dataRoot)
@@ -101,12 +116,18 @@ public struct ActivityQueryService: Sendable {
         // 1Password today must make yesterday unanswerable even for rows that
         // were legal when written.
         let rollups = ActivityRollups(store: store, policy: policy)
-        let bundle = try await rollups.answerBundle(
-            from: request.from,
-            to: request.to,
-            timezone: request.timezone,
-            rowCap: min(max(3, request.rowCap), Self.maxRows)
-        )
+        let bundle: ActivityAnswerBundle
+        do {
+            bundle = try await rollups.answerBundle(
+                from: request.from,
+                to: request.to,
+                timezone: request.timezone,
+                rowCap: min(max(3, request.rowCap), Self.maxRows),
+                bundleID: request.bundleID
+            )
+        } catch let error as ActivityRollups.RollupError {
+            throw QueryError.badRange(error.localizedDescription)
+        }
         return Self.encode(bundle, bundleIDFilter: request.bundleID, policy: policy)
     }
 
@@ -256,7 +277,8 @@ public struct ActivityQueryService: Sendable {
     /// accepts rather than guessing at a date and answering about the wrong day.
     public static func parseInstant(_ value: String, timezone: TimeZone) -> Double? {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let epoch = Double(trimmed), epoch > 1_000_000_000 { return epoch }
+        if let epoch = Double(trimmed), epoch.isFinite,
+           epoch >= minimumSupportedEpoch, epoch <= maximumSupportedEpoch { return epoch }
 
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -269,9 +291,14 @@ public struct ActivityQueryService: Sendable {
         dayFormatter.locale = Locale(identifier: "en_US_POSIX")
         dayFormatter.timeZone = timezone
         dayFormatter.dateFormat = "yyyy-MM-dd"
+        dayFormatter.isLenient = false
         if let date = dayFormatter.date(from: trimmed) { return date.timeIntervalSince1970 }
         return nil
     }
+
+    public static let maximumRangeSeconds: Double = 366 * 86_400
+    private static let minimumSupportedEpoch: Double = 0
+    private static let maximumSupportedEpoch: Double = 32_503_680_000 // 3000-01-01 UTC
 }
 
 /// Local mirror of `TrustCenter.ConversationSurfaceProfile`'s remote set.

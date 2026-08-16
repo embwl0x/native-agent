@@ -67,6 +67,9 @@ func slackTokenPasteSavesLegacyAndConnectorAuthFiles() async throws {
     let token = "xoxb-" + String(repeating: "a", count: 32)
     let result = await NativeOAuthFlow.saveSlackToken(
         token,
+        allowedChannelIds: ["C123"],
+        allowedUserIds: ["U456"],
+        requireMention: true,
         validateWithSlack: false,
         dataRoot: root
     )
@@ -87,6 +90,18 @@ func slackTokenPasteSavesLegacyAndConnectorAuthFiles() async throws {
     #expect(stringField(connector, "access_token") == token)
     #expect(stringField(legacy, "auth_mode") == "manual_oauth_token")
     #expect(stringField(connector, "auth_mode") == "manual_oauth_token")
+    guard case .object(let connectorObject) = connector else {
+        Issue.record("expected Slack connector auth object")
+        return
+    }
+    #expect(connectorObject["allowed_channel_ids"] == .array([.string("C123")]))
+    #expect(connectorObject["allowed_user_ids"] == .array([.string("U456")]))
+    #expect(connectorObject["require_mention"] == .bool(true))
+
+    let ingress = SlackSocketModeConfig.loadIngressPolicy(dataRoot: root)
+    #expect(ingress.allowedChannelIds == ["C123"])
+    #expect(ingress.allowedUserIds == ["U456"])
+    #expect(ingress.requireMention)
 
     let row = try await #require(NativeClient.readConnectorRegistryEntry(root: root, provider: "slack"))
     #expect(row["enabled"] == .bool(true))

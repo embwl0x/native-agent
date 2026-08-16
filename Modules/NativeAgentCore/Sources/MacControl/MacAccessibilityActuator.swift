@@ -380,6 +380,10 @@ public struct CGEventSink: MacEventSink {
             virtualKey: CGKeyCode(event.keyCode),
             keyDown: event.down
         ) else { return }
+        cg.setIntegerValueField(
+            .eventSourceUserData,
+            value: NativeAgentMacEventIdentity.sourceUserData
+        )
         cg.flags = flags(event.modifiers)
         if let text = event.unicodeText {
             let units = Array(text.utf16)
@@ -388,6 +392,7 @@ public struct CGEventSink: MacEventSink {
                 cg.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: base)
             }
         }
+        NativeAgentMotorEpoch.noteAgentMotorEvent()
         cg.post(tap: .cghidEventTap)
     }
 
@@ -410,9 +415,16 @@ public struct CGEventSink: MacEventSink {
             mouseCursorPosition: point,
             mouseButton: button
         ) else { return }
+        cg.setIntegerValueField(
+            .eventSourceUserData,
+            value: NativeAgentMacEventIdentity.sourceUserData
+        )
         if event.phase != .move {
             cg.setIntegerValueField(.mouseEventClickState, value: Int64(max(1, event.clickCount)))
         }
+        // A bare cursor move (`mac_nudge`) changes no app/focus state and must
+        // not hide nearby genuine human activity. Button/drag events can.
+        if event.phase != .move { NativeAgentMotorEpoch.noteAgentMotorEvent() }
         cg.post(tap: .cghidEventTap)
     }
 
@@ -426,6 +438,11 @@ public struct CGEventSink: MacEventSink {
             wheel2: event.deltaX,
             wheel3: 0
         ) else { return }
+        cg.setIntegerValueField(
+            .eventSourceUserData,
+            value: NativeAgentMacEventIdentity.sourceUserData
+        )
+        NativeAgentMotorEpoch.noteAgentMotorEvent()
         cg.post(tap: .cghidEventTap)
     }
 }
@@ -625,6 +642,7 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     public func perform(_ target: MacAXActTarget, action: String) -> MacAXActOutcome {
         guard let element = element(target.handle) else { return .invalidTarget }
         guard target.actions.contains(action) else { return .unsupported }
+        NativeAgentMotorEpoch.noteAgentMotorEvent()
         let status = AXUIElementPerformAction(element, action as CFString)
         switch status {
         case .success: return .performed
@@ -638,6 +656,7 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         var settable: DarwinBoolean = false
         let probe = AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable)
         guard probe == .success, settable.boolValue else { return .unsupported }
+        NativeAgentMotorEpoch.noteAgentMotorEvent()
         let status = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, value as CFTypeRef)
         switch status {
         case .success: return .performed
@@ -804,6 +823,35 @@ public enum MacEventPlanner {
             MacMouseEvent(phase: .drag, button: button, x: toX, y: toY),
             MacMouseEvent(phase: .up, button: button, x: toX, y: toY),
         ]
+    }
+
+    /// Smooth deterministic drag path. The model chooses only endpoints and an
+    /// optional duration; interpolation stays local so no frame-by-frame model
+    /// calls or coordinate chatter are needed. `steps` is bounded by the caller.
+    public static func smoothDrag(
+        fromX: Double,
+        fromY: Double,
+        toX: Double,
+        toY: Double,
+        button: MacMouseButton,
+        steps: Int
+    ) -> [MacMouseEvent] {
+        let count = max(2, min(steps, 60))
+        var events = [
+            MacMouseEvent(phase: .move, button: button, x: fromX, y: fromY),
+            MacMouseEvent(phase: .down, button: button, x: fromX, y: fromY),
+        ]
+        for index in 1...count {
+            let progress = Double(index) / Double(count)
+            events.append(MacMouseEvent(
+                phase: .drag,
+                button: button,
+                x: fromX + (toX - fromX) * progress,
+                y: fromY + (toY - fromY) * progress
+            ))
+        }
+        events.append(MacMouseEvent(phase: .up, button: button, x: toX, y: toY))
+        return events
     }
 }
 

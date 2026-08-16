@@ -1,4 +1,9 @@
 import Foundation
+#if os(Linux)
+import Glibc
+#else
+import Darwin
+#endif
 import NativeAgentCore
 import PersistenceCore
 #if canImport(CoreML) && !os(Linux)
@@ -241,12 +246,14 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         guard FileManager.default.fileExists(atPath: modelURL.path) else {
             throw EmbeddingError.modelNotFound(path: modelURL.path)
         }
+        let modelArtifactDigest = try Self.modelArtifactDigest(modelURL: modelURL)
         self.embeddingEpoch = try Self.epoch(
             modelURL: modelURL,
             vocabURL: vocabURL,
             dimensions: dimensions,
             modelID: modelId,
-            maximumSequenceLength: maxSeqLength
+            maximumSequenceLength: maxSeqLength,
+            modelArtifactDigest: modelArtifactDigest
         )
 
         #if canImport(CoreML) && !os(Linux)
@@ -270,7 +277,10 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         do {
             let urlToLoad: URL
             if ext == "mlpackage" {
-                urlToLoad = try Self.compileAndCache(packageURL: modelURL)
+                urlToLoad = try Self.compileAndCache(
+                    packageURL: modelURL,
+                    artifactDigest: modelArtifactDigest
+                )
             } else {
                 urlToLoad = modelURL
             }
@@ -280,7 +290,10 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
             if ext == "mlpackage" {
                 Self.wipeCompileCache(packageURL: modelURL)
                 do {
-                    let recompiled = try Self.compileAndCache(packageURL: modelURL)
+                    let recompiled = try Self.compileAndCache(
+                        packageURL: modelURL,
+                        artifactDigest: modelArtifactDigest
+                    )
                     loadedModel = try Self.loadModel(at: recompiled, configuration: configuration)
                     loadFailure = nil
                 } catch {
@@ -319,13 +332,9 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         vocabURL: URL?,
         dimensions: Int,
         modelID: String,
-        maximumSequenceLength: Int
+        maximumSequenceLength: Int,
+        modelArtifactDigest: String
     ) throws -> MemoryEmbeddingEpoch {
-        var isDirectory: ObjCBool = false
-        _ = FileManager.default.fileExists(atPath: modelURL.path, isDirectory: &isDirectory)
-        let modelDigest = try isDirectory.boolValue
-            ? MemoryEmbeddingEpoch.sha256(directory: modelURL)
-            : MemoryEmbeddingEpoch.sha256(file: modelURL)
         let tokenizerDigest: String
         if let vocabURL {
             tokenizerDigest = try MemoryEmbeddingEpoch.sha256(file: vocabURL)
@@ -335,7 +344,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         return MemoryEmbeddingEpoch(
             backend: "coreml",
             modelID: modelID,
-            modelArtifactDigest: modelDigest,
+            modelArtifactDigest: modelArtifactDigest,
             tokenizerArtifactDigest: tokenizerDigest,
             preprocessing: "wordpiece-v1;lowercase=true;unicode=nfc;controls=strip;punctuation=split",
             pooling: "attention-mask-mean-or-model-pooled",
@@ -345,68 +354,197 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         )
     }
 
+    private static func modelArtifactDigest(modelURL: URL) throws -> String {
+        var isDirectory: ObjCBool = false
+        _ = FileManager.default.fileExists(atPath: modelURL.path, isDirectory: &isDirectory)
+        return try isDirectory.boolValue
+            ? MemoryEmbeddingEpoch.sha256(directory: modelURL)
+            : MemoryEmbeddingEpoch.sha256(file: modelURL)
+    }
+
     #if canImport(CoreML) && !os(Linux)
     /// Remove the cached compiled artifact so the next compileAndCache starts
     /// from the pristine bundled .mlpackage. Used by the self-healing retry
     /// above and by the Doctor repair action.
     public static func wipeCompileCache(packageURL: URL) {
         let base = packageURL.deletingPathExtension().lastPathComponent
-        let cached = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            .appendingPathComponent("NativeAgent", isDirectory: true)
-            .appendingPathComponent("coreml", isDirectory: true)
-            .appendingPathComponent("\(base).mlmodelc", isDirectory: true)
-        try? FileManager.default.removeItem(at: cached)
+        let root = compileCacheRoot()
+        let modelRoot = root
+            .appendingPathComponent(base, isDirectory: true)
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try? withCompileCacheLock(cacheRoot: root) {
+            try? FileManager.default.removeItem(at: modelRoot)
+        }
     }
     #endif
 
     #if canImport(CoreML) && !os(Linux)
-    /// F2: compile an .mlpackage to .mlmodelc, caching the compiled artifact in
-    /// `<NSTemporaryDirectory>/NativeAgent/coreml/<basename>.mlmodelc`. If a
-    /// cached copy already exists and is fresher than the .mlpackage manifest,
-    /// returns it directly. Throws on compile failure; under the fail-closed
-    /// contract that surfaces as a runtime embed() error unless the caller
-    /// explicitly opted into mock vectors. Synchronous compile is acceptable
-    /// here: the init path is rare (once per process) and not on @MainActor.
-    fileprivate static func compileAndCache(packageURL: URL) throws -> URL {
+    /// F2: compile an .mlpackage to a durable digest + OS-keyed .mlmodelc slot.
+    /// Publication is atomic under a cross-process flock, so an overlapping app
+    /// restart can never observe a half-written model. Cache-load failure still
+    /// takes the self-healing wipe/recompile path in the initializer above.
+    static func compileAndCache(
+        packageURL: URL,
+        artifactDigest: String,
+        cacheRoot overrideRoot: URL? = nil,
+        osKey overrideOSKey: String? = nil
+    ) throws -> URL {
         let fm = FileManager.default
-        let base = packageURL.deletingPathExtension().lastPathComponent
-        let cacheDir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            .appendingPathComponent("NativeAgent", isDirectory: true)
-            .appendingPathComponent("coreml", isDirectory: true)
-        try? fm.createDirectory(at: cacheDir, withIntermediateDirectories: true)
-        let cached = cacheDir.appendingPathComponent("\(base).mlmodelc", isDirectory: true)
-        if fm.fileExists(atPath: cached.path) {
-            // Validate freshness: if the .mlpackage's manifest mtime is newer
-            // than the cached .mlmodelc, recompile.
-            let manifest = packageURL.appendingPathComponent("Manifest.json")
-            let manifestMtime = (try? fm.attributesOfItem(atPath: manifest.path)[.modificationDate]) as? Date
-            let cacheMtime = (try? fm.attributesOfItem(atPath: cached.path)[.modificationDate]) as? Date
-            if let mm = manifestMtime, let cm = cacheMtime, mm <= cm {
+        let root = overrideRoot ?? compileCacheRoot()
+        let cacheDir = compileCacheDirectory(
+            packageURL: packageURL,
+            artifactDigest: artifactDigest,
+            cacheRoot: overrideRoot,
+            osKey: overrideOSKey
+        ).deletingLastPathComponent()
+        let cached = compileCacheDirectory(
+            packageURL: packageURL,
+            artifactDigest: artifactDigest,
+            cacheRoot: overrideRoot,
+            osKey: overrideOSKey
+        )
+
+        try? fm.createDirectory(at: root, withIntermediateDirectories: true)
+        return try withCompileCacheLock(cacheRoot: root) {
+            try fm.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+            if fm.fileExists(atPath: cached.path) {
                 return cached
             }
-            if manifestMtime == nil || cacheMtime == nil {
-                // Can't compare — trust the cache.
-                return cached
+
+            let compiled = try MLModel.compileModel(at: packageURL)
+            let staging = cacheDir.appendingPathComponent(
+                ".\(UUID().uuidString).mlmodelc",
+                isDirectory: true
+            )
+            defer { try? fm.removeItem(at: staging) }
+            do {
+                try fm.moveItem(at: compiled, to: staging)
+            } catch {
+                try fm.copyItem(at: compiled, to: staging)
+                try? fm.removeItem(at: compiled)
             }
-            // Stale — wipe and recompile.
-            try? fm.removeItem(at: cached)
-        }
-        let compiled = try MLModel.compileModel(at: packageURL)
-        // Move compiled artifact into our cache slot so the next boot skips
-        // the compile entirely. moveItem fails if dest exists — we already
-        // removed it above on the stale path.
-        if fm.fileExists(atPath: cached.path) {
-            try? fm.removeItem(at: cached)
-        }
-        do {
-            try fm.moveItem(at: compiled, to: cached)
+            if fm.fileExists(atPath: cached.path) {
+                try? fm.removeItem(at: cached)
+            }
+            try fm.moveItem(at: staging, to: cached)
+            pruneCompileCache(cacheDir: cacheDir, keeping: cached)
+            pruneOperatingSystemCaches(
+                modelRoot: cacheDir.deletingLastPathComponent(),
+                keeping: cacheDir
+            )
             return cached
-        } catch {
-            // Move failed (e.g. cross-volume) — fall back to using the
-            // OS-tmp compile location directly. The MLModel load below will
-            // still succeed.
-            return compiled
         }
+    }
+
+    static func compileCacheDirectory(
+        packageURL: URL,
+        artifactDigest: String,
+        cacheRoot overrideRoot: URL? = nil,
+        osKey overrideOSKey: String? = nil
+    ) -> URL {
+        let base = packageURL.deletingPathExtension().lastPathComponent
+        let osKey = sanitizedCacheComponent(overrideOSKey ?? operatingSystemCacheKey())
+        let digest = sanitizedCacheComponent(artifactDigest)
+        return (overrideRoot ?? compileCacheRoot())
+            .appendingPathComponent(base, isDirectory: true)
+            .appendingPathComponent(osKey, isDirectory: true)
+            .appendingPathComponent("\(digest).mlmodelc", isDirectory: true)
+    }
+
+    static func compileCacheRoot(fileManager: FileManager = .default) -> URL {
+        let base = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        return base
+            .appendingPathComponent("NativeAgent", isDirectory: true)
+            .appendingPathComponent("coreml-compiled-v2", isDirectory: true)
+    }
+
+    static func operatingSystemCacheKey(processInfo: ProcessInfo = .processInfo) -> String {
+        let version = processInfo.operatingSystemVersion
+        let build = systemBuildVersion() ?? "unknown-build"
+        return "macos-\(version.majorVersion).\(version.minorVersion).\(version.patchVersion)-\(build)"
+    }
+
+    private static func systemBuildVersion() -> String? {
+        let url = URL(fileURLWithPath: "/System/Library/CoreServices/SystemVersion.plist")
+        guard let data = try? Data(contentsOf: url),
+              let plist = try? PropertyListSerialization.propertyList(from: data, format: nil),
+              let dictionary = plist as? [String: Any]
+        else { return nil }
+        return dictionary["ProductBuildVersion"] as? String
+    }
+
+    private static func sanitizedCacheComponent(_ value: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_."))
+        let scalars = value.unicodeScalars.map { allowed.contains($0) ? Character(String($0)) : "-" }
+        return String(scalars)
+    }
+
+    static func pruneCompileCache(
+        cacheDir: URL,
+        keeping current: URL,
+        maximumEntries: Int = 2,
+        fileManager fm: FileManager = .default
+    ) {
+        guard maximumEntries > 0,
+              let entries = try? fm.contentsOfDirectory(
+                at: cacheDir,
+                includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey],
+                options: [.skipsHiddenFiles]
+              )
+        else { return }
+        let candidates = entries.filter { $0.pathExtension == "mlmodelc" }
+            .sorted {
+                if $0.standardizedFileURL == current.standardizedFileURL { return true }
+                if $1.standardizedFileURL == current.standardizedFileURL { return false }
+                let lhs = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                let rhs = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                return lhs > rhs
+            }
+        for stale in candidates.dropFirst(maximumEntries) {
+            try? fm.removeItem(at: stale)
+        }
+    }
+
+    static func pruneOperatingSystemCaches(
+        modelRoot: URL,
+        keeping current: URL,
+        maximumEntries: Int = 2,
+        fileManager fm: FileManager = .default
+    ) {
+        guard maximumEntries > 0,
+              let entries = try? fm.contentsOfDirectory(
+                at: modelRoot,
+                includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey],
+                options: [.skipsHiddenFiles]
+              )
+        else { return }
+        let directories = entries.filter {
+            (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+        }.sorted {
+            if $0.standardizedFileURL == current.standardizedFileURL { return true }
+            if $1.standardizedFileURL == current.standardizedFileURL { return false }
+            let lhs = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            let rhs = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            return lhs > rhs
+        }
+        for stale in directories.dropFirst(maximumEntries) {
+            try? fm.removeItem(at: stale)
+        }
+    }
+
+    private static func withCompileCacheLock<T>(cacheRoot: URL, body: () throws -> T) throws -> T {
+        let lockPath = cacheRoot.appendingPathComponent(".compile.lock").path
+        let descriptor = open(lockPath, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+        guard descriptor >= 0 else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        defer { close(descriptor) }
+        guard flock(descriptor, LOCK_EX) == 0 else {
+            throw CocoaError(.fileLocking)
+        }
+        defer { flock(descriptor, LOCK_UN) }
+        return try body()
     }
     #endif
 
@@ -441,7 +579,8 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
             vocabURL: resolved.url(forResource: "minilm_vocab", withExtension: "txt"),
             dimensions: 384,
             modelID: "all-MiniLM-L6-v2",
-            maximumSequenceLength: 128
+            maximumSequenceLength: 128,
+            modelArtifactDigest: try modelArtifactDigest(modelURL: url)
         )
         if bundle == nil {
             bundledEpochLock.lock()

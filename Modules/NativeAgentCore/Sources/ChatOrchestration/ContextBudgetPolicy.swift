@@ -242,13 +242,16 @@ public enum ContextBudgetPolicy {
     /// for anything unrecognized — a deliberately pessimistic gauge default,
     /// not a measurement — so an unknown id must land in the floor regime
     /// rather than be scaled against a guess.
-    public static func windowTokens(forModel modelID: String?) -> Int? {
+    public static func windowTokens(
+        forModel modelID: String?,
+        providerID: String? = nil,
+        dataRoot: URL? = nil
+    ) -> Int? {
         guard let raw = modelID?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !raw.isEmpty,
-              FirstPartyModelCatalog.descriptor(for: raw.lowercased()) != nil
-        else { return nil }
-        let length = ProviderRouting.contextLength(forModel: raw)
-        return length > 0 ? length : nil
+              !raw.isEmpty else { return nil }
+        return ProviderRouting.verifiedContextLength(
+            forModel: raw, providerID: providerID, dataRoot: dataRoot
+        )
     }
 
     // MARK: - Resolution
@@ -322,8 +325,18 @@ public enum ContextBudgetPolicy {
     }
 
     /// Convenience: resolve straight from a model id.
-    public static func resolve(model: String?, surface: String) -> Resolved {
-        resolve(windowTokens: windowTokens(forModel: model), surface: surface)
+    public static func resolve(
+        model: String?,
+        providerID: String? = nil,
+        dataRoot: URL? = nil,
+        surface: String
+    ) -> Resolved {
+        resolve(
+            windowTokens: windowTokens(
+                forModel: model, providerID: providerID, dataRoot: dataRoot
+            ),
+            surface: surface
+        )
     }
 
     // MARK: - Internals

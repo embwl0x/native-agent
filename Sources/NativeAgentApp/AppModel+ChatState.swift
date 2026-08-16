@@ -40,7 +40,6 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-import CapabilityFoundry
 
 @MainActor
 extension AppModel {
@@ -181,7 +180,7 @@ extension AppModel {
             ids.append(sessionId)
         }
         guard (try? MacPinnedChatSessionStore.save(ids)) != nil else { return }
-        Task { @MainActor in await MacSyncEngine.shared.writeSnapshots() }
+        MacSyncEngine.shared.requestChatSnapshotPublication(includeTranscripts: false)
     }
 
     /// Per-session message mutators. Used by `_sendChatBody` so optimistic
@@ -225,13 +224,6 @@ extension AppModel {
         chatMessagesBySession[sessionId] = arr
     }
 
-    /// Returns true iff a message with this id exists in this session's
-    /// in-memory list. Used by `_sendChatBody` to find optimistic bubbles
-    /// to update without going through `chatMessages` (which only sees the
-    /// active session).
-    func chatMessageExists(id messageId: String, in sessionId: String) -> Bool {
-        chatMessagesBySession[sessionId]?.contains(where: { $0.id == messageId }) ?? false
-    }
     func clearStreamingBubbleState(_ sessionId: String) {
         streamingTexts[sessionId] = nil
         streamingBubbleIds[sessionId] = nil
@@ -274,17 +266,5 @@ extension AppModel {
     func isChatQueuePaused(_ sessionId: String) -> Bool {
         pausedChatQueueSessions.contains(sessionId)
     }
-    // PATCH-2026-05-08: wave2-chat-ux — persona quick-switch for ChatBrainControlBar
-    func cancelImprovementRefreshTask(_ id: String) {
-        improvementRefreshTasks[id]?.cancel()
-        improvementRefreshTasks[id] = nil
-    }
-
-    @MainActor
-    func setImprovementRefreshTask(_ id: String, task: Task<Void, Never>) {
-        improvementRefreshTasks[id]?.cancel()
-        improvementRefreshTasks[id] = task
-    }
-
     // Fix 2: chat draft and pending attachments keyed by sessionId so they survive tab changes
 }

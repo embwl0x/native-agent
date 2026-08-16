@@ -25,6 +25,8 @@ func slackSocketModeConfig_enablesHistoryFallbackWhenSettingIsAbsent() throws {
     let config = try #require(SlackSocketModeConfig.load(dataRoot: root))
     #expect(config.historyPollEnabled)
     #expect(config.historyPollInterval == 60)
+    #expect(config.requireMention)
+    #expect(config.ingressPolicy.isConfigured == false)
 }
 
 @Test
@@ -61,7 +63,8 @@ func slackSocketModeLoop_sessionRecycleStaysBelowTickWatchdog() {
             historyPollInterval: 60,
             historyConversationRefreshInterval: 600,
             allowedChannelIds: [],
-            allowedUserIds: []
+            allowedUserIds: [],
+            requireMention: true
         ),
         chatHandler: { _ in SlackSocketModeReply(text: "") }
     )
@@ -69,4 +72,66 @@ func slackSocketModeLoop_sessionRecycleStaysBelowTickWatchdog() {
     #expect(watchdog == 3_900)
     #expect(loop.sessionRecycleInterval == 3_600)
     #expect(loop.sessionRecycleInterval < watchdog)
+}
+
+@Test
+func slackIngressPolicy_emptyAllowlistFailsClosedOnEveryTransport() {
+    let policy = SlackIngressPolicy(
+        allowedChannelIds: [],
+        allowedUserIds: [],
+        requireMention: false,
+        botUserId: "UBOT"
+    )
+    #expect(policy.denial(
+        channelId: "D1", userId: "U1", eventType: "message",
+        channelType: "im", rawText: "hello"
+    ) == .allowlistEmpty)
+}
+
+@Test
+func slackIngressPolicy_matchesSecurityCenterChannelOrUserUnion() {
+    let policy = SlackIngressPolicy(
+        allowedChannelIds: ["C-allowed"],
+        allowedUserIds: ["U-allowed"],
+        requireMention: false,
+        botUserId: "UBOT"
+    )
+    #expect(policy.denial(
+        channelId: "C-allowed", userId: "U-other", eventType: "message",
+        channelType: "channel", rawText: "hello"
+    ) == nil)
+    #expect(policy.denial(
+        channelId: "C-other", userId: "U-allowed", eventType: "message",
+        channelType: "channel", rawText: "hello"
+    ) == nil)
+    #expect(policy.denial(
+        channelId: "C-other", userId: "U-other", eventType: "message",
+        channelType: "channel", rawText: "hello"
+    ) == .notAllowlisted)
+}
+
+@Test
+func slackIngressPolicy_requiresExactBotMentionOnlyInGroups() {
+    let policy = SlackIngressPolicy(
+        allowedChannelIds: ["C1", "D1"],
+        allowedUserIds: [],
+        requireMention: true,
+        botUserId: "UBOT"
+    )
+    #expect(policy.denial(
+        channelId: "C1", userId: "U1", eventType: "message",
+        channelType: "channel", rawText: "hello"
+    ) == .mentionRequired)
+    #expect(policy.denial(
+        channelId: "C1", userId: "U1", eventType: "message",
+        channelType: "channel", rawText: "<@UBOT> hello"
+    ) == nil)
+    #expect(policy.denial(
+        channelId: "C1", userId: "U1", eventType: "app_mention",
+        channelType: "channel", rawText: "hello"
+    ) == nil)
+    #expect(policy.denial(
+        channelId: "D1", userId: "U1", eventType: "message",
+        channelType: "im", rawText: "hello"
+    ) == nil)
 }

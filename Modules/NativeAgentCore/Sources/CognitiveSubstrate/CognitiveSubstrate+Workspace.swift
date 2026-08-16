@@ -91,11 +91,19 @@ extension CognitiveSubstrate {
         currentSessionId: String? = nil
     ) async -> CognitiveFrozenRead {
         let frozenConfiguration = configuration
+        let frozenDynamics = dynamics
         let fixedAffect = projectedAffect(at: fixedAt)
         let fixedMood = derivedMood(at: fixedAt)
         let fixedThoughtSeeds = projectedThoughtSeeds(at: fixedAt).sorted(by: thoughtSeedPrioritySort)
-        let frozenStandingViewInnerLine = activeStandingViewInnerLine()
-        let frozenSoundEchoLine = soundEchoLine(at: fixedAt)
+        let frozenStandingViewCandidates = standingViewCapsuleCandidates()
+        let frozenStandingViewInnerLine = frozenStandingViewCandidates.first?.line
+        // Sound selection must happen after the capsule has derived this turn's
+        // actual felt mode/valence. Capture its immutable inputs here instead of
+        // preselecting with nil/default register values.
+        let frozenSoundEchoLine: String? = nil // retained wire/source compatibility
+        let frozenSoundLandingScores = soundLandingScoreSnapshot()
+        let frozenPresentationState = capsulePresentationStateSnapshot()
+        let frozenPendingCompletionOpen = pendingCompletion != nil
         // W4/P2: captured, never recomputed downstream (see CognitiveFeltProxyReads).
         // Curiosity is workspace-relative, so it is captured per branch below where
         // the frozen workspace is known; the other two are workspace-independent.
@@ -114,6 +122,7 @@ extension CognitiveSubstrate {
                 stateRevision: dirtyRevision,
                 thoughtSeedRevision: thoughtSeedRevision,
                 configuration: frozenConfiguration,
+                personalityDynamics: frozenDynamics,
                 snapshot: empty,
                 workspace: CognitiveWorkspaceSnapshot(generatedAt: fixedAt, items: []),
                 affect: fixedAffect,
@@ -122,7 +131,11 @@ extension CognitiveSubstrate {
                 standingViewInnerLine: frozenStandingViewInnerLine,
                 soundEchoLine: frozenSoundEchoLine,
                 feltProxies: CognitiveFeltProxyReads(
-                    fatigue: frozenFatigue, curiosity: nil, clarity: frozenClarity)
+                    fatigue: frozenFatigue, curiosity: nil, clarity: frozenClarity),
+                standingViewCapsuleCandidates: frozenStandingViewCandidates,
+                soundLandingScores: frozenSoundLandingScores,
+                capsulePresentationState: frozenPresentationState,
+                pendingCompletionOpen: frozenPendingCompletionOpen
             )
         }
         var copiedField = field
@@ -140,6 +153,7 @@ extension CognitiveSubstrate {
                 stateRevision: dirtyRevision,
                 thoughtSeedRevision: thoughtSeedRevision,
                 configuration: frozenConfiguration,
+                personalityDynamics: frozenDynamics,
                 snapshot: snapshot,
                 workspace: CognitiveWorkspaceSnapshot(generatedAt: fixedAt, items: []),
                 affect: fixedAffect,
@@ -148,7 +162,11 @@ extension CognitiveSubstrate {
                 standingViewInnerLine: frozenStandingViewInnerLine,
                 soundEchoLine: frozenSoundEchoLine,
                 feltProxies: CognitiveFeltProxyReads(
-                    fatigue: frozenFatigue, curiosity: nil, clarity: frozenClarity)
+                    fatigue: frozenFatigue, curiosity: nil, clarity: frozenClarity),
+                standingViewCapsuleCandidates: frozenStandingViewCandidates,
+                soundLandingScores: frozenSoundLandingScores,
+                capsulePresentationState: frozenPresentationState,
+                pendingCompletionOpen: frozenPendingCompletionOpen
             )
         }
         let sessionId = Self.cleanedSessionId(currentSessionId)
@@ -177,6 +195,7 @@ extension CognitiveSubstrate {
             stateRevision: dirtyRevision,
             thoughtSeedRevision: thoughtSeedRevision,
             configuration: frozenConfiguration,
+            personalityDynamics: frozenDynamics,
             snapshot: snapshot,
             workspace: workspace,
             affect: fixedAffect,
@@ -192,7 +211,11 @@ extension CognitiveSubstrate {
                 curiosity: substrateCuriosityProxy(
                     from: workspace.items.filter { capsuleEligibleWorkspaceNode($0.node) },
                     at: fixedAt),
-                clarity: frozenClarity)
+                clarity: frozenClarity),
+            standingViewCapsuleCandidates: frozenStandingViewCandidates,
+            soundLandingScores: frozenSoundLandingScores,
+            capsulePresentationState: frozenPresentationState,
+            pendingCompletionOpen: frozenPendingCompletionOpen
         )
     }
 

@@ -537,6 +537,244 @@ private func writeSeed(
     #expect(try Data(contentsOf: path) == malformedRow)
 }
 
+@Test func duplicateIDsAndMalformedAuthorityRowsFailClosedWithoutChangingBytes() async throws {
+    let root = try makeTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let inbox = SwiftNativeApprovalInbox(root: root)
+    let path = await inbox.approvalsPath
+    try FileManager.default.createDirectory(
+        at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+    let duplicate = try JSONValue.array([
+        seedRecord(id: "same", createdAt: "2026-05-30T01:00:00+00:00").toJSON(),
+        seedRecord(id: "same", createdAt: "2026-05-30T02:00:00+00:00").toJSON(),
+    ]).serializedData(pretty: true)
+    try duplicate.write(to: path)
+    await #expect(throws: ApprovalInboxError.self) {
+        _ = try await inbox.list(filter: .all)
+    }
+    await #expect(throws: ApprovalInboxError.self) {
+        _ = try await inbox.resolve("same", decision: .approved, decidedBy: "user")
+    }
+    #expect(try Data(contentsOf: path) == duplicate)
+
+    var malformed = seedRecord(
+        id: "bad-authority", createdAt: "2026-05-30T03:00:00+00:00"
+    ).toJSON()
+    guard case .object(var object) = malformed else {
+        Issue.record("expected object seed")
+        return
+    }
+    object["remoteResolvable"] = .string("false")
+    malformed = .object(object)
+    let malformedBytes = try JSONValue.array([malformed]).serializedData(pretty: true)
+    try malformedBytes.write(to: path)
+    await #expect(throws: ApprovalInboxError.self) {
+        _ = try await inbox.create(.object([
+            "title": .string("must not overwrite"),
+            "action": .string("workflow_step"),
+        ]))
+    }
+    #expect(try Data(contentsOf: path) == malformedBytes)
+}
+
+@Test func terminalLegacyRowsRemainReadableButPendingRowsRequireAuthorityFields() async throws {
+    let root = try makeTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let inbox = SwiftNativeApprovalInbox(root: root)
+    let path = await inbox.approvalsPath
+    try FileManager.default.createDirectory(
+        at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+    func withoutAuthority(_ record: ApprovalRecord) -> JSONValue {
+        guard case .object(var object) = record.toJSON() else { return .null }
+        object.removeValue(forKey: "remoteResolvable")
+        object.removeValue(forKey: "localOnly")
+        return .object(object)
+    }
+
+    let legacy = seedRecord(
+        id: "legacy-terminal",
+        status: "resolved",
+        createdAt: "2026-05-30T01:00:00+00:00",
+        resolvedAt: "2026-05-30T02:00:00+00:00",
+        decision: "approved"
+    )
+    try JSONValue.array([withoutAuthority(legacy)])
+        .serializedData(pretty: true).write(to: path)
+    #expect(try await inbox.get("legacy-terminal").localOnly == false)
+
+    let pending = seedRecord(
+        id: "legacy-pending", createdAt: "2026-05-30T03:00:00+00:00"
+    )
+    let pendingBytes = try JSONValue.array([withoutAuthority(pending)])
+        .serializedData(pretty: true)
+    try pendingBytes.write(to: path)
+    await #expect(throws: ApprovalInboxError.self) {
+        _ = try await inbox.get("legacy-pending")
+    }
+    #expect(try Data(contentsOf: path) == pendingBytes)
+}
+
+@Test func typedResolutionProvenanceIsDurableAndRemoteAuthorityIsAtomic() async throws {
+    let root = try makeTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let inbox = SwiftNativeApprovalInbox(root: root)
+
+    let localOnly = try await inbox.create(.object([
+        "title": .string("Local authority"),
+        "action": .string("memory.update"),
+        "payload": .object([:]),
+        "remoteResolvable": .bool(true),
+        "localOnly": .bool(false),
+    ]))
+    let path = await inbox.approvalsPath
+    let before = try Data(contentsOf: path)
+    await #expect(throws: ApprovalInboxError.self) {
+        _ = try await inbox.resolve(
+            localOnly.id,
+            decision: .approved,
+            provenance: .signedIOS(clientID: "iphone-1", decidedBy: "ios_signed_operator")
+        )
+    }
+    #expect(try Data(contentsOf: path) == before)
+
+    let remote = try await inbox.create(.object([
+        "title": .string("Remote authority"),
+        "action": .string("workflow_step"),
+        "payload": .object([:]),
+        "remoteResolvable": .bool(true),
+        "localOnly": .bool(false),
+    ]))
+    let resolved = try await inbox.resolve(
+        remote.id,
+        decision: .denied,
+        provenance: .signedIOS(clientID: "iphone-1", decidedBy: "ios_signed_operator")
+    )
+    #expect(resolved.decidedBy == "ios_signed_operator")
+    #expect(resolved.resolutionProvenance == .signedIOS(
+        clientID: "iphone-1", decidedBy: "ios_signed_operator"
+    ))
+    let reread = try await inbox.get(remote.id)
+    #expect(reread.resolutionProvenance == resolved.resolutionProvenance)
+}
+
+@Test func createRejectsContradictoryAuthorityBeforeWritingApprovalBytes() async throws {
+    let root = try makeTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let inbox = SwiftNativeApprovalInbox(root: root)
+    await #expect(throws: ApprovalInboxError.self) {
+        _ = try await inbox.create(.object([
+            "title": .string("Contradictory"),
+            "action": .string("workflow_step"),
+            "payload": .object([:]),
+            "remoteResolvable": .bool(false),
+            "localOnly": .bool(false),
+        ]))
+    }
+    let path = await inbox.approvalsPath
+    #expect(FileManager.default.fileExists(atPath: path.path) == false)
+}
+
+@Test func telegramResolutionBindsChatAndUserInsideInboxLock() async throws {
+    let root = try makeTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let inbox = SwiftNativeApprovalInbox(root: root)
+    let approval = try await inbox.create(.object([
+        "title": .string("Telegram authority"),
+        "action": .string("workflow_step"),
+        "payload": .object([
+            "telegram": .object(["chatId": .string("77")]),
+            "origin": .object(["userId": .string("11")]),
+        ]),
+        "remoteResolvable": .bool(true),
+        "localOnly": .bool(false),
+    ]))
+    let path = await inbox.approvalsPath
+    let before = try Data(contentsOf: path)
+    await #expect(throws: ApprovalInboxError.self) {
+        _ = try await inbox.resolve(
+            approval.id,
+            decision: .approved,
+            provenance: .telegram(chatID: "77", userID: "12")
+        )
+    }
+    #expect(try Data(contentsOf: path) == before)
+
+    let resolved = try await inbox.resolve(
+        approval.id,
+        decision: .approved,
+        provenance: .telegram(chatID: "77", userID: "11")
+    )
+    #expect(resolved.decidedBy == "telegram_verified_user")
+    #expect(resolved.resolutionProvenance == .telegram(chatID: "77", userID: "11"))
+}
+
+@Test func annotationUsesCheckedInboxMutationAndPreservesDamagedBytes() async throws {
+    let root = try makeTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let inbox = SwiftNativeApprovalInbox(root: root)
+    let approval = try await inbox.create(.object([
+        "title": .string("Annotate"),
+        "action": .string("workflow_step"),
+        "payload": .object([:]),
+    ]))
+    let annotated = try await inbox.annotateExecution(
+        approval.id,
+        executedAction: .object(["status": .string("ok")]),
+        detail: "executed"
+    )
+    #expect(annotated.detail == "executed")
+    #expect(annotated.executedAction == .object(["status": .string("ok")]))
+
+    let path = await inbox.approvalsPath
+    let damaged = Data("not-json".utf8)
+    try damaged.write(to: path)
+    await #expect(throws: ApprovalInboxError.self) {
+        _ = try await inbox.annotateExecution(
+            approval.id,
+            executedAction: .object(["status": .string("replacement")]),
+            detail: "must not overwrite"
+        )
+    }
+    #expect(try Data(contentsOf: path) == damaged)
+}
+
+@Test func existingEmptyWrongSchemaAndMalformedSpendStoresFailClosedByteForByte() async throws {
+    let root = try makeTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let inbox = SwiftNativeApprovalInbox(root: root)
+    let path = inbox.injectionSpendPath
+    try FileManager.default.createDirectory(
+        at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+    let damagedStores: [Data] = [
+        Data(),
+        try JSONValue.object([
+            "schema": .string("mac-injection-approval-spend.v0"),
+            "spends": .object([:]),
+        ]).serializedData(pretty: true),
+        try JSONValue.object([
+            "schema": .string(SwiftNativeApprovalInbox.injectionSpendSchema),
+            "spends": .object([
+                "approval-1": .object(["spentAt": .string("2026-08-16T00:00:00Z")]),
+            ]),
+        ]).serializedData(pretty: true),
+    ]
+
+    for bytes in damagedStores {
+        try bytes.write(to: path)
+        let outcome = await inbox.consumeInjectionApproval(
+            id: "approval-2",
+            digest: "digest",
+            tool: "mac_click",
+            surface: "chat"
+        )
+        #expect(outcome == .unavailable)
+        #expect(try Data(contentsOf: path) == bytes)
+    }
+}
+
 @Test func existingUnreadableStoreIsUnavailableAndNotReplaced() async throws {
     let root = try makeTempRoot()
     defer { try? FileManager.default.removeItem(at: root) }

@@ -8,14 +8,6 @@ import Observation
 import Security
 import CryptoKit
 
-// Legacy LAN QR payload format retained for one-time migration only.
-// Current pairing uses ICloudPairingPayload below.
-struct PairingPayload: Codable {
-    let server: String
-    let token: String
-    let version: String
-}
-
 // iCloud pairing secret QR payload format (Mac side must produce matching JSON):
 // {"type": "icloud_pairing", "secret": "<base64-encoded-32-bytes>", "version": "1"}
 struct ICloudPairingPayload: Codable {
@@ -27,8 +19,10 @@ struct ICloudPairingPayload: Codable {
 @MainActor
 final class PairingStore: ObservableObject {
     private enum Keys {
-        static let serverURL = "mobile.pairing.serverURL"
-        static let bearerToken = "mobile.pairing.bearerToken"
+        // Retired LAN/HTTP credentials. These names remain only so launch can
+        // erase values written by older builds.
+        static let retiredServerURL = "mobile.pairing.serverURL"
+        static let retiredBearerToken = "mobile.pairing.bearerToken"
         // PATCH-2026-05-07: icloud-bridge iCloud pairing flag
         static let iCloudPaired = "mobile.pairing.iCloudPaired"
         static let ignoredKVSPublishedAt = "mobile.pairing.ignoredKVSPublishedAt"
@@ -42,7 +36,7 @@ final class PairingStore: ObservableObject {
     private static let keychainAccount = "iCloudPairingSecret"
     private static let keychainService = "com.nativeagent.mobile"
 
-    private func loadSecretFromKeychain() -> Data? {
+    private func readSecretFromKeychain() -> (status: OSStatus, data: Data?) {
         let q: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: Self.keychainService,
@@ -52,87 +46,113 @@ final class PairingStore: ObservableObject {
         ]
         var item: CFTypeRef?
         let status = SecItemCopyMatching(q as CFDictionary, &item)
-        guard status == errSecSuccess, let data = item as? Data else { return nil }
-        return data
+        return (status, item as? Data)
     }
 
-    // R11-C8: saveSecretToKeychain now returns a status code so callers can detect
-    // failure. On add failure the previous value is restored to prevent data loss
-    // during a transient Keychain error (e.g. Keychain locked mid-re-pair).
+    private func loadSecretFromKeychain() -> Data? {
+        let result = readSecretFromKeychain()
+        guard result.status == errSecSuccess else { return nil }
+        return result.data
+    }
+
+    /// Transaction algorithm is closure-injected so failure boundaries are
+    /// provable without mutating a developer's real Keychain in tests.
+    static func persistSecretTransaction(
+        _ data: Data,
+        read: () -> (OSStatus, Data?),
+        update: (Data) -> OSStatus,
+        add: (Data) -> OSStatus
+    ) -> OSStatus {
+        guard data.count == 32 else { return errSecParam }
+        let existing = read()
+        let writeStatus: OSStatus
+        switch existing.0 {
+        case errSecSuccess:
+            writeStatus = update(data)
+        case errSecItemNotFound:
+            let addStatus = add(data)
+            // Another process may have created the item between read and add.
+            writeStatus = addStatus == errSecDuplicateItem ? update(data) : addStatus
+        default:
+            return existing.0
+        }
+        guard writeStatus == errSecSuccess else { return writeStatus }
+        let verified = read()
+        guard verified.0 == errSecSuccess, verified.1 == data else { return errSecDecode }
+        return errSecSuccess
+    }
+
+    static func deleteSecretTransaction(
+        read: () -> (OSStatus, Data?),
+        delete: () -> OSStatus
+    ) -> OSStatus {
+        let deleteStatus = delete()
+        guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
+            return deleteStatus
+        }
+        let verified = read()
+        return verified.0 == errSecItemNotFound ? errSecSuccess : errSecDecode
+    }
+
     @discardableResult
     private func saveSecretToKeychain(_ data: Data) -> OSStatus {
-        let q: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.keychainService,
-            kSecAttrAccount as String: Self.keychainAccount,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
-        ]
-        // Read existing value before deleting so we can restore on failure.
-        let previousData = loadSecretFromKeychain()
-        SecItemDelete(q as CFDictionary)
-        var add = q
-        add[kSecValueData as String] = data
-        let addStatus = SecItemAdd(add as CFDictionary, nil)
-        if addStatus != errSecSuccess {
-            // Restore previous value to avoid erasing a durable secret.
-            if let prev = previousData {
-                SecItemDelete(q as CFDictionary)
-                var restore = q
-                restore[kSecValueData as String] = prev
-                SecItemAdd(restore as CFDictionary, nil)
+        Self.persistSecretTransaction(
+            data,
+            read: { self.readSecretFromKeychain() },
+            update: { value in
+                let query: [String: Any] = [
+                    kSecClass as String: kSecClassGenericPassword,
+                    kSecAttrService as String: Self.keychainService,
+                    kSecAttrAccount as String: Self.keychainAccount,
+                ]
+                let attributes: [String: Any] = [
+                    kSecValueData as String: value,
+                    kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+                ]
+                return SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+            },
+            add: { value in
+                let query: [String: Any] = [
+                    kSecClass as String: kSecClassGenericPassword,
+                    kSecAttrService as String: Self.keychainService,
+                    kSecAttrAccount as String: Self.keychainAccount,
+                    kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+                    kSecValueData as String: value,
+                ]
+                return SecItemAdd(query as CFDictionary, nil)
             }
-            NSLog("[PairingStore] saveSecretToKeychain failed (status=\(addStatus)); previous value restored")
-        }
-        return addStatus
+        )
     }
 
-    private func deleteSecretFromKeychain() {
-        let q: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.keychainService,
-            kSecAttrAccount as String: Self.keychainAccount,
-        ]
-        SecItemDelete(q as CFDictionary)
+    @discardableResult
+    private func deleteSecretFromKeychain() -> OSStatus {
+        Self.deleteSecretTransaction(
+            read: { self.readSecretFromKeychain() },
+            delete: {
+                let query: [String: Any] = [
+                    kSecClass as String: kSecClassGenericPassword,
+                    kSecAttrService as String: Self.keychainService,
+                    kSecAttrAccount as String: Self.keychainAccount,
+                ]
+                return SecItemDelete(query as CFDictionary)
+            }
+        )
     }
 
-    // DAEMON-KILL: legacy HTTP creds, not used for transport; retained for
-    // migration compatibility and deprecated UI guards only.
-    @Published var serverURL: String {
-        didSet { UserDefaults.standard.set(serverURL, forKey: Keys.serverURL) }
-    }
-    @Published var bearerToken: String {
-        didSet { UserDefaults.standard.set(bearerToken, forKey: Keys.bearerToken) }
-    }
     // PATCH-2026-05-07: icloud-bridge true when user connected via iCloud (no bearer token needed)
     @Published var isICloudPaired: Bool {
         didSet { UserDefaults.standard.set(isICloudPaired, forKey: Keys.iCloudPaired) }
     }
     // 32-byte HMAC key shared with the Mac; nil until user scans or pastes the pairing key.
     // v1: stored in Keychain (kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly — device-local, no iCloud sync).
-    @Published var iCloudPairingSecret: Data? {
-        didSet {
-            guard !isApplyingPersistedSecret else { return }
-            if let data = iCloudPairingSecret {
-                saveSecretToKeychain(data)
-            } else {
-                deleteSecretFromKeychain()
-            }
-        }
-    }
-    private var isApplyingPersistedSecret = false
+    // Persistence is owned only by installPairingSecret/clearPairing. Keeping
+    // the published value free of a side-effecting observer prevents a failed
+    // Keychain mutation from being represented as committed UI/runtime state.
+    @Published var iCloudPairingSecret: Data? = nil
 
-    /// True when any pairing method is configured.
-    /// DAEMON-KILL 2026-06-02: HTTP/bearer creds no longer constitute a real
-    /// pairing — only iCloud signed transport counts. Stale serverURL/token in
-    /// UserDefaults must NOT show the app as paired.
+    /// True when signed iCloud pairing is configured.
     var isPaired: Bool {
         isICloudPaired && isICloudSigned
-    }
-
-    /// DAEMON-KILL: true when legacy HTTP/bearer creds are present.
-    /// Retained only for migration/debug visibility; no longer a pairing signal.
-    var isHTTPPaired: Bool {
-        !serverURL.isEmpty && !bearerToken.isEmpty
     }
 
     /// True when the 32-byte HMAC secret is present (messages can be signed)
@@ -167,8 +187,11 @@ final class PairingStore: ObservableObject {
     }
 
     init() {
-        serverURL = UserDefaults.standard.string(forKey: Keys.serverURL) ?? ""
-        bearerToken = UserDefaults.standard.string(forKey: Keys.bearerToken) ?? ""
+        // HTTP/LAN transport is retired. Purge credentials from older builds
+        // rather than carrying an inert bearer token indefinitely. Repeating
+        // these idempotent removals also covers an upgrade after a downgrade.
+        UserDefaults.standard.removeObject(forKey: Keys.retiredServerURL)
+        UserDefaults.standard.removeObject(forKey: Keys.retiredBearerToken)
         isICloudPaired = UserDefaults.standard.bool(forKey: Keys.iCloudPaired)
 
         // Load from Keychain (v1). If absent, attempt one-time migration from legacy UserDefaults (v0).
@@ -192,41 +215,13 @@ final class PairingStore: ObservableObject {
             // AFTER confirming the Keychain write succeeded. Otherwise a
             // failed SecItemAdd (e.g. Keychain locked) would lose the secret
             // entirely.
-            let q: [String: Any] = [
-                kSecClass as String: kSecClassGenericPassword,
-                kSecAttrService as String: PairingStore.keychainService,
-                kSecAttrAccount as String: PairingStore.keychainAccount,
-                kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
-                kSecValueData as String: data,
-            ]
-            let addStatus = SecItemAdd(q as CFDictionary, nil)
-            if addStatus == errSecSuccess {
+            let saveStatus = saveSecretToKeychain(data)
+            if saveStatus == errSecSuccess {
                 // Fresh add succeeded — safe to clear legacy storage now.
                 UserDefaults.standard.removeObject(forKey: Keys.iCloudPairingSecretLegacy)
-            } else if addStatus == errSecDuplicateItem {
-                // R11-C8: Item already exists — verify the existing item passes the
-                // 32-byte check before clearing legacy storage. If it fails the check,
-                // overwrite with the legacy value instead of leaving a corrupt entry.
-                let existingOk = (loadSecretFromKeychain()?.count ?? 0) == 32
-                if existingOk {
-                    UserDefaults.standard.removeObject(forKey: Keys.iCloudPairingSecretLegacy)
-                } else {
-                    // Overwrite corrupt Keychain entry with the known-good legacy value.
-                    SecItemDelete(q as CFDictionary)
-                    var fix = q
-                    fix[kSecValueData as String] = data
-                    let fixStatus = SecItemAdd(fix as CFDictionary, nil)
-                    if fixStatus == errSecSuccess {
-                        UserDefaults.standard.removeObject(forKey: Keys.iCloudPairingSecretLegacy)
-                    } else {
-                        NSLog("[PairingStore] Keychain overwrite of corrupt entry failed (status=\(fixStatus)); keeping legacy storage")
-                    }
-                }
             } else {
                 // Keep legacy UserDefaults so we don't lose the secret.
-                // Property setter (didSet) will write to UserDefaults again,
-                // so it stays as a backup until next launch.
-                NSLog("[PairingStore] Keychain migration failed (status=\(addStatus)); keeping legacy storage")
+                NSLog("[PairingStore] Keychain migration failed (status=\(saveStatus)); keeping legacy storage")
             }
             iCloudPairingSecret = data
         } else {
@@ -328,14 +323,17 @@ final class PairingStore: ObservableObject {
     /// validated before the existing PairingStore transaction writes Keychain;
     /// no bridge or transport may become a second persistence owner.
     @discardableResult
-    func applyCloudKitPairingSecret(_ data: Data) -> Bool {
+    func applyCloudKitPairingSecret(
+        _ data: Data,
+        persist: ((Data) -> OSStatus)? = nil
+    ) -> Bool {
         guard shouldAcceptCloudKitPairingSecret(data) else {
             return false
         }
         if iCloudPairingSecret == data, isICloudPaired {
             return true
         }
-        return installPairingSecret(data, source: "CloudKit")
+        return installPairingSecret(data, source: "CloudKit", persist: persist)
     }
 
     /// A deliberate unpair ignores only the exact secret that was cleared.
@@ -348,9 +346,12 @@ final class PairingStore: ObservableObject {
     }
 
     /// Keychain-first pairing transaction. Published/UI state changes only
-    /// after the durable write succeeds, and the property observer is suppressed
-    /// so the successful transaction is not immediately repeated.
-    private func installPairingSecret(_ data: Data, source: String) -> Bool {
+    /// after the durable write and exact read-back succeed.
+    private func installPairingSecret(
+        _ data: Data,
+        source: String,
+        persist: ((Data) -> OSStatus)? = nil
+    ) -> Bool {
         guard data.count == 32 else {
             NSLog("[PairingStore] \(source) pairing rejected: expected 32 bytes, received \(data.count)")
             return false
@@ -358,32 +359,23 @@ final class PairingStore: ObservableObject {
         if loadSecretFromKeychain() == data, isICloudPaired {
             return false
         }
-        let writeStatus = saveSecretToKeychain(data)
+        let writeStatus = persist?(data) ?? saveSecretToKeychain(data)
         guard writeStatus == errSecSuccess else {
             NSLog("[PairingStore] \(source) pairing Keychain write failed (status=\(writeStatus))")
             return false
         }
-        isApplyingPersistedSecret = true
         iCloudPairingSecret = data
-        isApplyingPersistedSecret = false
         isICloudPaired = true
         UserDefaults.standard.removeObject(forKey: Keys.ignoredCloudKitSecretHash)
         NSLog("[PairingStore] \(source) pairing installed transactionally")
         return true
     }
 
-    /// Phase 14e-iCloud HMAC self-heal: force re-read of the HMAC secret from
-    /// KVS, bypassing `ignoredKVSPublishedAt` (which would otherwise suppress
-    /// a re-pair when the user had previously cleared pairing). Clears the
-    /// cached Keychain entry first so the next signed message uses the
-    /// authoritative KVS material. Returns true if a NEW secret landed.
+    /// Re-read HMAC material from KVS without weakening deliberate-unpair
+    /// suppression. Returns true only when a different secret is durably
+    /// installed in Keychain.
     @discardableResult
     func refreshFromKVS() async -> Bool {
-        // Clear the strict-vs-stale ignore stamp so the new secret can land
-        // even if clearPairing() set one. ignoredKVSPublishedAt is intended
-        // for a deliberate unpair; a signature_invalid_resync hint means the
-        // user wants to be paired and the cached state is wrong.
-        UserDefaults.standard.removeObject(forKey: Keys.ignoredKVSPublishedAt)
         // Synchronize first so we get the freshest KVS state — but under the
         // same timeout wrapper the launch path uses: this self-heal fires
         // precisely when KVS/cloudd is misbehaving (signature resync), and a
@@ -398,7 +390,7 @@ final class PairingStore: ObservableObject {
             NSLog("[PairingStore] refreshFromKVS: new HMAC secret installed")
             return true
         }
-        return applied
+        return false
     }
 
     /// KVS change observer for auto-bootstrap.  Follows the nonisolated + MainActor-hop
@@ -414,16 +406,9 @@ final class PairingStore: ObservableObject {
         }
     }
 
-    func applyPairingPayload(_ payload: PairingPayload) {
-        serverURL = payload.server
-        bearerToken = payload.token
-        isICloudPaired = false
-    }
-
     // PATCH-2026-05-07: icloud-bridge set iCloud as the active transport
     func applyICloudPairing() {
         isICloudPaired = true
-        // Optionally keep any previously stored HTTP creds as fallback
     }
 
     /// Apply an iCloud HMAC pairing secret decoded from a QR code or pasted key.
@@ -436,9 +421,13 @@ final class PairingStore: ObservableObject {
         return installPairingSecret(data, source: "manual")
     }
 
-    func clearPairing() {
-        serverURL = ""
-        bearerToken = ""
+    @discardableResult
+    func clearPairing(deleteSecret: (() -> OSStatus)? = nil) -> Bool {
+        let deleteStatus = deleteSecret?() ?? deleteSecretFromKeychain()
+        guard deleteStatus == errSecSuccess else {
+            NSLog("[PairingStore] clear pairing refused: Keychain delete/read-back failed (status=\(deleteStatus))")
+            return false
+        }
         let publishedAt = NSUbiquitousKeyValueStore.default.string(forKey: KVSPairingKey.publishedAt) ?? ISO8601DateFormatter().string(from: Date())
         UserDefaults.standard.set(publishedAt, forKey: Keys.ignoredKVSPublishedAt)
         if let secret = iCloudPairingSecret {
@@ -449,17 +438,11 @@ final class PairingStore: ObservableObject {
         }
         isICloudPaired = false
         iCloudPairingSecret = nil
+        return true
     }
 
     private static func secretHash(_ data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-    }
-
-    // PATCH-2026-06-02: runtime cutover — HTTP pairing extend retired. iCloud transport
-    // has no TTL handshake; the call is now a no-op shim that reports success.
-    func extendPairing(token: String) async -> (success: Bool, message: String) {
-        _ = token
-        return (true, "iCloud transport — no pairing TTL to extend.")
     }
 
     /// R11-N29: Computed property so it recomputes from current expiry whenever

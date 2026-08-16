@@ -372,6 +372,31 @@ func lockSignalDetection() {
     #expect(!ActivityWatcher.isLockSignal(bundleId: "com.apple.Terminal", localizedName: "Terminal"))
 }
 
+@Test("QUERY: bundle filter is applied before the source-row limit")
+func bundleFilterPrecedesLimit() async throws {
+    let store = try hermeticStore()
+    for index in 0..<4 {
+        try await store.openSpan(ActivitySpan(
+            id: "other-\(index)", startedAt: base + Double(index),
+            endedAt: base + Double(index) + 1, lastSeenAt: base + Double(index) + 1,
+            bundleId: "com.example.other", appName: "Other", eventCount: 1,
+            closeReason: .idle, tzOffsetMin: 0
+        ))
+    }
+    try await store.openSpan(ActivitySpan(
+        id: "wanted", startedAt: base + 10, endedAt: base + 11,
+        lastSeenAt: base + 11, bundleId: "com.example.wanted", appName: "Wanted",
+        eventCount: 1, closeReason: .idle, tzOffsetMin: 0
+    ))
+
+    let rows = try await store.spansOverlapping(
+        from: base, to: base + 20, limit: 1,
+        policy: ActivityPolicy(captureEnabled: true),
+        bundleID: "com.example.wanted"
+    )
+    #expect(rows.map(\.id) == ["wanted"])
+}
+
 /// Writes a byte-accurate v0-era `activity_span` database, migration stamp and
 /// all. Synchronous on purpose: inside an async test, GRDB's `write` resolves to
 /// its async overload, and the point here is to build the file the OLD way.

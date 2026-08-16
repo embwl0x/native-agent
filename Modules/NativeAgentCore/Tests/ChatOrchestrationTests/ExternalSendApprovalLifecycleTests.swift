@@ -129,3 +129,43 @@ private func writeAgentMailFixtureConfig(_ root: URL) throws {
     let approvals = try await SwiftNativeApprovalInbox(root: root).list(filter: .all)
     #expect(approvals.isEmpty)
 }
+
+@Test func trustedCallerCanBindAStableExternalSendIdempotencyKey() async throws {
+    let root = try makeExternalSendTempRoot("stable-idempotency")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let staged = try await ExternalSendApprovalLifecycle.stage(
+        invokedAs: "slack.post_message",
+        input: [
+            "channel": .string("C123"),
+            "text": .string("scheduled body"),
+            "_nativeAgentSchedulerOccurrenceKey": .string("must-not-be-inferred"),
+        ],
+        surface: "scheduler",
+        idempotencyKey: "  scheduler-occurrence-42  ",
+        dataRoot: root
+    )
+
+    let replay = try #require(ExternalSendApprovalRequest(record: staged.approval))
+    #expect(replay.idempotencyKey == "scheduler-occurrence-42")
+    #expect(replay.input["_nativeAgentSchedulerOccurrenceKey"] == nil)
+}
+
+@Test func invalidExplicitExternalSendIdempotencyKeyCreatesNoApproval() async throws {
+    let root = try makeExternalSendTempRoot("invalid-idempotency")
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    do {
+        _ = try await ExternalSendApprovalLifecycle.stage(
+            invokedAs: "slack.post_message",
+            input: ["channel": .string("C123"), "text": .string("scheduled body")],
+            surface: "scheduler",
+            idempotencyKey: String(repeating: "x", count: 129),
+            dataRoot: root
+        )
+        Issue.record("Oversized explicit idempotency key was accepted")
+    } catch {
+        #expect(error.localizedDescription.contains("1 to 128"))
+    }
+    let approvals = try await SwiftNativeApprovalInbox(root: root).list(filter: .all)
+    #expect(approvals.isEmpty)
+}

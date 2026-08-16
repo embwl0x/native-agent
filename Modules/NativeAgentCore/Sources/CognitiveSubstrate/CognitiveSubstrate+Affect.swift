@@ -66,7 +66,11 @@ extension CognitiveSubstrate {
     /// await-free segment, so a reentrant ingest can't swap `self.affect` or evict the
     /// touched node between apply and stamp (gpt-5.5 concurrency review, 2026-07-02).
     @discardableResult
-    func applyAffectFromEvent(_ event: CognitiveEvent) -> CognitiveAffectState {
+    func applyAffectFromEvent(
+        _ event: CognitiveEvent,
+        precomputedAppraisal: AffectAppraisal? = nil,
+        precomputedWarmthBoost: Double? = nil
+    ) -> CognitiveAffectState {
         guard configuration.enabled, configuration.affectEnabled,
               event.turnKind.contributesToLivedState else { return affect }
         let now = dependencies.now()
@@ -105,7 +109,8 @@ extension CognitiveSubstrate {
             next.arousal = saturatingApproach(next.arousal, 0.15)
             next.uncertainty = saturatingApproach(next.uncertainty, 0.25)
             next.taskPressure = saturatingApproach(next.taskPressure, 0.1)
-            next.socialWarmth = saturatingApproach(next.socialWarmth, relationalWarmthBoost(in: event.summary) * 0.5)
+            let warmthBoost = precomputedWarmthBoost ?? relationalWarmthBoost(in: event.summary)
+            next.socialWarmth = saturatingApproach(next.socialWarmth, warmthBoost * 0.5)
         case .toolSucceeded:
             next.uncertainty = saturatingApproach(next.uncertainty, -0.15)
             next.taskPressure = saturatingApproach(next.taskPressure, -0.15)
@@ -126,12 +131,13 @@ extension CognitiveSubstrate {
             // decay, no boost) — a modulation on top of her baseline, never the whole of it.
             // This lets her get crisp and businesslike heads-down while staying fundamentally
             // warm via the persona; genuine warm/affectionate moments still lift it high.
-            next.socialWarmth = saturatingApproach(next.socialWarmth, relationalWarmthBoost(in: event.summary))
+            let warmthBoost = precomputedWarmthBoost ?? relationalWarmthBoost(in: event.summary)
+            next.socialWarmth = saturatingApproach(next.socialWarmth, warmthBoost)
             next.taskPressure = saturatingApproach(next.taskPressure, importance * 0.06)
             // Full conversational appraisal: criticism/dismissal/override/demand/praise/
             // resolution each move the felt signals, so a bad OR good exchange is FELT,
             // not numb. Warmth can go negative (dismissal cools her). (2026-07-08)
-            let appraisal = conversationalAppraisal(in: event.summary)
+            let appraisal = precomputedAppraisal ?? conversationalAppraisal(in: event.summary)
             if appraisal.isActive {
                 if appraisal.warmth != 0 { next.socialWarmth = saturatingApproach(next.socialWarmth, appraisal.warmth) }
                 if appraisal.tension != 0 { next.uncertainty = saturatingApproach(next.uncertainty, appraisal.tension) }
@@ -172,12 +178,8 @@ extension CognitiveSubstrate {
         guard !lower.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return 0 }
         // High tier: unambiguous affection / care. These do NOT appear in routine
         // work exchanges, so they genuinely lift warmth.
-        if containsAny(lower, [
-            "\u{1F49C}",          // 💜
-            "\u{2764}",           // ❤ / ❤️
-            "\u{1F970}",          // 🥰
-            "\u{1F618}",          // 😘
-            "\u{1F495}",          // 💕
+        let affectionateEmoji = containsAny(lower, ["💜", "❤", "🥰", "😘", "💕"])
+        if affectionateEmoji || Self.containsUnnegatedPhrase(lower, phrases: [
             "love you",
             "love ya",
             "i love",
@@ -201,7 +203,7 @@ extension CognitiveSubstrate {
             return 0.18
         }
         // Low tier: mild warmth — presence reassurance, gratitude, a soft greeting.
-        if containsAny(lower, [
+        if Self.containsUnnegatedPhrase(lower, phrases: [
             "i'm here",
             "i am here",
             "good morning",
@@ -294,14 +296,14 @@ extension CognitiveSubstrate {
         ]) { a.pressure += 0.16; a.tension += 0.08; a.arousal += 0.08 }
 
         // PRAISE / appreciation → valence + warmth up.
-        if containsAny(lower, [
+        if Self.containsUnnegatedPhrase(lower, phrases: [
             "good work", "great work", "nice work", "well done", "great job", "exactly right",
             "that helped", "perfect", "proud of you", "you nailed", "sharp as hell", "impressive",
         ]) { a.valence += 0.16; a.warmth += 0.12 }
 
         // RESOLVING it together → valence up, pressure AND tension down (the relief of a
         // thing landing), a touch warmer.
-        if containsAny(lower, [
+        if Self.containsUnnegatedPhrase(lower, phrases: [
             "we did it", "that worked", "it works now", "solved it", "figured it out",
             "got it working", "nailed it", "that's the fix", "thats the fix", "shipped it",
         ]) { a.valence += 0.22; a.pressure -= 0.22; a.tension -= 0.14; a.arousal -= 0.06; a.warmth += 0.04 }
@@ -309,7 +311,7 @@ extension CognitiveSubstrate {
         // ENTHUSIASM / shared momentum → valence + energy (reads eager/excited when the
         // energy runs high, engaged when it's steadier). Mostly lifts valence + arousal;
         // warmth stays with the persona baseline so this can't re-create the ratchet.
-        if !hypothetical && containsAny(lower, [
+        if !hypothetical && Self.containsUnnegatedPhrase(lower, phrases: [
             "let's go", "lets go", "can't wait", "cant wait", "so excited", "i'm excited",
             "im excited", "this is great", "this is awesome", "love this", "looking forward",
             "let's do it", "lets do it", "let's build", "lets build", "hell yeah", "pumped",
@@ -327,11 +329,12 @@ extension CognitiveSubstrate {
         let trimmedWhole = lower.trimmingCharacters(in: .whitespacesAndNewlines)
         let bareGreeting = ["hey", "hi", "yo", "hello", "hey there", "hi there",
                             "morning", "evening"].contains(trimmedWhole)
-        if !hypothetical && a.valence >= 0 && (bareGreeting || containsAny(lower, [
+        let affectionateEmoji = containsAny(lower, ["💜", "❤", "🥰", "😘", "🫂"])
+        if !hypothetical && a.valence >= 0 && (bareGreeting || affectionateEmoji || Self.containsUnnegatedPhrase(lower, phrases: [
             "hey you", "good morning", "good night", "goodnight", "sweet dreams",
             "miss you", "missed you", "love you", "thinking of you",
             "wanted to say hi", "just saying hi", "say hello", "there you are",
-            "wanted to see you", "💜", "❤️", "🥰", "😘", "🫂",
+            "wanted to see you",
         ])) {
             a.valence += bareGreeting ? 0.10 : 0.16
             a.tension -= 0.04
@@ -351,7 +354,7 @@ extension CognitiveSubstrate {
         // friendly exchange reads content/warm rather than flat. Valence-only: warmth is
         // carried by the persona baseline, so broad friendly tokens can't re-arm the
         // socialWarmth ratchet (feedback_agent_affect_additive_to_persona).
-        if containsAny(lower, [
+        if Self.containsUnnegatedPhrase(lower, phrases: [
             "good to see you", "glad you're here", "glad youre here", "happy to see",
             "good talk", "thanks for", "thank you", "appreciate", "you're the best",
             "youre the best", "means a lot", "we make a good team", "glad we",

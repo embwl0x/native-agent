@@ -55,64 +55,6 @@ struct CapabilityRecord: Identifiable, Codable, Hashable {
     var updatedAt: String?
 }
 
-struct CapabilityFoundrySummary: Codable, Hashable {
-    var status: String
-    var principle: String?
-    var hotPathContract: CapabilityFoundryHotPath?
-    var summary: CapabilityFoundryCounts
-    var lanes: [CapabilityFoundryLane]
-    var reviewQueue: [CapabilityFoundryArtifact]
-    var recentArtifacts: [CapabilityFoundryArtifact]
-    var readouts: [CapabilityFoundryReadout]
-    var createdAt: String?
-}
-
-struct CapabilityFoundryHotPath: Codable, Hashable {
-    var chatInjection: String?
-    var bodiesLoaded: String?
-    var pluginPolicy: String?
-    var reviewRequiredFor: [String]?
-    var riskyPermissionsPresent: [String]?
-}
-
-struct CapabilityFoundryCounts: Codable, Hashable {
-    var total: Int
-    var active: Int
-    var review: Int
-    var autoCreated: Int
-    var byKind: [String: Int]?
-}
-
-struct CapabilityFoundryLane: Identifiable, Codable, Hashable {
-    var id: String
-    var title: String
-    var status: String
-    var count: Int
-    var reviewCount: Int
-    var endpoint: String?
-    var policyGate: String?
-    var hotPath: String?
-}
-
-struct CapabilityFoundryArtifact: Identifiable, Codable, Hashable {
-    var id: String
-    var kind: String
-    var name: String
-    var status: String
-    var description: String?
-    var riskClass: String?
-    var autoCreated: Bool?
-    var sourceRunId: String?
-    var updatedAt: String?
-}
-
-struct CapabilityFoundryReadout: Identifiable, Codable, Hashable {
-    var id: String
-    var title: String
-    var status: String
-    var surface: String?
-}
-
 struct IntentRoutePlan: Identifiable, Codable, Hashable {
     var id: String
     var message: String

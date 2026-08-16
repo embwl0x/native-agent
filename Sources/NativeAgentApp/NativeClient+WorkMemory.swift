@@ -39,7 +39,6 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-import CapabilityFoundry
 
 extension NativeClient {
     func getWorkshopExecutions() async throws -> [WorkshopExecutionRecord] {
@@ -100,7 +99,9 @@ extension NativeClient {
         // NativeAgentShared.MemoryRecord shape the UI uses (its memberwise
         // init is internal, so we round-trip through JSON).
         let dataRoot = PersistenceCore.defaultDataRoot()
-        guard let storage = try? MemoryStorage(dataRoot: dataRoot) else { return [] }
+        guard let storage = try? await SwiftNativeMemoryV2.resolvedStorage(
+            dataRoot: dataRoot
+        ) else { return [] }
         let stored: [StoredMemory]
         do {
             stored = try await storage.listMemories(persona: nil, status: "active", limit: 200)

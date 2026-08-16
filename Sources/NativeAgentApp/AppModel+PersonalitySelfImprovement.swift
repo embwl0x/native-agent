@@ -40,7 +40,6 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-import CapabilityFoundry
 
 @MainActor
 extension AppModel {
@@ -400,28 +399,6 @@ extension AppModel {
             _ = try await client.rejectTrainingProposal(id: id, reason: reason)
             statusText = "Proposal rejected"
             await loadTrainingProposals()
-        } catch {
-            selfImprovementError = "Reject failed: \(error.localizedDescription)"
-        }
-    }
-
-    @MainActor
-    func approvePromotionCandidate(id: String) async {
-        do {
-            _ = try await client.approvePromotionPending(id: id)
-            statusText = "Promotion approved"
-            await loadAllSelfImprovement()
-        } catch {
-            selfImprovementError = "Approve failed: \(error.localizedDescription)"
-        }
-    }
-
-    @MainActor
-    func rejectPromotionCandidate(id: String, reason: String) async {
-        do {
-            _ = try await client.rejectPromotionPending(id: id, reason: reason)
-            statusText = "Promotion rejected"
-            await loadAllSelfImprovement()
         } catch {
             selfImprovementError = "Reject failed: \(error.localizedDescription)"
         }

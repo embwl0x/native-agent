@@ -4,6 +4,7 @@ import PersistenceCore
 
 public enum SlackConnectorActions {
     private static let baseURL = URL(string: "https://slack.com/api")!
+    static let jsonContentType = "application/json; charset=utf-8"
 
     /// Validate local Slack authentication without making a network request.
     /// Completion delivery uses this before recording that dispatch began so a
@@ -235,7 +236,10 @@ public enum SlackConnectorActions {
         req.timeoutInterval = 30
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         if httpMethod != "GET" {
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            // Slack accepts JSON without an explicit charset, but returns a
+            // `missing_charset` response warning. Keep every JSON action on
+            // the same quiet, explicit UTF-8 transport contract.
+            req.setValue(jsonContentType, forHTTPHeaderField: "Content-Type")
             let bodyObject: [String: Any]
             if let jsonBody {
                 bodyObject = jsonBody

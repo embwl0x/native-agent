@@ -37,7 +37,6 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-import CapabilityFoundry
 
 // W-H Band (U5 decomposition, move-only): skill/tool/connector/workspace/
 // personality mutation routes (updateSkill, deleteSkill, updateTool,

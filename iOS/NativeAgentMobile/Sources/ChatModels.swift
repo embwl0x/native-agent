@@ -46,7 +46,7 @@ struct ToolEvent: Codable, Equatable, Identifiable {
     let seq: Int
 }
 
-struct ChatMessage: Identifiable, Codable {
+struct ChatMessage: Identifiable, Codable, Equatable {
     enum Role: String, Codable { case user, assistant }
     let id: UUID
     let role: Role

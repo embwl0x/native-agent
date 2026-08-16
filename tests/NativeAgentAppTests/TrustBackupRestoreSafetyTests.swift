@@ -1,6 +1,8 @@
 import Foundation
 import Testing
 import PersistenceCore
+import ApprovalInbox
+import MemoryV2
 @testable import NativeAgentApp
 
 @Suite("Trust backup restore safety")
@@ -21,6 +23,31 @@ struct TrustBackupRestoreSafetyTests {
         #expect(!NativeClient.productionExportRelativePaths.contains("missions"))
     }
 
+    @Test func backupUsesCoherentMemoryDatabaseAndOmitsChatLockSidecars() async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try MemoryStorage(dataRoot: root)
+        try write(
+            #"[{"id":"chat-1","title":"Chat","createdAt":"2026-08-16T00:00:00Z"}]"#,
+            to: "chat/sessions.json",
+            under: root
+        )
+        try write("stale lock bytes", to: "chat/sessions.json.lock", under: root)
+        try write("{\"role\":\"user\",\"content\":\"hello\"}\n", to: "chat/messages/chat-1.jsonl", under: root)
+        try write("stale lock bytes", to: "chat/messages/chat-1.jsonl.lock", under: root)
+
+        let backup = try await NativeClient.createBackup(reason: "coherent stores", dataRoot: root)
+        let data = URL(fileURLWithPath: backup.path).appendingPathComponent("data", isDirectory: true)
+
+        #expect(FileManager.default.fileExists(atPath: data.appendingPathComponent("memory/memory.sqlite").path))
+        #expect(!FileManager.default.fileExists(atPath: data.appendingPathComponent("memory/memory.sqlite-wal").path))
+        #expect(!FileManager.default.fileExists(atPath: data.appendingPathComponent("memory/memory.sqlite-shm").path))
+        _ = try MemoryStorage(dataRoot: data)
+        #expect(!FileManager.default.fileExists(atPath: data.appendingPathComponent("chat/sessions.json.lock").path))
+        #expect(!FileManager.default.fileExists(atPath: data.appendingPathComponent("chat/messages/chat-1.jsonl.lock").path))
+        #expect(try read("chat/messages/chat-1.jsonl", under: data).contains("hello"))
+    }
+
     @Test func restoreCreatesSafetyBackupBeforeReplacingLiveData() async throws {
         let root = try makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -29,9 +56,15 @@ struct TrustBackupRestoreSafetyTests {
         let target = try await NativeClient.createBackup(reason: "before policy migration", dataRoot: root)
         try write(trustPolicy("current"), to: "trust/policy.json", under: root)
 
-        let result = try await NativeClient.restoreBackup(id: target.id, dataRoot: root)
+        let staged = try await NativeClient.restoreBackup(id: target.id, dataRoot: root)
+
+        #expect(staged.requiresRestart)
+        #expect(try read("trust/policy.json", under: root) == trustPolicy("current"))
+        let resumed = try NativeClient.resumeStagedBackupRestoreAtLaunch(dataRoot: root)
+        let result = try #require(resumed)
 
         #expect(try read("trust/policy.json", under: root) == trustPolicy("target"))
+        #expect(!result.requiresRestart)
         #expect(result.restored.contains("trust"))
         let records = try NativeClient.readBackupRecords(root: root)
         let safety = try #require(records.first(where: { $0.id != target.id }))
@@ -114,6 +147,8 @@ struct TrustBackupRestoreSafetyTests {
         await gate.resume()
         _ = try await registryLock.value
         _ = try await firstRestore.value
+        #expect(try read("trust/policy.json", under: root) == trustPolicy("current"))
+        _ = try NativeClient.resumeStagedBackupRestoreAtLaunch(dataRoot: root)
         #expect(try read("trust/policy.json", under: root) == trustPolicy("target"))
     }
 
@@ -206,6 +241,250 @@ struct TrustBackupRestoreSafetyTests {
         )
     }
 
+    @Test func restoreIgnoresRegistryPathAndDerivesSourceUnderBackupRoot() async throws {
+        let root = try makeTempRoot()
+        let outside = try makeTempRoot()
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        try write(trustPolicy("target"), to: "trust/policy.json", under: root)
+        let target = try await NativeClient.createBackup(reason: "contained source", dataRoot: root)
+        try write(trustPolicy("outside"), to: "data/trust/policy.json", under: outside)
+        try rewriteBackupRegistryPath(root: root, id: target.id, path: outside.path)
+        try write(trustPolicy("current"), to: "trust/policy.json", under: root)
+
+        let staged = try await NativeClient.restoreBackup(id: target.id, dataRoot: root)
+        #expect(staged.requiresRestart)
+        _ = try NativeClient.resumeStagedBackupRestoreAtLaunch(dataRoot: root)
+
+        #expect(try read("trust/policy.json", under: root) == trustPolicy("target"))
+        #expect(try read("data/trust/policy.json", under: outside) == trustPolicy("outside"))
+    }
+
+    @Test func validatedLegacySwiftBackupIsSealedBeforeItCanBeStaged() async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try write(trustPolicy("legacy target"), to: "trust/policy.json", under: root)
+        let target = try await NativeClient.createBackup(reason: "legacy compatibility", dataRoot: root)
+        let backupDir = URL(fileURLWithPath: target.path)
+        let manifest = backupDir.appendingPathComponent("manifest.json")
+        var object = try #require(
+            JSONSerialization.jsonObject(with: Data(contentsOf: manifest)) as? [String: Any]
+        )
+        object.removeValue(forKey: "integrityVersion")
+        object.removeValue(forKey: "files")
+        object.removeValue(forKey: "reason")
+        let legacyBytes = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        try legacyBytes.write(to: manifest, options: .atomic)
+        try write(trustPolicy("current"), to: "trust/policy.json", under: root)
+
+        let staged = try await NativeClient.restoreBackup(id: target.id, dataRoot: root)
+        #expect(staged.requiresRestart)
+        _ = try NativeClient.resumeStagedBackupRestoreAtLaunch(dataRoot: root)
+
+        #expect(try read("trust/policy.json", under: root) == trustPolicy("legacy target"))
+        let sealed = try #require(
+            JSONSerialization.jsonObject(with: Data(contentsOf: manifest)) as? [String: Any]
+        )
+        #expect(sealed["integrityVersion"] as? Int == 2)
+        #expect(sealed["files"] != nil)
+        #expect(try Data(contentsOf: backupDir.appendingPathComponent("manifest.v1.json")) == legacyBytes)
+    }
+
+    @Test func tamperedBackupDigestIsRejectedAndBytesRemainUntouched() async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try write(trustPolicy("target"), to: "trust/policy.json", under: root)
+        let target = try await NativeClient.createBackup(reason: "digest target", dataRoot: root)
+        try write(
+            trustPolicy("tampered"),
+            to: "data/trust/policy.json",
+            under: URL(fileURLWithPath: target.path)
+        )
+        try write(trustPolicy("current"), to: "trust/policy.json", under: root)
+
+        do {
+            _ = try await NativeClient.restoreBackup(id: target.id, dataRoot: root)
+            Issue.record("Restore accepted backup bytes that no longer match the manifest")
+        } catch {
+            let nsError = error as NSError
+            #expect(nsError.domain == "NativeAgentBackup")
+            #expect(nsError.code == 422)
+        }
+
+        #expect(try read("trust/policy.json", under: root) == trustPolicy("current"))
+        #expect(
+            try read("data/trust/policy.json", under: URL(fileURLWithPath: target.path))
+                == trustPolicy("tampered")
+        )
+    }
+
+    @Test func backupSymlinkIsRejectedBeforeCurrentDataChanges() async throws {
+        let root = try makeTempRoot()
+        let outside = try makeTempRoot()
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        try write(trustPolicy("target"), to: "trust/policy.json", under: root)
+        let target = try await NativeClient.createBackup(reason: "symlink target", dataRoot: root)
+        let backupTrust = URL(fileURLWithPath: target.path).appendingPathComponent("data/trust")
+        try FileManager.default.removeItem(at: backupTrust)
+        try write(trustPolicy("outside"), to: "policy.json", under: outside)
+        try FileManager.default.createSymbolicLink(at: backupTrust, withDestinationURL: outside)
+        try write(trustPolicy("current"), to: "trust/policy.json", under: root)
+
+        do {
+            _ = try await NativeClient.restoreBackup(id: target.id, dataRoot: root)
+            Issue.record("Restore accepted a symbolic-link backup member")
+        } catch {
+            #expect((error as NSError).code == 422)
+        }
+
+        #expect(try read("trust/policy.json", under: root) == trustPolicy("current"))
+        #expect(try read("policy.json", under: outside) == trustPolicy("outside"))
+    }
+
+    @Test func stagedRestoreRevalidatesPinnedManifestAndDigestAtLaunch() async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try write(trustPolicy("target"), to: "trust/policy.json", under: root)
+        let target = try await NativeClient.createBackup(reason: "effect-time target", dataRoot: root)
+        try write(trustPolicy("current"), to: "trust/policy.json", under: root)
+        _ = try await NativeClient.restoreBackup(id: target.id, dataRoot: root)
+        try write(
+            trustPolicy("changed after staging"),
+            to: "data/trust/policy.json",
+            under: URL(fileURLWithPath: target.path)
+        )
+
+        do {
+            _ = try NativeClient.resumeStagedBackupRestoreAtLaunch(dataRoot: root)
+            Issue.record("Launch restore accepted bytes changed after staging")
+        } catch {
+            #expect((error as NSError).code == 422)
+        }
+
+        #expect(try read("trust/policy.json", under: root) == trustPolicy("current"))
+        #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("backups/restore-intent.json").path))
+    }
+
+    @Test func interruptedTargetApplicationRollsBackSafetySnapshotBeforeLaunch() async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try write(trustPolicy("target"), to: "trust/policy.json", under: root)
+        let target = try await NativeClient.createBackup(reason: "interrupted target", dataRoot: root)
+        try write(trustPolicy("current"), to: "trust/policy.json", under: root)
+        _ = try await NativeClient.restoreBackup(id: target.id, dataRoot: root)
+
+        let intent = root.appendingPathComponent("backups/restore-intent.json")
+        var object = try #require(
+            JSONSerialization.jsonObject(with: Data(contentsOf: intent)) as? [String: Any]
+        )
+        object["state"] = "applying"
+        try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+            .write(to: intent, options: .atomic)
+        try write(trustPolicy("partially applied"), to: "trust/policy.json", under: root)
+
+        do {
+            _ = try NativeClient.resumeStagedBackupRestoreAtLaunch(dataRoot: root)
+            Issue.record("Interrupted target application did not surface its rollback")
+        } catch {
+            let nsError = error as NSError
+            #expect(nsError.domain == "NativeAgentBackup")
+            #expect(nsError.code == 500)
+        }
+
+        #expect(try read("trust/policy.json", under: root) == trustPolicy("current"))
+        #expect(!FileManager.default.fileExists(atPath: intent.path))
+    }
+
+    @Test func restorePreservesNewerApprovalOccurrenceAndExternalSendFences() async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try write(trustPolicy("target"), to: "trust/policy.json", under: root)
+        try write(
+            #"[{"id":"job-1","lastOccurrenceKey":"old-occurrence"}]"#,
+            to: "scheduler/jobs.json",
+            under: root
+        )
+        let inbox = SwiftNativeApprovalInbox(root: root)
+        let approval = try await inbox.create(.object([
+            "title": .string("Fence test"),
+            "action": .string("test.effect"),
+            "risk": .string("high"),
+            "reason": .string("prove restore monotonicity"),
+            "payload": .object(["kind": .string("test")]),
+        ]))
+        let target = try await NativeClient.createBackup(reason: "old generation", dataRoot: root)
+
+        try write(
+            #"[{"id":"job-1","lastOccurrenceKey":"new-occurrence"}]"#,
+            to: "scheduler/jobs.json",
+            under: root
+        )
+        _ = try await inbox.resolve(
+            approval.id,
+            decision: .approved,
+            provenance: .local(decidedBy: "test")
+        )
+        _ = try await inbox.annotateExecution(
+            approval.id,
+            executedAction: .object(["status": .string("succeeded")]),
+            detail: "effect completed"
+        )
+        let initialSpend = await inbox.consumeApprovedEffect(
+            id: approval.id,
+            digest: "new-digest",
+            action: "test.effect",
+            surface: "test"
+        )
+        #expect(initialSpend == .spent)
+
+        let sendApprovalID = UUID().uuidString.lowercased()
+        let receipt: JSONValue = .object([
+            "kind": .string("external_send_execution"),
+            "approvalId": .string(sendApprovalID),
+            "idempotencyKey": .string("new-send-occurrence"),
+            "connectorId": .string("slack"),
+            "actionId": .string("slack.post_message"),
+            "status": .string("provider_accepted"),
+            "didDispatch": .bool(true),
+        ])
+        try write(
+            try receipt.serialize(pretty: false),
+            to: "connectors/actions/external_send_receipts/\(sendApprovalID).json",
+            under: root
+        )
+        try write(
+            "lock sidecar",
+            to: "connectors/actions/external_send_receipts/\(sendApprovalID).json.lock",
+            under: root
+        )
+
+        _ = try await NativeClient.restoreBackup(id: target.id, dataRoot: root)
+        _ = try NativeClient.resumeStagedBackupRestoreAtLaunch(dataRoot: root)
+
+        #expect(try read("scheduler/jobs.json", under: root).contains("new-occurrence"))
+        let recoveredApproval = try await SwiftNativeApprovalInbox(root: root).get(approval.id)
+        #expect(recoveredApproval.status == "resolved")
+        #expect(recoveredApproval.executedAction != nil)
+        let restoredSpend = await SwiftNativeApprovalInbox(root: root).consumeApprovedEffect(
+            id: approval.id,
+            digest: "new-digest",
+            action: "test.effect",
+            surface: "test"
+        )
+        #expect(restoredSpend == .alreadySpent)
+        #expect(
+            try read(
+                "connectors/actions/external_send_receipts/\(sendApprovalID).json",
+                under: root
+            ).contains("new-send-occurrence")
+        )
+    }
+
     private func makeTempRoot() throws -> URL {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("trust-backup-restore-\(UUID().uuidString)", isDirectory: true)
@@ -257,6 +536,20 @@ struct TrustBackupRestoreSafetyTests {
         #expect(try read(relativePath, under: root) == "[]")
         #expect(try read("trust/policy.json", under: root) == trustPolicy("current"))
         #expect(try NativeClient.readBackupRecords(root: root).map(\.id) == recordsBefore)
+    }
+
+    private func rewriteBackupRegistryPath(root: URL, id: String, path: String) throws {
+        for name in ["registry.json", "index.json"] {
+            let registry = root.appendingPathComponent("backups/\(name)")
+            var rows = try #require(
+                JSONSerialization.jsonObject(with: Data(contentsOf: registry)) as? [[String: Any]]
+            )
+            for index in rows.indices where rows[index]["id"] as? String == id {
+                rows[index]["path"] = path
+            }
+            try JSONSerialization.data(withJSONObject: rows, options: [.sortedKeys])
+                .write(to: registry, options: .atomic)
+        }
     }
 
     private func backupDirectoryCount(under root: URL) throws -> Int {

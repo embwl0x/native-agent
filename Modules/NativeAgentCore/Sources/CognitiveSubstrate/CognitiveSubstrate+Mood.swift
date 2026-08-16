@@ -42,6 +42,42 @@ public struct CognitiveMoodReading: Sendable, Equatable {
 }
 
 extension CognitiveSubstrate {
+    /// Shared clause/token parser for positive conversational evidence. It uses
+    /// the same Unicode punctuation boundaries, apostrophe preservation, and
+    /// two-token negation window as `dispositionTone`.
+    static func containsUnnegatedPhrase(_ text: String, phrases: [String]) -> Bool {
+        let negators: Set<String> = [
+            "not", "never", "no", "nothing", "isn't", "isnt", "wasn't", "wasnt",
+            "aren't", "arent", "don't", "dont", "doesn't", "doesnt",
+            "hardly", "barely", "less", "ill",
+        ]
+        func normalizedTokens(_ value: String) -> [String] {
+            value.lowercased()
+                .replacingOccurrences(of: "\u{2019}", with: "'")
+                .replacingOccurrences(of: "\u{2018}", with: "'")
+                .split(whereSeparator: { !$0.isLetter && !$0.isNumber && $0 != "-" && $0 != "'" })
+                .map(String.init)
+        }
+        let needles = phrases.map(normalizedTokens).filter { !$0.isEmpty }
+        guard !needles.isEmpty else { return false }
+        let normalized = text.lowercased()
+            .replacingOccurrences(of: "\u{2019}", with: "'")
+            .replacingOccurrences(of: "\u{2018}", with: "'")
+        for clause in normalized.split(whereSeparator: {
+            $0.isNewline || ($0.isPunctuation && $0 != "-" && $0 != "'")
+        }) {
+            let tokens = normalizedTokens(String(clause))
+            for needle in needles where needle.count <= tokens.count {
+                for start in 0...(tokens.count - needle.count) {
+                    guard Array(tokens[start..<(start + needle.count)]) == needle else { continue }
+                    let prior = tokens[max(0, start - 2)..<start]
+                    if !prior.contains(where: { negators.contains($0) }) { return true }
+                }
+            }
+        }
+        return false
+    }
+
 
     // MARK: - Tuning knobs (the ONE mood surface)
     // Every mood threshold lives here so there is a single place to tune the feature.

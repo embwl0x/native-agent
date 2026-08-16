@@ -309,9 +309,15 @@ extension MacSyncEngine {
         error: String? = nil,
         response: [String: String]? = nil
     ) async {
-        guard let transactionDir else { return }
+        guard let transactionDir,
+              let url = InboxActionFileBoundary.jsonURL(
+                in: transactionDir,
+                validatedID: id
+              ) else {
+            NSLog("[MacSyncEngine] Refused transaction write for invalid remote id")
+            return
+        }
         let now = ISO8601DateFormatter().string(from: Date())
-        let url = transactionDir.appendingPathComponent("\(id).json")
         // Off-main read-modify-write, AWAITED so sequential state transitions for
         // the same transaction id (received -> running -> done) complete in order
         // and can't clobber each other under iCloud slowness.

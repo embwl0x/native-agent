@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import NativeAgentCore
 @testable import NativeAgentApp
 
 @Suite("Provider execution-control persistence", .serialized)
@@ -237,5 +238,7 @@ struct ProviderExecutionControlPersistenceTests {
         let grok = try #require(catalog.models.first { $0.id == "grok-4.5" })
         #expect(grok.supportedReasoningEfforts == ["low", "medium", "high"])
         #expect(grok.supportsFast == true)
+        #expect(catalog.current.chat.model == nativeAgentPrimaryModel)
+        #expect(catalog.current.telegram.model == nativeAgentPrimaryModel)
     }
 }

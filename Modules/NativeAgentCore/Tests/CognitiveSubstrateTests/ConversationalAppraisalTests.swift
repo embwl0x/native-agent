@@ -77,6 +77,28 @@ struct ConversationalAppraisalTests {
         #expect(a.warmth > 0, "praise should warm her: \(a)")
     }
 
+    @Test func negatedPositiveLanguageDoesNotManufacturePraiseOrEnthusiasm() async throws {
+        let s = try await substrate("negated-positive")
+        for text in [
+            "that is not perfect",
+            "this is not exactly right",
+            "I don't love this",
+            "I'm not excited about it",
+            "that did not help",
+        ] {
+            let appraisal = await s.conversationalAppraisal(in: text)
+            #expect(appraisal.valence <= 0, "negated positive must not lift valence: \(text) → \(appraisal)")
+            #expect(appraisal.warmth <= 0, "negated positive must not add warmth: \(text) → \(appraisal)")
+        }
+    }
+
+    @Test func positiveContractionInsidePhraseRemainsPositive() async throws {
+        let s = try await substrate("positive-contraction")
+        let appraisal = await s.conversationalAppraisal(in: "I can't wait, let's go")
+        #expect(appraisal.valence > 0)
+        #expect(appraisal.arousal > 0)
+    }
+
     @Test func resolutionLiftsAndRelievesPressure() async throws {
         let s = try await substrate("resolve")
         let a = await s.conversationalAppraisal(in: "we did it, it works now")

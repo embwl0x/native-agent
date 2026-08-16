@@ -99,6 +99,7 @@ extension iCloudSyncEngine {
     /// assign published properties back on MainActor.
     func refreshSnapshots() async {
         guard let snapshotDir else { return }
+        let lifecycle = lifecycleGeneration
         if refreshInFlight {
             refreshQueued = true
             return
@@ -116,8 +117,10 @@ extension iCloudSyncEngine {
         let generation = snapshotRefreshGeneration
         refreshInFlight = true
         defer {
-            refreshInFlight = false
-            if refreshQueued {
+            if lifecycle == lifecycleGeneration {
+                refreshInFlight = false
+            }
+            if lifecycle == lifecycleGeneration, refreshQueued {
                 refreshQueued = false
                 Task { @MainActor in
                     await self.refreshSnapshots()
@@ -126,7 +129,8 @@ extension iCloudSyncEngine {
         }
         let bundle = await Self.loadAllSnapshots(snapshotDir: snapshotDir)
         // Resumption of an @MainActor async func is back on the main actor.
-        guard generation == snapshotRefreshGeneration else { return }
+        guard generation == snapshotRefreshGeneration,
+              lifecycle == lifecycleGeneration else { return }
         if let v = bundle.workshopTasks { workshopTasks = v }
         if let v = bundle.skills { skills = v }
         if let v = bundle.memories { memories = v }
@@ -164,6 +168,7 @@ extension iCloudSyncEngine {
 
     func refreshLightweightSnapshots() async {
         guard let snapshotDir else { return }
+        let lifecycle = lifecycleGeneration
         if refreshInFlight {
             refreshQueued = true
             return
@@ -175,8 +180,10 @@ extension iCloudSyncEngine {
         let generation = snapshotRefreshGeneration
         refreshInFlight = true
         defer {
-            refreshInFlight = false
-            if refreshQueued {
+            if lifecycle == lifecycleGeneration {
+                refreshInFlight = false
+            }
+            if lifecycle == lifecycleGeneration, refreshQueued {
                 refreshQueued = false
                 Task { @MainActor in
                     await self.refreshLightweightSnapshots()
@@ -184,7 +191,8 @@ extension iCloudSyncEngine {
             }
         }
         let bundle = await Self.loadLightweightSnapshots(snapshotDir: snapshotDir)
-        guard generation == snapshotRefreshGeneration else { return }
+        guard generation == snapshotRefreshGeneration,
+              lifecycle == lifecycleGeneration else { return }
         if let v = bundle.trustPolicy { trustPolicy = v }
         if let v = bundle.personality { personality = v }
         if let v = bundle.health { health = v }
@@ -195,10 +203,6 @@ extension iCloudSyncEngine {
         if let v = bundle.providers { providers = v }
         if let v = bundle.surfaceModels { applyRemoteSurfaceModels(v) }
         if let v = bundle.approvals { approvals = v }
-        if let v = bundle.inboxItems {
-            inboxSnapshotLoaded = true
-            inboxItems = v
-        }
         if bundle.loadedAllSnapshots {
             lastSyncAt = Date()
             syncError = nil
@@ -213,7 +217,9 @@ extension iCloudSyncEngine {
     // ALL snapshots on appear/pull (mirrors refreshApprovalsSnapshot).
     func refreshTurnSummariesSnapshot() async {
         guard let snapshotDir else { return }
+        let lifecycle = lifecycleGeneration
         if let latest: TurnSummaryFile = await Self.loadSnapshotObjectOnly(named: "turn_summaries.json", in: snapshotDir) {
+            guard lifecycle == lifecycleGeneration else { return }
             turnSummaries = latest
             lastSyncAt = Date()
             syncError = nil
@@ -222,7 +228,9 @@ extension iCloudSyncEngine {
 
     func refreshApprovalsSnapshot() async {
         guard let snapshotDir else { return }
+        let lifecycle = lifecycleGeneration
         if let latest: [ApprovalRequest] = await Self.loadSnapshotArrayOnly(named: "approvals.json", in: snapshotDir) {
+            guard lifecycle == lifecycleGeneration else { return }
             approvals = latest
             lastSyncAt = Date()
             syncError = nil
@@ -231,14 +239,17 @@ extension iCloudSyncEngine {
 
     func refreshActivitySnapshot() async {
         guard let snapshotDir else { return }
+        let lifecycle = lifecycleGeneration
         // 2026-07-04 (review): generation guard — foreground/push/poll refreshes
         // overlap; without this a SLOWER older read could assign its results
         // after a newer read already landed, briefly reviving stale data.
         targetedRefreshGeneration &+= 1
         let generation = targetedRefreshGeneration
         let bundle = await Self.loadActivitySnapshots(snapshotDir: snapshotDir)
-        guard generation == targetedRefreshGeneration else { return }
-        if let v = bundle.approvals { approvals = v }
+        guard generation == targetedRefreshGeneration,
+              lifecycle == lifecycleGeneration else { return }
+        if let v = bundle.workshopTasks { workshopTasks = v }
+        if let v = bundle.memories { memories = v }
         if let v = bundle.inboxItems {
             inboxSnapshotLoaded = true
             inboxItems = v
@@ -246,7 +257,6 @@ extension iCloudSyncEngine {
         if let v = bundle.memoryProposals { memoryProposals = v.filter(\.isPending) }
         if let v = bundle.trainingProposals { trainingProposals = v }
         if let v = bundle.promotionCandidates { promotionCandidates = v }
-        if let v = bundle.personality { personality = v }
         if bundle.loadedAllSnapshots {
             lastSyncAt = Date()
             syncError = nil
@@ -255,11 +265,27 @@ extension iCloudSyncEngine {
         }
     }
 
+    func refreshCatalogSnapshot() async {
+        guard let snapshotDir else { return }
+        let lifecycle = lifecycleGeneration
+        if let latest: [SkillRecord] = await Self.loadSnapshotArrayOnly(
+            named: "skills_snapshot.json",
+            in: snapshotDir
+        ) {
+            guard lifecycle == lifecycleGeneration else { return }
+            skills = latest
+            lastSyncAt = Date()
+            syncError = nil
+        }
+    }
+
     func refreshMemorySnapshot() async {
         guard let snapshotDir else { return }
+        let lifecycle = lifecycleGeneration
         async let latestMemories: [MemoryRecord]? = Self.loadSnapshotArrayOnly(named: "memories.json", in: snapshotDir)
         async let latestProposals: [MemoryProposalRecord]? = Self.loadSnapshotArrayOnly(named: "memory_proposals.json", in: snapshotDir)
         let (memoryRows, proposalRows) = await (latestMemories, latestProposals)
+        guard lifecycle == lifecycleGeneration else { return }
         if let memoryRows { memories = memoryRows }
         if let proposalRows { memoryProposals = proposalRows.filter(\.isPending) }
         if memoryRows != nil && proposalRows != nil {
@@ -274,21 +300,26 @@ extension iCloudSyncEngine {
 
     func refreshWorkshopTasksSnapshot() async {
         guard let snapshotDir else { return }
+        let lifecycle = lifecycleGeneration
         if let latest: [WorkshopTaskRecord] = await Self.loadSnapshotArrayOnly(named: "workshop_tasks.json", in: snapshotDir) {
+            guard lifecycle == lifecycleGeneration else { return }
             workshopTasks = latest
             lastSyncAt = Date()
             syncError = nil
         } else {
+            guard lifecycle == lifecycleGeneration else { return }
             syncError = "Workshop snapshot is still downloading from iCloud. Try again in a moment."
         }
     }
 
     func refreshCommandCenterSnapshot() async {
         guard let snapshotDir else { return }
+        let lifecycle = lifecycleGeneration
         async let latestHealth: RuntimeHealth? = Self.loadSnapshotObjectOnly(named: "health.json", in: snapshotDir)
         async let latestTrust: TrustPolicy? = Self.loadSnapshotObjectOnly(named: "trust_policy.json", in: snapshotDir)
         async let latestApprovals: [ApprovalRequest]? = Self.loadSnapshotArrayOnly(named: "approvals.json", in: snapshotDir)
         let (healthRow, trustRow, approvalRows) = await (latestHealth, latestTrust, latestApprovals)
+        guard lifecycle == lifecycleGeneration else { return }
         if let healthRow { health = healthRow }
         if let trustRow { trustPolicy = trustRow }
         if let approvalRows { approvals = approvalRows }
@@ -304,11 +335,13 @@ extension iCloudSyncEngine {
 
     func refreshSettingsSnapshot() async {
         guard let snapshotDir else { return }
+        let lifecycle = lifecycleGeneration
         async let latestTrust: TrustPolicy? = Self.loadSnapshotObjectOnly(named: "trust_policy.json", in: snapshotDir)
         async let latestPersonality: PersonalityProfile? = Self.loadSnapshotObjectOnly(named: "personality.json", in: snapshotDir)
         async let latestConnectors: [ConnectorRecord]? = Self.loadSnapshotArrayOnly(named: "connectors.json", in: snapshotDir)
         async let latestHealth: RuntimeHealth? = Self.loadSnapshotObjectOnly(named: "health.json", in: snapshotDir)
         let (trustRow, personalityRow, connectorRows, healthRow) = await (latestTrust, latestPersonality, latestConnectors, latestHealth)
+        guard lifecycle == lifecycleGeneration else { return }
         if let trustRow { trustPolicy = trustRow }
         if let personalityRow { personality = personalityRow }
         if let connectorRows { connectors = connectorRows }
@@ -325,9 +358,11 @@ extension iCloudSyncEngine {
 
     func refreshHealthSnapshot() async {
         guard let snapshotDir else { return }
+        let lifecycle = lifecycleGeneration
         async let latestHealth: RuntimeHealth? = Self.loadSnapshotObjectOnly(named: "health.json", in: snapshotDir)
         async let latestOrganism: OrganismLivingStatusFile? = Self.loadSnapshotObjectOnly(named: "organism_living_status.json", in: snapshotDir)
         let (latest, organism) = await (latestHealth, latestOrganism)
+        guard lifecycle == lifecycleGeneration else { return }
         if let latest {
             health = latest
         }
@@ -349,32 +384,40 @@ extension iCloudSyncEngine {
     // snapshot bundle.
     func refreshRunsSnapshot() async {
         guard let snapshotDir else { return }
+        let lifecycle = lifecycleGeneration
         if let latest: [RunRecord] = await Self.loadSnapshotArrayOnly(named: "runs.json", in: snapshotDir) {
+            guard lifecycle == lifecycleGeneration else { return }
             runs = latest
             lastSyncAt = Date()
             syncError = nil
         } else if runs.isEmpty {
+            guard lifecycle == lifecycleGeneration else { return }
             syncError = "Runs snapshot is still downloading from iCloud. Try again in a moment."
         }
     }
 
     func refreshTrustSnapshot() async {
         guard let snapshotDir else { return }
+        let lifecycle = lifecycleGeneration
         if let latest: TrustPolicy = await Self.loadSnapshotObjectOnly(named: "trust_policy.json", in: snapshotDir) {
+            guard lifecycle == lifecycleGeneration else { return }
             trustPolicy = latest
             lastSyncAt = Date()
             syncError = nil
         } else {
+            guard lifecycle == lifecycleGeneration else { return }
             syncError = "Trust snapshot is still downloading from iCloud. Try again in a moment."
         }
     }
 
     func refreshProviderControlsSnapshot() async {
         guard let snapshotDir else { return }
+        let lifecycle = lifecycleGeneration
         async let latestProviders: [ProviderInfo]? = Self.loadSnapshotArrayOnly(named: "providers.json", in: snapshotDir)
         async let latestTrust: TrustPolicy? = Self.loadSnapshotObjectOnly(named: "trust_policy.json", in: snapshotDir)
         async let latestSurfaceModels: [String: SurfaceModelPref]? = Self.loadSnapshotObjectOnly(named: "model_preferences.json", in: snapshotDir)
         let (providerRows, trustRow, surfaceModelRows) = await (latestProviders, latestTrust, latestSurfaceModels)
+        guard lifecycle == lifecycleGeneration else { return }
         if let providerRows { providers = providerRows }
         if let trustRow { trustPolicy = trustRow }
         // gpt-5.5 review finding #2: see the bulk-apply site above for why
@@ -396,9 +439,11 @@ extension iCloudSyncEngine {
 
     func refreshChatSessionListSnapshot() async {
         guard let snapshotDir else { return }
+        let lifecycle = lifecycleGeneration
         async let latestSessions: [ChatSession]? = Self.loadSnapshotArrayOnly(named: "sessions.json", in: snapshotDir)
         async let latestPinned: [ChatSession]? = Self.loadSnapshotArrayOnly(named: "pinned_chat_sessions.json", in: snapshotDir)
         let (sessionRows, pinnedRows) = await (latestSessions, latestPinned)
+        guard lifecycle == lifecycleGeneration else { return }
         if let sessionRows { sessions = sessionRows }
         if let pinnedRows { pinnedChatSessions = pinnedRows }
         if sessionRows != nil && pinnedRows != nil {
@@ -413,6 +458,7 @@ extension iCloudSyncEngine {
 
     func refreshChatTranscriptsSnapshot() async {
         guard let snapshotDir else { return }
+        let lifecycle = lifecycleGeneration
         // 2026-07-21 audit fix: generation guard — this lane is reachable
         // concurrently (5s ChatView loop, forceRefresh, scenePhase) and each
         // read can block ~2.5s in awaitCurrentVersion; without the guard two
@@ -422,7 +468,8 @@ extension iCloudSyncEngine {
         chatTranscriptsRefreshGeneration &+= 1
         let generation = chatTranscriptsRefreshGeneration
         if let latestTranscripts: [ChatTranscriptSnapshot] = await Self.loadSnapshotArrayOnly(named: "chat_transcripts.json", in: snapshotDir) {
-            guard generation == chatTranscriptsRefreshGeneration else { return }
+            guard generation == chatTranscriptsRefreshGeneration,
+                  lifecycle == lifecycleGeneration else { return }
             chatTranscripts = Self.transcriptMap(latestTranscripts)
             lastSyncAt = Date()
             syncError = nil
@@ -439,20 +486,23 @@ extension iCloudSyncEngine {
     @discardableResult
     func refreshInboxSnapshot() async -> Bool {
         guard let snapshotDir else { return false }
+        let lifecycle = lifecycleGeneration
         // 2026-07-04 (review): generation guard — same stale-clobber protection
         // as refreshActivitySnapshot (shared counter: inbox and activity both
         // write inboxItems, so they must invalidate each other's stale reads).
         targetedRefreshGeneration &+= 1
         let generation = targetedRefreshGeneration
         if let latest: [InboxItemRecord] = await Self.loadSnapshotArrayOnly(named: "inbox.json", in: snapshotDir) {
-            guard generation == targetedRefreshGeneration else { return true }
+            guard generation == targetedRefreshGeneration,
+                  lifecycle == lifecycleGeneration else { return true }
             inboxSnapshotLoaded = true
             inboxItems = latest
             lastSyncAt = Date()
             syncError = nil
             return true
         } else {
-            guard generation == targetedRefreshGeneration else { return false }
+            guard generation == targetedRefreshGeneration,
+                  lifecycle == lifecycleGeneration else { return false }
             syncError = "Inbox snapshot is still downloading from iCloud. Try again in a moment."
             return false
         }
@@ -512,25 +562,26 @@ extension iCloudSyncEngine {
     }
 
     private struct ActivitySnapshotBundle: Sendable {
-        var approvals: [ApprovalRequest]?
+        var workshopTasks: [WorkshopTaskRecord]?
+        var memories: [MemoryRecord]?
         var inboxItems: [InboxItemRecord]?
         var memoryProposals: [MemoryProposalRecord]?
         var trainingProposals: [TrainingProposalSummary]?
         var promotionCandidates: [PromotionCandidateSummary]?
-        var personality: PersonalityProfile?
 
         var loadedAnySnapshot: Bool {
-            approvals != nil ||
+            workshopTasks != nil ||
+                memories != nil ||
                 inboxItems != nil ||
                 memoryProposals != nil ||
                 trainingProposals != nil ||
-                promotionCandidates != nil ||
-                personality != nil
+                promotionCandidates != nil
         }
 
         var loadedAllSnapshots: Bool {
-            approvals != nil && inboxItems != nil && memoryProposals != nil
-                && trainingProposals != nil && promotionCandidates != nil && personality != nil
+            workshopTasks != nil && memories != nil && inboxItems != nil
+                && memoryProposals != nil && trainingProposals != nil
+                && promotionCandidates != nil
         }
     }
 
@@ -545,7 +596,6 @@ extension iCloudSyncEngine {
         var providers: [ProviderInfo]?
         var surfaceModels: [String: SurfaceModelPref]?
         var approvals: [ApprovalRequest]?
-        var inboxItems: [InboxItemRecord]?
 
         var loadedAnySnapshot: Bool {
             trustPolicy != nil ||
@@ -557,15 +607,14 @@ extension iCloudSyncEngine {
                 connectors != nil ||
                 providers != nil ||
                 surfaceModels != nil ||
-                approvals != nil ||
-                inboxItems != nil
+                approvals != nil
         }
 
         var loadedAllSnapshots: Bool {
             trustPolicy != nil && personality != nil && health != nil
                 && organismLivingStatus != nil && sessions != nil
                 && pinnedChatSessions != nil && connectors != nil && providers != nil
-                && surfaceModels != nil && approvals != nil && inboxItems != nil
+                && surfaceModels != nil && approvals != nil
         }
     }
 
@@ -623,7 +672,6 @@ extension iCloudSyncEngine {
         async let providers: [ProviderInfo]? = loadSnapshotArrayOnly(named: "providers.json", in: snapshotDir)
         async let surfaceModels: [String: SurfaceModelPref]? = loadSnapshotObjectOnly(named: "model_preferences.json", in: snapshotDir)
         async let approvals: [ApprovalRequest]? = loadSnapshotArrayOnly(named: "approvals.json", in: snapshotDir)
-        async let inboxItems: [InboxItemRecord]? = loadSnapshotArrayOnly(named: "inbox.json", in: snapshotDir)
         return await LightweightSnapshotBundle(
             trustPolicy: trustPolicy,
             personality: personality,
@@ -634,8 +682,7 @@ extension iCloudSyncEngine {
             connectors: connectors,
             providers: providers,
             surfaceModels: surfaceModels,
-            approvals: approvals,
-            inboxItems: inboxItems
+            approvals: approvals
         )
     }
 
@@ -650,19 +697,19 @@ extension iCloudSyncEngine {
     }
 
     private nonisolated static func loadActivitySnapshots(snapshotDir: URL) async -> ActivitySnapshotBundle {
-        async let approvals: [ApprovalRequest]? = loadSnapshotArrayOnly(named: "approvals.json", in: snapshotDir)
+        async let workshopTasks: [WorkshopTaskRecord]? = loadSnapshotArrayOnly(named: "workshop_tasks.json", in: snapshotDir)
+        async let memories: [MemoryRecord]? = loadSnapshotArrayOnly(named: "memories.json", in: snapshotDir)
         async let inboxItems: [InboxItemRecord]? = loadSnapshotArrayOnly(named: "inbox.json", in: snapshotDir)
         async let memoryProposals: [MemoryProposalRecord]? = loadSnapshotArrayOnly(named: "memory_proposals.json", in: snapshotDir)
         async let trainingProposals: [TrainingProposalSummary]? = loadSnapshotArrayOnly(named: "training_proposals.json", in: snapshotDir)
         async let promotionCandidates: [PromotionCandidateSummary]? = loadSnapshotArrayOnly(named: "promotion_candidates.json", in: snapshotDir)
-        async let personality: PersonalityProfile? = loadSnapshotObjectOnly(named: "personality.json", in: snapshotDir)
         return await ActivitySnapshotBundle(
-            approvals: approvals,
+            workshopTasks: workshopTasks,
+            memories: memories,
             inboxItems: inboxItems,
             memoryProposals: memoryProposals,
             trainingProposals: trainingProposals,
-            promotionCandidates: promotionCandidates,
-            personality: personality
+            promotionCandidates: promotionCandidates
         )
     }
 

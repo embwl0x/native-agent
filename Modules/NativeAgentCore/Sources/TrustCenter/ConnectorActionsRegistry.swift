@@ -956,6 +956,8 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
             inputSchema: schema([
                 ("text", prop("string")),
                 ("keys", prop("string")),
+                ("attention_session", prop("string")),
+                ("attention_user_sequence", prop("integer")),
             ])
         ),
         ConnectorActionDescriptor(
@@ -972,8 +974,11 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
                 ("double", prop("boolean")),
                 ("from", prop("object")),
                 ("to", prop("object")),
+                ("duration_ms", prop("integer")),
                 ("mark", prop("integer")),
                 ("view", prop("string")),
+                ("attention_session", prop("string")),
+                ("attention_user_sequence", prop("integer")),
             ])
         ),
         // W2/W3 injection surface (2026-08-12). Same `accessibility` category,
@@ -993,6 +998,8 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
                 ("x", prop("integer")),
                 ("y", prop("integer")),
                 ("units", prop("string")),
+                ("attention_session", prop("string")),
+                ("attention_user_sequence", prop("integer")),
             ])
         ),
         // W6 (2026-08-12). Same category, same approval tier: it posts a real
@@ -1007,6 +1014,8 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
                 ("key_tap", prop("boolean")),
                 ("settle_ms", prop("integer")),
                 ("full_screen", prop("boolean")),
+                ("attention_session", prop("string")),
+                ("attention_user_sequence", prop("integer")),
             ])
         ),
         ConnectorActionDescriptor(
@@ -1021,6 +1030,8 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
                 ("value", prop("string")),
                 ("mark", prop("integer")),
                 ("view", prop("string")),
+                ("attention_session", prop("string")),
+                ("attention_user_sequence", prop("integer")),
             ])
         ),
         // W1 accessibility perception organ — READ-ONLY. These read the
@@ -1076,6 +1087,21 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
                 ("max_image_bytes", prop("integer")),
                 ("max_nodes", prop("integer")),
                 ("max_depth", prop("integer")),
+            ])
+        ),
+        ConnectorActionDescriptor(
+            id: "mac.attention", connectorId: "mac", connector: "mac",
+            name: "Mac Attention",
+            description: "Start, continue, inspect or stop a bounded live-attention session over the fused Mac view. It notices coarse physical input and app changes without recording key contents; user input invalidates the old view and wins immediately. Read-only and ephemeral.",
+            risk: "low", dryRunAvailable: true, requiresApproval: false,
+            category: "accessibility",
+            inputSchema: schema([
+                ("mode", prop("string")),
+                ("session", prop("string")),
+                ("after_sequence", prop("integer")),
+                ("wait_ms", prop("integer")),
+                ("duration_seconds", prop("integer")),
+                ("full_screen", prop("boolean")),
             ])
         ),
         ConnectorActionDescriptor(

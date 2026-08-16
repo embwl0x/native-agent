@@ -4,28 +4,50 @@
 # messages-vanish fix) had no runner and could rot green forever.
 #
 # Destination: prefers an 'iPhone 16' simulator per the project convention;
-# falls back to any available iPhone simulator; skips gracefully (exit 0)
-# when no iOS simulator is installed or when running inside the builder
-# sandbox (simctl/CoreSimulator mach services are unreachable there — the
-# same NATIVE_AGENT_SWIFTPM_DISABLE_SANDBOX pattern script/test.sh uses).
+# falls back to any available iPhone simulator. The ordinary developer gate
+# skips gracefully when CoreSimulator is unavailable. `--require` is the
+# release lane: every would-be skip becomes a failure so a Mac-only machine can
+# never accidentally certify the iOS half of a public build.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECT="$ROOT/iOS/NativeAgentMobile/NativeAgentMobile.xcodeproj"
 SCHEME="NativeAgentMobile"
+REQUIRE=0
+
+usage() {
+  echo "usage: $0 [--require]" >&2
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --require) REQUIRE=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage; exit 2 ;;
+  esac
+  shift
+done
+
+skip_or_fail() {
+  local reason="$1"
+  if [[ "$REQUIRE" -eq 1 ]]; then
+    echo "[test-ios] FAIL: $reason (required release proof)" >&2
+    exit 1
+  fi
+  echo "[test-ios] SKIP: $reason"
+  exit 0
+}
 
 export CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-$ROOT/.runtime/clang-module-cache}"
 export SWIFT_MODULE_CACHE_PATH="${SWIFT_MODULE_CACHE_PATH:-$ROOT/.runtime/swift-module-cache}"
 mkdir -p "$CLANG_MODULE_CACHE_PATH" "$SWIFT_MODULE_CACHE_PATH"
 
 if [[ "${NATIVE_AGENT_SWIFTPM_DISABLE_SANDBOX:-0}" == "1" ]]; then
-  echo "[test-ios] SKIP: inside the builder sandbox (NATIVE_AGENT_SWIFTPM_DISABLE_SANDBOX=1); CoreSimulator is unreachable"
-  exit 0
+  skip_or_fail "inside the builder sandbox (NATIVE_AGENT_SWIFTPM_DISABLE_SANDBOX=1); CoreSimulator is unreachable"
 fi
 
 if ! command -v xcrun >/dev/null 2>&1 || ! xcrun simctl list devices available >/dev/null 2>&1; then
-  echo "[test-ios] SKIP: no Xcode/simctl available on this machine"
-  exit 0
+  skip_or_fail "no Xcode/simctl available on this machine"
 fi
 
 SIM_NAME="$(
@@ -54,8 +76,7 @@ else:
 )"
 
 if [[ -z "$SIM_NAME" ]]; then
-  echo "[test-ios] SKIP: no available iOS iPhone simulator installed"
-  exit 0
+  skip_or_fail "no available iOS iPhone simulator installed"
 fi
 
 echo "[test-ios] running $SCHEME tests on simulator: $SIM_NAME"

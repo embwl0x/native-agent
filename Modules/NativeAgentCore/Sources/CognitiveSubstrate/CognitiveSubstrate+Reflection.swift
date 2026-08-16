@@ -6,27 +6,15 @@ import NativeAgentCore
 import PersistenceCore
 
 extension CognitiveSubstrate {
-    /// Optional proposal invitation appended to the reflection prompt. Reflection used to
-    /// ask only for a free-form state read, so Opus never emitted anything the proposal
-    /// parser recognized and yield was always 0 — pretty journaling, no learning. This
-    /// invites up to 3 parser-tagged lines, but only when genuinely warranted, and is
-    /// explicit that a zero-proposal quiet pass is correct, so reflection can earn its cost
-    /// without manufacturing noise. The lines are proposals for the operator to approve via the
-    /// Observatory, never autonomous actions.
+    /// Reflection may propose one settled standing view. REM remains the only
+    /// canonical growth-proposal owner; reflection does not manufacture generic
+    /// schema/memory/identity mirrors without effect executors.
     private var reflectionProposalInvitation: String { """
     This is your own private reflection — read the state honestly. If something in it \
-    genuinely warrants capturing or changing, you may close with up to 3 lines, each on its \
-    own line, beginning with exactly one of these tags:
-      proposal: <a concrete adjustment to how you act or respond>
-      schema: <a refinement to how you model a recurring situation>
-      memory: <a durable preference, principle, or correction worth keeping in long-term memory>
-      identity: <a small, well-evidenced refinement to your self-model>
+    genuinely warrants a settled standing view, you may close with one line beginning:
       view: <a standing view of yours that has settled — a durable way you see something, not a task or a rule>
-    A durable line that emerged — a preference \(userAddress) stated, a principle you agreed to, a \
-    correction worth keeping — is worth a memory: line even when it is calm and carries no \
-    tension; don't let it evaporate just because nothing is wrong. Each line must be specific \
-    and earned by the state above. These are proposals for \(userAddress) to approve, not actions you \
-    take. If genuinely nothing is worth capturing or changing, write no such lines — a quiet \
+    It must be specific and earned by the state above. It is a proposal for \(userAddress) to \
+    approve, not an action you take. If genuinely nothing has settled, write no view line — a quiet \
     pass is a correct, expected outcome. Never invent one to fill space.
     """ }
 
@@ -119,7 +107,6 @@ extension CognitiveSubstrate {
             // mid-word (audit round 2, R1). The stored/displayed summary
             // stays bounded; only the parse reads the whole thing.
             receipt.proposalIds = await parseReflectionProposals(receipt: receipt, source: resultSummary)
-            await applyReflectionAffectNudge(from: boundedResult)
             // The slow layer (User, 2026-07-09): the reflection's considered tone
             // nudges her day-scale disposition — feelings that move slower than
             // the moment, carried into mood and the felt fingerprint.
@@ -267,67 +254,7 @@ extension CognitiveSubstrate {
         }
     }
 
-    private func applyReflectionAffectNudge(from result: String) async {
-        guard configuration.enabled, configuration.affectEnabled else { return }
-        let lower = result.lowercased()
-        let now = dependencies.now()
-        // Reflection merges into the affect that is true now, not the last
-        // materialized checkpoint a maintenance cadence happened to leave.
-        var next = projectedAffect(at: now)
-        var changed = false
-
-        if containsAny(lower, [
-            "warm",
-            "warmth",
-            "present",
-            "settled",
-            "grounded",
-            "with user",
-        ]) {
-            next.socialWarmth = max(next.socialWarmth, 0.48)
-            changed = true
-        }
-        if containsAny(lower, [
-            "settled",
-            "low-tension",
-            "low tension",
-            "calm",
-            "steady",
-            "grounded",
-        ]) {
-            next.uncertainty = clamp(next.uncertainty - 0.08)
-            next.taskPressure = clamp(next.taskPressure - 0.08)
-            changed = true
-        }
-        if containsAny(lower, [
-            "contradiction",
-            "misread",
-            "stale",
-            "wrong",
-            "anomaly",
-        ]) {
-            next.uncertainty = clamp(next.uncertainty + 0.05)
-            changed = true
-        }
-
-        guard changed else { return }
-        next.updatedAt = now
-        affect = next
-        await persistArtifact(
-            kind: "affect",
-            id: stableArtifactID("affect"),
-            status: "current",
-            score: next.arousal,
-            payload: next.toJSON(
-                lastUserPresenceAt: lastUserPresenceAt,
-                lastWarmPresenceAt: lastWarmPresenceAt
-            )
-        )
-    }
-
-    /// The SIGNED felt tone of a reflection — the slow-layer peer of the fast
-    /// keyword nudge above (User, 2026-07-09: reflections give her feelings a
-    /// slower-moving floor). The lexicon itself now lives in `dispositionTone`
+    /// The SIGNED felt tone of a reflection. The lexicon lives in `dispositionTone`
     /// (+Mood.swift), shared with the dream-mood writer so the two surfaces can
     /// never disagree about what "heavy" means. Fed to `integrateDisposition`
     /// (±dispositionNudgeMagnitude per call, ≤2 reflections/day, day-scale decay
@@ -364,7 +291,7 @@ extension CognitiveSubstrate {
         let now = dependencies.now()
         let evidenceNodeIds = await workspaceSnapshot().items.prefix(3).map(\.node.id)
         var proposalIds: [UUID] = []
-        for candidate in candidates.prefix(3) {
+        for candidate in candidates.prefix(1) {
             // Wave E: a `view:` line settles into a proposal-shaped standing view rather than
             // a schema proposal — still counted in proposalIds/yield (its id is reused).
             if candidate.target == "standing-view" {
@@ -382,34 +309,6 @@ extension CognitiveSubstrate {
                 }
                 continue
             }
-            let evidenceId = "reflection:\(receipt.id.uuidString)"
-            let id = stableArtifactID("reflection_schema|\(receipt.id.uuidString)|\(candidate.target)|\(stableDigest(candidate.body))")
-            guard schemaProposals[id] == nil else { continue }
-            let proposal = CognitiveSchemaProposal(
-                id: id,
-                title: bounded("\(candidate.target) reflection proposal", maxCharacters: 120),
-                body: bounded(candidate.body, maxCharacters: 500),
-                target: bounded(candidate.target, maxCharacters: 120),
-                status: .proposed,
-                confidence: candidate.confidence,
-                createdAt: now,
-                evidenceNodeIds: Array(evidenceNodeIds),
-                externalEvidenceIds: [evidenceId] + evidenceNodeIds.map { "node:\($0.uuidString)" },
-                lineageId: bounded("reflection:\(receipt.id.uuidString)", maxCharacters: 120)
-            )
-            guard !proposal.body.isEmpty else { continue }
-            schemaProposals[proposal.id] = proposal
-            enforceSchemaProposalCap()
-            proposalIds.append(proposal.id)
-            await persistArtifact(kind: "schema_proposal", id: proposal.id, status: proposal.status.rawValue, score: proposal.confidence, payload: proposal.toJSON())
-            _ = await recordTimelineEvent(
-                kind: .schemaProposal,
-                title: proposal.title,
-                summary: proposal.body,
-                artifactId: proposal.id,
-                lineageId: proposal.lineageId,
-                externalEvidenceIds: proposal.externalEvidenceIds
-            )
         }
         return proposalIds
     }
@@ -419,11 +318,6 @@ extension CognitiveSubstrate {
     /// parseable yet trimmable (a trimmed protocol line silently drops proposals).
     static let reflectionProposalPrefixTable: [(prefix: String, target: String, confidence: Double)] = [
         ("view:", "standing-view", 0.5),
-        ("proposal:", "reflection-proposal", 0.55),
-        ("suggestion:", "reflection-suggestion", 0.50),
-        ("schema:", "reflection-schema", 0.60),
-        ("memory:", "memory-proposal-review", 0.45),
-        ("identity:", "identity-proposal-review", 0.35),
     ]
 
     /// Normalize one reflection line the way the proposal parser sees it:

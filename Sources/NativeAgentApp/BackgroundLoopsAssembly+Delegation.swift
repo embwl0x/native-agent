@@ -8,7 +8,7 @@ import PersistenceCore
 //
 // The two halves this file joins deliberately live apart:
 //
-//   • `DelegationStatusProjector` (ChatOrchestration) owns READING the two
+//   • `DelegationStatusProjector` (ChatOrchestration) owns READING the bridge
 //     wake-job stores. It is the same reader `delegation_status` uses, so the
 //     tool and the cards can never disagree about what a record says.
 //   • `DelegationOutcomeLoop` (BackgroundLoops) owns the CURSOR, the terminal
@@ -28,7 +28,7 @@ import PersistenceCore
 
 extension BackgroundLoopsAssembly {
 
-    /// Reads both wake-job stores every 5 minutes and files ONE inbox card per
+    /// Reacts to bridge-store changes and files ONE inbox card per
     /// newly-terminal delegated job. Cursor lives at
     /// `<dataRoot>/logs/delegation_outcome_cursor.json`.
     ///
@@ -38,21 +38,35 @@ extension BackgroundLoopsAssembly {
     static func makeDelegationOutcomeLoop(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         configRoot: URL? = nil
-    ) -> DelegationOutcomeLoop {
-        DelegationOutcomeLoop(
+    ) -> some EventDeadlineLoopRunner {
+        let root = configRoot ?? FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config", isDirectory: true)
+        let underlying = DelegationOutcomeLoop(
+            // Normal reconciliation is event-driven. Six hours is only the
+            // missed-vnode/restart integrity sweep.
+            interval: 6 * 60 * 60,
             cursorPath: DelegationOutcomeLoop.defaultCursorPath(dataRoot: dataRoot),
             readJobs: {
-                // maxLimit, not defaultLimit: the default (20) is a chat-tool
-                // display budget. A loop that only ever looked at the newest 20
+                // The default (20) is a chat-tool display budget. A loop that
+                // only ever looked at the newest 20
                 // rows could step over a terminal job during a busy window and
                 // never card it — the cursor would then advance past it.
                 DelegationStatusProjector(configRoot: configRoot)
-                    .recentJobs(now: Date(), limit: DelegationStatusProjector.maxLimit)
+                    .allJobs(now: Date())
                     .map(delegationJobSnapshot(from:))
             },
             fileCard: { card in
                 await fileDelegationOutcomeNotice(dataRoot: dataRoot, card: card)
             }
+        )
+        return DelegationOutcomeEventRunner(
+            underlying: underlying,
+            watchedPaths: [
+                root.appendingPathComponent("claude-bridge/wake-jobs", isDirectory: true),
+                root.appendingPathComponent("codex-nativeagent-bridge/reply-jobs", isDirectory: true),
+                root.appendingPathComponent("codex-nativeagent-bridge/reply-jobs/undelivered", isDirectory: true),
+                root.appendingPathComponent("omp-bridge/wake-jobs", isDirectory: true),
+            ]
         )
     }
 
@@ -128,8 +142,11 @@ extension BackgroundLoopsAssembly {
                         newObj["status"] = obj["status"] ?? .string("unread")
                         newObj["read_at"] = obj["read_at"] ?? .null
                         replacement = .object(newObj)
-                        pushWorthy = false
                     }
+                    // The durable card id is also the push identity. If the
+                    // inbox row already exists, a lost cursor write may retry
+                    // the upsert but must never send a second push.
+                    pushWorthy = false
                     mutated.append(Data(try replacement.serialize(pretty: false).utf8))
                     found = true
                 }
@@ -157,4 +174,21 @@ extension BackgroundLoopsAssembly {
             return false
         }
     }
+}
+
+private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
+    let underlying: DelegationOutcomeLoop
+    let watchedPaths: [URL]
+
+    var loopId: String { underlying.loopId }
+    var interval: TimeInterval { underlying.interval }
+    var tickTimeoutOverride: TimeInterval? { underlying.tickTimeoutOverride }
+
+    func tickOutcome() async -> LoopTickOutcome { await underlying.tickOutcome() }
+
+    func physiologyEvents() -> AsyncStream<Void> {
+        EventDeadlinePhysiology.storeAndFileEvents(paths: watchedPaths)
+    }
+
+    func nextMeaningfulDeadline(after now: Date) async -> Date? { nil }
 }

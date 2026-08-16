@@ -39,7 +39,6 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-import CapabilityFoundry
 
 private struct SessionProviderUsageReceipt: Decodable {
     let model: String
@@ -722,124 +721,6 @@ extension NativeClient {
         )
     }
 
-    func compactSession(sessionId: String, force: Bool = false) async throws -> CompactionResult {
-        let trimmed = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            return CompactionResult(
-                compacted: false,
-                session_id: sessionId,
-                messages_before: 0,
-                messages_after: 0,
-                summary_chars: 0,
-                messages_replaced: 0,
-                reason: "empty session id",
-                percent: nil,
-                error: nil
-            )
-        }
-        let root = PersistenceCore.defaultDataRoot()
-        let messagesPath = root
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("messages", isDirectory: true)
-            .appendingPathComponent("\(trimmed).jsonl")
-        let sessionDir = root
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("sessions", isDirectory: true)
-            .appendingPathComponent(trimmed, isDirectory: true)
-        let persistence = SwiftNativePersistenceCore()
-        return try await persistence.withFileLock(messagesPath) {
-            // U5 W-A item 1 (:11481): a swallowed read rendered ANY read
-            // failure as "nothing to compact". Honesty-only fix (plan-
-            // verified NOT data-loss: empty read → replaceCount == 0 →
-            // early return, no write, backup taken) — propagate I/O errors
-            // and throw on bytes-but-no-rows instead of claiming there is
-            // nothing to compact. Missing file (fresh session) still reads
-            // as [] → honest "not enough messages".
-            let rows = try await Self.readJSONLHonest(
-                persistence, path: messagesPath, context: "compactSession")
-            let before = rows.count
-            // Match the user's old-system continuity preference: keep the last
-            // 20 rows hot and uncompacted so short confirmations like
-            // "yeah do that" still have the assistant turn they refer to.
-            let keepCount = 20
-            guard before > keepCount || force else {
-                return CompactionResult(
-                    compacted: false,
-                    session_id: trimmed,
-                    messages_before: before,
-                    messages_after: before,
-                    summary_chars: 0,
-                    messages_replaced: 0,
-                    reason: "not enough messages to compact",
-                    percent: nil,
-                    error: nil
-                )
-            }
-            let replaceCount = max(0, before - keepCount)
-            guard replaceCount > 0 else {
-                return CompactionResult(
-                    compacted: false,
-                    session_id: trimmed,
-                    messages_before: before,
-                    messages_after: before,
-                    summary_chars: 0,
-                    messages_replaced: 0,
-                    reason: "nothing to compact",
-                    percent: nil,
-                    error: nil
-                )
-            }
-            try FileManager.default.createDirectory(at: sessionDir, withIntermediateDirectories: true)
-            if FileManager.default.fileExists(atPath: messagesPath.path) {
-                let stamp = Self.fileSafeTimestamp()
-                let backup = sessionDir.appendingPathComponent("messages.compact.\(stamp).jsonl")
-                try? FileManager.default.copyItem(at: messagesPath, to: backup)
-            }
-            let replaced = Array(rows.prefix(replaceCount))
-            let kept = Array(rows.suffix(keepCount))
-            let summary = Self.compactionSummary(for: replaced)
-            let nowISO = ISO8601DateFormatter().string(from: Date())
-            let summaryRow: JSONValue = .object([
-                "id": .string("compact-\(UUID().uuidString.lowercased())"),
-                "sessionId": .string(trimmed),
-                "role": .string("system"),
-                "content": .string(summary),
-                "createdAt": .string(nowISO),
-                "source": .string("native_compaction"),
-                "metadata": .object([
-                    "kind": .string("compaction_summary"),
-                    "messages_replaced": .int(Int64(replaceCount)),
-                ]),
-            ])
-            let nextRows = [summaryRow] + kept
-            var payload = Data()
-            for row in nextRows {
-                payload.append(Data((try row.serialize(pretty: false)).utf8))
-                payload.append(0x0A)
-            }
-            try FileManager.default.createDirectory(at: messagesPath.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try payload.write(to: messagesPath, options: .atomic)
-            // gpt-5.5 review #1 (BLOCKING follow-through): the legacy
-            // context.json writer was the source of stale data
-            // (`auto_compact_threshold: 75` as a percent, fixed 200k budget,
-            // model="swift-native-compactor"). getSessionContext is now
-            // entirely live-computed from messages.jsonl, so the writer is
-            // gone. The next refresh() pass will reflect the post-compaction
-            // state directly.
-            return CompactionResult(
-                compacted: true,
-                session_id: trimmed,
-                messages_before: before,
-                messages_after: nextRows.count,
-                summary_chars: summary.count,
-                messages_replaced: replaceCount,
-                reason: "swift-native-compaction",
-                percent: nil,
-                error: nil
-            )
-        }
-    }
-
     static func visibleNotificationInboxPath(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> URL {
@@ -871,43 +752,11 @@ extension NativeClient {
             return false
         }
 
-        // U5 W-A item 1 (:11597): the read swallow turned a corrupt/
-        // unreadable inbox into rows=[] → "row not found" → false, silently
-        // dropping the status write (archived-card-resurrection class). Read
-        // failures throw, get LOGGED, and return false without ever treating
-        // corrupt-as-empty.
-        //
-        // 2026-08-11: reads via `InboxRewriteGuard.readLines` so a SINGLE
-        // malformed row among valid rows survives the rewrite verbatim
-        // instead of being silently dropped (the old lossy-read shape lost
-        // it on every status write).
         do {
-            return try await persistence.withFileLock(inboxPath) { () async throws -> Bool in
-                let lines = try InboxRewriteGuard.readLines(inboxPath)
-                guard !lines.isEmpty else { return false }
-                var updated = false
-                var mutated: [Data] = []
-                mutated.reserveCapacity(lines.count)
-
-                for line in lines {
-                    guard case .object(var obj)? = line.row,
-                          case .string(let rowID)? = obj["id"],
-                          rowID == id else {
-                        // Other rows AND undecodable lines: verbatim.
-                        mutated.append(line.raw)
-                        continue
-                    }
-                    obj["status"] = .string(status)
-                    if let readAt {
-                        obj["read_at"] = .string(readAt)
-                    }
-                    mutated.append(Data(try JSONValue.object(obj).serialize(pretty: false).utf8))
-                    updated = true
-                }
-                guard updated else { return false }
-                try InboxRewriteGuard.writeLines(mutated, to: inboxPath)
-                return true
-            }
+            _ = persistence // retained for source-compatible test injection
+            return try await LiveNotificationInbox(path: inboxPath).updateStatus(
+                id: id, status: status, readAt: readAt
+            )
         } catch {
             NSLog("[inbox] updateVisibleNotificationInboxStatus(\(action)) failed for \(id): \(String(describing: error))")
             return false
@@ -926,19 +775,13 @@ extension NativeClient {
     // → iOS InboxStore) inherit this ordering, so iOS inbox surfaces it
     // the same way without an extra sort there.
     func getInboxItems(unreadOnly: Bool = false) async throws -> [InboxItemRecord] {
-        let root = PersistenceCore.defaultDataRoot()
-        let inboxPath = root
-            .appendingPathComponent("notifications", isDirectory: true)
-            .appendingPathComponent("inbox.jsonl")
-        let persistence = SwiftNativePersistenceCore()
         // U5 W-A item 1 (:11647): the read was swallowed into [] — a
         // corrupt/unreadable inbox file rendered as an EMPTY inbox.
         // readJSONLHonest propagates I/O errors AND throws on
         // bytes-but-no-rows; per-row decode stays lossy (one malformed
         // record doesn't nuke the list) but ALL rows failing to decode
         // throws too (decodeLossyArray's all-fail rule).
-        let rows = try await Self.readJSONLHonest(
-            persistence, path: inboxPath, context: "getInboxItems")
+        let rows = try await LiveNotificationInbox.shared.rows()
         let decoder = JSONDecoder()
         var items: [InboxItemRecord] = []
         var decodeFailures = 0

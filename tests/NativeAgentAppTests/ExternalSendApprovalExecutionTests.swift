@@ -151,6 +151,70 @@ private func writeLegacyTerminalReceiptBeyondFormerTailWindow(
     #expect(replay.input["text"] == .string("connector dispatch private body"))
 }
 
+@Test func genericConnectorApprovalCarriesAndRevalidatesExactBoundedInput() async throws {
+    let root = try externalSendRoot("generic-connector-replay")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let descriptor = try #require(
+        connectorActionDescriptors().first(where: { $0.id == "x.post_tweet" })
+    )
+    let input: [String: JSONValue] = [
+        "text": .string("exact approved connector body"),
+        "replyToTweetId": .string("123"),
+    ]
+    let receipt = try await NativeClient(baseURL: "").runConnectorAction(
+        descriptor: descriptor,
+        dryRun: false,
+        input: input,
+        dataRoot: root
+    )
+    let approvalID = try #require(receipt.approvalId)
+    let inbox = SwiftNativeApprovalInbox(root: root)
+    _ = try await inbox.resolve(
+        approvalID,
+        decision: .approved,
+        provenance: .local(decidedBy: "test")
+    )
+    let record = try await inbox.get(approvalID)
+    let replay = try #require(NativeClient.connectorActionApprovalReplay(from: record))
+    #expect(replay.actionID == descriptor.id)
+    #expect(replay.connectorID == descriptor.connectorId)
+    #expect(replay.input == input)
+    try await NativeClient.validateApprovedConnectorReplay(
+        approvalID: approvalID,
+        descriptor: descriptor,
+        input: input,
+        dataRoot: root
+    )
+    await #expect(throws: Error.self) {
+        try await NativeClient.validateApprovedConnectorReplay(
+            approvalID: approvalID,
+            descriptor: descriptor,
+            input: ["text": .string("changed after approval")],
+            dataRoot: root
+        )
+    }
+}
+
+@Test func connectorDispatchForwardsTrustedExternalSendIdempotencyKeyExactly() async throws {
+    let root = try externalSendRoot("connector-stable-idempotency")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let receipt = try await NativeClient(baseURL: "").runConnectorAction(
+        id: "slack.post_message",
+        dryRun: false,
+        input: [
+            "channel": .string("C123"),
+            "text": .string("scheduled connector body"),
+        ],
+        externalSendIdempotencyKey: "scheduler-occurrence-77",
+        dataRoot: root
+    )
+
+    let approvalID = try #require(receipt.approvalId)
+    let record = try await SwiftNativeApprovalInbox(root: root).get(approvalID)
+    let replay = try #require(ExternalSendApprovalRequest(record: record))
+    #expect(replay.idempotencyKey == "scheduler-occurrence-77")
+}
+
 @Test func externalSendRoutingIgnoresDriftedRequiresApprovalMetadata() async throws {
     let root = try externalSendRoot("descriptor-drift")
     defer { try? FileManager.default.removeItem(at: root) }
@@ -356,6 +420,66 @@ private func writeLegacyTerminalReceiptBeyondFormerTailWindow(
         NativeClient.externalSendReceiptIndexPath(approvalID: record.id, dataRoot: root)
     )
     #expect(FileManager.default.fileExists(atPath: indexPath.path))
+}
+
+@Test func corruptAuthoritativeExternalSendReceiptBlocksDispatchAndPreservesBytes() async throws {
+    let root = try externalSendRoot("corrupt-authoritative-receipt")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let record = try await resolvedSlackApproval(root: root, decision: .approved)
+    let indexPath = try #require(
+        NativeClient.externalSendReceiptIndexPath(approvalID: record.id, dataRoot: root)
+    )
+    let damaged = Data("{not-valid-json".utf8)
+    try FileManager.default.createDirectory(
+        at: indexPath.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+    )
+    try damaged.write(to: indexPath, options: .atomic)
+    let capture = ExternalSendCapture()
+
+    let outcome = await NativeClient.applyResolvedExternalSend(
+        from: record,
+        dataRoot: root,
+        dependencies: externalSendDependencies(capture)
+    )
+
+    #expect(outcome.status == ExternalSendLifecycleState.outcomeUnknown.rawValue)
+    #expect(!outcome.didDispatch)
+    #expect(!outcome.shouldArchiveVisibleCard)
+    #expect(await capture.slackCalls.isEmpty)
+    #expect(try Data(contentsOf: indexPath) == damaged)
+    let model = try await ExternalSendMotorActionReadModelProvider(dataRoot: root)
+        .motorActionReadModel(actionId: record.id)
+    #expect(model?.phase == .waitingExternal)
+    #expect(model?.verification == .unknown)
+}
+
+@Test func legacyReceiptIsImportedOnlyWhenCanonicalReceiptIsMissing() async throws {
+    let root = try externalSendRoot("legacy-import-missing-only")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let record = try await resolvedSlackApproval(root: root, decision: .approved)
+    try writeLegacyTerminalReceiptBeyondFormerTailWindow(record: record, root: root)
+    let indexPath = try #require(
+        NativeClient.externalSendReceiptIndexPath(approvalID: record.id, dataRoot: root)
+    )
+    try FileManager.default.createDirectory(
+        at: indexPath.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+    )
+    let damaged = Data("[]".utf8)
+    try damaged.write(to: indexPath, options: .atomic)
+    let capture = ExternalSendCapture()
+
+    let outcome = await NativeClient.applyResolvedExternalSend(
+        from: record,
+        dataRoot: root,
+        dependencies: externalSendDependencies(capture)
+    )
+
+    #expect(outcome.status == ExternalSendLifecycleState.outcomeUnknown.rawValue)
+    #expect(!outcome.didDispatch)
+    #expect(await capture.slackCalls.isEmpty)
+    #expect(try Data(contentsOf: indexPath) == damaged)
 }
 
 @Test func failedApprovedSendIsTerminalHonestRedactedAndNotArchivedAsSuccess() async throws {
@@ -679,8 +803,9 @@ private func writeLegacyTerminalReceiptBeyondFormerTailWindow(
         dataRoot: root,
         dependencies: dependencies
     )
-    #expect(replay.status == "providerAccepted")
+    #expect(replay.status == "outcomeUnknown")
     #expect(!replay.didDispatch)
+    #expect(!replay.shouldArchiveVisibleCard)
     #expect(await capture.slackCalls.count == 1)
 }
 

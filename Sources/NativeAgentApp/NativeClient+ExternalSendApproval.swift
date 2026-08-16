@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import ApprovalInbox
 import ChatOrchestration
 import NativeAgentCore
@@ -166,6 +167,17 @@ private actor ExternalSendApprovalExecutor {
         case failed
     }
 
+    private enum CanonicalReceiptRead {
+        case missing
+        case valid(JSONValue)
+        case unavailable
+    }
+
+    private struct ReceiptLookup {
+        let receipt: JSONValue?
+        let canonicalUnavailable: Bool
+    }
+
     // A data root is loaded at most once. This keeps the unbounded legacy-log
     // fallback O(N) for a relaunch reconciliation pass instead of O(N^2).
     private var legacyReceiptIndexes: [String: [ReceiptKey: JSONValue]] = [:]
@@ -223,11 +235,30 @@ private actor ExternalSendApprovalExecutor {
         }
         defer { activeExecutions.remove(executionKey) }
 
-        let currentReceipt = await lifecycleReceipt(
+        let receiptLookup = await lifecycleReceipt(
             request: request,
             approvalID: record.id,
             dataRoot: dataRoot
         )
+        let currentReceipt = receiptLookup.receipt
+        guard !receiptLookup.canonicalUnavailable else {
+            _ = await annotate(
+                recordID: record.id,
+                summary: executionSummary(
+                    request: request,
+                    status: ExternalSendLifecycleState.outcomeUnknown.rawValue,
+                    receiptID: nil,
+                    error: "authoritative_receipt_unavailable"
+                ),
+                detail: "\(request.actionID) was not dispatched because its authoritative execution receipt is unreadable or invalid. Repair that preserved receipt before retrying.",
+                dataRoot: dataRoot
+            )
+            return ExternalSendExecutionOutcome(
+                status: ExternalSendLifecycleState.outcomeUnknown.rawValue,
+                didDispatch: false,
+                shouldArchiveVisibleCard: false
+            )
+        }
         let latestExecutedAction = try? await SwiftNativeApprovalInbox(root: dataRoot)
             .get(record.id).executedAction
         let settledStatus = currentReceipt.flatMap(Self.status)
@@ -546,7 +577,7 @@ private actor ExternalSendApprovalExecutor {
         approvalID: String,
         dataRoot: URL,
         allowLegacyAuditFallback: Bool = true
-    ) async -> JSONValue? {
+    ) async -> ReceiptLookup {
         let key = ReceiptKey(
             approvalID: approvalID,
             idempotencyKey: request.idempotencyKey,
@@ -558,13 +589,21 @@ private actor ExternalSendApprovalExecutor {
             approvalID: approvalID,
             dataRoot: dataRoot
         ) {
-            let indexed = await persistence.readJSON(indexPath, defaultValue: .null)
-            if Self.receiptKey(indexed) == key {
-                return indexed
+            switch Self.readCanonicalReceipt(at: indexPath, expectedKey: key) {
+            case .valid(let indexed):
+                return ReceiptLookup(receipt: indexed, canonicalUnavailable: false)
+            case .unavailable:
+                // An existing private receipt is authoritative. It may never
+                // be treated as absent or replaced from the legacy audit log.
+                return ReceiptLookup(receipt: nil, canonicalUnavailable: true)
+            case .missing:
+                break
             }
         }
 
-        guard allowLegacyAuditFallback else { return nil }
+        guard allowLegacyAuditFallback else {
+            return ReceiptLookup(receipt: nil, canonicalUnavailable: false)
+        }
 
         let receiptsPath = NativeClient.externalSendReceiptsPath(dataRoot: dataRoot)
         let rootKey = receiptsPath.standardizedFileURL.path
@@ -581,9 +620,44 @@ private actor ExternalSendApprovalExecutor {
             legacyReceiptIndexes[rootKey] = built
             receiptIndex = built
         }
-        guard let receipt = receiptIndex[key] else { return nil }
-        _ = await persistReceiptIndex(receipt, dataRoot: dataRoot)
-        return receipt
+        guard let receipt = receiptIndex[key] else {
+            return ReceiptLookup(receipt: nil, canonicalUnavailable: false)
+        }
+        let imported = await persistReceiptIndex(receipt, dataRoot: dataRoot)
+        guard imported != .failed else {
+            return ReceiptLookup(receipt: nil, canonicalUnavailable: true)
+        }
+        return ReceiptLookup(receipt: receipt, canonicalUnavailable: false)
+    }
+
+    private static func readCanonicalReceipt(
+        at path: URL,
+        expectedKey: ReceiptKey
+    ) -> CanonicalReceiptRead {
+        var info = stat()
+        if lstat(path.path, &info) != 0 {
+            return errno == ENOENT ? .missing : .unavailable
+        }
+        do {
+            let values = try path.resourceValues(forKeys: [
+                .isRegularFileKey,
+                .isSymbolicLinkKey,
+                .fileSizeKey,
+            ])
+            guard values.isRegularFile == true,
+                  values.isSymbolicLink != true,
+                  let size = values.fileSize,
+                  size > 0,
+                  size <= 1_048_576 else {
+                return .unavailable
+            }
+            let data = try Data(contentsOf: path, options: [.mappedIfSafe])
+            let value = try JSONValue.parse(data)
+            guard receiptKey(value) == expectedKey else { return .unavailable }
+            return .valid(value)
+        } catch {
+            return .unavailable
+        }
     }
 
     private static func receiptKey(_ receipt: JSONValue) -> ReceiptKey? {
@@ -654,9 +728,8 @@ private actor ExternalSendApprovalExecutor {
         let persistence = SwiftNativePersistenceCore()
         do {
             return try await persistence.withFileLock(path) {
-                let existing = await persistence.readJSON(path, defaultValue: .null)
-                if let existingKey = Self.receiptKey(existing) {
-                    guard existingKey == receiptKey else { return .failed }
+                switch Self.readCanonicalReceipt(at: path, expectedKey: receiptKey) {
+                case .valid(let existing):
                     let existingStatus = Self.status(existing)
                     let nextStatus = Self.status(receipt)
                     if let existingStatus, Self.isSettled(status: existingStatus) {
@@ -668,9 +741,12 @@ private actor ExternalSendApprovalExecutor {
                     if existing == receipt { return .existing }
                     try await persistence.writeJSON(receipt, to: path)
                     return .updated
+                case .unavailable:
+                    return .failed
+                case .missing:
+                    try await persistence.writeJSON(receipt, to: path)
+                    return .created
                 }
-                try await persistence.writeJSON(receipt, to: path)
-                return .created
             }
         } catch {
             return .failed
@@ -852,16 +928,19 @@ private actor ExternalSendApprovalExecutor {
             return nil
         }
 
-        let receipt = await lifecycleReceipt(
+        let receiptLookup = await lifecycleReceipt(
             request: request,
             approvalID: record.id,
             dataRoot: dataRoot,
             allowLegacyAuditFallback: false
         )
+        let receipt = receiptLookup.receipt
         // The private per-approval lifecycle receipt is the current execution
         // truth. `executedAction` is a UI annotation and must not become a
         // second motor-state owner.
-        let exactStatus = receipt.flatMap(Self.status)
+        let exactStatus = receiptLookup.canonicalUnavailable
+            ? ExternalSendLifecycleState.outcomeUnknown.rawValue
+            : receipt.flatMap(Self.status)
 
         let phase: MotorActionPhase
         let verification: MotorVerificationState

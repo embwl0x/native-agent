@@ -502,6 +502,170 @@ struct SwiftNativeTelegramBotPhaseBTests {
         #expect(read == 43)
     }
 
+    @Test func telegramPollLoop_replaysDurablyClaimedPendingUpdateAfterRestart() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("telegram_durable_replay_\(UUID().uuidString)", isDirectory: true)
+        let offset = root.appendingPathComponent("telegram", isDirectory: true)
+            .appendingPathComponent("last_offset.json")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let update = TelegramUpdate(
+            updateId: 700,
+            message: TelegramMessage(
+                messageId: 9,
+                chatId: 77,
+                chatType: "private",
+                fromUserId: 11,
+                text: "recover this turn",
+                date: 1
+            )
+        )
+        let inbox = TelegramUpdateInbox(offsetURL: offset)
+        _ = try await inbox.ensurePending(update)
+        try await SwiftNativePersistenceCore().writeJSON(
+            .object(["offset": .int(701)]),
+            to: offset
+        )
+
+        actor Capture {
+            var calls: [String] = []
+            var sent: [String] = []
+            func call(_ text: String) { calls.append(text) }
+            func send(_ text: String) { sent.append(text) }
+            func snapshot() -> ([String], [String]) { (calls, sent) }
+        }
+        let capture = Capture()
+        // This session would fail if touched. Recovery must drain the durable
+        // inbox without waiting for a new Telegram poll.
+        let offline = mockSession { request in
+            throw URLError(.notConnectedToInternet, userInfo: [NSURLErrorFailingURLErrorKey: request.url as Any])
+        }
+        let loop = TelegramPollLoop(
+            interval: 60,
+            token: tokenStr,
+            allowedChatIds: [77],
+            bot: SwiftNativeTelegramBot(dataRoot: root),
+            session: offline,
+            dataRoot: root,
+            offsetURL: offset,
+            sendMessage: { _, _, text in await capture.send(text) },
+            sendChatAction: { _, _, _ in },
+            chatHandler: { _, text in
+                await capture.call(text)
+                return "recovered reply"
+            },
+            typingRefreshNanoseconds: 0,
+            turnCoordinator: TelegramTurnCoordinator()
+        )
+
+        let outcome = await loop.tickOutcome()
+        let (calls, sent) = await capture.snapshot()
+        guard case .completed = outcome else {
+            Issue.record("expected durable replay to complete, got \(outcome)")
+            return
+        }
+        #expect(calls == ["recover this turn"])
+        #expect(sent == ["recovered reply"])
+        #expect(try await inbox.snapshots().first?.phase == .completed)
+    }
+
+    @Test func telegramPollLoop_quarantinesPriorProcessingClaimWithoutDuplicateEffect() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("telegram_durable_unknown_\(UUID().uuidString)", isDirectory: true)
+        let offset = root.appendingPathComponent("telegram", isDirectory: true)
+            .appendingPathComponent("last_offset.json")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let update = TelegramUpdate(
+            updateId: 701,
+            message: TelegramMessage(
+                messageId: 10,
+                chatId: 77,
+                chatType: "private",
+                fromUserId: 11,
+                text: "must not duplicate",
+                date: 1
+            )
+        )
+        let inbox = TelegramUpdateInbox(offsetURL: offset)
+        _ = try await inbox.ensurePending(update)
+        _ = try await inbox.transition(updateId: 701, from: [.pending], to: .processing)
+
+        actor Capture {
+            var handlerCalls = 0
+            func call() { handlerCalls += 1 }
+        }
+        let capture = Capture()
+        let emptySession = mockSession { request in
+            (makeResponse(request.url!, 200), Data(#"{"ok":true,"result":[]}"#.utf8))
+        }
+        let loop = TelegramPollLoop(
+            interval: 60,
+            token: tokenStr,
+            allowedChatIds: [77],
+            bot: SwiftNativeTelegramBot(dataRoot: root),
+            session: emptySession,
+            dataRoot: root,
+            offsetURL: offset,
+            sendMessage: { _, _, _ in },
+            sendChatAction: { _, _, _ in },
+            chatHandler: { _, _ in
+                await capture.call()
+                return "duplicate"
+            },
+            typingRefreshNanoseconds: 0,
+            turnCoordinator: TelegramTurnCoordinator()
+        )
+
+        _ = await loop.tickOutcome()
+        #expect(await capture.handlerCalls == 0)
+        #expect(try await inbox.snapshots().first?.phase == .outcomeUnknown)
+        let persisted = await SwiftNativePersistenceCore().readJSON(offset, defaultValue: .null)
+        guard case .object(let object) = persisted else {
+            Issue.record("expected offset object")
+            return
+        }
+        #expect(object["offset"] == .int(702))
+    }
+
+    @Test func telegramUpdateInbox_preservesMalformedClaimAndFailsClosed() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("telegram_durable_corrupt_\(UUID().uuidString)", isDirectory: true)
+        let offset = root.appendingPathComponent("telegram", isDirectory: true)
+            .appendingPathComponent("last_offset.json")
+        let inbox = TelegramUpdateInbox(offsetURL: offset)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: inbox.directory, withIntermediateDirectories: true)
+        let path = inbox.directory.appendingPathComponent("702.json")
+        let original = Data("{damaged".utf8)
+        try original.write(to: path)
+
+        await #expect(throws: TelegramUpdateInboxError.self) {
+            _ = try await inbox.snapshots()
+        }
+        #expect(try Data(contentsOf: path) == original)
+    }
+
+    @Test func telegramUpdateInbox_rejectsClaimWhoseFilenameDoesNotMatchUpdateID() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("telegram_durable_misnamed_\(UUID().uuidString)", isDirectory: true)
+        let offset = root.appendingPathComponent("telegram", isDirectory: true)
+            .appendingPathComponent("last_offset.json")
+        let inbox = TelegramUpdateInbox(offsetURL: offset)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let update = TelegramUpdate(updateId: 703)
+        _ = try await inbox.ensurePending(update)
+        let canonical = inbox.directory.appendingPathComponent("703.json")
+        let alias = inbox.directory.appendingPathComponent("704.json")
+        try FileManager.default.moveItem(at: canonical, to: alias)
+        let original = try Data(contentsOf: alias)
+
+        await #expect(throws: TelegramUpdateInboxError.self) {
+            _ = try await inbox.snapshots()
+        }
+        #expect(try Data(contentsOf: alias) == original)
+    }
+
     @Test func telegramHumanTurnPromotesBackgroundPollWorkToUserInitiated() async throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("telegram_priority_\(UUID().uuidString)", isDirectory: true)
@@ -979,6 +1143,69 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let (sent, cancelled) = await capture.snapshot()
         #expect(sent == ["Stopping the current Telegram turn."])
         #expect(cancelled)
+    }
+
+    @Test func telegramPollLoop_normal_turn_is_admitted_before_handler_can_compete_for_chat() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("telegram_atomic_admission_\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let offset = root.appendingPathComponent("telegram/last_offset.json")
+        let raw = #"""
+        {"ok":true,"result":[{"update_id":81,"message":{"message_id":41,"chat":{"id":77},"from":{"id":11},"text":"do the work","date":1}}]}
+        """#
+        let session = mockSession { req in
+            (makeResponse(req.url!, 200), Data(raw.utf8))
+        }
+        actor Capture {
+            var handlerCalls = 0
+            var competingAdmissionWon = false
+            var sent: [String] = []
+            func handlerEntered() { handlerCalls += 1 }
+            func markCompetingWin() { competingAdmissionWon = true }
+            func send(_ text: String) { sent.append(text) }
+            func snapshot() -> (Int, Bool, [String]) {
+                (handlerCalls, competingAdmissionWon, sent)
+            }
+        }
+        let capture = Capture()
+        let coordinator = TelegramTurnCoordinator()
+        let loop = TelegramPollLoop(
+            interval: 60,
+            token: tokenStr,
+            allowedChatIds: [77],
+            session: session,
+            dataRoot: root,
+            offsetURL: offset,
+            sendMessage: { _, _, text in await capture.send(text) },
+            sendChatAction: { _, _, _ in },
+            progressChatHandler: { _, _, _, _ in
+                await capture.handlerEntered()
+                // This is the old TOCTOU window made deterministic: when the
+                // normal Task was created before beginTurn, its handler could
+                // claim the still-empty coordinator itself. Atomic startTurn
+                // records the normal owner before this closure can begin.
+                if let competing = await coordinator.startTurn(
+                    chatId: 77,
+                    text: "competing continuation",
+                    operation: {}
+                ) {
+                    await capture.markCompetingWin()
+                    await competing.task.value
+                    await coordinator.finishTurn(chatId: 77, turnId: competing.id)
+                }
+                return "normal reply"
+            },
+            typingRefreshNanoseconds: 0,
+            turnCoordinator: coordinator
+        )
+
+        await loop.tick()
+
+        let result = await capture.snapshot()
+        #expect(result.0 == 1)
+        #expect(!result.1)
+        #expect(result.2 == ["normal reply"])
+        #expect(!(await coordinator.snapshot(chatId: 77).isRunning))
     }
 
     @Test func telegramPollLoop_retry_replays_last_user_message_without_command_prompt() async throws {

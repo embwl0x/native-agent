@@ -43,6 +43,44 @@ public final class OpenRouterAdapter: LLMAdapter {
     }
 
     public func complete(prompt: String, system: String?, model: String) async throws -> String {
+        try await complete(prompt: prompt, system: system, model: model, tools: nil)
+    }
+
+    public func complete(
+        prompt: String,
+        system: String?,
+        model: String,
+        tools: [LLMToolSchema]?
+    ) async throws -> String {
+        var messages: [[String: Any]] = []
+        if let system, !system.isEmpty {
+            messages.append(["role": "system", "content": system])
+        }
+        messages.append(["role": "user", "content": prompt])
+        return try await completeWire(messages: messages, model: model, tools: tools)
+    }
+
+    /// Preserve native image blocks and the assistant-tool/result transcript
+    /// on OpenRouter's OpenAI-compatible wire instead of flattening it into a
+    /// one-shot string (which silently dropped images and broke tool turn 2).
+    public func completeMessages(
+        messages: [LLMMessage],
+        system: String?,
+        model: String,
+        tools: [LLMToolSchema]?
+    ) async throws -> String {
+        try await completeWire(
+            messages: OpenAIAdapter.chatMessages(messages: messages, system: system),
+            model: model,
+            tools: tools
+        )
+    }
+
+    private func completeWire(
+        messages: [[String: Any]],
+        model: String,
+        tools: [LLMToolSchema]?
+    ) async throws -> String {
         guard let key = resolveKey(), !key.isEmpty else {
             throw LLMError.notConfigured(provider: "openrouter")
         }
@@ -51,12 +89,8 @@ public final class OpenRouterAdapter: LLMAdapter {
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        var messages: [[String: String]] = []
-        if let sys = system, !sys.isEmpty {
-            messages.append(["role": "system", "content": sys])
-        }
-        messages.append(["role": "user", "content": prompt])
-        let body: [String: Any] = ["model": model, "messages": messages]
+        var body: [String: Any] = ["model": model, "messages": messages]
+        try OpenAIAdapter.applyTools(to: &body, tools: tools)
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let data: Data
@@ -77,14 +111,110 @@ public final class OpenRouterAdapter: LLMAdapter {
             throw LLMError.modelUnavailable(provider: "openrouter", model: model)
         }
         try throwIfChatCompletionsError(status: status, data: data, mapping: Self.statusMapping, response: response)
-        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let choices = obj["choices"] as? [[String: Any]],
-              let first = choices.first,
-              let message = first["message"] as? [String: Any],
-              let content = message["content"] as? String else {
+        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw LLMError.invalidResponse(status: status)
         }
-        return content
+        return try OpenAIAdapter.parseCompletion(obj, status: status)
+    }
+
+    public func streamMessages(
+        messages: [LLMMessage],
+        system: String?,
+        model: String,
+        tools: [LLMToolSchema]?
+    ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
+        let session = self.session
+        let endpoint = self.endpoint
+        let keyResolved = self.resolveKey()
+        let dataRoot = self.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    guard let key = keyResolved, !key.isEmpty else {
+                        throw LLMError.notConfigured(provider: "openrouter")
+                    }
+                    var req = URLRequest(url: endpoint)
+                    req.httpMethod = "POST"
+                    req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+                    applyStreamingLLMHeaders(to: &req)
+                    var body: [String: Any] = [
+                        "model": model,
+                        "messages": OpenAIAdapter.chatMessages(messages: messages, system: system),
+                        "stream": true,
+                        "stream_options": ["include_usage": true],
+                    ]
+                    try OpenAIAdapter.applyTools(to: &body, tools: tools)
+                    req.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+                    let bytes: URLSession.AsyncBytes
+                    let response: URLResponse
+                    do {
+                        (bytes, response) = try await session.bytes(for: req)
+                    } catch {
+                        throw mapTransportError(error, fallback: .underlying(
+                            message: "connection refused: \(endpoint.host ?? "openrouter")"
+                        ))
+                    }
+                    let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                    if !(200..<300).contains(status) {
+                        let errorBody = await Self.drainErrorBody(bytes, maxBytes: 4096, timeout: 2.0)
+                        if status == 404 {
+                            _ = await OpenRouterModelCatalog.models(
+                                dataRoot: dataRoot, session: session, refresh: true
+                            )
+                            throw LLMError.modelUnavailable(provider: "openrouter", model: model)
+                        }
+                        try throwIfChatCompletionsError(
+                            status: status, data: errorBody,
+                            mapping: Self.statusMapping, response: response
+                        )
+                        throw LLMError.invalidResponse(status: status)
+                    }
+
+                    var decoder = ChatCompletionsStreamDecoder(providerLabel: "OpenRouter")
+                    var sawContent = false
+                    for try await sse in SSEEventStream(bytes) {
+                        try Task.checkCancellation()
+                        let frame = try decoder.consume(payload: sse.data)
+                        if frame.isDone { break }
+                        if frame.reasoning != nil { continuation.yield(.keepAlive) }
+                        if let content = frame.content {
+                            sawContent = true
+                            continuation.yield(.textDelta(content))
+                        }
+                        for _ in 0..<frame.toolCallDeltaCount { continuation.yield(.keepAlive) }
+                    }
+                    guard decoder.sawDone else {
+                        throw LLMError.streamTruncated(
+                            message: "openrouter stream ended without [DONE]"
+                        )
+                    }
+                    let completed = decoder.completedToolCalls(idPrefix: "openrouter")
+                    if !sawContent && completed.isEmpty {
+                        throw LLMError.streamTruncated(
+                            message: "openrouter stream produced no content ([DONE], empty)"
+                        )
+                    }
+                    for call in completed {
+                        continuation.yield(.toolCall(.init(
+                            id: call.id,
+                            name: call.name,
+                            inputJSON: Data(call.arguments.utf8)
+                        )))
+                    }
+                    continuation.finish()
+                } catch let error as LLMError {
+                    continuation.finish(throwing: error)
+                } catch is CancellationError {
+                    continuation.finish(throwing: CancellationError())
+                } catch {
+                    continuation.finish(throwing: mapTransportError(
+                        error, fallback: .underlying(message: "stream: \(error)")
+                    ))
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
     }
 
     public func stream(

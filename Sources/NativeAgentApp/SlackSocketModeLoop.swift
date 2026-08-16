@@ -13,11 +13,38 @@ struct SlackSocketModeConfig: Sendable, Equatable {
     let historyPollEnabled: Bool
     let historyPollInterval: TimeInterval
     let historyConversationRefreshInterval: TimeInterval
-    // 2026-07-21 audit fix: transport allowlist (mirrors TelegramConfig).
-    // Empty sets = open (prior behavior); when either is configured, only
-    // those channels/users may drive chat turns.
+    // Transport policy mirrors SecurityCenter's union of the two Slack token
+    // stores. An empty allowlist is deliberately unavailable, never open.
     let allowedChannelIds: Set<String>
     let allowedUserIds: Set<String>
+    let requireMention: Bool
+
+    var ingressPolicy: SlackIngressPolicy {
+        SlackIngressPolicy(
+            allowedChannelIds: allowedChannelIds,
+            allowedUserIds: allowedUserIds,
+            requireMention: requireMention,
+            botUserId: botUserId
+        )
+    }
+
+    static func loadIngressPolicy(
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) -> SlackIngressPolicy {
+        let objects = tokenObjects(dataRoot: dataRoot)
+        return SlackIngressPolicy(
+            allowedChannelIds: firstStringSet(
+                keys: ["allowed_channel_ids", "allowedChannelIds", "allowed_chat_ids", "allowedChatIds"],
+                in: objects
+            ),
+            allowedUserIds: firstStringSet(
+                keys: ["allowed_user_ids", "allowedUserIds"],
+                in: objects
+            ),
+            requireMention: firstBool(keys: ["require_mention", "requireMention"], in: objects) ?? true,
+            botUserId: firstString(keys: ["user_id", "bot_user_id", "bot_id"], in: objects)
+        )
+    }
 
     static func load(dataRoot: URL = PersistenceCore.defaultDataRoot()) -> SlackSocketModeConfig? {
         let objects = tokenObjects(dataRoot: dataRoot)
@@ -59,7 +86,8 @@ struct SlackSocketModeConfig: Sendable, Equatable {
             allowedUserIds: firstStringSet(
                 keys: ["allowed_user_ids", "allowedUserIds"],
                 in: objects
-            )
+            ),
+            requireMention: firstBool(keys: ["require_mention", "requireMention"], in: objects) ?? true
         )
     }
 
@@ -142,6 +170,52 @@ struct SlackSocketModeConfig: Sendable, Equatable {
     }
 }
 
+enum SlackIngressDenial: String, Sendable, Equatable {
+    case allowlistEmpty = "allowlist_empty_fail_closed"
+    case notAllowlisted = "not_allowlisted"
+    case mentionRequired = "mention_required"
+}
+
+/// One pure ingress decision shared by Socket Mode and history gap-fill.
+/// SecurityCenter separately rechecks the same channel/user union at effect
+/// time; this transport policy prevents unauthorized messages from becoming a
+/// turn in the first place. It owns no tool or provider authority.
+struct SlackIngressPolicy: Sendable, Equatable {
+    let allowedChannelIds: Set<String>
+    let allowedUserIds: Set<String>
+    let requireMention: Bool
+    let botUserId: String?
+
+    var isConfigured: Bool {
+        !allowedChannelIds.isEmpty || !allowedUserIds.isEmpty
+    }
+
+    func denial(
+        channelId: String,
+        userId: String,
+        eventType: String,
+        channelType: String?,
+        rawText: String
+    ) -> SlackIngressDenial? {
+        guard isConfigured else { return .allowlistEmpty }
+        guard allowedChannelIds.contains(channelId) || allowedUserIds.contains(userId) else {
+            return .notAllowlisted
+        }
+        let normalizedType = channelType?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let direct = normalizedType == "im" || normalizedType == "app_home" || channelId.hasPrefix("D")
+        guard requireMention, !direct else { return nil }
+        if eventType == "app_mention" { return nil }
+        guard let botUserId = botUserId?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !botUserId.isEmpty,
+              rawText.contains("<@\(botUserId)>") else {
+            return .mentionRequired
+        }
+        return nil
+    }
+}
+
 /// One-way latch marking that a planned session recycle (not a failure)
 /// closed the socket. Same lock pattern as SlackPingContinuationGate below.
 private final class SlackSessionRecycleFlag: @unchecked Sendable {
@@ -189,6 +263,13 @@ private final class SlackPingContinuationGate: @unchecked Sendable {
     }
 }
 
+struct SlackInboundFile: Sendable, Equatable {
+    let downloadURL: String
+    let mimeType: String
+    let name: String?
+    let byteSize: Int?
+}
+
 struct SlackInboundMessage: Sendable, Equatable {
     let eventId: String
     let teamId: String
@@ -200,6 +281,36 @@ struct SlackInboundMessage: Sendable, Equatable {
     let threadTs: String?
     let channelType: String?
     let isDirectMessage: Bool
+    let files: [SlackInboundFile]
+    let attachments: [ChatOrchestration.MultimodalAttachment]
+
+    init(
+        eventId: String,
+        teamId: String,
+        channelId: String,
+        userId: String,
+        eventType: String,
+        text: String,
+        ts: String,
+        threadTs: String?,
+        channelType: String?,
+        isDirectMessage: Bool,
+        files: [SlackInboundFile] = [],
+        attachments: [ChatOrchestration.MultimodalAttachment] = []
+    ) {
+        self.eventId = eventId
+        self.teamId = teamId
+        self.channelId = channelId
+        self.userId = userId
+        self.eventType = eventType
+        self.text = text
+        self.ts = ts
+        self.threadTs = threadTs
+        self.channelType = channelType
+        self.isDirectMessage = isDirectMessage
+        self.files = files
+        self.attachments = attachments
+    }
 
     var sessionKey: String {
         if let threadTs = normalizedThreadTs {
@@ -265,9 +376,6 @@ struct SlackSocketModeLoop: LoopRunner {
     /// ping inside this window counts as healthy. Pings run every 25s, so 90s
     /// is three missed heartbeats.
     static let socketHealthGrace: TimeInterval = 90
-    /// How often the history-poll task re-evaluates its trigger while idle.
-    static let historyPollCheckInterval: TimeInterval = 10
-
     /// LOOPS-5: conservative backstop poll that still runs while the socket
     /// looks healthy. Pings can keep succeeding while Slack silently stops
     /// delivering events, and that failure mode is invisible to the socket, so
@@ -367,7 +475,7 @@ struct SlackSocketModeLoop: LoopRunner {
             // best-effort poll here keeps messages flowing during exactly
             // the outages the fallback exists for. Failure is already the
             // tick's outcome; the poll's own error is recorded, not thrown.
-            if config.historyPollEnabled {
+            if config.historyPollEnabled, config.ingressPolicy.isConfigured {
                 do {
                     try await pollSlackHistoryOnce()
                     await writeState([
@@ -535,10 +643,14 @@ struct SlackSocketModeLoop: LoopRunner {
     }
 
     private func historyPollUntilCancelled() async {
-        guard config.historyPollEnabled else {
+        guard config.historyPollEnabled, config.ingressPolicy.isConfigured else {
+            let reason = config.historyPollEnabled
+                ? "allowlist_empty_fail_closed"
+                : "disabled_by_configuration"
             await writeState([
                 "historyPollEnabled": .bool(false),
                 "historyPollDisabledAt": .string(Self.nowString()),
+                "historyPollDisabledReason": .string(reason),
             ])
             return
         }
@@ -562,8 +674,14 @@ struct SlackSocketModeLoop: LoopRunner {
                 safetyInterval: historySafetyPollInterval
             ) else {
                 do {
-                    try await Task.sleep(
-                        nanoseconds: UInt64(Self.historyPollCheckInterval * 1_000_000_000))
+                    let deadline = Self.historyPollDeadline(
+                        socketHealthy: await socketHealth.isHealthy(now: now),
+                        lastPollAt: lastPollAt,
+                        pollInterval: config.historyPollInterval,
+                        safetyInterval: historySafetyPollInterval
+                    ) ?? now
+                    let delay = max(0.001, deadline.timeIntervalSinceNow)
+                    try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                 } catch {
                     return
                 }
@@ -621,6 +739,22 @@ struct SlackSocketModeLoop: LoopRunner {
         return elapsed >= safetyInterval ? .safetyInterval : nil
     }
 
+    /// The next instant at which the current health state can change the poll
+    /// decision. Sleeping to this deadline replaces the old ten-second scan;
+    /// socket-session cancellation still wakes the task immediately on ping or
+    /// transport failure.
+    static func historyPollDeadline(
+        socketHealthy: Bool,
+        lastPollAt: Date?,
+        pollInterval: TimeInterval,
+        safetyInterval: TimeInterval
+    ) -> Date? {
+        guard let lastPollAt else { return nil }
+        return lastPollAt.addingTimeInterval(
+            socketHealthy ? safetyInterval : pollInterval
+        )
+    }
+
     private func pollSlackHistoryOnce() async throws {
         let conversations = try await cachedPollableConversations()
         await writeState([
@@ -674,6 +808,13 @@ struct SlackSocketModeLoop: LoopRunner {
                 channelType = "group"
             } else {
                 channelType = "channel"
+            }
+            // When policy is channel-only, avoid fetching any conversation the
+            // transport could never admit. A user allowlist still needs all
+            // joined conversations so message authors can be evaluated.
+            if config.allowedUserIds.isEmpty,
+               !config.allowedChannelIds.contains(id) {
+                return nil
             }
             return SlackConversationRef(id: id, channelType: channelType)
         }
@@ -782,14 +923,25 @@ struct SlackSocketModeLoop: LoopRunner {
         conversation: SlackConversationRef
     ) -> SlackInboundMessage? {
         if Self.string(message["bot_id"]) != nil { return nil }
-        if let subtype = Self.string(message["subtype"]), !subtype.isEmpty { return nil }
+        if let subtype = Self.string(message["subtype"]),
+           !subtype.isEmpty, subtype != "file_share" { return nil }
         let user = Self.string(message["user"]) ?? ""
         guard !user.isEmpty else { return nil }
         if let botUserId = config.botUserId, user == botUserId { return nil }
         let rawText = Self.string(message["text"]) ?? ""
+        guard config.ingressPolicy.denial(
+            channelId: conversation.id,
+            userId: user,
+            eventType: "message",
+            channelType: conversation.channelType,
+            rawText: rawText
+        ) == nil else {
+            return nil
+        }
         let text = Self.stripBotMention(rawText, botUserId: config.botUserId)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return nil }
+        let files = Self.inboundFiles(message["files"])
+        guard !text.isEmpty || !files.isEmpty else { return nil }
         let ts = Self.string(message["ts"]) ?? ""
         guard !ts.isEmpty else { return nil }
         let teamId = config.teamId ?? "slack"
@@ -803,7 +955,8 @@ struct SlackSocketModeLoop: LoopRunner {
             ts: ts,
             threadTs: Self.string(message["thread_ts"]),
             channelType: conversation.channelType,
-            isDirectMessage: conversation.channelType == "im" || conversation.id.hasPrefix("D")
+            isDirectMessage: conversation.channelType == "im" || conversation.id.hasPrefix("D"),
+            files: files
         )
     }
 
@@ -813,10 +966,6 @@ struct SlackSocketModeLoop: LoopRunner {
                 try await Task.sleep(nanoseconds: 25_000_000_000)
                 try await sendPing(socket: socket)
                 await socketHealth.markAlive()
-                await writeState([
-                    "lastPingAt": .string(Self.nowString()),
-                    "lastPingError": .null,
-                ])
             } catch is CancellationError {
                 return
             } catch {
@@ -897,7 +1046,8 @@ struct SlackSocketModeLoop: LoopRunner {
         let eventType = Self.string(event["type"]) ?? ""
         guard eventType == "app_mention" || eventType == "message" else { return nil }
         if Self.string(event["bot_id"]) != nil { return nil }
-        if let subtype = Self.string(event["subtype"]), !subtype.isEmpty { return nil }
+        if let subtype = Self.string(event["subtype"]),
+           !subtype.isEmpty, subtype != "file_share" { return nil }
 
         let channelType = Self.string(event["channel_type"])?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let channel = Self.string(event["channel"]) ?? ""
@@ -910,20 +1060,20 @@ struct SlackSocketModeLoop: LoopRunner {
         guard !user.isEmpty else { return nil }
         if let botUserId = config.botUserId, user == botUserId { return nil }
 
-        // 2026-07-21 audit fix: transport allowlist gate. Previously ANY
-        // workspace member in ANY channel the bot sat in got a chat turn.
-        // When the allowlist is configured, only allowlisted channels/users
-        // may drive turns (mirrors the Telegram transport gate).
-        if !config.allowedChannelIds.isEmpty || !config.allowedUserIds.isEmpty {
-            guard config.allowedChannelIds.contains(channel) || config.allowedUserIds.contains(user) else {
-                return nil
-            }
-        }
-
         let rawText = Self.string(event["text"]) ?? ""
+        guard config.ingressPolicy.denial(
+            channelId: channel,
+            userId: user,
+            eventType: eventType,
+            channelType: channelType,
+            rawText: rawText
+        ) == nil else {
+            return nil
+        }
         let text = Self.stripBotMention(rawText, botUserId: config.botUserId)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return nil }
+        let files = Self.inboundFiles(event["files"])
+        guard !text.isEmpty || !files.isEmpty else { return nil }
 
         let teamId = Self.string(payload["team_id"]) ?? config.teamId ?? "slack"
         let ts = Self.string(event["ts"]) ?? Self.string(event["event_ts"]) ?? ""
@@ -940,7 +1090,8 @@ struct SlackSocketModeLoop: LoopRunner {
             ts: ts,
             threadTs: Self.string(event["thread_ts"]),
             channelType: channelType,
-            isDirectMessage: isDirectMessage
+            isDirectMessage: isDirectMessage,
+            files: files
         )
     }
 
@@ -967,7 +1118,16 @@ struct SlackSocketModeLoop: LoopRunner {
             "lastChannelId": .string(inbound.channelId),
         ])
         do {
-            let chatReply = try await chatHandler(inbound)
+            let hydratedInbound = await hydratingAttachments(inbound)
+            guard !hydratedInbound.text.isEmpty || !hydratedInbound.attachments.isEmpty else {
+                await recordError(
+                    context: "download_inbound_file",
+                    error: SlackSocketModeError.api("no supported Slack attachment could be read"),
+                    inbound: inbound
+                )
+                return false
+            }
+            let chatReply = try await chatHandler(hydratedInbound)
             let reply = chatReply.text.trimmingCharacters(in: .whitespacesAndNewlines)
             let imageAttachments = Self.uploadableImageAttachments(chatReply.attachments)
             guard !reply.isEmpty || !imageAttachments.isEmpty else {
@@ -1028,6 +1188,104 @@ struct SlackSocketModeLoop: LoopRunner {
             }
             _ = try? await outbound.postMessage(input)
             return false
+        }
+    }
+
+    private func hydratingAttachments(_ inbound: SlackInboundMessage) async -> SlackInboundMessage {
+        guard !inbound.files.isEmpty else { return inbound }
+        var attachments = inbound.attachments
+        var remainingBytes = 20 * 1_024 * 1_024
+        for file in inbound.files.prefix(4) where remainingBytes > 0 {
+            do {
+                let attachment = try await downloadInboundFile(
+                    file,
+                    maximumBytes: min(10 * 1_024 * 1_024, remainingBytes)
+                )
+                remainingBytes -= attachment.byteSize
+                attachments.append(attachment)
+            } catch {
+                await writeState([
+                    "lastInboundAttachmentErrorAt": .string(Self.nowString()),
+                    "lastInboundAttachmentError": .string(String(describing: error)),
+                ])
+            }
+        }
+        return SlackInboundMessage(
+            eventId: inbound.eventId,
+            teamId: inbound.teamId,
+            channelId: inbound.channelId,
+            userId: inbound.userId,
+            eventType: inbound.eventType,
+            text: inbound.text,
+            ts: inbound.ts,
+            threadTs: inbound.threadTs,
+            channelType: inbound.channelType,
+            isDirectMessage: inbound.isDirectMessage,
+            files: inbound.files,
+            attachments: attachments
+        )
+    }
+
+    private func downloadInboundFile(
+        _ file: SlackInboundFile,
+        maximumBytes: Int
+    ) async throws -> ChatOrchestration.MultimodalAttachment {
+        let mime = file.mimeType.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let supportedMIMEs: Set<String> = ["image/jpeg", "image/png", "image/gif", "image/webp"]
+        guard supportedMIMEs.contains(mime),
+              let url = URL(string: file.downloadURL), url.scheme?.lowercased() == "https" else {
+            throw SlackSocketModeError.api("unsupported Slack attachment")
+        }
+        if let declared = file.byteSize, declared > maximumBytes {
+            throw SlackSocketModeError.api("Slack attachment exceeds the \(maximumBytes)-byte limit")
+        }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 30
+        request.setValue("Bearer \(config.botToken)", forHTTPHeaderField: "Authorization")
+        let (bytes, response) = try await session.bytes(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw SlackSocketModeError.api("Slack attachment download failed")
+        }
+        if response.expectedContentLength > Int64(maximumBytes) {
+            throw SlackSocketModeError.api("Slack attachment exceeds the \(maximumBytes)-byte limit")
+        }
+        var data = Data()
+        data.reserveCapacity(min(file.byteSize ?? 0, maximumBytes))
+        for try await byte in bytes {
+            guard data.count < maximumBytes else {
+                throw SlackSocketModeError.api("Slack attachment exceeds the \(maximumBytes)-byte limit")
+            }
+            data.append(byte)
+        }
+        guard !data.isEmpty else { throw SlackSocketModeError.api("Slack attachment was empty") }
+        return ChatOrchestration.MultimodalAttachment(
+            type: "image",
+            base64: data.base64EncodedString(),
+            mime: mime,
+            name: file.name,
+            byteSize: data.count
+        )
+    }
+
+    private static func inboundFiles(_ value: JSONValue?) -> [SlackInboundFile] {
+        guard case .array(let rows)? = value else { return [] }
+        return rows.compactMap { value in
+            guard case .object(let file) = value,
+                  let url = string(file["url_private_download"]) ?? string(file["url_private"]),
+                  let mime = string(file["mimetype"]) else { return nil }
+            let bytes: Int? = {
+                switch file["size"] {
+                case .int(let value)?: return Int(value)
+                case .double(let value)?: return Int(value)
+                default: return nil
+                }
+            }()
+            return SlackInboundFile(
+                downloadURL: url,
+                mimeType: mime,
+                name: string(file["name"]),
+                byteSize: bytes
+            )
         }
     }
 
@@ -1198,6 +1456,16 @@ struct SlackSocketModeLoop: LoopRunner {
         }
         if user?.isEmpty ?? true {
             return ("missing_user", envelopeType, payloadType, eventType, subtype, channelType, channel, user, textPreview)
+        }
+        if let channel, let user,
+           let denial = config.ingressPolicy.denial(
+               channelId: channel,
+               userId: user,
+               eventType: eventType ?? "",
+               channelType: channelType,
+               rawText: Self.string(event["text"]) ?? ""
+           ) {
+            return (denial.rawValue, envelopeType, payloadType, eventType, subtype, channelType, channel, user, textPreview)
         }
         let text = Self.stripBotMention(Self.string(event["text"]) ?? "", botUserId: config.botUserId)
             .trimmingCharacters(in: .whitespacesAndNewlines)

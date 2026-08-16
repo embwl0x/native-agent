@@ -10,14 +10,21 @@ extension SchedulerDueJobRunner {
         // receipt. The park decision is made under the jobs lock; the receipt
         // is emitted afterward so the two file locks never nest.
         let parkedAttempts: Int? = try await persistence.withFileLock(jobsPath) { () async throws -> Int? in
-            let raw = await persistence.readJSON(jobsPath, defaultValue: .array([]))
-            guard case .array(var rows) = raw else { return nil }
+            var rows = try Self.readJobRowsChecked(at: jobsPath)
             var parkedAttempts: Int?
+            var found = false
             for idx in rows.indices {
                 guard case .object(var obj) = rows[idx],
                       (SchedulerJobRuntime.string(obj["id"]) ?? "") == job.id else {
                     continue
                 }
+                guard case .object(let active)? = obj["activeOccurrence"],
+                      SchedulerJobRuntime.string(active["key"]) == job.occurrenceKey else {
+                    throw NSError(domain: "NativeAgentScheduler", code: -409, userInfo: [
+                        NSLocalizedDescriptionKey: "occurrence claim changed before settlement: \(job.occurrenceKey)"
+                    ])
+                }
+                found = true
                 obj["lastRunAt"] = .string(Self.iso(runDate))
                 obj["lastRunStatus"] = .string(result.status)
                 obj["lastRunDetail"] = .string(String(result.detail.prefix(1000)))
@@ -70,8 +77,15 @@ extension SchedulerDueJobRunner {
                     obj["disabledReason"] = .string("could not compute next scheduled run")
                     Self.clearRetryState(&obj)
                 }
+                obj["lastOccurrenceKey"] = .string(job.occurrenceKey)
+                obj.removeValue(forKey: "activeOccurrence")
                 rows[idx] = .object(obj)
                 break
+            }
+            guard found else {
+                throw NSError(domain: "NativeAgentScheduler", code: -404, userInfo: [
+                    NSLocalizedDescriptionKey: "claimed scheduler job disappeared before settlement: \(job.id)"
+                ])
             }
             try await persistence.writeJSON(.array(rows), to: jobsPath)
             return parkedAttempts
@@ -95,8 +109,7 @@ extension SchedulerDueJobRunner {
     @discardableResult
     func pruneCompletedOneShotJobs(now: Date) async throws -> Int {
         try await persistence.withFileLock(jobsPath) { () async throws -> Int in
-            let raw = await persistence.readJSON(jobsPath, defaultValue: .array([]))
-            guard case .array(let rows) = raw else { return 0 }
+            let rows = try Self.readJobRowsChecked(at: jobsPath)
             let result = Self.pruneCompletedOneShotRows(rows, now: now)
             guard result.removed > 0 else { return 0 }
             try await persistence.writeJSON(.array(result.rows), to: jobsPath)
@@ -247,8 +260,7 @@ extension SchedulerDueJobRunner {
 
     func markDefaultCycleJobRun(id: String, detail: String, at runDate: Date) async throws {
         try await persistence.withFileLock(jobsPath) {
-            let raw = await persistence.readJSON(jobsPath, defaultValue: .array([]))
-            guard case .array(var rows) = raw else { return }
+            var rows = try Self.readJobRowsChecked(at: jobsPath)
             for idx in rows.indices {
                 guard case .object(var obj) = rows[idx],
                       (SchedulerJobRuntime.string(obj["id"]) ?? "") == id else {

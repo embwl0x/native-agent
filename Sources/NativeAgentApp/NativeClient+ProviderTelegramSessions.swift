@@ -39,7 +39,6 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-import CapabilityFoundry
 
 extension NativeClient {
     func getModelCatalog(refresh: Bool) async throws -> ModelCatalogResponse {
@@ -96,8 +95,42 @@ extension NativeClient {
                     priority: 1_000 + index
                 )
             }
+        let routingSnapshot = try await SwiftNativeProviderRouting(dataRoot: dataRoot)
+            .checkedRoutingSnapshot()
+        func projectedPreference(_ surface: String) -> ModelSurfacePreference? {
+            guard let preference = routingSnapshot.preferences[surface] else { return nil }
+            return ModelSurfacePreference(
+                surface: preference.surface,
+                model: preference.model,
+                reasoningEffort: preference.reasoningEffort,
+                serviceTier: preference.serviceTier,
+                source: nil,
+                modelKnown: preference.modelKnown
+            )
+        }
+        guard let chatPreference = projectedPreference("chat"),
+              let telegramPreference = projectedPreference("telegram") else {
+            throw NSError(
+                domain: "NativeAgentProviderRouting",
+                code: 500,
+                userInfo: [NSLocalizedDescriptionKey: "canonical routing snapshot is incomplete"]
+            )
+        }
+        let canonicalCurrent = ModelRoutingCurrent(
+            chat: chatPreference,
+            telegram: telegramPreference,
+            ios: projectedPreference("ios"),
+            executions: projectedPreference(WorkshopSurfaceVocabulary.canonical),
+            autonomy: projectedPreference("autonomy"),
+            swarms: projectedPreference("swarms"),
+            dream: projectedPreference("dream"),
+            training: projectedPreference("training")
+        )
         func withDiscoveredModels(_ catalog: ModelCatalogResponse) -> ModelCatalogResponse {
             var merged = catalog
+            // models.json is only a compatibility/catalog cache. The picker
+            // tuple always comes from Core's one recovered canonical snapshot.
+            merged.current = canonicalCurrent
             // The on-disk models.json file is a compatibility cache, not an
             // authority for first-party capabilities. Replace matching rows
             // with the verified/current catalogs so a stale persisted entry
@@ -160,48 +193,6 @@ extension NativeClient {
             ReasoningEffortOption(id: "ultra", label: "Ultra", description: nil)
         ]
 
-        let surfacesURL = dataRoot.appendingPathComponent("providers", isDirectory: true)
-            .appendingPathComponent("surfaces.json")
-        var surfacePrefs: [String: ModelSurfacePreference] = [:]
-        if let data = try? Data(contentsOf: surfacesURL),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            for (k, v) in obj {
-                guard let entry = v as? [String: Any] else { continue }
-                let model = (entry["model"] as? String) ?? defaultModel
-                let effort = (entry["reasoningEffort"] as? String) ?? "medium"
-                let serviceTier = (entry["serviceTier"] as? String)
-                    ?? (entry["service_tier"] as? String)
-                    ?? "default"
-                surfacePrefs[k] = ModelSurfacePreference(
-                    surface: k,
-                    model: model,
-                    reasoningEffort: effort,
-                    serviceTier: serviceTier,
-                    source: nil,
-                    modelKnown: nil
-                )
-            }
-        }
-        func pref(_ s: String) -> ModelSurfacePreference {
-            surfacePrefs[s] ?? ModelSurfacePreference(
-                surface: s,
-                model: defaultModel,
-                reasoningEffort: "medium",
-                serviceTier: "default",
-                source: nil,
-                modelKnown: nil
-            )
-        }
-        let current = ModelRoutingCurrent(
-            chat: pref("chat"),
-            telegram: pref("telegram"),
-            ios: surfacePrefs["ios"],
-            executions: ProviderRoutingSurfaceLookup.value(surfacePrefs, WorkshopSurfaceVocabulary.canonical),
-            autonomy: surfacePrefs["autonomy"],
-            swarms: surfacePrefs["swarms"],
-            dream: surfacePrefs["dream"],
-            training: surfacePrefs["training"]
-        )
         return ModelCatalogResponse(
             status: "ok",
             source: "first_party_capabilities_plus_signed_codex_and_openrouter",
@@ -209,7 +200,7 @@ extension NativeClient {
             fallbackModels: ["claude-sonnet-5"],
             models: baseline,
             reasoningEfforts: efforts,
-            current: current,
+            current: canonicalCurrent,
             updatedAt: nil
         )
     }

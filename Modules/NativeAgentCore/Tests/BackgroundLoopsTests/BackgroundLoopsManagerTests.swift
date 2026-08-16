@@ -57,6 +57,50 @@ private struct TimeoutStubLoop: LoopRunner {
     }
 }
 
+private final class DueAwareClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Date
+
+    init(_ date: Date) { stored = date }
+
+    func read() -> Date {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored
+    }
+
+    func advance(_ seconds: TimeInterval) {
+        lock.lock()
+        stored = stored.addingTimeInterval(seconds)
+        lock.unlock()
+    }
+}
+
+private actor DueWakeAdmissionPause {
+    private var started = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func pause() async {
+        started = true
+        let waiters = startWaiters
+        startWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        await withCheckedContinuation { releaseWaiters.append($0) }
+    }
+
+    func waitUntilStarted() async {
+        if started { return }
+        await withCheckedContinuation { startWaiters.append($0) }
+    }
+
+    func release() {
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+}
+
 /// A loop with a short tick budget whose body ignores cooperative
 /// cancellation — the exact shape that used to wedge the single-flight gate
 /// forever after one timeout.
@@ -245,6 +289,127 @@ struct BackgroundLoopsManagerTests {
         await manager.stop()
     }
 
+    @Test("due-aware OS wakes consult the durable cadence while manual runs still force")
+    func dueAwareWakePreservesManualForceRun() async {
+        let clock = DueAwareClock(Date(timeIntervalSince1970: 2_000_000))
+        let counter = TickCounter()
+        let scheduler = SwiftNativeLoopScheduler(
+            clock: { clock.read() },
+            startupStagger: 0,
+            durableFlushWindow: 0
+        )
+        let manager = BackgroundLoopsManager(
+            scheduler: scheduler,
+            clock: { clock.read() }
+        )
+        let loop = AsyncStubLoop("weekly_due_wake", interval: 7 * 24 * 60 * 60) {
+            await counter.bump()
+        }
+        await manager.start(loops: [loop])
+        let seededAt = await scheduler._testPersistedLastRun(loopId: loop.loopId)
+
+        #expect(
+            await manager.runTickIfDue(loopId: loop.loopId)
+                == .skipped(reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true)
+        )
+        #expect(await counter.value == 0)
+        #expect(await scheduler._testPersistedLastRun(loopId: loop.loopId) == seededAt)
+
+        // The explicit/manual surface remains a force-run and advances the
+        // exact durable clock used by later OS wakes.
+        #expect(await manager.runTickOnce(loopId: loop.loopId) == .completed(result: nil))
+        #expect(await counter.value == 1)
+        clock.advance(loop.interval - 1)
+        #expect(
+            await manager.runTickIfDue(loopId: loop.loopId)
+                == .skipped(reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true)
+        )
+        #expect(await counter.value == 1)
+
+        clock.advance(1)
+        #expect(await manager.runTickIfDue(loopId: loop.loopId) == .completed(result: nil))
+        #expect(await counter.value == 2)
+        await manager.stop()
+    }
+
+    @Test("concurrent due wakes share one execution and one durable settlement")
+    func concurrentDueWakesCoalesce() async throws {
+        let clock = DueAwareClock(Date(timeIntervalSince1970: 3_000_000))
+        let scheduler = SwiftNativeLoopScheduler(
+            clock: { clock.read() },
+            startupStagger: 0,
+            durableFlushWindow: 0
+        )
+        let probe = SuspendedTickProbe()
+        let loop = AsyncStubLoop("racing_due_wake", interval: 3_600) {
+            await probe.tick()
+        }
+        let manager = BackgroundLoopsManager(
+            scheduler: scheduler,
+            clock: { clock.read() }
+        )
+        await manager.start(loops: [loop])
+        clock.advance(loop.interval)
+
+        let first = Task { await manager.runTickIfDue(loopId: loop.loopId) }
+        await probe.waitUntilStarted()
+        let second = Task { await manager.runTickIfDue(loopId: loop.loopId) }
+        #expect(await manager._testWaitForCoalescedRequest(loopId: loop.loopId))
+        await probe.release()
+
+        #expect(await first.value == .completed(result: nil))
+        #expect(await second.value == .skipped(reason: LoopTickOutcome.coalescedSkipReason))
+        #expect(await probe.value == 1)
+        #expect(await scheduler._testPersistedLastRun(loopId: loop.loopId) == clock.read())
+        await manager.stop()
+    }
+
+    @Test("a periodic settlement between due read and gate admission cancels the OS body")
+    func dueWakeRechecksAfterGateAdmission() async {
+        let clock = DueAwareClock(Date(timeIntervalSince1970: 4_000_000))
+        let scheduler = SwiftNativeLoopScheduler(
+            clock: { clock.read() },
+            startupStagger: 0,
+            durableFlushWindow: 0
+        )
+        let body = TickCounter()
+        let loop = AsyncStubLoop("due_admission_race", interval: 3_600) {
+            await body.bump()
+        }
+        let manager = BackgroundLoopsManager(
+            scheduler: scheduler,
+            clock: { clock.read() }
+        )
+        await manager.start(loops: [loop])
+        clock.advance(loop.interval)
+
+        let pause = DueWakeAdmissionPause()
+        await manager._testSetDueWakePreAdmissionHook { await pause.pause() }
+        let osWake = Task { await manager.runTickIfDue(loopId: loop.loopId) }
+        await pause.waitUntilStarted() // the OS wake's initial durable read was due
+
+        // The periodic owner wins and durably settles while the OS wake is
+        // paused before gate admission — the exact historical TOCTOU window.
+        await manager._testRunPeriodicTick(loopId: loop.loopId)
+        #expect(await body.value == 1)
+        let periodicStamp = await scheduler._testPersistedLastRun(loopId: loop.loopId)
+        clock.advance(10)
+        await pause.release()
+
+        #expect(
+            await osWake.value
+                == .skipped(reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true)
+        )
+        #expect(await body.value == 1, "the due OS wake duplicated the settled periodic body")
+        #expect(await manager.status().first { $0.name == loop.loopId }?.runCount == 1)
+        #expect(
+            await scheduler._testPersistedLastRun(loopId: loop.loopId) == periodicStamp,
+            "the post-gate not-due wake advanced the durable cadence"
+        )
+        await manager._testSetDueWakePreAdmissionHook(nil)
+        await manager.stop()
+    }
+
     @Test("status distinguishes an active tick from a merely registered loop")
     func statusReportsActiveExecution() async throws {
         let probe = SuspendedTickProbe()
@@ -308,13 +473,8 @@ struct BackgroundLoopsManagerTests {
         await manager.stop()
     }
 
-    @Test("a timed-out uncancellable tick force-releases the gate so the next tick runs")
-    func timedOutWedgedTickDoesNotWedgeTheGate() async throws {
-        // Pre-fix: ManagedLoopRunner awaited `underlying.tickOutcome()`
-        // directly, so when the manager's timeout cancelled the tick task and
-        // the loop body ignored cancellation, `gate.finish` never ran. The
-        // gate stayed active forever and EVERY later tick coalesced into a
-        // skip — a permanently dead loop behind a single timeout receipt.
+    @Test("a timed-out uncancellable tick quarantines its registration until the child exits")
+    func timedOutWedgedTickDoesNotOverlapReplacementWork() async throws {
         let probe = SuspendedTickProbe()
         let loop = WedgedTimeoutStubLoop { await probe.tick() }
         let manager = BackgroundLoopsManager()
@@ -329,28 +489,39 @@ struct BackgroundLoopsManagerTests {
         }
         #expect(firstError.hasPrefix("timeout after"))
 
-        // A subsequent request must RUN the underlying loop rather than
-        // coalesce. Entry count is the only honest verdict here: a coalesced
-        // joiner is itself cancelled by the same tick timeout, so the returned
-        // outcome is `.failed(timeout…)` either way and cannot discriminate.
-        // The force-release also lands one actor hop after the timeout throws,
-        // so a single follow-up may legitimately still join — but a join waits
-        // for idle, so a bounded retry converges. Pre-fix, entries stayed at 1
-        // forever no matter how many attempts were made.
-        var entries = await probe.value
-        attempts: for _ in 0..<3 {
-            _ = await manager.runTickOnce(loopId: loop.loopId)
-            // The wedged body is entered from an unstructured child, so observe
-            // the entry by bounded polling rather than a bare sleep.
-            for _ in 0..<60 {  // ~3s per attempt — positive step under suite load
-                entries = await probe.value
-                if entries >= 2 { break attempts }
-                try await Task.sleep(nanoseconds: 50_000_000)
-            }
-        }
-        #expect(entries >= 2, "gate stayed wedged — underlying loop never ran again (entries=\(entries))")
+        // The timeout bounds the caller, not the effect lifecycle. While the
+        // non-cooperative child remains alive, status stays executing and a
+        // new request joins/coalesces rather than starting overlapping work.
+        let quarantined = try #require(await manager.status().first { $0.name == loop.loopId })
+        #expect(quarantined.executing)
+        #expect(await probe.value == 1)
+        let replacement = Task { await manager.runTickOnce(loopId: loop.loopId) }
+        await manager._testWaitForCoalescedRequest(loopId: loop.loopId)
+        #expect(await probe.value == 1)
 
         await probe.release()
+        #expect(await replacement.value == .skipped(reason: "coalesced with active tick"))
+
+        // Once the actual child has exited, the same registration becomes
+        // available again. This proves quarantine is lifecycle-bound rather
+        // than a permanent wedge.
+        var idle = false
+        for _ in 0..<100 {
+            if await manager.status().first(where: { $0.name == loop.loopId })?.executing == false {
+                idle = true
+                break
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(idle, "registration did not leave quarantine after child exit")
+        let next = Task { await manager.runTickOnce(loopId: loop.loopId) }
+        for _ in 0..<100 {
+            if await probe.value >= 2 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(await probe.value == 2)
+        await probe.release()
+        _ = await next.value
         await manager.stop()
     }
 

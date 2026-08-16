@@ -2,6 +2,184 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+enum TelegramUpdateClaimPhase: String, Sendable, Equatable {
+    case pending
+    case processing
+    case completed
+    case outcomeUnknown = "outcome_unknown"
+}
+
+struct TelegramUpdateClaim: Sendable, Equatable {
+    let updateId: Int
+    let update: TelegramUpdate
+    let phase: TelegramUpdateClaimPhase
+    let claimedAt: String
+    let updatedAt: String
+}
+
+enum TelegramUpdateInboxError: Error, LocalizedError, Equatable {
+    case malformedClaim(String)
+    case mismatchedUpdateId(expected: Int, actual: Int)
+
+    var errorDescription: String? {
+        switch self {
+        case .malformedClaim(let name):
+            return "Telegram durable inbox claim is malformed: \(name)"
+        case .mismatchedUpdateId(let expected, let actual):
+            return "Telegram durable inbox claim id mismatch: expected \(expected), got \(actual)"
+        }
+    }
+}
+
+/// Telegram-owned durable admission state. A fetched update is written here
+/// before its upstream offset advances. Pending work can therefore survive a
+/// crash after acknowledgement; a prior-run `processing` claim is quarantined
+/// as outcome-unknown rather than replaying possibly-effecting work.
+struct TelegramUpdateInbox: Sendable {
+    let directory: URL
+    private let persistence = SwiftNativePersistenceCore()
+
+    init(offsetURL: URL) {
+        let parent = offsetURL.deletingLastPathComponent()
+        if parent.lastPathComponent == "telegram" {
+            self.directory = parent.appendingPathComponent("update_inbox", isDirectory: true)
+        } else {
+            self.directory = parent.appendingPathComponent(
+                offsetURL.lastPathComponent + ".inbox",
+                isDirectory: true
+            )
+        }
+    }
+
+    func snapshots() async throws -> [TelegramUpdateClaim] {
+        guard FileManager.default.fileExists(atPath: directory.path) else { return [] }
+        let urls = try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+            options: [.skipsHiddenFiles]
+        )
+        var claims: [TelegramUpdateClaim] = []
+        var seenUpdateIDs: Set<Int> = []
+        for url in urls where url.pathExtension == "json" {
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            guard values.isRegularFile == true, values.isSymbolicLink != true else {
+                throw TelegramUpdateInboxError.malformedClaim(url.lastPathComponent)
+            }
+            let claim = try decodeClaim(at: url)
+            guard url.deletingPathExtension().lastPathComponent == String(claim.updateId),
+                  seenUpdateIDs.insert(claim.updateId).inserted else {
+                throw TelegramUpdateInboxError.malformedClaim(url.lastPathComponent)
+            }
+            claims.append(claim)
+        }
+        return claims.sorted { $0.updateId < $1.updateId }
+    }
+
+    @discardableResult
+    func ensurePending(_ update: TelegramUpdate) async throws -> TelegramUpdateClaim {
+        let path = claimPath(updateId: update.updateId)
+        return try await persistence.withFileLock(path) {
+            if FileManager.default.fileExists(atPath: path.path) {
+                return try decodeClaim(at: path)
+            }
+            let now = _tgNowString()
+            let claim = TelegramUpdateClaim(
+                updateId: update.updateId,
+                update: update,
+                phase: .pending,
+                claimedAt: now,
+                updatedAt: now
+            )
+            try await write(claim, to: path)
+            return claim
+        }
+    }
+
+    @discardableResult
+    func transition(
+        updateId: Int,
+        from allowed: Set<TelegramUpdateClaimPhase>,
+        to phase: TelegramUpdateClaimPhase
+    ) async throws -> TelegramUpdateClaim {
+        let path = claimPath(updateId: updateId)
+        return try await persistence.withFileLock(path) {
+            let current = try decodeClaim(at: path)
+            guard allowed.contains(current.phase) else { return current }
+            let next = TelegramUpdateClaim(
+                updateId: current.updateId,
+                update: current.update,
+                phase: phase,
+                claimedAt: current.claimedAt,
+                updatedAt: _tgNowString()
+            )
+            try await write(next, to: path)
+            return next
+        }
+    }
+
+    func pruneTerminalClaims(keepingNewest keep: Int = 256) async {
+        guard let claims = try? await snapshots() else { return }
+        let terminal = claims.filter { $0.phase == .completed || $0.phase == .outcomeUnknown }
+        guard terminal.count > keep else { return }
+        for claim in terminal.prefix(terminal.count - keep) {
+            try? FileManager.default.removeItem(at: claimPath(updateId: claim.updateId))
+        }
+    }
+
+    private func claimPath(updateId: Int) -> URL {
+        directory.appendingPathComponent("\(updateId).json", isDirectory: false)
+    }
+
+    private func decodeClaim(at path: URL) throws -> TelegramUpdateClaim {
+        let data: Data
+        do {
+            data = try Data(contentsOf: path)
+        } catch {
+            throw TelegramUpdateInboxError.malformedClaim(path.lastPathComponent)
+        }
+        guard case .object(let object) = try? JSONValue.parse(data),
+              case .int(let schema)? = object["schemaVersion"], schema == 1,
+              case .int(let rawUpdateId)? = object["updateId"],
+              let updateId = Int(exactly: rawUpdateId),
+              case .string(let rawPhase)? = object["phase"],
+              let phase = TelegramUpdateClaimPhase(rawValue: rawPhase),
+              case .string(let claimedAt)? = object["claimedAt"], !claimedAt.isEmpty,
+              case .string(let updatedAt)? = object["updatedAt"], !updatedAt.isEmpty,
+              let updateValue = object["update"],
+              let updateData = try? updateValue.serializedData(pretty: false),
+              let update = try? JSONDecoder().decode(TelegramUpdate.self, from: updateData) else {
+            throw TelegramUpdateInboxError.malformedClaim(path.lastPathComponent)
+        }
+        guard update.updateId == updateId else {
+            throw TelegramUpdateInboxError.mismatchedUpdateId(expected: updateId, actual: update.updateId)
+        }
+        return TelegramUpdateClaim(
+            updateId: updateId,
+            update: update,
+            phase: phase,
+            claimedAt: claimedAt,
+            updatedAt: updatedAt
+        )
+    }
+
+    private func write(_ claim: TelegramUpdateClaim, to path: URL) async throws {
+        let updateData = try JSONEncoder().encode(claim.update)
+        let updateValue = try JSONValue.parse(updateData)
+        let value: JSONValue = .object([
+            "schemaVersion": .int(1),
+            "updateId": .int(Int64(claim.updateId)),
+            "phase": .string(claim.phase.rawValue),
+            "claimedAt": .string(claim.claimedAt),
+            "updatedAt": .string(claim.updatedAt),
+            "update": updateValue,
+        ])
+        try await persistence.writeDataAtomicDurable(
+            value.serializedData(pretty: true),
+            to: path
+        )
+    }
+}
+
 extension TelegramPollLoop {
     static func inferDataRoot(from offsetURL: URL) -> URL {
         let parent = offsetURL.deletingLastPathComponent()

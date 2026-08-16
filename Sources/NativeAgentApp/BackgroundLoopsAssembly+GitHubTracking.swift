@@ -3,21 +3,34 @@ import BackgroundLoops
 import GitHubConnector
 import PersistenceCore
 
-// GitHub tracking is configuration- and due-driven: the manager may offer a
-// five-minute tick, but the connector performs no network work until a project
-// is configured and its persisted refresh interval has elapsed. The refresh
-// compares material entity signatures before touching Desk, so unchanged GitHub
-// state produces no Desk update and no notification.
+// GitHub tracking is event/deadline driven. Canonical config, snapshot, Desk,
+// and GitHub Command changes wake a reread; the connector's learned cadence
+// supplies the exact next network-refresh crossing. The periodic interval is
+// only a slow missed-event repair sweep.
 extension BackgroundLoopsAssembly {
+    static func githubTrackingWatchedPaths(dataRoot: URL) -> [URL] {
+        let commandDirectory = dataRoot
+            .appendingPathComponent("workshop/github_command", isDirectory: true)
+        let deskDirectory = dataRoot.appendingPathComponent("desk", isDirectory: true)
+        return [
+            dataRoot.appendingPathComponent("connectors/github/tracking.json"),
+            dataRoot.appendingPathComponent("connectors/github/tracking_snapshot.json"),
+            deskDirectory.appendingPathComponent("desk_ops.jsonl"),
+            deskDirectory.appendingPathComponent("desk_ops_base.json"),
+            commandDirectory.appendingPathComponent("ops.jsonl"),
+            commandDirectory.appendingPathComponent("ops_base.json"),
+        ]
+    }
+
     static func makeGitHubTrackingLoop(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        intervalSeconds: TimeInterval = 300
-    ) -> some LoopRunner {
+        intervalSeconds: TimeInterval = 6 * 60 * 60
+    ) -> some EventDeadlineLoopRunner {
         GitHubTrackingRunner(interval: intervalSeconds, dataRoot: dataRoot)
     }
 }
 
-private struct GitHubTrackingRunner: LoopRunner {
+private struct GitHubTrackingRunner: EventDeadlineLoopRunner {
     let interval: TimeInterval
     let dataRoot: URL
     // Bound to THIS loop's dataRoot. The loop writes observations under the
@@ -37,6 +50,7 @@ private struct GitHubTrackingRunner: LoopRunner {
     }
 
     var loopId: String { "github_tracking" }
+    var eventCoalescingDelay: TimeInterval { 0.5 }
     // 120s dated from the original daily-refresh feature and starved the loop
     // once tracking grew to ~99 items at a 15-minute cadence: a full refresh
     // is hundreds of sequential GitHub calls (90s+ healthy, minutes under
@@ -50,6 +64,20 @@ private struct GitHubTrackingRunner: LoopRunner {
 
     func tick() async {
         _ = await tickOutcome()
+    }
+
+    func physiologyEvents() -> AsyncStream<Void> {
+        return EventDeadlinePhysiology.storeAndFileEvents(
+            paths: BackgroundLoopsAssembly.githubTrackingWatchedPaths(dataRoot: dataRoot),
+            stores: [.desk, .githubCommand]
+        )
+    }
+
+    func nextMeaningfulDeadline(after now: Date) async -> Date? {
+        await GitHubConnectorActions.nextTrackingRefreshDeadline(
+            after: now,
+            dataRoot: dataRoot
+        )
     }
 
     func tickOutcome() async -> LoopTickOutcome {

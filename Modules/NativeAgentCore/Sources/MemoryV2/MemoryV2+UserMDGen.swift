@@ -21,11 +21,17 @@ public enum UserMDGeneratorError: Error, CustomStringConvertible {
     /// Not a failure: writing it there would fabricate the identity anchor
     /// onboarding is about to create.
     case onboardingIncomplete
+    /// A file that carries evidence of the generator's preamble contract is
+    /// unreadable or only partially marked. Regeneration must leave it untouched
+    /// instead of treating damage as an intentionally absent preamble.
+    case damagedExistingDocument(String)
 
     public var description: String {
         switch self {
         case .onboardingIncomplete:
             return "USER.md generation is gated until onboarding completes"
+        case .damagedExistingDocument(let reason):
+            return "USER.md generation refused because the existing document is damaged: \(reason)"
         }
     }
 }
@@ -211,7 +217,7 @@ public actor UserMDGenerator {
 
         let core = SwiftNativePersistenceCore()
         try await core.withFileLock(target) { [body, target] in
-            let preamble = Self.extractPreamble(at: target)
+            let preamble = try Self.loadPreambleForRegeneration(at: target)
             let payload = Self.assemble(preamble: preamble, body: body)
             try Self.atomicReplace(payload, at: target)
         }
@@ -219,32 +225,12 @@ public actor UserMDGenerator {
         return target
     }
 
-    /// `rename(2)` replaces the destination in one filesystem operation. The
-    /// previous remove-then-move sequence exposed a transient missing USER.md
-    /// to prompt assembly and other readers.
+    /// Durable atomic replacement through the shared persistence core. This is
+    /// the same temp-fsync + rename + parent-directory-fsync contract used by
+    /// canonical chat/session state; a successful regeneration must survive a
+    /// power loss, not merely a process crash.
     private static func atomicReplace(_ payload: String, at target: URL) throws {
-        let temporary = target.appendingPathExtension("tmp.\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: temporary) }
-        try Data(payload.utf8).write(to: temporary, options: .atomic)
-
-        let result: Int32 = temporary.withUnsafeFileSystemRepresentation { source -> Int32 in
-            guard let source else { return -1 }
-            return target.withUnsafeFileSystemRepresentation { destination -> Int32 in
-                guard let destination else { return -1 }
-                return rename(source, destination)
-            }
-        }
-        guard result == 0 else {
-            let code = errno
-            throw NSError(
-                domain: NSPOSIXErrorDomain,
-                code: Int(code),
-                userInfo: [
-                    NSLocalizedDescriptionKey:
-                        "rename(\(temporary.path) -> \(target.path)) failed: \(String(cString: strerror(code)))"
-                ]
-            )
-        }
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(Data(payload.utf8), to: target)
     }
 
     // MARK: - Rendering
@@ -363,6 +349,32 @@ public actor UserMDGenerator {
               startRange.upperBound <= endRange.lowerBound else { return nil }
         let inner = existing[startRange.upperBound..<endRange.lowerBound]
         return String(inner)
+    }
+
+    private static func loadPreambleForRegeneration(at url: URL) throws -> String? {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: url.path) else { return nil }
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch {
+            throw UserMDGeneratorError.damagedExistingDocument("unreadable: \(error)")
+        }
+        guard let existing = String(data: data, encoding: .utf8) else {
+            throw UserMDGeneratorError.damagedExistingDocument("not valid UTF-8")
+        }
+        let startCount = existing.components(separatedBy: preambleStartMarker).count - 1
+        let endCount = existing.components(separatedBy: preambleEndMarker).count - 1
+        if startCount == 0 && endCount == 0 { return nil }
+        guard startCount == 1, endCount == 1,
+              let startRange = existing.range(of: preambleStartMarker),
+              let endRange = existing.range(of: preambleEndMarker),
+              startRange.upperBound <= endRange.lowerBound else {
+            throw UserMDGeneratorError.damagedExistingDocument(
+                "preamble markers are missing, duplicated, or out of order"
+            )
+        }
+        return String(existing[startRange.upperBound..<endRange.lowerBound])
     }
 
     static func assemble(preamble: String?, body: String) -> String {

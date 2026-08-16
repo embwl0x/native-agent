@@ -30,6 +30,7 @@ extension MacSyncEngine {
         if isActive {
             stop()
         }
+        snapshotLifecycleGeneration &+= 1
         activeDocsURL = docsURL
         loadProcessedIds()
         loadSnapshotDigests()
@@ -46,6 +47,7 @@ extension MacSyncEngine {
         isActive = true
         startSnapshotIntegrityFallback()
         startCognitionSnapshotObservation()
+        startChatTranscriptSnapshotObservation()
         Task {
             await writeSnapshots(forceHeavy: true)
             if let snapshotDir {
@@ -64,6 +66,7 @@ extension MacSyncEngine {
         if isActive {
             stop()
         }
+        snapshotLifecycleGeneration &+= 1
         activeDocsURL = docsURL
         // PATCH-2026-05-08: fix-A.3 Load persisted processed IDs before any inbox processing.
         loadProcessedIds()
@@ -101,6 +104,7 @@ extension MacSyncEngine {
         // app could not observe; unchanged passes write nothing and call no LLM.
         startSnapshotIntegrityFallback()
         startCognitionSnapshotObservation()
+        startChatTranscriptSnapshotObservation()
 
         // Watch inbox for iOS-deposited action files
         startInboxQuery(docsURL: docsURL)
@@ -116,15 +120,24 @@ extension MacSyncEngine {
 
 
     func stop() {
+        snapshotLifecycleGeneration &+= 1
         isActive = false
         activeDocsURL = nil
         snapshotIntegrityTask?.cancel()
         snapshotIntegrityTask = nil
         cognitionSnapshotObservationTask?.cancel()
         cognitionSnapshotObservationTask = nil
+        if let chatTurnCompletedObserver {
+            NotificationCenter.default.removeObserver(chatTurnCompletedObserver)
+            self.chatTurnCompletedObserver = nil
+        }
+        chatTranscriptSnapshotPublicationTask?.cancel()
+        chatTranscriptSnapshotPublicationTask = nil
         snapshotWriteInFlight = false
         snapshotWriteQueued = false
         snapshotWriteQueuedNeedsHeavy = false
+        snapshotWriteQueuedNeedsChatTranscripts = false
+        snapshotWriteQueuedNeedsStandardPass = false
         // fix-snapshot-digest-persist: do NOT clear the digest map on stop().
         // Clearing it meant every reconnect re-wrote all snapshots (full iOS
         // read-storm). Persist it instead, and keep it in memory so a same-process
@@ -160,6 +173,56 @@ extension MacSyncEngine {
                 guard Self.shouldWriteSnapshot(for: change) else { continue }
                 await self.writeSnapshots()
             }
+        }
+    }
+
+    private func startChatTranscriptSnapshotObservation() {
+        if let chatTurnCompletedObserver {
+            NotificationCenter.default.removeObserver(chatTurnCompletedObserver)
+        }
+        chatTurnCompletedObserver = NotificationCenter.default.addObserver(
+            forName: .chatTurnCompleted,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.requestChatSnapshotPublication(includeTranscripts: true)
+            }
+        }
+    }
+
+    /// Coalesces a burst of completion edges into one sessions + transcript
+    /// snapshot pass. It deliberately does not request the unrelated heavy
+    /// catalogs, graph, run, or provider projections.
+    func requestChatTranscriptSnapshotPublication() {
+        requestChatSnapshotPublication(includeTranscripts: true)
+    }
+
+    /// One coalescer owns both transcript completions and session-index
+    /// mutations. A later transcript request upgrades an already-pending
+    /// sessions-only request without starting a second timer.
+    func requestChatSnapshotPublication(includeTranscripts: Bool) {
+        guard isActive else { return }
+        snapshotWriteQueuedNeedsChatTranscripts =
+            snapshotWriteQueuedNeedsChatTranscripts || includeTranscripts
+        guard chatTranscriptSnapshotPublicationTask == nil else { return }
+        let generation = snapshotLifecycleGeneration
+        chatTranscriptSnapshotPublicationTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(180))
+            } catch {
+                return
+            }
+            guard let self,
+                  self.isActive,
+                  generation == self.snapshotLifecycleGeneration else { return }
+            let includeTranscripts = self.snapshotWriteQueuedNeedsChatTranscripts
+            self.snapshotWriteQueuedNeedsChatTranscripts = false
+            self.chatTranscriptSnapshotPublicationTask = nil
+            await self.writeSnapshots(
+                includeChatTranscripts: includeTranscripts,
+                scope: .chatSessions
+            )
         }
     }
 

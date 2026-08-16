@@ -1,6 +1,16 @@
 import Foundation
 import PersistenceCore
 
+/// Read-only projection of SecurityCenter's canonical tool profile risk.
+/// Consumers may use this metadata for advisory behavior, but it grants no
+/// authority and does not replace effect-time SecurityCenter evaluation.
+public enum CanonicalToolRisk: String, Sendable, Codable, Equatable {
+    case low
+    case medium
+    case high
+    case critical
+}
+
 extension SwiftNativeSecurityCenter {
     static let catalogToolNames: Set<String> = ["tool_catalog", "list_tools", "tool_load", "tool_result_page"]
     // notificationToolNames are the carve-out for one-shot ping/notify
@@ -263,6 +273,29 @@ extension SwiftNativeSecurityCenter {
     struct ToolProfile: Sendable {
         var capabilities: Set<String>
         var risk: SecurityRisk
+    }
+
+    /// Classify a tool through the same profile owner used by authorization.
+    /// This is deliberately pure: it does not read policy, assess origins,
+    /// record receipts, or imply that the tool is allowed to run.
+    public static func canonicalToolRisk(
+        tool: String,
+        input: [String: JSONValue],
+        dataRoot: URL,
+        trustedWorkspaceRoots: [URL] = []
+    ) -> CanonicalToolRisk {
+        let risk = profile(
+            tool: canonicalToolName(tool),
+            input: input,
+            dataRoot: dataRoot,
+            trustedWorkspaceRoots: trustedWorkspaceRoots
+        ).risk
+        switch risk {
+        case .low: return .low
+        case .medium: return .medium
+        case .high: return .high
+        case .critical: return .critical
+        }
     }
 
     static func profile(

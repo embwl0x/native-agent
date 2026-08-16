@@ -26,6 +26,10 @@ public struct ActivityPolicy: Sendable, Codable, Equatable {
     public var browserTitlesEnabled: Bool
     /// Global override: app names only, no titles anywhere, whatever else says.
     public var appNameOnlyMode: Bool
+    /// Whether an activity answer may be returned to the selected chat model.
+    /// FALSE by default. Capture remains useful as a local record without
+    /// silently turning that record into provider input.
+    public var allowModelAccess: Bool
     /// User-editable exclusions. Ships with a starter list (see
     /// `defaultExcludedBundleIDs`) rather than empty.
     public var excludedBundleIDs: Set<String>
@@ -37,6 +41,7 @@ public struct ActivityPolicy: Sendable, Codable, Equatable {
         captureTitles: Bool = false,
         browserTitlesEnabled: Bool = false,
         appNameOnlyMode: Bool = false,
+        allowModelAccess: Bool = false,
         excludedBundleIDs: Set<String> = ActivityPolicy.defaultExcludedBundleIDs,
         retentionDays: Int = ActivityPolicy.defaultRetentionDays
     ) {
@@ -44,6 +49,7 @@ public struct ActivityPolicy: Sendable, Codable, Equatable {
         self.captureTitles = captureTitles
         self.browserTitlesEnabled = browserTitlesEnabled
         self.appNameOnlyMode = appNameOnlyMode
+        self.allowModelAccess = allowModelAccess
         self.excludedBundleIDs = excludedBundleIDs
         self.retentionDays = retentionDays
     }
@@ -56,6 +62,7 @@ public struct ActivityPolicy: Sendable, Codable, Equatable {
         captureTitles = try container.decodeIfPresent(Bool.self, forKey: .captureTitles) ?? false
         browserTitlesEnabled = try container.decodeIfPresent(Bool.self, forKey: .browserTitlesEnabled) ?? false
         appNameOnlyMode = try container.decodeIfPresent(Bool.self, forKey: .appNameOnlyMode) ?? false
+        allowModelAccess = try container.decodeIfPresent(Bool.self, forKey: .allowModelAccess) ?? false
         excludedBundleIDs = try container.decodeIfPresent(Set<String>.self, forKey: .excludedBundleIDs)
             ?? ActivityPolicy.defaultExcludedBundleIDs
         retentionDays = try container.decodeIfPresent(Int.self, forKey: .retentionDays)
@@ -184,6 +191,17 @@ public struct ActivityPolicy: Sendable, Codable, Equatable {
 /// directory as the span DB so a wipe of that directory takes the policy with
 /// it. See `ActivityWatchPaths` for why that directory is not `activity/`.
 public struct ActivityPolicyStore: Sendable {
+    public enum StoreError: Error, LocalizedError, Equatable {
+        case unavailable(String)
+
+        public var errorDescription: String? {
+            switch self {
+            case .unavailable(let detail):
+                return "The saved activity policy is unavailable: \(detail). Its bytes were preserved and activity settings cannot be changed until it is repaired."
+            }
+        }
+    }
+
     public let fileURL: URL
     private let persistence: any PersistenceCoreProtocol
 
@@ -200,19 +218,48 @@ public struct ActivityPolicyStore: Sendable {
     /// Missing file, unreadable file, or garbage → the SAFE default. A policy
     /// we cannot read must never fail open into capturing.
     public func load() -> ActivityPolicy {
-        guard let data = try? Data(contentsOf: fileURL) else { return ActivityPolicy() }
-        guard let policy = try? JSONDecoder().decode(ActivityPolicy.self, from: data) else {
-            return ActivityPolicy()
+        (try? loadChecked()) ?? ActivityPolicy()
+    }
+
+    /// Missing is the documented safe bootstrap. An existing unreadable,
+    /// non-regular, or malformed authority file is unavailable, not "missing".
+    public func loadChecked() throws -> ActivityPolicy {
+        let manager = FileManager.default
+        if (try? manager.destinationOfSymbolicLink(atPath: fileURL.path)) != nil {
+            throw StoreError.unavailable("the path is a symbolic link")
         }
-        return policy
+        guard manager.fileExists(atPath: fileURL.path) else { return ActivityPolicy() }
+        let values: URLResourceValues
+        do {
+            values = try fileURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+        } catch {
+            throw StoreError.unavailable(error.localizedDescription)
+        }
+        guard values.isRegularFile == true, values.isSymbolicLink != true else {
+            throw StoreError.unavailable("the path is not a regular file")
+        }
+        let data: Data
+        do {
+            data = try Data(contentsOf: fileURL, options: [.mappedIfSafe])
+        } catch {
+            throw StoreError.unavailable(error.localizedDescription)
+        }
+        do {
+            return try JSONDecoder().decode(ActivityPolicy.self, from: data)
+        } catch {
+            throw StoreError.unavailable("the file is malformed")
+        }
     }
 
     public func save(_ policy: ActivityPolicy) throws {
+        // A settings mutation may bootstrap a missing file, but it must never
+        // overwrite existing bytes that the owner cannot validate.
+        _ = try loadChecked()
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(policy)
         try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: fileURL)
-        try? FileManager.default.setAttributes(
+        try FileManager.default.setAttributes(
             [.posixPermissions: NSNumber(value: Int16(0o600))],
             ofItemAtPath: fileURL.path
         )

@@ -73,3 +73,35 @@ func wipeBeforeConsentCreatesNoStore() async throws {
     #expect(controller.lastPurgedRowCount == 0)
     #expect(!storeExists(root), "wipe must not create the store it empties")
 }
+
+@MainActor
+@Test("CONSENT: a failed exclusion save does not purge recorded rows")
+func failedExclusionSaveDoesNotPurge() async throws {
+    let root = freshDataRoot()
+    let spans = try ActivitySpanStore(dataRoot: root)
+    try await spans.openSpan(ActivitySpan(
+        id: "keep-me",
+        startedAt: 1_700_000_000,
+        endedAt: 1_700_000_100,
+        lastSeenAt: 1_700_000_100,
+        bundleId: "com.example.keep",
+        appName: "Keep",
+        eventCount: 1,
+        closeReason: .idle,
+        tzOffsetMin: 0
+    ))
+    let policyStore = ActivityPolicyStore(dataRoot: root)
+    try Data("{ damaged".utf8).write(to: policyStore.fileURL)
+
+    let controller = ActivityWatchController(dataRoot: root)
+    await controller.addExclusion(bundleID: "com.example.keep")
+
+    let remaining = try await spans.querySpans(
+        from: 1_699_999_999,
+        to: 1_700_000_101,
+        limit: 10
+    )
+    #expect(remaining.map(\.id) == ["keep-me"])
+    #expect(controller.lastPurgedRowCount == nil)
+    #expect(controller.lastError != nil)
+}

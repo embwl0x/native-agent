@@ -312,6 +312,23 @@ struct DelegationOutcomeLoopTests {
         #expect(succeeding.cards.map(\.jobKey) == ["claude:retry-me"])
     }
 
+    @Test func olderFailurePreventsCursorFromSkippingItForANewerSuccess() async throws {
+        let path = cursorPath()
+        let attempts = AttemptRecorder()
+        let recorder = CardRecorder(accept: { card in
+            attempts.record(card.jobKey)
+            return card.jobKey != "claude:older"
+        })
+        _ = await makeLoop(cursor: path, jobs: { [] }, recorder: recorder).tickOutcome()
+        let older = Self.claudeSuccess(id: "older", completedAt: Self.iso(-120))
+        let newer = Self.claudeSuccess(id: "newer", completedAt: Self.iso(-60))
+        _ = await makeLoop(cursor: path, jobs: { [newer, older] }, recorder: recorder).tickOutcome()
+        #expect(attempts.values == ["claude:older"])
+        let cursor = try #require(DelegationOutcomeCursor.load(from: path))
+        #expect(cursor.store("claude").cardedIDs.isEmpty)
+        #expect(cursor.store("claude").lastSeen == nil)
+    }
+
     @Test func perTickCapIsAnnouncedNeverSilent() async throws {
         let path = cursorPath()
         let recorder = CardRecorder()
@@ -375,4 +392,11 @@ private final class SnapshotBox: @unchecked Sendable {
         get { lock.lock(); defer { lock.unlock() }; return _value }
         set { lock.lock(); _value = newValue; lock.unlock() }
     }
+}
+
+private final class AttemptRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [String] = []
+    func record(_ value: String) { lock.withLock { storage.append(value) } }
+    var values: [String] { lock.withLock { storage } }
 }

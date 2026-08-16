@@ -6,6 +6,7 @@ import PersistenceCore
 private func reflexSignal(
     _ kind: SomaticSignalKind,
     sourceOrgan: String = "tool.search",
+    canonicalRisk: String = "low",
     id: UUID = UUID(uuidString: "52000000-0000-0000-0000-000000000001")!,
     at date: Date = Date(timeIntervalSince1970: 5_000)
 ) -> SomaticSignal {
@@ -14,7 +15,8 @@ private func reflexSignal(
         kind: kind,
         sourceOrgan: sourceOrgan,
         occurredAt: date,
-        intensity: 1
+        intensity: 1,
+        metadata: ["trustRisk": .string(canonicalRisk)]
     )
 }
 
@@ -70,7 +72,7 @@ private func reflexSignal(
 
     for offset in 0..<3 {
         state = OrganismReflexCompiler.applying(
-            signal: reflexSignal(.toolSucceeded, sourceOrgan: "tool.shell", at: date.addingTimeInterval(Double(offset))),
+            signal: reflexSignal(.toolSucceeded, sourceOrgan: "tool.shell", canonicalRisk: "critical", at: date.addingTimeInterval(Double(offset))),
             to: state
         )
     }
@@ -80,6 +82,35 @@ private func reflexSignal(
     #expect(candidate.reviewRequired)
     #expect(candidate.autoActivationAllowed == false)
     #expect(state.summary().highRiskCount == 1)
+}
+
+@Test func toolReflexRiskUsesCanonicalMetadataAndFailsClosedWhenMissing() throws {
+    let date = Date(timeIntervalSince1970: 5_100)
+    let medium = OrganismReflexCompiler.applying(
+        signal: reflexSignal(
+            .toolSucceeded,
+            sourceOrgan: "tool.write-file",
+            canonicalRisk: "medium",
+            at: date
+        ),
+        to: .empty,
+        limits: OrganismReflexLimits(minimumEvidenceForCandidate: 1)
+    )
+    #expect(medium.candidates["tool:tool-write-file"]?.trustClass == .confirmRequired)
+
+    let missing = SomaticSignal(
+        id: UUID(uuidString: "52000000-0000-0000-0000-000000000002")!,
+        kind: .toolSucceeded,
+        sourceOrgan: "tool.search",
+        occurredAt: date,
+        intensity: 1
+    )
+    let unknown = OrganismReflexCompiler.applying(
+        signal: missing,
+        to: .empty,
+        limits: OrganismReflexLimits(minimumEvidenceForCandidate: 1)
+    )
+    #expect(unknown.candidates["tool:tool-search"]?.trustClass == .highRisk)
 }
 
 @Test func lowRiskReflexApprovalAllowsOnlyApprovedLowRiskActivation() async throws {
@@ -159,7 +190,7 @@ private func reflexSignal(
 @Test func rejectMakesCandidatePermanentlyDeliberateAndNeverReproposes() async throws {
     let date = Date(timeIntervalSince1970: 5_000)
     var state = OrganismReflexCompiler.applying(
-        signal: reflexSignal(.toolFailed, sourceOrgan: "tool.bash", at: date),
+        signal: reflexSignal(.toolFailed, sourceOrgan: "tool.bash", canonicalRisk: "critical", at: date),
         to: .empty
     )
     let before = try #require(state.candidates["tool:tool-bash"])
@@ -185,7 +216,7 @@ private func reflexSignal(
 
     for offset in 2..<12 {
         state = OrganismReflexCompiler.applying(
-            signal: reflexSignal(.toolSucceeded, sourceOrgan: "tool.bash", at: date.addingTimeInterval(Double(offset))),
+            signal: reflexSignal(.toolSucceeded, sourceOrgan: "tool.bash", canonicalRisk: "critical", at: date.addingTimeInterval(Double(offset))),
             to: state
         )
     }
@@ -197,7 +228,7 @@ private func reflexSignal(
 @Test func approvalFailsClosedForNonLowRiskCandidate() async throws {
     let date = Date(timeIntervalSince1970: 5_000)
     let state = OrganismReflexCompiler.applying(
-        signal: reflexSignal(.toolFailed, sourceOrgan: "tool.bash", at: date),
+        signal: reflexSignal(.toolFailed, sourceOrgan: "tool.bash", canonicalRisk: "critical", at: date),
         to: .empty
     )
     let application = state.applyingReview(
@@ -359,17 +390,18 @@ private func reflexSignal(
     #expect(snapshot.reflexSummary == .empty)
 }
 
-@Test func enabledKernelSnapshotExposesReviewCandidatesWithoutActivation() async throws {
+@Test func enabledKernelDoesNotCompileRoutineGenericReviewCandidates() async throws {
     let kernel = OrganismKernel(configuration: .enabled)
     let date = Date(timeIntervalSince1970: 5_000)
 
-    await kernel.ingest(reflexSignal(.toolFailed, sourceOrgan: "tool.shell", at: date))
+    await kernel.ingest(reflexSignal(
+        .toolFailed,
+        sourceOrgan: "tool.shell",
+        canonicalRisk: "critical",
+        at: date
+    ))
     let snapshot = await kernel.snapshot()
-    let candidate = try #require(snapshot.reflexCandidates.first)
 
-    #expect(snapshot.reflexSummary.candidateCount == 1)
-    #expect(candidate.trustClass == .highRisk)
-    #expect(candidate.reviewRequired)
-    #expect(candidate.autoActivationAllowed == false)
-    #expect(candidate.pattern.contains("require verification"))
+    #expect(snapshot.reflexSummary == .empty)
+    #expect(snapshot.reflexCandidates.isEmpty)
 }

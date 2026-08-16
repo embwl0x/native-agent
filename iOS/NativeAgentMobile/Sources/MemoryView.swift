@@ -7,6 +7,7 @@ import NativeAgentShared
 
 struct MemoryView: View {
     @StateObject private var store = MemoryStore()
+    @ObservedObject private var sync = iCloudSyncEngine.shared
     @State private var segment: MemorySegment
     /// `false` when pushed as a navigationDestination from another
     /// NavigationStack (e.g. ActivityView → Memory Proposals). Nesting
@@ -79,6 +80,8 @@ struct MemoryView: View {
         }
         .refreshable { await store.refresh() }
         .onAppear { Task { await store.refresh() } }
+        .onChange(of: sync.memories) { _, _ in store.applySyncedState(from: sync) }
+        .onChange(of: sync.memoryProposals) { _, _ in store.applySyncedState(from: sync) }
     }
 }
 
@@ -104,9 +107,21 @@ final class MemoryStore: ObservableObject {
         isLoading = true
         await iCloudSyncEngine.shared.refreshMemorySnapshot()
         let sync = iCloudSyncEngine.shared
-        memories = sync.memories.filter { !hiddenDeletedMemoryIDs.contains($0.id) }
-        memoryProposals = sync.memoryProposals.filter { !hiddenResolvedMemoryProposalIDs.contains($0.id) }
+        applySyncedState(from: sync)
         isLoading = false
+    }
+
+    func applySyncedState(from sync: iCloudSyncEngine) {
+        let memoryIDs = Set(sync.memories.map(\.id))
+        let proposalIDs = Set(sync.memoryProposals.map(\.id))
+        hiddenDeletedMemoryIDs.formIntersection(memoryIDs.union(deletingMemoryIDs))
+        hiddenResolvedMemoryProposalIDs.formIntersection(
+            proposalIDs.union(decidingMemoryProposalIDs)
+        )
+        memories = sync.memories.filter { !hiddenDeletedMemoryIDs.contains($0.id) }
+        memoryProposals = sync.memoryProposals.filter {
+            !hiddenResolvedMemoryProposalIDs.contains($0.id)
+        }
     }
 
     func approveMemoryProposal(_ proposal: MemoryProposalRecord) {

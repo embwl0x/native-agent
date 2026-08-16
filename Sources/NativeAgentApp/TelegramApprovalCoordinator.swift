@@ -16,7 +16,8 @@ actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHandling 
     ) async throws -> Void
     typealias ApprovalResolver = @Sendable (
         _ id: String,
-        _ decision: ApprovalDecision
+        _ decision: ApprovalDecision,
+        _ provenance: ApprovalResolutionProvenance
     ) async throws -> Void
 
     private let dataRoot: URL
@@ -28,10 +29,11 @@ actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHandling 
         dataRoot: URL,
         token: String,
         promptSender: @escaping PromptSender = TelegramApprovalFiler.sendTelegramApprovalPrompt,
-        approvalResolver: @escaping ApprovalResolver = { id, decision in
+        approvalResolver: @escaping ApprovalResolver = { id, decision, provenance in
             _ = try await NativeClient(baseURL: "").resolveApproval(
                 id: id,
-                decision: decision.rawValue
+                decision: decision.rawValue,
+                provenance: provenance
             )
         }
     ) {
@@ -187,9 +189,16 @@ actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHandling 
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         let pending = try await inbox.get(id)
         try validateTelegramDecision(record: pending, chatId: chatId)
+        guard let fromUserId else {
+            throw TelegramApprovalError.missingUserIdentity
+        }
 
         let nativeDecision: ApprovalDecision = decision == .approved ? .approved : .denied
-        try await approvalResolver(id, nativeDecision)
+        try await approvalResolver(
+            id,
+            nativeDecision,
+            .telegram(chatID: String(chatId), userID: String(fromUserId))
+        )
 
         let resolved = (try? await inbox.get(id)) ?? pending
         switch decision {
@@ -341,6 +350,7 @@ private enum TelegramApprovalError: LocalizedError {
     case missingChatId
     case notPending(String)
     case notRemoteResolvable
+    case missingUserIdentity
     case chatMismatch
 
     var errorDescription: String? {
@@ -351,6 +361,8 @@ private enum TelegramApprovalError: LocalizedError {
             return "Approval is not pending (status: \(status))."
         case .notRemoteResolvable:
             return "Approval is local-only and cannot be resolved from Telegram."
+        case .missingUserIdentity:
+            return "Telegram approval could not determine the verified user identity."
         case .chatMismatch:
             return "Approval belongs to a different Telegram chat."
         }

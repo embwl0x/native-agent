@@ -52,6 +52,7 @@ public struct TurnPlan: Equatable, Sendable {
     public let requiresApprovalHint: Bool
     public let matchedCapabilityIds: [String]
     public let preloadPrediction: ToolPreloadHeuristics.Prediction?
+    public let residentCapabilityGuidance: String?
     public let policySnapshot: TurnPolicySnapshot
     public let receiptHints: [String]
     public let createdAt: String
@@ -66,6 +67,7 @@ public struct TurnPlan: Equatable, Sendable {
         requiresApprovalHint: Bool,
         matchedCapabilityIds: [String],
         preloadPrediction: ToolPreloadHeuristics.Prediction?,
+        residentCapabilityGuidance: String? = nil,
         policySnapshot: TurnPolicySnapshot,
         receiptHints: [String],
         createdAt: String
@@ -79,6 +81,7 @@ public struct TurnPlan: Equatable, Sendable {
         self.requiresApprovalHint = requiresApprovalHint
         self.matchedCapabilityIds = matchedCapabilityIds
         self.preloadPrediction = preloadPrediction
+        self.residentCapabilityGuidance = residentCapabilityGuidance
         self.policySnapshot = policySnapshot
         self.receiptHints = receiptHints
         self.createdAt = createdAt
@@ -93,7 +96,8 @@ public struct TurnPlan: Equatable, Sendable {
             contextMode != "minimal" ||
             requiresApprovalHint ||
             !preloadGroupNames.isEmpty ||
-            !matchedCapabilityIds.isEmpty
+            !matchedCapabilityIds.isEmpty ||
+            residentCapabilityGuidance != nil
     }
 
     var contextHint: String? {
@@ -115,6 +119,12 @@ public struct TurnPlan: Equatable, Sendable {
             parts.append("capabilities=\(caps.joined(separator: ","))")
         }
         var guidance = "Keep tool and context use focused; leave receipts for meaningful actions."
+        if let residentCapabilityGuidance {
+            guidance += " \(residentCapabilityGuidance)"
+        }
+        if preloadGroupNames.contains("github") {
+            guidance += " Best-fit capability: the connected GitHub API tools are ready for structured evidence. For a repository link, begin with github_get_repository, then use github_read_repository_content or github_list_commits when the question needs deeper source or history."
+        }
         if goalType == "file_work" {
             guidance += " For file_work, when the user names a file, doc, readme, or handoff, first locate and read that artifact with file/search tools (grep, list_dir, file_excerpt, read_file) before using repo/git tools as secondary evidence. For long docs or handoffs, prefer targeted file_excerpt or grep first and read the full file only when the answer needs it. For the NativeAgent handoff, prefer the repo-relative path docs/HANDOFF_CURRENT.md. Do not answer requested files, docs, or handoffs from memory, chat history, recent traces, or runtime introspection alone; use agent_introspect only when the user asks about live runtime status."
         }
@@ -196,6 +206,7 @@ public actor TurnPlanner {
             dataRoot: dataRoot,
             now: clock()
         )
+        let residentGroups = Self.residentCapabilityGroups(for: message)
         return TurnPlan(
             id: route.id,
             messageCharCount: message.count,
@@ -207,12 +218,39 @@ public actor TurnPlanner {
             matchedCapabilityIds: Self.meaningfulCapabilityIds(from: route.matchedCapabilities),
             preloadPrediction: ToolPreloadHeuristics.predict(
                 userMessage: message,
-                residentGroupHints: route.toolReadinessGroups
+                residentGroupHints: route.toolReadinessGroups + residentGroups
             ),
+            residentCapabilityGuidance: Self.residentCapabilityGuidance(for: message),
             policySnapshot: policySnapshot,
             receiptHints: route.nextActions,
             createdAt: route.createdAt
         )
+    }
+
+    /// Deterministic readiness for a narrow capability whose agent names are
+    /// too common to use as unconditional lexical preload triggers.
+    nonisolated static func residentCapabilityGroups(for message: String) -> [String] {
+        delegationIntent(in: message) ? ["delegation"] : []
+    }
+
+    /// Small positive cue paired with deterministic readiness. This keeps
+    /// bridge progress checks on the canonical projection rather than asking
+    /// the model to discover private job files through shell commands.
+    nonisolated static func residentCapabilityGuidance(for message: String) -> String? {
+        guard delegationIntent(in: message) else { return nil }
+        return "Best-fit capability: delegation_status reads current bridge work and outcomes; claude_message, codex_message, and omp_message send or continue work on the matching topic."
+    }
+
+    nonisolated private static func delegationIntent(in message: String) -> Bool {
+        let lower = message.lowercased()
+        let names = ["claude", "codex", "claude", "omp"]
+        guard names.contains(where: lower.contains) else { return false }
+        let bridgeIntent = [
+            "how is", "how's", "hows", "status", "progress", "running",
+            "working", "finished", "done", "timeout", "timed out", "job",
+            "send", "tell", "ask", "message", "reply", "continue", "resume",
+        ].contains(where: lower.contains)
+        return bridgeIntent
     }
 
     nonisolated static func meaningfulCapabilityIds(from capabilities: [JSONValue]) -> [String] {

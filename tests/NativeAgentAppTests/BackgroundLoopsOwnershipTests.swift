@@ -74,6 +74,28 @@ struct BackgroundLoopsOwnershipTests {
         await facade.stop()
     }
 
+    @Test("app background wake is due-aware while explicit one-shot remains force-run")
+    func appWakeDoesNotCreateASecondCadence() async {
+        let core = BackgroundLoops.BackgroundLoopsManager()
+        let counter = OwnershipTickCounter()
+        let loop = OwnershipTestLoop("weekly_os_wake") { await counter.bump() }
+        let facade = BackgroundLoopsManager(
+            coreManager: core,
+            assembleLoops: { [loop] },
+            runHeartbeatAtLaunch: { false }
+        )
+        await facade.start()
+
+        #expect(
+            await facade.runTickIfDue(loopId: loop.loopId)
+                == .skipped(reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true)
+        )
+        #expect(await counter.value == 0)
+        #expect(await facade.runTickOnce(loopId: loop.loopId) == .completed(result: nil))
+        #expect(await counter.value == 1)
+        await facade.stop()
+    }
+
     @Test("default Auto-Doctor launch posture performs no immediate tick")
     func autoDoctorLaunchOptOutStaysQuiet() async throws {
         let core = BackgroundLoops.BackgroundLoopsManager()

@@ -140,6 +140,11 @@ public actor SwiftNativeMacControl: MacControlClient {
     /// W3.5 — the latest fused view, so a later `mark` resolves to a real
     /// element. A mark is a REFERENCE ONLY: every injection gate still runs.
     private let screenViewStore: MacScreenViewStore
+    /// Explicit, bounded continuity over fused views. The source installs no
+    /// observers until `mac_attention start`; the store is shared because the
+    /// dispatcher constructs a short-lived MacControl client per tool call.
+    private let attentionEventSource: any MacAttentionEventSource
+    private let attentionStore: MacAttentionSessionStore
     /// W6 — the login-session probe `wake` refuses on. Injectable so the
     /// locked-refusal is pinned without a real password lock in the loop, and
     /// deliberately separate from the event sink: the thing that DECIDES
@@ -177,6 +182,8 @@ public actor SwiftNativeMacControl: MacControlClient {
         screenCaptureSource: any MacScreenCaptureSource = defaultMacScreenCaptureSource(),
         screenImageRenderer: any MacScreenImageRenderer = defaultMacScreenImageRenderer(),
         screenViewStore: MacScreenViewStore = .shared,
+        attentionEventSource: any MacAttentionEventSource = defaultMacAttentionEventSource(),
+        attentionStore: MacAttentionSessionStore = .shared,
         sessionStateSource: any MacSessionStateSource = defaultMacSessionStateSource(),
         policyProvider: (any MacControlPolicyProvider)? = nil,
         auditAppendPath: URL? = nil,
@@ -195,6 +202,8 @@ public actor SwiftNativeMacControl: MacControlClient {
         self.screenCaptureSource = screenCaptureSource
         self.screenImageRenderer = screenImageRenderer
         self.screenViewStore = screenViewStore
+        self.attentionEventSource = attentionEventSource
+        self.attentionStore = attentionStore
         self.sessionStateSource = sessionStateSource
         self.policyProvider = policyProvider
         self.auditAppendPath = auditAppendPath
@@ -505,6 +514,15 @@ public actor SwiftNativeMacControl: MacControlClient {
                 break
             }
         }
+        // An active attention session gives physical human input absolute
+        // priority. Check once at tool entry; handlers recheck at the exact
+        // effect boundary (and between multi-event gestures) so a mouse move
+        // arriving after this line still stops the action.
+        if macControlAccessibilityInjectionActions.contains(normalized)
+            || macControlAccessibilityNudgeActions.contains(normalized),
+           let refusal = await attentionActionRefusal(action: normalized, body: body) {
+            return refusal
+        }
         switch normalized {
         case "notify":      return try await handleNotify(body)
         case "file/read":   return try await handleFileRead(body)
@@ -523,12 +541,13 @@ public actor SwiftNativeMacControl: MacControlClient {
         // W3.5 — THE FUSED VIEW. Read tier like the three above: it looks at
         // the screen (AX structure + pixels) and changes nothing.
         case "view":        return await handleView(body)
+        case "attention":   return await handleAttention(body)
         // W2/W3 — INJECTION. Every one of these is behind the three-gate
         // predicate in `gatePreflightOutcome` (category + active Full Mac +
         // approval attestation) before control ever arrives here.
-        case "keystroke":   return handleKeystroke(body)
+        case "keystroke":   return await handleKeystroke(body)
         case "click":       return await handleClick(body)
-        case "scroll":      return handleScroll(body)
+        case "scroll":      return await handleScroll(body)
         case "ax_act":      return await handleAXAct(body)
         // W6 — the nudge + re-capture. Injection like the four above (it posts
         // HID events), with one extra refusal of its own: a real password lock.
@@ -536,7 +555,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         // W7 — the NUDGE. Reached through the unprivileged `dispatch` like the
         // reads above, not through `dispatchApprovedInjection`: it emits one
         // bare mouse move and nothing else.
-        case "nudge":       return handleNudge()
+        case "nudge":       return await handleNudge(body)
         case let action where macControlUnsupportedActions.contains(action):
             return Self.unsupportedResult(action: action)
         default:
@@ -562,6 +581,8 @@ public actor SwiftNativeMacControl: MacControlClient {
         // W3.5 — one AX walk plus one ScreenCaptureKit screenshot + encode.
         // Still in-process, but the capture is the slowest read here.
         case "view": return 20
+        // Event-driven wait is caller-bounded to 15s, followed by one view.
+        case "attention": return 40
         // In-process CGEvent / AX act; nothing here waits on another process.
         case "keystroke", "click", "scroll", "ax_act": return 15
         // W7 — one CGEvent post, in-process, nothing awaited.
@@ -2149,6 +2170,187 @@ public actor SwiftNativeMacControl: MacControlClient {
         )
     }
 
+    /// `mac_attention` — explicit, bounded continuity over `mac_view`.
+    ///
+    /// There is no frame loop and no model call here. Start installs passive
+    /// system-event observers for a bounded lifetime and takes one fused view.
+    /// Next sleeps on an event continuation (or its bounded deadline), then
+    /// takes exactly one more fused view. Stop tears the observers down and
+    /// invalidates the last attention-scene marks.
+    private func handleAttention(_ body: [String: JSONValue]) async -> MacControlResult {
+        let started = now()
+        let mode = (body.stringValue("mode") ?? "status").lowercased()
+
+        func result(
+            ok: Bool,
+            output: [String: JSONValue],
+            error: String? = nil,
+            status: Int? = nil
+        ) -> MacControlResult {
+            MacControlResult(
+                ok: ok,
+                action: "attention",
+                output: .object(output),
+                error: error,
+                durationMs: Int(now().timeIntervalSince(started) * 1000),
+                viaSwift: true,
+                httpStatus: status
+            )
+        }
+
+        switch mode {
+        case "start":
+            let duration = Self.intValue(body, "duration_seconds")
+                ?? MacAttentionSessionStore.defaultDurationSeconds
+            await screenViewStore.invalidate()
+            guard let initial = await attentionStore.start(
+                durationSeconds: duration,
+                now: now(),
+                eventSource: attentionEventSource
+            ) else {
+                return result(
+                    ok: false,
+                    output: [
+                        "active": .bool(false),
+                        "status": .string("unavailable"),
+                    ],
+                    error: "attention_observer_unavailable",
+                    status: 501
+                )
+            }
+            return await attentionViewResult(
+                body: body,
+                pending: initial,
+                started: started,
+                status: "started"
+            )
+
+        case "next":
+            guard let sessionId = body.stringValue("session"), !sessionId.isEmpty else {
+                return result(
+                    ok: false,
+                    output: ["active": .bool(false), "status": .string("invalid_request")],
+                    error: "missing required field: session",
+                    status: 400
+                )
+            }
+            let after = Int64(Self.intValue(body, "after_sequence") ?? -1)
+            let waitMs = Self.intValue(body, "wait_ms") ?? 1_500
+            let pending = await attentionStore.waitForActivity(
+                sessionId: sessionId,
+                after: after,
+                timeoutMilliseconds: waitMs,
+                now: now()
+            )
+            if Task.isCancelled {
+                return result(
+                    ok: false,
+                    output: ["active": .bool(true), "status": .string("cancelled")],
+                    error: "attention_wait_cancelled",
+                    status: 499
+                )
+            }
+            guard let pending else {
+                return result(
+                    ok: false,
+                    output: ["active": .bool(false), "status": .string("not_active")],
+                    error: "attention_session_not_active",
+                    status: 409
+                )
+            }
+            return await attentionViewResult(
+                body: body,
+                pending: pending,
+                started: started,
+                status: pending.timedOutWaiting ? "refreshed" : "changed"
+            )
+
+        case "status":
+            guard let current = await attentionStore.status(now: now()) else {
+                return result(ok: true, output: [
+                    "active": .bool(false),
+                    "status": .string("idle"),
+                ])
+            }
+            return result(ok: true, output: [
+                "active": .bool(true),
+                "status": .string(
+                    current.yieldRequired ? "yield_required"
+                        : (current.refreshRequired ? "refresh_required" : "watching")
+                ),
+                "attention": current.toJSON(),
+            ])
+
+        case "stop":
+            let wasActive = await attentionStore.stop()
+            await screenViewStore.invalidate()
+            return result(ok: true, output: [
+                "active": .bool(false),
+                "status": .string(wasActive ? "stopped" : "already_idle"),
+            ])
+
+        default:
+            return result(
+                ok: false,
+                output: ["active": .bool(false), "status": .string("invalid_request")],
+                error: "invalid mode: expected start, next, status, or stop",
+                status: 400
+            )
+        }
+    }
+
+    private func attentionViewResult(
+        body: [String: JSONValue],
+        pending: MacAttentionSnapshot,
+        started: Date,
+        status: String
+    ) async -> MacControlResult {
+        let view = await handleView(body)
+        guard case .object(var output) = view.output,
+              case .string(let viewId)? = output["view"] else {
+            return MacControlResult(
+                ok: false,
+                action: "attention",
+                output: view.output,
+                error: view.error ?? "attention_view_unavailable",
+                durationMs: Int(now().timeIntervalSince(started) * 1000),
+                viaSwift: true,
+                httpStatus: view.httpStatus
+            )
+        }
+        let current = await attentionStore.observed(
+            sessionId: pending.sessionId,
+            viewId: viewId,
+            sequence: pending.sequence,
+            userSequence: pending.userSequence,
+            now: now()
+        ) ?? pending
+        if current.refreshRequired {
+            // Input raced the capture. Never leave its marks usable while the
+            // result truthfully says the agent must yield and look again.
+            await screenViewStore.invalidate()
+        }
+        output["status"] = .string(
+            current.yieldRequired ? "yield_required"
+                : (current.refreshRequired ? "refresh_required" : status)
+        )
+        output["attention"] = current.toJSON()
+        output["how_to_continue"] = .string(
+            "While this attention session is active, pass attention_session and "
+            + "attention_user_sequence from this result to every Mac action. If yield_required "
+            + "is true, do not act; call mac_attention next and re-read the fresh fused view."
+        )
+        return MacControlResult(
+            ok: view.ok,
+            action: "attention",
+            output: .object(output),
+            error: view.error,
+            durationMs: Int(now().timeIntervalSince(started) * 1000),
+            viaSwift: true,
+            httpStatus: view.httpStatus
+        )
+    }
+
     static let screenRecordingNote =
         "NativeAgent does not have Screen Recording permission yet, so the picture half of the "
         + "view is missing (the accessibility legend still works). Grant it in System Settings → "
@@ -2306,11 +2508,51 @@ public actor SwiftNativeMacControl: MacControlClient {
         }
     }
 
+    /// Effect-time human-takeover check shared by every motor sibling.
+    private func attentionActionRefusal(
+        action: String,
+        body: [String: JSONValue]
+    ) async -> MacControlResult? {
+        let sessionId = body.stringValue("attention_session")
+        let userSequence = Self.intValue(body, "attention_user_sequence").map(Int64.init)
+        switch await attentionStore.permissionForAction(
+            sessionId: sessionId,
+            observedUserSequence: userSequence,
+            now: now()
+        ) {
+        case .allowed:
+            return nil
+        case .refused(let reason, let current):
+            let status: String
+            if reason.hasPrefix("human_takeover:") {
+                status = "yielded_to_user"
+            } else if reason.hasPrefix("scene_changed:") {
+                status = "refresh_required"
+            } else {
+                status = "attention_session_required"
+            }
+            return MacControlResult(
+                ok: false,
+                action: action,
+                output: .object([
+                    "ok": .bool(false),
+                    "status": .string(status),
+                    "error": .string(reason),
+                    "attention": current.toJSON(),
+                ]),
+                error: reason,
+                durationMs: 0,
+                viaSwift: true,
+                httpStatus: 409
+            )
+        }
+    }
+
     /// `keystroke` — literal Unicode typing and/or key chords.
     ///
     /// `text` is typed first, then `keys`, so `{text:"hello", keys:"cmd+s"}`
     /// reads in the order it happens. At least one must be present.
-    private func handleKeystroke(_ body: [String: JSONValue]) -> MacControlResult {
+    private func handleKeystroke(_ body: [String: JSONValue]) async -> MacControlResult {
         let started = now()
         let rawText = body.stringValue("text")
         let rawKeys = body.stringValue("keys")
@@ -2343,16 +2585,25 @@ public actor SwiftNativeMacControl: MacControlClient {
         var keyEvents = 0
         if let text {
             for event in MacEventPlanner.typeText(text) {
+                if let refusal = await attentionActionRefusal(action: "keystroke", body: body) {
+                    await screenViewStore.invalidate()
+                    return refusal
+                }
                 eventSink.post(key: event)
                 keyEvents += 1
             }
         }
         for chord in chords {
             for event in MacEventPlanner.chord(chord) {
+                if let refusal = await attentionActionRefusal(action: "keystroke", body: body) {
+                    await screenViewStore.invalidate()
+                    return refusal
+                }
                 eventSink.post(key: event)
                 keyEvents += 1
             }
         }
+        await screenViewStore.invalidate()
         return MacControlResult(
             ok: true,
             action: "keystroke",
@@ -2439,6 +2690,7 @@ public actor SwiftNativeMacControl: MacControlClient {
 
         var events: [MacMouseEvent]
         var describe: [String: JSONValue]
+        var dragStepDelayNanoseconds: UInt64 = 0
         if let markedTarget {
             let x = markedTarget.frame.x + markedTarget.frame.w / 2.0
             let y = markedTarget.frame.y + markedTarget.frame.h / 2.0
@@ -2470,11 +2722,23 @@ public actor SwiftNativeMacControl: MacControlClient {
                 "count": .int(Int64(count)),
             ]
         } else if let from = point("from"), let to = point("to") {
-            events = MacEventPlanner.drag(fromX: from.0, fromY: from.1, toX: to.0, toY: to.1, button: button)
+            let durationMs = max(80, min(Self.intValue(body, "duration_ms") ?? 240, 2_000))
+            let steps = max(4, min(60, durationMs / 16))
+            events = MacEventPlanner.smoothDrag(
+                fromX: from.0,
+                fromY: from.1,
+                toX: to.0,
+                toY: to.1,
+                button: button,
+                steps: steps
+            )
+            dragStepDelayNanoseconds = UInt64(durationMs) * 1_000_000 / UInt64(steps)
             describe = [
                 "gesture": .string("drag"),
                 "from": .object(["x": .double(from.0), "y": .double(from.1)]),
                 "to": .object(["x": .double(to.0), "y": .double(to.1)]),
+                "duration_ms": .int(Int64(durationMs)),
+                "drag_steps": .int(Int64(steps)),
             ]
         } else {
             guard let x = Self.doubleValue(body, "x"), let y = Self.doubleValue(body, "y") else {
@@ -2499,7 +2763,33 @@ public actor SwiftNativeMacControl: MacControlClient {
         if let refusal = injectionPreconditions(action: "click", requiresSink: true) {
             return refusal
         }
-        for event in events { eventSink.post(mouse: event) }
+        var pressed = false
+        var lastPosted: MacMouseEvent?
+        for event in events {
+            if let refusal = await attentionActionRefusal(action: "click", body: body) {
+                if pressed, let lastPosted {
+                    // Never strand a synthesized button-down when the human
+                    // takes over midway through a smooth drag.
+                    eventSink.post(mouse: MacMouseEvent(
+                        phase: .up,
+                        button: lastPosted.button,
+                        x: lastPosted.x,
+                        y: lastPosted.y
+                    ))
+                }
+                await screenViewStore.invalidate()
+                return refusal
+            }
+            eventSink.post(mouse: event)
+            lastPosted = event
+            if event.phase == .down { pressed = true }
+            if event.phase == .up { pressed = false }
+            if dragStepDelayNanoseconds > 0,
+               event.phase == .down || event.phase == .drag {
+                try? await Task.sleep(nanoseconds: dragStepDelayNanoseconds)
+            }
+        }
+        await screenViewStore.invalidate()
 
         describe["ok"] = .bool(true)
         describe["status"] = .string("clicked")
@@ -2518,7 +2808,7 @@ public actor SwiftNativeMacControl: MacControlClient {
 
     /// `scroll` — wheel events, optionally after moving the pointer so the
     /// scroll lands on the intended view rather than wherever the cursor sat.
-    private func handleScroll(_ body: [String: JSONValue]) -> MacControlResult {
+    private func handleScroll(_ body: [String: JSONValue]) async -> MacControlResult {
         let started = now()
         let dy = Self.intValue(body, "dy") ?? Self.intValue(body, "delta_y") ?? 0
         let dx = Self.intValue(body, "dx") ?? Self.intValue(body, "delta_x") ?? 0
@@ -2543,9 +2833,17 @@ public actor SwiftNativeMacControl: MacControlClient {
             return refusal
         }
         if let at {
+            if let refusal = await attentionActionRefusal(action: "scroll", body: body) {
+                return refusal
+            }
             eventSink.post(mouse: MacMouseEvent(phase: .move, button: .left, x: at.0, y: at.1))
         }
+        if let refusal = await attentionActionRefusal(action: "scroll", body: body) {
+            await screenViewStore.invalidate()
+            return refusal
+        }
         eventSink.post(scroll: MacScrollEvent(deltaX: clampedX, deltaY: clampedY, unit: unit))
+        await screenViewStore.invalidate()
 
         var output: [String: JSONValue] = [
             "ok": .bool(true),
@@ -2669,6 +2967,9 @@ public actor SwiftNativeMacControl: MacControlClient {
         if let refusal = injectionPreconditions(action: "ax_act", requiresSink: false) {
             return refusal
         }
+        if let refusal = await attentionActionRefusal(action: "ax_act", body: body) {
+            return refusal
+        }
 
         let requestedAction = body.stringValue("action")
         let value = body.stringValue("value")
@@ -2679,6 +2980,7 @@ public actor SwiftNativeMacControl: MacControlClient {
             action: requestedAction,
             value: value
         )
+        await screenViewStore.invalidate()
         let pathJSON = JSONValue.array(path.map { .int(Int64($0)) })
         switch outcome {
         case .failure(let error):
@@ -2777,13 +3079,16 @@ public actor SwiftNativeMacControl: MacControlClient {
     /// live event sink — the same floor `mac_ax_status` clears, plus the sink,
     /// because reporting "nudged" with the grant missing would be a lie: the
     /// window server silently swallows CGEventPost without it.
-    private func handleNudge() -> MacControlResult {
+    private func handleNudge(_ body: [String: JSONValue]) async -> MacControlResult {
         let started = now()
 
         // The TCC grant and a working sink. Same check the injection handlers
         // run — a policy gate is not a system grant — reused rather than
         // copied so a future fix to it cannot miss this handler.
         if let refusal = injectionPreconditions(action: "nudge", requiresSink: true) {
+            return refusal
+        }
+        if let refusal = await attentionActionRefusal(action: "nudge", body: body) {
             return refusal
         }
 
@@ -2797,6 +3102,7 @@ public actor SwiftNativeMacControl: MacControlClient {
             x: origin.x + Self.nudgeOffsetPoints,
             y: origin.y
         ))
+        await screenViewStore.invalidate()
 
         return MacControlResult(
             ok: true,
@@ -2893,6 +3199,9 @@ public actor SwiftNativeMacControl: MacControlClient {
         if let refusal = injectionPreconditions(action: "wake", requiresSink: true) {
             return refusal
         }
+        if let refusal = await attentionActionRefusal(action: "wake", body: body) {
+            return refusal
+        }
 
         // 4. THE NUDGE. A one-point mouse move and back is the smallest input
         //    that reaches the HID tap: it cannot type, cannot click, cannot
@@ -2901,6 +3210,10 @@ public actor SwiftNativeMacControl: MacControlClient {
         let origin = (before.cursorX ?? 0, before.cursorY ?? 0)
         var mouseEvents = 0
         for point in [(origin.0 + 1, origin.1), origin] {
+            if let refusal = await attentionActionRefusal(action: "wake", body: body) {
+                await screenViewStore.invalidate()
+                return refusal
+            }
             eventSink.post(mouse: MacMouseEvent(
                 phase: .move,
                 button: .left,
@@ -2914,6 +3227,10 @@ public actor SwiftNativeMacControl: MacControlClient {
         var keyEvents = 0
         if case .bool(true)? = body["key_tap"] {
             for down in [true, false] {
+                if let refusal = await attentionActionRefusal(action: "wake", body: body) {
+                    await screenViewStore.invalidate()
+                    return refusal
+                }
                 eventSink.post(key: MacKeyEvent(
                     keyCode: Self.wakeShiftKeyCode,
                     down: down,
@@ -2922,6 +3239,7 @@ public actor SwiftNativeMacControl: MacControlClient {
                 keyEvents += 1
             }
         }
+        await screenViewStore.invalidate()
 
         // 5. Let the window server tear the saver down before we photograph it.
         let settleMs = max(0, min(
@@ -2967,9 +3285,16 @@ public actor SwiftNativeMacControl: MacControlClient {
                 ]
             )
         }
+        if let refusal = await attentionActionRefusal(action: "wake", body: body) {
+            return refusal
+        }
 
         let dismissed = !after.obstructed
         let view = await handleView(body)
+        if let refusal = await attentionActionRefusal(action: "wake", body: body) {
+            await screenViewStore.invalidate()
+            return refusal
+        }
 
         var output: [String: JSONValue]
         if case .object(let viewOutput) = view.output {

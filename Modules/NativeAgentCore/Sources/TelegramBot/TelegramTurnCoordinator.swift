@@ -81,11 +81,12 @@ public actor TelegramTurnCoordinator {
     public func startTurn(
         chatId: Int,
         text: String,
+        priority: TaskPriority? = nil,
         operation: @escaping @Sendable () async -> Void
     ) -> (id: UUID, task: Task<Void, Never>)? {
         guard activeTurns[chatId] == nil else { return nil }
         let id = UUID()
-        let task = Task {
+        let task = Task(priority: priority) {
             await operation()
         }
         activeTurns[chatId] = ActiveTurn(

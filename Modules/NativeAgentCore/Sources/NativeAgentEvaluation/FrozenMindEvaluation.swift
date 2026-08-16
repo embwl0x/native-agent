@@ -1041,37 +1041,6 @@ public enum FrozenMindEvaluationRunner {
         let expired: Bool
     }
 
-    public static func run(
-        epoch: FrozenMindEpoch,
-        manifest: FrozenMindEvaluationManifest,
-        inputs: [String: FrozenMindScenarioInput],
-        callers: [FrozenMindProviderTarget: any FrozenMindEvaluationProviderCalling],
-        authorization: FrozenMindEvaluationAuthorization,
-        authorizer: any FrozenMindEvaluationEgressAuthorizing = DisabledFrozenMindEvaluationEgressAuthorizer(),
-        publicSafeMode: Bool,
-        beforeRevisions: @Sendable () async -> [FrozenMindOwnerRevision],
-        afterRevisions: @Sendable () async -> [FrozenMindOwnerRevision],
-        now: @escaping @Sendable () -> Date = Date.init
-    ) async throws -> FrozenMindEvaluationReport {
-        for frozen in manifest.scenarios where frozen.contract.negativeControl == nil {
-            guard inputs[frozen.id]?.system == epoch.packet.combinedSystem else {
-                throw FrozenMindEvaluationError.inputManifestMismatch(frozen.id)
-            }
-        }
-        return try await run(
-            epochManifest: epoch.manifest,
-            manifest: manifest,
-            inputs: inputs,
-            callers: callers,
-            authorization: authorization,
-            authorizer: authorizer,
-            publicSafeMode: publicSafeMode,
-            beforeRevisions: beforeRevisions,
-            afterRevisions: afterRevisions,
-            now: now
-        )
-    }
-
     /// Evaluation-only seam for generated/fake-provider proof. It accepts the
     /// immutable epoch manifest, never constructs a turn client, and therefore
     /// cannot acquire transcript, tool, memory, or feedback owners.

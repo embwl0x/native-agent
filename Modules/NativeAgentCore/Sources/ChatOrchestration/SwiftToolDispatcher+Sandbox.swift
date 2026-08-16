@@ -679,6 +679,7 @@ extension SwiftToolDispatcher {
         case "mac_ax_tree": action = "ax_tree"
         case "mac_ax_find": action = "ax_find"
         case "mac_view": action = "view"
+        case "mac_attention": action = "attention"
         default:
             throw AutonomyGateError.toolDenied(
                 reason: "SwiftToolDispatcher: '\(tool)' has no Swift Mac accessibility-read implementation"
@@ -701,7 +702,10 @@ extension SwiftToolDispatcher {
     /// property ActivityWatchArchitectureTests pins. Cheap: one small JSON read,
     /// on the catalog path only, and a missing/garbage file reads as `false`.
     func activityCaptureEnabled() -> Bool {
-        ActivityPolicyStore(dataRoot: dataRoot).load().captureEnabled
+        guard let policy = try? ActivityPolicyStore(dataRoot: dataRoot).loadChecked() else {
+            return false
+        }
+        return policy.captureEnabled && policy.allowModelAccess
     }
 
     /// W7 — `activity_query`: the ONE read path into the ambient activity
@@ -723,10 +727,11 @@ extension SwiftToolDispatcher {
     ///     rather than guessing at a date and confidently answering about the
     ///     wrong day.
     ///
-    /// ZERO LLM CALLS. Everything below is parsing, `Calendar` arithmetic and
-    /// SQL. The result is not persisted into the cognitive substrate and is
-    /// excluded from memory promotion — it is answerable in the turn that asked
-    /// and nowhere else.
+    /// ZERO ADDITIONAL LLM CALLS. Everything below is parsing, `Calendar`
+    /// arithmetic and SQL. With separate Agent Access consent, the bounded
+    /// result returns to the already-selected chat provider as the next tool
+    /// result. It is not persisted into the cognitive substrate and is excluded
+    /// from memory promotion.
     func impl_activity_query_tool(
         tool: String,
         input: [String: JSONValue],
@@ -757,7 +762,19 @@ extension SwiftToolDispatcher {
             }
         }
 
-        let timezone = stringArg("timezone").flatMap { TimeZone(identifier: $0) } ?? .current
+        let timezone: TimeZone
+        if let requestedTimezone = stringArg("timezone") {
+            guard let resolved = TimeZone(identifier: requestedTimezone) else {
+                throw AutonomyGateError.toolDenied(
+                    reason: ActivityQueryService.QueryError.badRange(
+                        "unknown IANA timezone \"\(requestedTimezone)\""
+                    ).description
+                )
+            }
+            timezone = resolved
+        } else {
+            timezone = .current
+        }
         let now = Date()
 
         let range: (from: Double, to: Double)
@@ -771,8 +788,20 @@ extension SwiftToolDispatcher {
                 )
             }
             let toRaw = stringArg("to") ?? intArg("to").map(String.init)
-            let to = toRaw.flatMap { ActivityQueryService.parseInstant($0, timezone: timezone) }
-                ?? now.timeIntervalSince1970
+            let to: Double
+            if let toRaw {
+                guard let parsed = ActivityQueryService.parseInstant(toRaw, timezone: timezone) else {
+                    throw AutonomyGateError.toolDenied(
+                        reason: ActivityQueryService.QueryError.badRange(
+                            "could not read `to` = \"\(toRaw)\". Accepted: epoch seconds, "
+                            + "an ISO-8601 instant, or YYYY-MM-DD."
+                        ).description
+                    )
+                }
+                to = parsed
+            } else {
+                to = now.timeIntervalSince1970
+            }
             range = (from, to)
         } else {
             let name = stringArg("range") ?? "today"

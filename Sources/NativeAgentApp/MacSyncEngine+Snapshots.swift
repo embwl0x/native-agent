@@ -15,62 +15,6 @@ import CognitiveSubstrate
 import KnowledgeGraph
 import PersistenceCore
 
-private struct OrganismLivingStatusFile: Codable, Sendable {
-    var generatedAt: Date
-    var enabled: Bool
-    var posture: String
-    var bodyLine: String?
-    var behaviorLine: String
-    var needsUser: Bool
-    var needsAttention: Bool
-    var signalCount: Int
-    var lastSignalAt: Date?
-    var body: OrganismLivingBodyFile
-    var counters: OrganismLivingCountersFile
-    var reflexCandidates: [OrganismLivingReflexCandidateFile]
-    var standingViewProposals: [OrganismLivingStandingViewProposalFile]
-}
-
-private struct OrganismLivingBodyFile: Codable, Sendable {
-    var macAwake: Bool
-    var iPhoneReachable: Bool
-    var providersHealthy: Bool
-    var memoryHealthy: Bool
-    var dreamHealthy: Bool
-    var toolHandsAvailable: Bool
-    var approvalChannelsOpen: Bool
-    var notificationPathHealthy: Bool
-    var resourcePressure: String
-}
-
-private struct OrganismLivingCountersFile: Codable, Sendable {
-    var fieldNodes: Int
-    var pendingPredictions: Int
-    var dreamRepairs: Int
-    var reflexCandidates: Int
-    var reflexesNeedReview: Int
-    var approvedReflexBiases: Int
-    var standingViewProposals: Int
-}
-
-private struct OrganismLivingReflexCandidateFile: Codable, Sendable {
-    var id: String
-    var pattern: String
-    var trustClass: String
-    var confidence: Double
-    var reviewRequired: Bool
-    var autoActivationAllowed: Bool
-    var approvedAt: Date?
-}
-
-private struct OrganismLivingStandingViewProposalFile: Codable, Sendable {
-    var id: String
-    var title: String
-    var rationale: String
-    var evidenceIDs: [String]
-    var reviewRequired: Bool
-}
-
 struct MobileToolCatalogRecord: Codable, Equatable, Sendable {
     var id: String
     var name: String
@@ -99,7 +43,48 @@ enum MobileToolCatalogProjection {
     }
 }
 
+enum MobileInboxProjection {
+    static let maximumRows = 300
+    static let maximumActiveRows = 200
+    static let maximumEncodedBytes = 384 * 1024
+
+    static func data(
+        from items: [InboxItemRecord],
+        encoder: JSONEncoder
+    ) throws -> (data: Data, included: Int) {
+        let sorted = items.sorted {
+            if $0.created_at != $1.created_at { return $0.created_at > $1.created_at }
+            return $0.id > $1.id
+        }
+        let active = sorted.filter(\.isActivityPending).prefix(maximumActiveRows)
+        let activeIDs = Set(active.map(\.id))
+        let resolved = sorted
+            .filter { !activeIDs.contains($0.id) && !$0.isActivityPending }
+            .prefix(max(0, maximumRows - active.count))
+        var projection = Array(active) + Array(resolved)
+        while true {
+            let data = try encoder.encode(projection)
+            if data.count <= maximumEncodedBytes {
+                return (data, projection.count)
+            }
+            guard !projection.isEmpty else { return (data, 0) }
+            projection.removeLast()
+        }
+    }
+}
+
+private enum SnapshotFileWriteResult {
+    case unchanged
+    case changed
+    case failed(String)
+}
+
 extension MacSyncEngine {
+    enum SnapshotWriteScope: Sendable {
+        case standard
+        case chatSessions
+    }
+
     // MARK: - Snapshot writer
     // 2026-05-09 / 2026-05-31: raw snapshot bytes flow through
     // NativeClient.trustSnapshotData() — bypasses Codable decode for
@@ -109,25 +94,56 @@ extension MacSyncEngine {
     // is "field missing in UI", not "snapshot file disappears". Centralized
     // in NativeClient as part of the Wave-2 direct-caller consolidation.
 
-    func writeSnapshots(forceHeavy: Bool = false) async {
-        guard let snapshotDir else { return }
+    func writeSnapshots(
+        forceHeavy: Bool = false,
+        includeChatTranscripts: Bool = false,
+        scope: SnapshotWriteScope = .standard
+    ) async {
+        guard isActive, let snapshotDir else { return }
         if snapshotWriteInFlight {
             snapshotWriteQueued = true
             snapshotWriteQueuedNeedsHeavy = snapshotWriteQueuedNeedsHeavy || forceHeavy
+            snapshotWriteQueuedNeedsChatTranscripts =
+                snapshotWriteQueuedNeedsChatTranscripts || includeChatTranscripts
+            snapshotWriteQueuedNeedsStandardPass =
+                snapshotWriteQueuedNeedsStandardPass || scope == .standard
             return
         }
+        let lifecycleGeneration = snapshotLifecycleGeneration
         snapshotWriteInFlight = true
         let includeHeavySnapshots = forceHeavy
+        let includeTranscriptSnapshots = forceHeavy || includeChatTranscripts
         defer {
-            snapshotWriteInFlight = false
-            if snapshotWriteQueued {
+            if lifecycleGeneration == snapshotLifecycleGeneration {
+                snapshotWriteInFlight = false
+            }
+            if lifecycleGeneration == snapshotLifecycleGeneration, snapshotWriteQueued {
                 snapshotWriteQueued = false
                 let queuedForceHeavy = snapshotWriteQueuedNeedsHeavy
+                let queuedIncludeChatTranscripts = snapshotWriteQueuedNeedsChatTranscripts
+                let queuedScope: SnapshotWriteScope = snapshotWriteQueuedNeedsStandardPass
+                    ? .standard
+                    : .chatSessions
                 snapshotWriteQueuedNeedsHeavy = false
+                snapshotWriteQueuedNeedsChatTranscripts = false
+                snapshotWriteQueuedNeedsStandardPass = false
                 Task { @MainActor in
-                    await self.writeSnapshots(forceHeavy: queuedForceHeavy)
+                    await self.writeSnapshots(
+                        forceHeavy: queuedForceHeavy,
+                        includeChatTranscripts: queuedIncludeChatTranscripts,
+                        scope: queuedScope
+                    )
                 }
             }
+        }
+
+        if scope == .chatSessions, !forceHeavy {
+            await writeChatSessionSnapshots(
+                includeTranscripts: includeChatTranscripts,
+                snapshotDir: snapshotDir,
+                lifecycleGeneration: lifecycleGeneration
+            )
+            return
         }
 
         let api = NativeClient(baseURL: "")
@@ -194,7 +210,7 @@ extension MacSyncEngine {
                 ).liveState()
                 let ownerDecisionCount = LivingAttentionPolicy.ownerDecisionDeskCount(in: desk.items)
                 organismLivingStatus.needsUser = ownerDecisionCount > 0
-                organismLivingStatus.needsAttention = organismLivingStatus.needsAttention
+                organismLivingStatus.needsAttention = (organismLivingStatus.needsAttention ?? false)
                     || desk.items.contains { $0.status == .blocked }
                 let why = ownerDecisionCount > 0
                     ? "Desk has \(ownerDecisionCount) item\(ownerDecisionCount == 1 ? "" : "s") explicitly waiting on the owner."
@@ -220,6 +236,7 @@ extension MacSyncEngine {
                 do { providers = try await api.listProviders() } catch { recordFetchFailure("providers", error) }
             }
 
+            guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
             let encoder = JSONEncoder()
             encoder.dateEncodingStrategy = .iso8601
             encoder.outputFormatting = .sortedKeys
@@ -227,9 +244,20 @@ extension MacSyncEngine {
             var changedSnapshotFilenames: Set<String> = []
 
             func writeData(_ data: Data, to filename: String) async {
-                if await writeSnapshotData(data, to: filename, in: snapshotDir) {
+                guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
+                switch await writeSnapshotData(
+                    data,
+                    to: filename,
+                    in: snapshotDir,
+                    lifecycleGeneration: lifecycleGeneration
+                ) {
+                case .changed:
                     wroteAnySnapshot = true
                     changedSnapshotFilenames.insert(filename)
+                case .failed(let reason):
+                    snapshotFetchFailures.append("\(filename) write: \(reason)")
+                case .unchanged:
+                    break
                 }
             }
 
@@ -379,7 +407,7 @@ extension MacSyncEngine {
                 await write(sessions, to: "sessions.json")
                 let pinnedSessions = pinnedChatSessions(from: sessions)
                 await write(pinnedSessions, to: "pinned_chat_sessions.json")
-                if includeHeavySnapshots {
+                if includeTranscriptSnapshots {
                     let transcriptSessions = transcriptSnapshotSessions(from: sessions, pinnedSessions: pinnedSessions)
                     let transcripts: [ChatTranscriptSnapshot] = transcriptSessions.isEmpty
                         ? []
@@ -411,6 +439,7 @@ extension MacSyncEngine {
                 )
             }
 
+            guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
             lastSnapshotAt = Date()
             // fix-2026-06-10 sync-audit #1: surface skipped-fetch errors instead
             // of clearing them — the snapshot files themselves kept last-good data.
@@ -443,16 +472,28 @@ extension MacSyncEngine {
                 let changedGroups = NAMobileSnapshotGroup.groups(
                     containingAny: changedSnapshotFilenames
                 )
-                _ = await iCloudBridge.shared.publishMobileSnapshotStatus(
+                let published = await iCloudBridge.shared.publishMobileSnapshotStatus(
                     groups: changedGroups,
                     snapshotDirectory: snapshotDir
                 )
+                guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
+                if !published, iCloudBridge.shared.usesCloudKitDeviceTransport {
+                    syncError = "iPhone snapshot publication failed for \(changedGroups.map(\.rawValue).sorted().joined(separator: ", ")). The last proven phone data was retained."
+                }
                 if !iCloudBridge.shared.usesCloudKitDeviceTransport {
                     let snapshotStamp = ISO8601DateFormatter().string(from: Date())
-                    _ = await withCKTimeout("MacSyncEngine.writeSnapshots.kvsSignal") {
+                    let groupNames = changedGroups
+                        .map(\.rawValue)
+                        .sorted()
+                        .joined(separator: ",")
+                    let snapshotSignal = "\(snapshotStamp)|groups=\(groupNames)"
+                    let signaled: Bool? = await withCKTimeout("MacSyncEngine.writeSnapshots.kvsSignal") {
                         let kvs = NSUbiquitousKeyValueStore.default
-                        kvs.set(snapshotStamp, forKey: KVSKey.snapshotUpdated)
+                        kvs.set(snapshotSignal, forKey: KVSKey.snapshotUpdated)
                         return kvs.synchronize()
+                    }
+                    if signaled != true {
+                        syncError = "iPhone snapshot signal failed. The files were retained for the next sync edge."
                     }
                 }
                 // fix-snapshot-digest-persist: checkpoint the updated digest map so
@@ -463,6 +504,95 @@ extension MacSyncEngine {
         } catch {
             syncError = "Snapshot error: \(error.localizedDescription)"
         }
+    }
+
+    /// Completion/session mutations need only the canonical session index,
+    /// pinned projection, and (for completed turns) bounded transcripts. This
+    /// avoids rebuilding health, approvals, memory, provider, run, and graph
+    /// snapshots on every ordinary conversation edge.
+    private func writeChatSessionSnapshots(
+        includeTranscripts: Bool,
+        snapshotDir: URL,
+        lifecycleGeneration: UInt64
+    ) async {
+        let api = NativeClient(baseURL: "")
+        let sessions: [ChatSession]
+        do {
+            sessions = try await api.getChatSessions()
+        } catch {
+            guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
+            syncError = "Chat session snapshot failed; the last proven phone sessions were retained: \(error.localizedDescription)"
+            return
+        }
+        guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
+
+        let pinnedSessions = pinnedChatSessions(from: sessions)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = .sortedKeys
+        var changedFilenames = Set<String>()
+        var writeFailures: [String] = []
+
+        func write<T: Encodable>(_ value: T, filename: String) async {
+            guard lifecycleGeneration == snapshotLifecycleGeneration,
+                  isActive,
+                  let data = try? encoder.encode(value) else { return }
+            switch await writeSnapshotData(
+                data,
+                to: filename,
+                in: snapshotDir,
+                lifecycleGeneration: lifecycleGeneration
+            ) {
+            case .changed:
+                changedFilenames.insert(filename)
+            case .failed(let reason):
+                writeFailures.append("\(filename): \(reason)")
+            case .unchanged:
+                break
+            }
+        }
+
+        await write(sessions, filename: "sessions.json")
+        await write(pinnedSessions, filename: "pinned_chat_sessions.json")
+        if includeTranscripts {
+            let selected = transcriptSnapshotSessions(
+                from: sessions,
+                pinnedSessions: pinnedSessions
+            )
+            let transcripts = await chatTranscriptSnapshots(for: selected, api: api)
+            await write(transcripts, filename: "chat_transcripts.json")
+        }
+        guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
+        lastSnapshotAt = Date()
+        if !writeFailures.isEmpty {
+            syncError = "iPhone chat snapshot write failed; last proven files were retained: \(writeFailures.joined(separator: "; "))"
+        }
+        guard !changedFilenames.isEmpty else { return }
+
+        let groups = NAMobileSnapshotGroup.groups(containingAny: changedFilenames)
+        let published = await iCloudBridge.shared.publishMobileSnapshotStatus(
+            groups: groups,
+            snapshotDirectory: snapshotDir
+        )
+        guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
+        if !published, iCloudBridge.shared.usesCloudKitDeviceTransport {
+            syncError = "iPhone chat snapshot publication failed. The last proven phone conversation was retained."
+        } else if writeFailures.isEmpty {
+            syncError = nil
+        }
+        if !iCloudBridge.shared.usesCloudKitDeviceTransport {
+            let stamp = ISO8601DateFormatter().string(from: Date())
+            let names = groups.map(\.rawValue).sorted().joined(separator: ",")
+            let signaled: Bool? = await withCKTimeout("MacSyncEngine.writeChatSessionSnapshots.kvsSignal") {
+                let kvs = NSUbiquitousKeyValueStore.default
+                kvs.set("\(stamp)|groups=\(names)", forKey: KVSKey.snapshotUpdated)
+                return kvs.synchronize()
+            }
+            if signaled != true {
+                syncError = "iPhone chat snapshot signal failed. The files were retained for the next sync edge."
+            }
+        }
+        saveSnapshotDigests()
     }
 
     private func pinnedChatSessionIds() -> [String] {
@@ -488,9 +618,18 @@ extension MacSyncEngine {
                   seen.insert(session.id).inserted else { return }
             out.append(session)
         }
-        if let main = sessions.first(where: { isMainAppSourceKey($0.sourceKey) && $0.archived != true }) {
-            append(main)
-        }
+        // Retain one Mac main and one phone main. `isMainAppSourceKey` includes
+        // both, so selecting only its first match made whichever device sorted
+        // second disappear from the mobile transcript projection.
+        append(sessions.first(where: {
+            $0.sourceKey?.trimmingCharacters(in: .whitespacesAndNewlines) == "app"
+                && $0.archived != true
+        }))
+        append(sessions.first(where: {
+            (NativeAgentICloudBridgeConstants.isMobileSourceKey($0.sourceKey)
+                || (($0.source ?? "").lowercased() == "ios" && ($0.sourceKey ?? "").isEmpty))
+                && $0.archived != true
+        }))
         for session in pinnedSessions {
             append(session)
         }
@@ -519,7 +658,12 @@ extension MacSyncEngine {
         return String(content.prefix(maxCharacters)) + "\n[truncated for iPhone snapshot]"
     }
 
-    private func writeSnapshotData(_ data: Data, to filename: String, in snapshotDir: URL) async -> Bool {
+    private func writeSnapshotData(
+        _ data: Data,
+        to filename: String,
+        in snapshotDir: URL,
+        lifecycleGeneration expectedLifecycleGeneration: UInt64
+    ) async -> SnapshotFileWriteResult {
         let digest = Data(SHA256.hash(data: data)).map { String(format: "%02x", $0) }.joined()
         let url = snapshotDir.appendingPathComponent(filename)
         // FIX (E): only skip the write when the digest matches AND the snapshot
@@ -528,7 +672,7 @@ extension MacSyncEngine {
         // recreating the snapshot forever, leaving iOS with no (or stale) data.
         if snapshotFileDigests[filename] == digest,
            FileManager.default.fileExists(atPath: url.path) {
-            return false
+            return .unchanged
         }
         // Off-main coordinated write, AWAITED so the write completes before this
         // returns. That keeps the original semantics exactly: digest is recorded
@@ -538,12 +682,18 @@ extension MacSyncEngine {
         let writeError = await Task.detached(priority: .utility) { [data, url] in
             Self.coordinatedWriteReturningError(data: data, to: url)
         }.value
+        // The coordinated filesystem write itself cannot be cancelled once it
+        // has entered Foundation. It still targets the captured old cache URL;
+        // after a stop/restart, do not let its late result mutate the new
+        // generation's digest/error/publication state.
+        guard expectedLifecycleGeneration == snapshotLifecycleGeneration,
+              isActive else { return .unchanged }
         if let writeError {
             syncError = "Snapshot write failed for \(filename): \(writeError)"
-            return false
+            return .failed(writeError)
         }
         snapshotFileDigests[filename] = digest
-        return true
+        return .changed
     }
 
     /// Coordinated write returning an optional error description (nil = success).
@@ -598,7 +748,21 @@ extension MacSyncEngine {
         let enc = JSONEncoder()
         enc.dateEncodingStrategy = .iso8601
         enc.outputFormatting = .sortedKeys
-        do { return .built(try enc.encode(items)) } catch {
+        do {
+            let projection = try MobileInboxProjection.data(from: items, encoder: enc)
+            if !items.isEmpty, projection.included == 0 {
+                return .skipped("mobile inbox rows exceeded the bounded projection budget")
+            }
+            if projection.included < items.count {
+                NSLog(
+                    "[MacSyncEngine] mobile inbox projection bounded rows=%d total=%d bytes=%d",
+                    projection.included,
+                    items.count,
+                    projection.data.count
+                )
+            }
+            return .built(projection.data)
+        } catch {
             return .skipped("inbox could not be encoded: \(error.localizedDescription)")
         }
     }

@@ -40,7 +40,6 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-import CapabilityFoundry
 
 enum NightlyReflectionJobOutcome: Equatable {
     case added
@@ -383,6 +382,11 @@ extension AppModel {
         let receipt: String
         do {
             let result = try await client.restoreBackup(id: backup.id)
+            if result.requiresRestart {
+                statusText = "Restore validated and staged with safety backup \(result.safetyBackupId ?? "created"). NativeAgent is restarting to restore before any live state owner opens."
+                AppRelauncher.relaunchApp()
+                return
+            }
             let scopes = NativeClient.scopeNames(for: result.restored)
             let restoredDescription = scopes.isEmpty ? "no matching data scopes" : scopes.joined(separator: ", ")
             receipt = "Restore completed at \(result.restoredAt): \"\(backup.reason)\" from \(backup.createdAt). Safety backup created first. Restored: \(restoredDescription)."

@@ -64,9 +64,7 @@ public actor JSONLEmbeddingStore: EmbeddingStore {
     //     serializes against other Swift processes that write
     //     <dataRoot>/memory_embeddings.jsonl. Without it a write that lands
     //     between our read and our atomic replace would be silently truncated.
-    //     Same `<path>.lock` sibling convention the
-    //     JSONLMemoryConsolidationRecaller (now thinly wrapping this
-    //     store) use.
+    //     Same `<path>.lock` sibling convention as production JSONL owners.
     //
     // Order matters: in-process FIRST, flock SECOND. Reversing would risk
     // an unbounded queue of process-local tasks all racing for one flock,
@@ -199,12 +197,7 @@ public actor JSONLEmbeddingStore: EmbeddingStore {
 
     /// Read-only snapshot of every record currently on disk, force-reloading
     /// from the file under the same two-layer lock used by writers.
-    /// Added (2026-05-31) for JSONLMemoryConsolidationRecaller so the
-    /// MemoryConsolidationLoop can enumerate records WITHOUT doing raw file
-    /// I/O outside the store — that was the duplicate-impl drift this
-    /// unification fixes. Exposes the immutable `Record` struct rather
-    /// than tuples so the recaller's ConsolidationCandidate mapping stays
-    /// strongly typed.
+    /// Exposes the immutable `Record` struct rather than raw tuples.
     public func allRecords() async throws -> [Record] {
         try await withPathLock {
             try await self._allRecordsLocked()

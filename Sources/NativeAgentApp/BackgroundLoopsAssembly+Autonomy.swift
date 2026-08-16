@@ -39,6 +39,7 @@ extension BackgroundLoopsAssembly {
     ) -> some EventDeadlineLoopRunner {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         let policyPath = trustPolicyPath(dataRoot: dataRoot)
+        let trustCenter = SwiftNativeTrustCenter(dataRoot: dataRoot)
         let loop = AutonomyPromotionLoop(
             // Daily is now the missed-event integrity cadence. Approval/policy
             // mutations and the persisted proposal cooldown drive normal work.
@@ -46,7 +47,7 @@ extension BackgroundLoopsAssembly {
             // Fail-safe: autonomy OFF ⇒ no proposals, no reconciliation. Read
             // the same enableAutonomy flag the Workshop execution gate uses.
             isEnabled: {
-                let policy = await SwiftNativeTrustCenter(dataRoot: dataRoot).loadTrustPolicy()
+                let policy = await trustCenter.loadTrustPolicy()
                 if case .bool(true) = policy["enableAutonomy"] ?? .null { return true }
                 return false
             },
@@ -54,44 +55,21 @@ extension BackgroundLoopsAssembly {
             // RAW saved toolAutonomy[tool]; nil if absent (absent ⇒ default/auto
             // ⇒ not a candidate). NOT loadTrustPolicy — that merges ~75 defaults.
             currentTier: { tool in
-                let raw = await SwiftNativePersistenceCore().readJSON(
-                    policyPath, defaultValue: .object([:]))
-                guard case .object(let obj) = raw,
-                      case .object(let autonomy)? = obj["toolAutonomy"],
-                      case .string(let tier)? = autonomy[tool] else { return nil }
-                return tier
+                try? await trustCenter.userConfiguredAutonomyLevel(for: tool)
             },
-            // Locked RAW-policy write: set toolAutonomy[tool]="auto" preserving
-            // EVERY other saved key + other tools. Reads the saved dict (not the
-            // normalized one) so we never bake the default catalog into the file.
+            // Canonical checked CAS: preserve every other raw saved key and
+            // refuse corruption or a tier changed since the human-approved
+            // promotion was re-verified.
             applyPromotion: { tool in
-                let persistence = SwiftNativePersistenceCore()
                 do {
-                    return try await persistence.withFileLock(policyPath) { () -> Bool in
-                        let raw = await persistence.readJSON(policyPath, defaultValue: .object([:]))
-                        var obj: [String: JSONValue]
-                        if case .object(let o) = raw { obj = o } else { obj = [:] }
-                        var autonomy: [String: JSONValue]
-                        if case .object(let a)? = obj["toolAutonomy"] { autonomy = a } else { autonomy = [:] }
-                        // CAS + eligibility re-check INSIDE the lock (gpt-5.5
-                        // review): the tier the reconciler observed may have been
-                        // tightened (the user/TrustCenter) between its check and this
-                        // write. Re-read the LOCKED raw tier and apply the SAME
-                        // eligibility predicate the proposer uses; write "auto"
-                        // ONLY if still a legitimate target. Never clobber a
-                        // tightening; never promote an ineligible/forged target.
-                        let lockedTier: String? = {
-                            if case .string(let t)? = autonomy[tool] { return t }
-                            return nil
-                        }()
-                        guard let lockedTier,
-                              AutonomyPromotionLoop.isPromotableTarget(tool: tool, tier: lockedTier)
-                        else { return false }   // not eligible under the lock → no write
-                        autonomy[tool] = .string("auto")
-                        obj["toolAutonomy"] = .object(autonomy)
-                        try await persistence.writeJSON(.object(obj), to: policyPath)
-                        return true
-                    }
+                    guard let tier = try await trustCenter.userConfiguredAutonomyLevel(for: tool),
+                          AutonomyPromotionLoop.isPromotableTarget(tool: tool, tier: tier)
+                    else { return false }
+                    return try await trustCenter.compareAndSetToolAutonomy(
+                        tool: tool,
+                        expectedCurrentTiers: [tier],
+                        newTier: "auto"
+                    )
                 } catch {
                     FileHandle.standardError.write(Data(
                         "AutonomyPromotion: policy write failed for \(tool): \(error)\n".utf8))
@@ -260,30 +238,14 @@ struct AutonomyPromotionInboxAdapter: AutonomyPromotionInboxPort {
             executedActionPresent: rec.executedAction != nil)
     }
 
-    /// Stamp `executedAction` + `detail` directly on requests.json under the
-    /// persistence flock (the memory.repair / consolidation-gate convention —
-    /// ApprovalInbox has no protocol method for this).
+    /// Stamp the executor outcome through the authoritative ApprovalInbox.
     func annotate(id: String, executedAction: JSONValue, detail: String) async throws {
-        let path = dataRoot
-            .appendingPathComponent("workflows", isDirectory: true)
-            .appendingPathComponent("approvals", isDirectory: true)
-            .appendingPathComponent("requests.json")
-        let persistence = SwiftNativePersistenceCore()
         do {
-            try await persistence.withFileLock(path) {
-                let raw = await persistence.readJSON(path, defaultValue: .array([]))
-                guard case .array(var rows) = raw else { return }
-                for idx in rows.indices {
-                    guard case .object(var obj) = rows[idx],
-                          case .string(let rowID)? = obj["id"],
-                          rowID == id else { continue }
-                    obj["executedAction"] = executedAction
-                    obj["detail"] = .string(detail)
-                    rows[idx] = .object(obj)
-                    break
-                }
-                try await persistence.writeJSON(.array(rows), to: path)
-            }
+            _ = try await inbox.annotateExecution(
+                id,
+                executedAction: executedAction,
+                detail: detail
+            )
         } catch {
             // FIX 3 (A4.5): rethrow — a swallowed annotate() left the card
             // unstamped (silently re-applicable) while the tick reported success.

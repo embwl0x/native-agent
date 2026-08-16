@@ -105,7 +105,19 @@ extension AppDelegate {
         // Detached so first-launch I/O doesn't gate UI ready.
         Task.detached(priority: .utility) {
             let logger = Logger(subsystem: "com.nativeagent.app", category: "memory-migration")
-            let report = await MemoryV2Migrator().migrate()
+            let canonicalStorage: MemoryStorage
+            do {
+                canonicalStorage = try await SwiftNativeMemoryV2.resolvedStorage(
+                    dataRoot: NativeAgentPaths.dataRoot
+                )
+            } catch {
+                logger.error("MemoryV2 canonical storage unavailable; migration and projections refused: \(String(describing: error), privacy: .public)")
+                return
+            }
+            let report = await MemoryV2Migrator(
+                dataRoot: NativeAgentPaths.dataRoot,
+                storage: RealMemoryStorage(storage: canonicalStorage)
+            ).migrate()
             if report.skippedAlreadyMigrated {
                 logger.info("MemoryV2 migration: already complete; skipped")
             } else {
@@ -123,6 +135,33 @@ extension AppDelegate {
                 reason: "memory_migration_finished"
             ))
             await DerivedStateInvalidationCenter.shared.flush()
+            guard report.requiredFailures == 0 else {
+                logger.error("MemoryV2 derived projection reconciliation refused because migration is incomplete")
+                return
+            }
+
+            // Rebuildable projections converge only after the canonical
+            // migration boundary. Keeping this sequence in one utility task
+            // prevents first-launch USER/KG/Spotlight snapshots from racing an
+            // empty pre-migration store.
+            do {
+                _ = try await SwiftNativeMemoryV2.shared.reconcileKnowledgeGraphProjection()
+            } catch {
+                logger.error("MemoryV2 Knowledge Graph reconciliation failed: \(String(describing: error), privacy: .public)")
+            }
+            if let generator = await SwiftNativeMemoryV2.shared.bindUserMDGenerator(
+                dataRoot: NativeAgentPaths.dataRoot,
+                personaRoot: NativeAgentPaths.personaRoot
+            ) {
+                do {
+                    _ = try await generator.regenerate()
+                } catch UserMDGeneratorError.onboardingIncomplete {
+                    // Expected on a blank install; onboarding owns first write.
+                } catch {
+                    logger.error("MemoryV2 USER.md reconciliation failed: \(String(describing: error), privacy: .public)")
+                }
+            }
+            await MemorySpotlightBootstrap.shared.reindexAll()
         }
 
         // Swift-native cutover/fin-integration: register background activity entries
@@ -178,7 +217,19 @@ extension AppDelegate {
             await NativeCognitionRuntime.shared.bootstrap()
         }
         Task.detached(priority: .utility) {
-            await MemorySpotlightBootstrap.shared.reindexAll()
+            let logger = Logger(subsystem: "com.nativeagent.app", category: "chat-reconciliation")
+            do {
+                let report = try await ChatSessionIndexReconciler(
+                    dataRoot: NativeAgentPaths.dataRoot
+                ).reconcile()
+                if report.sessionsRecovered > 0 || report.corruptTranscripts > 0 {
+                    logger.info(
+                        "Chat reconciliation: recovered=\(report.sessionsRecovered, privacy: .public) corrupt=\(report.corruptTranscripts, privacy: .public) examined=\(report.transcriptsExamined, privacy: .public)"
+                    )
+                }
+            } catch {
+                logger.error("Chat reconciliation refused: \(String(describing: error), privacy: .public)")
+            }
         }
         Task.detached(priority: .utility) {
             // NativeAgentApp owns composition; Core owns process lifecycle,
@@ -217,25 +268,6 @@ extension AppDelegate {
                 FileHandle.standardError.write(
                     Data("Desk hierarchy reconciliation failed: \(error)\n".utf8)
                 )
-            }
-        }
-        Task.detached(priority: .utility) {
-            // UserMDGenerator opens the SQLite db; isolated so a file-lock
-            // contention (e.g. another instance holding the GRDB pool) can't
-            // stall the rest of bring-up.
-            if let gen = UserMDGenerator.shared {
-                // Pre-onboarding this throws `onboardingIncomplete` and writes
-                // nothing (fix-blank-install-onboarding, 2026-08-02). It used
-                // to create the persona dir and an empty USER.md on a blank
-                // machine, which satisfied onboarding's own identity-anchor
-                // check and hid the wizard depending on who won the launch
-                // race. The gate lives in the generator, so EVERY caller —
-                // launch, memory-insert pokes, consolidation — is covered and
-                // the outcome no longer depends on task ordering.
-                _ = try? await gen.regenerate()
-                if let bridge = await SwiftNativeMemoryV2.shared.underlyingBridge() {
-                    await bridge.underlyingStorage().attachUserMDGenerator(gen)
-                }
             }
         }
         Task.detached(priority: .utility) {
@@ -399,6 +431,36 @@ extension AppDelegate {
         return false
     }
 
+    @MainActor
+    func application(
+        _ application: NSApplication,
+        didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
+    ) {
+        iCloudBridge.shared.cloudKitPushRegistrationSucceeded()
+    }
+
+    @MainActor
+    func application(
+        _ application: NSApplication,
+        didFailToRegisterForRemoteNotificationsWithError error: Error
+    ) {
+        iCloudBridge.shared.cloudKitPushRegistrationFailed(error)
+    }
+
+    @MainActor
+    func application(
+        _ application: NSApplication,
+        didReceiveRemoteNotification userInfo: [String: Any]
+    ) {
+        let payload = Dictionary(uniqueKeysWithValues: userInfo.map {
+            (AnyHashable($0.key), $0.value)
+        })
+        guard iCloudBridge.shared.recognizesCloudKitRemoteNotification(payload) else { return }
+        Task { @MainActor in
+            await iCloudBridge.shared.handleCloudKitPushWake()
+        }
+    }
+
     // runtime integration + background loops: drain Swift-native subsystems
     // before process exit.
     func applicationWillTerminate(_ notification: Notification) {
@@ -469,6 +531,11 @@ extension AppDelegate {
         group.enter()
         Task.detached {
             await NativeContextFlowRuntime.shared.stop()
+            group.leave()
+        }
+        group.enter()
+        Task { @MainActor in
+            await ActivityWatchController.shared.shutdown()
             group.leave()
         }
         _ = group.wait(timeout: .now() + 3.0)

@@ -4,12 +4,12 @@ import PersistenceCore
 // MARK: - Delegation outcome cards (W2b, upgrade campaign 2026-08 Track A)
 //
 // THE PROBLEM this closes (L1 themes 1/3/14, L2 Q1): W2 gave Agent a READ tool
-// over the two wake-job stores (`delegation_status`), but reading is a pull.
+// over the bridge wake-job stores (`delegation_status`), but reading is a pull.
 // Nothing PUSHED. A delegated job could finish — or fail, or lose its delivery
 // — and the only way anyone found out was by asking. The terminal transition
 // was invisible unless someone happened to look at the right moment.
 //
-// This loop is the push side: every ~5 minutes it reads the same two stores,
+// This loop is the push side: it reacts to store changes and periodically repairs,
 // finds jobs that became terminal SINCE A DURABLE CURSOR, and files exactly one
 // inbox card per newly-terminal job.
 //
@@ -50,7 +50,7 @@ import PersistenceCore
 /// two cannot drift into disagreeing about what a record says.
 public struct DelegationJobSnapshot: Sendable, Equatable {
     public var id: String
-    /// "claude" | "codex" — which store the row came from.
+    /// "claude" | "codex" | "omp" — which store the row came from.
     public var source: String
     public var agent: String
     public var topicSlug: String?
@@ -228,6 +228,7 @@ public struct DelegationOutcomeCard: Sendable, Equatable {
         switch (agent.isEmpty ? source : agent).lowercased() {
         case "claude", "claude": return "Claude"
         case "codex": return "Codex"
+        case "omp": return "OMP"
         case let other: return other.prefix(1).uppercased() + other.dropFirst()
         }
     }
@@ -320,7 +321,7 @@ public struct DelegationOutcomeCursor: Sendable, Equatable {
         }
     }
 
-    /// Keyed by store source id ("claude" / "codex").
+    /// Keyed by store source id (for example "claude", "codex", or "omp").
     public var stores: [String: StoreCursor]
 
     public init(stores: [String: StoreCursor] = [:]) {
@@ -525,9 +526,12 @@ public struct DelegationOutcomeLoop: LoopRunner {
                 cursor.record(source: job.source, id: job.id, stamp: job.completionStamp)
                 filed += 1
             } else {
-                // Leave it un-carded. The cursor stamp is NOT advanced past it
-                // either, because `record` is the only thing that moves it.
+                // Contiguous settlement: stop at the first failed card. If a
+                // newer job were recorded after this failure, `lastSeen` would
+                // advance past the older row and the timestamp filter could
+                // hide it forever on the next tick.
                 failed += 1
+                break
             }
         }
 
@@ -542,7 +546,9 @@ public struct DelegationOutcomeLoop: LoopRunner {
 
         var result = "filed \(filed) delegation outcome card(s)"
         if failed > 0 { result += "; \(failed) inbox write(s) failed and will retry next tick" }
-        if deferred > 0 { result += "; \(deferred) more deferred by the per-tick cap" }
+        let failureDeferred = max(0, batch.count - filed - failed)
+        let totalDeferred = deferred + failureDeferred
+        if totalDeferred > 0 { result += "; \(totalDeferred) more deferred for contiguous settlement" }
         if filed == 0 && failed == 0 {
             return .skipped(reason: "no terminal outcome could be classified from \(pending.count) pending job(s)")
         }

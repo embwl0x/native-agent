@@ -1,24 +1,228 @@
 # NativeAgent Project Status
 
-Last updated: 2026-08-09
+Last updated: 2026-08-16
 
 ## Summary
 
-The private `main` branch contains an unreleased 0.3.9 stabilization pile;
-`VERSION` intentionally remains `0.3.8`. A 2026-08-08 fine-tooth sweep is
-implemented and verified locally. It repairs
-last-writer-wins chat-brain persistence, checked recovery for malformed Codex
-CLI adoption-consent records, persistent/HTTPS-only update notices, typed refusal of
-freshly retired OpenRouter models without changing the user's LLM, exact
-Subconscious route readiness, iPhone session/cache/queue ownership, terminal
-CloudKit failure receipts, atomic pursuit notification policy, evidence-honest
-trigger testing, authenticated transactional installer rollback, consolidated
-slash-command ownership, and duplicate App Intents shortcut-provider metadata.
-The architecture map and focused regression suites cover the new boundaries.
-The canonical repository gate, iOS continuity suites, and Xcode App Intents
-metadata extraction pass. These changes are now installed on User's Mac from
-the final clean private Native Experience hardening head;
-they remain private and have not been published or released.
+Public release 0.4.0 is cut; private `main` contains the subsequent integrated
+stabilization and documentation work. Source and live behavior remain
+authoritative over older release prose below.
+
+The newest private source adds a follow-up structural closeout without a
+new owner or model call. Manual compaction now delegates to the canonical Core
+compactor and uses the same verified provider/model context-window authority as
+turn admission. Mac and iOS share one value-only organism status DTO. A live
+checked CloudKit transport skips legacy Drive mount/query startup while keeping
+KVS nudges and the complete explicit/failure fallback. Cognition capsule
+preparation is pure and commits presentation only after accepted injection;
+standing-view relevance, reflection proposal scope, reflex retirement, and
+negation appraisal are tightened inside the existing cognition/organism owners.
+Cross-device de-mission writer flips remain deferred because the current public
+iOS peer predates their replacement keys. The source is committed and installed;
+it has not been pushed, published, or released.
+
+The settled follow-up passes the complete canonical gate: 6,084 Core Swift
+Testing plus 225 Core XCTest, 61 Shared Swift Testing, 1,164 Mac app Swift
+Testing plus 23 Mac app XCTest, and 94 iOS XCTest plus 2 iOS Swift Testing. All
+release, privacy, resource, blueprint, timer, persona, Python, and diff guards
+are green. The separate optimized production build completed in 536.58 seconds
+with zero warnings or errors. Clean commit
+`227236a18679bf58ffcc4ff042026c15355c7b28` is installed and authenticated as
+the exact running Apple Development build.
+
+A fresh nine-turn same-session conversation on Claude Fable 5 crossed baseline,
+compression, friction, repair, warmth, and neutral carryover with one coherent
+voice, no warnings, and no failed tool dispatch. Every trace used Fluid Context
+with 20 selected atoms and no unnecessary expansion. Fluid Context remained
+active at matching generation `2097/2097`, 40 sources, zero degraded sources,
+normal pressure, and no error; subconscious telemetry completed 21/21
+microcycles with zero failures and the organism moved materially on every turn.
+Provider calls averaged 4.58 seconds and whole turns 5.30 seconds. NativeAgent
+returned to 0.0% CPU at rest. Doctor passed all 14 areas, native tool lazy
+loading and dispatch passed, Telegram remained active, and Slack Socket Mode was
+connected without a current error. Whole-machine resource pressure was briefly
+elevated while a separate local-model process was active; the organism
+conserved correctly, then returned to nominal pressure and its normal loop
+budget. The new session and full transcript also appeared immediately in the
+canonical Mac index and mobile transcript snapshot.
+
+The same follow-up closes three remaining concurrency/durability seams without
+new loops: scheduler authority reads fail closed unless the file is genuinely
+missing, weekly REM uses one cross-process reservation in PersistenceCore, and
+Telegram chat admission creates its interactive Task atomically inside the
+coordinator. Mobile snapshot work is lifecycle-fenced, exact group-routed, and
+bounded; canonical session mutations publish immediately, transcript retention
+keeps exact Mac/mobile mains plus pins, and visible iOS stores consume those
+publications without an active-mode polling loop.
+
+Desk remains the user-visible pursuit/project owner; Workshop is only its
+bounded execution and settlement membrane. Continuation context is limited to
+three untrusted receipt summaries and validated contained artifact references,
+never copied artifact bodies or a new memory lane. Conservative artifact-backed
+goal closure, v2 workflow step bounds/claims/recovery, and paged delegation
+outcome projection prevent silent truncation or repeated effects while keeping
+legacy definitions and additive persisted fields readable.
+
+Trust and persistence closeout is fail-closed at the actual effect boundary.
+Approved generic actions spend their canonical approval before dispatch;
+restore preserves newer replay/effect/scheduler fences and uses coherent online
+Memory plus locked chat backups. Pairing rotation is atomic on Mac and
+transactional in iOS Keychain, unsigned resync cannot replay a request, remote
+IDs/paths are strictly bounded, and CloudKit construction proves the exact
+container entitlement. Memory/KG migrations, embeddings, USER.md, Spotlight,
+restart chat-index recovery, and backup now share checked canonical evidence
+without adding another fact owner or repairing damaged bytes by guesswork.
+Older/minimal Memory schemas remain valid when required authority columns exist;
+missing required columns fail closed, and canonical archived/excluded lifecycle
+state overrides stale indexing payloads.
+
+The notification/activity hot paths are consolidated around their existing
+owners. One bounded JSONL notification inbox preserves corrupt physical rows;
+CloudKit is push-first with registration-aware missed-push repair and throttled
+quiet cursor persistence; Slack history sleeps to its exact decision deadline;
+Activity startup/termination is bounded and chronological rollups preserve the
+existing Calendar/DST semantics. No new poller or model call was added.
+
+Provider/model state now converges on one exact Core tuple and checked current
+snapshot across Telegram and Mac. OpenRouter carries structured multimodal/tool
+turns with truthful cached capabilities and exact-root context windows; Slack
+adds bounded authenticated image-share hydration and Anthropic-compatible
+text/tool handling. Generic completion notices no longer over-preload builder,
+file, or GitHub tools, while concrete status/repository evidence remains lazy-
+attached on the first call.
+
+Unused compile edges, exact zero-caller app seams, the residual Frozen Mind v1
+runner island, and a duplicate feedback ranker are removed while current v2
+evaluation, public/persisted compatibility, migration keys, and installed
+schedule identities remain. Release proof now uses one attestation that binds
+source, canonical test receipt with required-iOS proof, exact DMG bytes/digest,
+and notarization/stapling state; publication uploads and byte-readbacks the
+appcast, DMG, receipt, and attestation while recomputing the receipt digest. The
+companion release graph inventories every test/production source and resource
+and verifies the shared scheme plus generated-project reproduction.
+
+Build work is also cheaper without changing compilation semantics:
+deterministic source inventory prevents needless package replanning, Core test
+shards reuse a build only while the full source digest is stable, and CoreML
+compilation uses a locked persistent exact-artifact/OS cache. Release symbols
+retain a verified private dSYM while the shipped binary is stripped and
+checked. Cleanup remains dry-run/allowlisted, and non-WMO stays off until
+separate runtime proof passes.
+
+The newest private source closes a real Telegram-observed tool-choice gap
+without broadening the resident prompt or adding another router. GitHubConnector
+now provides bounded native repository overview, content/tree, commit, and
+notification reads. A pasted `github.com` repository URL deterministically
+attaches that small lazy tool group on the first model call; explicit browser
+requests still keep browser access. Questions about ongoing Claude, Codex,
+Claude, or OMP work similarly attach the canonical delegation-status read before
+the first call. Guidance is short and positive—ready attached tools and their
+best fits—not a blacklist or a shell prohibition.
+
+A three-day Telegram trace audit found the rest of the context system healthy:
+Fluid Context, persona memory, cognition, organism input, and lazy skill
+discovery were present. Of 89 shell calls on the busiest day, low-level Mac,
+session, TCC, and much of the build/install forensics were appropriate. Routine
+GitHub and notification work, basic git inspection, ordinary file reads, and
+repeated bridge-store hunting had native paths and now receive clearer first-
+turn routing. The existing atomic wake-hold release helper remains the only
+correct release mutation path; no parallel owner was added.
+
+The complete canonical gate passes on this source, including every release,
+privacy, architecture, resource, Core, Shared, Mac app, and iOS lane (1,142 Mac
+app tests and 91 iOS tests). The run exposed an empty-array expansion bug in the
+default iOS handoff inside `script/test.sh`; the runner now handles both optional
+and required-iOS invocations and the full gate was rerun green.
+
+Installed live proof uses the same shared chat factory as the real surfaces. A
+fresh repository-link turn selected `github_get_repository` first and then
+`github_read_repository_content`, with no browser/search/fetch/shell/tool-load
+detour; the native calls themselves took 35 ms and 250 ms. A bridge-status probe
+then caught and closed one sender-envelope edge in the lazy delegation route.
+After reinstall, the same request used one 53 ms `delegation_status` read and no
+shell. The configured Fable model, active Fluid Context with matching
+generations and zero degraded sources, and enabled organism all remained intact.
+
+The current private source contains a broad whole-system reliability pass over
+the existing architecture. Trust authorization and policy mutation now use one
+checked generation; ApprovalInbox owns strict row mutation and typed decision
+provenance; fixed-size signing/pairing secrets are durable-before-use and never
+silently rotate; damaged external-send receipts block replay; and Trust backup
+restore is manifest-bound, root-contained, staged, and resumed before runtime
+owners open after restart. Slack and Telegram share stricter durable ingress
+rules, scheduler/Desk/Workshop/delegation effects have stable claims and
+restart settlement, and timed-out background children retain their
+single-flight quarantine until they exit.
+
+Opportunistic macOS background callbacks now ask Core whether the registered
+loop is durably due before entering its existing single-flight gate, then
+recheck while holding that gate. Early or coalesced wakes do not mutate health,
+counters, or cadence. GitHub tracking now uses exact config/snapshot, Desk, and
+GitHub Command events plus the canonical connector's learned next deadline; a
+six-hour interval remains only as missed-event repair.
+
+The same source pass makes Activity disclosure explicitly consented and keeps
+agent-driven Mac actions out of human activity, consolidates default-root
+MemoryV2 ownership, replaces graph-wide hot-path materialization with bounded
+SQLite reads and one-transaction snapshots, freezes the admitted provider tuple
+and appraisal inputs for each turn, and keeps unapproved reflex review outside
+live posture/prompt influence. Screenshot drafts remain until acceptance,
+detached sessions follow canonical transcript events, and delivery/transport
+diagnostics now reflect exact admitted reality. Release proof is also stricter:
+an unchanged source object, required iOS lane, exact-commit receipt, hermetic
+provider-readiness checks, authenticated installed-build smoke, and tracked
+MiniLM model data are part of the release contract. Development build/install
+signing now has one behavior-fixtured mechanical owner instead of two drifting
+script copies. Retired production islands were removed without deleting
+historical persisted bytes.
+
+Mac/iPhone chat freshness now rides the existing canonical post-persistence
+completion edge across Mac, Telegram, Slack, bridge, and iOS-forwarded turns.
+MacSyncEngine coalesces completion bursts into one sessions + transcript-only
+snapshot pass and retains that demand across an in-flight snapshot. iPhone no
+longer polls chat sessions every five seconds; changed snapshot groups trigger a
+targeted read and exact-visible-session merge that preserves pending messages,
+streaming placeholders/tool events, and composer input.
+
+This 2026-08-16 tree passes the complete required-iOS canonical gate: 222 Core
+XCTest cases, 6,028 Core Swift Testing cases, 57 Shared tests, 1,165 Mac app
+tests, and 91 iOS tests, plus every release, public-export, MiniLM, privacy,
+architecture, timer-ownership, persona, and inventory guard. Clean commit
+`5b170880f2656cdf7aebf028280e47c14c4f0ab4` also passes a no-local-reuse fresh
+clone: the exact pinned MiniLM hashes verify and the `MemoryV2` target builds
+from scratch. A final connector regression now pins UTF-8 on Slack JSON POSTs,
+removing Slack's harmless `missing_charset` metadata warning; the complete
+required-iOS gate passed again afterward.
+
+The exact clean Apple Development build is installed and authenticated.
+Configured chat remains on Claude Fable 5. Fluid Context is active with 40
+sources, matching generations, zero degraded sources, normal pressure, and no
+error; the organism is enabled; Doctor passes all 14 areas; Telegram is polling
+without an active error; Slack auth/socket health, Desk, Workshop, delegation,
+MemoryV2, Knowledge Graph, MiniLM, iCloud, providers, tools, and autonomy all
+read healthy. An 11-turn same-session natural conversation crossed baseline,
+distance, friction, repair, warmth, play, and neutral carryover with coherent
+voice and material organism movement on every turn. All traces used Fluid
+Context with 19 selected atoms and no failed tool dispatch. NativeAgent added
+only 181–250 ms beyond the provider call (194 ms median); quiet CPU returned to
+0.0%, and physical footprint settled near 229 MB with 185 MB reclaimable after
+the full Doctor/CoreML/conversation pass. Nothing was pushed, published, or
+released.
+
+The newest source adds an explicit bounded Mac-attention session over the
+existing fused ScreenCaptureKit + Accessibility view. It is event-driven and
+ephemeral: no polling refresh loop, extra model, screen history, key content,
+memory, or scheduler. Physical user input invalidates the frozen scene and wins
+at every motor effect boundary; Agent must re-observe before continuing. Motor
+completion also retires its view, and coordinate drags use bounded local
+interpolation with safe mid-drag release. The same TrustCenter/Full Mac/TCC
+gates, secret redaction, screenshot sink stripping, operation receipts, and
+domain verification remain in force. The full 363-test MacControl suite,
+complete 6,110-test Core package, and 1,106-test root app package pass; this
+source is installed in the private Apple Development bundle. Authenticated live
+proof shows chat ready, active Fluid Context with matching generations and zero
+degraded sources, the organism enabled under nominal resource pressure, and a
+successful fused-image attention start/status/stop cycle.
 
 A 2026-08-09 canonical Telegram-session audit verifies 26 of 26 completed
 turns, Fluid Context on every turn, cognitive/organism context on every model
@@ -573,9 +777,10 @@ The canonical publisher regenerates, fully tests, pushes, independently clones,
 and rescans the exact public source. A production release preflight then caught
 that the broad runtime `data/` ignore also matched CoreML's case-varied `Data/`
 directory: temporary export builds had the copied MiniLM model, but fresh public
-clones did not. Export and sync now force-track only the exact verified CoreML
-resource directory, and the public-release source guard refuses missing or
-present-but-untracked model resources. The remaining gates are the
+clones did not. The exact verified CoreML `Data/` resource is now ordinary Git
+source in the private tree and therefore reaches the generic archive without a
+machine-local copy seam; the public-release source guard still refuses missing
+or present-but-untracked model resources. The remaining gates are the
 source-matched notarized DMG, Sparkle/GitHub release, and fresh-VM proof.
 
 A clean VirtualBuddy install also caught a dry-run-only signing failure that
@@ -1016,7 +1221,7 @@ unchanged. This is production integration, not a shadow latency controller.
 | Policy/trust | Real | Unified policy receipts, shared Full Mac / Developer Mode boundaries, default-off multimodal gates such as OpenAI image generation, and one canonical conversation-surface profile shared by planning, policy, and approval execution so aliases cannot drift across trust seams. Shared chat composition authenticates the exact origin and makes one autonomy/approval decision; its inner app dispatcher still runs SecurityCenter hard checks without contradicting that decision, while direct/raw app clients retain their own autonomy gate. Full Mac YOLO therefore follows authenticated Telegram/Slack/iOS conversation identity for ordinary tools, never a claimed surface label, and cannot silently authorize self-modification, money, external sends, bad signatures, or prompt injection. Once the already-policy-filtered inventory proves Full Mac, native file, shell, Git, patch, build, Mac-control, restart, and evolution schemas are supplied immediately on the next turn without a lazy-load detour or app restart; ordinary chat remains lazy, and schema availability grants no new safety authority. Existing TrustCenter policy, capability sources/roots, Mac Integration permissions, and local capability signing keys are checked authority: only missing state bootstraps defaults; corrupt saved state is byte-preserved, unavailable, and fail-closed for reads, mutations, SecurityCenter, command execution, Mac integration dispatch/preload, and backup restore. ApprovalInbox is authoritative safety state: missing means empty, while corrupt/unreadable/malformed state fails closed and cannot be overwritten by a new approval. |
 | Image generation | Real/default-off | `image_generate` lazy-loads for art/image prompts and defaults to Codex/ChatGPT OAuth through the Codex Responses `image_generation` tool (`gpt-image-2`, PNG receipts under `data/generated_images/`). It requires the Trust Center `image_generation_openai` gate. `provider="codex_cli"` remains as an explicit diagnostic artifact collector for CLI child-session experiments; `provider="openai_api"` is the platform API fallback. |
 | Connectors | Mixed+ | Status/proof gates exist; credentialed non-status actions require proven account readiness and policy approval where appropriate. Telegram routes to its canonical settings owner, Browser opens its real surface, Slack/GitHub use validated token entry, X/Gmail/Google Calendar accept locally saved OAuth application credentials and use PKCE with exact loopback callbacks, and Notion validates an internal-integration token before connection. Gmail search/read, primary Calendar status/list, and Notion search/page read are real bounded lazy tools with Google refresh-token handling; Google scopes are read-only until verified write executors ship. Empty or malformed credential files cannot mark a row connected or pass the shared connector-auth mutation boundary. Unsupported providers have no mutation affordance, and the retired generic device-flow poll plus credential-free `connected=true` mutation remain removed. GitHub is first-class: its PAT is Keychain-backed with fail-closed exact-path plaintext migration and symmetric revoke; its synchronous UI status reads validated Keychain metadata while every action still resolves the secret from Keychain. Configurable connected-account repository discovery, compact 20-row provider read models, bounded body/diff excerpts, typed rate-limit failures, confirm-only external mutations, and due-driven cached refresh are real. Durable contribution scope persists the authenticated login, tracks only its authored PRs plus keyword-linked issues, keeps closed PR history outside current Desk work, replaces explicit repository selections, reconciles prior snapshot-owned Desk rows, and emits a sampled low-noise digest with exact counts. Other connector depth varies. |
-| Release hardening | Public source and notarized Mac releases live | Dry-run release, bundle verifier, blank-slate resource checks, Developer ID/notarization workflow, and optional local privacy denylist support exist. Public CloudKit release preflight and mounted-artifact verification share one exact provisioning-profile contract: signature team, team-prefixed app identifier, public container, CloudKit service, production APNS/CloudKit environments, and all-devices/no-device-list distribution must agree; a valid but stale profile for another app/container is rejected before build and after packaging. One Sparkle controller is shared by the app menu and visible Settings button; it starts only for a real published HTTPS feed and valid EdDSA public key. The GitHub release wrapper derives stable feed/version URLs and refuses private repositories, dirty or unpushed source, and missing Apple/Sparkle credentials. Its publisher creates a draft, uploads the exact appcast and DMG, reads both back byte-for-byte, publishes only after that proof, and treats an existing tag as idempotent only for identical assets. The existing post-publish unauthenticated fetch still gates artifact promotion. Hardened-runtime ad-hoc bundles explicitly disable library validation because they have no Team ID and must still load bundled Sparkle; the canonical gate pins that shared entitlement across release, build/run, and install paths, while Developer ID production signing remains unchanged. Development, installed, and release bundles carry the full source object ID plus fail-closed dirty provenance; bridge/Doctor status exposes exact identity only for a clean full ID, and release verification binds the plist value to `Resources/VERSION_SHA`. The public exporter removes private release plumbing, rewrites private identities in text and path components to identity-neutral source vocabulary, emits generic one-commit metadata, builds the renamed tree, and scans the linked executable; path/source/history/binary identity failures are fail-closed, and a retired fixed public persona is rejected in production source/docs and executable strings. Visible Mac/iPhone names resolve configured profile state with a neutral fallback. Public sync refusal is visible in the terminal, durably receipted under ignored local state, and surfaced through a best-effort Mac notification. MiniLM source/export/staged bundles require the exact tracked path set, sizes, and SHA-256 manifest; export and sync force-add only the verified CoreML `Data/` directory so a fresh public clone cannot lose model weights to the broad runtime ignore. Codex, Claude Code, and OMP wakeup workers are required source and staged-bundle resources: public app-only installs ship them, release verification rejects any omission, and one shared runtime discovers the local Node/CLI chain without trusting Finder's reduced `PATH`. The public source mirror and notarized DMG/Sparkle GitHub Releases are live; every new release still requires an exact source-matched artifact and untouched fresh-VM launch proof before it replaces the prior tested baseline. |
+| Release hardening | Public source and notarized Mac releases live | Dry-run release, bundle verifier, blank-slate resource checks, Developer ID/notarization workflow, and optional local privacy denylist support exist. Public CloudKit release preflight and mounted-artifact verification share one exact provisioning-profile contract: signature team, team-prefixed app identifier, public container, CloudKit service, production APNS/CloudKit environments, and all-devices/no-device-list distribution must agree; a valid but stale profile for another app/container is rejected before build and after packaging. One Sparkle controller is shared by the app menu and visible Settings button; it starts only for a real published HTTPS feed and valid EdDSA public key. The GitHub release wrapper derives stable feed/version URLs and refuses private repositories, dirty or unpushed source, and missing Apple/Sparkle credentials. Its publisher creates a draft, uploads the exact appcast and DMG, reads both back byte-for-byte, publishes only after that proof, and treats an existing tag as idempotent only for identical assets. The existing post-publish unauthenticated fetch still gates artifact promotion. A full release now runs the canonical gate on one clean unchanged source object, requires the iOS simulator lane rather than accepting a skip, executes destructive provider-readiness coverage only inside the hermetic test root, and preserves an exact-commit JSON receipt beside the DMG. Hardened-runtime ad-hoc bundles explicitly disable library validation because they have no Team ID and must still load bundled Sparkle; the canonical gate pins that shared entitlement across release, build/run, and install paths, while Developer ID production signing remains unchanged. Development, installed, and release bundles carry the full source object ID plus fail-closed dirty provenance; bridge/Doctor status exposes exact identity only for a clean full ID, and release verification binds the plist value to `Resources/VERSION_SHA`. The public exporter removes private release plumbing, rewrites private identities in text and path components to identity-neutral source vocabulary, emits generic one-commit metadata, builds the renamed tree, and scans the linked executable; path/source/history/binary identity failures are fail-closed, and a retired fixed public persona is rejected in production source/docs and executable strings. Visible Mac/iPhone names resolve configured profile state with a neutral fallback. Public sync refusal is visible in the terminal, durably receipted under ignored local state, and surfaced through a best-effort Mac notification. MiniLM source/export/staged bundles require the exact tracked path set, sizes, and SHA-256 manifest; the exact CoreML `Data/` resource is tracked in the private source tree so both private and public fresh clones reproduce it without a local-state copy seam. Codex, Claude Code, and OMP wakeup workers are required source and staged-bundle resources: public app-only installs ship them, release verification rejects any omission, and one shared runtime discovers the local Node/CLI chain without trusting Finder's reduced `PATH`. The public source mirror and notarized DMG/Sparkle GitHub Releases are live; every new release still requires an exact source-matched artifact and untouched fresh-VM launch proof before it replaces the prior tested baseline. |
 
 ## Living Fabric Convergence
 

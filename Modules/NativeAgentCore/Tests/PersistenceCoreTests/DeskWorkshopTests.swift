@@ -392,6 +392,73 @@ struct DeskWorkshopTests {
         #expect(row.pursuit?.lastWorkedAt != nil)
     }
 
+    @Test func typedGoalSettlementRoundTripsAndCASClosesOnlyExactReservation() async throws {
+        let root = tmpRoot(); defer { try? FileManager.default.removeItem(at: root) }
+        let store = SwiftNativeDeskStore(dataRoot: root)
+        let pursuit = try await store.openPursuit(
+            project: "na", title: "P", pursuit: validPursuit(11)
+        )
+        let reservationID = try await store.reserveWorkSession(
+            pursuit.handle, day: "2026-08-16", slot: "am"
+        )
+        _ = try await store.completeWorkSession(
+            pursuit.handle,
+            reservationId: reservationID,
+            receipt: "[completed] verified result",
+            disposition: .goalSatisfied,
+            artifactRefs: ["final/report.md"]
+        )
+        let settledState = try await store.liveState()
+        let settled = try #require(settledState.items.first { $0.handle == pursuit.handle })
+        let reservation = try #require(settled.pursuit?.reservations.first)
+        #expect(reservation.disposition == .goalSatisfied)
+        #expect(reservation.artifactRefs == ["final/report.md"])
+
+        let wrongClose = try await store.closePursuitIfGoalSatisfied(
+            pursuit.handle,
+            reservationId: "wrong-reservation",
+            expectedUpdatedAt: settled.updatedAt,
+            outcomeSummary: "must not close"
+        )
+        #expect(wrongClose == false)
+        let exactClose = try await store.closePursuitIfGoalSatisfied(
+            pursuit.handle,
+            reservationId: reservationID,
+            expectedUpdatedAt: settled.updatedAt,
+            outcomeSummary: "verified result"
+        )
+        #expect(exactClose == true)
+        let finalState = try await store.liveState()
+        #expect(finalState.items.first { $0.handle == pursuit.handle }?.status == .done)
+    }
+
+    @Test func progressDispositionCannotClosePursuitEvenWithMatchingCAS() async throws {
+        let root = tmpRoot(); defer { try? FileManager.default.removeItem(at: root) }
+        let store = SwiftNativeDeskStore(dataRoot: root)
+        let pursuit = try await store.openPursuit(
+            project: "na", title: "P", pursuit: validPursuit(12)
+        )
+        let reservationID = try await store.reserveWorkSession(
+            pursuit.handle, day: "2026-08-16", slot: "am"
+        )
+        _ = try await store.completeWorkSession(
+            pursuit.handle,
+            reservationId: reservationID,
+            receipt: "made progress",
+            disposition: .progress,
+            artifactRefs: ["notes.md"]
+        )
+        let state = try await store.liveState()
+        let item = try #require(state.items.first { $0.handle == pursuit.handle })
+        let closed = try await store.closePursuitIfGoalSatisfied(
+            pursuit.handle,
+            reservationId: reservationID,
+            expectedUpdatedAt: item.updatedAt,
+            outcomeSummary: "prose says done"
+        )
+        #expect(closed == false)
+    }
+
     @Test func reserveRefusedOnNonPursuit() async throws {
         let root = tmpRoot(); defer { try? FileManager.default.removeItem(at: root) }
         let store = SwiftNativeDeskStore(dataRoot: root)

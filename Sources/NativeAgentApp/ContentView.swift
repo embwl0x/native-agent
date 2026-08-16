@@ -772,10 +772,6 @@ enum NativeScreenCapture {
         return context.makeImage() ?? source
     }
 
-    static func capturePNGBase64() async throws -> (base64: String, byteSize: Int) {
-        let capture = try await captureImageBase64()
-        return (capture.base64, capture.byteSize)
-    }
 }
 
 // PATCH-2026-05-06: multimodal-ui Sprint 3 — ChatView extended with voice, image, file, screen capture

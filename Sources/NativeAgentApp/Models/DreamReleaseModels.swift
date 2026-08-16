@@ -66,6 +66,8 @@ struct BackupRestoreResult: Codable, Hashable {
     var id: String
     var restored: [String]
     var restoredAt: String
+    var requiresRestart: Bool = false
+    var safetyBackupId: String? = nil
 }
 
 struct ConnectorRecord: Identifiable, Codable, Hashable {

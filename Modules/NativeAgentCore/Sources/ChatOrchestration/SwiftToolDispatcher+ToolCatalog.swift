@@ -74,7 +74,8 @@ extension SwiftToolDispatcher {
         "google_calendar_status", "google_calendar_list",
         "notion_status", "notion_search", "notion_read_page",
         // GitHub — PAT-backed tools. Repo visibility writes are confirm-gated.
-        "github_status", "github_list_repos", "github_list_issues",
+        "github_status", "github_list_repos", "github_list_notifications", "github_get_repository",
+        "github_read_repository_content", "github_list_commits", "github_list_issues",
         "github_search", "github_list_pull_requests", "github_get_issue",
         "github_get_pull_request", "github_pull_request_files", "github_pull_request_activity",
         "github_discover_tracking", "github_project_digest", "github_mutate",
@@ -186,7 +187,7 @@ extension SwiftToolDispatcher {
     /// a SYSTEM permission it reports in its result, not a policy tier, exactly
     /// as the AX reads report the Accessibility grant.
     static let fullMacAccessibilityReadToolNames: [String] = [
-        "mac_ax_status", "mac_ax_tree", "mac_ax_find", "mac_view",
+        "mac_ax_status", "mac_ax_tree", "mac_ax_find", "mac_view", "mac_attention",
     ]
 
     /// W7 — `mac_nudge`, the one-mouse-move tool. Its own list because it is

@@ -53,7 +53,6 @@ public actor CognitiveSubstrate {
     /// `resolveStandingView(approved:)` (User) activates one. Persisted one artifact per view
     /// (kind "standing_view"), restored on boot. See CognitiveSubstrate+StandingViews.swift.
     var standingViews: [UUID: CognitiveStandingView] = [:]
-    private var identityProposals: [UUID: CognitiveIdentityProposal] = [:]
     private var developmentalTimeline: [UUID: CognitiveDevelopmentalTimelineEvent] = [:]
     private var replayEvidenceIds: Set<String> = []
     var reflectionReceipts: [UUID: CognitiveReflectionReceipt] = [:]
@@ -289,6 +288,23 @@ public actor CognitiveSubstrate {
         landingScores[id]?.score ?? 0
     }
 
+    /// Immutable Sound-ranking inputs for one frozen capsule epoch.
+    func soundLandingScoreSnapshot() -> [UUID: Double] {
+        landingScores.mapValues(\.score)
+    }
+
+    /// Presentation-only cadence state captured beside a frozen cognition read.
+    func capsulePresentationStateSnapshot() -> CognitiveCapsulePresentationState {
+        CognitiveCapsulePresentationState(
+            fingerprintFamily: fingerprintFamilyRun?.family,
+            fingerprintCount: fingerprintFamilyRun?.count ?? 0,
+            fingerprintLastSurfacedAt: fingerprintFamilyRun?.lastSurfacedAt,
+            lastLiveCapsuleAt: lastLiveCapsuleAt,
+            lastSessionBridgeAt: lastSessionBridgeAt,
+            negativeSoundEchoRun: negativeSoundEchoRun
+        )
+    }
+
     /// Stamp a bounded landing verdict on the node a completion produced.
     func stampLandingScore(_ score: Double, forNodeId id: UUID, at now: Date) {
         let bounded = Self.clampSigned(score)
@@ -443,6 +459,21 @@ public actor CognitiveSubstrate {
         // attention publication, and persistence untouched on replay.
         guard !field.hasSeenEvent(event) else { return false }
         let now = dependencies.now()
+        // One deterministic scan bundle per admitted user turn. This stays
+        // inside the actor's await-free transition and owns no state: it only
+        // prevents affect, semantic appraisal, and retrospective landing from
+        // rescanning the same already-loaded text and standing views.
+        let buildsAffectBundle = configuration.affectEnabled
+            && event.turnKind.contributesToLivedState
+        let userAppraisal = buildsAffectBundle && Self.isUserAuthored(event.kind)
+            ? conversationalAppraisal(in: event.summary)
+            : AffectAppraisal()
+        // Semantic relationship stake historically samples this lexical cue
+        // for every lived event, while affect consumes it only for user turns.
+        // Compute it once without changing either caller's gating.
+        let turnWarmthBoost = (buildsAffectBundle || event.kind == .userMessageReceived)
+            ? relationalWarmthBoost(in: event.summary)
+            : 0
         let evicted = evictSpentVerificationNodes(before: event, at: now)
         let ingestOutcome = field.ingest(
             event,
@@ -459,7 +490,7 @@ public actor CognitiveSubstrate {
             lastUserPresenceAt = now
             // Anchor the ambient warmth floor to genuinely warm moments only, so a pure-work
             // session followed by absence never manufactures affect-warmth (it stays content-driven).
-            if relationalWarmthBoost(in: event.summary) > 0 { lastWarmPresenceAt = now }
+            if turnWarmthBoost > 0 { lastWarmPresenceAt = now }
         }
         // Affect apply + emotional-tag stamp run as ONE await-free actor segment right
         // after field.ingest above, so no reentrant ingest (during a later persistence
@@ -468,7 +499,11 @@ public actor CognitiveSubstrate {
         // synchronous; the affect persistence that updateAffectFromEvent used to do is
         // moved below, after the state is already consistent.
         let updatedAffect = contributesToLivedState
-            ? applyAffectFromEvent(event)
+            ? applyAffectFromEvent(
+                event,
+                precomputedAppraisal: userAppraisal,
+                precomputedWarmthBoost: turnWarmthBoost
+            )
             : affect
         // Stamp the tag from the affect this event just produced ("how she feels having
         // just experienced it", Wave A). Gated on affect: no affect, no live feeling.
@@ -479,19 +514,23 @@ public actor CognitiveSubstrate {
             // Compute the conversational appraisal ONCE and thread it through both
             // consumers — semanticAppraisal and emotionTag each used to run the
             // heavy ~10-pass lexicon scan on the identical summary (hot-path dedup).
-            let precomputedAppraisal = Self.isUserAuthored(event.kind)
-                ? conversationalAppraisal(in: event.summary)
-                : AffectAppraisal()
+            // Concerns depend on the post-event affect epoch, so derive them
+            // once here after applyAffectFromEvent rather than before it.
+            let standingViewConcerns = standingViews.values.contains { $0.status == .active }
+                ? appraisalConcerns()
+                : []
             let semantic = semanticAppraisal(
                 for: event,
                 post: updatedAffect,
-                precomputedAppraisal: precomputedAppraisal
+                precomputedAppraisal: userAppraisal,
+                precomputedWarmthBoost: turnWarmthBoost,
+                precomputedStandingViewConcerns: standingViewConcerns
             )
             let tag = emotionTag(
                 for: event,
                 affect: updatedAffect,
                 semantic: semantic,
-                precomputedAppraisal: precomputedAppraisal
+                precomputedAppraisal: userAppraisal
             )
             field.stampEmotionTag(
                 key: ingestOutcome.key,
@@ -506,7 +545,12 @@ public actor CognitiveSubstrate {
         // reentrant ingest suspending in between could evict/recreate that node
         // or swap the slot underneath us. Pure, synchronous, no suspension.
         if contributesToLivedState, configuration.affectEnabled {
-            reconsolidatePendingCompletion(with: event, outcome: ingestOutcome, now: now)
+            reconsolidatePendingCompletion(
+                with: event,
+                outcome: ingestOutcome,
+                now: now,
+                precomputedAppraisal: userAppraisal
+            )
         }
         // Publish before persistence awaits. The owner transition is already
         // internally consistent, and a slow SQLite write must not delay the
@@ -588,7 +632,6 @@ public actor CognitiveSubstrate {
         episodes.removeAll(keepingCapacity: false)
         schemaProposals.removeAll(keepingCapacity: false)
         standingViews.removeAll(keepingCapacity: false)
-        identityProposals.removeAll(keepingCapacity: false)
         developmentalTimeline.removeAll(keepingCapacity: false)
         replayEvidenceIds.removeAll(keepingCapacity: false)
         reflectionReceipts.removeAll(keepingCapacity: false)
@@ -707,7 +750,6 @@ public actor CognitiveSubstrate {
                 "thoughtSeedCount": .int(Int64(projectedThoughtSeeds(at: dependencies.now()).count)),
                 "episodeCount": .int(Int64(episodes.count)),
                 "schemaProposalCount": .int(Int64(schemaProposals.count)),
-                "identityProposalCount": .int(Int64(identityProposals.count)),
                 "timelineCount": .int(Int64(developmentalTimeline.count)),
                 "reflectionCount": .int(Int64(reflectionReceipts.count)),
                 "experimentCount": .int(Int64(experimentResults.count)),
@@ -735,7 +777,6 @@ public actor CognitiveSubstrate {
             CognitiveArtifactFamilyLoad(key: "episode", kindPrefix: "episode", limit: 120),
             CognitiveArtifactFamilyLoad(key: "schema_proposal", kindPrefix: "schema_proposal", limit: 120),
             CognitiveArtifactFamilyLoad(key: "standing_view", kindPrefix: "standing_view", limit: 60),
-            CognitiveArtifactFamilyLoad(key: "identity_proposal", kindPrefix: "identity_proposal", limit: 120),
             CognitiveArtifactFamilyLoad(
                 key: "developmental_timeline",
                 kindPrefix: "developmental_timeline",
@@ -810,12 +851,6 @@ public actor CognitiveSubstrate {
                 && CognitiveStandingView.Status(rawValue: status) != nil
                 && dateValue(object["createdAt"]) != nil
                 && dateValue(object["updatedAt"]) != nil
-        case "identity_proposal":
-            guard let status = stringValue(object["status"]) else { return false }
-            return uuidValue(object["id"]) != nil
-                && stringValue(object["claim"]) != nil
-                && CognitiveIdentityProposalStatus(rawValue: status) != nil
-                && dateValue(object["createdAt"]) != nil
         case "developmental_timeline":
             guard let kind = stringValue(object["kind"]) else { return false }
             return uuidValue(object["id"]) != nil
@@ -865,7 +900,6 @@ public actor CognitiveSubstrate {
         restoreEpisodes(from: payloads("episode"))
         restoreSchemaProposals(from: payloads("schema_proposal"))
         let clampedStandingViewIds = restoreStandingViews(from: payloads("standing_view"))
-        restoreIdentityProposals(from: payloads("identity_proposal"))
         restoreDevelopmentalTimeline(from: payloads("developmental_timeline"))
         restoreReflectionReceipts(from: payloads("reflection_receipt"))
         restoreExperimentResults(from: payloads("experiment"))
@@ -1158,110 +1192,6 @@ public actor CognitiveSubstrate {
         }
     }
 
-    public func groundExternalContext(
-        query: String,
-        memory: (any CognitiveMemoryReading)? = nil,
-        knowledgeGraph: (any CognitiveKnowledgeGraphReading)? = nil,
-        limit: Int = 5
-    ) async -> CognitiveExternalGroundingResult {
-        guard configuration.enabled else {
-            return CognitiveExternalGroundingResult(query: "", notes: ["disabled"])
-        }
-        let trimmed = bounded(query.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 240)
-        guard !trimmed.isEmpty else {
-            return CognitiveExternalGroundingResult(query: "", notes: ["empty-query"])
-        }
-        let cappedLimit = max(1, min(10, limit))
-        var notes: [String] = []
-        let memoryHits: [CognitiveExternalReference]
-        if let memory {
-            do {
-                memoryHits = try await memory.recallMemory(query: trimmed, limit: cappedLimit)
-                    .prefix(cappedLimit)
-                    .map { boundedExternalReference($0) }
-            } catch {
-                memoryHits = []
-                notes.append("memory-read-failed")
-            }
-        } else {
-            memoryHits = []
-            notes.append("memory-reader-unavailable")
-        }
-
-        let graphHits: [CognitiveExternalReference]
-        if let knowledgeGraph {
-            do {
-                graphHits = try await knowledgeGraph.searchKnowledgeGraph(query: trimmed, limit: cappedLimit)
-                    .prefix(cappedLimit)
-                    .map { boundedExternalReference($0) }
-            } catch {
-                graphHits = []
-                notes.append("knowledge-graph-read-failed")
-            }
-        } else {
-            graphHits = []
-            notes.append("knowledge-graph-reader-unavailable")
-        }
-
-        if !memoryHits.isEmpty || !graphHits.isEmpty {
-            await recordReceipt(
-                kind: "external_grounding",
-                payload: .object([
-                    "query": .string(trimmed),
-                    "memoryHitCount": .int(Int64(memoryHits.count)),
-                    "graphHitCount": .int(Int64(graphHits.count)),
-                ])
-            )
-        }
-        return CognitiveExternalGroundingResult(
-            query: trimmed,
-            memoryHits: memoryHits,
-            graphHits: graphHits,
-            notes: notes.isEmpty ? ["read-only"] : notes
-        )
-    }
-
-    public func makeMemoryProposalCandidate(
-        text: String,
-        source: String = "cognitive_substrate",
-        confidence: Double = 0.5,
-        kind: String = "cognitive_proposal",
-        evidenceNodeIds: [UUID] = []
-    ) async -> CognitiveMemoryProposalCandidate? {
-        // Gated on `enabled` alone since R8c removed `assimilationEnabled`
-        // (production always set that flag = enabled, so live behavior is
-        // unchanged; hand-built partial presets are now proposal-capable —
-        // deliberate: proposals are quality-gated below and approval-mediated
-        // downstream, never auto-applied).
-        guard configuration.enabled else { return nil }
-        let trimmed = bounded(text.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 500)
-        guard !trimmed.isEmpty else { return nil }
-        guard MemoryCandidateQuality.isDurableCandidate(text: trimmed, source: source, kind: kind) else { return nil }
-        let candidate = CognitiveMemoryProposalCandidate(
-            id: dependencies.makeUUID(),
-            text: trimmed,
-            source: bounded(source, maxCharacters: 120),
-            confidence: confidence,
-            kind: bounded(kind, maxCharacters: 80),
-            evidenceNodeIds: unique(evidenceNodeIds)
-        )
-        await persistArtifact(
-            kind: "memory_proposal_candidate",
-            id: candidate.id,
-            status: "candidate",
-            score: candidate.confidence,
-            payload: candidate.toJSON()
-        )
-        return candidate
-    }
-
-    public func recordMemoryProposalStage(_ receipt: CognitiveMemoryProposalStageReceipt) async {
-        await recordReceipt(
-            kind: "memory_proposal_stage",
-            payload: receipt.toJSON()
-        )
-    }
-
     // Agent's subconscious is for feelings / emotions / views / continuity — NOT a task
     // tracker (User, 2026-06-30). The commitment/prediction extraction machinery that once
     // ran here was removed in R8c (2026-07-01); the vestigial assimilate() no-op seam and
@@ -1290,39 +1220,6 @@ public actor CognitiveSubstrate {
         return episode
     }
 
-    @discardableResult
-    public func proposeIdentity(
-        claim: String,
-        evidenceNodeIds: [UUID] = []
-    ) async -> CognitiveIdentityProposal? {
-        await waitForMaintenanceTransition()
-        guard configuration.enabled, configuration.replayEnabled else { return nil }
-        let evidence = unique(evidenceNodeIds)
-        guard evidence.count >= 2 else { return nil }
-        let trimmed = bounded(claim.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 240)
-        guard !trimmed.isEmpty else { return nil }
-        let proposal = CognitiveIdentityProposal(
-            id: dependencies.makeUUID(),
-            claim: trimmed,
-            evidenceCount: evidence.count,
-            status: .proposed,
-            createdAt: dependencies.now(),
-            evidenceNodeIds: evidence
-        )
-        identityProposals[proposal.id] = proposal
-        enforceIdentityProposalCap()
-        await persistArtifact(kind: "identity_proposal", id: proposal.id, status: proposal.status.rawValue, score: min(1, Double(evidence.count) / 5), payload: proposal.toJSON())
-        _ = await recordTimelineEvent(
-            kind: .identityProposal,
-            title: "Identity proposal",
-            summary: proposal.claim,
-            artifactId: proposal.id,
-            lineageId: "identity:\(proposal.id.uuidString)",
-            externalEvidenceIds: proposal.evidenceNodeIds.map { "node:\($0.uuidString)" }
-        )
-        return proposal
-    }
-
     public func episodeSnapshot() async -> [CognitiveEpisodeReference] {
         episodes.values.sorted { lhs, rhs in
             if lhs.occurredAt != rhs.occurredAt { return lhs.occurredAt > rhs.occurredAt }
@@ -1332,13 +1229,6 @@ public actor CognitiveSubstrate {
 
     public func schemaProposalSnapshot() async -> [CognitiveSchemaProposal] {
         schemaProposals.values.sorted { lhs, rhs in
-            if lhs.createdAt != rhs.createdAt { return lhs.createdAt > rhs.createdAt }
-            return lhs.id.uuidString < rhs.id.uuidString
-        }
-    }
-
-    public func identityProposalSnapshot() async -> [CognitiveIdentityProposal] {
-        identityProposals.values.sorted { lhs, rhs in
             if lhs.createdAt != rhs.createdAt { return lhs.createdAt > rhs.createdAt }
             return lhs.id.uuidString < rhs.id.uuidString
         }
@@ -1357,54 +1247,13 @@ public actor CognitiveSubstrate {
         id: UUID,
         accepted: Bool
     ) async -> CognitiveSchemaProposal? {
-        await waitForMaintenanceTransition()
-        guard configuration.enabled, configuration.replayEnabled,
-              var proposal = schemaProposals[id] else { return nil }
-        proposal.status = accepted ? .accepted : .rejected
-        schemaProposals[id] = proposal
-        await persistArtifact(
-            kind: "schema_proposal",
-            id: proposal.id,
-            status: proposal.status.rawValue,
-            score: accepted ? proposal.confidence : 0,
-            payload: proposal.toJSON()
-        )
-        _ = await recordTimelineEvent(
-            kind: .proposalResolution,
-            title: "Schema proposal \(proposal.status.rawValue)",
-            summary: proposal.body,
-            artifactId: proposal.id,
-            lineageId: proposal.lineageId,
-            externalEvidenceIds: proposal.externalEvidenceIds
-        )
-        return proposal
-    }
-
-    public func resolveIdentityProposal(
-        id: UUID,
-        accepted: Bool
-    ) async -> CognitiveIdentityProposal? {
-        await waitForMaintenanceTransition()
-        guard configuration.enabled, configuration.replayEnabled,
-              var proposal = identityProposals[id] else { return nil }
-        proposal.status = accepted ? .accepted : .rejected
-        identityProposals[id] = proposal
-        await persistArtifact(
-            kind: "identity_proposal",
-            id: proposal.id,
-            status: proposal.status.rawValue,
-            score: accepted ? min(1, Double(proposal.evidenceCount) / 5) : 0,
-            payload: proposal.toJSON()
-        )
-        _ = await recordTimelineEvent(
-            kind: .proposalResolution,
-            title: "Identity proposal \(proposal.status.rawValue)",
-            summary: proposal.claim,
-            artifactId: proposal.id,
-            lineageId: "identity:\(proposal.id.uuidString)",
-            externalEvidenceIds: proposal.evidenceNodeIds.map { "node:\($0.uuidString)" }
-        )
-        return proposal
+        // Compatibility no-op for older callers. These rows mirror canonical
+        // REM status and never owned an association-model effect. Review must
+        // happen through the REM approval path, which writes GROWTH and then
+        // returns here through replay integration.
+        _ = id
+        _ = accepted
+        return nil
     }
 
     func iso8601String(_ date: Date) -> String {
@@ -1520,7 +1369,6 @@ public actor CognitiveSubstrate {
                 "workspaceCount": .int(Int64(summary.workspaceCount)),
                 "thoughtSeedCount": .int(Int64(summary.thoughtSeedCount)),
                 "episodeCount": .int(Int64(summary.episodeCount)),
-                "identityProposalCount": .int(Int64(summary.identityProposalCount)),
                 "reflectionCount": .int(Int64(summary.reflectionCount)),
             ]),
             "facultyMeasurements": .array(measurements.map { $0.toJSON() }),
@@ -1543,7 +1391,6 @@ public actor CognitiveSubstrate {
                 workspaceCount: 0,
                 thoughtSeedCount: 0,
                 episodeCount: 0,
-                identityProposalCount: 0,
                 reflectionCount: 0,
                 affect: currentAffect,
                 ablations: ablations
@@ -1558,7 +1405,6 @@ public actor CognitiveSubstrate {
             workspaceCount: workspaceCount,
             thoughtSeedCount: activeThoughtSeeds.count,
             episodeCount: episodes.count,
-            identityProposalCount: identityProposals.count,
             reflectionCount: reflectionReceipts.count,
             affect: currentAffect,
             ablations: ablations
@@ -1664,28 +1510,6 @@ public actor CognitiveSubstrate {
         guard trimmed.lowercased().hasPrefix(prefix.lowercased()) else { return trimmed }
         return String(trimmed.dropFirst(prefix.count))
             .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private func boundedExternalReference(_ reference: CognitiveExternalReference) -> CognitiveExternalReference {
-        var metadata: [String: JSONValue] = [:]
-        for key in reference.metadata.keys.sorted().prefix(configuration.maximumMetadataKeys) {
-            guard let value = reference.metadata[key] else { continue }
-            let boundedKey = bounded(key, maxCharacters: 80)
-            metadata[boundedKey] = JSONValueBounding.bounded(
-                value,
-                bounds: substrateMetadataBounds,
-                redactSecrets: true,
-                keyPath: boundedKey.lowercased()
-            )
-        }
-        return CognitiveExternalReference(
-            id: bounded(reference.id, maxCharacters: 160),
-            source: bounded(reference.source, maxCharacters: 80),
-            title: bounded(reference.title, maxCharacters: 160),
-            summary: bounded(reference.summary, maxCharacters: 500),
-            score: reference.score,
-            metadata: metadata
-        )
     }
 
     /// Bounds for the shared `JSONValueBounding` on the substrate metadata path.
@@ -1849,13 +1673,7 @@ public actor CognitiveSubstrate {
                 "reflectionSurfaceConfigured": configuration.reflectionSurface.isEmpty ? 0 : 1,
             ]
         case .selfModelAccuracy:
-            let accepted = identityProposals.values.filter { $0.status == .accepted }.count
-            let rejected = identityProposals.values.filter { $0.status == .rejected }.count
-            let proposed = identityProposals.values.filter { $0.status == .proposed }.count
             return [
-                "acceptedIdentity": Double(accepted),
-                "rejectedIdentity": Double(rejected),
-                "proposedIdentity": Double(proposed),
                 "schemaReviewItems": Double(schemaProposals.count),
             ]
         case .ablation:
@@ -2105,28 +1923,6 @@ public actor CognitiveSubstrate {
         }
     }
 
-    private func restoreIdentityProposals(from payloads: [JSONValue]) {
-        identityProposals.removeAll(keepingCapacity: true)
-        for payload in payloads {
-            guard case .object(let object) = payload,
-                  let id = uuidValue(object["id"]),
-                  let claim = stringValue(object["claim"]),
-                  let statusRaw = stringValue(object["status"]),
-                  let status = CognitiveIdentityProposalStatus(rawValue: statusRaw),
-                  let createdAt = dateValue(object["createdAt"]) else {
-                continue
-            }
-            identityProposals[id] = CognitiveIdentityProposal(
-                id: id,
-                claim: claim,
-                evidenceCount: intValue(object["evidenceCount"]) ?? 0,
-                status: status,
-                createdAt: createdAt,
-                evidenceNodeIds: uuidArrayValue(object["evidenceNodeIds"])
-            )
-        }
-    }
-
     private func restoreDevelopmentalTimeline(from payloads: [JSONValue]) {
         developmentalTimeline.removeAll(keepingCapacity: true)
         for payload in payloads {
@@ -2347,7 +2143,8 @@ public actor CognitiveSubstrate {
     private func reconsolidatePendingCompletion(
         with event: CognitiveEvent,
         outcome: ContinuityField.IngestOutcome?,
-        now: Date
+        now: Date,
+        precomputedAppraisal: AffectAppraisal? = nil
     ) {
         if let pending = pendingCompletion {
             let age = now.timeIntervalSince(pending.recordedAt)
@@ -2370,7 +2167,7 @@ public actor CognitiveSubstrate {
            let pendingSession = pending.sessionId,
            eventSession == pendingSession {
             pendingCompletion = nil
-            let reaction = conversationalAppraisal(in: event.summary).valence
+            let reaction = (precomputedAppraisal ?? conversationalAppraisal(in: event.summary)).valence
             // A turn cannot be the reaction to ITSELF. Both kinds map to the
             // .conversationFocus node kind, so the two turns share a field key unless
             // the subjects differ per-turn (which ChatOrchestration mints — audit C2).
@@ -2415,8 +2212,18 @@ public actor CognitiveSubstrate {
             // at capsule compile gets paired with what really happened. It writes
             // a JSONL row and returns; nothing here reads the envelope back into
             // the turn, and no flag exists that could.
+            let replyCharacters: Int = {
+                if case .int(let value)? = event.metadata[
+                    Self.replyCharacterCountMetadataKey
+                ], value >= 0 {
+                    return Int(clamping: value)
+                }
+                // Backward-compatible fallback for direct library callers and
+                // older persisted events that predate the count metadata.
+                return event.summary.count
+            }()
             consumeDeliveryEnvelopeTelemetry(
-                replyCharacters: event.summary.count,
+                replyCharacters: replyCharacters,
                 sessionId: event.sessionId,
                 at: now
             )
@@ -2464,10 +2271,6 @@ extension CognitiveSubstrate {
 
     func enforceSchemaProposalCap() {
         evictOldest(from: &schemaProposals, cap: 120) { $0.createdAt }
-    }
-
-    func enforceIdentityProposalCap() {
-        evictOldest(from: &identityProposals, cap: 120) { $0.createdAt }
     }
 
     func enforceDevelopmentalTimelineCap() {

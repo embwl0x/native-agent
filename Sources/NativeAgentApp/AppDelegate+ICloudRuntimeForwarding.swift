@@ -574,23 +574,46 @@ extension AppDelegate {
             "createdAt": .string(nowISO),
             "updatedAt": .string(nowISO),
             "source": .string("ios"),
+            "sourceKey": .string(NativeAgentICloudBridgeConstants.mobileSourceKey),
             "archived": .bool(false),
             "messageCount": .int(0),
         ]
         let persistence = SwiftNativePersistenceCore()
-        try await persistence.withFileLock(sessionsPath) {
+        let changed = try await persistence.withFileLock(sessionsPath) { () async throws -> Bool in
             let parent = sessionsPath.deletingLastPathComponent()
             try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
             var sessions = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
-            let alreadyPresent = sessions.contains { row in
+            if let index = sessions.firstIndex(where: { row in
                 guard case .string(let id)? = row["id"] else { return false }
                 return id == sessionID
+            }) {
+                let existingSourceKey: String? = {
+                    guard case .string(let value)? = sessions[index]["sourceKey"] else { return nil }
+                    return value
+                }()
+                guard !NativeAgentICloudBridgeConstants.isMobileSourceKey(existingSourceKey) else {
+                    return false
+                }
+                guard case .string(let existingSource)? = sessions[index]["source"],
+                      existingSource.lowercased() == "ios",
+                      (existingSourceKey ?? "").isEmpty else { return false }
+                // Compatibility migration for sessions authored by older iOS
+                // builds, which wrote only `source: ios`.
+                sessions[index]["sourceKey"] = .string(NativeAgentICloudBridgeConstants.mobileSourceKey)
+                let out = try ChatSessionIndexFile.serializedData(for: sessions)
+                try out.write(to: sessionsPath, options: .atomic)
+                return true
             }
-            if alreadyPresent { return }
             sessions.insert(entry, at: 0)
             let out = try ChatSessionIndexFile.serializedData(for: sessions)
             try out.write(to: sessionsPath, options: .atomic)
             _ = try? ChatSessionRetention.enforce(dataRoot: root, now: Date())
+            return true
+        }
+        if changed {
+            await MainActor.run {
+                MacSyncEngine.shared.requestChatSnapshotPublication(includeTranscripts: false)
+            }
         }
     }
 }

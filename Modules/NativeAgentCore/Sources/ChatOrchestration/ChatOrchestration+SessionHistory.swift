@@ -38,6 +38,11 @@ public struct SessionHistoryReadStats: Sendable, Equatable {
     public let bytesRead: Int64
     public let linesRead: Int
     public let decodedCount: Int
+    /// Rows present in the sampled bytes that could not be decoded as JSON.
+    /// They remain on disk; this is visibility, never an automatic repair.
+    public let malformedRowCount: Int
+    /// Valid JSON rows that are not usable chat message objects.
+    public let invalidShapeRowCount: Int
     public let returnedCount: Int
     /// L4-04: rows skipped because they belong to the CURRENT run. This is
     /// the number that separates "fresh session, nothing to load" from
@@ -51,6 +56,8 @@ public struct SessionHistoryReadStats: Sendable, Equatable {
         bytesRead: Int64 = 0,
         linesRead: Int = 0,
         decodedCount: Int = 0,
+        malformedRowCount: Int = 0,
+        invalidShapeRowCount: Int = 0,
         excludedByRunId: Int = 0,
         returnedCount: Int = 0,
         truncated: Bool = false
@@ -60,6 +67,8 @@ public struct SessionHistoryReadStats: Sendable, Equatable {
         self.bytesRead = bytesRead
         self.linesRead = linesRead
         self.decodedCount = decodedCount
+        self.malformedRowCount = malformedRowCount
+        self.invalidShapeRowCount = invalidShapeRowCount
         self.excludedByRunId = excludedByRunId
         self.returnedCount = returnedCount
         self.truncated = truncated
@@ -233,6 +242,8 @@ public actor SessionHistoryReader {
                 bytesRead: bytesRead,
                 linesRead: lines.count,
                 decodedCount: decodedCount,
+                malformedRowCount: decodeResult.malformedRowCount,
+                invalidShapeRowCount: decodeResult.invalidShapeRowCount,
                 excludedByRunId: decodeResult.excludedByRunId,
                 returnedCount: msgs.count,
                 truncated: truncated
@@ -319,6 +330,8 @@ public actor SessionHistoryReader {
                 bytesRead: head.bytesRead + tail.bytesRead,
                 linesRead: head.lines.count + tail.lines.count,
                 decodedCount: decoded.count,
+                malformedRowCount: decodeResult.malformedRowCount,
+                invalidShapeRowCount: decodeResult.invalidShapeRowCount,
                 excludedByRunId: decodeResult.excludedByRunId,
                 returnedCount: out.count,
                 truncated: head.truncated || tail.truncated || decoded.count != out.count
@@ -390,6 +403,8 @@ public actor SessionHistoryReader {
                 bytesRead: lineRead.bytesRead,
                 linesRead: lineRead.lines.count,
                 decodedCount: decoded.count,
+                malformedRowCount: decodeResult.malformedRowCount,
+                invalidShapeRowCount: decodeResult.invalidShapeRowCount,
                 excludedByRunId: decodeResult.excludedByRunId,
                 returnedCount: out.count,
                 truncated: lineRead.truncated || decoded.count != out.count
@@ -591,16 +606,29 @@ public actor SessionHistoryReader {
     private nonisolated static func decodeMessages(
         from lines: [String],
         excludingRunId: String?
-    ) -> (messages: [ChatMessage], excludedByRunId: Int) {
+    ) -> (
+        messages: [ChatMessage],
+        excludedByRunId: Int,
+        malformedRowCount: Int,
+        invalidShapeRowCount: Int
+    ) {
         var msgs: [ChatMessage] = []
         var excludedCount = 0
+        var malformedCount = 0
+        var invalidShapeCount = 0
         msgs.reserveCapacity(lines.count)
         for line in lines {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty { continue }
-            guard let lineData = trimmed.data(using: .utf8) else { continue }
-            guard let parsed = try? JSONValue.parse(lineData) else { continue }
-            guard case .object(let obj) = parsed else { continue }
+            guard let lineData = trimmed.data(using: .utf8),
+                  let parsed = try? JSONValue.parse(lineData) else {
+                malformedCount += 1
+                continue
+            }
+            guard case .object(let obj) = parsed else {
+                invalidShapeCount += 1
+                continue
+            }
             if let excludingRunId,
                message(parsed, hasRunId: excludingRunId) {
                 excludedCount += 1
@@ -613,7 +641,10 @@ public actor SessionHistoryReader {
             if case .string(let s)? = obj["content"] { content = s }
             if case .string(let s)? = obj["createdAt"] { timestamp = s }
             else if case .string(let s)? = obj["timestamp"] { timestamp = s }
-            guard let role, let content else { continue }
+            guard let role, let content else {
+                invalidShapeCount += 1
+                continue
+            }
             msgs.append(ChatMessage(
                 role: role,
                 content: content,
@@ -621,7 +652,7 @@ public actor SessionHistoryReader {
                 extras: parsed
             ))
         }
-        return (msgs, excludedCount)
+        return (msgs, excludedCount, malformedCount, invalidShapeCount)
     }
 
     private nonisolated static func message(_ value: JSONValue, hasRunId runId: String) -> Bool {
@@ -796,7 +827,11 @@ extension SwiftNativeTurnEngine {
         // renderer sizes flows from `ContextBudgetPolicy.resolve`. An unknown
         // or unresolvable model yields nil and the floor regime, i.e. exactly
         // the pre-policy budgets.
-        let historyWindowTokens = ContextBudgetPolicy.windowTokens(forModel: base.modelId)
+        let historyWindowTokens = ContextBudgetPolicy.windowTokens(
+            forModel: base.modelId,
+            providerID: LLMCallContext.providerId,
+            dataRoot: historyReader.dataRoot
+        )
         let historyBudget = ContextBudgetPolicy.resolve(
             windowTokens: historyWindowTokens,
             surface: surface

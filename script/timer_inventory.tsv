@@ -14,7 +14,8 @@ Modules/NativeAgentCore/Sources/Dispatcher/Actions/FileSystemActions.swift	*	2	t
 Modules/NativeAgentCore/Sources/MCPDispatcher/MCPHTTPTransport.swift	*	1	timeout_retry_deadline	MCPHTTPRetryBackoff
 Modules/NativeAgentCore/Sources/MCPDispatcher/MCPSubprocess+Pool.swift	*	1	event_deadline	MCPSubprocessPool.idleDeadline
 Modules/NativeAgentCore/Sources/MCPDispatcher/MCPSubprocess+Process.swift	*	1	timeout_retry_deadline	MCPSubprocessProcess
-Modules/NativeAgentCore/Sources/MacControl/MacControl+Client.swift	*	4	timeout_retry_deadline	MacControlOperationOwner
+Modules/NativeAgentCore/Sources/MacControl/MacControl+Client.swift	*	5	timeout_retry_deadline	MacControlOperationOwner
+Modules/NativeAgentCore/Sources/MacControl/MacAttention.swift	*	2	event_deadline	MacAttentionSessionStore.expiryAndWaitDeadlines
 Modules/NativeAgentCore/Sources/MacControl/TrustedRemoteEffectNodes.swift	*	2	timeout_retry_deadline	TrustedRemoteEffectNodeProcessDeadline
 Modules/NativeAgentCore/Sources/NativeAgentCore/ProcessTreeReaper.swift	*	1	timeout_retry_deadline	ProcessTreeReaper
 Modules/NativeAgentCore/Sources/MemoryV2/MemoryV2+CloudKit.swift	*	2	external_protocol_poll	MemoryCloudKitTransport
@@ -61,7 +62,8 @@ Sources/NativeAgentApp/MacAppleScriptBridge+Runtime.swift	*	1	timeout_retry_dead
 Sources/NativeAgentApp/MacControlBridge.swift	*	5	timeout_retry_deadline	MacControlBridgeProcessAndConnectionOwner
 Sources/NativeAgentApp/MacIntegrationView.swift	*	1	visible_ui	MacIntegrationUI
 Sources/NativeAgentApp/MacPairingView.swift	*	2	visible_ui	MacPairingUI
-Sources/NativeAgentApp/MacSyncEngine+Lifecycle.swift	*	1	integrity_sweep	MacSyncSnapshotIntegrityFallback
+Sources/NativeAgentApp/MacSyncEngine+Lifecycle.swift	Task.sleep(for: .seconds(15 * 60))	1	integrity_sweep	MacSyncSnapshotIntegrityFallback
+Sources/NativeAgentApp/MacSyncEngine+Lifecycle.swift	Task.sleep(for: .milliseconds(180))	1	event_deadline	MacSyncChatTranscriptCoalescer
 Sources/NativeAgentApp/MacSyncEngine+Storage.swift	*	1	event_deadline	MacSyncArchiveRetentionDeadline
 Sources/NativeAgentApp/MemoryView.swift	*	2	visible_ui	MemoryViewUI
 Sources/NativeAgentApp/MenuBarController.swift	*	1	visible_ui	MenuBarUI
@@ -87,7 +89,7 @@ Sources/NativeAgentApp/NativeOAuthLoopbackCallbackServer.swift	*	1	timeout_retry
 Sources/NativeAgentApp/iCloudBridge.swift	*	2	external_protocol_poll	iCloudBridgeTransport
 iOS/NativeAgentMobile/Sources/ChatStore+ICloudReplies.swift	*	3	external_protocol_poll	MobileICloudReplyTransport
 iOS/NativeAgentMobile/Sources/ChatStore+Typewriter.swift	*	1	visible_ui	MobileTypewriterUI
-iOS/NativeAgentMobile/Sources/ChatView.swift	*	2	visible_ui	MobileChatUI
+iOS/NativeAgentMobile/Sources/ChatView.swift	*	1	visible_ui	MobileChatUI
 iOS/NativeAgentMobile/Sources/ContentView.swift	*	3	visible_ui	MobileContentUI
 iOS/NativeAgentMobile/Sources/Diagnostics/CKLandmine.swift	*	1	external_protocol_poll	MobileCloudKitDiagnostic
 iOS/NativeAgentMobile/Sources/KnowledgeGraphView.swift	*	1	visible_ui	MobileKnowledgeGraphUI
@@ -109,4 +111,3 @@ Sources/NativeAgentApp/TurnInspectorStore.swift	cardsDebounceSeconds	1	visible_u
 Sources/NativeAgentApp/BackgroundLoopsAssembly+TriggerScheduler.swift	UInt64(morningBriefSynthesisTimeout * 1_000_000_000)	1	timeout_retry_deadline	BackgroundLoopsAssembly.withBoundedMorningBriefTurn
 Modules/NativeAgentCore/Sources/ActivityProbeCLI/main.swift	DispatchSource.makeTimerSource(queue: .main)	1	visible_ui	ActivityProbeCLI.runStatusTicker
 Modules/NativeAgentCore/Sources/ActivityWatch/ActivityWatcher.swift	Task.sleep(nanoseconds: 5_000_000_000)	1	timeout_retry_deadline	ActivityWatcher.stopShutdownWatchdog
-Sources/NativeAgentApp/ActivityWatchController.swift	Task.sleep(nanoseconds: 250_000_000)	1	visible_ui	ActivityWatchController.refreshCapturingFlagAfterTeardown

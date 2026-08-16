@@ -7,7 +7,8 @@ import NativeAgentCore
 // execute(job:now:)) kept `running == true` and blocked every later due row for
 // the lifetime of the process. Each job now races its body against a deadline;
 // on timeout the body is cancelled cooperatively, the job is marked failed with
-// an explicit timeout receipt, and the runner CONTINUES to the next due job.
+// an explicit timeout receipt, and the pass STOPS. The runner refuses a new
+// pass until the timed-out body has actually exited.
 //
 // FAIL LOUD, no retry: a timed-out job records status "error" with
 // failureKind == "job_timeout" and a stderr line — it is never silently retried
@@ -36,18 +37,20 @@ extension SchedulerDueJobRunner {
     /// distinct loud timeout receipt.
     ///
     /// Cancellation of the timed-out body: on deadline the body Task is
-    /// `cancel()`ed (cooperative) and ABANDONED — `raceAgainstTimeout` resolves
-    /// on the FIRST of {body, deadline} via an unstructured task + latch and does
-    /// NOT structurally await the loser, so the runner proceeds immediately even
-    /// if the abandoned body ignores cancellation. Every current job kind routes
-    /// through NativeClient's URLSession async calls, which DO honor cancellation,
-    /// so an abandoned body typically unwinds promptly; a body stuck in genuinely
-    /// non-cooperative work (a tight CPU loop / blocking syscall that never checks
-    /// Task.isCancelled) may linger in the background but can no longer block the
-    /// runner or hold `running` true.
+    /// `cancel()`ed cooperatively and the caller-facing race resolves promptly.
+    /// A body-exit hook separately owns its real lifecycle: until that hook
+    /// fires, `inFlightJobBodies` keeps every later scheduler pass quarantined.
+    /// This preserves the deadline without allowing a non-cooperative loser to
+    /// overlap another scheduled effect.
     func executeWithTimeout(job: DueJob, now: Date) async -> JobResult {
         let seconds = Self.jobTimeoutSeconds(forKind: job.kind)
-        let outcome = await raceAgainstTimeout(seconds: seconds) { [self] in
+        inFlightJobBodies += 1
+        let outcome = await raceAgainstTimeout(
+            seconds: seconds,
+            onBodyExit: { [weak self] in
+                Task { await self?.scheduledJobBodyDidExit() }
+            }
+        ) { [self] in
             try await execute(job: job, now: now)
         }
         switch outcome {
@@ -90,6 +93,14 @@ extension SchedulerDueJobRunner {
                 ])
             )
         }
+    }
+
+    private func scheduledJobBodyDidExit() {
+        inFlightJobBodies = max(0, inFlightJobBodies - 1)
+        guard inFlightJobBodies == 0 else { return }
+        let waiters = jobBodyExitWaiters
+        jobBodyExitWaiters.removeAll()
+        waiters.forEach { $0.resume() }
     }
 }
 
@@ -141,10 +152,12 @@ private actor TimeoutRaceLatch<T: Sendable> {
 /// closure.
 func raceAgainstTimeout<T: Sendable>(
     seconds: Double,
+    onBodyExit: @escaping @Sendable () -> Void = {},
     _ operation: @escaping @Sendable () async throws -> T
 ) async -> TimeoutRaceOutcome<T> {
     let latch = TimeoutRaceLatch<T>()
     let bodyTask = Task {
+        defer { onBodyExit() }
         do {
             let value = try await operation()
             await latch.resolve(.value(value))

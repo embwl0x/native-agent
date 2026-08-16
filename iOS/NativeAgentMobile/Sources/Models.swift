@@ -113,62 +113,6 @@ struct WorkshopTaskRecord: Identifiable, Codable, Hashable, Sendable {
 // MultimodalAttachment, ChatSession, RuntimeHealth, RunRecord, MemoryRecord,
 // PersonalityTraits, PersonalityProfile, PersonalityDoc moved to NativeAgentShared.
 
-struct OrganismLivingStatusFile: Codable, Hashable, Sendable {
-    var generatedAt: Date
-    var enabled: Bool
-    var posture: String
-    var bodyLine: String?
-    var behaviorLine: String
-    var needsUser: Bool
-    var needsAttention: Bool?
-    var signalCount: Int
-    var lastSignalAt: Date?
-    var body: OrganismLivingBodyFile
-    var counters: OrganismLivingCountersFile
-    var reflexCandidates: [OrganismLivingReflexCandidateFile]?
-    var standingViewProposals: [OrganismLivingStandingViewProposalFile]?
-}
-
-struct OrganismLivingBodyFile: Codable, Hashable, Sendable {
-    var macAwake: Bool
-    var iPhoneReachable: Bool
-    var providersHealthy: Bool
-    var memoryHealthy: Bool
-    var dreamHealthy: Bool
-    var toolHandsAvailable: Bool
-    var approvalChannelsOpen: Bool
-    var notificationPathHealthy: Bool
-    var resourcePressure: String
-}
-
-struct OrganismLivingCountersFile: Codable, Hashable, Sendable {
-    var fieldNodes: Int
-    var pendingPredictions: Int
-    var dreamRepairs: Int
-    var reflexCandidates: Int
-    var reflexesNeedReview: Int
-    var approvedReflexBiases: Int?
-    var standingViewProposals: Int?
-}
-
-struct OrganismLivingReflexCandidateFile: Codable, Hashable, Sendable, Identifiable {
-    var id: String
-    var pattern: String
-    var trustClass: String
-    var confidence: Double
-    var reviewRequired: Bool
-    var autoActivationAllowed: Bool
-    var approvedAt: Date?
-}
-
-struct OrganismLivingStandingViewProposalFile: Codable, Hashable, Sendable, Identifiable {
-    var id: String
-    var title: String
-    var rationale: String
-    var evidenceIDs: [String]
-    var reviewRequired: Bool
-}
-
 // Note: iOS ChatView.swift defines its own local ChatMessage for display; this Codable version
 // is used for the iCloud snapshot transport layer.
 struct ChatMessageRecord: Identifiable, Codable, Hashable {

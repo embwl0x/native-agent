@@ -21,9 +21,16 @@ extension MacSyncEngine {
     // the "signature" field in the JSON.  Until then all unsigned messages are
     // rejected when signature validation is enforced.
 
-    private var pairingSecret: Data {
+    private func pairingSecret() throws -> Data {
+        guard !pairingSecretRotationInProgress else {
+            throw NSError(
+                domain: "MacSyncEngine.Security",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "pairing key rotation is in progress"]
+            )
+        }
         if let s = _pairingSecret { return s }
-        let s = PairingSecretManager.loadOrGenerateSecret()
+        let s = try PairingSecretManager.loadOrGenerateSecret()
         _pairingSecret = s
         return s
     }
@@ -36,27 +43,52 @@ extension MacSyncEngine {
         _pairingSecret = nil
     }
 
+    /// Close the HMAC boundary before canonical pairing bytes are replaced.
+    /// Inbound validation/signing remains unavailable until `finish` installs
+    /// the exact bytes returned by durable rotation.
+    func beginPairingSecretRotation() {
+        pairingSecretRotationInProgress = true
+        _pairingSecret = nil
+    }
+
+    func finishPairingSecretRotation(with persistedSecret: Data?) {
+        _pairingSecret = persistedSecret
+        pairingSecretRotationInProgress = false
+    }
+
     /// Compute HMAC-SHA256 over `body` using the pairing secret.
-    private func hmacSHA256(body: Data) -> String {
-        let key = SymmetricKey(data: pairingSecret)
+    private func hmacSHA256(body: Data) throws -> String {
+        let key = SymmetricKey(data: try pairingSecret())
         let mac = HMAC<SHA256>.authenticationCode(for: body, using: key)
         return Data(mac).map { String(format: "%02x", $0) }.joined()
     }
 
-    func signedResponse(_ response: [String: String]) -> [String: String] {
+    func signedResponse(_ response: [String: String]) throws -> [String: String] {
         var body = response
         body.removeValue(forKey: "signature")
         guard let canonical = try? JSONSerialization.data(withJSONObject: body, options: [.sortedKeys]) else {
-            return response
+            throw NSError(
+                domain: "MacSyncEngine.Security",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "response could not be canonicalized"]
+            )
         }
-        body["signature"] = hmacSHA256(body: canonical)
+        body["signature"] = try hmacSHA256(body: canonical)
         return body
     }
 
-    func writeRejectedResponseIfNeeded(action: InboxAction, transactionId: String, message: String) async {
-        guard let responsesDir else { return }
-        let responseURL = responsesDir.appendingPathComponent("\(action.msgId).json")
-        guard !FileManager.default.fileExists(atPath: responseURL.path) else { return }
+    @discardableResult
+    func writeRejectedResponseIfNeeded(
+        action: InboxAction,
+        transactionId: String,
+        message: String
+    ) async -> Bool {
+        guard let responsesDir,
+              let responseURL = InboxActionFileBoundary.jsonURL(
+                in: responsesDir,
+                validatedID: action.msgId
+              ) else { return false }
+        guard !FileManager.default.fileExists(atPath: responseURL.path) else { return true }
         let lower = message.lowercased()
         let code: String
         if lower.contains("hmac") || lower.contains("signature wrong") {
@@ -66,7 +98,7 @@ extension MacSyncEngine {
         } else {
             code = "signature_required"
         }
-        let response = signedResponse([
+        guard let response = try? signedResponse([
             "status": "error",
             "ok": "false",
             "code": code,
@@ -75,8 +107,11 @@ extension MacSyncEngine {
             "transactionId": transactionId,
             "action": action.action,
             "createdAt": ISO8601DateFormatter().string(from: Date()),
-        ])
-        guard let responseData = try? JSONEncoder().encode(response) else { return }
+        ]) else {
+            syncError = "Pairing secret unavailable; rejection response was not written."
+            return false
+        }
+        guard let responseData = try? JSONEncoder().encode(response) else { return false }
         let msgId = action.msgId
         // Off-main write, but AWAITED so the kvs signal ordering and caller
         // sequencing are preserved (no fire-and-forget race).
@@ -85,12 +120,14 @@ extension MacSyncEngine {
         }.value
         if let writeError {
             syncError = "Could not write rejection response for \(msgId): \(writeError)"
+            return false
         } else {
             _ = await withCKTimeout("MacSyncEngine.writeRejectedResponse.kvsSignal") {
                 let kvs = NSUbiquitousKeyValueStore.default
                 kvs.set(msgId, forKey: "inbox_response_\(msgId)")
                 return kvs.synchronize()
             }
+            return true
         }
     }
 
@@ -138,15 +175,19 @@ extension MacSyncEngine {
         guard let sig = action.signature else {
             // S.2: write an upgrade-required response so old iOS apps get a clear error
             // instead of timing out waiting for a response that never comes.
-            let responseURL = responsesDir?.appendingPathComponent("\(action.msgId).json")
+            let responseURL = responsesDir.flatMap {
+                InboxActionFileBoundary.jsonURL(in: $0, validatedID: action.msgId)
+            }
             // fix-R9-3 Use [String: String] so iOS's JSONDecoder([String:String]) can parse it.
-            let upgradeResp = signedResponse([
+            guard let upgradeResp = try? signedResponse([
                 "msgId":     action.msgId,
                 "ok":        "false",
                 "error":     "iOS app needs upgrade to enable HMAC signing. Update via App Store / TestFlight.",
                 "code":      "signature_required",
                 "createdAt": ISO8601DateFormatter().string(from: Date()),
-            ])
+            ]) else {
+                return "pairing secret unavailable — could not sign upgrade response"
+            }
             // PATCH-2026-05-08: review-fix-r7 Only set KVS after a successful
             // atomic write. Otherwise old iOS gets pinged but finds no
             // response file, and times out anyway.
@@ -189,7 +230,12 @@ extension MacSyncEngine {
         guard let canonical = try? JSONSerialization.data(withJSONObject: withoutSig, options: [.sortedKeys]) else {
             return "cannot re-serialize for HMAC"
         }
-        let expected = hmacSHA256(body: canonical)
+        let expected: String
+        do {
+            expected = try hmacSHA256(body: canonical)
+        } catch {
+            return "pairing secret unavailable: \(error.localizedDescription)"
+        }
         // N32: lowercase before compare (hmacSHA256 already produces lowercase hex;
         // guard against iOS sending uppercase) and use constant-time compare.
         let sigLower = sig.lowercased()

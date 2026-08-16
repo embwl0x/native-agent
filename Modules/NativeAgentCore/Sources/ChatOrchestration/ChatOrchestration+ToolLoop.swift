@@ -852,7 +852,7 @@ enum ToolCallParser {
     /// the live incident): a progressive action verb followed within a clause
     /// by "now"/"next", not preceded by a completion word. Completion words
     /// ("just finished running now") stay valid stopping points.
-    nonisolated(unsafe) private static let inProgressShapeRegex = try! NSRegularExpression(
+    private static let inProgressShapeRegex = try! NSRegularExpression(
         pattern: #"(?<!finished\s)(?<!done\s)(?<!just\s)(?<!already\s)(?<!stopped\s)\b(reading|checking|looking|going\s+through|pulling|fetching|loading|opening|scanning|digging|reviewing|inspecting|working\s+(?:on|through)|diving\s+(?:in|into)|taking\s+a\s+look|starting\s+(?:on|with))\b[^.!?\n]{0,60}\b(now|next)\b"#,
         options: [.caseInsensitive]
     )
@@ -866,7 +866,7 @@ enum ToolCallParser {
     /// approach.", "let me see"). Their genuine action forms are already caught
     /// elsewhere ("go through" / "take a look" by inProgressShapeRegex, "let me
     /// see what" by the phrase list), so keeping them here only added FP risk.
-    nonisolated(unsafe) private static let deferredIntentRegex = try! NSRegularExpression(
+    private static let deferredIntentRegex = try! NSRegularExpression(
         pattern: #"\b(let\s+me|i'll|i\s+will|going\s+to|about\s+to)(\s+\w+){0,2}\s+(check|look|pull|fetch|grab|read|dig|scan|open|run|start|load)\b"#,
         options: [.caseInsensitive]
     )
@@ -893,7 +893,7 @@ enum ToolCallParser {
         "sent", "wrote", "read", "built", "broke", "kept", "held", "came",
         "put", "set", "told", "said", "did",
     ]
-    nonisolated(unsafe) private static let pastTenseEdRegex = try! NSRegularExpression(
+    private static let pastTenseEdRegex = try! NSRegularExpression(
         pattern: #"\b\w{3,}ed\b"#,
         options: [.caseInsensitive]
     )
@@ -2532,7 +2532,12 @@ extension SwiftNativeTurnEngine {
         do {
             let result = try await FluidContextToolScope.$current.withValue(fluidContextTurn) {
             try await ChatTurnRuntimeContext.$current.withValue(
-                .init(model: modelId, surface: surface, personaID: personaID)
+                .init(
+                    model: modelId,
+                    surface: surface,
+                    personaID: personaID,
+                    providerID: LLMCallContext.providerId
+                )
             ) {
                 try await ToolNoticeBus.$emit.withValue({ kind, text in
                     await progress?(.notice(kind: kind, text: text))

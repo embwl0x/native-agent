@@ -5,6 +5,10 @@ public struct CognitiveConfiguration: Sendable, Equatable {
     public var persistenceEnabled: Bool
     public var workspaceEnabled: Bool
     public var capsuleInjectionEnabled: Bool
+    /// Canary for relevance-gating the durable standing-view `Inner` line.
+    /// Turning this off restores the prior most-recent-active-view behavior
+    /// without changing any persisted view or appraisal influence.
+    public var standingViewCapsuleRelevanceEnabled: Bool
     public var affectEnabled: Bool
     public var thoughtSeedsEnabled: Bool
     public var replayEnabled: Bool
@@ -30,6 +34,7 @@ public struct CognitiveConfiguration: Sendable, Equatable {
         persistenceEnabled: Bool = false,
         workspaceEnabled: Bool = false,
         capsuleInjectionEnabled: Bool = false,
+        standingViewCapsuleRelevanceEnabled: Bool = true,
         affectEnabled: Bool = false,
         thoughtSeedsEnabled: Bool = false,
         replayEnabled: Bool = false,
@@ -54,6 +59,7 @@ public struct CognitiveConfiguration: Sendable, Equatable {
         self.persistenceEnabled = persistenceEnabled
         self.workspaceEnabled = workspaceEnabled
         self.capsuleInjectionEnabled = capsuleInjectionEnabled
+        self.standingViewCapsuleRelevanceEnabled = standingViewCapsuleRelevanceEnabled
         self.affectEnabled = affectEnabled
         self.thoughtSeedsEnabled = thoughtSeedsEnabled
         self.replayEnabled = replayEnabled

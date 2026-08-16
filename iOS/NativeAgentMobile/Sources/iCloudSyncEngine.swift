@@ -100,6 +100,10 @@ final class iCloudSyncEngine: ObservableObject {
     var isSetUp = false
     var refreshInFlight = false
     var refreshQueued = false
+    /// Invalidates reads/cache writes suspended across teardown or a transport
+    /// root change. Generation guards on individual lanes handle ordering;
+    /// this guard handles ownership replacement.
+    var lifecycleGeneration: UInt64 = 0
     var snapshotRefreshGeneration: UInt64 = 0
     // 2026-07-04 (review): generation counter for the TARGETED inbox/activity
     // refreshes (foreground, remote-push, poll loops overlap) — a stale slower

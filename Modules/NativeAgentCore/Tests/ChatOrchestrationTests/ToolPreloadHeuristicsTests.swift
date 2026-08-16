@@ -56,6 +56,32 @@ private let availableFullMacOn: Set<String> = availableFullMacOff
 
 @Suite("ToolPreloadHeuristics")
 struct ToolPreloadHeuristicsTests {
+    @Test("GitHub repository URL selects native repository reads without generic browser preload")
+    func githubRepositoryURLUsesConnectorRoute() throws {
+        let prediction = try #require(ToolPreloadHeuristics.predict(
+            userMessage: "Really inspect https://github.com/deepseek-ai/deepseek-harness and tell me what you think"
+        ))
+        #expect(prediction.groupNames.first == "github")
+        #expect(!prediction.groupNames.contains("browser"))
+        #expect(prediction.candidateTools.contains("github_get_repository"))
+        #expect(prediction.candidateTools.contains("github_read_repository_content"))
+        #expect(prediction.candidateTools.contains("github_list_commits"))
+        let describedAsURL = try #require(ToolPreloadHeuristics.predict(
+            userMessage: "Here's the URL https://github.com/deepseek-ai/deepseek-harness — look through it"
+        ))
+        #expect(describedAsURL.groupNames.contains("github"))
+        #expect(!describedAsURL.groupNames.contains("browser"))
+    }
+
+    @Test("Explicit browser request keeps browser available for a GitHub URL")
+    func explicitBrowserRequestKeepsBrowserRoute() throws {
+        let prediction = try #require(ToolPreloadHeuristics.predict(
+            userMessage: "Open https://github.com/deepseek-ai/deepseek-harness in the browser"
+        ))
+        #expect(prediction.groupNames.contains("github"))
+        #expect(prediction.groupNames.contains("browser"))
+    }
+
 
     // MARK: pattern → group table
 
@@ -742,11 +768,16 @@ struct ToolPreloadHeuristicsTests {
 
 @Suite("ToolPreloadHeuristics bridge-sender hint")
 struct ToolPreloadBridgeHintTests {
-    @Test func bridgePrefixedTurnHintsWorkingGroups() throws {
-        // Real shape of a codex completion relay — no builder-strong lexical
-        // evidence in the body, which was exactly the 2026-07-25 miss class.
-        let prediction = try #require(ToolPreloadHeuristics.predict(
+    @Test func genericBridgeCompletionDoesNotPreloadRepositoryTools() {
+        let prediction = ToolPreloadHeuristics.predict(
             userMessage: "[from: codex, via bridge] Codex replied to your message. This is an asynchronous completion event."
+        )
+        #expect(prediction == nil)
+    }
+
+    @Test func bridgeRepositoryCompletionHintsWorkingGroups() throws {
+        let prediction = try #require(ToolPreloadHeuristics.predict(
+            userMessage: "[from: codex, via bridge] I updated the provider adapter files and tests in the repository."
         ))
         let groups = Set(prediction.groupNames)
         #expect(groups.isSuperset(of: ["builder", "files", "github"]))
@@ -772,14 +803,14 @@ struct ToolPreloadBridgeHintTests {
         #expect(!patterns.contains { $0.hasPrefix("bridge-sender:") })
     }
 
-    @Test func residentMarkerStaysHonestNextToBridgeHint() throws {
+    @Test func residentMarkerStaysHonestWithoutUnprovenBridgeHint() throws {
         let prediction = try #require(ToolPreloadHeuristics.predict(
             userMessage: "[from: claude, via bridge] verify the store",
             residentGroupHints: ["desk"]
         ))
         let patterns = prediction.matchedPatterns
         #expect(patterns.contains("resident-route:desk"))
-        #expect(patterns.contains("bridge-sender:builder"))
+        #expect(!patterns.contains("bridge-sender:builder"))
         #expect(!patterns.contains("resident-route:builder"))
     }
 }

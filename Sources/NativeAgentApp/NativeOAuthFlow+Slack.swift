@@ -9,6 +9,9 @@ extension NativeOAuthFlow {
     static func saveSlackToken(
         _ rawToken: String,
         appToken rawAppToken: String? = nil,
+        allowedChannelIds: Set<String>? = nil,
+        allowedUserIds: Set<String>? = nil,
+        requireMention: Bool? = nil,
         validateWithSlack: Bool = true,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async -> OAuthFlowResult {
@@ -58,6 +61,12 @@ extension NativeOAuthFlow {
                 obj["auth_mode"] = "manual_oauth_token"
                 obj["saved_at"] = now
                 mergeSlackSocketModeFields(appToken: appToken, into: &obj)
+                mergeSlackIngressFields(
+                    allowedChannelIds: allowedChannelIds,
+                    allowedUserIds: allowedUserIds,
+                    requireMention: requireMention,
+                    into: &obj
+                )
                 mergeSlackAuthFields(authFields, into: &obj)
                 try writeJSONObject(obj, to: legacyPath)
             }
@@ -71,6 +80,12 @@ extension NativeOAuthFlow {
                 obj["saved_at"] = now
                 obj["validated_at"] = validateWithSlack ? now : nil
                 mergeSlackSocketModeFields(appToken: appToken, into: &obj)
+                mergeSlackIngressFields(
+                    allowedChannelIds: allowedChannelIds,
+                    allowedUserIds: allowedUserIds,
+                    requireMention: requireMention,
+                    into: &obj
+                )
                 mergeSlackAuthFields(authFields, into: &obj)
                 try writeJSONObject(obj, to: connectorPath)
             }
@@ -182,6 +197,23 @@ extension NativeOAuthFlow {
         obj["app_token"] = appToken
         obj["socket_mode_app_token"] = appToken
         obj["socket_mode_enabled"] = true
+    }
+
+    private static func mergeSlackIngressFields(
+        allowedChannelIds: Set<String>?,
+        allowedUserIds: Set<String>?,
+        requireMention: Bool?,
+        into obj: inout [String: Any]
+    ) {
+        if let allowedChannelIds {
+            obj["allowed_channel_ids"] = allowedChannelIds.sorted()
+        }
+        if let allowedUserIds {
+            obj["allowed_user_ids"] = allowedUserIds.sorted()
+        }
+        if let requireMention {
+            obj["require_mention"] = requireMention
+        }
     }
 
 }

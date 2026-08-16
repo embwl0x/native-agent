@@ -84,7 +84,6 @@ import Connectors
 // Browser owns status, cancel, dry-run, and
 // approval-gated visible navigation are Swift-native.
 import Browser
-import CapabilityFoundry
 
 // 2026-06-07: lifted from `private` to internal so MacIntegrationBridgeImpl
 // can construct the same provider when dispatching mac_spotlight_search (the

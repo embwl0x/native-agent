@@ -20,6 +20,7 @@ func policyDefaultsAreSafe() {
     #expect(!policy.captureTitles)
     #expect(!policy.browserTitlesEnabled)
     #expect(!policy.appNameOnlyMode)
+    #expect(!policy.allowModelAccess)
     #expect(policy.retentionDays == 30)
     #expect(!policy.excludedBundleIDs.isEmpty, "the starter exclusion list must not ship empty")
     // Nothing is capturable at all while the master switch is off.
@@ -71,6 +72,7 @@ func policyRoundTripsThroughDisk() throws {
         captureTitles: true,
         browserTitlesEnabled: true,
         appNameOnlyMode: false,
+        allowModelAccess: true,
         excludedBundleIDs: ["com.example.one", "com.example.two"],
         retentionDays: 14
     )
@@ -107,8 +109,44 @@ func policyDecodesMissingKeysSafely() throws {
     #expect(loaded.captureEnabled)
     #expect(!loaded.captureTitles, "a key this build added must not default to ON")
     #expect(!loaded.browserTitlesEnabled)
+    #expect(!loaded.allowModelAccess)
     #expect(loaded.retentionDays == 30)
     #expect(loaded.excludedBundleIDs == ActivityPolicy.defaultExcludedBundleIDs)
+}
+
+@Test("POLICY: an existing malformed file blocks mutation and preserves its bytes")
+func corruptPolicyBlocksMutation() throws {
+    let store = ActivityPolicyStore(dataRoot: tempRoot())
+    try FileManager.default.createDirectory(
+        at: store.fileURL.deletingLastPathComponent(), withIntermediateDirectories: true
+    )
+    let original = Data("{ damaged policy".utf8)
+    try original.write(to: store.fileURL)
+
+    #expect(throws: ActivityPolicyStore.StoreError.self) {
+        try store.save(ActivityPolicy(captureEnabled: true))
+    }
+    #expect(try Data(contentsOf: store.fileURL) == original)
+}
+
+@Test("POLICY: a dangling symlink is unavailable, not a missing bootstrap file")
+func symlinkPolicyBlocksMutation() throws {
+    let store = ActivityPolicyStore(dataRoot: tempRoot())
+    try FileManager.default.createDirectory(
+        at: store.fileURL.deletingLastPathComponent(), withIntermediateDirectories: true
+    )
+    try FileManager.default.createSymbolicLink(
+        at: store.fileURL,
+        withDestinationURL: store.fileURL.deletingLastPathComponent()
+            .appendingPathComponent("missing-target.json")
+    )
+    #expect(throws: ActivityPolicyStore.StoreError.self) {
+        _ = try store.loadChecked()
+    }
+    #expect(throws: ActivityPolicyStore.StoreError.self) {
+        try store.save(ActivityPolicy(captureEnabled: true))
+    }
+    #expect((try? FileManager.default.destinationOfSymbolicLink(atPath: store.fileURL.path)) != nil)
 }
 
 // MARK: - Retention

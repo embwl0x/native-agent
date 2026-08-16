@@ -22,11 +22,6 @@ private struct StubLLMClient: LLMClient {
     }
 }
 
-private struct StubRecaller: MemoryConsolidationRecaller {
-    func listAllForConsolidation() async throws -> [ConsolidationCandidate] { [] }
-    func remove(id: String) async throws {}
-}
-
 private func mkTmpRoot() -> URL {
     let url = URL(fileURLWithPath: NSTemporaryDirectory())
         .appendingPathComponent("bg-loops-assembly-\(UUID().uuidString)", isDirectory: true)
@@ -54,13 +49,5 @@ struct BackgroundLoopsAssemblySanityTests {
         )
         #expect(loop.loopId == "rem_cycle")
         #expect(loop.interval == 604_800)
-    }
-
-    @Test("MemoryConsolidationLoop constructs with stub recaller")
-    func memoryConsolidationLoopConstructs() {
-        let root = mkTmpRoot()
-        let loop = MemoryConsolidationLoop(recaller: StubRecaller(), dataRoot: root)
-        #expect(loop.loopId == "memory_consolidation")
-        #expect(loop.interval == 3600)
     }
 }

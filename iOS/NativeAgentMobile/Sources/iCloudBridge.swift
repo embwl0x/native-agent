@@ -170,8 +170,7 @@ final class iCloudBridge: ObservableObject {
     // CK-3b: the device-sync transport SEAM. Non-nil ⇒ CloudKit is the active
     // transport (resolver selected `.cloudkit` AND the entitlement is present —
     // makeCloudKitTransport enforces the crash-guard). nil ⇒ the legacy
-    // KVS/ubiquity path runs unchanged. Resolver defaults `.kvs`, so this stays
-    // nil until CK-4 bakes the flag → zero runtime change here.
+    // KVS/ubiquity path runs unchanged.
     private var deviceTransport: DeviceSyncTransport?
     var usesCloudKitDeviceTransport: Bool { deviceTransport != nil }
     // CK-3c: single-flight guard for the transport drain (APNs push + observe
@@ -255,8 +254,26 @@ final class iCloudBridge: ObservableObject {
 
         // CloudKit does not require an iCloud Drive/ubiquity Documents mount.
         // Establish the entitlement-checked public transport first; legacy
-        // KVS/Drive setup continues independently when a container is present.
+        // If CloudKit cannot start, the complete KVS/Drive fallback remains.
         configureDeviceTransportIfAvailable()
+
+        // A live CloudKit transport owns the public message and snapshot data
+        // planes. Retain only the cheap KVS observer for progress/resync nudges;
+        // avoid the blocking Drive mount, directory tree, and metadata query.
+        // If CloudKit is unavailable (or KVS is explicitly selected), the full
+        // legacy setup below remains the fail-safe path.
+        if deviceTransport != nil {
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(kvsDidChange(_:)),
+                name: NSUbiquitousKeyValueStore.didChangeExternallyNotification,
+                object: kvs
+            )
+            kvs.synchronize()
+            available = true
+            syncStatus = "CloudKit ready"
+            return
+        }
 
         // 2026-05-09 fix: FileManager.default.url(forUbiquityContainerIdentifier:)
         // is SYNCHRONOUS and can block for many seconds (sometimes 30s+) on
@@ -284,14 +301,6 @@ final class iCloudBridge: ObservableObject {
     private func applyContainerResult(_ containerURL: URL?, generation: Int) {
         guard generation == setupGeneration, isSetUp else { return }
         guard let containerURL else {
-            if DeviceSyncTransportResolver.bridgeCanStart(
-                cloudKitTransportActive: deviceTransport != nil,
-                ubiquityContainerAvailable: false
-            ) {
-                available = true
-                syncStatus = "CloudKit ready — iCloud Drive unavailable"
-                return
-            }
             available = false
             syncStatus = "iCloud unavailable — sign into iCloud in Settings → Apple Account"
             isSetUp = false  // allow retry
@@ -469,7 +478,7 @@ final class iCloudBridge: ObservableObject {
             return msg
         }
 
-        // Legacy KVS/ubiquity path (default until CK-4 bakes the flag).
+        // Explicit/fail-safe legacy KVS/ubiquity path.
         guard let docsURL = driveURL else {
             throw BridgeError.containerUnavailable
         }
@@ -621,8 +630,10 @@ final class iCloudBridge: ObservableObject {
             syncStatus = "iCloud pairing refresh from Mac"
             if await pairingStore?.refreshFromKVS() == true {
                 NSLog("[iCloudBridge] signature_invalid_resync applied — new HMAC installed")
+                // The unsigned envelope is only a wake-up. Replay handlers run
+                // solely after KVS supplied a different, durably installed key.
+                for handler in resyncHintHandlers.values { handler(hint) }
             }
-            for handler in resyncHintHandlers.values { handler(hint) }
         }
         for rejection in result.rejections {
             syncStatus = rejection.userMessage
@@ -683,8 +694,8 @@ final class iCloudBridge: ObservableObject {
             syncStatus = "iCloud pairing refresh from Mac"
             if await pairingStore?.refreshFromKVS() == true {
                 NSLog("[iCloudBridge] signature_invalid_resync applied — new HMAC installed")
+                for handler in resyncHintHandlers.values { handler(msg) }
             }
-            for handler in resyncHintHandlers.values { handler(msg) }
             return true
         }
 

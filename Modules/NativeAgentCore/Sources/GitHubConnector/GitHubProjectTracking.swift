@@ -279,6 +279,18 @@ public extension GitHubConnectorActions {
     static func refreshTrackingIfDue(dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> Bool {
         try await GitHubProjectTracker.refreshIfDue(dataRoot: dataRoot)
     }
+
+    /// Read-only projection of the connector's exact learned refresh crossing.
+    /// Event/deadline schedulers use this instead of reimplementing tracking
+    /// config, snapshot, or Desk cadence policy outside its canonical owner.
+    /// A missing/malformed config or snapshot has no future crossing; startup
+    /// and file-event reconciliation still call `refreshTrackingIfDue`.
+    static func nextTrackingRefreshDeadline(
+        after now: Date,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) async -> Date? {
+        await GitHubProjectTracker.nextRefreshDeadline(after: now, dataRoot: dataRoot)
+    }
 }
 
 extension GitHubConnectorActions {
@@ -789,6 +801,21 @@ private enum GitHubProjectTracker {
         }
         _ = try await refresh(dataRoot: dataRoot, force: false)
         return true
+    }
+
+    static func nextRefreshDeadline(after now: Date, dataRoot: URL) async -> Date? {
+        guard let config = try? loadConfig(dataRoot: dataRoot),
+              let snapshot = try? await loadSnapshot(dataRoot: dataRoot),
+              let refreshed = DeskClock.parseISO(snapshot.refreshedAt)
+        else { return nil }
+        let interval = await learnedDueInterval(
+            dataRoot: dataRoot,
+            entities: snapshot.entities,
+            configuredSeconds: Double(config.refreshIntervalMinutes * 60),
+            now: now
+        )
+        let deadline = refreshed.addingTimeInterval(interval)
+        return deadline > now ? deadline : nil
     }
 
     /// How long this snapshot may sit before it is refetched, given what the

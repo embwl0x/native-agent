@@ -548,6 +548,16 @@ private func mentionCount(_ store: KnowledgeGraphStore, name: String) -> Int? {
     let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
     let archived = fact("mem-archived-fresh-index", "TradingView watchlist sync.")
     try await indexer.indexMemory(archived)
+    let indexedRows = try await pool.read { db in
+        try Int.fetchOne(
+            db,
+            sql: "SELECT COUNT(*) FROM kg_memory_index WHERE memory_id = ?",
+            arguments: [archived.id]
+        ) ?? -1
+    }
+    // The hook payload says active, but the supported pre-v5 minimal store is
+    // authoritative and says archived. The stale row is refused before GC.
+    #expect(indexedRows == 0)
 
     let report = try await indexer.collectGarbage(
         liveFacts: [fact(
@@ -558,12 +568,70 @@ private func mentionCount(_ store: KnowledgeGraphStore, name: String) -> Int? {
         apply: true
     )
     #expect(report.applied)
-    #expect(report.staleIndexRowsDeleted == 1)
-    #expect(report.candidates.contains { $0.name == "TradingView" })
+    #expect(report.staleIndexRowsDeleted == 0)
+    #expect(report.candidates.isEmpty)
 
     let graph = try await KnowledgeGraphStore.loadFromMemoryV2(
         memoryDir: dir, jsonImportPath: nil)
     #expect(!entityNames(graph).contains("TradingView"))
+}
+
+@Test func minimalMemorySchemaStillHonorsPresentLifecycle() async throws {
+    let dir = try hygieneTempDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let sqlitePath = dir.appendingPathComponent("memory.sqlite")
+    _ = try DatabasePool(path: sqlitePath.path)
+    let pool = try await KnowledgeGraphPoolCache.shared.pool(at: sqlitePath)
+    try await pool.write { db in
+        try db.execute(sql: """
+            CREATE TABLE memories (
+              id TEXT PRIMARY KEY,
+              content TEXT,
+              status TEXT,
+              lifecycle TEXT
+            );
+            INSERT INTO memories (id, content, status, lifecycle)
+            VALUES ('mem-corrected-minimal', 'TradingView watchlist sync.', 'active', 'corrected');
+            """)
+    }
+
+    let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
+    try await indexer.indexMemory(fact("mem-corrected-minimal", "TradingView watchlist sync."))
+
+    let indexedRows = try await pool.read { db in
+        try Int.fetchOne(
+            db,
+            sql: "SELECT COUNT(*) FROM kg_memory_index WHERE memory_id = 'mem-corrected-minimal'"
+        ) ?? -1
+    }
+    #expect(indexedRows == 0)
+    let graph = try await KnowledgeGraphStore.loadFromMemoryV2(
+        memoryDir: dir, jsonImportPath: nil)
+    #expect(!entityNames(graph).contains("TradingView"))
+}
+
+@Test func indexHookRefusesMemoriesTableMissingRequiredAuthorityColumns() async throws {
+    let dir = try hygieneTempDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let sqlitePath = dir.appendingPathComponent("memory.sqlite")
+    _ = try DatabasePool(path: sqlitePath.path)
+    let pool = try await KnowledgeGraphPoolCache.shared.pool(at: sqlitePath)
+    try await pool.write { db in
+        try db.execute(sql: """
+            CREATE TABLE memories (id TEXT PRIMARY KEY, content TEXT);
+            INSERT INTO memories (id, content)
+            VALUES ('mem-damaged-schema', 'TradingView watchlist sync.');
+            """)
+    }
+
+    let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
+    await #expect(throws: KnowledgeGraphReadError.self) {
+        try await indexer.indexMemory(fact("mem-damaged-schema", "TradingView watchlist sync."))
+    }
+    let indexedRows = try await pool.read { db in
+        try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM kg_memory_index") ?? -1
+    }
+    #expect(indexedRows == 0)
 }
 
 @Test func gcNeverSweepsEntitiesWithoutCreationStamp() async throws {

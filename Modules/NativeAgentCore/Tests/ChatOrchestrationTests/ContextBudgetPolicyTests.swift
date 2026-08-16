@@ -165,6 +165,41 @@ struct ContextBudgetFloorRegimeTests {
         #expect(ContextBudgetPolicy.windowTokens(forModel: "  Kimi-K3  ") == 1_048_576)
     }
 
+    @Test func exactProviderTupleSelectsVerifiedWindow() throws {
+        #expect(ContextBudgetPolicy.windowTokens(
+            forModel: "gpt-5.6-sol", providerID: "openai"
+        ) == 400_000)
+        #expect(ContextBudgetPolicy.windowTokens(
+            forModel: "gpt-5.6-sol", providerID: "openai_oauth_direct"
+        ) == 372_000)
+        #expect(ContextBudgetPolicy.windowTokens(
+            forModel: "anthropic/claude-sonnet-5", providerID: "openrouter"
+        ) == 1_000_000)
+        #expect(ContextBudgetPolicy.windowTokens(
+            forModel: "anthropic/claude-sonnet-5", providerID: "anthropic"
+        ) == nil)
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("context-window-openrouter-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let providers = root.appendingPathComponent("providers", isDirectory: true)
+        try FileManager.default.createDirectory(at: providers, withIntermediateDirectories: true)
+        let cached: [String: Any] = [
+            "models": [[
+                "id": "vendor/live-model",
+                "name": "Live Model",
+                "context_length": 654_321,
+                "supports_streaming": true,
+            ]],
+        ]
+        try JSONSerialization.data(withJSONObject: cached).write(
+            to: providers.appendingPathComponent("openrouter-models-cache.json")
+        )
+        #expect(ContextBudgetPolicy.windowTokens(
+            forModel: "vendor/live-model", providerID: "openrouter", dataRoot: root
+        ) == 654_321)
+    }
+
     /// The RENDERED block, not just the numbers: a floor-regime render must be
     /// character-identical to the legacy no-window call.
     @Test func floorRenderIsCharacterIdenticalToLegacyCall() throws {

@@ -40,7 +40,6 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-import CapabilityFoundry
 
 extension NativeClient {
     /// One trust-aware catalog projection for the Mac Tools page and the

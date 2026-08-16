@@ -184,18 +184,6 @@ extension BackgroundLoopsAssembly {
         )
     }
 
-    // NOT BUILT HERE (2026-08-02, silo-dissolution E-4): the stale-artifact
-    // sweep and the golden-eval loop. Both gated on UserDefaults keys
-    // (`staleArtifactSweepEnabled`, `goldenEvalEnabled`) that NOTHING in the
-    // repo ever writes — no @AppStorage, no Toggle, no set(forKey:). Registered,
-    // they woke forever and could never act, and the sweep additionally walked
-    // data/ daily to append a report nobody reads. Deleted rather than given a
-    // toggle: no theater, and neither lane was asked for. `StaleArtifactSweep`,
-    // `StaleArtifactSweepLoop`, `GoldenEvalLoop` and `GoldenEvalJobs` remain in
-    // BackgroundLoops with their tests, so rebuilding either is a factory + one
-    // line in `assembleAllLoops` — behind a real switch this time.
-
-
     // The weekly self-improvement loop's on/off gate is the
     // "selfImprovementEnabled" UserDefaults flag, owned by the Self-Improvement
     // tab's switch (SelfImprovementView). Read inline in makeWeeklySelfImprovementLoop.

@@ -367,6 +367,11 @@ public actor MacScreenViewStore {
         return .success(hit)
     }
 
+    /// Forget the frozen scene because a physical user input or a completed
+    /// motor action may have changed it. This is a safety invalidation, not a
+    /// history deletion: the store intentionally owns only one live view.
+    public func invalidate() { latest = nil }
+
     /// Test seam only: forget everything. Never called on a production path.
     public func reset() { latest = nil }
 }
@@ -1730,6 +1735,7 @@ public enum MacScreenViewResultRedaction {
     /// instead of opening a second screen-read channel no sink knows about.
     public static let viewToolNames: Set<String> = [
         "mac_view", "mac.view", "view",
+        "mac_attention", "mac.attention", "attention",
         "mac_wake", "mac.wake", "wake",
     ]
 

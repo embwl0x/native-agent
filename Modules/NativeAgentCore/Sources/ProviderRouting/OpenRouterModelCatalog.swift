@@ -127,6 +127,19 @@ public enum OpenRouterModelCatalog {
         await models(dataRoot: dataRoot, session: session, refresh: refresh).map { $0.providerJSON() }
     }
 
+    /// Read-only exact capability projection from the last live-backed cache.
+    /// A stale cache remains evidence of the model's published window; TTL
+    /// controls picker refresh, not whether prompt budgeting may remember a
+    /// previously verified smaller bound.
+    public static func cachedDescriptor(
+        for modelID: String,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) -> ProviderModelDescriptor? {
+        let wanted = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !wanted.isEmpty else { return nil }
+        return readCache(dataRoot: dataRoot)?.first { $0.id == wanted }
+    }
+
     /// Served only when both the on-disk cache and a live fetch are
     /// unavailable. Ids must exist on OpenRouter TODAY — a retired id here
     /// turns the no-network first-run picker into a 404 factory. Verified
@@ -138,7 +151,7 @@ public enum OpenRouterModelCatalog {
                 id: "meta-llama/llama-3.3-70b-instruct",
                 name: "Llama 3.3 70B (OpenRouter)",
                 contextLength: 131_072,
-                supportsStreaming: false,
+                supportsStreaming: true,
                 supportsVision: false,
                 supportsTools: false,
                 supportsJSONMode: false
@@ -147,7 +160,7 @@ public enum OpenRouterModelCatalog {
                 id: "anthropic/claude-sonnet-5",
                 name: "Claude Sonnet 5 (OpenRouter)",
                 contextLength: 1_000_000,
-                supportsStreaming: false,
+                supportsStreaming: true,
                 supportsVision: false,
                 supportsTools: false,
                 supportsJSONMode: false
@@ -209,18 +222,23 @@ public enum OpenRouterModelCatalog {
         let context = positiveInt(row["context_length"])
             ?? positiveInt((row["top_provider"] as? [String: Any])?["context_length"])
             ?? 128_000
+        let architecture = row["architecture"] as? [String: Any]
+        let inputModalities = stringSet(architecture?["input_modalities"])
+        let supportedParameters = stringSet(row["supported_parameters"])
 
         return ProviderModelDescriptor(
             id: id,
             name: name,
             contextLength: context,
-            // These describe the capabilities NativeAgent's adapter can
-            // deliver, not merely what OpenRouter says the upstream model can
-            // do. The current adapter is buffered prompt completion only.
-            supportsStreaming: false,
-            supportsVision: false,
-            supportsTools: false,
-            supportsJSONMode: false,
+            // Capability = upstream declaration AND a NativeAgent wire path.
+            // The adapter implements SSE for every text model; the remaining
+            // capabilities stay model-specific and come from OpenRouter's
+            // own live metadata.
+            supportsStreaming: true,
+            supportsVision: inputModalities.contains("image"),
+            supportsTools: supportedParameters.contains("tools"),
+            supportsJSONMode: supportedParameters.contains("response_format")
+                || supportedParameters.contains("structured_outputs"),
             costPer1KIn: pricePer1K((row["pricing"] as? [String: Any])?["prompt"]),
             costPer1KOut: pricePer1K((row["pricing"] as? [String: Any])?["completion"])
         )
@@ -290,10 +308,10 @@ public enum OpenRouterModelCatalog {
                 id: id,
                 name: name,
                 contextLength: int(row["context_length"]) ?? 128_000,
-                supportsStreaming: false,
-                supportsVision: false,
-                supportsTools: false,
-                supportsJSONMode: false,
+                supportsStreaming: bool(row["supports_streaming"]) ?? true,
+                supportsVision: bool(row["supports_vision"]) ?? false,
+                supportsTools: bool(row["supports_tools"]) ?? false,
+                supportsJSONMode: bool(row["supports_json_mode"]) ?? false,
                 costPer1KIn: double(row["cost_per_1k_in"]),
                 costPer1KOut: double(row["cost_per_1k_out"])
             )
@@ -349,5 +367,10 @@ public enum OpenRouterModelCatalog {
         case .int(let i)?: return Double(i)
         default: return nil
         }
+    }
+
+    private static func bool(_ value: JSONValue?) -> Bool? {
+        guard case .bool(let value)? = value else { return nil }
+        return value
     }
 }

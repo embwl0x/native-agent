@@ -74,6 +74,18 @@ extension AppDelegate {
         NSApp.terminate(nil)
     }
 
+    @MainActor
+    static func presentBackupRestoreError(_ detail: String) {
+        NSLog("[backup-restore] refusing to start after staged restore failure: \(detail)")
+        NSApp.setActivationPolicy(.regular)
+        let alert = NSAlert()
+        alert.messageText = "NativeAgent could not safely finish the backup restore."
+        alert.informativeText = "NativeAgent stopped before opening live state. If recovery is incomplete, the preserved safety rollback will resume on the next launch.\n\n\(detail)"
+        alert.alertStyle = .critical
+        alert.runModal()
+        NSApp.terminate(nil)
+    }
+
     // MARK: - Login item
 
     /// Register the app to launch at login. Uses SMAppService (modern,

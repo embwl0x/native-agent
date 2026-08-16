@@ -266,6 +266,54 @@ struct ChatCompletionsAdapterErrorAndUsageTests {
         #expect(trace.contains("utputTokens") || trace.contains("output_tokens"),
                 "completion tokens must reach telemetry: \(trace)")
     }
+
+    @Test func openRouterStructuredStreamPreservesImagesToolsAndToolResults() async throws {
+        let sse = Data("""
+        data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_7","function":{"name":"lookup","arguments":"{\\"q\\":\\"cats\\"}"}}]}}]}
+
+        data: [DONE]
+
+        """.utf8)
+        ProtocolStub.set(status: 200, body: sse, headers: ["Content-Type": "text/event-stream"])
+        let adapter = OpenRouterAdapter(session: session(), apiKeyOverride: "k")
+        let schema = LLMToolSchema(
+            name: "lookup",
+            description: "Look something up",
+            parametersJSON: Data(#"{"type":"object","properties":{"q":{"type":"string"}}}"#.utf8)
+        )
+        let messages: [LLMMessage] = [
+            .userWithImages("what is this?", images: [
+                .image(mediaType: "image/png", base64: "aGVsbG8=", name: "sample.png", byteSize: 5),
+            ]),
+            LLMMessage(role: .assistant, content: [
+                .toolUse(id: "prior", name: "lookup", inputJSON: Data(#"{"q":"dogs"}"#.utf8)),
+            ]),
+            LLMMessage(role: .user, content: [
+                .toolResult(toolUseId: "prior", content: "done", isError: false),
+            ]),
+        ]
+        var calls: [LLMStreamToolCall] = []
+        for try await event in adapter.streamMessages(
+            messages: messages, system: "system", model: "google/gemini-test", tools: [schema]
+        ) {
+            if case .toolCall(let call) = event { calls.append(call) }
+        }
+        #expect(calls.count == 1)
+        #expect(calls.first?.id == "call_7")
+        #expect(calls.first?.name == "lookup")
+        #expect(String(data: calls.first?.inputJSON ?? Data(), encoding: .utf8) == #"{"q":"cats"}"#)
+
+        let body = try #require(ProtocolStub.lastBody)
+        let root = try #require(try JSONSerialization.jsonObject(with: body) as? [String: Any])
+        #expect(root["stream"] as? Bool == true)
+        #expect((root["tools"] as? [[String: Any]])?.count == 1)
+        let rows = try #require(root["messages"] as? [[String: Any]])
+        let imageRow = try #require(rows.first { ($0["role"] as? String) == "user" })
+        let parts = try #require(imageRow["content"] as? [[String: Any]])
+        let imageURL = try #require(parts.first { ($0["type"] as? String) == "image_url" })
+        #expect(((imageURL["image_url"] as? [String: Any])?["url"] as? String)?.hasPrefix("data:image/png;base64,") == true)
+        #expect(rows.contains { ($0["role"] as? String) == "tool" && ($0["tool_call_id"] as? String) == "prior" })
+    }
 }
 
 // MARK: - Absent-`index` tool-call fragmentation (gpt-5.5 BLOCKING 2026-08-02)

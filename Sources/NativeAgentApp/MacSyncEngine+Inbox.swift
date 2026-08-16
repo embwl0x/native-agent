@@ -129,16 +129,24 @@ extension MacSyncEngine {
             }.value
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
-            if let data, let staleAction = try? decoder.decode(InboxAction.self, from: data) {
-                let txId = staleAction.transactionId ?? staleAction.msgId
-                let response = signedResponse([
+            if let data,
+               let staleAction = try? decoder.decode(InboxAction.self, from: data),
+               let ids = InboxActionFileBoundary.validatedIDs(for: staleAction),
+               let responseURL = InboxActionFileBoundary.jsonURL(
+                in: responsesDir,
+                validatedID: ids.messageID
+               ) {
+                let txId = ids.transactionID
+                guard let response = try? signedResponse([
                     "status": "error",
                     "message": "Mac could not confirm whether this command completed, so it was not retried automatically.",
                     "msgId": staleAction.msgId,
                     "transactionId": txId,
                     "action": staleAction.action,
-                ])
-                let responseURL = responsesDir.appendingPathComponent("\(staleAction.msgId).json")
+                ]) else {
+                    syncError = "Pairing secret unavailable; stale command \(staleAction.msgId) remains pending."
+                    continue
+                }
                 // M3 (2026-07-09): the encode+write used to be stacked `try?` and
                 // the pending file was archived regardless — an encode or iCloud
                 // write failure silently consumed the command and the phone waited
@@ -209,20 +217,45 @@ extension MacSyncEngine {
                 }.value
                 continue
             }
-            guard !processedMsgIds.contains(action.msgId) else {
+            guard let ids = InboxActionFileBoundary.validatedIDs(for: action) else {
+                syncError = "Rejected inbox file \(fileURL.lastPathComponent): invalid message identity"
+                NSLog("[MacSyncEngine] Rejected inbox file with non-UUID identity: %@", fileURL.lastPathComponent)
+                let rejectedDir = inboxDir.appendingPathComponent("_rejected")
+                let rejectedURL = rejectedDir.appendingPathComponent(fileURL.lastPathComponent)
+                await Task.detached(priority: .utility) { [rejectedDir, fileURL, rejectedURL] in
+                    try? FileManager.default.createDirectory(at: rejectedDir, withIntermediateDirectories: true)
+                    try? FileManager.default.moveItem(at: fileURL, to: rejectedURL)
+                }.value
+                continue
+            }
+            guard !processedMsgIds.contains(ids.messageID) else {
                 let duplicateURL = inboxDir.appendingPathComponent("duplicate_\(fileURL.lastPathComponent).done")
                 await Task.detached(priority: .utility) { [fileURL, duplicateURL] in
                     try? FileManager.default.moveItem(at: fileURL, to: duplicateURL)
                 }.value
                 continue
             }
-            let transactionId = action.transactionId ?? action.msgId
+            let transactionId = ids.transactionID
             await writeTransaction(id: transactionId, action: action.action, state: "received", attempts: 1)
 
             // C.1: Validate HMAC signature + timestamp freshness before dispatching.
             if let validationError = await validateInboxAction(data: data, action: action) {
                 syncError = "Rejected inbox message \(action.msgId): \(validationError)"
-                await writeRejectedResponseIfNeeded(action: action, transactionId: transactionId, message: validationError)
+                if validationError.contains("pairing secret unavailable") {
+                    // Local authority is unavailable, so this is not evidence
+                    // that the peer sent a bad action. Leave it untouched for
+                    // exact retry after deliberate local repair.
+                    continue
+                }
+                guard await writeRejectedResponseIfNeeded(
+                    action: action,
+                    transactionId: transactionId,
+                    message: validationError
+                ) else {
+                    // Do not consume an invalid remote action unless its
+                    // signed rejection durably exists for the peer to read.
+                    continue
+                }
                 await writeTransaction(id: transactionId, action: action.action, state: "rejected", attempts: 1, error: validationError)
                 // Still mark as processed so a replayed/tampered file isn't retried.
                 recordProcessed(action.msgId)  // fix-R9-9
@@ -269,10 +302,23 @@ extension MacSyncEngine {
             responseBody["msgId"] = action.msgId
             responseBody["transactionId"] = transactionId
             responseBody["action"] = action.action
-            let response = signedResponse(responseBody)
+            guard let response = try? signedResponse(responseBody) else {
+                syncError = "Pairing secret unavailable after command \(action.msgId); command left pending without an unsigned response."
+                await writeTransaction(
+                    id: transactionId,
+                    action: action.action,
+                    state: "response_write_failed",
+                    attempts: 1,
+                    error: syncError
+                )
+                continue
+            }
 
             // Write response (coordinated iCloud write) — SEVERE blocking risk; do it off main.
-            let responseURL = responsesDir.appendingPathComponent("\(action.msgId).json")
+            guard let responseURL = InboxActionFileBoundary.jsonURL(
+                in: responsesDir,
+                validatedID: ids.messageID
+            ) else { continue }
             let responseWritten = await writeInboxResponse(response, to: responseURL)
             guard responseWritten else {
                 syncError = "Could not write iCloud response for \(action.msgId); command left pending."
@@ -376,18 +422,21 @@ extension MacSyncEngine {
     func processCloudKitActionMessage(_ message: BridgeMessage) async -> Bool {
         guard message.metadata?["kind"] == "icloud_action",
               let declaredID = message.metadata?["actionId"],
-              UUID(uuidString: declaredID) != nil,
               let data = message.text.data(using: .utf8) else {
             return true
         }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         guard let action = try? decoder.decode(InboxAction.self, from: data),
-              action.msgId == declaredID else {
+              let ids = InboxActionFileBoundary.validatedIDs(for: action),
+              ids.messageID == declaredID else {
             return true
         }
-        guard let responsesDir else { return false }
-        let responseURL = responsesDir.appendingPathComponent("\(action.msgId).json")
+        guard let responsesDir,
+              let responseURL = InboxActionFileBoundary.jsonURL(
+                in: responsesDir,
+                validatedID: ids.messageID
+              ) else { return false }
 
         // A prior attempt may have executed successfully but lost its CloudKit
         // response send. Re-send the durable signed response; never redispatch.
@@ -411,7 +460,7 @@ extension MacSyncEngine {
             }
         }
 
-        let transactionId = action.transactionId ?? action.msgId
+        let transactionId = ids.transactionID
         await writeTransaction(
             id: transactionId,
             action: action.action,
@@ -421,7 +470,11 @@ extension MacSyncEngine {
 
         let response: [String: String]
         if let validationError = await validateInboxAction(data: data, action: action) {
-            response = signedResponse([
+            if validationError.contains("pairing secret unavailable") {
+                syncError = "Pairing secret unavailable; CloudKit action \(action.msgId) remains unacknowledged."
+                return false
+            }
+            guard let signed = try? signedResponse([
                 "status": "error",
                 "ok": "false",
                 "code": validationError.contains("signature") ? "signature_invalid" : "invalid_action",
@@ -429,7 +482,11 @@ extension MacSyncEngine {
                 "msgId": action.msgId,
                 "transactionId": transactionId,
                 "action": action.action,
-            ])
+            ]) else {
+                syncError = "Pairing secret unavailable; CloudKit action \(action.msgId) remains unacknowledged."
+                return false
+            }
+            response = signed
             await writeTransaction(
                 id: transactionId,
                 action: action.action,
@@ -462,7 +519,11 @@ extension MacSyncEngine {
             body["msgId"] = action.msgId
             body["transactionId"] = transactionId
             body["action"] = action.action
-            response = signedResponse(body)
+            guard let signed = try? signedResponse(body) else {
+                syncError = "Pairing secret unavailable after CloudKit action \(action.msgId); action remains unacknowledged."
+                return false
+            }
+            response = signed
             let status = (response["status"] ?? "").lowercased()
             let completedState = status == "error"
                     || status == "failed"

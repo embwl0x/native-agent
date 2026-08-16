@@ -85,3 +85,169 @@ func selectDueJobs_tiesKeepFileOrder() async throws {
     let due = try await runner.selectDueJobs(now: now, maxJobs: 10)
     #expect(due.map(\.id) == ["a", "b", "c"])
 }
+
+@Test("due occurrence is durably claimed before it is returned for execution")
+func claimDueJobs_persistsStableOccurrenceIdentity() async throws {
+    let root = try selectionRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    let due = now.timeIntervalSince1970 - 15
+    let runner = SchedulerDueJobRunner(root: root)
+    try writeJobs([[
+        "id": "claimed",
+        "name": "Claimed",
+        "kind": "notify",
+        "enabled": true,
+        "oneShot": true,
+        "nextRunAtEpoch": due,
+    ]], to: runner.jobsPath)
+
+    let batch = try await runner.claimDueJobs(now: now, maxJobs: 5)
+    let job = try #require(batch.jobs.first)
+    #expect(batch.recoveredUnknown.isEmpty)
+    #expect(job.occurrenceKey == SchedulerDueJobRunner.DueJob.makeOccurrenceKey(
+        jobId: "claimed", dueEpoch: due
+    ))
+
+    let data = try Data(contentsOf: runner.jobsPath)
+    let rows = try #require(try JSONSerialization.jsonObject(with: data) as? [[String: Any]])
+    let active = try #require(rows.first?["activeOccurrence"] as? [String: Any])
+    #expect(active["key"] as? String == job.occurrenceKey)
+    #expect(active["state"] as? String == "claimed")
+}
+
+@Test("a claim surviving restart becomes unknown and is never replayed")
+func claimDueJobs_recoversAmbiguousOccurrenceWithoutRepeatingEffect() async throws {
+    let root = try selectionRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    let due = now.timeIntervalSince1970 - 15
+    let key = SchedulerDueJobRunner.DueJob.makeOccurrenceKey(jobId: "ambiguous", dueEpoch: due)
+    let runner = SchedulerDueJobRunner(root: root)
+    try writeJobs([[
+        "id": "ambiguous",
+        "name": "Ambiguous",
+        "kind": "connector_action",
+        "enabled": true,
+        "oneShot": true,
+        "nextRunAtEpoch": due,
+        "activeOccurrence": [
+            "key": key,
+            "claimedAt": SchedulerDueJobRunner.iso(now.addingTimeInterval(-30)),
+            "state": "claimed",
+        ],
+    ]], to: runner.jobsPath)
+
+    let batch = try await runner.claimDueJobs(now: now, maxJobs: 5)
+    #expect(batch.jobs.isEmpty)
+    #expect(batch.recoveredUnknown.map(\.occurrenceKey) == [key])
+
+    let data = try Data(contentsOf: runner.jobsPath)
+    let rows = try #require(try JSONSerialization.jsonObject(with: data) as? [[String: Any]])
+    let row = try #require(rows.first)
+    #expect(row["activeOccurrence"] == nil)
+    #expect(row["enabled"] as? Bool == false)
+    #expect(row["lastRunStatus"] as? String == "unknown")
+    #expect(row["lastUnknownOccurrenceKey"] as? String == key)
+}
+
+@Test("a malformed surviving claim fails closed instead of authorizing the effect")
+func claimDueJobs_malformedClaimIsPreservedAndNotExecuted() async throws {
+    let root = try selectionRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    let runner = SchedulerDueJobRunner(root: root)
+    try writeJobs([[
+        "id": "damaged-claim",
+        "name": "Damaged claim",
+        "kind": "notify",
+        "enabled": true,
+        "oneShot": true,
+        "nextRunAtEpoch": now.timeIntervalSince1970 - 5,
+        "activeOccurrence": ["state": "claimed"],
+    ]], to: runner.jobsPath)
+
+    let batch = try await runner.claimDueJobs(now: now, maxJobs: 1)
+    #expect(batch.jobs.isEmpty)
+    #expect(batch.recoveredUnknown.count == 1)
+    let data = try Data(contentsOf: runner.jobsPath)
+    let rows = try #require(try JSONSerialization.jsonObject(with: data) as? [[String: Any]])
+    let row = try #require(rows.first)
+    #expect(row["enabled"] as? Bool == false)
+    #expect(row["lastInvalidOccurrenceClaim"] != nil)
+}
+
+@Test("corrupt jobs.json fails closed and default repair preserves its bytes")
+func schedulerCorruptStateIsNeverReplacedWithGenesisDefaults() async throws {
+    let root = try selectionRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let runner = SchedulerDueJobRunner(root: root)
+    try FileManager.default.createDirectory(
+        at: runner.jobsPath.deletingLastPathComponent(), withIntermediateDirectories: true
+    )
+    let corrupt = Data(#"[{"id":"keep-me"}, BROKEN]"#.utf8)
+    try corrupt.write(to: runner.jobsPath)
+
+    await #expect(throws: (any Error).self) {
+        _ = try await runner.ensureDefaultCycleJobs(
+            now: Date(timeIntervalSince1970: 1_800_000_000)
+        )
+    }
+    await #expect(throws: (any Error).self) {
+        _ = try await runner.claimDueJobs(
+            now: Date(timeIntervalSince1970: 1_800_000_000), maxJobs: 1
+        )
+    }
+    #expect(try Data(contentsOf: runner.jobsPath) == corrupt)
+}
+
+@Test("wrong top-level scheduler shape fails closed without rewriting")
+func schedulerNonArrayStateIsPreserved() async throws {
+    let root = try selectionRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let runner = SchedulerDueJobRunner(root: root)
+    try FileManager.default.createDirectory(
+        at: runner.jobsPath.deletingLastPathComponent(), withIntermediateDirectories: true
+    )
+    let wrongShape = Data(#"{"jobs":[{"id":"keep-me"}]}"#.utf8)
+    try wrongShape.write(to: runner.jobsPath)
+
+    await #expect(throws: (any Error).self) {
+        _ = try await runner.selectDueJobs(
+            now: Date(timeIntervalSince1970: 1_800_000_000), maxJobs: 1
+        )
+    }
+    #expect(try Data(contentsOf: runner.jobsPath) == wrongShape)
+}
+
+@Test("settlement requires the exact active occurrence and clears it atomically")
+func update_requiresAndSettlesExactOccurrenceClaim() async throws {
+    let root = try selectionRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    let due = now.timeIntervalSince1970 - 15
+    let runner = SchedulerDueJobRunner(root: root)
+    try writeJobs([[
+        "id": "settle",
+        "name": "Settle",
+        "kind": "notify",
+        "enabled": true,
+        "oneShot": true,
+        "nextRunAtEpoch": due,
+    ]], to: runner.jobsPath)
+    let batch = try await runner.claimDueJobs(now: now, maxJobs: 1)
+    let job = try #require(batch.jobs.first)
+    let result = SchedulerDueJobRunner.JobResult(
+        status: "completed",
+        detail: "done",
+        output: .object([:])
+    )
+
+    try await runner.update(job: job, result: result, at: now)
+    let data = try Data(contentsOf: runner.jobsPath)
+    let rows = try #require(try JSONSerialization.jsonObject(with: data) as? [[String: Any]])
+    let row = try #require(rows.first)
+    #expect(row["activeOccurrence"] == nil)
+    #expect(row["lastOccurrenceKey"] as? String == job.occurrenceKey)
+    #expect(row["enabled"] as? Bool == false)
+}

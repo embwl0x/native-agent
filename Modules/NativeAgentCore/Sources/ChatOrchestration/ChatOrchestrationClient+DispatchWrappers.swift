@@ -352,10 +352,20 @@ public enum ChatTurnRuntimeContext {
         public let model: String
         public let surface: String
         public let personaID: String?
-        public init(model: String, surface: String, personaID: String? = nil) {
+        /// Exact provider/auth transport admitted for this turn. Keep this
+        /// separate from model-family inference: API key, OAuth-direct,
+        /// OpenRouter, and Codex may expose overlapping model names.
+        public let providerID: String?
+        public init(
+            model: String,
+            surface: String,
+            personaID: String? = nil,
+            providerID: String? = nil
+        ) {
             self.model = model
             self.surface = surface
             self.personaID = personaID
+            self.providerID = providerID
         }
     }
     @TaskLocal public static var current: Active?

@@ -36,6 +36,20 @@ public struct MacIntegrationPermission: Sendable, Codable, Equatable {
     }
 }
 
+public struct MacIntegrationPermissionMutationProvenance: Sendable, Equatable {
+    public let kind: String
+    public let decidedBy: String
+    public let clientID: String?
+
+    public static func local(decidedBy: String = "mac_operator") -> Self {
+        Self(kind: "local", decidedBy: decidedBy, clientID: nil)
+    }
+
+    public static func signedIOS(clientID: String, decidedBy: String = "ios_signed_operator") -> Self {
+        Self(kind: "signed_ios", decidedBy: decidedBy, clientID: clientID)
+    }
+}
+
 /// Persistence failures are authority failures, not permission defaults.
 /// Only a missing store may bootstrap from `defaultPermission(for:)`.
 public enum MacIntegrationPermissionStoreError: Error, Sendable, Equatable, LocalizedError {
@@ -271,6 +285,28 @@ public actor MacIntegrationPermissionStore {
     /// PersistenceCore. Read/write are clamped to axis support so a caller
     /// can't accidentally grant write to spotlight (or read to scheduler).
     public func set(integrationId: String, read: Bool, write: Bool) async throws {
+        _ = try await setWithReceipt(
+            integrationId: integrationId,
+            read: read,
+            write: write,
+            actionID: UUID().uuidString.lowercased(),
+            surface: "mac_ui",
+            provenance: .local()
+        )
+    }
+
+    /// One-generation permission mutation + provenance receipt. The receipt is
+    /// embedded in the same atomic authority document, so receipt validation or
+    /// persistence failure leaves the permission axes unchanged.
+    @discardableResult
+    public func setWithReceipt(
+        integrationId: String,
+        read: Bool,
+        write: Bool,
+        actionID: String,
+        surface: String,
+        provenance: MacIntegrationPermissionMutationProvenance
+    ) async throws -> MacIntegrationPermission {
         guard MacIntegrationID.all.contains(integrationId) else {
             throw NSError(
                 domain: "MacIntegrationPermissionStore",
@@ -281,9 +317,24 @@ public actor MacIntegrationPermissionStore {
         }
         let clampedRead = MacIntegrationID.supportsRead(integrationId) ? read : false
         let clampedWrite = MacIntegrationID.supportsWrite(integrationId) ? write : false
+        let actionID = actionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let surface = surface.trimmingCharacters(in: .whitespacesAndNewlines)
+        let decidedBy = provenance.decidedBy.trimmingCharacters(in: .whitespacesAndNewlines)
+        let clientID = provenance.clientID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !actionID.isEmpty, actionID.utf8.count <= 128,
+              !surface.isEmpty, surface.utf8.count <= 64,
+              !decidedBy.isEmpty, decidedBy.utf8.count <= 128,
+              provenance.kind == "local" || provenance.kind == "signed_ios",
+              provenance.kind != "signed_ios" || (clientID?.isEmpty == false && (clientID?.utf8.count ?? 0) <= 256) else {
+            throw NSError(
+                domain: "MacIntegrationPermissionStore",
+                code: -2,
+                userInfo: [NSLocalizedDescriptionKey: "Permission mutation provenance is invalid."]
+            )
+        }
 
         let path = storePath
-        try await persistence.withFileLock(path) {
+        return try await persistence.withFileLock(path) {
             // Read-modify-write inside the lock so concurrent writers don't
             // clobber each other's keys.
             // Missing is the only bootstrap-empty case. Existing unreadable,
@@ -291,6 +342,52 @@ public actor MacIntegrationPermissionStore {
             // a toggle cannot erase the evidence and silently resurrect
             // defaults for every sibling integration.
             var dict = try Self.loadRawStoreChecked(at: path)
+            let effectiveBefore: MacIntegrationPermission = {
+                guard case .object(let current)? = dict[integrationId] else {
+                    return MacIntegrationID.defaultPermission(for: integrationId)
+                }
+                let defaults = MacIntegrationID.defaultPermission(for: integrationId)
+                let beforeRead: Bool = {
+                    guard MacIntegrationID.supportsRead(integrationId),
+                          case .bool(let value)? = current["read"] else { return defaults.read }
+                    return value
+                }()
+                let beforeWrite: Bool = {
+                    guard MacIntegrationID.supportsWrite(integrationId),
+                          case .bool(let value)? = current["write"] else { return defaults.write }
+                    return value
+                }()
+                return MacIntegrationPermission(read: beforeRead, write: beforeWrite)
+            }()
+            var receipts: [JSONValue] = {
+                guard case .array(let rows)? = dict["_mutationReceipts"] else { return [] }
+                return rows
+            }()
+            if let existing = receipts.first(where: {
+                guard case .object(let object) = $0 else { return false }
+                return object["actionId"] == .string(actionID)
+            }) {
+                guard case .object(let object) = existing,
+                      object["integrationId"] == .string(integrationId),
+                      object["surface"] == .string(surface),
+                      case .object(let after)? = object["after"],
+                      after["read"] == .bool(clampedRead),
+                      after["write"] == .bool(clampedWrite),
+                      case .object(let priorProvenance)? = object["provenance"],
+                      priorProvenance["kind"] == .string(provenance.kind),
+                      priorProvenance["decidedBy"] == .string(decidedBy),
+                      priorProvenance["clientId"] == clientID.map(JSONValue.string) else {
+                    throw NSError(
+                        domain: "MacIntegrationPermissionStore",
+                        code: -3,
+                        userInfo: [NSLocalizedDescriptionKey:
+                            "Permission action id is already bound to a different mutation."]
+                    )
+                }
+                // Signed inbox retries are idempotent and, critically, an old
+                // retried action may not revert a newer local choice.
+                return effectiveBefore
+            }
             // Persist only the supported axes for this id (matches the
             // contract: the file does not store an entry for an axis the
             // integration doesn't have).
@@ -302,7 +399,31 @@ public actor MacIntegrationPermissionStore {
                 perEntry["write"] = .bool(clampedWrite)
             }
             dict[integrationId] = .object(perEntry)
+            var provenanceJSON: [String: JSONValue] = [
+                "kind": .string(provenance.kind),
+                "decidedBy": .string(decidedBy),
+            ]
+            if let clientID { provenanceJSON["clientId"] = .string(clientID) }
+            receipts.append(.object([
+                "kind": .string("mac_integration_permission_mutation.v1"),
+                "actionId": .string(actionID),
+                "surface": .string(surface),
+                "integrationId": .string(integrationId),
+                "before": .object([
+                    "read": .bool(effectiveBefore.read),
+                    "write": .bool(effectiveBefore.write),
+                ]),
+                "after": .object([
+                    "read": .bool(clampedRead),
+                    "write": .bool(clampedWrite),
+                ]),
+                "provenance": .object(provenanceJSON),
+                "recordedAt": .string(ISO8601DateFormatter().string(from: Date())),
+            ]))
+            if receipts.count > 500 { receipts = Array(receipts.suffix(500)) }
+            dict["_mutationReceipts"] = .array(receipts)
             try await self.persistence.writeJSON(.object(dict), to: path)
+            return MacIntegrationPermission(read: clampedRead, write: clampedWrite)
         }
     }
 
@@ -330,6 +451,36 @@ public actor MacIntegrationPermissionStore {
         }
         guard case .object(let dict) = raw else {
             throw MacIntegrationPermissionStoreError.invalidRoot
+        }
+
+        if let receiptValue = dict["_mutationReceipts"] {
+            guard case .array(let receipts) = receiptValue else {
+                throw MacIntegrationPermissionStoreError.malformedStore
+            }
+            for receipt in receipts {
+                guard case .object(let object) = receipt,
+                      object["kind"] == .string("mac_integration_permission_mutation.v1"),
+                      case .string(let actionID)? = object["actionId"], !actionID.isEmpty,
+                      case .string(let surface)? = object["surface"], !surface.isEmpty,
+                      case .string(let integrationID)? = object["integrationId"],
+                      MacIntegrationID.all.contains(integrationID),
+                      case .object(let before)? = object["before"],
+                      case .bool(_)? = before["read"], case .bool(_)? = before["write"],
+                      case .object(let after)? = object["after"],
+                      case .bool(_)? = after["read"], case .bool(_)? = after["write"],
+                      case .object(let provenance)? = object["provenance"],
+                      case .string(let provenanceKind)? = provenance["kind"],
+                      provenanceKind == "local" || provenanceKind == "signed_ios",
+                      case .string(let decidedBy)? = provenance["decidedBy"], !decidedBy.isEmpty,
+                      case .string(let recordedAt)? = object["recordedAt"], !recordedAt.isEmpty else {
+                    throw MacIntegrationPermissionStoreError.malformedStore
+                }
+                if provenanceKind == "signed_ios" {
+                    guard case .string(let clientID)? = provenance["clientId"], !clientID.isEmpty else {
+                        throw MacIntegrationPermissionStoreError.malformedStore
+                    }
+                }
+            }
         }
 
         // Unknown ids/fields are retained for forward compatibility. Every

@@ -37,7 +37,6 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-import CapabilityFoundry
 
 // W-H Band (U5 decomposition, move-only): improvement gauntlet + capability
 // pack install/rollback cluster, relocated verbatim into a same-module

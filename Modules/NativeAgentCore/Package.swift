@@ -108,7 +108,7 @@ let extraDeps: [String: [String]] = [
     "MemoryV2": ["PersistenceCore", "KnowledgeGraph", "ApprovalInbox"],
     "DreamREMCycle": ["PersistenceCore", "ProviderRouting", "KnowledgeGraph"],
     "SelfImprovement": ["PersistenceCore"],
-    "TrustCenter": ["PersistenceCore", "PersonaEngine", "ToolRegistry", "MCPDispatcher", "MacControl"],
+    "TrustCenter": ["PersistenceCore", "ToolRegistry", "MCPDispatcher", "MacControl"],
     "TelegramBot": ["PersistenceCore", "BackgroundLoops", "ProviderRouting"],
     "ProviderRouting": ["PersistenceCore"],
     "BackgroundLoops": ["PersistenceCore", "DoctorChecks", "DreamREMCycle", "ProviderRouting", "TriggerScheduler"],
@@ -166,8 +166,8 @@ let extraDeps: [String: [String]] = [
     // secret redactor every captured window title passes through (W5). We reuse
     // it rather than writing a second redactor: two copies drift, and the copy
     // that drifts is the one nobody re-reviews. No cycle — MacControl depends
-    // only on PersistenceCore, and nothing in the tree depends on ActivityWatch
-    // except its own CLI.
+    // only on PersistenceCore. ChatOrchestration reaches ActivityWatch through
+    // one pinned query adapter, and the Mac app owns the capture lifecycle.
     "ActivityWatch": ["PersistenceCore", "MacControl"],
 ]
 
@@ -175,7 +175,6 @@ let extraDeps: [String: [String]] = [
 let externalDeps: [String: [Target.Dependency]] = [
     "CognitiveSubstrate": [.product(name: "GRDB", package: "GRDB.swift")],
     "Context": [.product(name: "GRDB", package: "GRDB.swift")],
-    "MCPDispatcher": [.product(name: "GRDB", package: "GRDB.swift")],
     "MemoryV2": [.product(name: "GRDB", package: "GRDB.swift")],
     // F6 (eval E06 fix-2): KnowledgeGraph reader now queries the same
     // memory.sqlite the MemoryV2 actor writes (kg_entities + kg_relationships
@@ -259,7 +258,6 @@ let package = Package(
             dependencies: [
                 .target(name: "NativeAgentCore"),
                 .target(name: "ChatOrchestration"),
-                .target(name: "CognitiveSubstrate"),
                 .target(name: "Context"),
                 .target(name: "PersistenceCore"),
                 .target(name: "ProviderRouting"),

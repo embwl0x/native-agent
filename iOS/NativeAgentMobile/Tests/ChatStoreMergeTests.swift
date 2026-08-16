@@ -259,6 +259,104 @@ final class ChatStoreMergeTests: XCTestCase {
                       "a late cancellation without an active placeholder must not stop the new turn")
     }
 
+    func test_publishedTranscriptUpdatesVisibleNonemptySession() {
+        let defaults = isolatedDefaults()
+        let store = ChatStore(defaults: defaults, restoreQueuedSends: false)
+        store.replaceMainSessionID("phone-main")
+        store.setSelectedSessionID("phone-main")
+        let user = msg(.user, "already visible")
+        let firstReply = msg(.assistant, "first reply")
+        store.messages = [user, firstReply]
+        let externalUser = msg(.user, "message from the Mac")
+        let externalReply = msg(.assistant, "Mac-side reply")
+
+        store.applyMacTranscriptSnapshot(
+            [user, firstReply, externalUser, externalReply],
+            sessionID: "phone-main"
+        )
+
+        XCTAssertEqual(store.messages.map(\.id), [user, firstReply, externalUser, externalReply].map(\.id))
+    }
+
+    func test_publishedTranscriptUpdatesContentWhenIdentityIsStable() {
+        let defaults = isolatedDefaults()
+        let store = ChatStore(defaults: defaults, restoreQueuedSends: false)
+        store.replaceMainSessionID("phone-main")
+        store.setSelectedSessionID("phone-main")
+        let replyID = UUID()
+        store.messages = [msg(.assistant, "old content", id: replyID)]
+
+        store.applyMacTranscriptSnapshot(
+            [msg(.assistant, "corrected content", id: replyID)],
+            sessionID: "phone-main"
+        )
+
+        XCTAssertEqual(store.messages.first?.text, "corrected content")
+    }
+
+    func test_publishedTranscriptPreservesPendingLocalStream() {
+        let defaults = isolatedDefaults()
+        let store = ChatStore(defaults: defaults, restoreQueuedSends: false)
+        store.replaceMainSessionID("phone-main")
+        store.setSelectedSessionID("phone-main")
+        let existingUser = msg(.user, "earlier")
+        let existingReply = msg(.assistant, "earlier reply")
+        let pendingUser = msg(.user, "still sending")
+        var placeholder = msg(.assistant, "partial")
+        placeholder.isStreaming = true
+        placeholder.toolEvents = [ToolEvent(name: "read_file", seq: 1)]
+        store.messages = [existingUser, existingReply, pendingUser, placeholder]
+        store.pendingSendArgs["pending"] = ChatStore.PendingSendArgs(
+            text: pendingUser.text,
+            sessionID: "phone-main",
+            controls: .defaults,
+            attachments: [],
+            appendedUserId: pendingUser.id
+        )
+        store.pendingICloudPlaceholders["pending"] = placeholder.id
+        store.isLoading = true
+
+        store.applyMacTranscriptSnapshot(
+            [existingUser, existingReply],
+            sessionID: "phone-main"
+        )
+
+        XCTAssertTrue(store.messages.contains(where: { $0.id == pendingUser.id }))
+        let retained = store.messages.first(where: { $0.id == placeholder.id })
+        XCTAssertEqual(retained?.text, "partial")
+        XCTAssertEqual(retained?.toolEvents, placeholder.toolEvents)
+        XCTAssertTrue(retained?.isStreaming == true)
+        XCTAssertTrue(store.isLoading)
+    }
+
+    func test_publishedTranscriptForAnotherSessionCannotClobberVisibleChat() {
+        let defaults = isolatedDefaults()
+        let store = ChatStore(defaults: defaults, restoreQueuedSends: false)
+        store.replaceMainSessionID("phone-main")
+        store.setSelectedSessionID("phone-main")
+        let visible = msg(.assistant, "keep visible")
+        store.messages = [visible]
+
+        store.applyMacTranscriptSnapshot(
+            [msg(.assistant, "other session")],
+            sessionID: "different-session"
+        )
+
+        XCTAssertEqual(store.messages, [visible])
+    }
+
+    func test_snapshotSignalGroupsDistinguishesTargetedChatPublication() {
+        XCTAssertEqual(
+            iCloudSyncEngine.snapshotSignalGroups("2026-08-16T01:02:03Z|groups=chat,core"),
+            Set([.chat, .core])
+        )
+        XCTAssertEqual(
+            iCloudSyncEngine.snapshotSignalGroups("2026-08-16T01:02:03Z|groups=activity"),
+            Set([.activity])
+        )
+        XCTAssertNil(iCloudSyncEngine.snapshotSignalGroups("2026-08-16T01:02:03Z"))
+    }
+
     // The vanish repro: snapshot is a strict prefix of local resolved state.
     func test_stale_snapshot_does_not_drop_resolved_turns() {
         let u1 = msg(.user, "first question")
@@ -626,18 +724,11 @@ final class ChatStoreMergeTests: XCTestCase {
         XCTAssertFalse(store.isLoading, "the current session's final reply must still resolve normally")
     }
 
-    // F3-H1 (round-3 audit): the HMAC signature self-heal retry must sign with
-    // the REFRESHED secret. The retry send is nested inside the refresh Task
-    // (`await refreshFromKVS(); send(...)`), so it runs strictly AFTER the KVS
-    // refresh completes. This pins that ordering: the retry send does NOT fire
-    // synchronously from receiveICloudRejection — the pre-fix bug, where a
-    // detached `Task { await refreshFromKVS() }` was followed by an immediate
-    // synchronous `send(...)`. That send re-signed with the STALE secret while
-    // the refresh Task was still suspended at the KVS synchronize; with the
-    // single retry slot already consumed, the second signature_invalid rejection
-    // fell through to failPendingReply and the message was permanently dropped
-    // on exactly the stale-secret event this path exists to heal.
-    func test_signatureSelfHeal_retrySendRunsAfterKVSRefresh() async {
+    // An invalid/unsigned envelope may wake a KVS refresh, but it cannot replay
+    // a locally pending message unless that refresh durably installs a different
+    // key. A simulator without KVS change therefore surfaces re-pair guidance
+    // and leaves no fresh send behind.
+    func test_signatureSelfHeal_doesNotReplayWithoutDurableKeyChange() async {
         let store = ChatStore(restoreQueuedSends: false)
         let client = MacBridgeClient()   // held strong — pendingRetryClient is weak
         let pairing = PairingStore()     // held strong — pairingStoreRef is weak
@@ -650,7 +741,6 @@ final class ChatStoreMergeTests: XCTestCase {
         store.messages = [msg(.user, "signed question"), placeholder]
         store.isLoading = true
         store.pendingICloudPlaceholders[correlation] = placeholder.id
-        store.streamingHintsByMessageId[placeholder.id] = "Sending"
         store.pendingSendArgs[correlation] = ChatStore.PendingSendArgs(
             text: "signed question",
             sessionID: "session",
@@ -665,51 +755,31 @@ final class ChatStoreMergeTests: XCTestCase {
             reason: "signature_invalid"
         ))
 
-        // SYNCHRONOUS: the retry slot is consumed and the old placeholder torn
-        // down immediately, but the actual send is deferred behind the refresh
-        // await. Pre-fix, send() ran here synchronously — appending a fresh
-        // streaming placeholder and setting isLoading=true while signing with
-        // the stale secret. These assertions fail against the pre-fix ordering.
+        // SYNCHRONOUS: reserve the one refresh attempt, but preserve local UI
+        // state until the KVS result is known.
         XCTAssertTrue(store.retriedSignatureCorrelations.contains(correlation),
-                      "the single retry slot is consumed")
-        XCTAssertNil(store.pendingICloudPlaceholders[correlation],
-                     "old placeholder removed during synchronous cleanup")
-        XCTAssertFalse(store.isLoading,
-                       "cleanup ran; the retry send has NOT fired yet")
-        XCTAssertTrue(store.messages.allSatisfy { !$0.isStreaming },
-                      "no new streaming placeholder — send is deferred behind refreshFromKVS()")
+                      "the single refresh slot is reserved")
+        XCTAssertNotNil(store.pendingICloudPlaceholders[correlation])
+        XCTAssertTrue(store.isLoading)
         XCTAssertTrue(store.streamingHintsByMessageId.isEmpty,
-                      "no 'Sending' hint yet — the retry send has not run")
+                      "no retry send may fire before a durable key change")
 
-        // Drain the MainActor until the refresh Task resolves and the deferred
-        // send fires. Bounded (no blind sleep). Ceiling is comfortably past the
-        // refresh's internal KVS-synchronize timeout (2s) — on a simulator with
-        // no live iCloud, refreshFromKVS resolves via that timeout, then send
-        // runs; the ceiling must exceed it so we observe the send, not a false
-        // negative from exiting on the same 2s boundary.
-        //
-        // The signal is `streamingHintsByMessageId` becoming non-empty: send()
-        // sets it ("Sending") synchronously at the head of its body, and the
-        // fast-fail path (no iCloud in the simulator → sendMessage throws) tears
-        // the placeholder down and flips isLoading back to false WITHOUT
-        // clearing this hint. So isLoading / isStreaming are transient and race
-        // the failure teardown, but the hint durably records that the retry send
-        // ran — which is exactly what we need to prove (send fired post-refresh,
-        // the message was not dropped). We assert it was empty synchronously
-        // above, so its appearance here is unambiguously the retry send.
-        var sendFired = false
+        // Wait past the bounded KVS refresh. With no new KVS material, the
+        // original placeholder becomes explicit re-pair guidance and no new
+        // transport send is created.
+        var refreshResolved = false
         for _ in 0..<600 {   // ~6s ceiling > 2s KVS-synchronize timeout
             await Task.yield()
-            if !store.streamingHintsByMessageId.isEmpty
-                || store.isLoading
-                || store.messages.contains(where: { $0.isStreaming }) {
-                sendFired = true
+            if store.pendingICloudPlaceholders[correlation] == nil {
+                refreshResolved = true
                 break
             }
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
-        XCTAssertTrue(sendFired,
-                      "the retry send fires AFTER refreshFromKVS completes — the message is not dropped")
+        XCTAssertTrue(refreshResolved)
+        XCTAssertTrue(store.streamingHintsByMessageId.isEmpty)
+        XCTAssertFalse(store.isLoading)
+        XCTAssertEqual(store.errorBanner, "Pairing out of sync — re-pair?")
     }
 
     func test_sharedIdentityUsesProfileNameAndNeutralFallback() {

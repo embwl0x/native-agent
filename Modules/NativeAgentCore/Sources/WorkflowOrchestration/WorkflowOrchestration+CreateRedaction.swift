@@ -10,6 +10,7 @@ import SystemOps
 // MARK: - Create-side normalization (shared, pure) — mirror Runtime.create_workflow
 
 public enum WorkflowCreate {
+    public static let maximumStepCount = 24
     /// Python `value[:n]` slices by Unicode CODE POINTS, not grapheme clusters.
     /// Mirror it exactly so `name[:120]`, `description[:1000]`, `trigger[:200]`,
     /// `title[:160]`, `kind[:80]` are byte-identical across the cutover.
@@ -345,14 +346,17 @@ public enum WorkflowCreate {
                 "requiresApproval": .bool(false),
             ])]
         }
-        // record_trace's stepCount = len(normalized_steps) — the count AFTER the
-        // empty-default replacement but BEFORE the steps[:24] slice (Python never
-        // reassigns normalized_steps to the capped list; only the workflow dict
-        // gets steps=normalized_steps[:24]). Capture the UNCAPPED count for the
-        // trace (gpt-5.5 review finding #1, 2026-06-02).
-        let uncappedStepCount = normalized.count
-        // steps[:24]
-        if normalized.count > 24 { normalized = Array(normalized.prefix(24)) }
+        // Never silently amputate a large project. The retired daemon used
+        // steps[:24], which made a successfully-saved workflow look complete
+        // while losing the tail. Refuse before any registry/activity mutation
+        // so the caller can decompose the work explicitly.
+        guard normalized.count <= maximumStepCount else {
+            throw WorkflowOrchestrationError.tooManySteps(
+                count: normalized.count,
+                maximum: maximumStepCount
+            )
+        }
+        let stepCount = normalized.count
         // description = str(body.get("description") or "").strip()[:1000]
         let descRaw = pyBool(objField(body, "description")) ? pyStr(objField(body, "description")) : ""
         let description = codepointPrefix(strip(descRaw), 1000)
@@ -361,8 +365,9 @@ public enum WorkflowCreate {
         // trigger = str(body.get("trigger") or "").strip()[:200]
         let triggerRaw = pyBool(objField(body, "trigger")) ? pyStr(objField(body, "trigger")) : ""
         let trigger = codepointPrefix(strip(triggerRaw), 200)
-        // engineVersion = str(body.get("engineVersion") or body.get("engine_version") or "1")
-        let engineVersion = firstNonEmptyOr(body, ["engineVersion", "engine_version"], fallback: "1")
+        // New workflows use the durable v2 state machine by default. Explicit
+        // v1 remains readable for legacy dry-run compatibility.
+        let engineVersion = firstNonEmptyOr(body, ["engineVersion", "engine_version"], fallback: "2")
         // variables = body.get("variables") if isinstance(..., dict) else {}
         let variables = objOrEmpty(body, "variables")
         let record: JSONValue = .object([
@@ -377,7 +382,7 @@ public enum WorkflowCreate {
             "createdAt": .string(now),
             "updatedAt": .string(now),
         ])
-        return (workflowId, record, uncappedStepCount)
+        return (workflowId, record, stepCount)
     }
 
     /// First TRUTHY (Python `or`) of body[keys] str()'d, else fallback — used
@@ -402,6 +407,7 @@ public enum WorkflowOrchestrationError: Error, Equatable, LocalizedError {
     /// return a 500; the native client throws so the caller surfaces the same
     /// failure rather than silently coercing to 0.
     case invalidTimeout(String)
+    case tooManySteps(count: Int, maximum: Int)
 
     public var errorDescription: String? {
         switch self {
@@ -411,6 +417,8 @@ public enum WorkflowOrchestrationError: Error, Equatable, LocalizedError {
             return "workflow '\(id)' is not runnable: \(reasons.joined(separator: "; "))"
         case .invalidTimeout(let value):
             return "invalid workflow timeout: \(value)"
+        case .tooManySteps(let count, let maximum):
+            return "workflow has \(count) steps; maximum is \(maximum). Break the project into Desk children or multiple workflows."
         }
     }
 }

@@ -258,17 +258,11 @@ extension NativeClient {
     /// review, 2026-06-10): prefer the launch-attached SHARED storage —
     /// `SwiftNativeMemoryV2.shared.underlyingBridge().underlyingStorage()` —
     /// so USER.md regen / Spotlight / KG hooks fire on the kind stamps
-    /// (same rule as updateMemory/deleteMemory, F2). The direct
-    /// `MemoryStorage(dataRoot:)` open is the documented fallback only:
-    /// custom dataRoot (tests run on temp roots — the shared instance is
-    /// rooted at the default dataRoot, so it would target the WRONG store)
-    /// or the bridge not yet attached at call time.
+    /// (same rule as updateMemory/deleteMemory, F2). The shared resolver opens
+    /// a private store only for custom roots; an unavailable live owner fails
+    /// closed instead of silently creating a hookless default-root fallback.
     private static func kindBackfillStorage(dataRoot: URL) async throws -> MemoryStorage {
-        if dataRoot.path == PersistenceCore.defaultDataRoot().path,
-           let bridge = await SwiftNativeMemoryV2.shared.underlyingBridge() {
-            return await bridge.underlyingStorage()
-        }
-        return try MemoryStorage(dataRoot: dataRoot)
+        try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
     }
 
     /// Stages the kind-backfill approval card if the legacy kind-less rows

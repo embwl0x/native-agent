@@ -39,7 +39,6 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-import CapabilityFoundry
 
 
 extension NativeClient {
@@ -265,7 +264,8 @@ extension NativeClient {
     /// the policy file lock and replaces it with the derived
     /// `fullMacExpiresAt` (on-disk confirmedAt + hours). The `__` prefix
     /// marks it as transport-only, not a policy field.
-    static let fullMacExpiryDurationIntentKey = "__fullMacExpiryDurationIntentHours"
+    static let fullMacExpiryDurationIntentKey =
+        SwiftNativeTrustCenter.fullMacExpiryDurationIntentKey
 
     /// Pure patch-body builder for the Full Mac duration picker.
     ///
@@ -311,52 +311,6 @@ extension NativeClient {
             body[fullMacExpiryDurationIntentKey] = h
         }
         return body
-    }
-
-    /// Consume `fullMacExpiryDurationIntentKey` from a trust patch — MUST
-    /// run inside the policy-file lock with the freshly read on-disk dict.
-    /// With a gate-parseable on-disk `fullMacConfirmedAt`, the explicit
-    /// `fullMacExpiresAt` becomes confirmedAt + hours. With no (or an
-    /// unparseable) stamp, `fullMacExpiresAt` stays cleared ("") — the
-    /// Trust Center reconfirm flow re-applies the duration after stamping,
-    /// which fills it in.
-    ///
-    /// Parsing uses the GATE's own parser (`MacControlGate.parseISO8601`,
-    /// review blocker fix 2026-06-10): the gate accepts naive/date-only
-    /// timestamps that `AppModel.tolerantISO8601Date` rejects, and a
-    /// gate-valid-but-ISO-invalid confirmedAt previously produced an empty
-    /// expiresAt → the gate clamped the "48h" pick to its 24h window while
-    /// the picker claimed 48h. Read-only reuse; no gate behavior change.
-    static func resolveFullMacExpiryIntent(
-        _ patch: [String: JSONValue],
-        onDisk current: [String: JSONValue]
-    ) -> [String: JSONValue] {
-        var out = patch
-        guard let intent = out.removeValue(forKey: fullMacExpiryDurationIntentKey) else {
-            return out
-        }
-        let hours: Double? = {
-            switch intent {
-            case .double(let d): return d
-            case .int(let i): return Double(i)
-            default: return nil
-            }
-        }()
-        // Intent is only ever attached for >24h picks; drop anything else.
-        guard let h = hours, h > 24 else { return out }
-        let confirmedRaw: String = {
-            if case .string(let s)? = current["fullMacConfirmedAt"] {
-                return s.trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-            return ""
-        }()
-        guard !confirmedRaw.isEmpty,
-              let anchor = MacControlGate.parseISO8601(confirmedRaw) else {
-            return out // expiresAt stays "" from the base body
-        }
-        out["fullMacExpiresAt"] = .string(
-            SwiftNativeManifestSigner.isoTimestamp(anchor.addingTimeInterval(h * 3600)))
-        return out
     }
 
     static func macControlPolicyForAccessMode(_ mode: String, remoteFromIosAllowed: Bool = false, developerMode: Bool = false) -> [String: Any] {

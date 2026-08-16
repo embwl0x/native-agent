@@ -39,7 +39,6 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-import CapabilityFoundry
 
 
 extension NativeClient {
@@ -172,7 +171,7 @@ extension NativeClient {
     // a read-only preview of active memories + pending proposals.
     func triggerMemoryConsolidation(dryRun: Bool) async throws -> [String: Any] {
         let dataRoot = PersistenceCore.defaultDataRoot()
-        let storage = try MemoryStorage(dataRoot: dataRoot)
+        let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
         if dryRun {
             let active = (try? await storage.listMemories(persona: nil, status: "active", limit: nil).count) ?? 0
             let pending = (try? await storage.listProposals(status: "pending").count) ?? 0

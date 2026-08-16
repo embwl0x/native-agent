@@ -4,9 +4,11 @@
 //   - iCloud Drive (NSMetadataQuery): chat history, attachments, full message payloads
 // No Apple Developer cert required. Works on free Apple ID.
 // Container: configured by NativeAgentICloudBridgeConstants.
-// CloudKit (Option C) is the v2 upgrade path — see docs/mobile_companion.md
+// CloudKit is the selected public transport; KVS/Drive remains an explicit
+// diagnostic and compatibility fallback.
 
 import Foundation
+import AppKit
 import SwiftUI
 import NativeAgentShared
 import PersistenceCore
@@ -34,15 +36,15 @@ final class iCloudBridge: ObservableObject {
     // CK-3b: the device-sync transport SEAM. Non-nil ⇒ CloudKit is the active
     // transport (resolver selected `.cloudkit` AND the entitlement is present —
     // makeCloudKitTransport enforces the crash-guard). nil ⇒ the legacy
-    // KVS/ubiquity path below runs unchanged. The resolver defaults `.kvs`, so
-    // this stays nil until CK-4 bakes the flag → zero runtime change here.
+    // KVS/ubiquity path below runs unchanged.
     private var deviceTransport: DeviceSyncTransport?
     var usesCloudKitDeviceTransport: Bool { deviceTransport != nil }
     private(set) var cloudKitVisualNotificationPeerReady: Bool = false
     // CK-3c: single-flight guard for the transport drain (timer + observe +
     // on-demand triggers coalesce; per-message delivery is already atomic in the
-    // transport) + the flag-gated poll task (Mac has no APNs push handler, so it
-    // polls the transport while CloudKit is active).
+    // transport) + a dynamic fallback poll. APNs is the normal wake path when
+    // registration succeeds; development/ad-hoc builds without APS retain the
+    // fast poll rather than silently losing phone messages.
     private var deviceDrainInFlight = false
     private var deviceDrainQueued = false
     private var deviceDrainTimerTask: Task<Void, Never>?
@@ -180,6 +182,29 @@ final class iCloudBridge: ObservableObject {
         // before resolving the legacy Documents container.
         configureDeviceTransportIfAvailable()
 
+        // A successfully constructed CloudKit transport is the runtime
+        // capability proof for the public lane. Keep KVS as a best-effort
+        // control/progress nudge, but do not mount or scan the retired Drive
+        // data plane. If CloudKit is unavailable (or the build selects KVS),
+        // setup falls through to the complete legacy path unchanged.
+        if deviceTransport != nil {
+            MacSyncEngine.shared.startCloudKitSnapshotProjection()
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(kvsDidChange(_:)),
+                name: NSUbiquitousKeyValueStore.didChangeExternallyNotification,
+                object: nil
+            )
+            Task.detached(priority: .utility) {
+                _ = await withCKTimeout("iCloudBridge.setup.cloudKitKVSNudge") {
+                    NSUbiquitousKeyValueStore.default.synchronize()
+                }
+            }
+            available = true
+            syncStatus = "CloudKit ready"
+            return
+        }
+
         // 2026-05-28 fix: FileManager.default.url(forUbiquityContainerIdentifier:)
         // is SYNCHRONOUS and can block for many seconds (sometimes 30s+) on first
         // launch while the iCloud container mounts. Running it on the @MainActor
@@ -206,19 +231,6 @@ final class iCloudBridge: ObservableObject {
         // Ignore a stale resolve from a superseded setup()/tearDown().
         guard generation == setupGeneration, isSetUp else { return }
         guard let containerURL else {
-            if DeviceSyncTransportResolver.bridgeCanStart(
-                cloudKitTransportActive: deviceTransport != nil,
-                ubiquityContainerAvailable: false
-            ) {
-                // Transport selection is now final: there is no Drive root to
-                // replace this cache. Starting projection here avoids building
-                // the same heavy snapshots once for the temporary CloudKit
-                // cache and again moments later when Drive resolves.
-                MacSyncEngine.shared.startCloudKitSnapshotProjection()
-                available = true
-                syncStatus = "CloudKit ready — iCloud Drive unavailable"
-                return
-            }
             // Reset isSetUp so the caller can retry later once iCloud signs in.
             isSetUp = false
             available = false
@@ -285,7 +297,7 @@ final class iCloudBridge: ObservableObject {
 
     /// Starts the checked CloudKit transport without depending on iCloud Drive.
     /// The factory remains the sole entitlement/crash guard. Legacy KVS/Drive
-    /// setup proceeds independently and is still used when this returns nil.
+    /// setup is retained only when this returns nil.
     private func configureDeviceTransportIfAvailable() {
         guard deviceTransport == nil else { return }
         let containerID = NativeAgentICloudBridgeConstants.containerID
@@ -316,20 +328,49 @@ final class iCloudBridge: ObservableObject {
             }
         }
         Task {
-            _ = await PairingSecretManager.publishMaterial(to: transport)
+            let pairingPublished = await PairingSecretManager.publishMaterial(to: transport)
+            if !pairingPublished {
+                self.syncStatus = "iPhone pairing unavailable — check the Mac pairing key and iCloud"
+            }
             _ = await self.publishProviderCatalogStatus()
         }
 
-        // Mac has no APNs push handler, so poll while CloudKit is active.
-        // This is transport-only and does not depend on a Drive mount.
+        startDeviceDrainFallback(every: 8)
+        NSApplication.shared.registerForRemoteNotifications(matching: [])
+    }
+
+    private func startDeviceDrainFallback(every interval: TimeInterval) {
         deviceDrainTimerTask?.cancel()
         deviceDrainTimerTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 8_000_000_000)
+                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
                 if Task.isCancelled { break }
                 await self?.drainDeviceTransport()
             }
         }
+    }
+
+    /// APNs registration is a runtime capability: release builds normally have
+    /// it, while local development builds may not. Keep a low-rate integrity
+    /// fallback even with push so a lost notification never strands a message.
+    func cloudKitPushRegistrationSucceeded() {
+        guard deviceTransport != nil else { return }
+        startDeviceDrainFallback(every: 5 * 60)
+    }
+
+    func cloudKitPushRegistrationFailed(_ error: Error) {
+        guard deviceTransport != nil else { return }
+        NSLog("[iCloudBridge] CloudKit push unavailable; retaining polling fallback: %@",
+              error.localizedDescription)
+        startDeviceDrainFallback(every: 8)
+    }
+
+    func recognizesCloudKitRemoteNotification(_ userInfo: [AnyHashable: Any]) -> Bool {
+        CloudKitDeviceTransport.isDeviceSyncNotification(userInfo)
+    }
+
+    func handleCloudKitPushWake() async {
+        _ = await drainDeviceTransport()
     }
 
     /// Republishes the current canonical secret after an explicit rotation.
@@ -339,6 +380,14 @@ final class iCloudBridge: ObservableObject {
     func publishCurrentPairingSecret() async -> Bool {
         guard let deviceTransport else { return false }
         return await PairingSecretManager.publishMaterial(to: deviceTransport)
+    }
+
+    /// Publish the exact bytes returned by the atomic rotation transaction.
+    /// This avoids a second disk read becoming a different authority decision.
+    @discardableResult
+    func publishPairingSecret(_ secret: Data) async -> Bool {
+        guard let deviceTransport else { return false }
+        return await PairingSecretManager.publishMaterial(secret, to: deviceTransport)
     }
 
     // MARK: - Drive directory bootstrap
@@ -373,9 +422,11 @@ final class iCloudBridge: ObservableObject {
         // Phase 14e-iCloud: sign with the pairing secret. PairingSecretManager
         // is the Mac-side single source of truth (used by MacSyncEngine for
         // the action channel) — same secret signs both channels so iOS can
-        // verify with one key.  loadOrGenerateSecret() always returns Data.
-        let secret = PairingSecretManager.loadOrGenerateSecret()
-        let msg = (try? unsigned.signed(with: secret)) ?? unsigned
+        // verify with one key. Pairing state must be durable and checked before
+        // any message is signed or published; an unavailable local secret may
+        // never degrade into an unsigned transport message.
+        let secret = try PairingSecretManager.loadOrGenerateSecret()
+        let msg = try unsigned.signed(with: secret)
 
         // CK-3b: CloudKit transport path. The signed BridgeMessage rides verbatim
         // in the record's payloadJSON (lossless — signature preserved), so iOS
@@ -384,7 +435,7 @@ final class iCloudBridge: ObservableObject {
         // producing a clear user-facing error instead of an opaque server failure.
         if let ck = deviceTransport {
             try await ck.send(msg)
-            await recordChatDeliveryReceipt(msg, transport: "cloudkit")
+            await recordChatDeliveryReceipt(msg, transport: "cloudkit", secret: secret)
             // CK-5: fire the lightweight KVS "new message" nudge so the peer drains
             // CloudKit IMMEDIATELY — an event-driven foreground trigger (fires on
             // send, not on a timer, so no idle churn / scroll bounce), and it works
@@ -402,7 +453,7 @@ final class iCloudBridge: ObservableObject {
             return msg
         }
 
-        // Legacy KVS/ubiquity path (default until CK-4 bakes the flag).
+        // Explicit/fail-safe legacy KVS/ubiquity path.
         guard let docsURL = driveURL else {
             throw BridgeError.containerUnavailable
         }
@@ -416,7 +467,7 @@ final class iCloudBridge: ObservableObject {
         try await Task.detached(priority: .utility) { [data, outboxURL] in
             try data.write(to: outboxURL, options: .atomic)
         }.value
-        await recordChatDeliveryReceipt(msg, transport: "icloud_drive")
+        await recordChatDeliveryReceipt(msg, transport: "icloud_drive", secret: secret)
 
         // KVS trigger: notify iOS side that a new file is waiting in Drive
         let triggerValue = "\(ISO8601DateFormatter().string(from: Date())):\(msg.id)"
@@ -452,14 +503,17 @@ final class iCloudBridge: ObservableObject {
             correlationID: correlationID,
             metadata: ["kind": "icloud_action_response"]
         )
-        let secret = PairingSecretManager.loadOrGenerateSecret()
+        let secret = try PairingSecretManager.loadOrGenerateSecret()
         try await deviceTransport.send(unsigned.signed(with: secret))
         lastSyncAt = Date()
         syncStatus = "Sent action response via CloudKit"
     }
 
-    private func recordChatDeliveryReceipt(_ message: BridgeMessage, transport: String) async {
-        let secret = PairingSecretManager.loadOrGenerateSecret()
+    private func recordChatDeliveryReceipt(
+        _ message: BridgeMessage,
+        transport: String,
+        secret: Data
+    ) async {
         let row: JSONValue = .object([
             "at": .string(ISO8601DateFormatter().string(from: Date())),
             "messageId": .string(message.id),
@@ -700,11 +754,12 @@ final class iCloudBridge: ObservableObject {
             correlationID: correlationID,
             metadata: compactMetadata
         )
-        let secret = PairingSecretManager.loadOrGenerateSecret()
         let msg: BridgeMessage
         do {
+            let secret = try PairingSecretManager.loadOrGenerateSecret()
             msg = try unsigned.signed(with: secret)
         } catch {
+            syncStatus = "iPhone pairing unavailable — repair the Mac pairing key"
             NSLog("[iCloudBridge] failed to sign KVS progress msg=%@: %@", correlationID, "\(error)")
             return false
         }
@@ -769,7 +824,14 @@ final class iCloudBridge: ObservableObject {
     private func handleIncomingFromTransport(_ msg: BridgeMessage) async -> Bool {
         // Already handled (persistent seen-set; the transport also dedups by id).
         if seenMessageIDs.contains(msg.id) { return true }
-        let secret = PairingSecretManager.loadOrGenerateSecret()
+        let secret: Data
+        do {
+            secret = try PairingSecretManager.loadOrGenerateSecret()
+        } catch {
+            syncStatus = "iPhone pairing unavailable — repair the Mac pairing key"
+            NSLog("[iCloudBridge] deferring iOS→Mac CK msg %@: %@", msg.id, error.localizedDescription)
+            return false
+        }
         // HMAC — a CK record is no more trusted than a Drive file. Verify or drop.
         // (Full resync self-heal parity — republish secret + resync hint — is a
         // follow-up; it needs pairing-over-CK wired first. Drop+log is secure.)
@@ -864,10 +926,17 @@ final class iCloudBridge: ObservableObject {
             outboxScanQueued = true
             return
         }
-        outboxScanInFlight = true
         let seenSnapshot = seenMessageIDs
         let inFlightSnapshot = inFlightIncomingMessageIDs
-        let secret = PairingSecretManager.loadOrGenerateSecret()
+        let secret: Data
+        do {
+            secret = try PairingSecretManager.loadOrGenerateSecret()
+        } catch {
+            syncStatus = "iPhone pairing unavailable — repair the Mac pairing key"
+            NSLog("[iCloudBridge] pairing authority unavailable during Drive scan: %@", error.localizedDescription)
+            return
+        }
+        outboxScanInFlight = true
         outboxScanTask = Task.detached(priority: .utility) { [docsURL, seenSnapshot, inFlightSnapshot, secret] in
             let scan = Self.scanIosOutboxFiles(
                 docsURL: docsURL,
@@ -1201,9 +1270,15 @@ final class iCloudBridge: ObservableObject {
     @objc private nonisolated func kvsDidChange(_ note: Notification) {
         let changedKeys = note.userInfo?[NSUbiquitousKeyValueStoreChangedKeysKey] as? [String]
         Task { @MainActor in
-            if let changed = changedKeys, changed.contains(KVSKey.newMessageInDrive) {
-                self.syncStatus = "KVS trigger received — checking Drive…"
-                self.checkIosOutbox()
+            let messageChanged = changedKeys == nil
+                || changedKeys?.contains(KVSKey.newMessageInDrive) == true
+            if messageChanged {
+                if self.deviceTransport != nil {
+                    _ = await self.drainDeviceTransport()
+                } else {
+                    self.syncStatus = "KVS trigger received — checking Drive…"
+                    self.checkIosOutbox()
+                }
             }
         }
     }

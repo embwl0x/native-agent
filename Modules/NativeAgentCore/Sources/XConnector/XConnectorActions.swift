@@ -180,7 +180,10 @@ public enum XConnectorActions {
     }
 
     private static func saveOAuth2Token(_ tokens: [String: Any]) throws {
-        let path = oauth2TokenPath()
+        try saveOAuth2Token(tokens, to: oauth2TokenPath())
+    }
+
+    static func saveOAuth2Token(_ tokens: [String: Any], to path: URL) throws {
         try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
         let data = try JSONSerialization.data(withJSONObject: tokens, options: [.prettyPrinted, .sortedKeys])
         try data.write(to: path, options: .atomic)
@@ -201,15 +204,17 @@ public enum XConnectorActions {
     /// other caller awaits the same Task's value, and once the Task
     /// completes (success or failure) `inFlight` is cleared so the next
     /// expired call can start fresh.
-    private actor RefreshGate {
+    actor RefreshGate {
         static let shared = RefreshGate()
         private var inFlight: Task<String, Error>?
 
-        func resolveBearer() async throws -> String {
+        func resolveBearer(
+            using operation: @escaping @Sendable () async throws -> String
+        ) async throws -> String {
             if let existing = inFlight {
                 return try await existing.value
             }
-            let task = Task { try await XConnectorActions.currentBearerLocked() }
+            let task = Task { try await operation() }
             inFlight = task
             defer { inFlight = nil }
             return try await task.value
@@ -217,7 +222,9 @@ public enum XConnectorActions {
     }
 
     private static func currentBearer() async throws -> String {
-        try await RefreshGate.shared.resolveBearer()
+        try await RefreshGate.shared.resolveBearer {
+            try await XConnectorActions.currentBearerLocked()
+        }
     }
 
     fileprivate static func currentBearerLocked() async throws -> String {
@@ -319,11 +326,31 @@ public enum XConnectorActions {
 
     private static func oauth1AuthHeader(method: String, url: URL, query: [(String, String)], formBody: [(String, String)] = []) async throws -> String {
         let credentials = try loadOAuth1Credentials()
+        return oauth1AuthHeader(
+            method: method,
+            url: url,
+            query: query,
+            formBody: formBody,
+            credentials: credentials,
+            nonce: UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased(),
+            timestamp: Int(Date().timeIntervalSince1970)
+        )
+    }
+
+    static func oauth1AuthHeader(
+        method: String,
+        url: URL,
+        query: [(String, String)],
+        formBody: [(String, String)] = [],
+        credentials: OAuth1Credentials,
+        nonce: String,
+        timestamp: Int
+    ) -> String {
         var oauthParams: [(String, String)] = [
             ("oauth_consumer_key", credentials.apiKey),
-            ("oauth_nonce", UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()),
+            ("oauth_nonce", nonce),
             ("oauth_signature_method", "HMAC-SHA1"),
-            ("oauth_timestamp", String(Int(Date().timeIntervalSince1970))),
+            ("oauth_timestamp", String(timestamp)),
             ("oauth_token", credentials.accessToken),
             ("oauth_version", "1.0")
         ]
@@ -466,7 +493,7 @@ public enum XConnectorActions {
         return ResolvedUser(id: id, username: (dataObj["username"] as? String) ?? fallbackUsername)
     }
 
-    private static func timelineQuery(input: [String: JSONValue]) -> [(String, String)] {
+    static func timelineQuery(input: [String: JSONValue]) -> [(String, String)] {
         var query: [(String, String)] = [
             ("max_results", String(clampedInt(input["max"], defaultValue: 25, min: 1, max: 100))),
             ("tweet.fields", tweetFields)
@@ -480,7 +507,7 @@ public enum XConnectorActions {
         return query
     }
 
-    private static func userTweetsQuery(input: [String: JSONValue]) -> [(String, String)] {
+    static func userTweetsQuery(input: [String: JSONValue]) -> [(String, String)] {
         var query: [(String, String)] = [
             ("max_results", String(clampedInt(input["max"], defaultValue: 25, min: 1, max: 100))),
             ("tweet.fields", tweetFields)
@@ -546,7 +573,7 @@ public enum XConnectorActions {
         return .object(obj)
     }
 
-    private static func httpFailureEnvelope(actionId: String, statusCode: Int, data: Data) -> JSONValue {
+    static func httpFailureEnvelope(actionId: String, statusCode: Int, data: Data) -> JSONValue {
         let envelope = failureEnvelope(
             actionId: actionId,
             short: "http_\(statusCode)",
@@ -560,7 +587,7 @@ public enum XConnectorActions {
         return .object(obj)
     }
 
-    private static func appendQuery(_ query: [(String, String)], to url: URL) -> URL {
+    static func appendQuery(_ query: [(String, String)], to url: URL) -> URL {
         guard !query.isEmpty else { return url }
         guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
         var items = components.queryItems ?? []
@@ -569,12 +596,12 @@ public enum XConnectorActions {
         return components.url ?? url
     }
 
-    private static func formEncode(_ items: [(String, String)]) -> String {
+    static func formEncode(_ items: [(String, String)]) -> String {
         items.map { "\(percentEncode($0.0))=\(percentEncode($0.1))" }
             .joined(separator: "&")
     }
 
-    private static func percentEncode(_ value: String) -> String {
+    static func percentEncode(_ value: String) -> String {
         var out = ""
         out.reserveCapacity(value.utf8.count)
         for byte in value.utf8 {
@@ -588,7 +615,7 @@ public enum XConnectorActions {
         return out
     }
 
-    private static func baseURLString(_ url: URL) -> String {
+    static func baseURLString(_ url: URL) -> String {
         guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
             return url.absoluteString.components(separatedBy: "?").first ?? url.absoluteString
         }
@@ -635,7 +662,7 @@ public enum XConnectorActions {
             .appendingPathComponent("x.json")
     }
 
-    private static func bodyExcerpt(_ data: Data) -> String {
+    static func bodyExcerpt(_ data: Data) -> String {
         String(data: data.prefix(400), encoding: .utf8) ?? "<\(min(data.count, 400)) binary bytes>"
     }
 
@@ -659,11 +686,11 @@ public enum XConnectorActions {
         }
     }
 
-    private static func clampedInt(_ raw: JSONValue?, defaultValue: Int, min minValue: Int, max maxValue: Int) -> Int {
+    static func clampedInt(_ raw: JSONValue?, defaultValue: Int, min minValue: Int, max maxValue: Int) -> Int {
         max(minValue, min(inputInt(raw) ?? defaultValue, maxValue))
     }
 
-    private static func normalizedUsername(_ raw: String?) -> String? {
+    static func normalizedUsername(_ raw: String?) -> String? {
         guard let value = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
             return nil
         }
@@ -691,7 +718,7 @@ public enum XConnectorActions {
         "\(value.prefix(4))...\(value.suffix(4))"
     }
 
-    private struct OAuth1Credentials {
+    struct OAuth1Credentials {
         let apiKey: String
         let apiSecret: String
         let accessToken: String

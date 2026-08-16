@@ -2645,10 +2645,14 @@ private func _actingClient(
         body: ([
             "from": .object(["x": .int(5), "y": .int(6)]),
             "to": .object(["x": .int(70), "y": .int(80)]),
+            "duration_ms": .int(80),
         ])
     )
     #expect(r.ok)
-    #expect(drag.mouse.map(\.phase) == [.move, .down, .drag, .up])
+    #expect(drag.mouse.prefix(2).map(\.phase) == [.move, .down])
+    #expect(drag.mouse.dropFirst(2).dropLast().allSatisfy { $0.phase == .drag })
+    #expect(drag.mouse.last?.phase == .up)
+    #expect(drag.mouse.count == 8) // move + down + five 16ms drag steps + up
     #expect(drag.mouse.last?.x == 70 && drag.mouse.last?.y == 80)
 }
 

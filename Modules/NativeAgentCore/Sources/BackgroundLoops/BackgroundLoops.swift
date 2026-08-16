@@ -445,6 +445,10 @@ public enum LoopTickOutcome: Sendable, Equatable {
     /// health, and must not reset the consecutive-failure streak (gpt-5.5
     /// BLOCKING, A4.8 round).
     public static let coalescedSkipReason = "coalesced with active tick"
+    /// An opportunistic wake arrived before the canonical durable cadence was
+    /// eligible. The wake is only a signal; it does not advance loop health,
+    /// counters, or the durable last-run clock.
+    public static let notDueSkipReason = "durable cadence not due"
 
     /// Constructor for "I am skipping because I am failing". Prefer this over
     /// a bare `.skipped(reason:)` in any loop that gates itself behind its own
@@ -914,6 +918,21 @@ public actor SwiftNativeLoopScheduler {
 
     public func allLoopStates() async -> [LoopState] {
         Array(states.values).sorted { $0.loopId < $1.loopId }
+    }
+
+    /// Read-only eligibility projection for an opportunistic OS wake.
+    ///
+    /// The periodic scheduler and this projection consult the same durable
+    /// per-loop last-run map. The caller must still enter the manager's shared
+    /// execution gate after a `true` result: eligibility is deliberately not a
+    /// second claim owner, and concurrent periodic/OS wakes are coalesced by
+    /// that existing gate.
+    public func isDue(loopId: String, at requestedNow: Date? = nil) async -> Bool? {
+        await loadPersistedStateIfNeeded()
+        guard let registration = loops[loopId] else { return nil }
+        guard let lastRun = persistedLastRun[loopId] else { return true }
+        let now = requestedNow ?? clock()
+        return now.timeIntervalSince(lastRun) >= max(0, registration.loop.interval)
     }
 
     // MARK: internals

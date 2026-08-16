@@ -31,6 +31,7 @@ extension iCloudSyncEngine {
             return
         }
         tearDown()
+        lifecycleGeneration &+= 1
         isSetUp = true
         let fm = FileManager.default
         if prefersCloudKitSnapshotCache {
@@ -50,13 +51,15 @@ extension iCloudSyncEngine {
             try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
         }
 
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(kvsDidChange(_:)),
-            name: NSUbiquitousKeyValueStore.didChangeExternallyNotification,
-            object: kvs
-        )
-        kvs.synchronize()
+        if !prefersCloudKitSnapshotCache {
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(kvsDidChange(_:)),
+                name: NSUbiquitousKeyValueStore.didChangeExternallyNotification,
+                object: kvs
+            )
+            kvs.synchronize()
+        }
 
         // Initial load stays light. Heavy/tab-specific snapshots are loaded
         // by the visible tab on demand so launch cannot hydrate every chat
@@ -65,6 +68,10 @@ extension iCloudSyncEngine {
     }
 
     func tearDown() {
+        lifecycleGeneration &+= 1
+        snapshotRefreshGeneration &+= 1
+        targetedRefreshGeneration &+= 1
+        chatTranscriptsRefreshGeneration &+= 1
         NotificationCenter.default.removeObserver(self)
         snapshotDir = nil
         inboxDir = nil
@@ -80,7 +87,18 @@ extension iCloudSyncEngine {
     /// The bytes retain the existing snapshot contracts; only their transport
     /// changes for public Mac builds that cannot use CloudDocuments.
     func enableCloudKitSnapshotCache() {
+        lifecycleGeneration &+= 1
+        snapshotRefreshGeneration &+= 1
+        targetedRefreshGeneration &+= 1
+        chatTranscriptsRefreshGeneration &+= 1
+        refreshInFlight = false
+        refreshQueued = false
         prefersCloudKitSnapshotCache = true
+        NotificationCenter.default.removeObserver(
+            self,
+            name: NSUbiquitousKeyValueStore.didChangeExternallyNotification,
+            object: kvs
+        )
         let root = Self.cloudKitCacheRoot()
         let snapshots = root.appendingPathComponent("snapshots", isDirectory: true)
         let responses = root.appendingPathComponent("responses", isDirectory: true)
@@ -92,6 +110,7 @@ extension iCloudSyncEngine {
             )
         }
         snapshotDir = snapshots
+        inboxDir = nil
         responsesDir = responses
         transactionDir = transactions
         isSetUp = true
@@ -102,6 +121,7 @@ extension iCloudSyncEngine {
         _ value: String,
         group: NAMobileSnapshotGroup
     ) async {
+        let generation = lifecycleGeneration
         do {
             let files = try NAMobileSnapshotStatusCodec.decode(
                 value,
@@ -118,15 +138,11 @@ extension iCloudSyncEngine {
                     )
                 }
             }.value
+            guard generation == lifecycleGeneration else { return }
             prefersCloudKitSnapshotCache = true
             snapshotDir = directory
-            switch group {
-            case .advanced:
-                await refreshTurnSummariesSnapshot()
-                await refreshRunsSnapshot()
-            case .core, .catalog, .chat, .activity:
-                await refreshSnapshots()
-            }
+            await refreshSnapshotGroup(group)
+            guard generation == lifecycleGeneration else { return }
             lastSyncAt = Date()
             syncError = nil
         } catch {
@@ -157,7 +173,48 @@ extension iCloudSyncEngine {
         let changed = note.userInfo?[NSUbiquitousKeyValueStoreChangedKeysKey] as? [String]
         Task { @MainActor in
             guard let changed, changed.contains(KVSKey.snapshotUpdated) else { return }
-            await self.refreshLightweightSnapshots()
+            let signal = self.kvs.string(forKey: KVSKey.snapshotUpdated)
+            // Old Mac builds published only an ISO timestamp. Treat that as an
+            // unknown group and do one targeted transcript read for continuity;
+            // current builds name changed groups and avoid unrelated reads.
+            if let groups = Self.snapshotSignalGroups(signal), !groups.isEmpty {
+                for group in NAMobileSnapshotGroup.allCases where groups.contains(group) {
+                    await self.refreshSnapshotGroup(group)
+                }
+            } else {
+                // Legacy timestamp-only publishers did not identify the
+                // changed group, so compatibility requires one complete read.
+                await self.refreshSnapshots()
+            }
         }
+    }
+
+    func refreshSnapshotGroup(_ group: NAMobileSnapshotGroup) async {
+        switch group {
+        case .core:
+            await refreshLightweightSnapshots()
+        case .catalog:
+            await refreshCatalogSnapshot()
+        case .chat:
+            await refreshChatTranscriptsSnapshot()
+        case .activity:
+            await refreshActivitySnapshot()
+        case .advanced:
+            await refreshTurnSummariesSnapshot()
+            await refreshRunsSnapshot()
+        }
+    }
+
+    nonisolated static func snapshotSignalGroups(
+        _ value: String?
+    ) -> Set<NAMobileSnapshotGroup>? {
+        guard let value,
+              let marker = value.range(of: "|groups=") else { return nil }
+        let rawGroups = value[marker.upperBound...]
+        return Set(
+            rawGroups
+                .split(separator: ",")
+                .compactMap { NAMobileSnapshotGroup(rawValue: String($0)) }
+        )
     }
 }

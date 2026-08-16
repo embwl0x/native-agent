@@ -336,6 +336,33 @@ func outOfBandPolicyEnableIsRefused() async throws {
     await watcher.stop()
 }
 
+#if canImport(AppKit)
+@Test("LIFECYCLE: rapid disable then enable restarts only after the old capture thread exits")
+func rapidDisableEnableRestartsCleanly() async throws {
+    let root = regressionRoot()
+    let store = try ActivitySpanStore(dataRoot: root)
+    let enabled = ActivityPolicy(captureEnabled: true)
+    let watcher = ActivityWatcher(store: store, policy: enabled, heartbeatInterval: 60)
+    watcher.start()
+    #expect(watcher.lifecycleState == .running)
+
+    var disabled = enabled
+    disabled.captureEnabled = false
+    watcher.updatePolicy(disabled)
+    watcher.updatePolicy(enabled)
+
+    let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+    while watcher.lifecycleState != .running, ContinuousClock.now < deadline {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(watcher.lifecycleState == .running)
+    #expect(watcher.isCaptureEnabled)
+    #expect(watcher.isCapturing)
+    await watcher.stop()
+    #expect(watcher.lifecycleState == .stopped)
+}
+#endif
+
 @Test("OUT-OF-BAND: a polled captureEnabled=false DOES disable an enabled watcher")
 func outOfBandPolicyDisableIsStillApplied() async throws {
     // The positive control for the clamp above: tightening still lands, or the
@@ -397,6 +424,18 @@ func outOfBandPolicyCannotLoosenPrivacy() async throws {
         "the polled exclusions must be unioned with the current ones, got \(clamped.excludedBundleIDs)"
     )
     await watcher.stop()
+}
+
+@Test("OUT-OF-BAND: a policy poll cannot grant model access")
+func outOfBandPolicyCannotGrantModelAccess() throws {
+    var current = capturePolicy(titles: false)
+    current.allowModelAccess = false
+    var polled = current
+    polled.allowModelAccess = true
+    let safe = try #require(ActivityWatcher.safelyPolled(
+        polled, current: current, currentlyEnabled: true
+    ))
+    #expect(!safe.allowModelAccess)
 }
 
 @Test("CONFORMANCE: the title read re-checks the capture fence immediately before the AX call")

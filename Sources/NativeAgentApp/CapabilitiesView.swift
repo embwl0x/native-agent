@@ -116,7 +116,7 @@ struct CapabilitiesView: View {
             // E-1 already stripped its fake counters; what was left was a
             // status badge and 2-3 lane tiles over a subsystem that was never
             // ported (no auto-implementation ledger, no review pipeline). The
-            // CapabilityFoundry module stays for its MCP metadata consumer;
+            // Core CapabilityFoundry stays behind its MCP metadata consumer;
             // the panel claimed a workshop that does not exist.
 
             collapsedCard(

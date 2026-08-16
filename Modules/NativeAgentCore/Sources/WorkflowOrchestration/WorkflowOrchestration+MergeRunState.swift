@@ -196,6 +196,8 @@ public enum WorkflowRunState {
             "completedAt": objField(state, "completedAt") ?? .null,
             "currentStepIndex": objField(state, "currentStepIndex") ?? .null,
             "approvalId": objField(state, "approvalId") ?? .null,
+            "blockedReason": objField(state, "blockedReason") ?? .null,
+            "recoveryRequired": objField(state, "recoveryRequired") ?? .bool(false),
         ])
     }
 

@@ -38,6 +38,12 @@ final class MacSyncEngine: ObservableObject {
     /// cognition/organism -> iOS snapshot path without shortening the slow
     /// integrity fallback or adding a polling loop.
     var cognitionSnapshotObservationTask: Task<Void, Never>?
+    /// Existing chat completion notifications drive one bounded transcript
+    /// projection pass. The short coalescer absorbs completion fan-out (for
+    /// example a bridge delivery plus its local refresh) without polling or
+    /// rebuilding the transcript for every notification.
+    var chatTurnCompletedObserver: NSObjectProtocol?
+    var chatTranscriptSnapshotPublicationTask: Task<Void, Never>?
     /// One exact archive-retention crossing, recalculated after each prune.
     var pruneDeadlineTask: Task<Void, Never>?
     var archiveRetentionWatcher: FileChangeWatcher?
@@ -45,6 +51,11 @@ final class MacSyncEngine: ObservableObject {
     var snapshotWriteInFlight = false
     var snapshotWriteQueued = false
     var snapshotWriteQueuedNeedsHeavy = false
+    var snapshotWriteQueuedNeedsChatTranscripts = false
+    var snapshotWriteQueuedNeedsStandardPass = false
+    /// Invalidates any snapshot pass suspended across stop/restart. A late pass
+    /// must never publish into a newly selected cache/container generation.
+    var snapshotLifecycleGeneration: UInt64 = 0
     var inboxProcessingInFlight = false
     var inboxProcessingQueued = false
     var snapshotFileDigests: [String: String] = [:]
@@ -101,6 +112,7 @@ final class MacSyncEngine: ObservableObject {
     }
     let processedIdsCap = 5000
     var _pairingSecret: Data?
+    var pairingSecretRotationInProgress = false
 
     enum KVSKey {
         static let snapshotUpdated = "snapshot_updated"

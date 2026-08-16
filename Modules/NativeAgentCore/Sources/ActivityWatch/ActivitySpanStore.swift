@@ -260,7 +260,7 @@ public actor ActivitySpanStore {
     ) throws -> [ActivitySpan] {
         let excluded = policy.map { Array($0.effectiveExcludedBundleIDs) } ?? []
         return try dbQueue.read { db in
-            try Self.fetchSpans(
+            return try Self.fetchSpans(
                 db,
                 predicate: "started_at >= ? AND started_at <= ?",
                 arguments: [from, to],
@@ -279,14 +279,24 @@ public actor ActivitySpanStore {
         from: Double,
         to: Double,
         limit: Int = 20_000,
-        policy: ActivityPolicy? = nil
+        policy: ActivityPolicy? = nil,
+        bundleID: String? = nil
     ) throws -> [ActivitySpan] {
         let excluded = policy.map { Array($0.effectiveExcludedBundleIDs) } ?? []
         return try dbQueue.read { db in
-            try Self.fetchSpans(
+            var predicate = "started_at <= ? AND COALESCE(ended_at, last_seen_at) >= ?"
+            var arguments: [DatabaseValueConvertible] = [to, from]
+            if let bundleID, !bundleID.isEmpty {
+                // Apply the caller's bundle restriction before LIMIT. Filtering
+                // an already-capped array could turn a dense valid answer into
+                // an apparently empty one.
+                predicate += " AND bundle_id = ?"
+                arguments.append(bundleID)
+            }
+            return try Self.fetchSpans(
                 db,
-                predicate: "started_at <= ? AND COALESCE(ended_at, last_seen_at) >= ?",
-                arguments: [to, from],
+                predicate: predicate,
+                arguments: arguments,
                 excluded: excluded,
                 order: "started_at ASC",
                 limit: limit

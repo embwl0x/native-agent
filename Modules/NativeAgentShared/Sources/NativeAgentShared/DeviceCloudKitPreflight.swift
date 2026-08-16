@@ -88,13 +88,9 @@ public enum DeviceCloudKitPreflight {
         #endif
     }
 
-    /// Diagnostic only — NOT a hard gate. True iff the process entitlements list
-    /// `containerIdentifier` (macOS), or "can't introspect, no objection" (iOS).
-    /// Container-id string formats vary across profiles (with/without an
-    /// `iCloud.` prefix, case), so a macOS false here is worth LOGGING but must
-    /// not disable CloudKit on its own — the hard gate stays
-    /// `hasCloudKitEntitlement()`. iOS returns true so the diagnostic stays quiet
-    /// where the entitlement can't be read.
+    /// Exact container gate. True iff the process entitlements list the selected
+    /// `containerIdentifier` (macOS), or install-time provisioning has already
+    /// enforced the declared container entitlement (iOS).
     public static func entitlementGrantsContainer(_ containerIdentifier: String) -> Bool {
         #if os(macOS)
         guard let task = SecTaskCreateFromSelf(nil),
@@ -102,7 +98,7 @@ public enum DeviceCloudKitPreflight {
                 task, iCloudContainersEntitlementKey as CFString, nil),
               let ids = raw as? [String]
         else { return false }
-        return ids.contains { $0.caseInsensitiveCompare(containerIdentifier) == .orderedSame }
+        return ids.contains(containerIdentifier)
         #else
         return true
         #endif

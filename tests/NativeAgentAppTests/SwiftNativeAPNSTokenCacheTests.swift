@@ -9,6 +9,20 @@ import Testing
 /// under concurrency (the actor serializes access).
 @Suite struct SwiftNativeAPNSTokenCacheTests {
 
+    @Test func processedInboxArchivesAreNotAPNSTokenAuthority() throws {
+        let testFile = URL(fileURLWithPath: #filePath)
+        let source = testFile
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/NativeAgentApp/SwiftNativeAPNS.swift")
+        let text = try String(contentsOf: source, encoding: .utf8)
+        #expect(!text.contains("loadICloudProcessedTokens"))
+        #expect(!text.contains("icloud_processed_register_push_token"))
+        #expect(text.contains("loadSwiftTokens(dataRoot: dataRoot)"))
+        #expect(text.contains("loadLegacyTokens(dataRoot: dataRoot)"))
+    }
+
     /// Mutable clock the tests advance to drive expiry deterministically.
     private final class TestClock: @unchecked Sendable {
         private let lock = NSLock()

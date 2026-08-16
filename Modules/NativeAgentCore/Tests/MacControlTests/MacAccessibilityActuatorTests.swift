@@ -336,6 +336,23 @@ final class _FakeAXActSource: MacAXActSource, @unchecked Sendable {
     #expect(events[3].x == 30 && events[3].y == 40)
 }
 
+@Test func smoothDragInterpolatesLocallyAndEndsExactlyAtTheTarget() {
+    let events = MacEventPlanner.smoothDrag(
+        fromX: 10,
+        fromY: 20,
+        toX: 110,
+        toY: 220,
+        button: .left,
+        steps: 5
+    )
+    #expect(events.count == 8)
+    #expect(events.prefix(2).map(\.phase) == [.move, .down])
+    #expect(events.dropFirst(2).dropLast().allSatisfy { $0.phase == .drag })
+    #expect(events[2].x == 30 && events[2].y == 60)
+    #expect(events.last?.phase == .up)
+    #expect(events.last?.x == 110 && events.last?.y == 220)
+}
+
 @Test func clickCountIsClampedToThree() {
     let events = MacEventPlanner.click(x: 0, y: 0, button: .left, count: 99)
     #expect(events.filter { $0.phase == .down }.count == 3)

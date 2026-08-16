@@ -2,6 +2,47 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RELEASE_RECEIPT=""
+REQUIRE_IOS=0
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: script/test.sh [--require-ios] [--release-receipt PATH]
+
+--require-ios           Fail instead of skipping when no iOS simulator is available.
+--release-receipt PATH  Require one clean, stable Git revision and write a JSON
+                        receipt only after every canonical check passes. This
+                        mode implies --require-ios.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --require-ios) REQUIRE_IOS=1 ;;
+    --release-receipt)
+      [[ $# -ge 2 ]] || { usage; exit 2; }
+      RELEASE_RECEIPT="$2"
+      REQUIRE_IOS=1
+      shift
+      ;;
+    --release-receipt=*)
+      RELEASE_RECEIPT="${1#--release-receipt=}"
+      REQUIRE_IOS=1
+      ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage; exit 2 ;;
+  esac
+  shift
+done
+
+TEST_SOURCE_REVISION=""
+if [[ -n "$RELEASE_RECEIPT" ]]; then
+  TEST_SOURCE_REVISION="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
+  [[ "$TEST_SOURCE_REVISION" =~ ^[0-9A-Fa-f]{40}$ || "$TEST_SOURCE_REVISION" =~ ^[0-9A-Fa-f]{64}$ ]] \
+    || { echo "[test] FATAL: a release receipt requires one exact Git object ID" >&2; exit 1; }
+  [[ -z "$(git -C "$ROOT" status --porcelain --untracked-files=normal)" ]] \
+    || { echo "[test] FATAL: a release receipt requires a clean source tree" >&2; exit 1; }
+fi
 
 export CLANG_MODULE_CACHE_PATH="$ROOT/.runtime/clang-module-cache"
 export SWIFT_MODULE_CACHE_PATH="$ROOT/.runtime/swift-module-cache"
@@ -21,6 +62,10 @@ mkdir -p "$CLANG_MODULE_CACHE_PATH" "$SWIFT_MODULE_CACHE_PATH"
 # `HermeticDataRootCanaryTests` pins that branch ordering.
 NATIVE_AGENT_TEST_DATA_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/nativeagent-test-dataroot.XXXXXX")"
 export NATIVE_AGENT_DATA_ROOT="$NATIVE_AGENT_TEST_DATA_ROOT"
+# ProviderReadinessTests are destructive by design, but the canonical gate has
+# already moved their owner root into the throwaway directory above. Arm them
+# here so they execute rather than returning early and being counted as passes.
+export NATIVE_AGENT_PROVIDER_READINESS_TEST=1
 cleanup_test_data_root() {
   [[ -n "${NATIVE_AGENT_TEST_DATA_ROOT:-}" ]] && rm -rf "$NATIVE_AGENT_TEST_DATA_ROOT"
   return 0
@@ -64,6 +109,18 @@ echo "[test] public release source guards"
 echo "[test] release MiniLM resource guards"
 "$ROOT/tests/scripts/release_resource_guards_test.sh"
 
+echo "[test] release symbol archive + stripping guards"
+"$ROOT/tests/scripts/release_symbol_guards_test.sh"
+
+echo "[test] canonical test inventory"
+"$ROOT/tests/scripts/test_inventory_guards_test.sh"
+
+echo "[test] build source inventory guard tests"
+"$ROOT/tests/scripts/build_source_inventory_guards_test.sh"
+
+echo "[test] generated artifact cleanup guard tests"
+"$ROOT/tests/scripts/generated_artifact_cleanup_guards_test.sh"
+
 echo "[test] architecture blueprint drift"
 "$ROOT/script/check_architecture_blueprint.swift" --repo "$ROOT"
 
@@ -94,6 +151,9 @@ SWIFTPM_SANDBOX_FLAG=()
 if [[ "${NATIVE_AGENT_SWIFTPM_DISABLE_SANDBOX:-0}" == "1" ]]; then
   SWIFTPM_SANDBOX_FLAG=(--disable-sandbox)
 fi
+
+# shellcheck source=lib/build_source_inventory.sh
+source "$ROOT/script/lib/build_source_inventory.sh"
 
 echo "[test] NativeAgentCore XCTest tests"
 swift test ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} --package-path "$ROOT/Modules/NativeAgentCore" --disable-swift-testing
@@ -137,10 +197,25 @@ CORE_SWIFT_TEST_SHARDS=(
   # (Swift Testing) added to any of them is NOT silently skipped by the shards.
   "CommandPaletteTests|OnboardingTests|MacIntegrationTests|XConnectorTests"
 )
+CORE_TEST_SOURCE_DIGEST="$(nativeagent_source_state_digest "$ROOT/Modules/NativeAgentCore")"
+core_shard_index=0
 for shard in "${CORE_SWIFT_TEST_SHARDS[@]}"; do
   echo "[test] NativeAgentCore Swift Testing shard: $shard"
-  swift test ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} --package-path "$ROOT/Modules/NativeAgentCore" --disable-xctest --no-parallel --filter "^(${shard})\\."
+  core_shard_build_flag=()
+  if [[ "$core_shard_index" -gt 0 ]]; then
+    core_shard_build_flag=(--skip-build)
+  fi
+  swift test ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} \
+    ${core_shard_build_flag[@]+"${core_shard_build_flag[@]}"} \
+    --package-path "$ROOT/Modules/NativeAgentCore" \
+    --disable-xctest --no-parallel --filter "^(${shard})\\."
+  core_shard_index=$((core_shard_index + 1))
 done
+CORE_TEST_SOURCE_DIGEST_AFTER="$(nativeagent_source_state_digest "$ROOT/Modules/NativeAgentCore")"
+if [[ "$CORE_TEST_SOURCE_DIGEST" != "$CORE_TEST_SOURCE_DIGEST_AFTER" ]]; then
+  echo "[test] ERROR: NativeAgentCore source/resource state changed during sharded execution; refusing stale --skip-build success." >&2
+  exit 1
+fi
 
 echo "[test] NativeAgentShared Swift tests"
 swift test ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} --package-path "$ROOT/Modules/NativeAgentShared"
@@ -156,7 +231,15 @@ echo "[test] iOS NativeAgentMobile tests"
 # The script skips gracefully when no simulator exists or when invoked under
 # the builder sandbox (it honors the same NATIVE_AGENT_SWIFTPM_DISABLE_SANDBOX
 # pattern as the swift gates above).
-"$ROOT/script/test_ios.sh"
+IOS_ARGS=()
+if [[ "$REQUIRE_IOS" -eq 1 ]]; then
+  IOS_ARGS+=(--require)
+fi
+if [[ ${#IOS_ARGS[@]} -gt 0 ]]; then
+  "$ROOT/script/test_ios.sh" "${IOS_ARGS[@]}"
+else
+  "$ROOT/script/test_ios.sh"
+fi
 
 echo "[test] tracked Python guard"
 tracked_hits="$(
@@ -187,6 +270,9 @@ if [[ -n "$cache_hit" ]]; then
 fi
 
 echo "[test] working-tree Python guard"
+# This one explicitly ignored, offline ground-truth oracle is developer test
+# authoring material; it is never tracked, built, or bundled. The tracked
+# Python guard above remains the release authority.
 working_py_hit="$(
   find "$ROOT" \
     -path "$ROOT/.git" -prune -o \
@@ -197,6 +283,7 @@ working_py_hit="$(
     -path "$ROOT/build" -prune -o \
     -path "$ROOT/DerivedData" -prune -o \
     -path "$ROOT/data" -prune -o \
+    -path "$ROOT/tests/activity_watch/verify_ground_truth.py" -prune -o \
     -type f -name '*.py' \
     -print -quit 2>/dev/null || true
 )"
@@ -207,5 +294,22 @@ fi
 
 echo "[test] git diff whitespace"
 git -C "$ROOT" diff --check
+
+if [[ -n "$RELEASE_RECEIPT" ]]; then
+  final_revision="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
+  [[ "$final_revision" == "$TEST_SOURCE_REVISION" ]] \
+    || { echo "[test] FATAL: source HEAD changed during the release test gate" >&2; exit 1; }
+  [[ -z "$(git -C "$ROOT" status --porcelain --untracked-files=normal)" ]] \
+    || { echo "[test] FATAL: tracked or untracked source changed during the release test gate" >&2; exit 1; }
+  receipt_dir="$(dirname "$RELEASE_RECEIPT")"
+  mkdir -p "$receipt_dir"
+  receipt_tmp="$RELEASE_RECEIPT.tmp.$$"
+  completed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf '{\n  "schema_version": 1,\n  "source_revision": "%s",\n  "source_dirty": false,\n  "canonical_gate": "script/test.sh",\n  "ios_required": true,\n  "ios_result": "passed",\n  "completed_at": "%s"\n}\n' \
+    "$TEST_SOURCE_REVISION" "$completed_at" > "$receipt_tmp"
+  mv -f "$receipt_tmp" "$RELEASE_RECEIPT"
+  chmod 0644 "$RELEASE_RECEIPT"
+  echo "[test] release receipt: $RELEASE_RECEIPT"
+fi
 
 echo "[test] Swift-native checks passed"

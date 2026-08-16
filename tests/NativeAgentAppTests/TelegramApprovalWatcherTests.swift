@@ -30,7 +30,7 @@ struct TelegramApprovalWatcherTests {
             dataRoot: root,
             token: "test-token",
             promptSender: { _, _, _, _, _ in },
-            approvalResolver: { _, _ in }
+            approvalResolver: { _, _, _ in }
         )
     }
 

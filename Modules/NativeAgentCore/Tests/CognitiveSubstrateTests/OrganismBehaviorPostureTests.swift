@@ -242,7 +242,7 @@ private func postureSnapshot(
     #expect(posture.approvedReflexBiasSampleCount == 3)
     #expect(posture.approvedLowRiskReflexTotalCount == 5)
     #expect(posture.approvedReflexBiasesAreSampled)
-    #expect(posture.reviewSignals.contains { $0.contains("9 reflex candidate") })
+    #expect(!posture.reviewSignals.contains { $0.contains("reflex candidate") })
     #expect(rendered.contains("approved_low_risk_reflex_biases: sample 3 of 5"))
     #expect(rendered.contains("approved_low_risk_reflex: Soft preference"))
 
@@ -257,4 +257,40 @@ private func postureSnapshot(
     #expect(json["directives"] == nil)
     #expect(json["review_signals"] == nil)
     #expect(json["approved_reflex_biases"] == nil)
+}
+
+@Test func unapprovedReflexQueueRemainsObservableWithoutShapingPromptOrPosture() throws {
+    let date = Date(timeIntervalSince1970: 7_100)
+    let pending = OrganismReflexCandidate(
+        id: "tool:tool-write-file",
+        pattern: "Pending write preference",
+        trustClass: .highRisk,
+        evidenceCount: 4,
+        successCount: 4,
+        confidence: 0.8,
+        reviewRequired: true,
+        firstSeenAt: date.addingTimeInterval(-300),
+        lastUpdatedAt: date
+    )
+    let snapshot = postureSnapshot(
+        reflexSummary: OrganismReflexSummary(
+            candidateCount: 1,
+            reviewRequiredCount: 1,
+            highRiskCount: 1
+        ),
+        reflexCandidates: [pending]
+    )
+    let posture = try #require(OrganismBehaviorPosture.from(snapshot: snapshot))
+    let rendered = posture.privateRuntimeContext(
+        runId: "run-review",
+        sessionId: "session-review",
+        surface: "chat",
+        fileAccess: "workspace"
+    )
+
+    #expect(posture.posture == "steady")
+    #expect(posture.reviewRequiredReflexCount == 1)
+    #expect(posture.approvedReflexBiases.isEmpty)
+    #expect(!rendered.contains("reflex candidate"))
+    #expect(!rendered.contains("emerging reflex"))
 }

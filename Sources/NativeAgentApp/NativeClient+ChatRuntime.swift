@@ -39,7 +39,6 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-import CapabilityFoundry
 
 enum ChatTurnNoticeDestination: Equatable {
     case chatTop

@@ -621,6 +621,30 @@ struct ChatImageCacheTests {
 @Suite("Perf wave 2 — F1 detached panel scroll throttle")
 struct DetachedPanelScrollThrottleTests {
 
+    @Test func detached_panel_refreshes_from_canonical_transcript_events_without_polling() throws {
+        let source = try AppSourceScraping.appSource("DetachedChatPanelView.swift")
+        #expect(source.contains("ViewFileRefreshTask.run("))
+        #expect(source.contains("chat/messages"))
+        #expect(source.contains("refreshDetachedChatMessagesAfterTurn"))
+        #expect(!source.contains("Timer.publish"))
+    }
+
+    @Test func screenshot_composers_clear_only_after_turn_acceptance() throws {
+        let mainSource = try AppSourceScraping.appSource("ChatView+Attachments.swift")
+        let mainCapture = try AppSourceScraping.functionBody(named: "captureScreen", in: mainSource)
+        let mainAcceptance = try #require(mainCapture.range(of: "startActiveChatTurn"))
+        let mainClear = try #require(mainCapture.range(of: "text = \"\""))
+        #expect(mainAcceptance.lowerBound < mainClear.lowerBound)
+        #expect(mainCapture.contains("case .rejected(let message)"))
+
+        let detachedSource = try AppSourceScraping.appSource("DetachedChatPanelView.swift")
+        let detachedCapture = try AppSourceScraping.functionBody(named: "captureScreen", in: detachedSource)
+        let detachedAcceptance = try #require(detachedCapture.range(of: "startChatTurnForSession"))
+        let detachedClear = try #require(detachedCapture.range(of: "draft = \"\""))
+        #expect(detachedAcceptance.lowerBound < detachedClear.lowerBound)
+        #expect(detachedCapture.contains("case .rejected(let message)"))
+    }
+
     /// Throttle-only. The panel must route streaming deltas through the shared
     /// coordinator AND must not gain the `autoFollow` disarm, which is the held
     /// NEEDS-USER behavior change.

@@ -8,6 +8,7 @@ import NativeAgentShared
 struct WorkshopView: View {
     @EnvironmentObject private var bridgeClient: MacBridgeClient
     @StateObject private var store = WorkshopStore()
+    @ObservedObject private var sync = iCloudSyncEngine.shared
     @State private var showNewWorkshopTask = false
     @State private var selectedWorkshopTask: WorkshopTaskRecord?
 
@@ -90,6 +91,9 @@ struct WorkshopView: View {
             }
             .refreshable { await store.refresh() }
             .onAppear { Task { await store.refresh() } }
+            .onChange(of: sync.workshopTasks) { _, tasks in
+                store.applySyncedTasks(tasks)
+            }
             .sheet(isPresented: $showNewWorkshopTask) {
                 NewWorkshopTaskSheet(store: store)
             }
@@ -132,9 +136,14 @@ final class WorkshopStore: ObservableObject {
         isLoading = true
         await iCloudSyncEngine.shared.refreshWorkshopTasksSnapshot()
         let next = iCloudSyncEngine.shared.workshopTasks
+        applySyncedTasks(next)
+        isLoading = false
+    }
+
+    func applySyncedTasks(_ next: [WorkshopTaskRecord]) {
+        guard next != tasks else { return }
         notifyForNewCompletions(next)
         tasks = next
-        isLoading = false
     }
 
     func submitWorkshopTask(title: String, objective: String) async -> Bool {

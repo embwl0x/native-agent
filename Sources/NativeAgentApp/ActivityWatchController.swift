@@ -49,7 +49,13 @@ final class ActivityWatchController {
     init(dataRoot: URL = NativeAgentPaths.dataRoot) {
         self.dataRoot = dataRoot
         self.policyStore = ActivityPolicyStore(dataRoot: dataRoot)
-        self.policy = policyStore.load()
+        do {
+            self.policy = try policyStore.loadChecked()
+            self.lastError = nil
+        } catch {
+            self.policy = ActivityPolicy()
+            self.lastError = error.localizedDescription
+        }
     }
 
     // MARK: - Lifecycle
@@ -76,7 +82,14 @@ final class ActivityWatchController {
             isCapturing = false
             return
         }
-        ensureWatcher()?.start()
+        guard let watcher = ensureWatcher() else { return }
+        Task { @MainActor [weak self, weak watcher] in
+            guard let self, let watcher else { return }
+            if !(await watcher.startBounded()) {
+                self.lastError = "Activity capture could not start cleanly. Its partial startup was rolled back."
+            }
+            self.refreshCapturingFlag()
+        }
         refreshCapturingFlag()
     }
 
@@ -95,7 +108,26 @@ final class ActivityWatchController {
             let created = ActivityWatcher(
                 store: store,
                 policy: policy,
-                policySource: ActivityPolicyFileSource(dataRoot: dataRoot)
+                policySource: ActivityPolicyFileSource(dataRoot: dataRoot),
+                lifecycleChanged: { [weak self] state in
+                    Task { @MainActor [weak self] in
+                        self?.refreshCapturingFlag()
+                        if state == .degraded {
+                            self?.lastError = "Activity capture stopped because its live watcher became unavailable."
+                        }
+                    }
+                },
+                policyChanged: { [weak self] applied in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        self.policy = applied
+                        do {
+                            _ = try self.policyStore.loadChecked()
+                        } catch {
+                            self.lastError = error.localizedDescription
+                        }
+                    }
+                }
             )
             spanStore = store
             watcher = created
@@ -140,24 +172,20 @@ final class ActivityWatchController {
     /// then failed, the running process would be capturing under a policy that
     /// no longer exists on disk — invisible, and wrong in the dangerous
     /// direction.
-    func apply(_ next: ActivityPolicy) {
+    @discardableResult
+    func apply(_ next: ActivityPolicy) -> Bool {
         do {
             try policyStore.save(next)
         } catch {
             lastError = "Could not save the activity policy: \(error.localizedDescription)"
-            return
+            return false
         }
         lastError = nil
         policy = next
 
         if next.captureEnabled {
-            guard let watcher = ensureWatcher() else { return }
+            guard let watcher = ensureWatcher() else { return false }
             watcher.updatePolicy(next)
-            // First enable in this process: nothing is installed yet, and
-            // updatePolicy's off→on branch handles that. start() is still
-            // called for the cold case where the watcher was constructed but
-            // never started.
-            watcher.start()
         } else if let watcher {
             // INSTANT PAUSE. updatePolicy tears the observers down and closes
             // the open span; we do not wait for it before flipping the
@@ -165,13 +193,10 @@ final class ActivityWatchController {
             // honest answer the moment capture is disallowed is yes.
             watcher.updatePolicy(next)
         }
-        // The watcher's teardown is asynchronous (it hops the capture thread
-        // and drains the pump), so poll the truth rather than assume it.
+        // Lifecycle invalidations keep this exact after asynchronous teardown;
+        // this immediate read covers the mutation edge itself without a timer.
         refreshCapturingFlag()
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 250_000_000)
-            self?.refreshCapturingFlag()
-        }
+        return true
     }
 
     func setCaptureEnabled(_ enabled: Bool) {
@@ -198,10 +223,16 @@ final class ActivityWatchController {
         apply(next)
     }
 
+    func setModelAccessEnabled(_ enabled: Bool) {
+        var next = policy
+        next.allowModelAccess = enabled
+        apply(next)
+    }
+
     func setRetentionDays(_ days: Int) {
         var next = policy
         next.retentionDays = max(1, min(365, days))
-        apply(next)
+        guard apply(next) else { return }
         Task { await runRetention() }
     }
 
@@ -218,7 +249,8 @@ final class ActivityWatchController {
         guard !trimmed.isEmpty else { return }
         var next = policy
         next.excludedBundleIDs.insert(trimmed)
-        apply(next)
+        // Never purge rows unless the exclusion first became durable.
+        guard apply(next) else { return }
 
         guard let store = existingStore() else {
             // Nothing on disk to purge — capture has never been on, so no store

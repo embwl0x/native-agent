@@ -423,9 +423,18 @@ func macView_imageIsStrippedFromThePersistedToolRow() throws {
         == json)
     // The MacControl-side names all answer, so a registry/action spelling of
     // the same tool cannot slip past the sink.
-    for name in ["mac_view", "mac.view", "view", "MAC_VIEW"] {
+    for name in [
+        "mac_view", "mac.view", "view", "MAC_VIEW",
+        "mac_attention", "mac.attention", "attention", "MAC_ATTENTION",
+    ] {
         #expect(MacScreenViewResultRedaction.carriesImage(tool: name), "\(name) must be recognized")
     }
+    let attentionStripped = SwiftNativeChatOrchestrationClient.screenViewRedactedResultJSON(
+        tool: "mac_attention",
+        json: json
+    )
+    #expect(!attentionStripped.contains("iVBORw0KGgo"))
+    #expect(attentionStripped.contains("image_redacted"))
     #expect(!MacScreenViewResultRedaction.carriesImage(tool: "mac_ax_tree"))
 }
 

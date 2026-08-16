@@ -1,4 +1,5 @@
 import Foundation
+import ApprovalInbox
 import CognitiveSubstrate
 import MacIntegration
 import NativeAgentCore
@@ -134,13 +135,6 @@ struct MacSyncActionRouter {
 
         let api = NativeClient(baseURL: "")
 
-        func approvalAllowsRemoteResolve(_ approvalId: String) async throws -> Bool {
-            guard let row = try await api.getApprovals().first(where: { $0.id == approvalId }) else {
-                return true
-            }
-            return row.localOnly != true && row.remoteResolvable != false
-        }
-
         do {
             switch action.action {
             case "submitWorkshopTask", "submitMission":
@@ -247,28 +241,40 @@ struct MacSyncActionRouter {
             case "approveApproval":
                 let approvalId = payload["approvalId"] ?? payload["id"] ?? ""
                 guard !approvalId.isEmpty else { return ["status": "error", "message": "Missing approvalId"] }
-                guard try await approvalAllowsRemoteResolve(approvalId) else {
-                    return ["status": "error", "error": "approval_local_only", "message": "Approval must be reviewed on the Mac app."]
-                }
-                let row = try await api.resolveApproval(id: approvalId, decision: "approve")
+                let row = try await api.resolveApproval(
+                    id: approvalId,
+                    decision: "approve",
+                    provenance: .signedIOS(
+                        clientID: action.clientId,
+                        decidedBy: "ios_signed_operator"
+                    )
+                )
                 return approvalActionResponse(approvalRequestToDict(row), approvalId: approvalId, fallbackStatus: "approved")
 
             case "rejectApproval":
                 let approvalId = payload["approvalId"] ?? payload["id"] ?? ""
                 guard !approvalId.isEmpty else { return observed(["status": "error", "message": "Missing approvalId"]) }
-                guard try await approvalAllowsRemoteResolve(approvalId) else {
-                    return observed(["status": "error", "error": "approval_local_only", "message": "Approval must be reviewed on the Mac app."])
-                }
-                let row = try await api.resolveApproval(id: approvalId, decision: "reject")
+                let row = try await api.resolveApproval(
+                    id: approvalId,
+                    decision: "reject",
+                    provenance: .signedIOS(
+                        clientID: action.clientId,
+                        decidedBy: "ios_signed_operator"
+                    )
+                )
                 return observed(approvalActionResponse(approvalRequestToDict(row), approvalId: approvalId, fallbackStatus: "rejected"))
 
             case "cancelApproval":
                 let approvalId = payload["approvalId"] ?? payload["id"] ?? ""
                 guard !approvalId.isEmpty else { return observed(["status": "error", "message": "Missing approvalId"]) }
-                guard try await approvalAllowsRemoteResolve(approvalId) else {
-                    return observed(["status": "error", "error": "approval_local_only", "message": "Approval must be reviewed on the Mac app."])
-                }
-                let row = try await api.resolveApproval(id: approvalId, decision: "cancel")
+                let row = try await api.resolveApproval(
+                    id: approvalId,
+                    decision: "cancel",
+                    provenance: .signedIOS(
+                        clientID: action.clientId,
+                        decidedBy: "ios_signed_operator"
+                    )
+                )
                 return observed(approvalActionResponse(approvalRequestToDict(row), approvalId: approvalId, fallbackStatus: "canceled"))
 
             case "inboxAction":
@@ -280,13 +286,19 @@ struct MacSyncActionRouter {
                 let normalizedAction = actionId == "deny" ? "reject" : actionId
                 let endpointAction = nativeActions.contains(normalizedAction) ? normalizedAction : "act"
                 if endpointAction == "approve" || endpointAction == "reject" {
-                    guard try await approvalAllowsRemoteResolve(itemId) else {
-                        return observed([
-                            "status": "error",
-                            "error": "approval_local_only",
-                            "message": "Approval must be reviewed on the Mac app.",
-                        ])
-                    }
+                    let row = try await api.resolveApproval(
+                        id: itemId,
+                        decision: endpointAction,
+                        provenance: .signedIOS(
+                            clientID: action.clientId,
+                            decidedBy: "ios_signed_operator"
+                        )
+                    )
+                    return observed(approvalActionResponse(
+                        approvalRequestToDict(row),
+                        approvalId: itemId,
+                        fallbackStatus: endpointAction == "approve" ? "approved" : "rejected"
+                    ))
                 }
                 try await api.inboxAction(itemId, action: endpointAction)
                 return observed([
@@ -410,7 +422,11 @@ struct MacSyncActionRouter {
                 let next = current.filter { $0 != sessionId }
                 if next != current {
                     try MacPinnedChatSessionStore.save(next)
-                    await MacSyncEngine.shared.writeSnapshots()
+                    await MainActor.run {
+                        MacSyncEngine.shared.requestChatSnapshotPublication(
+                            includeTranscripts: false
+                        )
+                    }
                 }
                 return observed([
                     "status": "ok",
@@ -534,19 +550,14 @@ struct MacSyncActionRouter {
                         "message": "A known integration id and exact read/write booleans are required.",
                     ])
                 }
-                try await MacIntegrationPermissionStore.shared.set(
+                let recovered = try await MacIntegrationPermissionStore.shared.setWithReceipt(
                     integrationId: request.id,
                     read: request.read,
-                    write: request.write
+                    write: request.write,
+                    actionID: action.msgId,
+                    surface: "ios_icloud",
+                    provenance: .signedIOS(clientID: action.clientId)
                 )
-                guard let recovered = try await MacIntegrationPermissionStore.shared
-                    .currentChecked()[request.id] else {
-                    throw NSError(
-                        domain: "MacSyncActionRouter",
-                        code: -1,
-                        userInfo: [NSLocalizedDescriptionKey: "Mac integration permission read-back failed"]
-                    )
-                }
                 MacIntegrationICloudBridge.shared.push(
                     id: request.id,
                     read: recovered.read,
@@ -566,6 +577,12 @@ struct MacSyncActionRouter {
             default:
                 return observed(["status": "error", "message": "Unknown action: \(action.action)"])
             }
+        } catch ApprovalInboxError.resolutionNotAuthorized(_, _) {
+            return observed([
+                "status": "error",
+                "error": "approval_local_only",
+                "message": "Approval must be reviewed on the Mac app.",
+            ])
         } catch {
             return observed(["status": "error", "message": error.localizedDescription])
         }

@@ -37,7 +37,6 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-import CapabilityFoundry
 
 // W-H Band (U5 decomposition, move-only): Wave-3 runtime seam wrappers
 // (mobile pairing, MacControl run, inbox/connector URLSession

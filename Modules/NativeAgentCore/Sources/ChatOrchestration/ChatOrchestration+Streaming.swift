@@ -825,7 +825,7 @@ extension SwiftNativeTurnEngine {
     nonisolated static func renderNativeToolInstructions() -> String {
         """
         NativeAgent Swift tool protocol (native tool use):
-        - Your Swift tools are attached to this request as native tools. Call them directly through the tool-use channel; do not describe or narrate calls as text.
+        - Your Swift tools are attached to this request as native tools and are ready to call directly through the tool-use channel. tool_load expands the set when a needed capability is absent.
         - COMPLETION CONTRACT: every reply must be EITHER tool call(s) OR your complete final answer. You have no background execution — work you describe but do not call never happens. A reply that only announces or narrates in-progress work ("checking now", "reading the files now", "going through it") is invalid and NativeAgent bounces it back to you. Do the work in THIS reply: make the next tool call, or deliver the finished answer.
         - After NativeAgent returns a tool result, use the result to answer or make another call.
         - For recent commits use git_log, for repo state use git_status, and for diffs use git_diff. Do not ask for raw shell/git commands unless a shell tool is explicitly available.
@@ -858,6 +858,7 @@ extension SwiftNativeTurnEngine {
         return """
         NativeAgent Swift tool protocol (text compatibility):
         - This provider request intentionally does not include provider-native tools. Do not infer that tools are unavailable.
+        - Every tool in Available Swift tools is ready to call directly. tool_load expands the set when a needed capability is absent.
         - To use a Swift tool, output only one or more exact markers, with a JSON object body:
           <tool_use name="tool_name">{"arg":"value"}</tool_use>
         - Do not wrap tool markers in Markdown or code fences.

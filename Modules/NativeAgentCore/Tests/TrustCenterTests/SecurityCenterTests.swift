@@ -10,6 +10,27 @@ private func makeSecurityTempRoot() throws -> URL {
     return dir
 }
 
+@Test func SecurityCenter_canonicalToolRiskProjectsExistingProfileWithoutAuthority() throws {
+    let root = try makeSecurityTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    #expect(SwiftNativeSecurityCenter.canonicalToolRisk(
+        tool: "read_file",
+        input: ["path": .string(root.appendingPathComponent("note.txt").path)],
+        dataRoot: root
+    ) == .low)
+    #expect(SwiftNativeSecurityCenter.canonicalToolRisk(
+        tool: "write_file",
+        input: ["path": .string("/tmp/outside-nativeagent.txt")],
+        dataRoot: root
+    ) == .high)
+    #expect(SwiftNativeSecurityCenter.canonicalToolRisk(
+        tool: "shell",
+        input: ["command": .string("true")],
+        dataRoot: root
+    ) == .critical)
+}
+
 @Test func SecurityCenter_blocksEveryToolWhenSavedAuthorityIsCorrupt() async throws {
     let root = try makeSecurityTempRoot()
     defer { try? FileManager.default.removeItem(at: root) }

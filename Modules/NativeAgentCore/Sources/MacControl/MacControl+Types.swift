@@ -268,6 +268,10 @@ public let macControlAccessibilityReadActions: Set<String> = [
     // reports honestly rather than failing opaque — but a system grant is not
     // a policy tier, so this stays read tier.
     "view",
+    // Explicit, bounded continuity over the same fused view. It passively
+    // notices coarse physical input and scene changes while active, never key
+    // contents, and returns a fresh redacted fused view on start/next.
+    "attention",
 ]
 
 /// Swift-native INJECTION actions with no daemon ancestor (W2/W3). Same
@@ -731,7 +735,7 @@ public func macControlGateCategory(forAction action: String) -> String? {
     case "jxa":                                           return "jxa"
     case "shortcut", "shortcut/run":                      return "shortcuts"
     case "focus_app", "quit_app", "keystroke", "click":   return "accessibility"
-    case "ax_status", "ax_tree", "ax_find", "view":       return "accessibility"
+    case "ax_status", "ax_tree", "ax_find", "view", "attention": return "accessibility"
     // W2/W3 Swift-native injection: same category as keystroke/click above,
     // which is where the daemon put every accessibility-mediated act.
     // W6 `wake` joins them: it posts HID events and re-reads the screen.

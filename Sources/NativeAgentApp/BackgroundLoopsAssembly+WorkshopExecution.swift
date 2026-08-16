@@ -14,6 +14,7 @@ import WorkshopExecution
 import TrustCenter
 import MacControl
 import SelfImprovement
+import NotificationInbox
 
 // MARK: - Workshop Executor
 
@@ -336,18 +337,8 @@ extension BackgroundLoopsAssembly {
             "status": .string("unread"),
             "read_at": .null,
         ])
-        let persistence = SwiftNativePersistenceCore()
-        let inserted = try await persistence.withFileLock(inboxPath) { () async throws -> Bool in
-            let rows = try await persistence.tailJSONL(inboxPath, limit: Int.max, maxBytes: nil)
-            let exists = rows.contains { row in
-                guard case .object(let obj) = row,
-                      case .string(let id)? = obj["id"] else { return false }
-                return id == approvalId
-            }
-            if exists { return false }
-            try await persistence.appendJSONL(card, to: inboxPath)
-            return true
-        }
+        let inserted = try await LiveNotificationInbox(path: inboxPath)
+            .appendUnique(card, id: approvalId)
         if inserted {
             await InboxPushNotifier.notifyIfAttentionWorthy(
                 dataRoot: dataRoot,

@@ -2,14 +2,12 @@
 
 import SwiftUI
 import CognitiveSubstrate
-import Context
-import PersistenceCore
 
 extension CognitionObservatoryView {
 
     // Standing Views + Schema Proposals rendering moved to CognitionProposalsView
-    // (Activity surface, B2.4). Identity Proposals deleted — inert at HEAD
-    // (`proposeIdentity` has no production caller).
+    // (Activity surface, B2.4). Identity Proposals were retired after the
+    // liveness audit proved the experimental producer never shipped.
 
     @ViewBuilder
     func developmentalTimeline(_ events: [CognitiveDevelopmentalTimelineEvent]) -> some View {

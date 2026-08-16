@@ -698,7 +698,7 @@ private func makeIDFactory(_ ids: [String]) -> @Sendable () -> String {
     #expect(stringField(rec, "name") == "Untitled workflow")
     #expect(id == "untitled-workflow")
     #expect(stringField(rec, "status") == "active")
-    #expect(stringField(rec, "engineVersion") == "1")
+    #expect(stringField(rec, "engineVersion") == "2")
     #expect(stringField(rec, "description") == "")
     #expect(stringField(rec, "trigger") == "")
     // Empty steps -> single "plan" router step default.
@@ -756,14 +756,26 @@ private func makeIDFactory(_ ids: [String]) -> @Sendable () -> String {
     #expect(stringField(steps![1], "id") == "second")
 }
 
-@Test func buildRecordStepsCappedAt24() throws {
+@Test func buildRecordRefusesMoreThan24StepsWithoutDroppingTail() throws {
     var raw: [JSONValue] = []
     for i in 0..<40 { raw.append(.object(["title": .string("Step \(i)")])) }
-    let (_, rec, stepCount) = try WorkflowCreate.buildRecord(body: .object(["steps": .array(raw)]), now: "T", uuid: { "u" })
-    #expect(arrayField(rec, "steps")?.count == 24)
-    // stepCount preserves retired len(normalized_steps) behavior — the UNCAPPED 40, NOT the
-    // [:24]-capped persisted list (gpt-5.5 review finding #1).
-    #expect(stepCount == 40)
+    #expect(throws: WorkflowOrchestrationError.tooManySteps(count: 40, maximum: 24)) {
+        _ = try WorkflowCreate.buildRecord(
+            body: .object(["steps": .array(raw)]), now: "T", uuid: { "u" }
+        )
+    }
+}
+
+@Test func createWorkflowOversizeRefusalWritesNoRegistryOrReceipts() async throws {
+    let root = tempRoot()
+    let client = SwiftNativeWorkflowOrchestrationClient(root: root, useFileLock: false)
+    let steps = (0..<25).map { JSONValue.object(["title": .string("Step \($0)")]) }
+    await #expect(throws: WorkflowOrchestrationError.tooManySteps(count: 25, maximum: 24)) {
+        _ = try await client.createWorkflow(.object(["name": .string("Too Large"), "steps": .array(steps)]))
+    }
+    #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("workflows/registry.json").path))
+    #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("activity/events.jsonl").path))
+    #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("traces/events.jsonl").path))
 }
 
 @Test func buildRecordWhitespaceOnlyTitleFallsBackToStepId() throws {
@@ -1028,6 +1040,161 @@ private func makeIDFactory(_ ids: [String]) -> @Sendable () -> String {
     let runs = try await client.listWorkflowRuns()
     #expect(runs.count == 1)
     #expect(stringField(runs[0], "id") == "run-v1")
+}
+
+@Test func legacyV1LiveApprovalRunHealsOntoResumableV2() async throws {
+    let root = tempRoot()
+    try writeRegistry(root, [
+        .object([
+            "id": .string("legacy-live"),
+            "name": .string("Legacy Live"),
+            "engineVersion": .string("1"),
+            "steps": .array([
+                .object([
+                    "id": .string("gate"), "title": .string("Gate"),
+                    "kind": .string("approval"), "requiresApproval": .bool(true),
+                ]),
+            ]),
+            "createdAt": .string("T"), "updatedAt": .string("T"),
+        ]),
+    ])
+    let client = SwiftNativeWorkflowOrchestrationClient(
+        root: root, now: { "2026-08-16T00:00:00Z" },
+        uuid: makeIDFactory(["legacy-run"]), useFileLock: false
+    )
+    let waiting = try await client.runWorkflow(
+        id: "legacy-live", objective: "finish safely", execute: true,
+        engineVersion: nil, variables: nil
+    )
+    #expect(stringField(waiting, "id") == "legacy-run")
+    #expect(stringField(waiting, "engineVersion") == "2")
+    #expect(stringField(waiting, "status") == "waiting_approval")
+    #expect(FileManager.default.fileExists(atPath: root
+        .appendingPathComponent("workflows/run_state/legacy-run.json").path))
+}
+
+@Test func deniedApprovalSettlesRunOnceInsteadOfParkingForever() async throws {
+    let root = tempRoot()
+    try writeRegistry(root, [
+        .object([
+            "id": .string("deny-flow"), "name": .string("Deny Flow"),
+            "engineVersion": .string("2"),
+            "steps": .array([.object([
+                "id": .string("gate"), "title": .string("Gate"),
+                "kind": .string("approval"), "requiresApproval": .bool(true),
+            ])]),
+            "createdAt": .string("T"), "updatedAt": .string("T"),
+        ]),
+    ])
+    let client = SwiftNativeWorkflowOrchestrationClient(
+        root: root, now: { "2026-08-16T00:00:00Z" },
+        uuid: makeIDFactory(["denied-run"]), useFileLock: false
+    )
+    let waiting = try await client.runWorkflow(
+        id: "deny-flow", objective: "test", execute: true,
+        engineVersion: nil, variables: nil
+    )
+    let approvalID = try #require(stringField(waiting, "approvalId"))
+    _ = try await SwiftNativeApprovalInbox(root: root).resolve(
+        approvalID, decision: .denied, decidedBy: "test"
+    )
+    let terminal = try await client.resumeWorkflowRun(id: "denied-run")
+    #expect(stringField(terminal, "status") == "failed")
+    #expect(stringField(arrayField(terminal, "steps")?.last ?? .null, "detail") == "Approval denied.")
+    let repeated = try await client.resumeWorkflowRun(id: "denied-run")
+    #expect(stringField(repeated, "status") == "failed")
+    #expect((try await client.listWorkflowRuns()).count == 2)
+}
+
+@Test func canceledApprovalSettlesRunCanceledOnceInsteadOfParkingForever() async throws {
+    let root = tempRoot()
+    try writeRegistry(root, [
+        .object([
+            "id": .string("cancel-approval-flow"),
+            "name": .string("Cancel Approval Flow"),
+            "engineVersion": .string("2"),
+            "steps": .array([.object([
+                "id": .string("gate"), "title": .string("Gate"),
+                "kind": .string("approval"), "requiresApproval": .bool(true),
+            ])]),
+            "createdAt": .string("T"), "updatedAt": .string("T"),
+        ]),
+    ])
+    let client = SwiftNativeWorkflowOrchestrationClient(
+        root: root,
+        now: { "2026-08-16T00:00:00Z" },
+        uuid: makeIDFactory(["canceled-approval-run"]),
+        useFileLock: false
+    )
+    let waiting = try await client.runWorkflow(
+        id: "cancel-approval-flow",
+        objective: "test",
+        execute: true,
+        engineVersion: nil,
+        variables: nil
+    )
+    let approvalID = try #require(stringField(waiting, "approvalId"))
+    _ = try await SwiftNativeApprovalInbox(root: root).resolve(
+        approvalID,
+        decision: .canceled,
+        decidedBy: "test"
+    )
+
+    let terminal = try await client.resumeWorkflowRun(id: "canceled-approval-run")
+    #expect(stringField(terminal, "status") == "canceled")
+    #expect(stringField(arrayField(terminal, "steps")?.last ?? .null, "status") == "canceled")
+    #expect(stringField(arrayField(terminal, "steps")?.last ?? .null, "detail") == "Approval canceled.")
+    let repeated = try await client.resumeWorkflowRun(id: "canceled-approval-run")
+    #expect(stringField(repeated, "status") == "canceled")
+    let runs = try await client.listWorkflowRuns()
+    #expect(runs.count == 2)
+}
+
+@Test func restartRepairsDispatchedAttemptWithoutBlindReplay() async throws {
+    struct InjectedCrash: Error {}
+    let root = tempRoot()
+    try writeRegistry(root, [
+        .object([
+            "id": .string("crash-flow"), "name": .string("Crash Flow"),
+            "engineVersion": .string("2"),
+            "steps": .array([.object([
+                "id": .string("trace"), "title": .string("Trace"), "kind": .string("trace"),
+            ])]),
+            "createdAt": .string("T"), "updatedAt": .string("T"),
+        ]),
+    ])
+    let crashing = SwiftNativeWorkflowOrchestrationClient(
+        root: root, now: { "2026-08-16T00:00:00Z" },
+        uuid: makeIDFactory(["crash-run"]), useFileLock: false,
+        afterStepAttemptPersisted: { _, _ in throw InjectedCrash() },
+        processIdentity: "crashed-process"
+    )
+    await #expect(throws: InjectedCrash.self) {
+        _ = try await crashing.runWorkflow(
+            id: "crash-flow", objective: "test", execute: true,
+            engineVersion: nil, variables: nil
+        )
+    }
+
+    let sameProcessReader = SwiftNativeWorkflowOrchestrationClient(
+        root: root, now: { "2026-08-16T00:00:30Z" }, useFileLock: false,
+        processIdentity: "crashed-process"
+    )
+    let sameProcessRuns = try await sameProcessReader.listWorkflowRuns()
+    #expect(sameProcessRuns.isEmpty)
+
+    let restarted = SwiftNativeWorkflowOrchestrationClient(
+        root: root, now: { "2026-08-16T00:01:00Z" }, useFileLock: false,
+        processIdentity: "restarted-process"
+    )
+    let firstList = try await restarted.listWorkflowRuns()
+    #expect(firstList.count == 1)
+    #expect(stringField(firstList[0], "status") == "blocked")
+    #expect(stringField(firstList[0], "blockedReason") == "interrupted_after_step_dispatch")
+    let secondList = try await restarted.listWorkflowRuns()
+    #expect(secondList.count == 1)
+    let resumed = try await restarted.resumeWorkflowRun(id: "crash-run")
+    #expect(stringField(resumed, "status") == "blocked")
 }
 
 @Test func runWorkflowV2PausesForApprovalThenResumeCompletesTraceStep() async throws {

@@ -19,6 +19,8 @@ require_file() {
 REPOSITORY="${NATIVEAGENT_GITHUB_REPOSITORY:-}"
 APPCAST="${NATIVEAGENT_PUBLISH_APPCAST:-}"
 DMG="${NATIVEAGENT_PUBLISH_DMG:-}"
+TEST_RECEIPT="${NATIVEAGENT_PUBLISH_TEST_RECEIPT:-}"
+ATTESTATION="${NATIVEAGENT_PUBLISH_ATTESTATION:-}"
 APPCAST_URL="${NATIVEAGENT_PUBLISH_APPCAST_URL:-}"
 DOWNLOAD_URL="${NATIVEAGENT_DMG_DOWNLOAD_URL:-}"
 TARGET="${NATIVEAGENT_GITHUB_TARGET_COMMIT:-}"
@@ -28,10 +30,13 @@ TARGET="${NATIVEAGENT_GITHUB_TARGET_COMMIT:-}"
 command -v gh >/dev/null 2>&1 || fail "GitHub CLI (gh) is required."
 command -v xmllint >/dev/null 2>&1 || fail "xmllint is required."
 command -v jq >/dev/null 2>&1 || fail "jq is required."
+command -v shasum >/dev/null 2>&1 || fail "shasum is required."
 gh auth status >/dev/null 2>&1 || fail "GitHub CLI is not authenticated; run: gh auth login"
 
 require_file "$APPCAST" "NATIVEAGENT_PUBLISH_APPCAST"
 require_file "$DMG" "NATIVEAGENT_PUBLISH_DMG"
+require_file "$TEST_RECEIPT" "NATIVEAGENT_PUBLISH_TEST_RECEIPT"
+require_file "$ATTESTATION" "NATIVEAGENT_PUBLISH_ATTESTATION"
 
 VISIBILITY="$(gh api "repos/$REPOSITORY" --jq '.visibility' 2>/dev/null || true)"
 [[ "$VISIBILITY" == "public" ]] \
@@ -45,8 +50,16 @@ VERSION="$(xmllint --xpath \
 TAG="v$VERSION"
 DMG_NAME="$(basename "$DMG")"
 EXPECTED_DMG_NAME="NativeAgent-$VERSION.dmg"
+ATTESTATION_NAME="$(basename "$ATTESTATION")"
+TEST_RECEIPT_NAME="$(basename "$TEST_RECEIPT")"
+EXPECTED_ATTESTATION_NAME="NativeAgent-$VERSION.release-attestation.json"
+EXPECTED_TEST_RECEIPT_NAME="NativeAgent-$VERSION.test-receipt.json"
 [[ "$DMG_NAME" == "$EXPECTED_DMG_NAME" ]] \
   || fail "DMG name '$DMG_NAME' does not match feed version $VERSION."
+[[ "$ATTESTATION_NAME" == "$EXPECTED_ATTESTATION_NAME" ]] \
+  || fail "attestation name '$ATTESTATION_NAME' does not match feed version $VERSION."
+[[ "$TEST_RECEIPT_NAME" == "$EXPECTED_TEST_RECEIPT_NAME" ]] \
+  || fail "test receipt name '$TEST_RECEIPT_NAME' does not match feed version $VERSION."
 
 EXPECTED_APPCAST_URL="https://github.com/$REPOSITORY/releases/latest/download/appcast.xml"
 EXPECTED_DOWNLOAD_URL="https://github.com/$REPOSITORY/releases/download/$TAG/$DMG_NAME"
@@ -60,6 +73,44 @@ HEAD="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
 TARGET="${TARGET:-$HEAD}"
 [[ "$TARGET" == "$HEAD" ]] \
   || fail "release target $TARGET does not match the source/artifact commit $HEAD."
+
+DMG_SHA256="$(shasum -a 256 "$DMG" | awk '{print $1}')"
+TEST_RECEIPT_SHA256="$(shasum -a 256 "$TEST_RECEIPT" | awk '{print $1}')"
+DMG_BYTES="$(wc -c < "$DMG" | tr -d '[:space:]')"
+jq -e --arg target "$TARGET" \
+  '.schema_version == 1
+   and .source_revision == $target
+   and .source_dirty == false
+   and .canonical_gate == "script/test.sh"
+   and .ios_required == true
+   and .ios_result == "passed"' \
+  "$TEST_RECEIPT" >/dev/null \
+  || fail "release test receipt does not prove the exact clean source and required iOS gate."
+jq -e \
+  --arg version "$VERSION" \
+  --arg target "$TARGET" \
+  --arg dmg_name "$DMG_NAME" \
+  --arg dmg_sha256 "$DMG_SHA256" \
+  --arg receipt_sha256 "$TEST_RECEIPT_SHA256" \
+  --argjson dmg_bytes "$DMG_BYTES" \
+  '.schema_version == 1
+   and .version == $version
+   and .source_revision == $target
+   and .test_receipt.canonical_gate == "script/test.sh"
+   and .test_receipt.source_dirty == false
+   and .test_receipt.ios_required == true
+   and .test_receipt.ios_result == "passed"
+   and .test_receipt.sha256 == $receipt_sha256
+   and .dmg.name == $dmg_name
+   and .dmg.sha256 == $dmg_sha256
+   and .dmg.byte_length == $dmg_bytes
+   and .app.notarized == true
+   and .app.stapled == true
+   and ((.dmg.signature_required == true and .dmg.notarized == true and .dmg.stapled == true)
+        or (.dmg.signature_required == false and .dmg.notarized == false and .dmg.stapled == false))
+   and .verification_tool == "script/verify_release_artifact.sh"' \
+  "$ATTESTATION" >/dev/null \
+  || fail "release attestation does not bind the exact source, canonical test gate, and final DMG verification."
 REMOTE_TARGET="$(gh api "repos/$REPOSITORY/commits/$TARGET" --jq '.sha' 2>/dev/null || true)"
 [[ "$REMOTE_TARGET" == "$TARGET" ]] \
   || fail "source commit $TARGET is not present in $REPOSITORY. Publish the reviewed source first."
@@ -124,11 +175,17 @@ verify_release_assets() {
     --repo "$REPOSITORY" \
     --pattern appcast.xml \
     --pattern "$DMG_NAME" \
+    --pattern "$TEST_RECEIPT_NAME" \
+    --pattern "$ATTESTATION_NAME" \
     --dir "$destination" >/dev/null
   cmp -s "$APPCAST" "$destination/appcast.xml" \
     || fail "GitHub release $TAG has a different appcast.xml."
   cmp -s "$DMG" "$destination/$DMG_NAME" \
     || fail "GitHub release $TAG has different DMG bytes."
+  cmp -s "$TEST_RECEIPT" "$destination/$TEST_RECEIPT_NAME" \
+    || fail "GitHub release $TAG has different test-receipt bytes."
+  cmp -s "$ATTESTATION" "$destination/$ATTESTATION_NAME" \
+    || fail "GitHub release $TAG has different release-attestation bytes."
 }
 
 # Idempotent retry: a prior successful publish may have completed before the
@@ -138,7 +195,7 @@ if RELEASE_JSON="$(gh api "repos/$REPOSITORY/releases/tags/$TAG" 2>/dev/null)"; 
   [[ "$DRAFT" == "false" ]] \
     || fail "a draft release already exists for $TAG. Inspect or delete that draft before retrying."
   verify_release_assets
-  echo "==> GitHub release $TAG already exists with the exact appcast and DMG."
+  echo "==> GitHub release $TAG already exists with the exact appcast, DMG, test receipt, and attestation."
   exit 0
 fi
 
@@ -152,6 +209,8 @@ echo "==> Creating draft GitHub release $TAG"
 gh release create "$TAG" \
   "$APPCAST#Sparkle update feed" \
   "$DMG#NativeAgent $VERSION for macOS" \
+  "$TEST_RECEIPT#NativeAgent $VERSION exact-commit test receipt" \
+  "$ATTESTATION#NativeAgent $VERSION release attestation" \
   --repo "$REPOSITORY" \
   --target "$TARGET" \
   --title "NativeAgent $VERSION" \

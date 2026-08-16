@@ -71,6 +71,16 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
     /// Short by design — neither endpoint does LLM work.
     static let readWorkDeadlineSeconds: Int = 60
 
+    /// The canonical chat store is already durable when a bridge turn reaches
+    /// this seam. Reuse the app's existing completion edge so Mac UI and the
+    /// coalesced iOS transcript projection observe the same turn without a
+    /// second transcript owner.
+    private static func publishChatTurnCompleted(sessionID: String?) async {
+        await MainActor.run {
+            NotificationCenter.default.post(name: .chatTurnCompleted, object: sessionID)
+        }
+    }
+
     /// Claim-once latch shared by a work Task and its deadline timer so
     /// exactly one of them writes the HTTP response.
     private final class WorkLatch: @unchecked Sendable {
@@ -1387,6 +1397,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                         suppressUserAppend: false
                     )
                 }
+                await Self.publishChatTurnCompleted(sessionID: resp.sessionId ?? sessionId)
                 let durationMs = Int(Date().timeIntervalSince(started) * 1000)
                 let trimmedReply = resp.output.trimmingCharacters(in: .whitespacesAndNewlines)
                 let attachmentPayload = Self.bridgeAttachmentPayload(resp.attachments)
@@ -1465,6 +1476,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                 }
                 self.writeJSON(conn, status: 200, obj: responseObject)
             } catch is CancellationError {
+                await Self.publishChatTurnCompleted(sessionID: sessionId)
                 // 2026-07-21 gpt-5.5 review: the bridge deadline cancels the
                 // work task — a cancel is NOT a chat failure. The cancelled
                 // partial already persisted via streamCancelled; writing a
@@ -1505,6 +1517,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                 guard workLatch.claim() else { return }
                 self.writeJSON(conn, status: 200, obj: cancelObject)
             } catch {
+                await Self.publishChatTurnCompleted(sessionID: sessionId)
                 var failureStatus = "chat_failed"
                 var failureDetail = String(describing: error)
                 if lifecycleClaimed, !responseCached,
@@ -1657,6 +1670,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                             suppressUserAppend: true
                         )
                     }
+                await Self.publishChatTurnCompleted(sessionID: resp.sessionId ?? enqueued.sessionId)
                 let durationMs = Int(Date().timeIntervalSince(started) * 1000)
                 let trimmedReply = resp.output.trimmingCharacters(in: .whitespacesAndNewlines)
                 let attachmentPayload = Self.bridgeAttachmentPayload(resp.attachments)
@@ -1687,10 +1701,12 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                     "ack": "enqueued",
                 ])
             } catch is CancellationError {
+                await Self.publishChatTurnCompleted(sessionID: enqueued.sessionId)
                 // Nothing arms this lane's cancellation after the ack today;
                 // tolerate it anyway without a failure row (mirrors the legacy
                 // lane's cancelled-partial handling).
             } catch {
+                await Self.publishChatTurnCompleted(sessionID: enqueued.sessionId)
                 Self.persistMessageReply([
                     "at": ISO8601DateFormatter().string(from: Date()),
                     "status": "chat_failed",

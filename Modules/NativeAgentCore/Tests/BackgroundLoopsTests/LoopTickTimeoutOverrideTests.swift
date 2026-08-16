@@ -32,9 +32,8 @@ private func mkTmp() throws -> URL {
 /// U5 W-D fix-round (gpt-5.5 NEEDS_FIX): the "memory_consolidation" slot is
 /// deliberately ABSENT here. Production registers
 /// MemoryConsolidationHygieneRunner (NativeAgentApp target) for that slot —
-/// NOT this module's MemoryConsolidationLoop, whose production wiring was
-/// retired in U3. Pinning the dead type proved nothing about what ships; the
-/// assembled loop's override is pinned app-side in
+/// The retired module-side JSONL loop is gone. The assembled loop's override
+/// is pinned app-side in
 /// Tests/NativeAgentAppTests/BackgroundLoopsAssemblyOverrideTests.swift,
 /// resolved through BackgroundLoopsAssembly.makeMemoryConsolidationLoop (the
 /// factory assembleAllLoops calls).

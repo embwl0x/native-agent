@@ -125,6 +125,48 @@ struct MigrationTests {
         #expect(report2.memoriesImported == 0)
     }
 
+    @Test func malformed_legacy_wrapper_never_stamps_completion() async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let memoryDir = root.appendingPathComponent("memory", isDirectory: true)
+        try FileManager.default.createDirectory(at: memoryDir, withIntermediateDirectories: true)
+        try Data(#"{"unexpected":[]}"#.utf8).write(
+            to: memoryDir.appendingPathComponent("memory.json")
+        )
+
+        let report = await MemoryV2Migrator(
+            dataRoot: root,
+            storage: InMemoryMemoryStorageStub(),
+            embedder: MockEmbeddingProvider()
+        ).migrate()
+
+        #expect(report.requiredFailures == 1)
+        #expect(!FileManager.default.fileExists(
+            atPath: memoryDir.appendingPathComponent(".migrated_to_sqlite_v2_approved_only").path
+        ))
+    }
+
+    @Test func malformed_legacy_note_row_never_stamps_completion() async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let notesDir = root.appendingPathComponent("memory/persona", isDirectory: true)
+        try FileManager.default.createDirectory(at: notesDir, withIntermediateDirectories: true)
+        try Data(#"{"id":"missing-text"}"#.utf8).write(
+            to: notesDir.appendingPathComponent("notes.jsonl")
+        )
+
+        let report = await MemoryV2Migrator(
+            dataRoot: root,
+            storage: InMemoryMemoryStorageStub(),
+            embedder: MockEmbeddingProvider()
+        ).migrate()
+
+        #expect(report.requiredFailures == 1)
+        #expect(!FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("memory/.migrated_to_sqlite_v2_approved_only").path
+        ))
+    }
+
     @Test func marker_with_empty_store_still_skips_completed_migration() async throws {
         let root = try makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }

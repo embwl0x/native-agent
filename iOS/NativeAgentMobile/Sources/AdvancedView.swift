@@ -166,6 +166,10 @@ final class AdvancedStore: ObservableObject {
         runs = iCloudSyncEngine.shared.runs
         isLoading = false
     }
+
+    func applySyncedRuns(_ next: [RunRecord]) {
+        if next != runs { runs = next }
+    }
 }
 
 // MARK: - Status detail
@@ -431,6 +435,7 @@ private enum RunKindStyle {
 
 struct RunsLogView: View {
     @ObservedObject var store: AdvancedStore
+    @ObservedObject private var sync = iCloudSyncEngine.shared
 
     var body: some View {
         List {
@@ -456,6 +461,9 @@ struct RunsLogView: View {
         .navigationBarTitleDisplayMode(.inline)
         .task { await store.refreshRuns() }
         .refreshable { await store.refreshRuns() }
+        .onChange(of: sync.runs) { _, runs in
+            store.applySyncedRuns(runs)
+        }
     }
 }
 

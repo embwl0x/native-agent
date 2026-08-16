@@ -11,10 +11,10 @@ extension SchedulerDueJobRunner {
     /// until the slow integrity sweep. Startup and source-change reconciliation
     /// still run immediately through BackgroundLoopsManager.
     func nextMeaningfulDeadline(after now: Date) async -> Date? {
-        let raw = try? await persistence.withFileLock(jobsPath) {
-            await persistence.readJSON(jobsPath, defaultValue: .array([]))
+        let rows = try? await persistence.withFileLock(jobsPath) {
+            try Self.readJobRowsChecked(at: jobsPath)
         }
-        guard case .array(let rows)? = raw else { return nil }
+        guard let rows else { return nil }
         let nowEpoch = now.timeIntervalSince1970
         var earliestFuture: Double?
         var hasOverdue = false
@@ -41,10 +41,106 @@ extension SchedulerDueJobRunner {
 
     func selectDueJobs(now: Date, maxJobs: Int) async throws -> [DueJob] {
         let nowEpoch = now.timeIntervalSince1970
-        let raw = try await persistence.withFileLock(jobsPath) {
-            await persistence.readJSON(jobsPath, defaultValue: .array([]))
+        let rows = try await persistence.withFileLock(jobsPath) {
+            try Self.readJobRowsChecked(at: jobsPath)
         }
-        guard case .array(let rows) = raw else { return [] }
+        return Self.dueJobs(in: rows, nowEpoch: nowEpoch, maxJobs: maxJobs)
+    }
+
+    /// Atomically selects and claims scheduled occurrences before any effect
+    /// executes. A claim surviving process restart is an ambiguous outcome,
+    /// not permission to repeat a notification, connector action, Desk task,
+    /// or other non-idempotent effect.
+    func claimDueJobs(now: Date, maxJobs: Int) async throws -> ClaimedDueJobs {
+        try await persistence.withFileLock(jobsPath) { () async throws -> ClaimedDueJobs in
+            var rows = try Self.readJobRowsChecked(at: jobsPath)
+            let selected = Self.dueJobs(
+                in: rows,
+                nowEpoch: now.timeIntervalSince1970,
+                // An occurrence claim is intentionally one-at-a-time. Keep the
+                // legacy parameter for source compatibility, but make it
+                // impossible for a future caller to preclaim an untouched
+                // batch that would become falsely ambiguous after a crash.
+                maxJobs: min(max(0, maxJobs), 1)
+            )
+            guard !selected.isEmpty else { return ClaimedDueJobs(jobs: [], recoveredUnknown: []) }
+
+            var claimed: [DueJob] = []
+            var recovered: [OccurrenceRecovery] = []
+            for job in selected {
+                guard let index = rows.firstIndex(where: { row in
+                    guard case .object(let object) = row else { return false }
+                    return SchedulerJobRuntime.string(object["id"]) == job.id
+                }), case .object(var object) = rows[index] else { continue }
+
+                if let activeValue = object["activeOccurrence"] {
+                    let decodedPriorKey: String?
+                    if case .object(let active) = activeValue {
+                        decodedPriorKey = SchedulerJobRuntime.string(active["key"])
+                    } else {
+                        decodedPriorKey = nil
+                    }
+                    let priorKey = decodedPriorKey ?? job.occurrenceKey
+                    let detail: String
+                    if decodedPriorKey == nil {
+                        detail = "A prior scheduler occurrence claim was malformed. Its external effect "
+                            + "may have happened, so NativeAgent preserved the claim and did not repeat it."
+                        object["lastInvalidOccurrenceClaim"] = activeValue
+                    } else {
+                        detail = "A prior scheduler pass ended after claiming occurrence \(priorKey). "
+                            + "Its external effect may have happened, so NativeAgent did not repeat it."
+                    }
+                    object["lastRunAt"] = .string(Self.iso(now))
+                    object["lastRunStatus"] = .string("unknown")
+                    object["lastRunDetail"] = .string(detail)
+                    object["lastRunError"] = .string(detail)
+                    object["lastUnknownOccurrenceKey"] = .string(priorKey)
+                    object.removeValue(forKey: "activeOccurrence")
+                    if SchedulerJobRuntime.bool(object["oneShot"], default: false) {
+                        object["enabled"] = .bool(false)
+                        object["disabledReason"] = .string("unknown outcome after restart; review before retry")
+                    } else if let next = try? SchedulerJobRuntime.nextRunEpochAfterNow(
+                        for: .object(object), now: { now }
+                    ) {
+                        Self.stampNextRun(&object, epoch: next)
+                    } else {
+                        object["enabled"] = .bool(false)
+                        object["disabledReason"] = .string("unknown outcome and next run could not be computed")
+                    }
+                    // Unknown means "do not automatically replay." Any prior
+                    // retry floor/counter would contradict that settlement and
+                    // could re-arm the same occurrence through catch-up logic.
+                    Self.clearRetryState(&object)
+                    rows[index] = .object(object)
+                    recovered.append(OccurrenceRecovery(
+                        jobId: job.id,
+                        jobName: job.name,
+                        kind: job.kind,
+                        occurrenceKey: priorKey,
+                        detail: detail
+                    ))
+                    continue
+                }
+
+                object["activeOccurrence"] = .object([
+                    "key": .string(job.occurrenceKey),
+                    "dueEpoch": .int(Int64(job.dueEpoch.rounded())),
+                    "claimedAt": .string(Self.iso(now)),
+                    "state": .string("claimed"),
+                ])
+                rows[index] = .object(object)
+                claimed.append(job)
+            }
+            try await persistence.writeJSON(.array(rows), to: jobsPath)
+            return ClaimedDueJobs(jobs: claimed, recoveredUnknown: recovered)
+        }
+    }
+
+    private static func dueJobs(
+        in rows: [JSONValue],
+        nowEpoch: Double,
+        maxJobs: Int
+    ) -> [DueJob] {
         // The cap is applied AFTER an earliest-due-first sort. Walking file
         // order and breaking at `maxJobs` meant a row late in jobs.json could
         // starve behind head rows once the job list outgrew the cap, no matter
@@ -57,7 +153,10 @@ extension SchedulerDueJobRunner {
             let nextEpoch = SchedulerJobRuntime.epoch(from: obj["nextRunAt"])
                 ?? SchedulerJobRuntime.epoch(from: obj["nextRunAtEpoch"])
             guard let nextEpoch, nextEpoch <= nowEpoch else { continue }
-            let id = SchedulerJobRuntime.string(obj["id"]) ?? UUID().uuidString.lowercased()
+            // A scheduled effect without durable job identity cannot acquire a
+            // stable occurrence claim or be settled safely. Job creation owns
+            // IDs; malformed legacy rows remain untouched for repair.
+            guard let id = SchedulerJobRuntime.string(obj["id"]), !id.isEmpty else { continue }
             let name = SchedulerJobRuntime.string(obj["name"]) ?? id
             let kind = (SchedulerJobRuntime.string(obj["kind"]) ?? "notify").lowercased()
             let payload: [String: JSONValue]
@@ -97,9 +196,7 @@ extension SchedulerDueJobRunner {
             )
 
         let repaired = try await persistence.withFileLock(jobsPath) { () async throws -> [String] in
-            let raw = await persistence.readJSON(jobsPath, defaultValue: .array([]))
-            var rows: [JSONValue]
-            if case .array(let arr) = raw { rows = arr } else { rows = [] }
+            var rows = try Self.readJobRowsChecked(at: jobsPath)
             var repaired: [String] = []
 
             let dreamRanToday = Self.containsLastRunToday(rows: rows, kind: "dream", dateKey: runDateKey)

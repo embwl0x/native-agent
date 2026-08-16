@@ -65,10 +65,12 @@ public struct WorkshopSessionReceipt: Sendable, Equatable {
     public let model: String?
     public let artifactPaths: [String]
     public let generatedAt: Date
+    public let disposition: DeskWorkDisposition
 
     public init(
         handle: String, reservationId: String, status: WorkshopSessionStatus,
-        summary: String, model: String?, artifactPaths: [String], generatedAt: Date
+        summary: String, model: String?, artifactPaths: [String], generatedAt: Date,
+        disposition: DeskWorkDisposition = .progress
     ) {
         self.handle = handle
         self.reservationId = reservationId
@@ -77,6 +79,7 @@ public struct WorkshopSessionReceipt: Sendable, Equatable {
         self.model = model
         self.artifactPaths = artifactPaths
         self.generatedAt = generatedAt
+        self.disposition = disposition
     }
 }
 
@@ -113,6 +116,7 @@ public struct WorkshopSession: WorkshopSessionRunning {
     }
 
     public func run(_ request: WorkshopSessionRequest) async -> WorkshopSessionReceipt {
+        let resultStore = WorkshopSessionResultStore(dataRoot: dataRoot)
         // ---- H5: authorization is the triggerSource, and nothing else. ----
         let expected = WorkshopSessionRequest.makeTriggerSource(
             handle: request.handle, reservationId: request.reservationId)
@@ -125,12 +129,14 @@ public struct WorkshopSession: WorkshopSessionRunning {
         // forged or stale reservationId has no matching row → refuse, no LLM.
         guard let state = try? await store.liveState(),
               let item = state.items.first(where: { $0.handle == request.handle }),
-              item.isPursuit,
-              let reservation = item.pursuit?.reservations.first(where: {
-                  $0.reservationId == request.reservationId
-              }),
-              reservation.completedAt == nil else {
+              WorkshopPump.hasLiveAttempt(request.reservationId, on: item) else {
             return refused("no live reservation \(request.reservationId) on \(request.handle)", request)
+        }
+
+        if resultStore.hasClaim(reservationId: request.reservationId),
+           let durable = resultStore.load(reservationId: request.reservationId),
+           durable.handle == request.handle {
+            return durable
         }
 
         // A reservation authorizes at most one execution attempt. The claim is
@@ -147,52 +153,65 @@ public struct WorkshopSession: WorkshopSessionRunning {
         // before constructing the provider client.
         guard let claimedState = try? await store.liveState(),
               let claimedItem = claimedState.items.first(where: { $0.handle == request.handle }),
-              let claimedReservation = claimedItem.pursuit?.reservations.first(where: {
-                  $0.reservationId == request.reservationId
-              }),
-              claimedReservation.completedAt == nil else {
+              WorkshopPump.hasLiveAttempt(request.reservationId, on: claimedItem) else {
             return refused("reservation became stale before execution", request)
         }
 
         // ---- Build the membrane and run ONE bounded turn (H1/L12 + M6). ----
         let collector = WorkshopArtifactCollector()
+        let progressCollector = WorkshopProgressCollector()
         let profile = WorkshopToolProfile(
             inner: SwiftToolDispatcher(
                 dataRoot: dataRoot,
                 allowProcessGlobalTools: dataRoot == PersistenceCore.defaultDataRoot()
             ),
             artifactWriter: WorkshopArtifactWriter(dataRoot: dataRoot, handle: request.handle),
-            collector: collector
+            collector: collector,
+            progressCollector: progressCollector
         )
         let executor = turnExecutor ?? Self.productionTurnExecutor(dataRoot: dataRoot)
 
         let outcome = await runWithDeadline(request: request, tools: profile, executor: executor)
         let artifacts = await collector.written()
+        let progress = await progressCollector.latest()
 
+        let receipt: WorkshopSessionReceipt
         switch outcome {
         case .done(let model, let output):
-            return WorkshopSessionReceipt(
+            let requested = progress?.disposition ?? .progress
+            // A typed completion without a durable artifact is not enough to
+            // close a large project. Keep it as progress; Pump re-verifies the
+            // handle-scoped paths again at the owner CAS boundary.
+            let disposition: DeskWorkDisposition = requested == .goalSatisfied && artifacts.isEmpty
+                ? .progress
+                : requested
+            receipt = WorkshopSessionReceipt(
                 handle: request.handle, reservationId: request.reservationId,
-                status: .completed, summary: Self.trimSummary(output),
-                model: model, artifactPaths: artifacts, generatedAt: now())
+                status: .completed, summary: progress?.summary ?? Self.trimSummary(output),
+                model: model, artifactPaths: artifacts, generatedAt: now(), disposition: disposition)
         case .timedOut:
             // Finite needs-User state — the anti-wedge (M6).
-            return WorkshopSessionReceipt(
+            receipt = WorkshopSessionReceipt(
                 handle: request.handle, reservationId: request.reservationId,
                 status: .blocked, summary: "session exceeded the \(Int(deadlineSeconds))s deadline; left in-flight for the user",
-                model: nil, artifactPaths: artifacts, generatedAt: now())
+                model: nil, artifactPaths: artifacts, generatedAt: now(), disposition: .blocked)
         case .failed(let reason):
-            return WorkshopSessionReceipt(
+            receipt = WorkshopSessionReceipt(
                 handle: request.handle, reservationId: request.reservationId,
                 status: .blocked, summary: "session could not finish: \(Self.trimSummary(reason))",
-                model: nil, artifactPaths: artifacts, generatedAt: now())
+                model: nil, artifactPaths: artifacts, generatedAt: now(), disposition: .blocked)
         }
+        // Terminal result is durable before control returns to the pump. If the
+        // app exits between here and Desk settlement, startup reconciliation
+        // can finish the exact same attempt without another provider turn.
+        _ = resultStore.save(receipt)
+        return receipt
     }
 
     private func refused(_ why: String, _ request: WorkshopSessionRequest) -> WorkshopSessionReceipt {
         WorkshopSessionReceipt(
             handle: request.handle, reservationId: request.reservationId,
-            status: .refused, summary: why, model: nil, artifactPaths: [], generatedAt: now())
+            status: .refused, summary: why, model: nil, artifactPaths: [], generatedAt: now(), disposition: .blocked)
     }
 
     private enum TurnOutcome { case done(model: String, output: String); case timedOut; case failed(String) }
@@ -263,6 +282,101 @@ public struct WorkshopSession: WorkshopSessionRunning {
     }
 }
 
+/// Durable terminal handoff between the one-turn runner and Desk settlement.
+/// It is a reconciliation record, not a second task owner: Desk remains the
+/// visible/canonical lifecycle and this file is deleted only by retention.
+struct WorkshopSessionResultStore: Sendable {
+    let dataRoot: URL
+
+    private var directory: URL {
+        dataRoot.appendingPathComponent("workshop/session_results", isDirectory: true)
+    }
+
+    func path(reservationId: String) -> URL? {
+        guard let safe = try? WorkshopArtifactWriter.validateSafeComponent(reservationId) else { return nil }
+        return directory.appendingPathComponent("\(safe).json")
+    }
+
+    func save(_ receipt: WorkshopSessionReceipt) -> Bool {
+        guard let path = path(reservationId: receipt.reservationId) else { return false }
+        let row: JSONValue = .object([
+            "version": .int(1),
+            "handle": .string(receipt.handle),
+            "reservationId": .string(receipt.reservationId),
+            "status": .string(receipt.status.rawValue),
+            "summary": .string(String(receipt.summary.prefix(600))),
+            "model": receipt.model.map(JSONValue.string) ?? .null,
+            "artifactPaths": .array(receipt.artifactPaths.map(JSONValue.string)),
+            "disposition": .string(receipt.disposition.rawValue),
+            "generatedAt": .string(Self.formatISO(receipt.generatedAt)),
+        ])
+        do {
+            let data = try row.serializedData(pretty: false)
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: path)
+            return true
+        } catch {
+            NSLog("[workshop] terminal result durability failed for %@: %@",
+                  receipt.reservationId, String(describing: error))
+            return false
+        }
+    }
+
+    func load(reservationId: String) -> WorkshopSessionReceipt? {
+        guard let path = path(reservationId: reservationId),
+              let data = try? Data(contentsOf: path),
+              let value = try? JSONValue.parse(data),
+              case .object(let object) = value,
+              case .string(let handle)? = object["handle"],
+              case .string(let storedID)? = object["reservationId"], storedID == reservationId,
+              case .string(let statusRaw)? = object["status"],
+              let status = WorkshopSessionStatus(rawValue: statusRaw),
+              case .string(let summary)? = object["summary"],
+              case .string(let generatedRaw)? = object["generatedAt"],
+              let generatedAt = Self.parseISO(generatedRaw) else { return nil }
+        let model: String? = if case .string(let value)? = object["model"] { value } else { nil }
+        let artifacts: [String] = if case .array(let values)? = object["artifactPaths"] {
+            values.compactMap { if case .string(let value) = $0 { value } else { nil } }
+        } else { [] }
+        let disposition: DeskWorkDisposition = if case .string(let raw)? = object["disposition"] {
+            DeskWorkDisposition(rawValue: raw) ?? .progress
+        } else { .progress }
+        return WorkshopSessionReceipt(
+            handle: handle,
+            reservationId: reservationId,
+            status: status,
+            summary: summary,
+            model: model,
+            artifactPaths: artifacts,
+            generatedAt: generatedAt,
+            disposition: disposition
+        )
+    }
+
+    func hasClaim(reservationId: String) -> Bool {
+        guard let safe = try? WorkshopArtifactWriter.validateSafeComponent(reservationId) else { return false }
+        return FileManager.default.fileExists(atPath: dataRoot
+            .appendingPathComponent("workshop/reservation_claims/\(safe).claim").path)
+    }
+
+    func remove(reservationId: String) {
+        guard let path = path(reservationId: reservationId) else { return }
+        try? FileManager.default.removeItem(at: path)
+    }
+
+
+    private static func formatISO(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
+    }
+
+    private static func parseISO(_ raw: String) -> Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return fractional.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
+    }
+}
+
 /// Workshop-local autonomy policy. The ordinary SecurityCenter and file-access
 /// wrappers remain active; this resolver only prevents the generic chat policy
 /// from reclassifying the already-hard-ceilinged profile as an approval lane.
@@ -277,6 +391,17 @@ struct WorkshopAutonomyResolver: AutonomyResolver {
         guard WorkshopSurfaceVocabulary.isWorkshopSurface(surface),
               WorkshopToolProfile.isPermitted(toolName) else {
             return "deny"
+        }
+        // These three capabilities are implemented entirely inside the
+        // handle-scoped Workshop profile. They never reach the generic
+        // dispatcher, so an owner policy that quite correctly denies unknown
+        // global tool names must not make the private membrane unusable.
+        if [
+            WorkshopToolProfile.artifactToolName,
+            WorkshopToolProfile.artifactReadToolName,
+            WorkshopToolProfile.progressToolName,
+        ].contains(toolName) {
+            return "auto"
         }
         let ownerPolicy = try await base.autonomyLevel(forTool: toolName, surface: surface)
         if ownerPolicy == "deny" || ownerPolicy == "blocked" {

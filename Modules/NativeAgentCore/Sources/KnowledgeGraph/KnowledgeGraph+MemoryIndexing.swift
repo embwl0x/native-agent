@@ -181,23 +181,95 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         deleted: Bool
     ) async throws {
         let dbPool = try await pool()
-        if deleted {
-            try await dbPool.write { db in
-                try Self.deleteMemoryFactEntity(db, memoryID: memoryID)
-                try db.execute(sql: "DELETE FROM kg_memory_index WHERE memory_id = ?", arguments: [memoryID])
-            }
-            return
-        }
-
-        let content = fact.content.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard fact.status == "active", !content.isEmpty else { return }
-
-        let contentHash = Self.contentHash("\(Self.indexVersion):\(content)")
-        let now = Self.nowISO8601()
-        let extracted = Self.extractEntities(from: content)
         let primaryUserName = resolvedPrimaryUserName()
         do {
             try await dbPool.write { db in
+                // Hook payloads are wake hints, not authority. In the production
+                // database MemoryV2 and KG share this exact transaction domain,
+                // so re-read the canonical row now. A delayed update task that
+                // arrives after a delete can no longer resurrect stale entities.
+                let hasMemoryTable = (try Int.fetchOne(db, sql: """
+                    SELECT COUNT(*) FROM sqlite_master
+                    WHERE type = 'table' AND name = 'memories'
+                    """) ?? 0) > 0
+                let canonicalFact: KnowledgeGraphMemoryFact?
+                if hasMemoryTable {
+                    let columns = Set(try Row.fetchAll(
+                        db, sql: "PRAGMA table_info(memories)"
+                    ).compactMap { row -> String? in row["name"] })
+                    let requiredColumns: Set<String> = ["id", "content", "status"]
+                    guard requiredColumns.isSubset(of: columns) else {
+                        let missing = requiredColumns.subtracting(columns).sorted()
+                        throw KnowledgeGraphReadError.storeUnreadable(
+                            "memories table is missing required columns: \(missing.joined(separator: ", "))"
+                        )
+                    }
+                    canonicalFact = try Row.fetchOne(
+                        db,
+                        sql: "SELECT * FROM memories WHERE id = ?",
+                        arguments: [memoryID]
+                    ).flatMap { row -> KnowledgeGraphMemoryFact? in
+                            let content: String = row["content"] ?? ""
+                            let status: String = row["status"] ?? ""
+                            // v5 introduced lifecycle; supported older/minimal
+                            // stores mean confirmed when the column is absent.
+                            // If it is present, the canonical row remains the
+                            // authority and corrected/contradicted/deleted facts
+                            // stay excluded.
+                            let lifecycle: String = columns.contains("lifecycle")
+                                ? (row["lifecycle"] ?? "confirmed")
+                                : "confirmed"
+                            let recallExcludedLifecycle: Set<String> = [
+                                "corrected", "contradicted", "deleted",
+                            ]
+                            guard status == "active",
+                                  !recallExcludedLifecycle.contains(
+                                    lifecycle.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                                  ),
+                                  !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                                return nil
+                            }
+                            let metadata: JSONValue? = if columns.contains("metadata_json") {
+                                (row["metadata_json"] as String?).flatMap {
+                                    try? JSONValue.parse(Data($0.utf8))
+                                }
+                            } else {
+                                fact.metadata
+                            }
+                            return KnowledgeGraphMemoryFact(
+                                id: row["id"] ?? memoryID,
+                                content: content,
+                                source: columns.contains("source") ? row["source"] : fact.source,
+                                status: status,
+                                createdAt: columns.contains("created_at")
+                                    ? (row["created_at"] ?? "") : fact.createdAt,
+                                updatedAt: columns.contains("updated_at")
+                                    ? (row["updated_at"] ?? "") : fact.updatedAt,
+                                metadata: metadata
+                            )
+                        }
+                } else if deleted || fact.status != "active"
+                            || fact.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    canonicalFact = nil
+                } else {
+                    canonicalFact = fact
+                }
+
+                guard let canonicalFact else {
+                    try Self.deleteMemoryFactEntity(db, memoryID: memoryID)
+                    try db.execute(
+                        sql: "DELETE FROM kg_memory_index WHERE memory_id = ?",
+                        arguments: [memoryID]
+                    )
+                    return
+                }
+
+                let content = canonicalFact.content
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let contentHash = Self.contentHash("\(Self.indexVersion):\(content)")
+                let now = Self.nowISO8601()
+                let extracted = Self.extractEntities(from: content)
+
                 // U5 W-C re-entry fix, layer 2: the hash check runs INSIDE the
                 // same write transaction as the upserts. A changed hash cannot
                 // be incrementally overlaid: that would retain entities/edges
@@ -212,7 +284,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
                 if existingHash != nil { throw IndexingControl.requiresCanonicalRebuild }
                 try Self.indexActiveFact(
                     db,
-                    fact: fact,
+                    fact: canonicalFact,
                     memoryID: memoryID,
                     content: content,
                     contentHash: contentHash,

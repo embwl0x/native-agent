@@ -19,7 +19,6 @@ let package = Package(
             // accepted. Package.resolved pins the current 2.9.4 patch.
             from: "2.9.2"
         ),
-        .package(url: "https://github.com/groue/GRDB.swift.git", from: "7.0.0"),
         .package(path: "Modules/NativeAgentShared"),
         .package(path: "Modules/NativeAgentCore")
     ],
@@ -28,7 +27,6 @@ let package = Package(
             name: "NativeAgentApp",
             dependencies: [
                 .product(name: "Sparkle", package: "Sparkle"),
-                .product(name: "GRDB", package: "GRDB.swift"),
                 .product(name: "NativeAgentShared", package: "NativeAgentShared"),
                 .product(name: "NativeAgentCore", package: "NativeAgentCore"),
                 .product(name: "ApprovalInbox", package: "NativeAgentCore"),
@@ -125,14 +123,6 @@ let package = Package(
                 // (direct URLSession POST to
                 // OpenAI's /v1/audio/speech, key via LLMCredentialResolver).
                 .product(name: "MultimodalTTS", package: "NativeAgentCore"),
-                // CapabilityFoundry owns the live GET
-                // /v1/capability-foundry route (Mac ContentView.capabilityFoundry
-                // panel). NativeClient.getCapabilityFoundry() returns the structural
-                // contract (principle / hotPathContract / lane skeleton /
-                // readouts, zeroed counts) from SwiftNativeCapabilityFoundryClient.
-                // Swift-native structural readout; side-effecting backlog
-                // implementation stays disabled until its Swift owner lands.
-                .product(name: "CapabilityFoundry", package: "NativeAgentCore"),
                 // MacIntegration — per-integration READ/WRITE permission
                 // gating for Calendar / Reminders / Contacts / Mail / Messages
                 // / Notes / Music / Notifications / Spotlight / Scheduler.

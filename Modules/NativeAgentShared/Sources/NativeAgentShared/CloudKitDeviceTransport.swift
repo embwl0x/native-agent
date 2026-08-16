@@ -215,6 +215,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     private var statusHandlers: [String: @Sendable (String) async -> Void] = [:]
     private var visibleNotificationSubscriptionReady = false
     private var lastPullDate: Date?
+    private var lastPullCursorPersistenceAt: Date?
     // CK-3c: transport-level drain serialization (guarded by `lock`). Concurrent
     // drains must NOT overlap — one drain's releaseClaim racing another's
     // cursor-advance can drop a record (gpt-5.5 CK-3c review P0). While a drain
@@ -236,17 +237,21 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     public init(
         role: NADeviceRole,
         containerIdentifier: String,
-        configured: Bool = DeviceCloudKitPreflight.hasCloudKitEntitlement()
+        configured: Bool? = nil
     ) {
         self.role = role
         self.containerIdentifier = containerIdentifier
-        self.configured = configured
+        self.configured = configured ?? (
+            DeviceCloudKitPreflight.hasCloudKitEntitlement()
+                && DeviceCloudKitPreflight.entitlementGrantsContainer(containerIdentifier)
+        )
         // CK-3c: restore the persisted pull cursor so a cold start resumes from
         // where it left off instead of re-pulling every record from zero (which
         // would re-deliver old messages past the bridge seen-set cap). Keyed by
         // (role, container) so distinct devices/containers never share a cursor.
         if let ts = UserDefaults.standard.object(forKey: Self.cursorKey(role: role, container: containerIdentifier)) as? Double {
             self.lastPullDate = Date(timeIntervalSince1970: ts)
+            self.lastPullCursorPersistenceAt = Date()
         }
     }
 
@@ -258,6 +263,20 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
 
     private static func cursorKey(role: NADeviceRole, container: String) -> String {
         "NADeviceSync.cursor.\(role.rawValue).\(container)"
+    }
+
+    /// Quiet successful pulls advance the in-memory high watermark on every
+    /// drain, but do not need to dirty preferences on every fallback tick.
+    static let emptyCursorPersistenceInterval: TimeInterval = 5 * 60
+
+    static func shouldPersistPullCursor(
+        immediately: Bool,
+        lastPersistenceAt: Date?,
+        now: Date
+    ) -> Bool {
+        immediately || lastPersistenceAt.map {
+            now.timeIntervalSince($0) >= emptyCursorPersistenceInterval
+        } ?? true
     }
 
     /// CK-3c: true iff `userInfo` is a CloudKit silent push for one of the
@@ -506,7 +525,10 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
             safeRecordDate: cursorAdvance,
             halted: halted
         ) {
-            setLastPullDate(nextCursor)
+            setLastPullDate(
+                nextCursor,
+                persistImmediately: cursorAdvance != nil || halted
+            )
         }
         return dispatched
     }
@@ -1088,8 +1110,21 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         return (incomingHandler, lastPullDate)
     }
 
-    private func setLastPullDate(_ date: Date) {
-        lock.lock(); lastPullDate = date; lock.unlock()
+    private func setLastPullDate(_ date: Date, persistImmediately: Bool) {
+        let shouldPersist: Bool = {
+            lock.lock()
+            defer { lock.unlock() }
+            lastPullDate = date
+            let now = Date()
+            let persist = Self.shouldPersistPullCursor(
+                immediately: persistImmediately,
+                lastPersistenceAt: lastPullCursorPersistenceAt,
+                now: now
+            )
+            if persist { lastPullCursorPersistenceAt = now }
+            return persist
+        }()
+        guard shouldPersist else { return }
         // CK-3c: persist so the cursor survives a restart (see init). role +
         // containerIdentifier are immutable lets — no lock needed; UserDefaults
         // is thread-safe.
@@ -1190,18 +1225,17 @@ public extension DeviceSyncTransportResolver {
         role: NADeviceRole,
         containerIdentifier: String,
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        hasEntitlement: () -> Bool = DeviceCloudKitPreflight.hasCloudKitEntitlement
+        hasEntitlement: () -> Bool = DeviceCloudKitPreflight.hasCloudKitEntitlement,
+        grantsContainer: (String) -> Bool = DeviceCloudKitPreflight.entitlementGrantsContainer
     ) -> DeviceSyncTransport? {
         guard resolvedKind(environment: environment) == .cloudkit else { return nil }
         guard hasEntitlement() else {
             NSLog("[ck-device] NATIVE_AGENT_DEVICE_SYNC=cloudkit but the CloudKit entitlement is ABSENT — staying on the legacy KVS/ubiquity transport (no CKContainer is touched). This is the 2026-06-03 launch-crash guard.")
             return nil
         }
-        if !DeviceCloudKitPreflight.entitlementGrantsContainer(containerIdentifier) {
-            // Diagnostic only — container-id string formats vary across profiles,
-            // so this does NOT disable CloudKit (the hard gate above already
-            // passed). It just flags a likely-misconfigured container id.
-            NSLog("[ck-device] note: entitlements do not visibly list container '\(containerIdentifier)' — proceeding on the CloudKit service grant; verify the container id if sync fails.")
+        guard grantsContainer(containerIdentifier) else {
+            NSLog("[ck-device] CloudKit service is granted but the exact container '\(containerIdentifier)' is absent — refusing to construct CKContainer and staying on the legacy transport.")
+            return nil
         }
         return CloudKitDeviceTransport(
             role: role, containerIdentifier: containerIdentifier, configured: true)

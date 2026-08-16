@@ -30,6 +30,10 @@ import PersistenceCore
 // this type can become a sentence the model reads.
 
 extension CognitiveSubstrate {
+    /// Metadata-only bridge from ChatOrchestration. The model-visible/event
+    /// summary remains capped; this count lets observation telemetry measure
+    /// the actual redacted reply without retaining another copy of it.
+    public static let replyCharacterCountMetadataKey = "replyCharacterCount"
 
     /// The envelope the mechanism WOULD have chosen: a target reply-length band
     /// and a one-beat flag. Non-lexical, bounded, and inert.

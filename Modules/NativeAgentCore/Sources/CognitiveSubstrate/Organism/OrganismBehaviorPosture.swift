@@ -86,7 +86,7 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
                 chemicalState: snapshot.chemicalState,
                 bodySchema: snapshot.bodySchema,
                 predictionSummary: snapshot.predictionSummary,
-                reflexSummary: snapshot.reflexSummary
+                approvedLowRiskReflexCount: snapshot.reflexSummary.approvedLowRiskCount
             ),
             claimDiscipline: claimDiscipline(
                 bodySchema: snapshot.bodySchema,
@@ -109,8 +109,7 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
                 reflexSummary: snapshot.reflexSummary
             ),
             reviewSignals: reviewSignals(
-                dreamRepairSummary: snapshot.dreamRepairSummary,
-                reflexSummary: snapshot.reflexSummary
+                dreamRepairSummary: snapshot.dreamRepairSummary
             ),
             approvedReflexBiases: approvedReflexBiases(from: snapshot.reflexCandidates),
             reviewRequiredReflexCount: snapshot.reflexSummary.reviewRequiredCount,
@@ -187,7 +186,7 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
         chemicalState: ChemicalState,
         bodySchema: BodySchema,
         predictionSummary: OrganismPredictionSummary,
-        reflexSummary: OrganismReflexSummary
+        approvedLowRiskReflexCount: Int
     ) -> String {
         if bodySchema.resourcePressure == .critical || chemicalState.fatigue >= 0.35 {
             return "conserving"
@@ -198,10 +197,7 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
         if bodySchema.providerPathRequiresCaution || bodySchema.toolPathRequiresCaution || predictionSummary.strategyCaution >= 0.18 || chemicalState.vigilance >= 0.24 {
             return "careful"
         }
-        if reflexSummary.reviewRequiredCount > 0 {
-            return "reviewing"
-        }
-        if reflexSummary.approvedLowRiskCount > 0 {
+        if approvedLowRiskReflexCount > 0 {
             return "trained"
         }
         if bodySchema.notificationRequiresReceipt {
@@ -302,9 +298,6 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
         if bodySchema.memoryRequiresCurrentContext {
             out.append("Lean on the current conversation before relying on memory recall.")
         }
-        if reflexSummary.reviewRequiredCount > 0 {
-            out.append("Treat emerging reflexes as review-only; do not auto-activate them.")
-        }
         if reflexSummary.approvedLowRiskCount > 0 {
             out.append("Let approved low-risk reflexes bias order and phrasing only when the current context matches.")
         }
@@ -312,18 +305,11 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
     }
 
     private static func reviewSignals(
-        dreamRepairSummary: OrganismDreamRepairSummary,
-        reflexSummary: OrganismReflexSummary
+        dreamRepairSummary: OrganismDreamRepairSummary
     ) -> [String] {
         var out: [String] = []
         if dreamRepairSummary.proposedStandingViews > 0 {
             out.append("dream repair has standing-view proposals waiting for review")
-        }
-        if reflexSummary.reviewRequiredCount > 0 {
-            out.append("\(reflexSummary.reviewRequiredCount) reflex candidate(s) require review")
-        }
-        if reflexSummary.highRiskCount > 0 {
-            out.append("\(reflexSummary.highRiskCount) high-risk reflex candidate(s) remain inactive")
         }
         return out
     }

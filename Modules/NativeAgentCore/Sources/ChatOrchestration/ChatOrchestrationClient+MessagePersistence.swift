@@ -431,6 +431,17 @@ extension SwiftNativeChatOrchestrationClient {
             maximumCharacters: Self.persistedToolResultMaximumCharacters,
             label: "tool result"
         )
+        let canonicalRiskInput: [String: JSONValue] = {
+            guard let parsed = try? JSONValue.parse(Data(inputJSON.utf8)),
+                  case .object(let object) = parsed
+            else { return [:] }
+            return object
+        }()
+        let canonicalToolRisk = SwiftNativeSecurityCenter.canonicalToolRisk(
+            tool: toolName,
+            input: canonicalRiskInput,
+            dataRoot: dataRoot
+        )
         let path = dataRoot
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("messages", isDirectory: true)
@@ -475,6 +486,7 @@ extension SwiftNativeChatOrchestrationClient {
             resultSummary: safeResultSummary,
             ok: ok,
             cognitiveResult: cognitiveResult,
+            canonicalToolRisk: canonicalToolRisk,
             source: messageSource,
             createdAt: createdAt,
             messageId: messageId
@@ -900,6 +912,51 @@ extension SwiftNativeChatOrchestrationClient {
         surface: String,
         runId: String?
     ) async throws -> ChatSessionCompactionOutcome {
+        try await compactSession(
+            sessionId: sessionId,
+            model: model,
+            surface: surface,
+            runId: runId,
+            providerID: LLMCallContext.providerId,
+            trigger: "auto_threshold",
+            force: false
+        )
+    }
+
+    /// Explicit user-requested compaction through the same canonical owner as
+    /// automatic pre-turn compaction. `force` bypasses only the automatic
+    /// enable/threshold gates; validation, verified backup, keep-tail,
+    /// durable replacement, trace projection, and optional distillation remain
+    /// identical.
+    @discardableResult
+    public func compactSession(
+        sessionId: String,
+        model: String,
+        surface: String = "chat",
+        runId: String? = nil,
+        providerID: String? = nil,
+        force: Bool = true
+    ) async throws -> ChatSessionCompactionOutcome {
+        try await compactSession(
+            sessionId: sessionId,
+            model: model,
+            surface: surface,
+            runId: runId,
+            providerID: providerID,
+            trigger: force ? "manual_request" : "manual_threshold",
+            force: force
+        )
+    }
+
+    private func compactSession(
+        sessionId: String,
+        model: String,
+        surface: String,
+        runId: String?,
+        providerID: String?,
+        trigger: String,
+        force: Bool
+    ) async throws -> ChatSessionCompactionOutcome {
         let compactor = ChatSessionAutocompactor(
             dataRoot: dataRoot,
             config: autocompactionConfig,
@@ -909,7 +966,10 @@ extension SwiftNativeChatOrchestrationClient {
             sessionId: sessionId,
             model: model,
             surface: surface,
-            runId: runId
+            runId: runId,
+            providerID: providerID,
+            trigger: trigger,
+            force: force
         )
         // Fire-and-forget LLM distillation of the mechanical summary. Only when
         // distill is enabled AND a backup was taken (both encoded in the outcome
@@ -1059,6 +1119,13 @@ extension SwiftNativeChatOrchestrationClient {
             let bounded = Array(Set(recalledMemoryIds)).sorted().prefix(32)
             metadata["memoryRecordIds"] = .array(bounded.map { .string($0) })
         }
+        if normalizedRole == "assistant", kind == .assistantTurnCompleted {
+            // The event summary is deliberately capped below, but delivery-
+            // envelope telemetry needs the length of the actual redacted
+            // reply. Carry only that bounded count; never duplicate content.
+            metadata[CognitiveSubstrate.replyCharacterCountMetadataKey] =
+                .int(Int64(redactedSummary.count))
+        }
         // Chat workload class comes from surface provenance, never from topic
         // words. An ordinary user asking about the scheduler/doctor/observatory
         // is still a live turn. The bridge's explicit provenance prefix may
@@ -1114,6 +1181,7 @@ extension SwiftNativeChatOrchestrationClient {
         resultSummary: String,
         ok: Bool,
         cognitiveResult: ChatToolOutcome.CognitiveResult?,
+        canonicalToolRisk: CanonicalToolRisk,
         source: String,
         createdAt: String,
         messageId: String
@@ -1127,6 +1195,7 @@ extension SwiftNativeChatOrchestrationClient {
             "toolName": .string(toolName),
             "ok": .bool(ok),
             "source": .string(source),
+            "trustRisk": .string(canonicalToolRisk.rawValue),
         ]
         if let runId { metadata["runId"] = .string(runId) }
         let succeeded = exactCognitiveResult == .succeeded

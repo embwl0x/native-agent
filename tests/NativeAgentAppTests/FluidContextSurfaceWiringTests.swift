@@ -154,7 +154,8 @@ struct FluidContextSurfaceWiringTests {
 
         let dreamAssembly = try AppSourceScraping.appSource("BackgroundLoopsAssembly+DreamsMemory.swift")
         let memoryDelta = try AppSourceScraping.functionBody(named: "makeDreamMemoryDeltaProvider", in: dreamAssembly)
-        #expect(memoryDelta.contains("MemoryStorage(dataRoot: standardized)"))
+        #expect(memoryDelta.contains("SwiftNativeMemoryV2.resolvedOwner("))
+        #expect(memoryDelta.contains("alternateRootEmbedder: MockEmbeddingProvider()"))
         #expect(memoryDelta.contains("memory.listMemory"))
         let feltSummary = try AppSourceScraping.functionBody(named: "makeDreamFeltSummaryProvider", in: dreamAssembly)
         #expect(feltSummary.contains("cognitionRuntime ?? self.cognitionRuntime(for: dataRoot)"))

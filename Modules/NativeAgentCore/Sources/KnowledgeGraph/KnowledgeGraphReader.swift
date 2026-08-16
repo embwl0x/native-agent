@@ -40,6 +40,8 @@ public enum KnowledgeGraphReadError: Error, LocalizedError, Sendable {
     case storeUnreadable(String)
     case malformedEnvelope(String)
     case paginationLimitExceeded(Int)
+    case queryLimitExceeded(maximumBytes: Int, maximumTokens: Int)
+    case relationshipLimitExceeded(Int)
 
     public var errorDescription: String? {
         switch self {
@@ -49,6 +51,10 @@ public enum KnowledgeGraphReadError: Error, LocalizedError, Sendable {
             return "Knowledge graph projection was malformed: \(detail)"
         case .paginationLimitExceeded(let limit):
             return "Knowledge graph projection exceeded its \(limit)-page safety bound"
+        case .queryLimitExceeded(let bytes, let tokens):
+            return "Knowledge graph query exceeded its safety bound (\(bytes) bytes / \(tokens) tokens)"
+        case .relationshipLimitExceeded(let limit):
+            return "Knowledge graph projection exceeded its \(limit)-relationship safety bound"
         }
     }
 }
@@ -70,6 +76,7 @@ public protocol KnowledgeGraphReader: Sendable {
     func allEntitiesChecked(page: Int) async throws -> JSONValue
     func searchChecked(q: String) async throws -> JSONValue
     func entityChecked(id: String) async throws -> KnowledgeGraphEntityResult
+    func completeSnapshotChecked(maxPages: Int) async throws -> JSONValue
 }
 
 public extension KnowledgeGraphReader {
@@ -99,6 +106,12 @@ public extension KnowledgeGraphReader {
     /// cross-page edge appearances, and never reads the retired JSON file
     /// directly when SQLite is authoritative.
     func completeSnapshotChecked(maxPages: Int = 500) async throws -> JSONValue {
+        try await completeSnapshotByPagingChecked(maxPages: maxPages)
+    }
+
+    /// Default complete-snapshot implementation for non-SQLite conformers and
+    /// the legacy pre-SQLite JSON compatibility lane.
+    func completeSnapshotByPagingChecked(maxPages: Int = 500) async throws -> JSONValue {
         let pageLimit = max(1, maxPages)
         var entities: [JSONValue] = []
         var edges: [JSONValue] = []
@@ -267,6 +280,21 @@ public struct SwiftNativeKnowledgeGraphReader: KnowledgeGraphReader {
 
     public func allEntitiesChecked(page: Int) async throws -> JSONValue {
         if Task.isCancelled { throw CancellationError() }
+        let memoryDir = graphPath.deletingLastPathComponent()
+        if FileManager.default.fileExists(
+            atPath: memoryDir.appendingPathComponent("memory.sqlite").path
+        ) {
+            do {
+                return try await KnowledgeGraphStore.pageFromMemoryV2(
+                    memoryDir: memoryDir,
+                    jsonImportPath: graphPath,
+                    page: page
+                )
+            } catch KnowledgeGraphSQLiteLoadError.databaseMissing {
+                // Deleted between existence check and pool open: pre-SQLite
+                // JSON compatibility remains the only valid fallback.
+            }
+        }
         let s = try await loadStore()
         // Reproduce the daemon ROUTE's `max(0, int(page))` clamp
         // at this route-replacement boundary.
@@ -275,6 +303,20 @@ public struct SwiftNativeKnowledgeGraphReader: KnowledgeGraphReader {
 
     public func searchChecked(q: String) async throws -> JSONValue {
         if Task.isCancelled { throw CancellationError() }
+        let memoryDir = graphPath.deletingLastPathComponent()
+        if FileManager.default.fileExists(
+            atPath: memoryDir.appendingPathComponent("memory.sqlite").path
+        ) {
+            do {
+                return try await KnowledgeGraphStore.searchFromMemoryV2(
+                    memoryDir: memoryDir,
+                    jsonImportPath: graphPath,
+                    query: q
+                )
+            } catch KnowledgeGraphSQLiteLoadError.databaseMissing {
+                // See allEntitiesChecked: deletion races may use legacy JSON.
+            }
+        }
         let s = try await loadStore()
         // searchEntities("") is [] — the empty-q 400 contract lives in the
         // optional `search(q:)` shim and in the Mac client.
@@ -283,6 +325,20 @@ public struct SwiftNativeKnowledgeGraphReader: KnowledgeGraphReader {
 
     public func entityChecked(id: String) async throws -> KnowledgeGraphEntityResult {
         if Task.isCancelled { throw CancellationError() }
+        let memoryDir = graphPath.deletingLastPathComponent()
+        if FileManager.default.fileExists(
+            atPath: memoryDir.appendingPathComponent("memory.sqlite").path
+        ) {
+            do {
+                return try await KnowledgeGraphStore.entityFromMemoryV2(
+                    memoryDir: memoryDir,
+                    jsonImportPath: graphPath,
+                    id: id
+                )
+            } catch KnowledgeGraphSQLiteLoadError.databaseMissing {
+                // See allEntitiesChecked: deletion races may use legacy JSON.
+            }
+        }
         let s = try await loadStore()
         // Daemon route: get_entity(id) is checked
         // first; if missing -> 404. neighbors() is what the WIRED route returns
@@ -290,6 +346,25 @@ public struct SwiftNativeKnowledgeGraphReader: KnowledgeGraphReader {
         // we return the neighbors envelope on hit and notFound otherwise.
         guard s.hasEntity(id) else { return .notFound }
         return .found(s.neighbors(id))
+    }
+
+    public func completeSnapshotChecked(maxPages: Int = 500) async throws -> JSONValue {
+        if Task.isCancelled { throw CancellationError() }
+        let memoryDir = graphPath.deletingLastPathComponent()
+        if FileManager.default.fileExists(
+            atPath: memoryDir.appendingPathComponent("memory.sqlite").path
+        ) {
+            do {
+                return try await KnowledgeGraphStore.completeSnapshotFromMemoryV2(
+                    memoryDir: memoryDir,
+                    jsonImportPath: graphPath,
+                    maxPages: maxPages
+                )
+            } catch KnowledgeGraphSQLiteLoadError.databaseMissing {
+                // Deleted between existence check and pool open.
+            }
+        }
+        return try await completeSnapshotByPagingChecked(maxPages: maxPages)
     }
 }
 

@@ -533,7 +533,7 @@ enum MemoryDeletionPresentation {
 // Surfaces the four indicators that prove the daemon-era memory backend has
 // been replaced with the Apple-native stack:
 //   * SQLite record count read directly from `<dataRoot>/memory/memory.sqlite`
-//     via `MemoryStorage(dataRoot:).listMemories(...)`.
+//     through MemoryV2's canonical resolved storage owner.
 //   * Core ML MiniLM (Neural Engine) embedder availability — keyed off the
 //     migration marker + the Core ML model URL probe.
 //   * CoreSpotlight indexed count — the `.spotlight_reindexed` sentinel under
@@ -642,7 +642,7 @@ struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
         // SQLite probe — open the same store MemoryV2+Storage.swift uses and
         // list active rows. `try?` so a fresh install with no sqlite yet stays
         // at 0 rather than vanishing the panel.
-        if let store = try? MemoryStorage(dataRoot: dataRoot) {
+        if let store = try? await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot) {
             if let memories = try? await store.listMemories(persona: nil, status: nil, limit: nil) {
                 snap.sqliteRecordCount = memories.count
             }

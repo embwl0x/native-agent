@@ -241,7 +241,7 @@ struct ActivityView: View {
                             systemImage: "eye",
                             tint: .purple,
                             count: cognitionPending.count,
-                            subtitle: "Standing views & schema proposals from reflection"
+                            subtitle: "Standing views from reflection"
                         )
                     }
                     ForEach(Array(cognitionPending.standingViews.prefix(2)), id: \.id) { view in
@@ -251,19 +251,6 @@ struct ActivityView: View {
                             onApprove: { resolveStandingView(view.id, approved: true) },
                             onReject: { resolveStandingView(view.id, approved: false) }
                         )
-                    }
-                    // Top up with schema proposals if there's room for a preview.
-                    if cognitionPending.standingViews.count < 2 {
-                        let take = 2 - cognitionPending.standingViews.count
-                        ForEach(Array(cognitionPending.schemaProposals.prefix(take)), id: \.id) { proposal in
-                            InlineCognitionProposalCard(
-                                title: proposal.title,
-                                subtitle: "schema proposal — \(proposal.target)",
-                                detail: proposal.body,
-                                onApprove: { resolveSchemaProposal(proposal.id, accepted: true) },
-                                onReject: { resolveSchemaProposal(proposal.id, accepted: false) }
-                            )
-                        }
                     }
                     if cognitionPending.count > 2 {
                         Button {
@@ -346,12 +333,6 @@ struct ActivityView: View {
         }
     }
 
-    private func resolveSchemaProposal(_ id: UUID, accepted: Bool) {
-        Task {
-            await NativeCognitionRuntime.shared.resolveSchemaProposal(id: id, accepted: accepted)
-            await loadCognitionPending()
-        }
-    }
 }
 
 private struct SidebarActivityRow: View {

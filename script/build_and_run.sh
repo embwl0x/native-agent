@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=lib/provisioning_profile_contract.sh
 source "$ROOT/script/lib/provisioning_profile_contract.sh"
+# shellcheck source=lib/development_bundle_signing.sh
+source "$ROOT/script/lib/development_bundle_signing.sh"
 APP_NAME="NativeAgent"
 PRODUCT="NativeAgentApp"
 APP_LOG="$ROOT/.runtime/nativeagent-app.log"
@@ -97,6 +99,9 @@ export NATIVEAGENT_MOBILE_SOURCE_KEY
 export NATIVEAGENT_BACKGROUND_TASK_PREFIX
 export NATIVEAGENT_DEVICE_SYNC
 
+# shellcheck source=lib/build_source_inventory.sh
+source "$ROOT/script/lib/build_source_inventory.sh"
+
 mkdir -p "$ROOT/.runtime" "$ROOT/dist/$APP_NAME.app/Contents/MacOS"
 export CLANG_MODULE_CACHE_PATH="$ROOT/.runtime/clang-module-cache"
 export SWIFT_MODULE_CACHE_PATH="$ROOT/.runtime/swift-module-cache"
@@ -106,9 +111,14 @@ mkdir -p "$CLANG_MODULE_CACHE_PATH" "$SWIFT_MODULE_CACHE_PATH"
 # a new source file added to a local package dep (Modules/NativeAgentCore) is
 # invisible to the ROOT build until the PARENT manifest mtime changes — the
 # cached .build/debug.yaml keeps the dep's old source list and the build fails
-# with "cannot find <NewType> in scope". Touch the root manifest to force a
-# re-plan every build.
-touch "$ROOT/Package.swift"
+# with "cannot find <NewType> in scope". Re-plan only when the deterministic
+# source/resource PATH inventory changes; ordinary content edits remain owned
+# by SwiftPM and no longer force an otherwise-cached plan on every build.
+if nativeagent_refresh_swiftpm_plan_if_inventory_changed "$ROOT"; then
+  echo "[swiftpm-plan] source/resource inventory changed; refreshed build plan"
+else
+  echo "[swiftpm-plan] source/resource inventory unchanged; keeping cached plan"
+fi
 
 # DOWNTIME GUARD 2026-07-02: the running app used to be pkill'd HERE, before
 # `swift build` — so a compile failure (e.g. the stale-plan case above) left
@@ -123,7 +133,7 @@ swift build ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} --package-pa
 
 BIN="$(swift build ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} --package-path "$ROOT" --show-bin-path)/$PRODUCT"
 # Stage + sign into a TEMP bundle and only swap it into dist/NativeAgent.app
-# after _verify_signed_bundle passes. Every fallible step (resource staging,
+# after the shared signing owner passes deep verification. Every fallible step (resource staging,
 # provisioning checks, codesign, verification) therefore runs while the
 # previous dist bundle — and the running app — are still intact; a failure
 # anywhere exits nonzero with nothing killed and nothing half-replaced.
@@ -282,203 +292,9 @@ xattr -dr com.apple.quarantine "$BUNDLE" 2>/dev/null || true
 rm -rf "$BUNDLE/Contents/.runtime" "$BUNDLE/Contents/.build"
 assert_no_python_artifacts "$BUNDLE"
 
-# Mac app signing.
-#
-# Default path: dev cert + embedded provisioning profile + DER entitlements
-# (so iCloud bidi chat works between iOS and Mac).  Falls back to ad-hoc
-# automatically if the local cert or ignored local profile is missing.
-#
-# Force ad-hoc with NATIVE_AGENT_ADHOC=1 (useful for tests that bypass the
-# entitlement chain entirely).
-PROVISION_PROFILE="${NATIVEAGENT_PROVISIONING_PROFILE:-$ROOT/local/NativeAgent.provisionprofile}"
-# Authoritatively detect a real signing identity from the keychain FIRST. A
-# stale/blank env var must NOT be able to force ad-hoc when a real cert exists:
-# an ad-hoc iCloud bundle is killed by macOS on launch. Prefer "Apple
-# Development", then fall back to any Developer ID Application identity.
-DISCOVERED_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk -F '"' '/Apple Development/ {print $2; exit}')"
-if [[ -z "$DISCOVERED_IDENTITY" ]]; then
-    DISCOVERED_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk -F '"' '/Developer ID Application/ {print $2; exit}')"
-fi
-ENV_IDENTITY="${NATIVE_AGENT_DEVELOPMENT_SIGN_IDENTITY:-${NATIVE_AGENT_DEVELOPER_ID:-}}"
-if [[ -n "$ENV_IDENTITY" ]]; then
-    # An explicit env override only wins if it names an identity that actually
-    # exists in the keychain. If a real cert exists but the env var points at a
-    # DIFFERENT/nonexistent identity, fail loudly rather than silently dropping
-    # to ad-hoc (the exact incident class this guard protects against).
-    if security find-identity -v -p codesigning 2>/dev/null | grep -Fq -- "$ENV_IDENTITY"; then
-        SIGN_IDENTITY="$ENV_IDENTITY"
-    elif [[ -n "$DISCOVERED_IDENTITY" ]]; then
-        echo "[sign] NATIVE_AGENT_DEVELOPMENT_SIGN_IDENTITY/NATIVE_AGENT_DEVELOPER_ID='$ENV_IDENTITY'" >&2
-        echo "[sign] is NOT present in the keychain, but a real signing identity IS:" >&2
-        echo "[sign]   '$DISCOVERED_IDENTITY'" >&2
-        echo "[sign] Refusing to silently ad-hoc-sign an iCloud app (macOS would kill it)." >&2
-        echo "[sign] Fix or unset the env var (the discovered identity will be used)," >&2
-        echo "[sign] or set NATIVE_AGENT_ADHOC=1 to explicitly opt into ad-hoc." >&2
-        exit 1
-    else
-        # No real cert anywhere: keep the (stale) env value so the membership
-        # gate below falls through to the documented ad-hoc path.
-        SIGN_IDENTITY="$ENV_IDENTITY"
-    fi
-else
-    SIGN_IDENTITY="$DISCOVERED_IDENTITY"
-fi
-ENT_FULL="${NATIVEAGENT_ENTITLEMENTS:-$ROOT/local/NativeAgent.entitlements}"
-ENT_ADHOC="$ROOT/NativeAgent.adhoc.entitlements"
-
-_sign_nested_plain() {
-    local identity="$1"
-    local timestamp_arg="${2:---timestamp=none}"
-    if [[ -d "$BUNDLE/Contents/Frameworks/Sparkle.framework" ]]; then
-        codesign --force --deep --sign "$identity" --options runtime $timestamp_arg \
-            "$BUNDLE/Contents/Frameworks/Sparkle.framework" >/dev/null 2>&1 || true
-    fi
-}
-
-_strip_unprovisioned_entitlements() {
-    # Keep aligned with install_app.sh. The local source entitlements declare
-    # background task identifiers for future unlock, but the current Mac
-    # development profile does not grant com.apple.developer.background-tasks.
-    # Signing the dev bundle with that key makes AMFI reject launch before the
-    # app starts.
-    local src="$ENT_FULL"
-    local out="$1"
-    /usr/bin/perl -0pe 's/\s*<key>com\.apple\.developer\.background-tasks<\/key>\s*<array>.*?<\/array>//s' "$src" > "$out"
-}
-
-_sign_dev_cert() {
-    # Embed provisioning profile into the bundle (required for restricted entitlements).
-    # This function runs inside an `if ! _sign_dev_cert` guard, which SUPPRESSES
-    # `set -e`. A failed profile copy must NOT be masked and silently treated as
-    # the "maybe fall back to ad-hoc" path — without the embedded profile the
-    # iCloud entitlements are not honored and the app is killed at launch. Make
-    # the profile copy a hard, immediate abort (exit, not return) so it can never
-    # be swallowed by the guard.
-    if ! cp "$PROVISION_PROFILE" "$BUNDLE/Contents/embedded.provisionprofile"; then
-        echo "[sign] FATAL: failed to copy provisioning profile into the bundle:" >&2
-        echo "[sign]   $PROVISION_PROFILE -> $BUNDLE/Contents/embedded.provisionprofile" >&2
-        echo "[sign] Cannot honor iCloud entitlements without it. Aborting." >&2
-        exit 1
-    fi
-    chmod 0644 "$BUNDLE/Contents/embedded.provisionprofile"
-    _sign_nested_plain "$SIGN_IDENTITY" "--timestamp=none"
-    local ENT_TEMPLATE_PATH="${TMPDIR:-/tmp}/na_ent_template.$$.entitlements"
-    local ENT_SIGN_PATH="${TMPDIR:-/tmp}/na_ent_sign.$$.entitlements"
-    local PROFILE_PLIST="${TMPDIR:-/tmp}/na_profile.$$.plist"
-    _strip_unprovisioned_entitlements "$ENT_TEMPLATE_PATH"
-    if ! decode_provisioning_profile "$PROVISION_PROFILE" "$PROFILE_PLIST" \
-      || ! verify_profile_identity_contract "$PROFILE_PLIST" "$NATIVEAGENT_MAC_BUNDLE_ID" \
-      || ! prepare_profile_signing_entitlements "$ENT_TEMPLATE_PATH" "$PROFILE_PLIST" "$ENT_SIGN_PATH"; then
-        rm -f "$ENT_TEMPLATE_PATH" "$ENT_SIGN_PATH" "$PROFILE_PLIST"
-        echo "[sign] FATAL: provisioning profile identity does not match the bundle." >&2
-        exit 1
-    fi
-    # Sign with hardened runtime + DER entitlements.  --generate-entitlement-der
-    # is required on Tahoe for restricted entitlements (iCloud) to be honored.
-    # NOTE: do not suppress stderr here — a failure means the app falls back to
-    # an unlaunchable ad-hoc signature, and the codesign error is the only clue.
-    codesign --force \
-        --sign "$SIGN_IDENTITY" \
-        --options runtime \
-        --generate-entitlement-der \
-        --entitlements "$ENT_SIGN_PATH" \
-        --timestamp=none \
-        "$BUNDLE"
-    if ! verify_signed_bundle_profile_identity "$BUNDLE" "$PROFILE_PLIST" "$NATIVEAGENT_MAC_BUNDLE_ID"; then
-        rm -f "$ENT_TEMPLATE_PATH" "$ENT_SIGN_PATH" "$PROFILE_PLIST"
-        echo "[sign] FATAL: signed CloudKit identity does not match the embedded profile." >&2
-        exit 1
-    fi
-    rm -f "$ENT_TEMPLATE_PATH" "$ENT_SIGN_PATH" "$PROFILE_PLIST"
-}
-
-_sign_adhoc() {
-    _sign_nested_plain "-" "--timestamp=none"
-    # Do NOT suppress the final top-level signature: a total signing failure
-    # here would otherwise look like success and ship an unsigned bundle. Drop
-    # the `2>&1`/`|| true` so the error is visible and fatal under `set -e`.
-    if [[ -f "$ENT_ADHOC" ]]; then
-        codesign --force --sign - --entitlements "$ENT_ADHOC" "$BUNDLE"
-    else
-        codesign --force --sign - "$BUNDLE"
-    fi
-}
-
-# Fatal integrity gate: a failed inner Sparkle signature is
-# swallowed by `|| true` inside _sign_nested_plain and only surfaces at launch
-# as an unsigned nested Mach-O. Verify the whole bundle after signing and make
-# any failure FATAL (mirrors verify_release_artifact.sh's --verify --deep
-# --strict gate for release builds).
-_verify_signed_bundle() {
-    echo "[sign] verifying bundle signature (--deep --strict)..."
-    if ! codesign --verify --deep --strict --verbose=2 "$BUNDLE"; then
-        echo "[sign] codesign --verify --deep --strict FAILED for $BUNDLE" >&2
-        echo "[sign] a nested Mach-O (Sparkle) is unsigned or invalid." >&2
-        echo "[sign] refusing to ship an unlaunchable bundle. Fix the cause and re-run." >&2
-        exit 1
-    fi
-}
-
-_assert_profile_allows_current_mac() {
-    local profile="$1" ids devices_xml id matched
-    ids="$(system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Hardware UUID|Provisioning UDID/ {print $2}')"
-    [[ -z "$ids" ]] && return 0
-    if ! devices_xml="$(/usr/bin/security cms -D -i "$profile" | /usr/bin/plutil -extract ProvisionedDevices xml1 -o - - 2>/dev/null)"; then
-        return 0
-    fi
-    matched=0
-    while IFS= read -r id; do
-        if [[ -n "$id" ]] && /usr/bin/grep -Fq "<string>$id</string>" <<<"$devices_xml"; then
-            matched=1
-            break
-        fi
-    done <<<"$ids"
-    [[ "$matched" == "1" ]] && return 0
-
-    echo "[sign] provisioning profile does not include this Mac, so macOS will refuse to launch the iCloud build." >&2
-    echo "[sign]   profile: $profile" >&2
-    echo "[sign] this Mac IDs:" >&2
-    while IFS= read -r id; do
-        [[ -n "$id" ]] && echo "[sign]   - $id" >&2
-    done <<<"$ids"
-    echo "[sign] profile allowed devices:" >&2
-    printf '%s\n' "$devices_xml" | awk -F'[<>]' '/<string>/ {print "[sign]   - " $3}' >&2
-    echo "[sign] Regenerate/download the Mac Development profile for $NATIVEAGENT_MAC_BUNDLE_ID with this Mac selected," >&2
-    echo "[sign] replace $ROOT/local/NativeAgent.provisionprofile, then rerun ./script/install_app.sh." >&2
-    echo "[sign] Temporary local-only launch: NATIVE_AGENT_ADHOC=1 ./script/install_app.sh (iCloud disabled)." >&2
-    exit 1
-}
-
-if [[ "${NATIVE_AGENT_ADHOC:-0}" == "1" ]]; then
-    echo "[sign] NATIVE_AGENT_ADHOC=1 — using ad-hoc signature (no iCloud)"
-    _sign_adhoc
-elif [[ -f "$PROVISION_PROFILE" && -f "$ENT_FULL" ]] \
-     && [[ -n "$SIGN_IDENTITY" ]] \
-     && security find-identity -v -p codesigning 2>/dev/null | grep -Fq -- "$SIGN_IDENTITY"; then
-    echo "[sign] Apple Development cert + provisioning profile + iCloud entitlements"
-    _assert_profile_allows_current_mac "$PROVISION_PROFILE"
-    # Cert + profile ARE present: a dev-cert signing failure here is the exact
-    # incident class (silent ad-hoc fallback → iCloud-killed app). Treat it as
-    # FATAL. Only allow the ad-hoc fallback behind an explicit opt-in flag.
-    if ! _sign_dev_cert; then
-        echo "[sign] dev-cert signing FAILED (see codesign error above)." >&2
-        if [[ "${NATIVE_AGENT_ADHOC_FALLBACK:-0}" == "1" ]]; then
-            echo "[sign] NATIVE_AGENT_ADHOC_FALLBACK=1 — falling back to ad-hoc" >&2
-            echo "[sign] iCloud entitlements will NOT be honored and macOS may kill the app." >&2
-            _sign_adhoc
-        else
-            echo "[sign] cert+profile are present, so this is NOT a missing-identity case —" >&2
-            echo "[sign] refusing to silently ship an unlaunchable ad-hoc iCloud app." >&2
-            echo "[sign] Fix the codesign cause and re-run, or set NATIVE_AGENT_ADHOC_FALLBACK=1" >&2
-            echo "[sign] (or NATIVE_AGENT_ADHOC=1) to explicitly opt into ad-hoc." >&2
-            exit 1
-        fi
-    fi
-else
-    echo "[sign] no local provisioning profile / cert — ad-hoc (iCloud disabled)"
-    _sign_adhoc
-fi
-_verify_signed_bundle
+# Mac app signing. One shared owner keeps build and install on the exact same
+# identity/profile/entitlement decision tree.
+nativeagent_sign_development_bundle "$BUNDLE" "$ROOT" "$NATIVEAGENT_MAC_BUNDLE_ID" "[sign]"
 
 # ─── POINT OF NO RETURN ─────────────────────────────────────────────────────
 # The staged bundle is built, signed, and codesign-verified. Only now do we
@@ -538,7 +354,7 @@ case "$MODE" in
     # curl-probe no longer answers and the strict probe after `pgrep` was
     # forcing this --verify path to exit non-zero on every install. Combined
     # with `/usr/bin/open` returning 1 on launchd-163 (an OS launchd-cache
-    # issue, not a bundle problem — `_verify_signed_bundle` already proved
+    # issue, not a bundle problem — the shared signing owner already proved
     # the bundle is valid + signed), this killed install_app.sh BEFORE it
     # could swap the bundle into ~/Applications/.
     # New verify: signed-and-valid is the gate that matters. Try a non-fatal

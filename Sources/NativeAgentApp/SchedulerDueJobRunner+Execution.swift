@@ -126,7 +126,12 @@ extension SchedulerDueJobRunner {
                     try await MacSyncEngine.shared.sendNotificationToPairedDevices(
                         title: channelText.title,
                         body: channelText.message,
-                        userInfo: ["screen": "inbox", "source": "scheduler", "jobId": job.id]
+                        userInfo: [
+                            "screen": "inbox",
+                            "source": "scheduler",
+                            "jobId": job.id,
+                            "occurrenceKey": job.occurrenceKey,
+                        ]
                     )
                     delivered.append(channel)
                 case "telegram":
@@ -138,7 +143,8 @@ extension SchedulerDueJobRunner {
                         message: channelText.message,
                         source: string(job.payload["source"]) ?? "scheduled_job",
                         severity: channel == "chat" ? "important" : "info",
-                        jobId: job.id
+                        jobId: job.id,
+                        itemId: Self.notificationItemId(job: job, channel: channel)
                     )
                     delivered.append(channel)
                 case "activity":
@@ -152,6 +158,7 @@ extension SchedulerDueJobRunner {
                             "jobId": .string(job.id),
                             "jobName": .string(job.name),
                             "deliveryChannel": .string("activity"),
+                            "occurrenceKey": .string(job.occurrenceKey),
                         ])
                     )
                     delivered.append(channel)
@@ -191,7 +198,12 @@ extension SchedulerDueJobRunner {
         }
         let input: [String: JSONValue]
         if case .object(let obj)? = job.payload["input"] { input = obj } else { input = [:] }
-        let receipt = try await NativeClient(baseURL: "").runConnectorAction(id: actionId, dryRun: false, input: input)
+        let receipt = try await NativeClient(baseURL: "").runConnectorAction(
+            id: actionId,
+            dryRun: false,
+            input: input,
+            externalSendIdempotencyKey: job.occurrenceKey
+        )
         return JobResult(
             status: receipt.status == "completed" ? "completed" : receipt.status,
             detail: "connector action \(actionId) \(receipt.status)",
@@ -201,6 +213,16 @@ extension SchedulerDueJobRunner {
                 "status": .string(receipt.status),
             ])
         )
+    }
+
+    private static func notificationItemId(job: DueJob, channel: String) -> String {
+        let raw = "\(job.occurrenceKey).\(channel)"
+        let safe = raw.map { character -> Character in
+            character.isLetter || character.isNumber || character == "-" || character == "_"
+                ? character
+                : "-"
+        }
+        return "scheduled-\(String(safe).prefix(180))"
     }
 
     private func executeDream(job: DueJob) async throws -> JobResult {

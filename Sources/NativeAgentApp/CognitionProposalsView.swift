@@ -1,9 +1,7 @@
-// B2.4 (prerelease campaign): the Cognition Observatory's two APPROVAL-shaped
-// panels — Standing Views and Schema Proposals — moved OUT of the observatory
-// (a read-only surface after the split) and onto the Activity surface, which is
-// the app's single "needs your eyes" landing. The rendering is a move (not a
-// rewrite) of the former `CognitionObservatoryView.standingViews(_:)` /
-// `.schemaProposals(_:)` builders; the resolve wiring is unchanged.
+// B2.4 (prerelease campaign): the Cognition Observatory's Standing Views and
+// Schema Proposals panels moved OUT of the observatory and onto Activity.
+// Standing Views remain the only actionable cognition proposals here. Schema
+// rows are read-only lineage from the canonical Dream/REM approval path.
 //
 // This view loads its own observatory detail and subscribes to the cognition
 // change stream so an approve/reject (or a background reflection producing a new
@@ -27,7 +25,7 @@ enum CognitionProposalsFeed {
         let detail = await NativeCognitionRuntime.shared.observatoryDetail()
         return Pending(
             standingViews: detail.standingViews.filter { $0.status == .proposed },
-            schemaProposals: detail.schemaProposals.filter { $0.status == .proposed }
+            schemaProposals: []
         )
     }
 }
@@ -51,7 +49,7 @@ struct CognitionProposalsView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: NativeAgentSpacing.lg) {
-                Text("Proposals from \(appModel.agentDisplayName)'s reflection wait for your call here. Approving a standing view lets it start coloring her appraisals; approving a schema proposal applies it to her association model.")
+                Text("Standing views from \(appModel.agentDisplayName)'s reflection wait for your call here. Replay schemas below are read-only lineage from the canonical Dream/REM approval path.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -59,7 +57,7 @@ struct CognitionProposalsView: View {
                     standingViews(visibleStandingViews)
                 }
 
-                NativePanel(title: "Schema Proposals", systemImage: "point.3.connected.trianglepath.dotted", tint: .green) {
+                NativePanel(title: "REM Replay Lineage", systemImage: "point.3.connected.trianglepath.dotted", tint: .green) {
                     schemaProposalsBody(schemaProposals)
                 }
             }
@@ -125,7 +123,7 @@ struct CognitionProposalsView: View {
         }
     }
 
-    // MARK: Schema proposals (moved from CognitionObservatoryView+Proposals)
+    // MARK: Read-only Dream/REM schema lineage
 
     @ViewBuilder
     private func schemaProposalsBody(_ proposals: [CognitiveSchemaProposal]) -> some View {
@@ -148,20 +146,6 @@ struct CognitionProposalsView: View {
                                 .foregroundStyle(.secondary)
                         }
                         Spacer()
-                        if proposal.status == .proposed {
-                            Button("Approve", systemImage: "checkmark") {
-                                Task {
-                                    await NativeCognitionRuntime.shared.resolveSchemaProposal(id: proposal.id, accepted: true)
-                                    await refresh()
-                                }
-                            }
-                            Button("Reject", systemImage: "xmark") {
-                                Task {
-                                    await NativeCognitionRuntime.shared.resolveSchemaProposal(id: proposal.id, accepted: false)
-                                    await refresh()
-                                }
-                            }
-                        }
                     }
                     Divider()
                 }

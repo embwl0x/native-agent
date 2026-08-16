@@ -129,7 +129,6 @@ private actor LoopExecutionGate {
         guard active else {
             active = true
             activeSince = startedAt
-            runCount += 1
             generation &+= 1
             return generation
         }
@@ -141,6 +140,16 @@ private actor LoopExecutionGate {
         }
         await waitForIdle()
         return nil
+    }
+
+    /// Counts only an execution whose body is actually about to run. A
+    /// due-aware wake acquires the gate before its final durable due check; if
+    /// that check says a periodic winner already settled, the claim is released
+    /// without manufacturing a run count.
+    func markExecutionStarted(token: UInt64) -> Bool {
+        guard active, token == generation else { return false }
+        runCount += 1
+        return true
     }
 
     /// Releases the gate for exactly one acquire. `date` is nil for a forced
@@ -267,12 +276,18 @@ private actor ManagedTickRace {
     private var result: Result?
     private var waiters: [CheckedContinuation<Result, Never>] = []
 
-    func resolve(_ value: Result) {
-        guard result == nil else { return }
+    /// Returns true only to the first resolver. A cancelled manager-facing
+    /// wait can therefore leave lifecycle cleanup to the still-running child:
+    /// when that child eventually exits, its rejected `.finished` resolution
+    /// is the proof that it is finally safe to release the execution gate.
+    @discardableResult
+    func resolve(_ value: Result) -> Bool {
+        guard result == nil else { return false }
         result = value
         let parked = waiters
         waiters.removeAll()
         for waiter in parked { waiter.resume(returning: value) }
+        return true
     }
 
     func wait() async -> Result {
@@ -300,20 +315,57 @@ private struct ManagedLoopRunner: LoopRunner {
 
     /// Single-release discipline: exactly one `finish` per `acquireOrJoin`,
     /// carrying the acquire's token. The underlying tick runs in an
-    /// unstructured child so cancellation of THIS task (the manager's tick
-    /// timeout cancels it) releases the gate immediately even when the loop
-    /// body ignores cooperative cancellation — otherwise the gate stayed
-    /// active forever and every later tick coalesced into a skip, permanently
-    /// wedging the loop behind a one-time timeout.
+    /// unstructured child so the manager-facing timeout stays bounded even
+    /// when a buggy body ignores cooperative cancellation. Crucially, that
+    /// timeout no longer releases the gate: the registration stays
+    /// quarantined/busy until the actual child exits. Releasing early allowed
+    /// a replacement effecting tick to overlap a timed-out body whose external
+    /// effects were still in flight.
     func tickOutcome() async -> LoopTickOutcome {
+        await tickOutcome(ifDue: nil)
+    }
+
+    /// Due-aware entry used by opportunistic OS wakes. Gate ownership comes
+    /// first; the durable due check comes second. That order closes the race in
+    /// which a periodic tick could settle after an early due read but before
+    /// this request entered the single-flight owner.
+    func tickOutcomeIfDue(
+        _ isDue: @escaping @Sendable () async -> Bool
+    ) async -> LoopTickOutcome {
+        await tickOutcome(ifDue: isDue)
+    }
+
+    private func tickOutcome(
+        ifDue isDue: (@Sendable () async -> Bool)?
+    ) async -> LoopTickOutcome {
         guard let token = await gate.acquireOrJoin(startedAt: clock()) else {
             return .skipped(reason: LoopTickOutcome.coalescedSkipReason)
+        }
+        if let isDue, !(await isDue()) {
+            await gate.finish(at: nil, token: token)
+            await onFinished()
+            return .skipped(
+                reason: LoopTickOutcome.notDueSkipReason,
+                healthNeutral: true
+            )
+        }
+        guard await gate.markExecutionStarted(token: token) else {
+            await gate.finish(at: nil, token: token)
+            return .failed(error: "background loop execution ownership lost")
         }
         let race = ManagedTickRace()
         let loop = underlying
         let child = Task {
             let outcome = await loop.tickOutcome()
-            await race.resolve(.finished(outcome))
+            let delivered = await race.resolve(.finished(outcome))
+            if !delivered {
+                // Cancellation/timeout already won the caller-facing race.
+                // This return is nevertheless the first authoritative proof
+                // that the old effecting body is gone, so only now may a new
+                // execution acquire the registration.
+                await gate.finish(at: nil, token: token)
+                await onFinished()
+            }
         }
         let result = await withTaskCancellationHandler {
             await race.wait()
@@ -328,13 +380,28 @@ private struct ManagedLoopRunner: LoopRunner {
             await onFinished()
             return outcome
         case .cancelled:
-            // Forced release: the child may still be running. It can only
-            // resolve an already-latched race and its token is stale, so it
-            // cannot double-finish or close a newer tick's gate.
-            await gate.finish(at: nil, token: token)
-            await onFinished()
+            // The caller receives a bounded failure, but the gate deliberately
+            // remains active. The child above releases it only after its real
+            // exit, preventing a replacement effecting tick from overlapping
+            // this quarantined execution.
             return .failed(error: "cancelled before tick completed")
         }
+    }
+}
+
+/// Adapts the managed runner's gate-then-due entry back to `LoopRunner` so the
+/// existing timeout and outcome-accounting path stays singular.
+private struct DueAwareManagedLoopRunner: LoopRunner {
+    let base: ManagedLoopRunner
+    let isDue: @Sendable () async -> Bool
+
+    var loopId: String { base.loopId }
+    var interval: TimeInterval { base.interval }
+    var tickTimeoutOverride: TimeInterval? { base.tickTimeoutOverride }
+    var failureBackoffPolicy: LoopFailureBackoffPolicy? { base.failureBackoffPolicy }
+
+    func tickOutcome() async -> LoopTickOutcome {
+        await base.tickOutcomeIfDue(isDue)
     }
 }
 
@@ -385,6 +452,9 @@ public actor BackgroundLoopsManager {
     /// surfaces the problem in `status()` instead of a respawn loop hiding it.
     /// `internal` so a test can compress the schedule; production never sets it.
     internal var eventListenerRestartBackoff: [TimeInterval] = [1, 5, 30]
+    /// Deterministic test seam for the due-read → gate-admission race. nil in
+    /// production; it carries no runtime policy or state.
+    internal var dueWakePreAdmissionHook: (@Sendable () async -> Void)?
 
     public init(
         scheduler: SwiftNativeLoopScheduler = SwiftNativeLoopScheduler(),
@@ -540,10 +610,17 @@ public actor BackgroundLoopsManager {
         guard let registration = registrations[loopId] else {
             return .failed(error: "loop not registered: \(loopId)")
         }
+        return await executeAndRecord(loopId: loopId, runner: registration.runner)
+    }
+
+    private func executeAndRecord(
+        loopId: String,
+        runner: any LoopRunner
+    ) async -> LoopTickOutcome {
         do {
             let outcome = try await tickWithTimeoutOutcome(
-                registration.runner,
-                timeout: registration.runner.tickTimeoutOverride ?? 300
+                runner,
+                timeout: runner.tickTimeoutOverride ?? 300
             )
             switch outcome {
             case .completed(let result):
@@ -565,7 +642,7 @@ public actor BackgroundLoopsManager {
             await reschedulePhysiologyDeadline(loopId: loopId)
             return .skipped(reason: "cancelled")
         } catch is TickTimeoutError {
-            let error = "timeout after \(formatTimeout(registration.runner.tickTimeoutOverride ?? 300))"
+            let error = "timeout after \(formatTimeout(runner.tickTimeoutOverride ?? 300))"
             // A TIMED-OUT tick did not complete its body, so it must NOT book a
             // fresh durable last-run stamp — same accounting as the periodic
             // path in `SwiftNativeLoopScheduler.runOneTick`. Without this a
@@ -585,6 +662,51 @@ public actor BackgroundLoopsManager {
             await reschedulePhysiologyDeadline(loopId: loopId)
             return .failed(error: detail)
         }
+    }
+
+    /// Accepts an opportunistic wake only when the canonical scheduler's
+    /// durable cadence is due. This is the NSBackgroundActivityScheduler path:
+    /// it is a wake source into Core, not an independent second cadence.
+    /// Explicit user/manual force-runs continue to use `runTickOnce`.
+    ///
+    /// A cheap initial eligibility read avoids touching the gate for normal
+    /// early wakes. The authoritative read happens again after gate admission,
+    /// so a periodic tick that settles between those reads prevents this wake
+    /// from invoking the body.
+    @discardableResult
+    public func runTickIfDue(loopId: String) async -> LoopTickOutcome {
+        if starting { await waitForStartTransition() }
+        if !started { _ = await start() }
+        guard started else {
+            return .failed(error: "background loop manager unavailable")
+        }
+        guard let registration = registrations[loopId] else {
+            return .failed(error: "loop not registered: \(loopId)")
+        }
+        // Cheap early rejection. This is NOT the authoritative decision: the
+        // same durable predicate runs again only after this request owns the
+        // shared execution gate.
+        guard await scheduler.isDue(loopId: loopId) == true else {
+            return .skipped(reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true)
+        }
+        await dueWakePreAdmissionHook?()
+        let dueRunner = DueAwareManagedLoopRunner(
+            base: registration.runner,
+            isDue: { [weak self, scheduler, gate = registration.gate] in
+                guard let self,
+                      await self.registrationGateIsCurrent(loopId: loopId, gate: gate)
+                else { return false }
+                return await scheduler.isDue(loopId: loopId) == true
+            }
+        )
+        return await executeAndRecord(loopId: loopId, runner: dueRunner)
+    }
+
+    private func registrationGateIsCurrent(
+        loopId: String,
+        gate: LoopExecutionGate
+    ) -> Bool {
+        registrations[loopId]?.gate === gate
     }
 
     /// Replaces or removes exactly one registration. The old target is
@@ -854,6 +976,12 @@ public actor BackgroundLoopsManager {
 
     internal func _testRunPeriodicTick(loopId: String) async {
         await scheduler._testRunOneTick(loopId: loopId)
+    }
+
+    internal func _testSetDueWakePreAdmissionHook(
+        _ hook: (@Sendable () async -> Void)?
+    ) {
+        dueWakePreAdmissionHook = hook
     }
 
     internal func _testTaskHandle(loopId: String) async -> Task<Void, Never>? {

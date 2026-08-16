@@ -674,6 +674,8 @@ public actor SwiftNativeTurnEngine {
         trace.setFlag("contextFlow.semanticQueryReady", readyQueryEmbedding != nil)
         let packetBudget = ContextBudgetPolicy.resolve(
             model: LLMCallContext.admittedModel,
+            providerID: LLMCallContext.providerId,
+            dataRoot: remPinsDataRoot,
             surface: surface
         )
         trace.setFlag("budget.packetDerived", packetBudget.isDerived)
@@ -879,7 +881,12 @@ public actor SwiftNativeTurnEngine {
         // memory block's character bound are now a function of the window
         // instead of the hardcoded k=5 / 5×1,200. Floor regime (small or
         // unknown model) reproduces both exactly.
-        let turnBudget = ContextBudgetPolicy.resolve(model: modelId, surface: surface)
+        let turnBudget = ContextBudgetPolicy.resolve(
+            model: modelId,
+            providerID: LLMCallContext.providerId,
+            dataRoot: remPinsDataRoot,
+            surface: surface
+        )
         trace.setCount("budget.windowTokens", turnBudget.windowTokens ?? 0)
         trace.setFlag("budget.derived", turnBudget.isDerived)
         trace.setCount("budget.recallRowLimit", turnBudget.recallRowLimit)

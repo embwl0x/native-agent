@@ -1,4 +1,5 @@
 import Foundation
+import MacControl
 import NativeAgentCore
 import PersistenceCore
 
@@ -37,6 +38,12 @@ public actor SwiftNativeTrustCenter: TrustCenterProtocol {
         "confirm", "destructive_strong", "blocked",
     ]
 
+    /// Transport-only patch key used by the Full Mac duration picker. The
+    /// checked mutation owner consumes it while holding the policy-file lock;
+    /// it is never persisted as authority state.
+    public static let fullMacExpiryDurationIntentKey =
+        "__fullMacExpiryDurationIntentHours"
+
     public init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore(),
@@ -55,9 +62,19 @@ public actor SwiftNativeTrustCenter: TrustCenterProtocol {
         guard case .object(let patch) = update else {
             throw TrustCenterError.invalidRequest
         }
+        return try Self.decodePolicy(.object(try await applyPolicyPatchChecked(patch)))
+    }
+
+    /// Canonical checked trust-policy mutation. Every patch is merged against
+    /// one freshly validated raw generation under the cross-process file lock,
+    /// and the returned normalized policy is derived from that exact written
+    /// generation rather than a later reread.
+    public func applyPolicyPatchChecked(
+        _ patch: [String: JSONValue]
+    ) async throws -> [String: JSONValue] {
         let path = trustPolicyPath
         let defaults = defaultTrustPolicy()
-        try await persistence.withFileLock(path) {
+        let merged = try await persistence.withFileLock(path) {
             // Wave 4 read-both (phase A): BOTH the caller's patch and the
             // current on-disk object may carry the future `workshopPolicy`
             // spelling (the patch from a future caller; the disk from a write
@@ -71,13 +88,57 @@ public actor SwiftNativeTrustCenter: TrustCenterProtocol {
             let current = WorkshopPolicyBlockVocabulary.foldToWireKey(
                 try Self.loadRawPolicyChecked(at: path))
             try Self.validateKnownAuthorityPolicyTypes(current, against: defaults)
-            let patch = WorkshopPolicyBlockVocabulary.foldToWireKey(patch)
+            var patch = WorkshopPolicyBlockVocabulary.foldToWireKey(patch)
+            patch = Self.resolveFullMacExpiryIntent(patch, onDisk: current)
             let merged = Self.deepMerge(current, patch)
             try Self.validateAuthorityPolicyShape(merged)
             try Self.validateKnownAuthorityPolicyTypes(merged, against: defaults)
             try await persistence.writeJSON(.object(merged), to: path)
+            return merged
         }
-        return try await getTrust()
+        return normalizedTrustPolicy(saved: merged)
+    }
+
+    /// Checked compare-and-set used by the human-approved autonomy promotion
+    /// reconciler. Only the named raw override is changed, and only while its
+    /// locked value remains one of the caller's already-reviewed tiers.
+    public func compareAndSetToolAutonomy(
+        tool: String,
+        expectedCurrentTiers: Set<String>,
+        newTier: String
+    ) async throws -> Bool {
+        let cleanTool = tool.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanTool.isEmpty,
+              !expectedCurrentTiers.isEmpty,
+              Self.unifiedPolicyAutonomyLevels.contains(newTier)
+        else {
+            throw TrustCenterError.invalidRequest
+        }
+
+        let path = trustPolicyPath
+        let defaults = defaultTrustPolicy()
+        return try await persistence.withFileLock(path) {
+            var current = WorkshopPolicyBlockVocabulary.foldToWireKey(
+                try Self.loadRawPolicyChecked(at: path))
+            try Self.validateKnownAuthorityPolicyTypes(current, against: defaults)
+            var autonomy: [String: JSONValue]
+            if case .object(let value)? = current["toolAutonomy"] {
+                autonomy = value
+            } else {
+                autonomy = [:]
+            }
+            guard case .string(let lockedTier)? = autonomy[cleanTool],
+                  expectedCurrentTiers.contains(lockedTier)
+            else {
+                return false
+            }
+            autonomy[cleanTool] = .string(newTier)
+            current["toolAutonomy"] = .object(autonomy)
+            try Self.validateAuthorityPolicyShape(current)
+            try Self.validateKnownAuthorityPolicyTypes(current, against: defaults)
+            try await persistence.writeJSON(.object(current), to: path)
+            return true
+        }
     }
 
     public func simulateTrust(_ scenario: JSONValue) async throws -> TrustSimulationResult {
@@ -191,6 +252,42 @@ public actor SwiftNativeTrustCenter: TrustCenterProtocol {
                 out[key] = value
             }
         }
+        return out
+    }
+
+    /// Consume the Full Mac duration intent under the policy lock. For
+    /// durations above the gate's 24-hour sliding-window ceiling, anchor the
+    /// explicit expiry to the confirmedAt from the same locked generation.
+    private nonisolated static func resolveFullMacExpiryIntent(
+        _ patch: [String: JSONValue],
+        onDisk current: [String: JSONValue]
+    ) -> [String: JSONValue] {
+        var out = patch
+        guard let intent = out.removeValue(forKey: fullMacExpiryDurationIntentKey) else {
+            return out
+        }
+        let hours: Double? = {
+            switch intent {
+            case .double(let value): return value
+            case .int(let value): return Double(value)
+            default: return nil
+            }
+        }()
+        guard let hours, hours > 24 else { return out }
+        guard case .string(let rawConfirmedAt)? = current["fullMacConfirmedAt"] else {
+            return out
+        }
+        let confirmedAt = rawConfirmedAt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !confirmedAt.isEmpty,
+              let anchor = MacControlGate.parseISO8601(confirmedAt)
+        else {
+            return out
+        }
+        out["fullMacExpiresAt"] = .string(
+            SwiftNativeManifestSigner.isoTimestamp(
+                anchor.addingTimeInterval(hours * 60 * 60)
+            )
+        )
         return out
     }
 

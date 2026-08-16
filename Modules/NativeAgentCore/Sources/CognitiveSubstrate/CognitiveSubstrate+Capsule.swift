@@ -46,8 +46,13 @@ extension CognitiveSubstrate {
         // lives in BOTH ChatOrchestration injection seams (structured + text
         // compat), not in her inner voice.
         let stableKernel = "How you feel:"
+        var presentationState = capsulePresentationStateSnapshot()
         let dynamicLines = innerStateCapsuleLines(
-            from: capsuleItems, request: request, at: now, live: true)
+            from: capsuleItems,
+            request: request,
+            at: now,
+            presentationState: &presentationState
+        )
         let provenanceNodeIds = innerStateProvenance(from: capsuleItems, at: now)
         let boundedStableKernel = bounded(stableKernel, maxCharacters: maximumCharacters)
         let separatorCost = dynamicLines.isEmpty ? 0 : 2
@@ -72,16 +77,27 @@ extension CognitiveSubstrate {
         _ request: CognitiveCapsuleRequest,
         from read: CognitiveFrozenRead
     ) -> CognitiveCapsule {
+        compileFrozenCapsulePresentation(request, from: read).capsule
+    }
+
+    /// Pure frozen render plus the presentation mutation that would become
+    /// valid only if this exact capsule is accepted into provider context.
+    public func compileFrozenCapsulePresentation(
+        _ request: CognitiveCapsuleRequest,
+        from read: CognitiveFrozenRead
+    ) -> CognitivePreparedCapsule {
         guard read.configuration.enabled,
               read.configuration.capsuleInjectionEnabled,
               request.mode != .off else {
-            return CognitiveCapsule(
-                generatedAt: read.fixedAt,
-                mode: .off,
-                stableKernel: "",
-                dynamicContext: "",
-                provenanceNodeIds: [],
-                truncated: false
+            return CognitivePreparedCapsule(
+                capsule: CognitiveCapsule(
+                    generatedAt: read.fixedAt,
+                    mode: .off,
+                    stableKernel: "",
+                    dynamicContext: "",
+                    provenanceNodeIds: [],
+                    truncated: false
+                )
             )
         }
         let maximumCharacters = min(
@@ -89,22 +105,27 @@ extension CognitiveSubstrate {
             max(0, request.maximumCharacters ?? read.configuration.maximumCapsuleCharacters)
         )
         guard maximumCharacters > 0 else {
-            return CognitiveCapsule(
-                generatedAt: read.fixedAt,
-                mode: request.mode,
-                stableKernel: "",
-                dynamicContext: "",
-                provenanceNodeIds: [],
-                truncated: true
+            return CognitivePreparedCapsule(
+                capsule: CognitiveCapsule(
+                    generatedAt: read.fixedAt,
+                    mode: request.mode,
+                    stableKernel: "",
+                    dynamicContext: "",
+                    provenanceNodeIds: [],
+                    truncated: true
+                )
             )
         }
         let items = read.workspace.items.filter { capsuleEligibleWorkspaceNode($0.node) }
         let stableKernel = "How you feel:"
+        let expectedPresentationState = read.capsulePresentationState
+        var nextPresentationState = expectedPresentationState
         let dynamicLines = innerStateCapsuleLines(
             from: items,
             request: request,
             at: read.fixedAt,
-            frozenRead: read
+            frozenRead: read,
+            presentationState: &nextPresentationState
         )
         let provenanceNodeIds = innerStateProvenance(
             from: items,
@@ -115,7 +136,7 @@ extension CognitiveSubstrate {
         let separatorCost = dynamicLines.isEmpty ? 0 : 2
         let remaining = max(0, maximumCharacters - boundedStableKernel.count - separatorCost)
         let fittedLines = fitCapsuleLines(dynamicLines, maxCharacters: remaining)
-        return CognitiveCapsule(
+        let capsule = CognitiveCapsule(
             generatedAt: read.fixedAt,
             mode: request.mode,
             stableKernel: boundedStableKernel,
@@ -123,22 +144,46 @@ extension CognitiveSubstrate {
             provenanceNodeIds: provenanceNodeIds,
             truncated: fittedLines.truncated || boundedStableKernel.count < stableKernel.count
         )
+        let turnKind = CognitiveTurnKind.inferred(fromSignals: [
+            request.surface,
+            request.sessionId ?? "",
+            request.userMessage,
+        ])
+        let commit: CognitiveCapsulePresentationCommit?
+        if turnKind == .live,
+           request.mode == .inject,
+           !capsule.dynamicContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            // A tail line that lost the capsule budget was never presented and
+            // must remain eligible for the next accepted turn.
+            if !capsule.dynamicContext.contains("- Since:") {
+                nextPresentationState.lastSessionBridgeAt = expectedPresentationState.lastSessionBridgeAt
+            }
+            if !capsule.dynamicContext.contains("- Sound:") {
+                nextPresentationState.negativeSoundEchoRun = expectedPresentationState.negativeSoundEchoRun
+            }
+            commit = CognitiveCapsulePresentationCommit(
+                fixedAt: read.fixedAt,
+                expected: expectedPresentationState,
+                next: nextPresentationState
+            )
+        } else {
+            commit = nil
+        }
+        return CognitivePreparedCapsule(capsule: capsule, presentationCommit: commit)
     }
 
-    /// - Parameter live: TRUE only on `compileCapsule`, the one path allowed to
-    ///   advance cadence/suppression/session-bridge bookkeeping. A frozen read is
-    ///   a pure rendering of a captured moment and must leave that state alone —
-    ///   otherwise an Observatory panel re-rendering a capsule would silently
-    ///   consume the agent's next fingerprint or burn her morning bridge line.
+    /// Rendering mutates only the caller's copied presentation value. The live
+    /// actor is advanced later by `applyCapsulePresentationCommit`, and only for
+    /// an accepted injection.
     private func innerStateCapsuleLines(
         from workspaceItems: [CognitiveWorkspaceItem],
         request: CognitiveCapsuleRequest,
         at now: Date,
         frozenRead: CognitiveFrozenRead? = nil,
-        live: Bool = false
+        presentationState: inout CognitiveCapsulePresentationState
     ) -> [String] {
         var lines: [String] = []
-        let dyn = dynamics
+        let dyn = frozenRead?.personalityDynamics ?? dynamics
         let signals = feltSignalsForCapsule(
             from: workspaceItems,
             request: request,
@@ -172,7 +217,15 @@ extension CognitiveSubstrate {
         // felt state has reset and whose only bridge is a machine changelog. One
         // gap-gated line, built from renderers that have already shipped, so she
         // can pick a thread back up instead of rebooting into competence.
-        if let bridge = feltSessionBridgeLine(at: now, dynamics: dyn, live: live) {
+        if let bridge = feltSessionBridgeLine(
+            at: now,
+            dynamics: dyn,
+            presentationState: &presentationState,
+            fieldNodes: frozenRead?.snapshot.nodes,
+            pendingCompletionOpen: frozenRead?.pendingCompletionOpen,
+            cognitionEnabled: frozenRead?.configuration.enabled,
+            affectEnabled: frozenRead?.configuration.affectEnabled
+        ) {
             tailLines.append(bridge)
         }
         // Her subconscious carries her INNER LIFE — feeling, voice, focus/continuity, and her
@@ -186,9 +239,11 @@ extension CognitiveSubstrate {
         // takeaway). Both use the "- Inner:" prefix, so the total Inner-line count stays <= 1;
         // a .proposed/.retired view never reaches here. No active view -> byte-identical to
         // the pre-Wave-E takeaway path.
-        let standingViewInnerLine = frozenRead == nil
-            ? activeStandingViewInnerLine()
-            : frozenRead?.standingViewInnerLine
+        let standingViewInnerLine = activeStandingViewInnerLine(
+            relevantTo: request.userMessage,
+            candidates: frozenRead?.standingViewCapsuleCandidates,
+            relevanceEnabled: frozenRead?.configuration.standingViewCapsuleRelevanceEnabled
+        )
         if let viewLine = standingViewInnerLine {
             tailLines.append(viewLine)
         } else if let takeaway = (frozenRead?.thoughtSeeds ?? projectedThoughtSeeds(at: now))
@@ -202,11 +257,26 @@ extension CognitiveSubstrate {
         }
         // Wave G: the self-exemplar echo goes LAST so budget truncation drops it
         // before it can displace focus/feeling/inner — it's an enhancer, not core.
-        let echoLine = frozenRead == nil
-            ? soundEchoLine(at: now, mode: mode, roomValence: signals.valence, live: live)
-            : frozenRead?.soundEchoLine
-        if let echo = echoLine {
-            tailLines.append(echo)
+        let echo = soundEchoSelection(
+            at: now,
+            mode: mode,
+            roomValence: signals.valence,
+            fieldNodes: frozenRead?.snapshot.nodes,
+            fixedAffect: frozenRead?.affect,
+            fixedMood: frozenRead?.mood,
+            landingScores: frozenRead?.soundLandingScores,
+            negativeRun: presentationState.negativeSoundEchoRun,
+            dynamics: dyn,
+            cognitionEnabled: frozenRead?.configuration.enabled,
+            affectEnabled: frozenRead?.configuration.affectEnabled
+        )
+        if let echoLine = echo.line {
+            tailLines.append(echoLine)
+            if let leadingWasNegative = echo.leadingWasNegative {
+                presentationState.negativeSoundEchoRun = leadingWasNegative
+                    ? presentationState.negativeSoundEchoRun + 1
+                    : 0
+            }
         }
 
         // The felt fingerprint REPLACES the Focus/Feeling/Voice sentences (User,
@@ -238,7 +308,7 @@ extension CognitiveSubstrate {
                 at: now,
                 dynamics: dyn,
                 mayStayQuiet: !tailLines.isEmpty,
-                live: live)
+                presentationState: &presentationState)
             if verdict.speak {
                 lines.append(fingerprint)
             }
@@ -280,11 +350,10 @@ extension CognitiveSubstrate {
         at now: Date,
         dynamics dyn: PersonalityDynamicsConfiguration,
         mayStayQuiet: Bool = true,
-        live: Bool
+        presentationState: inout CognitiveCapsulePresentationState
     ) -> FingerprintCadenceVerdict {
-        let previous = fingerprintFamilyRun
-        let sameFamily = previous?.family == family
-        let run = sameFamily ? (previous?.count ?? 0) + 1 : 1
+        let sameFamily = presentationState.fingerprintFamily == family
+        let run = sameFamily ? presentationState.fingerprintCount + 1 : 1
 
         var speak = true
         if dyn.fingerprintDutyCycle > 1, mayStayQuiet {
@@ -295,21 +364,21 @@ extension CognitiveSubstrate {
         }
         if speak, mayStayQuiet, sameFamily, dyn.fingerprintFamilyRepeatLimit > 0,
            run > dyn.fingerprintFamilyRepeatLimit {
-            let sinceSurfaced = previous.map { now.timeIntervalSince($0.lastSurfacedAt) } ?? 0
+            let sinceSurfaced = presentationState.fingerprintLastSurfacedAt
+                .map { now.timeIntervalSince($0) } ?? 0
             // The window is the escape hatch, not the rule: quiet until it
             // expires, then one line, then quiet again if nothing has moved.
             speak = sinceSurfaced >= dyn.fingerprintSuppressionWindow
         }
 
-        if live {
-            fingerprintFamilyRun = FingerprintFamilyRun(
-                family: family,
-                // A re-surfaced line restarts the run, so the next suppression
-                // costs the full K capsules again rather than one.
-                count: speak && sameFamily && run > dyn.fingerprintFamilyRepeatLimit ? 1 : run,
-                lastSurfacedAt: speak ? now : (previous?.lastSurfacedAt ?? now)
-            )
-        }
+        presentationState.fingerprintFamily = family
+        // A re-surfaced line restarts the run, so the next suppression costs
+        // the full K capsules again rather than one.
+        presentationState.fingerprintCount =
+            speak && sameFamily && run > dyn.fingerprintFamilyRepeatLimit ? 1 : run
+        presentationState.fingerprintLastSurfacedAt = speak
+            ? now
+            : (presentationState.fingerprintLastSurfacedAt ?? now)
         return FingerprintCadenceVerdict(speak: speak, run: run)
     }
 
@@ -341,30 +410,36 @@ extension CognitiveSubstrate {
     func feltSessionBridgeLine(
         at now: Date,
         dynamics dyn: PersonalityDynamicsConfiguration,
-        live: Bool
+        presentationState: inout CognitiveCapsulePresentationState,
+        fieldNodes frozenFieldNodes: [CognitiveNode]? = nil,
+        pendingCompletionOpen frozenPendingCompletionOpen: Bool? = nil,
+        cognitionEnabled: Bool? = nil,
+        affectEnabled: Bool? = nil
     ) -> String? {
-        guard configuration.enabled, configuration.affectEnabled else { return nil }
+        guard cognitionEnabled ?? configuration.enabled,
+              affectEnabled ?? configuration.affectEnabled else { return nil }
         let gap = dyn.sessionBridgeGapHours * 60 * 60
         guard gap > 0 else { return nil }
 
         // No prior capsule = a fresh process, not a remembered gap. Staying
         // silent is the honest read: she has nothing to pick back up.
-        guard let previousCapsuleAt = lastLiveCapsuleAt else {
-            if live { lastLiveCapsuleAt = now }
+        guard let previousCapsuleAt = presentationState.lastLiveCapsuleAt else {
+            presentationState.lastLiveCapsuleAt = now
             return nil
         }
         let elapsed = now.timeIntervalSince(previousCapsuleAt)
-        if live { lastLiveCapsuleAt = now }
+        presentationState.lastLiveCapsuleAt = now
         guard elapsed >= gap else { return nil }
         // One bridge per gap: a recompile of the same first turn must not speak
         // twice.
-        if let spoken = lastSessionBridgeAt, now.timeIntervalSince(spoken) < gap {
+        if let spoken = presentationState.lastSessionBridgeAt,
+           now.timeIntervalSince(spoken) < gap {
             return nil
         }
 
         // The strongest-felt nameable moment from before the gap — the exact
         // ranking feltDaySummary computes, over the same population.
-        let felt = field.peekNodes().filter { node in
+        let felt = (frozenFieldNodes ?? field.peekNodes()).filter { node in
             guard node.turnKind == .live,
                   node.kind == .conversationFocus || node.kind == .correction,
                   feltDirection(
@@ -395,11 +470,13 @@ extension CognitiveSubstrate {
 
         // Resolution status from `pendingCompletion`: was the last thing she
         // said still waiting to find out how it landed when the gap opened?
-        let left = pendingCompletion != nil ? "left open" : "where you left it"
+        let left = (frozenPendingCompletionOpen ?? (pendingCompletion != nil))
+            ? "left open"
+            : "where you left it"
         let line = capsuleLineText(
             "- Since: \(word) — \(signal) — \(left)", maxCharacters: 200)
         guard line.hasPrefix("- Since:") else { return nil }
-        if live { lastSessionBridgeAt = now }
+        presentationState.lastSessionBridgeAt = now
         return line
     }
 
@@ -706,6 +783,16 @@ extension CognitiveSubstrate {
     ///   consecutive-negative-echo run, exactly as `innerStateCapsuleLines`
     ///   already gates cadence/suppression/session-bridge bookkeeping. An
     ///   Observatory panel re-rendering a capsule must not burn the brake.
+    struct SoundEchoSelection: Sendable, Equatable {
+        var line: String?
+        var leadingWasNegative: Bool?
+
+        static let silent = SoundEchoSelection(line: nil, leadingWasNegative: nil)
+    }
+
+    /// Direct diagnostic/test wrapper. Production capsule rendering uses the
+    /// pure selector below and carries its proposed brake update in the turn's
+    /// `CognitiveCapsulePresentationCommit`.
     func soundEchoLine(
         at now: Date,
         ignoringCadence: Bool = false,
@@ -713,9 +800,37 @@ extension CognitiveSubstrate {
         roomValence: Double? = nil,
         live: Bool = false
     ) -> String? {
-        guard configuration.enabled, configuration.affectEnabled else { return nil }
-        let dyn = dynamics
-        let fieldNodes = field.peekNodes()
+        let selection = soundEchoSelection(
+            at: now,
+            ignoringCadence: ignoringCadence,
+            mode: mode,
+            roomValence: roomValence,
+            negativeRun: negativeSoundEchoRun
+        )
+        if live, let leadingWasNegative = selection.leadingWasNegative {
+            negativeSoundEchoRun = leadingWasNegative ? negativeSoundEchoRun + 1 : 0
+        }
+        return selection.line
+    }
+
+    private func soundEchoSelection(
+        at now: Date,
+        ignoringCadence: Bool = false,
+        mode: FeltMode? = nil,
+        roomValence: Double? = nil,
+        fieldNodes frozenFieldNodes: [CognitiveNode]? = nil,
+        fixedAffect: CognitiveAffectState? = nil,
+        fixedMood: CognitiveMoodReading? = nil,
+        landingScores frozenLandingScores: [UUID: Double]? = nil,
+        negativeRun: Int,
+        dynamics frozenDynamics: PersonalityDynamicsConfiguration? = nil,
+        cognitionEnabled: Bool? = nil,
+        affectEnabled: Bool? = nil
+    ) -> SoundEchoSelection {
+        guard cognitionEnabled ?? configuration.enabled,
+              affectEnabled ?? configuration.affectEnabled else { return .silent }
+        let dyn = frozenDynamics ?? dynamics
+        let fieldNodes = frozenFieldNodes ?? field.peekNodes()
         // Her OWN live conversation turns only — never User's words as her voice,
         // never tool/system summaries (the feltDaySummary injection-safety rule).
         let assistantTurns = fieldNodes.filter { node in
@@ -725,7 +840,7 @@ extension CognitiveSubstrate {
             let age = now.timeIntervalSince(node.lastActivatedAt)
             return age >= 0 && age <= dyn.soundEchoWindow
         }
-        guard !assistantTurns.isEmpty else { return nil }
+        guard !assistantTurns.isEmpty else { return .silent }
 
         // 2026-08-09 — CLOSING-TIC FIX. The original verbal-rut detector
         // examined only `soundEchoFragment`, intentionally the first sentence.
@@ -777,7 +892,7 @@ extension CognitiveSubstrate {
         // echoes the pool narrows to the non-negative band for one turn; if that
         // band is empty the echo goes quiet rather than extending the run.
         let brakeEngaged = dyn.soundEchoNegativeRunLimit >= 0
-            && negativeSoundEchoRun >= dyn.soundEchoNegativeRunLimit
+            && negativeRun >= dyn.soundEchoNegativeRunLimit
         let candidates = brakeEngaged ? admitted.filter { $0.emotionalValence >= 0 } : admitted
         // CADENCE GATE (see soundEchoDutyCycle): an echo that speaks on every
         // turn is a tic no matter how varied its wording. Seed from the newest
@@ -790,21 +905,28 @@ extension CognitiveSubstrate {
         let shouldEcho = ignoringCadence
             || Self.soundEchoShouldSpeak(seed: latestActivity, dutyCycle: dyn.soundEchoDutyCycle)
         if !shouldEcho {
-            return wornEdgeTokens.isEmpty ? nil : Self.soundRutAwarenessLine
+            return SoundEchoSelection(
+                line: wornEdgeTokens.isEmpty ? nil : Self.soundRutAwarenessLine,
+                leadingWasNegative: nil
+            )
         }
         if candidates.isEmpty {
-            return wornEdgeTokens.isEmpty ? nil : Self.soundRutAwarenessLine
+            return SoundEchoSelection(
+                line: wornEdgeTokens.isEmpty ? nil : Self.soundRutAwarenessLine,
+                leadingWasNegative: nil
+            )
         }
         // REGISTER MATCH (see soundEchoRegisterScore): mirror the voice that
         // fits the room now, instead of always the warmest voice on record.
         let targetWarmth = Self.soundEchoRegisterTarget(
-            roomWarmth: projectedAffect(at: now).socialWarmth,
+            roomWarmth: (fixedAffect ?? projectedAffect(at: now)).socialWarmth,
             mode: mode,
             dynamics: dyn)
         // W7/P5 — the room on the second axis. The live felt signals when the
         // capsule has them; otherwise the slow mood layer, which is what the
         // fingerprint itself falls back to when no felt node is in the workspace.
-        let targetValence = (roomValence ?? derivedMood(at: now).valence).clampedSigned()
+        let targetValence = (roomValence ?? fixedMood?.valence ?? derivedMood(at: now).valence)
+            .clampedSigned()
         func score(_ node: CognitiveNode) -> Double {
             let fit = Self.soundEchoRegisterScore(
                 warmth: node.emotionalWarmth,
@@ -815,8 +937,10 @@ extension CognitiveSubstrate {
                 tolerance: dyn.soundEchoRegisterTolerance,
                 halfLife: dyn.soundEchoRecencyHalfLife)
             // W7/P10 — did it LAND? Bounded re-rank inside the register band.
+            let landing = frozenLandingScores.map { $0[node.id] ?? 0 }
+                ?? landingScore(forNodeId: node.id)
             return fit * Self.soundEchoLandingFactor(
-                landing: landingScore(forNodeId: node.id),
+                landing: landing,
                 weight: dyn.soundEchoLandingWeight)
         }
         let ranked = candidates.sorted { lhs, rhs in
@@ -841,7 +965,10 @@ extension CognitiveSubstrate {
             return (f, Self.distinctiveEchoTokens(f), node.emotionalValence)
         }
         guard !fragged.isEmpty else {
-            return wornEdgeTokens.isEmpty ? nil : Self.soundRutAwarenessLine
+            return SoundEchoSelection(
+                line: wornEdgeTokens.isEmpty ? nil : Self.soundRutAwarenessLine,
+                leadingWasNegative: nil
+            )
         }
         var tokenCounts: [String: Int] = [:]
         for entry in fragged {
@@ -870,13 +997,10 @@ extension CognitiveSubstrate {
         pick(allowWorn: false)
         if fragments.isEmpty { pick(allowWorn: true) }
         guard !fragments.isEmpty else {
-            return wornEdgeTokens.isEmpty ? nil : Self.soundRutAwarenessLine
-        }
-        // W7/P5 — advance (or clear) the negative-register run. LIVE ONLY, and
-        // only once an echo has actually been produced: a turn where the echo
-        // stayed silent neither extends nor forgives the run.
-        if live {
-            negativeSoundEchoRun = (leadValence ?? 0) < 0 ? negativeSoundEchoRun + 1 : 0
+            return SoundEchoSelection(
+                line: wornEdgeTokens.isEmpty ? nil : Self.soundRutAwarenessLine,
+                leadingWasNegative: nil
+            )
         }
         // "lately", not "when it landed" — warmth on her turn is the room's
         // temperature at encode (assistant completions never raise warmth
@@ -886,7 +1010,10 @@ extension CognitiveSubstrate {
         if !wornFragmentTokens.isEmpty || !wornEdgeTokens.isEmpty {
             line += Self.soundRutAwarenessSuffix
         }
-        return line
+        return SoundEchoSelection(
+            line: line,
+            leadingWasNegative: (leadValence ?? 0) < 0
+        )
     }
 
     private static let soundRutAwarenessSuffix =
@@ -1369,6 +1496,15 @@ extension CognitiveSubstrate {
         _ request: CognitiveCapsuleRequest,
         at fixedAt: Date
     ) async -> CognitiveCapsule? {
+        await prepareFrozenCapsulePresentation(request, at: fixedAt)?.capsule
+    }
+
+    /// Production preparation seam: one immutable cognition epoch plus a pure
+    /// presentation commit for the accepted-turn boundary.
+    public func prepareFrozenCapsulePresentation(
+        _ request: CognitiveCapsuleRequest,
+        at fixedAt: Date
+    ) async -> CognitivePreparedCapsule? {
         let requestTurnKind = CognitiveTurnKind.inferred(fromSignals: [
             request.surface,
             request.sessionId ?? "",
@@ -1376,12 +1512,37 @@ extension CognitiveSubstrate {
         ])
         guard requestTurnKind == .live || request.allowNonLiveProjection else { return nil }
         let read = await frozenRead(at: fixedAt, currentSessionId: request.sessionId)
-        let capsule = compileFrozenCapsule(request, from: read)
-        guard capsule.mode == .inject,
-              !capsule.dynamicContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        let prepared = compileFrozenCapsulePresentation(request, from: read)
+        guard prepared.capsule.mode == .inject,
+              !prepared.capsule.dynamicContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return nil
         }
-        return capsule
+        return prepared
+    }
+
+    /// Apply presentation-only state after the exact frozen capsule was
+    /// accepted into provider context. A stale/out-of-order commit is ignored
+    /// rather than rolling cadence backward over a newer accepted turn.
+    @discardableResult
+    public func applyCapsulePresentationCommit(
+        _ commit: CognitiveCapsulePresentationCommit
+    ) -> Bool {
+        guard capsulePresentationStateSnapshot() == commit.expected else { return false }
+        let next = commit.next
+        if let family = next.fingerprintFamily,
+           let surfacedAt = next.fingerprintLastSurfacedAt {
+            fingerprintFamilyRun = FingerprintFamilyRun(
+                family: family,
+                count: next.fingerprintCount,
+                lastSurfacedAt: surfacedAt
+            )
+        } else {
+            fingerprintFamilyRun = nil
+        }
+        lastLiveCapsuleAt = next.lastLiveCapsuleAt
+        lastSessionBridgeAt = next.lastSessionBridgeAt
+        negativeSoundEchoRun = next.negativeSoundEchoRun
+        return true
     }
 
     private func fitCapsuleLines(_ lines: [String], maxCharacters: Int) -> (text: String, truncated: Bool) {

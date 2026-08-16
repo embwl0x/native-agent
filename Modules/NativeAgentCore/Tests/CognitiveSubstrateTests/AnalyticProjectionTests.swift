@@ -384,6 +384,45 @@ struct AnalyticProjectionTests {
         #expect(afterConfigurationMutation == before)
     }
 
+    @Test("capsule presentation advances only after its frozen commit is accepted")
+    func capsulePresentationCommitBoundary() async throws {
+        let start = Date(timeIntervalSince1970: 77_000)
+        let clock = Clock(start)
+        let mind = substrate(clock: clock)
+        await mind.ingest(event(
+            .userMessageReceived,
+            summary: "A warm steady turn",
+            at: start,
+            id: "presentation-seed"
+        ))
+        let request = CognitiveCapsuleRequest(
+            surface: "chat",
+            userMessage: "stay with this warm turn",
+            sessionId: "projection-tests",
+            mode: .inject
+        )
+
+        let before = await mind.capsulePresentationStateSnapshot()
+        let first = try #require(await mind.prepareFrozenCapsulePresentation(request, at: start))
+        let retry = try #require(await mind.prepareFrozenCapsulePresentation(request, at: start))
+        #expect(first == retry, "a failed/unaccepted attempt must leave a byte-identical retry")
+        #expect(await mind.capsulePresentationStateSnapshot() == before)
+
+        let commit = try #require(first.presentationCommit)
+        #expect(await mind.applyCapsulePresentationCommit(commit))
+        #expect(await mind.capsulePresentationStateSnapshot() == commit.next)
+        #expect(!(await mind.applyCapsulePresentationCommit(commit)),
+                "the same accepted projection cannot consume presentation state twice")
+
+        _ = await mind.compileCapsule(CognitiveCapsuleRequest(
+            surface: "observatory",
+            userMessage: "preview",
+            mode: .inspectOnly
+        ))
+        #expect(await mind.capsulePresentationStateSnapshot() == commit.next,
+                "an Observatory preview must remain pure")
+    }
+
     @Test("expired seeds disappear from every live read before maintenance")
     func expiredSeedsAreAbsentAcrossReadBoundaries() async throws {
         let start = Date(timeIntervalSince1970: 80_000)

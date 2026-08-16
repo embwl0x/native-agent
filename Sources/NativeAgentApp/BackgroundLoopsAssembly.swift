@@ -344,14 +344,6 @@ enum BackgroundLoopsAssembly {
             // oversized files / an over-budget data/ tree and files ONE inbox
             // card. Detect-never-delete.
             makeDataRootDiskHygieneLoop(dataRoot: dataRoot),
-            // NOT registered: the A5.5 stale-artifact sweep. Its `isEnabled` gate
-            // reads `staleArtifactSweepEnabled`, a UserDefaults key with no
-            // @AppStorage, no Toggle and no `set(forKey:)` anywhere in the repo
-            // (verified 2026-08-02) — so the delete leg could never fire, and the
-            // registration bought a daily walk of data/ plus an append to
-            // logs/maintenance_sweep.jsonl that nothing reads. `StaleArtifactSweep`
-            // + `StaleArtifactSweepLoop` and their tests remain; re-register here
-            // the day the sweep has a real toggle behind it.
             makeMemoryConsolidationLoop(dataRoot: dataRoot),
             makeWeeklySelfImprovementLoop(dataRoot: dataRoot, llm: llm),
             makeREMCycleLoop(dataRoot: dataRoot, llm: llm, cognitionRuntime: cognition),
@@ -379,12 +371,6 @@ enum BackgroundLoopsAssembly {
             // U4 Wave C: autonomy-promotion PROPOSAL loop (cards only; applies
             // human-approved promotions via a re-verifying reconcile).
             makeAutonomyPromotionLoop(dataRoot: dataRoot),
-            // NOT registered: the MEASURE v2 golden-eval loop, for the same
-            // reason as the sweep above — `goldenEvalEnabled` has no writer
-            // anywhere in the repo, so the loop woke weekly forever and could
-            // never submit a job. `GoldenEvalLoop`/`GoldenEvalJobs` and the
-            // scoreboard's `golden_eval` trigger-source cohort remain intact;
-            // re-register here once the cohort has a toggle.
             // Desk notify (2026-06-29): desk-side push when a direct/urgent
             // tracked item changes. A SEPARATE loop from the cognition manifest
             // above — it reads desk state and pings User, never touching the

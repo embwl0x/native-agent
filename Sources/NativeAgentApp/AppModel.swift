@@ -40,7 +40,6 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-import CapabilityFoundry
 
 @MainActor
 @Observable
@@ -574,9 +573,6 @@ final class AppModel {
     // PATCH-2026-05-08: wave3 Feature A/B state
     var healthCard: HealthCard?
     var whatsRunning: WhatsRunning?
-
-    // S.4: per-sheet deferred refresh tasks keyed by run.id so concurrent sheets don't race
-    var improvementRefreshTasks: [String: Task<Void, Never>] = [:]
 
     @MainActor
     var chatDrafts: [String: String] = [:]

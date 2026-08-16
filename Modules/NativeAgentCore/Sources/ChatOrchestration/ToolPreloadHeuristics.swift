@@ -324,7 +324,9 @@ public enum ToolPreloadHeuristics {
                 "failed ci", "github issue", "github issues", "github project", "hermes github",
             ],
             tools: [
-                "github_status", "github_list_repos", "github_list_issues", "github_search",
+                "github_status", "github_list_repos", "github_list_notifications", "github_get_repository",
+                "github_read_repository_content", "github_list_commits",
+                "github_list_issues", "github_search",
                 "github_list_pull_requests", "github_get_issue", "github_get_pull_request",
                 "github_pull_request_files", "github_pull_request_activity",
                 "github_discover_tracking", "github_project_digest", "github_mutate",
@@ -333,12 +335,26 @@ public enum ToolPreloadHeuristics {
             // loading for compatibility, but is not automatically preloaded
             // or advertised as routine GitHub readiness.
             loadTools: [
-                "github_status", "github_list_repos", "github_list_issues", "github_search",
+                "github_status", "github_list_repos", "github_list_notifications", "github_get_repository",
+                "github_read_repository_content", "github_list_commits",
+                "github_list_issues", "github_search",
                 "github_list_pull_requests", "github_get_issue", "github_get_pull_request",
                 "github_pull_request_files", "github_pull_request_activity",
                 "github_discover_tracking", "github_project_digest", "github_mutate",
                 "github_set_repo_visibility",
             ]
+        ),
+        // Bridge progress is a canonical local projection, not a filesystem
+        // investigation. The lexical classifier stays empty because names
+        // such as "Codex" also appear in ordinary conversation; TurnPlanner
+        // supplies this group only when the same message carries an actual
+        // status/message/resume intent.
+        GroupEntry(
+            group: "delegation",
+            aliases: ["bridges", "agents"],
+            tokens: [],
+            phrases: [],
+            tools: ["delegation_status"]
         ),
         GroupEntry(
             group: "slack",
@@ -494,6 +510,7 @@ public enum ToolPreloadHeuristics {
         let tokens = tokenSet(lower)
         let rawTokens = lower.split(whereSeparator: { $0.isWhitespace || $0.isNewline })
         let webSignals = webAddressSignals(rawTokens: rawTokens)
+        let hasGitHubAddress = containsGitHubAddress(rawTokens: rawTokens)
         // Whole whitespace-delimited words (punctuation-trimmed) for the
         // standalone-only patterns — "agent_inbox" / "docs/agent_inbox/"
         // stay single words here and never equal "inbox".
@@ -521,7 +538,20 @@ public enum ToolPreloadHeuristics {
                 hits.removeAll()
             }
             if entry.group == "browser" {
-                hits.append(contentsOf: webSignals)
+                // A github.com repository/issue/PR URL is already a strong
+                // connector route. Keep the browser available when the user
+                // explicitly asks for it, but do not let the generic fact
+                // that the message contains a URL compete with GitHub's
+                // structured API lane.
+                if hasGitHubAddress {
+                    let explicitBrowserSignals: Set<String> = [
+                        "browser", "navigate", "screenshot", "visible browser",
+                        "open url", "open website", "open webpage", "browser screenshot",
+                    ]
+                    hits.removeAll { !explicitBrowserSignals.contains($0) }
+                } else {
+                    hits.append(contentsOf: webSignals)
+                }
             }
             if entry.group == "builder" {
                 hits = builderEvidence(
@@ -534,18 +564,13 @@ public enum ToolPreloadHeuristics {
         }
         let knownGroups = Set(table.lazy.filter(\.preloadable).map(\.group))
         var hintedGroups = Set(residentGroupHints.filter { knownGroups.contains($0) })
-        // Bridge-tagged turns are agent-to-agent WORK traffic by construction:
-        // the "[from: <sender>, via bridge]" prefix is machine-affixed by
-        // ClaudeBridge, and every such turn (codex completion relays, claude
-        // corrections, wake prompts) asks this session to verify something —
-        // git forensics, file reads, repo state. Their bodies rarely carry
-        // builder-strong lexical evidence ("poke him" → she git-logs), which
-        // is exactly the miss class of 2026-07-25: 29 zero-candidate turns
-        // followed by manual bash/git_*/read_file loads. Hinting the working
-        // set is schema visibility only — dispatch gates are unchanged, and
-        // a spoofed prefix in ordinary chat costs nothing but prompt bytes.
+        // A bridge prefix proves provenance, not capability intent. Only add
+        // the repo working set when the bridge body also carries concrete
+        // build/file/version-control evidence. Status and completion notices
+        // otherwise stay on their resident route without paying three broad
+        // tool schemas on every ordinary bridge turn.
         let isBridgeTurn = trimmed.hasPrefix("[from: ") && trimmed.contains("via bridge]")
-        let bridgeGroups: Set<String> = isBridgeTurn
+        let bridgeGroups: Set<String> = isBridgeTurn && bridgeCarriesRepositoryWork(lower)
             ? Set(["builder", "files", "github"].filter { knownGroups.contains($0) })
             : []
         hintedGroups.formUnion(bridgeGroups)
@@ -598,6 +623,17 @@ public enum ToolPreloadHeuristics {
             candidates.formUnion(entry.tools)
         }
         return Prediction(groups: capped, candidateTools: candidates)
+    }
+
+    private static func bridgeCarriesRepositoryWork(_ lower: String) -> Bool {
+        let body = lower.split(separator: "]", maxSplits: 1).last.map(String.init) ?? lower
+        let signals = [
+            " repo", "repository", " source", " file", " path",
+            "branch", "commit", "git ", "github", "pull request", " pr ",
+            "build", "compile", "test", "implementation", " patch", " diff",
+            "worktree", "project", "fixed", "changed", "created", "updated",
+        ]
+        return signals.contains { body.contains($0) }
     }
 
     /// Compact discovery index shared by the Core and app-owned catalog
@@ -911,6 +947,20 @@ public enum ToolPreloadHeuristics {
             }
         }
         return []
+    }
+
+    private static func containsGitHubAddress(rawTokens: [Substring]) -> Bool {
+        rawTokens.contains { raw in
+            let token = raw.trimmingCharacters(in: CharacterSet(charactersIn: ".,!?;:)('\"`"))
+            let lower = token.lowercased()
+            if let url = URL(string: lower),
+               let host = url.host?.lowercased(),
+               host == "github.com" || host == "www.github.com" {
+                return true
+            }
+            let host = String(lower.split(separator: "/", maxSplits: 1).first ?? "")
+            return host == "github.com" || host == "www.github.com"
+        }
     }
 
     private static func isWebAddressToken(_ token: String) -> Bool {

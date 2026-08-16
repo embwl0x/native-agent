@@ -49,8 +49,18 @@ public struct ChatSessionAutocompactionConfig: Sendable, Equatable {
     /// compact sooner so a global 200k preference cannot exceed a 128k model's
     /// usable request window. Forty percent leaves room for persona, Fluid
     /// Context, cognition, tool schemas, the current turn, and model output.
-    public func effectiveThresholdTokens(forModel model: String) -> Int {
-        let contextWindow = ProviderRouting.contextLength(forModel: model)
+    public func effectiveThresholdTokens(
+        forModel model: String,
+        providerID: String? = nil,
+        dataRoot: URL? = nil
+    ) -> Int {
+        guard let contextWindow = ProviderRouting.verifiedContextLength(
+            forModel: model,
+            providerID: providerID,
+            dataRoot: dataRoot
+        ) else {
+            return thresholdTokens
+        }
         let modelPressureThreshold = max(
             1,
             Int(Double(contextWindow) * Self.maximumContextWindowFraction)
@@ -146,9 +156,14 @@ struct ChatSessionAutocompactor: Sendable {
         model: String,
         surface: String,
         runId: String?,
-        trigger: String = "auto_threshold"
+        providerID: String? = nil,
+        trigger: String = "auto_threshold",
+        force: Bool = false
     ) async throws -> ChatSessionCompactionOutcome {
-        guard config.enabled else {
+        // Manual compaction is an explicit user action. It bypasses the
+        // automatic enable/threshold gates, but never the transcript validator,
+        // verified backup, keep-tail, or durable-write contracts below.
+        guard config.enabled || force else {
             return skipped(
                 sessionId: rawSessionId,
                 reason: "autocompaction disabled",
@@ -173,9 +188,14 @@ struct ChatSessionAutocompactor: Sendable {
             )
         }
 
-        let effectiveThresholdTokens = config.effectiveThresholdTokens(forModel: model)
+        let effectiveThresholdTokens = config.effectiveThresholdTokens(
+            forModel: model,
+            providerID: providerID,
+            dataRoot: dataRoot
+        )
         let divisor = Self.tokenDivisor(forModel: model)
-        if Double(sourceBytesBefore) < Double(effectiveThresholdTokens) * divisor {
+        if !force,
+           Double(sourceBytesBefore) < Double(effectiveThresholdTokens) * divisor {
             return skipped(
                 sessionId: sessionId,
                 reason: "below threshold by file size",
@@ -190,7 +210,7 @@ struct ChatSessionAutocompactor: Sendable {
             let before = rows.count
             let transcriptChars = Self.transcriptCharacterCount(rows)
             let estimatedTokens = max(0, Int((Double(transcriptChars) / divisor).rounded()))
-            guard estimatedTokens >= effectiveThresholdTokens else {
+            guard force || estimatedTokens >= effectiveThresholdTokens else {
                 return skipped(
                     sessionId: sessionId,
                     reason: "below threshold",

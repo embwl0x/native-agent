@@ -79,14 +79,18 @@ extension SwiftNativeTrustCenter: OriginAwareAutonomyResolver {
         surface: String,
         originTrusted: Bool
     ) async throws -> String {
-        let policy = await self.loadTrustPolicy()
+        // Resolve the normalized policy and raw user-only overrides from one
+        // checked authority generation. Two independent reads could otherwise
+        // splice a just-revoked override with the prior broad posture.
+        let authorization = try await self.loadAuthorizationSnapshotChecked()
+        let policy = authorization.policy
         // 2026-07-21 audit fix: an explicit USER-SET "blocked" entry
         // OUTRANKS the broad yolo/full-Mac posture — previously an active
         // yolo window silently flattened even a deliberate user-set
         // "blocked". confirm/send_approval stay flattened (pinned behavior);
         // consult the RAW user file, NOT the merged policy: merged code
         // defaults would masquerade as explicit entries.
-        let userOverrides = await self.userConfiguredAutonomyOverrides()
+        let userOverrides = authorization.userConfiguredAutonomyOverrides
         let hasExplicitBlock = Self.hasExplicitBlockOverride(toolName, overrides: userOverrides)
         if !hasExplicitBlock,
            Self.fullMacPolicyAllows(
@@ -348,7 +352,7 @@ extension SwiftNativeTrustCenter: OriginAwareAutonomyResolver {
              "mac.ax_status", "mac.ax_tree", "mac.ax_find",
              // W3.5 — the fused view. Same category, same read tier: it draws
              // numbers on a picture of the screen and acts on nothing.
-             "mac_view", "mac.view",
+             "mac_view", "mac.view", "mac_attention", "mac.attention",
              // W7 — mac_nudge. Same category, same read-tier treatment: with
              // the category on it resolves to auto with no approval floor,
              // exactly like mac_ax_status. It is absent from

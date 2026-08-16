@@ -40,7 +40,6 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-import CapabilityFoundry
 
 struct QueuedChatTurn: Identifiable, Equatable, Sendable {
     static let maxPerSession = 20
@@ -93,7 +92,12 @@ extension AppModel {
             return .failure("No active session to compact")
         }
         do {
-            _ = try await client.compactSession(sessionId: activeChatSessionId, force: true)
+            _ = try await client.compactSession(
+                sessionId: activeChatSessionId,
+                model: chatModel,
+                providerID: chatProvider,
+                force: true
+            )
             chatMessages = (try? await client.getChatMessages(sessionId: activeChatSessionId)) ?? chatMessages
             statusText = "Session compacted"
             return .success(statusText)
@@ -278,6 +282,7 @@ extension AppModel {
             activeChatSessionId = ""
             UserDefaults.standard.removeObject(forKey: "activeChatSessionId")
             await loadChatState()
+            MacSyncEngine.shared.requestChatSnapshotPublication(includeTranscripts: false)
         } catch {
             statusText = "Archive failed: \(error.localizedDescription)"
         }

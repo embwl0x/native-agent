@@ -14,9 +14,7 @@ extension ChatView {
             showToast("Pinned tabs could not be updated")
             return
         }
-        Task { @MainActor in
-            await MacSyncEngine.shared.writeSnapshots()
-        }
+        MacSyncEngine.shared.requestChatSnapshotPublication(includeTranscripts: false)
     }
 
     func prunePinnedSessions() {

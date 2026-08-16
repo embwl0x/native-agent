@@ -206,6 +206,7 @@ public enum CognitiveSomaticSignalAdapter {
         "motorDomain",
         "motorActionIdentity",
         "verification",
+        "trustRisk",
     ]
 
     private static func stringValue(_ value: JSONValue?) -> String? {

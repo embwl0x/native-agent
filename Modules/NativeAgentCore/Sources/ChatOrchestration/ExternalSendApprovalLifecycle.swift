@@ -113,6 +113,7 @@ public enum ExternalSendApprovalLifecycle {
         invokedAs: String,
         input: [String: JSONValue],
         surface: String,
+        idempotencyKey suppliedIdempotencyKey: String? = nil,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async throws -> ExternalSendApprovalStagingResult {
         guard let actionID = ExternalSendApprovalRequest.canonicalActionID(for: invokedAs),
@@ -137,6 +138,17 @@ public enum ExternalSendApprovalLifecycle {
             )
         }
 
+        let idempotencyKey: String
+        if let suppliedIdempotencyKey {
+            let trimmed = suppliedIdempotencyKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, trimmed.utf8.count <= 128 else {
+                throw ExternalSendApprovalError.invalidIdempotencyKey
+            }
+            idempotencyKey = trimmed
+        } else {
+            idempotencyKey = UUID().uuidString.lowercased()
+        }
+
         let sessionID = nonEmpty(ChatToolSessionContext.verifiedSessionId)
         let chatID = nonEmpty(ChatToolSessionContext.verifiedChatId)
         var payload: [String: JSONValue] = [
@@ -146,7 +158,7 @@ public enum ExternalSendApprovalLifecycle {
             "invokedAs": .string(invokedAs),
             "surface": .string(surface),
             "input": privateInput,
-            "idempotencyKey": .string(UUID().uuidString.lowercased()),
+            "idempotencyKey": .string(idempotencyKey),
             "origin": .object([
                 "sessionId": sessionID.map(JSONValue.string) ?? .null,
                 "chatId": chatID.map(JSONValue.string) ?? .null,
@@ -268,6 +280,7 @@ enum ExternalSendApprovalError: LocalizedError {
     case missingInput(String)
     case fieldTooLarge(String, maximumBytes: Int)
     case inputTooLarge(actual: Int, maximum: Int)
+    case invalidIdempotencyKey
 
     var errorDescription: String? {
         switch self {
@@ -279,6 +292,8 @@ enum ExternalSendApprovalError: LocalizedError {
             return "External send field \(field) exceeds \(maximumBytes) bytes."
         case .inputTooLarge(let actual, let maximum):
             return "External send replay input is \(actual) bytes; maximum is \(maximum)."
+        case .invalidIdempotencyKey:
+            return "External send idempotency key must contain 1 to 128 UTF-8 bytes."
         }
     }
 }

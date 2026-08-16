@@ -430,6 +430,102 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
 // MARK: - SwiftNativeMemoryV2.shared
 
 extension SwiftNativeMemoryV2 {
+    /// True when `dataRoot` names the process-wide production store.
+    ///
+    /// Keep this comparison in one place. Long-lived app factories used to
+    /// spell it several different ways (`==`, `standardizedFileURL`, or no
+    /// check at all), which could create a second MemoryV2 actor, SQLite pool,
+    /// embedding cache, and projection-hook owner over the live database.
+    public static func usesDefaultDataRoot(_ dataRoot: URL) -> Bool {
+        canonicalRootIdentity(dataRoot)
+            == canonicalRootIdentity(PersistenceCore.defaultDataRoot())
+    }
+
+    /// Resolve the MemoryV2 owner for an injected data root without introducing
+    /// a process-wide registry.
+    ///
+    /// The default root always returns ``shared`` so normal app composition has
+    /// one actor and one underlying `MemoryStorage`. Alternate roots remain
+    /// hermetic and receive a private actor rooted exactly at the injected URL.
+    /// Failure to open an alternate store returns the existing unwired,
+    /// fail-closed actor; it never borrows the user's live memory.
+    public static func resolvedOwner(
+        dataRoot: URL,
+        alternateRootEmbedder: (any EmbeddingProvider)? = nil
+    ) -> SwiftNativeMemoryV2 {
+        guard !usesDefaultDataRoot(dataRoot) else { return .shared }
+        let root = dataRoot.standardizedFileURL
+        guard let storage = try? MemoryStorage(dataRoot: root) else {
+            return SwiftNativeMemoryV2()
+        }
+        return SwiftNativeMemoryV2(
+            embedder: alternateRootEmbedder ?? ManagedEmbeddingProvider(dataRoot: root),
+            storage: MemoryStorageBridge(storage: storage)
+        )
+    }
+
+    /// Resolve the concrete storage actor for operations that need canonical
+    /// administrative APIs not exposed by `MemoryV2Protocol`. Default-root
+    /// callers receive the exact storage beneath ``shared``; alternate roots
+    /// open an isolated store. An unavailable shared actor fails closed rather
+    /// than quietly constructing a hookless second owner over live memory.
+    public static func resolvedStorage(dataRoot: URL) async throws -> MemoryStorage {
+        if usesDefaultDataRoot(dataRoot) {
+            guard let bridge = await SwiftNativeMemoryV2.shared.underlyingBridge() else {
+                throw MemoryV2Error.storageUnavailable
+            }
+            return await bridge.underlyingStorage()
+        }
+        return try MemoryStorage(dataRoot: dataRoot.standardizedFileURL)
+    }
+
+    /// Build and attach the USER.md projection hook to this actor's exact
+    /// underlying storage. The caller gets the generator only after the hook is
+    /// installed, so launch cannot regenerate through one SQLite owner and then
+    /// attach mutations to another.
+    public func bindUserMDGenerator(
+        dataRoot: URL,
+        personaRoot: URL? = nil,
+        debounceInterval: TimeInterval = 30
+    ) async -> UserMDGenerator? {
+        guard let bridge = storage as? MemoryStorageBridge else { return nil }
+        let underlying = await bridge.underlyingStorage()
+        let storagePath = underlying.path
+        let storageDataRoot = storagePath
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        guard Self.canonicalRootIdentity(storageDataRoot)
+            == Self.canonicalRootIdentity(dataRoot) else {
+            return nil
+        }
+        let generator = UserMDGenerator(
+            storage: underlying,
+            dataRoot: dataRoot,
+            personaRoot: personaRoot,
+            debounceInterval: debounceInterval
+        )
+        await underlying.attachUserMDGenerator(generator)
+        return generator
+    }
+
+    /// Reconcile the rebuildable Knowledge Graph projection from the exact
+    /// canonical MemoryV2 database owned by this actor. This is the launch and
+    /// post-migration convergence seam; it does not create a second fact owner.
+    @discardableResult
+    public func reconcileKnowledgeGraphProjection() async throws -> KnowledgeGraphMemoryRebuildReport {
+        guard let bridge = storage as? MemoryStorageBridge else {
+            throw MemoryV2Error.storageUnavailable
+        }
+        let underlying = await bridge.underlyingStorage()
+        let sqlitePath = underlying.path
+        let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
+        return try await indexer.rebuildMemoryDerivedGraphFromCanonicalStore()
+    }
+
+    private static func canonicalRootIdentity(_ root: URL) -> String {
+        root.standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
     /// R13: mark an existing memory corrected by a newer one. Routes to the
     /// storage protocol requirement (production bridge → single-transaction
     /// lineage write; minimal fixtures honestly report not-applied).

@@ -460,10 +460,17 @@ public actor WorkshopExecutorLoop {
     /// time. Per-Workshop execution failures are contained (logged + that Workshop execution goes
     /// `failed`); the pass moves on. Safe to call from a LoopRunner tick.
     public func drainOnce() async {
-        guard await isEnabled() else { return }
         // Crash/restart orphan recovery — completes BEFORE this drain claims
         // anything (the shared barrier; see reconcileTask).
         await ensureOrphansReconciled()
+        // Terminal execution state is canonical; its Desk projection and
+        // unified receipt are retryable derived settlement. Reconcile every
+        // terminal record before admitting new work so a crash between the
+        // terminal CAS and the event sink cannot leave a zombie Desk item.
+        await reconcileTerminalDeskSettlements()
+        // Disabling autonomous execution blocks new claims, not durable
+        // zero-effect repair of work that was already admitted.
+        guard await isEnabled() else { return }
         // Fail approvals nobody is coming to answer (no-op unless the
         // approval-wait deadline is configured). Runs each drain tick so the
         // timeout granularity is the drain interval — fine for a multi-hour
@@ -482,6 +489,13 @@ public actor WorkshopExecutorLoop {
             } catch {
                 Self.logger.error("drain claim failed for \(record.id, privacy: .public): \(String(describing: error), privacy: .public)")
             }
+        }
+    }
+
+    private func reconcileTerminalDeskSettlements() async {
+        for record in await scanQueue()
+        where ["completed", "failed", "cancelled", "canceled"].contains(record.status.lowercased()) {
+            await WorkshopDeskReceiptBridge.recordTerminal(record, reason: nil, dataRoot: root)
         }
     }
 

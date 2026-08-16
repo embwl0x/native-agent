@@ -165,9 +165,6 @@ private enum DoctorFileRepair {
         }
     }
 
-    static func appendJSONLReceipt(_ receipt: JSONValue, to path: URL) async {
-        try? await SwiftNativePersistenceCore().appendJSONL(receipt, to: path)
-    }
 }
 
 // MARK: - StorageCheck

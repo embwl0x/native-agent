@@ -1633,4 +1633,31 @@ final class DeskStoreTests: XCTestCase {
         let rendered = DeskProjection.render(driftItem(notes: [note(2, resolve.receiptNote)]), now: renderNow)
         XCTAssertFalse(rendered.contains("⚑ drift"), rendered)
     }
+
+    func test_owner_cadence_attempt_is_typed_idempotent_and_terminal() async throws {
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SwiftNativeDeskStore(dataRoot: root)
+        let item = try await store.createItem(kind: .watch, project: "ops", title: "daily digest")
+        _ = try await store.setCadence(item.handle, cadence: Cadence(mode: .daily))
+        let day = DeskClock.dayStamp(Date())
+        let first = try await store.reserveWorkAttempt(
+            item.handle, lane: .ownerCadence, day: day, slot: "b1")
+        let replay = try await store.reserveWorkAttempt(
+            item.handle, lane: .ownerCadence, day: day, slot: "b1")
+        XCTAssertEqual(first, replay)
+        let reservedState = try await store.liveState()
+        XCTAssertEqual(reservedState.items.first { $0.handle == item.handle }?.workAttempts.count, 1)
+
+        _ = try await store.completeWorkAttempt(item.handle, attemptId: first, receipt: "[completed] digest")
+        let secondSettlement = try await store.completeWorkAttempt(
+            item.handle, attemptId: first, receipt: "[completed] digest")
+        XCTAssertNil(secondSettlement)
+        let settledState = try await store.liveState()
+        let settled = try XCTUnwrap(settledState.items.first { $0.handle == item.handle })
+        XCTAssertEqual(settled.workAttempts.first?.lane, .ownerCadence)
+        XCTAssertNotNil(settled.workAttempts.first?.completedAt)
+        XCTAssertNotNil(settled.cadence.nextRefreshAt)
+        XCTAssertEqual(settled.notes.filter { $0.text == "[completed] digest" }.count, 1)
+    }
 }

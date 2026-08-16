@@ -187,6 +187,10 @@ public enum DeskClock {
         return "wres_\(clean(bare))_\(clean(day))_\(clean(slot))"
     }
 
+    public static func workAttemptId(handle: String, lane: DeskWorkAttempt.Lane, day: String, slot: String) -> String {
+        "wattempt_\(lane.rawValue)_\(reservationId(handle: handle, day: day, slot: slot).dropFirst(5))"
+    }
+
     /// The `yyyy-MM-dd` UTC day for a timestamp — the reservation/day bucket.
     public static func dayStamp(_ date: Date) -> String {
         let f = DateFormatter()
@@ -665,6 +669,13 @@ public struct PromotionDossier: Sendable, Equatable {
 // the caps count DISTINCT reservations from the ops feed, never a mutable
 // counter that could drift.
 
+public enum DeskWorkDisposition: String, Sendable, Equatable {
+    case progress
+    case goalSatisfied = "goal_satisfied"
+    case blocked
+    case abandon
+}
+
 public struct WorkReservation: Sendable, Equatable {
     public var reservationId: String
     public var day: String            // "yyyy-MM-dd"
@@ -672,14 +683,20 @@ public struct WorkReservation: Sendable, Equatable {
     public var reservedAt: String
     public var receipt: String?       // set by completeWorkSession
     public var completedAt: String?
+    public var disposition: DeskWorkDisposition?
+    /// Handle-relative Workshop artifacts only. These are durable references,
+    /// never copied into Memory or Fluid Context and never auto-injected.
+    public var artifactRefs: [String]
 
-    public init(reservationId: String, day: String, slot: String, reservedAt: String, receipt: String? = nil, completedAt: String? = nil) {
+    public init(reservationId: String, day: String, slot: String, reservedAt: String, receipt: String? = nil, completedAt: String? = nil, disposition: DeskWorkDisposition? = nil, artifactRefs: [String] = []) {
         self.reservationId = reservationId
         self.day = day
         self.slot = slot
         self.reservedAt = reservedAt
         self.receipt = receipt
         self.completedAt = completedAt
+        self.disposition = disposition
+        self.artifactRefs = artifactRefs
     }
 
     public var isCompleted: Bool { completedAt != nil }
@@ -693,6 +710,8 @@ public struct WorkReservation: Sendable, Equatable {
         ]
         if let receipt, !receipt.isEmpty { obj["receipt"] = .string(receipt) }
         if let completedAt, !completedAt.isEmpty { obj["completedAt"] = .string(completedAt) }
+        if let disposition { obj["disposition"] = .string(disposition.rawValue) }
+        if !artifactRefs.isEmpty { obj["artifactRefs"] = .array(artifactRefs.map(JSONValue.string)) }
         return .object(obj)
     }
 
@@ -704,7 +723,77 @@ public struct WorkReservation: Sendable, Equatable {
               let reservedAt = jsonString(obj, "reservedAt") else { return nil }
         return WorkReservation(
             reservationId: reservationId, day: day, slot: slot, reservedAt: reservedAt,
-            receipt: jsonString(obj, "receipt"), completedAt: jsonString(obj, "completedAt")
+            receipt: jsonString(obj, "receipt"), completedAt: jsonString(obj, "completedAt"),
+            disposition: jsonString(obj, "disposition").flatMap(DeskWorkDisposition.init(rawValue:)),
+            artifactRefs: jsonStringArray(obj, "artifactRefs")
+        )
+    }
+}
+
+/// A typed execution attempt owned directly by a Desk item. Pursuit
+/// reservations keep their existing compatibility ledger; ordinary owner
+/// cadence work uses this sibling ledger so it can be admitted and settled
+/// without pretending the owner's task is a self-authored pursuit.
+public struct DeskWorkAttempt: Sendable, Equatable {
+    public enum Lane: String, Sendable, Equatable {
+        case ownerCadence = "owner_cadence"
+    }
+
+    public var attemptId: String
+    public var lane: Lane
+    public var day: String
+    public var slot: String
+    public var reservedAt: String
+    public var receipt: String?
+    public var completedAt: String?
+
+    public init(
+        attemptId: String,
+        lane: Lane,
+        day: String,
+        slot: String,
+        reservedAt: String,
+        receipt: String? = nil,
+        completedAt: String? = nil
+    ) {
+        self.attemptId = attemptId
+        self.lane = lane
+        self.day = day
+        self.slot = slot
+        self.reservedAt = reservedAt
+        self.receipt = receipt
+        self.completedAt = completedAt
+    }
+
+    public func toJSON() -> JSONValue {
+        var object: [String: JSONValue] = [
+            "attemptId": .string(attemptId),
+            "lane": .string(lane.rawValue),
+            "day": .string(day),
+            "slot": .string(slot),
+            "reservedAt": .string(reservedAt),
+        ]
+        if let receipt, !receipt.isEmpty { object["receipt"] = .string(receipt) }
+        if let completedAt, !completedAt.isEmpty { object["completedAt"] = .string(completedAt) }
+        return .object(object)
+    }
+
+    public static func fromJSON(_ value: JSONValue) -> DeskWorkAttempt? {
+        guard case .object(let object) = value,
+              let attemptId = jsonString(object, "attemptId"),
+              let laneRaw = jsonString(object, "lane"),
+              let lane = Lane(rawValue: laneRaw),
+              let day = jsonString(object, "day"),
+              let slot = jsonString(object, "slot"),
+              let reservedAt = jsonString(object, "reservedAt") else { return nil }
+        return DeskWorkAttempt(
+            attemptId: attemptId,
+            lane: lane,
+            day: day,
+            slot: slot,
+            reservedAt: reservedAt,
+            receipt: jsonString(object, "receipt"),
+            completedAt: jsonString(object, "completedAt")
         )
     }
 }
@@ -844,6 +933,8 @@ public struct DeskItem: Sendable, Equatable {
     public var deferUntil: String?
     public var origin: DeskOrigin       // immutable after create; default .owner
     public var pursuit: Pursuit?        // present only for origin=agent, kind=project
+    /// Direct Desk-owned execution attempts for non-pursuit lanes.
+    public var workAttempts: [DeskWorkAttempt]
 
     /// True for a store-recognized pursuit: self-authored project. The
     /// work-session ops and the open-pursuit cap key on exactly this shape.
@@ -887,7 +978,8 @@ public struct DeskItem: Sendable, Equatable {
         origin: DeskOrigin = .owner,
         pursuit: Pursuit? = nil,
         blockedOn: [String] = [],
-        deferUntil: String? = nil
+        deferUntil: String? = nil,
+        workAttempts: [DeskWorkAttempt] = []
     ) {
         self.handle = handle
         self.alias = alias
@@ -911,6 +1003,7 @@ public struct DeskItem: Sendable, Equatable {
         self.pursuit = pursuit
         self.blockedOn = blockedOn
         self.deferUntil = deferUntil
+        self.workAttempts = workAttempts
     }
 
     /// Live refs in render priority order (gh_pr > gh_issue > … > note), capped.
@@ -948,6 +1041,7 @@ public struct DeskItem: Sendable, Equatable {
         // round-trips byte-identical (M10). pursuit emitted only when present.
         if origin != .owner { obj["origin"] = .string(origin.rawValue) }
         if let pursuit { obj["pursuit"] = pursuit.toJSON() }
+        if !workAttempts.isEmpty { obj["workAttempts"] = .array(workAttempts.map { $0.toJSON() }) }
         return .object(obj)
     }
 
@@ -993,6 +1087,13 @@ public struct DeskItem: Sendable, Equatable {
         } else if strictCollections, obj["blockedOn"] != nil {
             return nil   // present but not an array — corrupt, never "empty"
         }
+        var workAttempts: [DeskWorkAttempt] = []
+        if case .array(let rows)? = obj["workAttempts"] {
+            workAttempts = rows.compactMap { DeskWorkAttempt.fromJSON($0) }
+            if strictCollections, workAttempts.count != rows.count { return nil }
+        } else if strictCollections, obj["workAttempts"] != nil {
+            return nil
+        }
         if strictCollections, let pursuitValue = obj["pursuit"] {
             // A present pursuit must be an OBJECT, and every nested ledger
             // collection that is present must be a fully-decodable array —
@@ -1027,7 +1128,8 @@ public struct DeskItem: Sendable, Equatable {
             origin: jsonString(obj, "origin").flatMap(DeskOrigin.decodePersisted) ?? .owner,
             pursuit: obj["pursuit"].map { Pursuit.fromJSON($0) },
             blockedOn: blockedOn,
-            deferUntil: jsonString(obj, "deferUntil")
+            deferUntil: jsonString(obj, "deferUntil"),
+            workAttempts: workAttempts
         )
     }
 }
@@ -1131,6 +1233,9 @@ public enum DeskOpBody: Sendable, Equatable {
     // Workshop work-session seam (Wave B drives these; Wave A designs them).
     case reserveWorkSession(reservationId: String, day: String, slot: String)
     case completeWorkSession(reservationId: String, receipt: String)
+    case settleWorkSession(reservationId: String, receipt: String, disposition: DeskWorkDisposition, artifactRefs: [String])
+    case reserveWorkAttempt(attemptId: String, lane: DeskWorkAttempt.Lane, day: String, slot: String)
+    case completeWorkAttempt(attemptId: String, receipt: String)
     case workLog(receipt: String)   // desk_work_log — a plain work receipt note
     // Sequencing seam. Both REPLACE (never merge) so the op is the whole truth
     // of the field at that point in the feed.
@@ -1153,6 +1258,9 @@ public enum DeskOpBody: Sendable, Equatable {
         case .archiveItem: return "archive_item"
         case .reserveWorkSession: return "reserve_work_session"
         case .completeWorkSession: return "complete_work_session"
+        case .settleWorkSession: return "complete_work_session"
+        case .reserveWorkAttempt: return "reserve_work_attempt"
+        case .completeWorkAttempt: return "complete_work_attempt"
         case .workLog: return "work_log"
         case .setBlockedOn: return "set_blocked_on"
         case .setDeferUntil: return "set_defer_until"
@@ -1235,6 +1343,19 @@ public struct DeskOp: Sendable, Equatable {
             obj["slot"] = .string(slot)
         case let .completeWorkSession(reservationId, receipt):
             obj["reservationId"] = .string(reservationId)
+            obj["receipt"] = .string(receipt)
+        case let .settleWorkSession(reservationId, receipt, disposition, artifactRefs):
+            obj["reservationId"] = .string(reservationId)
+            obj["receipt"] = .string(receipt)
+            obj["disposition"] = .string(disposition.rawValue)
+            obj["artifactRefs"] = .array(artifactRefs.map(JSONValue.string))
+        case let .reserveWorkAttempt(attemptId, lane, day, slot):
+            obj["attemptId"] = .string(attemptId)
+            obj["lane"] = .string(lane.rawValue)
+            obj["day"] = .string(day)
+            obj["slot"] = .string(slot)
+        case let .completeWorkAttempt(attemptId, receipt):
+            obj["attemptId"] = .string(attemptId)
             obj["receipt"] = .string(receipt)
         case let .workLog(receipt):
             obj["receipt"] = .string(receipt)
@@ -1323,7 +1444,28 @@ public struct DeskOp: Sendable, Equatable {
         case "complete_work_session":
             guard let reservationId = jsonString(obj, "reservationId"),
                   let receipt = jsonString(obj, "receipt") else { return nil }
-            body = .completeWorkSession(reservationId: reservationId, receipt: receipt)
+            if let raw = jsonString(obj, "disposition"),
+               let disposition = DeskWorkDisposition(rawValue: raw) {
+                body = .settleWorkSession(
+                    reservationId: reservationId,
+                    receipt: receipt,
+                    disposition: disposition,
+                    artifactRefs: jsonStringArray(obj, "artifactRefs")
+                )
+            } else {
+                body = .completeWorkSession(reservationId: reservationId, receipt: receipt)
+            }
+        case "reserve_work_attempt":
+            guard let attemptId = jsonString(obj, "attemptId"),
+                  let laneRaw = jsonString(obj, "lane"),
+                  let lane = DeskWorkAttempt.Lane(rawValue: laneRaw),
+                  let day = jsonString(obj, "day"),
+                  let slot = jsonString(obj, "slot") else { return nil }
+            body = .reserveWorkAttempt(attemptId: attemptId, lane: lane, day: day, slot: slot)
+        case "complete_work_attempt":
+            guard let attemptId = jsonString(obj, "attemptId"),
+                  let receipt = jsonString(obj, "receipt") else { return nil }
+            body = .completeWorkAttempt(attemptId: attemptId, receipt: receipt)
         case "work_log":
             guard let receipt = jsonString(obj, "receipt") else { return nil }
             body = .workLog(receipt: receipt)

@@ -99,7 +99,7 @@ From the private repo at the exact reviewed commit:
 cd /tmp/nativeagent-public-export
 ```
 
-The exporter creates fresh single-commit history, scrubs private identities, excludes local/runtime state, copies and verifies the exact MiniLM resources, rejects derived ContextFlow state, and builds the exported source. Review and release from that output. It does not push a public repository.
+The exporter creates fresh single-commit history, scrubs private identities, excludes local/runtime state, verifies the exact Git-owned MiniLM resources, rejects derived ContextFlow state, and builds the exported source. The model payload must already be tracked in the source commit; export never repairs it from machine-local state. Review and release from that output. It does not push a public repository.
 
 If this is a clone of the published `embwl0x/native-agent` mirror, this step is
 already complete. Verify that `.nativeagent-public-source` is tracked by the

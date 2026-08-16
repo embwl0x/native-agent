@@ -37,7 +37,6 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-import CapabilityFoundry
 
 // W-H Band (U5 decomposition, move-only): providers + OAuth-readiness
 // validators + embeddings/health routes. Relocated verbatim: the four
@@ -563,43 +562,16 @@ extension NativeClient {
         ])
     }
 
-    // DAEMON-DEAD PORT (2026-06-02): persist provider config to
-    // <dataRoot>/providers/<id>.json under flock. Merges with the existing
-    // dict so unrelated fields aren't clobbered. Empty/whitespace api_key and
-    // default_model are skipped (matches the daemon's "only set if provided"
-    // semantics).
     func configureProvider(_ id: String, apiKey: String?, authMode: String, defaultModel: String? = nil) async throws -> EmptyResponse {
-        let path = PersistenceCore.defaultDataRoot()
-            .appendingPathComponent("providers", isDirectory: true)
-            .appendingPathComponent("\(id).json")
-        try? FileManager.default.createDirectory(
-            at: path.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        let persistence = SwiftNativePersistenceCore()
-        try await persistence.withFileLock(path) {
-            let current = await persistence.readJSON(path, defaultValue: .object([:]))
-            var entry: [String: JSONValue]
-            if case .object(let obj) = current { entry = obj } else { entry = [:] }
-            entry["auth_mode"] = .string(authMode)
-            if let key = apiKey, !key.isEmpty {
-                entry["api_key"] = .string(key)
-            }
-            if let dm = defaultModel?.trimmingCharacters(in: .whitespacesAndNewlines), !dm.isEmpty {
-                entry["default_model"] = .string(dm)
-            }
-            try await persistence.writeJSON(.object(entry), to: path)
+        var config: [String: JSONValue] = ["auth_mode": .string(authMode)]
+        if let key = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty {
+            config["api_key"] = .string(key)
         }
-        let normalizedId = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if normalizedId == "moonshot" {
-            _ = await MoonshotModelCatalog.models(dataRoot: PersistenceCore.defaultDataRoot(), refresh: true)
+        if let model = defaultModel?.trimmingCharacters(in: .whitespacesAndNewlines), !model.isEmpty {
+            config["default_model"] = .string(model)
         }
-        // Wave C review (MED): OpenRouter refresh parity must reach THIS path —
-        // it is the Mac Provider Settings save route (the Core routing layer's
-        // configureProvider parity alone never fires from the sheet).
-        if normalizedId == "openrouter" {
-            _ = await OpenRouterModelCatalog.models(dataRoot: PersistenceCore.defaultDataRoot(), refresh: true)
-        }
+        _ = try await SwiftNativeProviderRouting(dataRoot: PersistenceCore.defaultDataRoot())
+            .configureProvider(id: id, config: .object(config))
         return EmptyResponse()
     }
 
@@ -1210,23 +1182,6 @@ extension NativeClient {
                 .map { $0.prefix(1).uppercased() + $0.dropFirst() }
                 .joined(separator: " ")
         }
-    }
-
-    func postCrashReport(traceback: String, stderrTail: String, exitCode: Int, capturedAt: String) async throws -> [String: Any] {
-        // WAVE 15 (2026-06-01): Swift-only — daemon route retired.
-        let impl = makeCrashReportClient()
-        let r = try await impl.postCrashReport(
-            traceback: traceback,
-            stderrTail: stderrTail,
-            exitCode: exitCode,
-            capturedAt: capturedAt
-        )
-        // Preserve the established /v1/system/crash_report response dict.
-        return [
-            "stored": r.stored,
-            "path": r.path,
-            "improvementSpawned": r.improvementSpawned
-        ]
     }
 
 }

@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 @testable import BackgroundLoops
+import PersistenceCore
 
 @Suite("OncePerPeriodReservation")
 struct OncePerPeriodReservationTests {
@@ -33,6 +34,27 @@ struct OncePerPeriodReservationTests {
         guard case .alreadyReserved = second else {
             Issue.record("expected alreadyReserved, got \(second)"); return
         }
+    }
+
+    @Test("concurrent drivers admit exactly one reservation")
+    func concurrentDriversAdmitOne() async throws {
+        let marker = tempMarker()
+        defer { try? FileManager.default.removeItem(at: marker.deletingLastPathComponent()) }
+
+        async let first = reserveOncePerPeriod(key: "week-1", at: marker)
+        async let second = reserveOncePerPeriod(key: "week-1", at: marker)
+        let outcomes = await [first, second]
+        var reserved = 0
+        var skipped = 0
+        for outcome in outcomes {
+            switch outcome {
+            case .reserved: reserved += 1
+            case .alreadyReserved: skipped += 1
+            case .failed(let error): Issue.record("unexpected failure: \(error)")
+            }
+        }
+        #expect(reserved == 1)
+        #expect(skipped == 1)
     }
 
     @Test("key form: a new period key reserves again")
@@ -124,6 +146,37 @@ struct OncePerPeriodReservationTests {
         struct Boom: Error {}
         let r = await reserveOncePerPeriod(at: marker, stamp: "new") { _ in throw Boom() }
         guard case .failed = r else { Issue.record("expected failed, got \(r)"); return }
+        #expect(!FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    @Test("an existing non-UTF8 marker fails closed and is preserved")
+    func corruptMarkerFailsClosed() async throws {
+        let marker = tempMarker()
+        defer { try? FileManager.default.removeItem(at: marker.deletingLastPathComponent()) }
+        let original = Data([0xff, 0xfe, 0xfd])
+        try original.write(to: marker)
+
+        let result = await reserveOncePerPeriod(key: "week-2", at: marker)
+        guard case .failed = result else {
+            Issue.record("expected failed, got \(result)")
+            return
+        }
+        #expect(try Data(contentsOf: marker) == original)
+    }
+
+    @Test("a lock-path failure never authorizes periodic work")
+    func lockFailureFailsClosed() async throws {
+        let root = tempMarker().deletingLastPathComponent()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let blockingParent = root.appendingPathComponent("not-a-directory")
+        try Data("block".utf8).write(to: blockingParent)
+        let marker = blockingParent.appendingPathComponent("marker")
+
+        let result = await reserveOncePerPeriod(key: "week-1", at: marker)
+        guard case .failed = result else {
+            Issue.record("expected failed, got \(result)")
+            return
+        }
         #expect(!FileManager.default.fileExists(atPath: marker.path))
     }
 

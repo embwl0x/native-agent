@@ -188,6 +188,81 @@ struct ContextSelectionTests {
     }
 
     @Test
+    func liveSelectorUsesFeedbackToRankOtherwiseEqualPeers() throws {
+        let discouraged = atom(
+            "feedback-discouraged",
+            source: "feedback-a",
+            kind: .memory,
+            body: "Atlas launch readiness is recorded in this peer note."
+        )
+        let useful = atom(
+            "feedback-useful",
+            source: "feedback-b",
+            kind: .memory,
+            body: "Atlas launch readiness is recorded in this peer note."
+        )
+        let fixture = generation([discouraged, useful])
+        let packet = try ContextSelector().select(
+            signal(
+                "Atlas launch readiness",
+                generation: fixture,
+                feedbackUtilityOverrides: [
+                    discouraged.draft.id: -1,
+                    useful.draft.id: 1,
+                ],
+                feedbackDecayOverrides: [
+                    discouraged.draft.id: 0,
+                    useful.draft.id: 1,
+                ],
+                budget: useful.draft.body.count
+            ),
+            from: fixture
+        )
+
+        #expect(packet.receipt.selectedAtomIDs == [useful.draft.id])
+        let scores = Dictionary(uniqueKeysWithValues: packet.receipt.candidateScores.map {
+            ($0.atomID, $0.features)
+        })
+        #expect(scores[useful.draft.id]?.usefulness == 1)
+        #expect(scores[discouraged.draft.id]?.usefulness == -1)
+        #expect(scores[useful.draft.id]?.decay == 1)
+        #expect(scores[discouraged.draft.id]?.decay == 0)
+    }
+
+    @Test
+    func feedbackCannotBypassLivePrivacyEligibility() throws {
+        let privateAtom = atom(
+            "feedback-private",
+            source: "feedback-private",
+            kind: .memory,
+            body: "Atlas private launch detail.",
+            privacy: .localPrivate
+        )
+        let publicAtom = atom(
+            "feedback-public",
+            source: "feedback-public",
+            kind: .memory,
+            body: "Atlas public launch detail.",
+            privacy: .publicSafe
+        )
+        let fixture = generation([privateAtom, publicAtom])
+        let packet = try ContextSelector().select(
+            signal(
+                "Atlas launch detail",
+                generation: fixture,
+                allowedPrivacy: [.publicSafe],
+                feedbackUtilityOverrides: [privateAtom.draft.id: 1],
+                feedbackDecayOverrides: [privateAtom.draft.id: 1]
+            ),
+            from: fixture
+        )
+
+        #expect(!packet.receipt.candidateScores.map(\.atomID).contains(privateAtom.draft.id))
+        #expect(!packet.receipt.selectedAtomIDs.contains(privateAtom.draft.id))
+        #expect(packet.receipt.selectedAtomIDs.contains(publicAtom.draft.id))
+    }
+
+    @Test
     func expiredAndDeletedAtomsAreExcludedBeforeScoring() throws {
         let expired = atom(
             "expired",
@@ -691,6 +766,8 @@ struct ContextSelectionTests {
         allowedSourceIDs: Set<ContextSourceID>? = nil,
         queryEmbedding: [Float]? = nil,
         queryEmbeddingModelFingerprint: String? = nil,
+        feedbackUtilityOverrides: [ContextAtomID: Double] = [:],
+        feedbackDecayOverrides: [ContextAtomID: Double] = [:],
         conflicts: [ContextConflictDefinition] = [],
         budget: Int = 500
     ) -> NeedSignal {
@@ -704,6 +781,8 @@ struct ContextSelectionTests {
                 allowedSourceIDs: allowedSourceIDs
                     ?? Set(generation.sources.map(\.descriptor.id))
             ),
+            feedbackUtilityOverrides: feedbackUtilityOverrides,
+            feedbackDecayOverrides: feedbackDecayOverrides,
             mandatoryAtomIDs: mandatory,
             deletedAtomIDs: deleted,
             queryEmbedding: queryEmbedding,

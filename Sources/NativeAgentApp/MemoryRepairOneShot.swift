@@ -26,6 +26,7 @@ import MemoryV2
 import NativeAgentCore
 import PersistenceCore
 import SQLite3
+import NotificationInbox
 
 enum MemoryRepairOneShot {
 
@@ -73,7 +74,7 @@ enum MemoryRepairOneShot {
         // to propose. Detection failure (no sqlite yet, cold install) → skip.
         let rows: [(id: String, current: String, proposed: String)]
         do {
-            let storage = try MemoryStorage(dataRoot: dataRoot)
+            let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
             let actives = try await storage.listMemories(persona: nil, status: "active", limit: nil)
             rows = actives.compactMap { m in
                 guard truncatedLengths.contains(m.content.count),
@@ -236,18 +237,8 @@ enum MemoryRepairOneShot {
             "status": .string("unread"),
             "read_at": .null,
         ])
-        let persistence = SwiftNativePersistenceCore()
-        let inserted = try await persistence.withFileLock(inboxPath) { () async throws -> Bool in
-            let rows = try await persistence.tailJSONL(inboxPath, limit: Int.max, maxBytes: nil)
-            let exists = rows.contains { row in
-                guard case .object(let obj) = row,
-                      case .string(let id)? = obj["id"] else { return false }
-                return id == approvalId
-            }
-            if exists { return false }
-            try await persistence.appendJSONL(card, to: inboxPath)
-            return true
-        }
+        let inserted = try await LiveNotificationInbox(path: inboxPath)
+            .appendUnique(card, id: approvalId)
         if inserted {
             await InboxPushNotifier.notifyIfAttentionWorthy(
                 dataRoot: dataRoot,
@@ -308,7 +299,7 @@ enum MemoryRepairOneShot {
         var outcome = TruncatedRepairOutcome()
         guard !repairs.isEmpty else { return outcome }
         outcome.backupPath = try backupSQLiteStore(dataRoot: dataRoot)
-        let storage = try MemoryStorage(dataRoot: dataRoot)
+        let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
         let embeddingProvider: any EmbeddingProvider =
             embedder ?? ManagedEmbeddingProvider(dataRoot: dataRoot)
         for repair in repairs {

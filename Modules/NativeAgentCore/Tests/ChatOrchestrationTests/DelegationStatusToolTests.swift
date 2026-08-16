@@ -52,6 +52,12 @@ struct DelegationStatusToolTests {
         return dir
     }
 
+    private func ompDir(_ root: URL) -> URL {
+        let dir = root.appendingPathComponent("omp-bridge/wake-jobs", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
     private func write(_ json: String, to directory: URL, named name: String) {
         try? Data(json.utf8).write(to: directory.appendingPathComponent(name))
     }
@@ -396,6 +402,26 @@ struct DelegationStatusToolTests {
         #expect(lost.completionTextHead?.count == 200)
     }
 
+    @Test func projectsOMPRecordAndNestedBridgeDelivery() throws {
+        let root = makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        write("""
+        {"messageId":"OMP-1","state":"settled","status":"completed",
+         "createdAt":"2026-08-05T18:40:00.000Z","startedAt":"2026-08-05T18:41:00.000Z",
+         "completedAt":"2026-08-05T18:45:00.000Z","lastActivityAt":"2026-08-05T18:44:59.000Z",
+         "payload":{"topic":"NativeAgent Cleanup"},"bridge":{"status":"delivered"},
+         "reply":"Tightened the Desk bridge."}
+        """, to: ompDir(root), named: "OMP-1.json")
+        let row = try #require(job(projector(root).recentJobs(now: Self.now), "OMP-1"))
+        #expect(row.source == "omp")
+        #expect(row.agent == "omp")
+        #expect(row.topicSlug == "nativeagent-cleanup")
+        #expect(row.deliveryOutcome == "delivered")
+        #expect(row.runStatus == "completed")
+        #expect(row.completionTextHead == "Tightened the Desk bridge.")
+        #expect(row.stallBasis == .terminal)
+    }
+
     // MARK: - Bounding, ordering, missing stores
 
     @Test func returnsNewestFirstAndHonoursTheBound() {
@@ -421,6 +447,20 @@ struct DelegationStatusToolTests {
         // Out-of-range limits clamp instead of throwing or returning nothing.
         #expect(projector(root).recentJobs(now: Self.now, limit: 0).count == 1)
         #expect(projector(root).recentJobs(now: Self.now, limit: 10_000).count == 10)
+    }
+
+    @Test func reconciliationProjectionIsNotLimitedByChatDisplayBudget() {
+        let root = makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dir = claudeDir(root)
+        for index in 0..<150 {
+            write("""
+            {"messageId":"BURST-\(index)","createdAt":"2026-08-05T18:00:00.000Z",
+             "completedAt":"2026-08-05T18:30:00.000Z","status":"completed","state":"settled"}
+            """, to: dir, named: "BURST-\(index).json")
+        }
+        #expect(projector(root).recentJobs(now: Self.now, limit: 10_000).count == 100)
+        #expect(projector(root).allJobs(now: Self.now).count == 150)
     }
 
     @Test func missingOrGarbageRecordsDoNotSinkTheCall() {

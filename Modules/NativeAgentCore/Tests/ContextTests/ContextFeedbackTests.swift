@@ -5,7 +5,7 @@ import Testing
 @Suite("Fluid Context FC7 feedback")
 struct ContextFeedbackTests {
     @Test
-    func retrievalUtilityIsCappedAndCannotOverrideAuthorityOrPrivacy() throws {
+    func retrievalUtilityIsCappedAndPreservesAuthorityAndPrivacyMetadata() throws {
         let weak = ContextFeedbackSeed(
             atomID: atom("weak"),
             authority: .external,
@@ -45,11 +45,8 @@ struct ContextFeedbackTests {
         #expect(weakState.utility <= 0.18)
         #expect(weakState.authority == .external)
         #expect(weakState.privacy == .localPrivate)
-        #expect(ContextFeedbackRanker.ranksBefore(strongState, weakState))
-        #expect(ContextFeedbackRanker.eligible(
-            snapshot.states,
-            allowedPrivacy: [.publicSafe]
-        ).map(\.atomID) == [strong.atomID])
+        #expect(strongState.authority == .canonical)
+        #expect(strongState.privacy == .publicSafe)
     }
 
     @Test
@@ -130,7 +127,6 @@ struct ContextFeedbackTests {
         let staleState = try #require(snapshot[stale.atomID])
         let correctedState = try #require(snapshot[corrected.atomID])
 
-        #expect(ContextFeedbackRanker.ranksBefore(correctedState, staleState))
         #expect(correctedState.utility > 0)
         #expect(staleState.utility < 0)
     }

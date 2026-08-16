@@ -3,6 +3,7 @@ import AppKit
 import ApplicationServices
 import CoreGraphics
 import Foundation
+import MacControl
 
 /// The live capture spine — metadata only, zero inference.
 ///
@@ -49,6 +50,14 @@ public final class ActivityWatcher: @unchecked Sendable {
         public var isLocked: Bool
     }
 
+    public enum LifecycleState: String, Sendable, Equatable {
+        case stopped
+        case starting
+        case running
+        case stopping
+        case degraded
+    }
+
     // MARK: Stored state
 
     private let store: ActivitySpanStore
@@ -60,12 +69,17 @@ public final class ActivityWatcher: @unchecked Sendable {
     /// watcher watches no file — the default, which keeps every existing
     /// caller, test and simulation constructing exactly what it did before.
     private let policySource: (any ActivityPolicySource)?
+    private let lifecycleChanged: (@Sendable (LifecycleState) -> Void)?
+    private let policyChanged: (@Sendable (ActivityPolicy) -> Void)?
 
     // Cross-thread scalars. Guarded by `lock`.
     private let lock = NSLock()
     private var _runLoop: CFRunLoop?
     private var _paused = false
     private var _stopping = false
+    private var _stopRequested = false
+    private var _restartAfterStop = false
+    private var _lifecycleState: LifecycleState = .stopped
     /// Mirror of `policy.captureEnabled`, readable off the capture thread. The
     /// engine owns the authoritative copy; this exists because `start()` has to
     /// decide whether to create the capture thread BEFORE there is one to ask.
@@ -104,6 +118,7 @@ public final class ActivityWatcher: @unchecked Sendable {
     private var pumpTask: Task<Void, Never>?
     private let started = NSCondition()
     private var isThreadReady = false
+    private var isThreadExited = true
 
     public init(
         store: ActivitySpanStore,
@@ -111,7 +126,9 @@ public final class ActivityWatcher: @unchecked Sendable {
         clock: ActivityClock = SystemActivityClock(),
         idleThreshold: TimeInterval = 300,
         heartbeatInterval: TimeInterval = 60,
-        policySource: (any ActivityPolicySource)? = nil
+        policySource: (any ActivityPolicySource)? = nil,
+        lifecycleChanged: (@Sendable (LifecycleState) -> Void)? = nil,
+        policyChanged: (@Sendable (ActivityPolicy) -> Void)? = nil
     ) {
         self.store = store
         self.clock = clock
@@ -122,6 +139,8 @@ public final class ActivityWatcher: @unchecked Sendable {
         self.heartbeatInterval = heartbeatInterval
         self.ownProcessID = ProcessInfo.processInfo.processIdentifier
         self.policySource = policySource
+        self.lifecycleChanged = lifecycleChanged
+        self.policyChanged = policyChanged
         // The caller passed us the policy it just loaded off disk; priming here
         // stops the first poll from re-applying that identical policy.
         (policySource as? ActivityPolicyFileSource)?.prime()
@@ -168,37 +187,83 @@ public final class ActivityWatcher: @unchecked Sendable {
     public var isCapturing: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return _installed && !_paused && !_stopping
+        return _installed && !_paused && !_stopping && !_stopRequested
+            && _lifecycleState != .degraded
+    }
+
+    public var lifecycleState: LifecycleState {
+        withLock { _lifecycleState }
     }
 
     /// Starts the pump, the capture thread, and the workspace observers —
     /// **unless the policy says capture is off**, in which case this installs
     /// nothing at all and returns immediately. See `isCaptureEnabled`.
     public func start() {
-        lock.lock()
-        _stopping = false
-        let enabled = _captureEnabled
-        lock.unlock()
+        let enabled = withLock { () -> Bool in
+            guard _captureEnabled else { return false }
+            if _stopping || _stopRequested {
+                _restartAfterStop = true
+                return false
+            }
+            return true
+        }
         guard enabled else {
             // REFUSED. No observer, no thread, no span, no pump. The caller is
             // free to call `start()` unconditionally at launch; the policy is
             // what decides, and it decides here rather than in five callers.
             return
         }
-        startInstalled()
+        guard beginStartInstalled() else { return }
+        started.lock()
+        while !isThreadReady { started.wait() }
+        started.unlock()
+        transitionLifecycle(to: .running)
+    }
+
+    /// App-facing startup that never parks the main actor on an AX/run-loop
+    /// bootstrap. If the capture thread does not acknowledge readiness in time,
+    /// the partially installed observers and pump are rolled back.
+    @discardableResult
+    public func startBounded(timeout: TimeInterval = 5) async -> Bool {
+        let enabled = withLock { () -> Bool in
+            guard _captureEnabled else { return false }
+            if _stopping || _stopRequested {
+                _restartAfterStop = true
+                return false
+            }
+            return true
+        }
+        guard enabled else { return !isCaptureEnabled }
+        guard beginStartInstalled() else {
+            return lifecycleState == .running || lifecycleState == .starting
+        }
+        guard await waitForThreadReady(timeout: timeout) else {
+            transitionLifecycle(to: .degraded)
+            await stop()
+            return false
+        }
+        transitionLifecycle(to: .running)
+        return true
     }
 
     /// The real installer. Private on purpose: every path into it goes through
     /// the `_captureEnabled` check above, so there is exactly one gate.
-    private func startInstalled() {
+    @discardableResult
+    private func beginStartInstalled() -> Bool {
         lock.lock()
-        if _installed {
+        if _installed || _stopping || _stopRequested {
+            if _captureEnabled { _restartAfterStop = true }
             lock.unlock()
-            return
+            return false
         }
         _installed = true
-        isThreadReady = false
+        _lifecycleState = .starting
         lock.unlock()
+        started.lock()
+        isThreadReady = false
+        isThreadExited = false
+        started.unlock()
+        lifecycleChanged?(.starting)
         // UNBOUNDED, deliberately (gpt-5.5 BLOCKING, 2026-08-14). These are
         // span *control* commands (open/touch/close), not a high-rate event
         // firehose: they arrive at human app-switch rate. `bufferingNewest`
@@ -211,7 +276,7 @@ public final class ActivityWatcher: @unchecked Sendable {
         )
         self.continuation = continuation
         let store = self.store
-        pumpTask = Task.detached(priority: .utility) {
+        pumpTask = Task.detached(priority: .utility) { [weak self] in
             for await command in stream {
                 do {
                     try await store.apply(command)
@@ -219,6 +284,8 @@ public final class ActivityWatcher: @unchecked Sendable {
                     FileHandle.standardError.write(
                         Data("activity-watch: store write failed: \(error)\n".utf8)
                     )
+                    self?.handleStoreFailure()
+                    break
                 }
             }
         }
@@ -230,24 +297,36 @@ public final class ActivityWatcher: @unchecked Sendable {
         thread.name = "com.nativeagent.activity-watch"
         thread.stackSize = 512 * 1024
         thread.start()
-
-        started.lock()
-        while !isThreadReady { started.wait() }
-        started.unlock()
+        return true
     }
 
     /// Closes the open span cleanly, tears the observer down, stops the run
     /// loop, and drains the pump. Never called from the capture thread.
     public func stop() async {
-        let proceed = withLock { () -> Bool in
+        withLock {
+            _stopRequested = true
+            _restartAfterStop = false
+        }
+        await stopInstalled()
+    }
+
+    private func stopForPolicyDisable() async {
+        await stopInstalled()
+    }
+
+    private func stopInstalled() async {
+        let (proceed, announceStopping) = withLock { () -> (Bool, Bool) in
             // Nothing installed → nothing to tear down. This is the ordinary
             // case when capture was never enabled, and it must not block on a
             // run-loop hop that will never be serviced (there is no run loop).
-            guard _installed, !_stopping else { return false }
+            guard _installed, !_stopping else { return (false, false) }
             _stopping = true
-            return true
+            let announce = _lifecycleState != .stopping
+            _lifecycleState = .stopping
+            return (true, announce)
         }
         guard proceed else { return }
+        if announceStopping { lifecycleChanged?(.stopping) }
 
         removeWorkspaceObservers()
 
@@ -270,6 +349,22 @@ public final class ActivityWatcher: @unchecked Sendable {
             }
         }
 
+        // The run-loop block acknowledging CFRunLoopStop is not the same thing
+        // as the capture thread having exited. Do not clear installed state or
+        // permit a restart until the old thread confirms its actual exit.
+        guard await waitForThreadExit(timeout: 5) else {
+            transitionLifecycle(to: .degraded)
+            Task { [weak self] in
+                guard let self else { return }
+                _ = await self.waitForThreadExit(timeout: nil)
+                await self.finishStoppedThread()
+            }
+            return
+        }
+        await finishStoppedThread()
+    }
+
+    private func finishStoppedThread() async {
         self.continuation?.finish()
         self.continuation = nil
         await pumpTask?.value
@@ -277,11 +372,66 @@ public final class ActivityWatcher: @unchecked Sendable {
 
         // Back to the uninstalled state, so a later off→on policy flip can
         // re-install cleanly instead of finding `_installed` stuck true.
-        withLock {
+        let restart = withLock { () -> Bool in
             _installed = false
             _runLoop = nil
             _stopping = false
+            _stopRequested = false
             _currentApp = nil
+            _lifecycleState = .stopped
+            let shouldRestart = _restartAfterStop && _captureEnabled
+            _restartAfterStop = false
+            return shouldRestart
+        }
+        lifecycleChanged?(.stopped)
+        if restart {
+            Task { [weak self] in _ = await self?.startBounded() }
+        }
+    }
+
+    private func waitForThreadReady(timeout: TimeInterval) async -> Bool {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                self.started.lock()
+                defer { self.started.unlock() }
+                let deadline = Date().addingTimeInterval(max(0, timeout))
+                while !self.isThreadReady, !self.isThreadExited {
+                    if !self.started.wait(until: deadline) {
+                        continuation.resume(returning: false)
+                        return
+                    }
+                }
+                continuation.resume(returning: self.isThreadReady)
+            }
+        }
+    }
+
+    private func waitForThreadExit(timeout: TimeInterval?) async -> Bool {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self else {
+                    continuation.resume(returning: true)
+                    return
+                }
+                self.started.lock()
+                defer { self.started.unlock() }
+                if let timeout {
+                    let deadline = Date().addingTimeInterval(timeout)
+                    while !self.isThreadExited {
+                        if !self.started.wait(until: deadline) {
+                            continuation.resume(returning: false)
+                            return
+                        }
+                    }
+                } else {
+                    while !self.isThreadExited { self.started.wait() }
+                }
+                continuation.resume(returning: true)
+            }
         }
     }
 
@@ -289,6 +439,26 @@ public final class ActivityWatcher: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return body()
+    }
+
+    private func transitionLifecycle(to state: LifecycleState) {
+        let changed = withLock { () -> Bool in
+            guard _lifecycleState != state else { return false }
+            _lifecycleState = state
+            return true
+        }
+        if changed { lifecycleChanged?(state) }
+    }
+
+    private func handleStoreFailure() {
+        let shouldStop = withLock { () -> Bool in
+            guard !_stopping, _lifecycleState != .degraded else { return false }
+            _lifecycleState = .degraded
+            return true
+        }
+        guard shouldStop else { return }
+        lifecycleChanged?(.degraded)
+        Task { [weak self] in await self?.stop() }
     }
 
     public func pause() {
@@ -340,7 +510,21 @@ public final class ActivityWatcher: @unchecked Sendable {
         _captureEnabled = policy.captureEnabled
         _lastKnownPolicy = policy
         let installed = _installed
+        var announceStopping = false
+        if policy.captureEnabled {
+            if _stopping || _stopRequested { _restartAfterStop = true }
+        } else {
+            _stopRequested = installed
+            _restartAfterStop = false
+            if installed, _lifecycleState != .stopping {
+                _lifecycleState = .stopping
+                announceStopping = true
+            }
+        }
+        let stopPending = _stopping || _stopRequested
         lock.unlock()
+        if announceStopping { lifecycleChanged?(.stopping) }
+        policyChanged?(policy)
 
         switch (wasEnabled || installed, policy.captureEnabled) {
         case (_, false):
@@ -353,20 +537,33 @@ public final class ActivityWatcher: @unchecked Sendable {
                     let commands = self.engine.updatePolicy(policy, at: self.safeNow())
                     self.emit(commands)
                 }
-                Task { [weak self] in await self?.stop() }
+                Task { [weak self] in await self?.stopForPolicyDisable() }
             } else {
                 applyPolicyToEngineDirectly(policy)
             }
         case (false, true):
             // ON, from cold. Seed the engine before the observers exist so the
             // first activation is evaluated against the new policy.
-            applyPolicyToEngineDirectly(policy)
-            startInstalled()
+            if stopPending {
+                onCaptureThread { [weak self] in
+                    guard let self else { return }
+                    let commands = self.engine.updatePolicy(policy, at: self.safeNow())
+                    self.emit(commands)
+                }
+            } else {
+                applyPolicyToEngineDirectly(policy)
+                Task { [weak self] in _ = await self?.startBounded() }
+            }
         case (true, true):
-            onCaptureThread { [weak self] in
-                guard let self else { return }
-                let commands = self.engine.updatePolicy(policy, at: self.safeNow())
-                self.emit(commands)
+            if installed {
+                onCaptureThread { [weak self] in
+                    guard let self else { return }
+                    let commands = self.engine.updatePolicy(policy, at: self.safeNow())
+                    self.emit(commands)
+                }
+            } else {
+                applyPolicyToEngineDirectly(policy)
+                Task { [weak self] in _ = await self?.startBounded() }
             }
         }
     }
@@ -457,6 +654,9 @@ public final class ActivityWatcher: @unchecked Sendable {
         // false → true is loosening, so it is refused; true → false is tightening.
         safe.captureTitles = polled.captureTitles && current.captureTitles
         safe.browserTitlesEnabled = polled.browserTitlesEnabled && current.browserTitlesEnabled
+        // Model-provider access is a separate explicit consent. A file poll
+        // can turn it off, never on.
+        safe.allowModelAccess = polled.allowModelAccess && current.allowModelAccess
         // The one flag whose TRUE is the private setting: it can only go on.
         safe.appNameOnlyMode = polled.appNameOnlyMode || current.appNameOnlyMode
         // Keeping data for longer is loosening; keeping it for less is not.
@@ -517,6 +717,11 @@ public final class ActivityWatcher: @unchecked Sendable {
 
         detachObserver()
         stopTickTimer()
+        started.lock()
+        isThreadReady = false
+        isThreadExited = true
+        started.broadcast()
+        started.unlock()
     }
 
     private func onCaptureThread(_ block: @escaping @Sendable () -> Void) {
@@ -752,6 +957,10 @@ public final class ActivityWatcher: @unchecked Sendable {
         return _paused
     }
 
+    private var isStopping: Bool {
+        withLock { _stopping || _stopRequested }
+    }
+
     // MARK: - Span handling (capture thread)
 
     private func seedFromFrontmostApplication() {
@@ -787,7 +996,27 @@ public final class ActivityWatcher: @unchecked Sendable {
         // that says off on disk — and only notice a whole tick later.
         pollPolicySource()
         guard isCaptureEnabled else { return }
+        guard !isStopping else { return }
         guard !isPaused else { return }
+
+        // An activation immediately following NativeAgent's own bounded motor
+        // epoch is agent-driven provenance, not evidence that the person chose
+        // this app. Close any human span and record nothing for this edge.
+        guard !NativeAgentMotorEpoch.isAgentDriven() else {
+            feed(.activate(
+                bundleId: ActivityPolicy.selfProcessBundleID,
+                appName: "agent-driven",
+                at: safeNow()
+            ))
+            detachObserver()
+            stopTickTimer()
+            // Observe without opening a span. The first later AX event outside
+            // the bounded motor epoch is evidence the human took over this app;
+            // it will seed a fresh human span below. This avoids permanently
+            // losing the app until the next app switch.
+            if let pid, pid != ownProcessID { attachObserver(pid: pid) }
+            return
+        }
 
         // Lock gate FIRST — while locked AX answers with plausible garbage.
         if Self.isLockSignal(bundleId: bundleId, localizedName: appName) || reconcileLocked() {
@@ -861,6 +1090,15 @@ public final class ActivityWatcher: @unchecked Sendable {
     /// never awaits the actor.
     fileprivate func handleAXEvent(notification: String) {
         guard !isPaused else { return }
+        guard !isStopping else { return }
+        // AX notifications caused by our own click/type/set-value must not be
+        // counted as human focus events. A later physical app activation or AX
+        // event outside the bounded motor epoch resumes ordinary attribution.
+        guard !NativeAgentMotorEpoch.isAgentDriven() else { return }
+        if engine.openSpan == nil {
+            seedFromFrontmostApplication()
+            return
+        }
         // RECONCILE THE POLICY AT EVERY WRITE SITE (second pass, 2026-08-14).
         //
         // The poll already ran at span-OPEN (handleActivation) and on the tick,
@@ -947,7 +1185,7 @@ public final class ActivityWatcher: @unchecked Sendable {
         // The app may die mid-read; `.invalidUIElement` / `.cannotComplete`
         // return nil here rather than throwing the capture thread off course.
         guard CFGetTypeID(windowRef) == AXUIElementGetTypeID() else { return nil }
-        let window = unsafeBitCast(windowRef, to: AXUIElement.self)
+        let window = unsafeDowncast(windowRef, to: AXUIElement.self)
 
         var titleRef: CFTypeRef?
         let titleErr = AXUIElementCopyAttributeValue(
@@ -985,6 +1223,7 @@ public final class ActivityWatcher: @unchecked Sendable {
 
     private func onTick() {
         guard !isPaused else { return }
+        guard !isStopping else { return }
 
         // (4) re-read the policy file. An out-of-band disable (the probe CLI,
         // a second process, a hand edit, a restore) is otherwise invisible to a

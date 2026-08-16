@@ -17,7 +17,7 @@ import PersistenceCore
 extension SwiftToolDispatcher {
 
     /// delegation_status — list the newest delegated jobs across the Claude
-    /// and Codex wake-job stores with their real lifecycle timestamps.
+    /// Claude, Codex, and OMP wake-job stores with their real lifecycle timestamps.
     ///
     /// Read-only. Store roots come from `agentBridgeConfigRoot` (the same
     /// injection point `claude_message` uses), so tests never touch the live
@@ -59,6 +59,7 @@ extension SwiftToolDispatcher {
             "stores": .object([
                 "claude": .string(Self.homeRelativePath(projector.claudeJobsDirectory)),
                 "codex": .string(Self.homeRelativePath(projector.codexJobsDirectory)),
+                "omp": .string(Self.homeRelativePath(projector.ompJobsDirectory)),
             ]),
             "note": .string("Read-only projection of the on-disk wake-job records. stall_basis names the evidence behind `stalled`: \"deadline\" and \"stall_seconds\" are real verdicts, \"terminal\" means the run already ended, and \"none\" means the record carries no deadline or stall threshold — the job is NOT known to be healthy, it is unmeasurable. Codex records carry neither, so codex jobs are always stall_basis=none while in flight. delivery_outcome \"unknown\" means the bridge could not confirm the handoff either way; it is NOT the same as \"lost\". An absent completion_text_head on a delivered job is normal — the runner clears the text once delivery succeeds."),
         ])
@@ -85,6 +86,7 @@ extension SwiftToolDispatcher {
         switch normalized {
         case "claude", "claude": return "claude"
         case "codex": return "codex"
+        case "omp", "kimi": return "omp"
         default: return nil
         }
     }

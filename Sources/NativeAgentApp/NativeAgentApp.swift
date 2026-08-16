@@ -123,6 +123,14 @@ enum NativeAgentAppMain {
             AppDelegate.presentPublicReleaseDataRootError(error)
             return
         }
+        do {
+            _ = try NativeClient.resumeStagedBackupRestoreAtLaunch(
+                dataRoot: NativeAgentPaths.dataRoot
+            )
+        } catch {
+            AppDelegate.presentBackupRestoreError(error.localizedDescription)
+            return
+        }
         NativeAgentApp.main()
     }
 }

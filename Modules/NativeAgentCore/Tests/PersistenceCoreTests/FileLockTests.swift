@@ -153,9 +153,8 @@ final class FileLockTests: XCTestCase {
 
     // MARK: - BUG-B regression
     //
-    // BUG-B: JSONLMemoryConsolidationRecaller.remove (Sources/NativeAgentApp/
-    // BackgroundLoopsAssembly.swift) does read-modify-write on
-    // <dataRoot>/memory_embeddings.jsonl. Without flock around the RMW, a
+    // Regression shape: a read-modify-write owner and a peer appender target
+    // the same JSONL file. Without flock around the RMW, a
     // concurrent writer that lands between our read and our atomic-replace gets
     // its rows silently truncated. This test models that race: the
     // "recaller" deletes id=A under a lock; a "daemon" writer concurrently
@@ -177,8 +176,7 @@ final class FileLockTests: XCTestCase {
         try Data(seed.utf8).write(to: target)
 
         await withTaskGroup(of: Void.self) { group in
-            // Writer 1: "recaller" — delete id=A under the lock (mirrors the
-            // BUG-B FIX in JSONLMemoryConsolidationRecaller.remove: read all,
+            // Writer 1: delete id=A under the lock: read all,
             // filter out matching id, rewrite atomically — all under flock).
             group.addTask {
                 try? await core.withFileLock(target) {

@@ -472,7 +472,7 @@ public enum OrganismReflexCompiler {
             return ReflexEvent(
                 id: "tool:\(source)",
                 pattern: "When tool \(source) completes successfully, prefer the same bounded execution path.",
-                trustClass: trustClass(for: source),
+                trustClass: trustClass(from: signal),
                 succeeded: true
             )
         case .toolFailed:
@@ -480,7 +480,7 @@ public enum OrganismReflexCompiler {
             return ReflexEvent(
                 id: "tool:\(source)",
                 pattern: "When tool \(source) becomes brittle, require verification before claiming completion.",
-                trustClass: trustClass(for: source),
+                trustClass: trustClass(from: signal),
                 succeeded: false
             )
         case .providerSucceeded, .providerRecovered:
@@ -524,16 +524,19 @@ public enum OrganismReflexCompiler {
         return OrganismReflexCandidate.clamp(base * 0.70 + evidenceBoost - failurePenalty)
     }
 
-    private static func trustClass(for canonicalSource: String) -> OrganismReflexTrustClass {
-        let riskyMarkers = ["shell", "bash", "git", "file-write", "delete", "trash", "system", "browser", "oauth"]
-        if riskyMarkers.contains(where: canonicalSource.contains) {
+    private static func trustClass(from signal: SomaticSignal) -> OrganismReflexTrustClass {
+        guard case .string(let raw)? = signal.metadata["trustRisk"] else {
+            // Missing provenance is not evidence of safety. Older or non-chat
+            // producers remain review-only until a canonically classified
+            // observation arrives.
             return .highRisk
         }
-        let confirmMarkers = ["dispatch", "provider", "workflow", "mcp", "approval"]
-        if confirmMarkers.contains(where: canonicalSource.contains) {
-            return .confirmRequired
+        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "low": return .lowRisk
+        case "medium": return .confirmRequired
+        case "high", "critical": return .highRisk
+        default: return .highRisk
         }
-        return .lowRisk
     }
 
     private static func enforcingCapacity(

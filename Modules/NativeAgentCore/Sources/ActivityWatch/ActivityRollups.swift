@@ -122,6 +122,17 @@ public struct ActivityAnswerBundle: Sendable, Equatable {
 /// to. That is what makes a DST day come out as 23 or 25 hours instead of a
 /// fixed 24, and what lets the same rows answer correctly from another timezone.
 public struct ActivityRollups: Sendable {
+    public enum RollupError: Error, LocalizedError, Equatable {
+        case sourceRowsExceeded(limit: Int)
+
+        public var errorDescription: String? {
+            switch self {
+            case .sourceRowsExceeded(let limit):
+                return "More than \(limit) activity spans match this request. Ask for a shorter range or one bundle_id so NativeAgent does not return an incomplete answer."
+            }
+        }
+    }
+
     public enum Grain: String, Sendable, CaseIterable {
         case hourly
         case daily
@@ -137,6 +148,7 @@ public struct ActivityRollups: Sendable {
     /// The acceptance criterion from the plan, as a constant: any single answer
     /// fits in ~50 rows.
     public static let answerRowCap = 50
+    public static let sourceSpanLimit = 20_000
 
     private let store: ActivitySpanStore
     private let policy: ActivityPolicy
@@ -206,19 +218,53 @@ public struct ActivityRollups: Sendable {
         spans: [ActivitySpan], from: Double, to: Double, grain: Grain, timezone: TimeZone
     ) -> [ActivityBucket] {
         let boundaries = bucketBoundaries(from: from, to: to, grain: grain, timezone: timezone)
+        return buckets(spans: spans, from: from, to: to, boundaries: boundaries)
+    }
+
+    /// Chronological sweep over precomputed boundaries. Each source span enters
+    /// the active set once and leaves it once; only spans which can overlap the
+    /// current bucket are inspected. This keeps a long activity history from
+    /// turning into `bucketCount * spanCount` work and lets `answerBundle` reuse
+    /// the exact boundaries it already generated for coverage accounting.
+    static func buckets(
+        spans: [ActivitySpan],
+        from: Double,
+        to: Double,
+        boundaries: [(start: Double, end: Double)]
+    ) -> [ActivityBucket] {
+        guard to > from, !boundaries.isEmpty, !spans.isEmpty else { return [] }
+        let ordered = spans.sorted {
+            if $0.startedAt != $1.startedAt { return $0.startedAt < $1.startedAt }
+            return $0.id < $1.id
+        }
         var out: [ActivityBucket] = []
+        var cursor = 0
+        var active: [ActivitySpan] = []
 
         for (bucketStart, bucketEnd) in boundaries {
+            let windowStart = max(bucketStart, from)
+            let windowEnd = min(bucketEnd, to)
+            guard windowEnd > windowStart else { continue }
+
+            active.removeAll { ($0.endedAt ?? $0.lastSeenAt) <= windowStart }
+            while cursor < ordered.count, ordered[cursor].startedAt < windowEnd {
+                let span = ordered[cursor]
+                if (span.endedAt ?? span.lastSeenAt) > windowStart {
+                    active.append(span)
+                }
+                cursor += 1
+            }
+
             // Key by bundle id; carry the most recent app name seen for it.
             var seconds: [String: Double] = [:]
             var names: [String: String] = [:]
             var counts: [String: Int] = [:]
             var events: [String: Double] = [:]
 
-            for span in spans {
+            for span in active {
                 let spanEnd = span.endedAt ?? span.lastSeenAt
-                let overlapStart = max(span.startedAt, max(bucketStart, from))
-                let overlapEnd = min(spanEnd, min(bucketEnd, to))
+                let overlapStart = max(span.startedAt, windowStart)
+                let overlapEnd = min(spanEnd, windowEnd)
                 let overlap = overlapEnd - overlapStart
                 guard overlap > 0 else { continue }
                 let total = max(spanEnd - span.startedAt, 0)
@@ -232,7 +278,10 @@ public struct ActivityRollups: Sendable {
                 events[span.bundleId, default: 0] += Double(span.eventCount) * share
             }
 
-            for (bundleId, secs) in seconds.sorted(by: { $0.value > $1.value }) {
+            for (bundleId, secs) in seconds.sorted(by: {
+                if $0.value != $1.value { return $0.value > $1.value }
+                return $0.key < $1.key
+            }) {
                 out.append(ActivityBucket(
                     start: bucketStart,
                     end: bucketEnd,
@@ -363,9 +412,19 @@ public struct ActivityRollups: Sendable {
         to: Double,
         timezone: TimeZone,
         grain: Grain? = nil,
-        rowCap: Int = ActivityRollups.answerRowCap
+        rowCap: Int = ActivityRollups.answerRowCap,
+        bundleID: String? = nil
     ) async throws -> ActivityAnswerBundle {
-        let spans = try await store.spansOverlapping(from: from, to: to, policy: policy)
+        let spans = try await store.spansOverlapping(
+            from: from,
+            to: to,
+            limit: Self.sourceSpanLimit + 1,
+            policy: policy,
+            bundleID: bundleID
+        )
+        guard spans.count <= Self.sourceSpanLimit else {
+            throw RollupError.sourceRowsExceeded(limit: Self.sourceSpanLimit)
+        }
         // A window longer than ~36 h is a day-scale question; below that the
         // hour is the interesting unit.
         let chosenGrain = grain ?? ((to - from) > 36 * 3600 ? .daily : .hourly)
@@ -386,7 +445,7 @@ public struct ActivityRollups: Sendable {
         let bucketedTo = coverage.coveredTo
 
         let allBuckets = Self.buckets(
-            spans: spans, from: from, to: to, grain: chosenGrain, timezone: timezone
+            spans: spans, from: from, to: to, boundaries: coverage.boundaries
         )
         // Keep the heaviest buckets, then restore chronological order — a
         // timeline that jumps around is unreadable, and sorting by weight is

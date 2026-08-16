@@ -10,13 +10,13 @@ import PersistenceCore
 // computed deadlines by hand and filed stuck-job reports that the job files
 // themselves refuted.
 //
-// This file is the read-only projection over those two stores. It is
+// This file is the read-only projection over the supported bridge stores. It is
 // deliberately a pure value transform: directory URLs and the clock are
 // INJECTED, so the tests are hermetic and never touch the live ~/.config.
 //
 // ── PREMISE VERIFICATION (2026-08-11, read from the JS writers, not assumed) ──
-// The two stores do NOT share a record shape. That mattered enough to write
-// down, because the naive assumption (one field set, two directories) would
+// The stores do NOT share a record shape. That mattered enough to write down,
+// because the naive assumption (one field set, several directories) would
 // have produced a projection that silently reports `null` for every codex job.
 //
 // Claude — script/claude_thread_wakeup.js
@@ -43,9 +43,15 @@ import PersistenceCore
 //          so via `stall_basis: "none"` rather than reporting a confident
 //          `false` that reads like "verified healthy".
 //
+// OMP — script/omp_thread_wakeup.js
+//   dir:   ~/.config/omp-bridge/wake-jobs/*.json
+//   shape: messageId, payload.topic, state, status, createdAt, startedAt,
+//          lastActivityAt, updatedAt, completedAt, bridge.status, and retained
+//          completionText/reply/stderrTail.
+//
 // The wire fence holds: nothing here writes, and neither JS helper is touched.
 
-/// One job's projected lifecycle, normalized across the two bridge stores.
+/// One job's projected lifecycle, normalized across the bridge stores.
 /// Every timestamp is the RAW string from the record (already ISO-8601 from
 /// both writers) — we never reformat, so a malformed legacy value round-trips
 /// visibly instead of silently becoming `null`.
@@ -63,7 +69,7 @@ public struct DelegationJobProjection: Sendable, Equatable {
     }
 
     public var id: String
-    /// Which bridge store this row came from: "claude" | "codex".
+    /// Which bridge store this row came from: "claude" | "codex" | "omp".
     public var source: String
     /// The agent that runs the job. Currently 1:1 with `source`, kept separate
     /// because the claude store is also where a future third runner would land.
@@ -139,12 +145,14 @@ public struct DelegationJobProjection: Sendable, Equatable {
     }
 }
 
-/// Pure, injectable reader over the two wake-job stores.
+/// Pure, injectable reader over the three wake-job stores.
 public struct DelegationStatusProjector: Sendable {
     /// Default: `~/.config/claude-bridge/wake-jobs`.
     public var claudeJobsDirectory: URL
     /// Default: `~/.config/codex-nativeagent-bridge/reply-jobs`.
     public var codexJobsDirectory: URL
+    /// Default: `~/.config/omp-bridge/wake-jobs`.
+    public var ompJobsDirectory: URL
 
     public static let completionTextHeadLimit = 200
     public static let defaultLimit = 20
@@ -161,25 +169,42 @@ public struct DelegationStatusProjector: Sendable {
         self.codexJobsDirectory = root
             .appendingPathComponent("codex-nativeagent-bridge", isDirectory: true)
             .appendingPathComponent("reply-jobs", isDirectory: true)
+        self.ompJobsDirectory = root
+            .appendingPathComponent("omp-bridge", isDirectory: true)
+            .appendingPathComponent("wake-jobs", isDirectory: true)
     }
 
-    public init(claudeJobsDirectory: URL, codexJobsDirectory: URL) {
+    public init(claudeJobsDirectory: URL, codexJobsDirectory: URL, ompJobsDirectory: URL? = nil) {
         self.claudeJobsDirectory = claudeJobsDirectory
         self.codexJobsDirectory = codexJobsDirectory
+        self.ompJobsDirectory = ompJobsDirectory ?? codexJobsDirectory
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("omp-bridge/wake-jobs", isDirectory: true)
     }
 
-    /// Read both stores and return the newest `limit` jobs, newest first.
+    /// Read all supported stores and return the newest `limit` jobs, newest first.
     /// Unreadable/absent directories contribute zero rows rather than failing
     /// the whole call — a machine with only one bridge configured still gets a
     /// useful answer.
     public func recentJobs(now: Date, limit: Int = DelegationStatusProjector.defaultLimit) -> [DelegationJobProjection] {
         let bounded = max(1, min(limit, Self.maxLimit))
+        return Array(allJobs(now: now).prefix(bounded))
+    }
+
+    /// Complete ordered projection for reconciliation owners. This is
+    /// deliberately separate from `recentJobs`: the latter is a model-visible
+    /// display budget, while a durable outcome cursor must never skip an older
+    /// record merely because more than 100 newer jobs arrived in one burst.
+    public func allJobs(now: Date) -> [DelegationJobProjection] {
         var rows: [DelegationJobProjection] = []
         for url in Self.jsonFiles(in: claudeJobsDirectory) {
             if let row = Self.projectClaude(url: url, now: now) { rows.append(row) }
         }
         for (url, undelivered) in Self.codexJobFiles(in: codexJobsDirectory) {
             if let row = Self.projectCodex(url: url, undelivered: undelivered, now: now) { rows.append(row) }
+        }
+        for url in Self.jsonFiles(in: ompJobsDirectory) {
+            if let row = Self.projectOMP(url: url, now: now) { rows.append(row) }
         }
         rows.sort { lhs, rhs in
             switch (lhs.recencyKey, rhs.recencyKey) {
@@ -189,7 +214,7 @@ public struct DelegationStatusProjector: Sendable {
             default: return lhs.id > rhs.id  // stable tiebreak
             }
         }
-        return Array(rows.prefix(bounded))
+        return rows
     }
 
     // MARK: - Directory scanning
@@ -340,6 +365,68 @@ public struct DelegationStatusProjector: Sendable {
         return row
     }
 
+    // MARK: - OMP projection
+
+    /// OMP keeps settled job records, like Claude, but writes the delivery
+    /// result as a nested `bridge.status` and the topic inside `payload`.
+    static func projectOMP(url: URL, now: Date) -> DelegationJobProjection? {
+        guard let job = readObject(url) else { return nil }
+        let id = string(job, "messageId") ?? url.deletingPathExtension().lastPathComponent
+        let createdAt = string(job, "createdAt")
+        let startedAt = string(job, "startedAt")
+        let completedAt = string(job, "completedAt")
+        let liveness = laterISO(string(job, "lastActivityAt"), string(job, "updatedAt"))
+        let start = firstDate(startedAt, createdAt)
+        let end = date(completedAt) ?? now
+        let elapsed = start.map { Int(max(0, end.timeIntervalSince($0)).rounded()) }
+        let state = string(job, "state")
+        let status = string(job, "status")
+        let terminal = completedAt != nil || state == "settled"
+        let (stalled, basis) = stallVerdict(
+            terminal: terminal,
+            deadlineAt: nil,
+            stallSeconds: number(job, "idleSeconds"),
+            lastLiveness: liveness ?? startedAt ?? createdAt,
+            now: now
+        )
+        var payload: [String: JSONValue] = [:]
+        if case .object(let value)? = job["payload"] { payload = value }
+        var bridge: [String: JSONValue] = [:]
+        if case .object(let value)? = job["bridge"] { bridge = value }
+        let bridgeStatus = string(bridge, "status")
+        let delivery: String? = switch bridgeStatus {
+        case "delivered", "dry_run": "delivered"
+        case "failed": "lost"
+        case "unknown": "unknown"
+        default: nil
+        }
+        let retained = string(job, "completionText")
+            ?? string(job, "reply")
+            ?? string(job, "stderrTail")
+        var row = DelegationJobProjection(
+            id: id,
+            source: "omp",
+            agent: "omp",
+            topicSlug: string(payload, "topic").map(slug),
+            state: state,
+            status: status,
+            runStatus: status,
+            createdAt: createdAt,
+            claimedAt: nil,
+            startedAt: startedAt,
+            lastLiveness: liveness,
+            completedAt: completedAt,
+            elapsedSeconds: elapsed,
+            stalled: stalled,
+            stallBasis: basis,
+            deliveryLost: bridgeStatus == "failed" ? true : nil,
+            deliveryOutcome: delivery,
+            completionTextHead: head(retained)
+        )
+        row.recencyKey = firstDate(completedAt, liveness, startedAt, createdAt)
+        return row
+    }
+
     /// Claude's runner records BOTH an explicit `deliveryLost` boolean and a
     /// `bridgeStatus`. Only those two are consulted — the disposition is never
     /// guessed from the presence or absence of other fields.
@@ -363,17 +450,21 @@ public struct DelegationStatusProjector: Sendable {
             guard case .object(let e) = entry,
                   case .object(let payload)? = e["payload"],
                   let topic = string(payload, "topic") else { continue }
-            let slug = String(topic.lowercased().map { $0.isLetter || $0.isNumber ? $0 : "-" })
-                .split(separator: "-", omittingEmptySubsequences: true).joined(separator: "-")
-            let trimmed = String(slug.prefix(64))
+            let trimmed = slug(topic)
             if !trimmed.isEmpty { return trimmed }
         }
         return nil
     }
 
+    static func slug(_ topic: String) -> String {
+        let value = String(topic.lowercased().map { $0.isLetter || $0.isNumber ? $0 : "-" })
+            .split(separator: "-", omittingEmptySubsequences: true).joined(separator: "-")
+        return String(value.prefix(64))
+    }
+
     // MARK: - Shared helpers
 
-    /// The single place a stall verdict is made, for both stores.
+    /// The single place a stall verdict is made, for every store.
     static func stallVerdict(
         terminal: Bool,
         deadlineAt: String?,

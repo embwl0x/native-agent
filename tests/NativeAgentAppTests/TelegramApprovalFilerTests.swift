@@ -52,10 +52,10 @@ struct TelegramApprovalFilerTests {
                     payload: payload
                 )
             },
-            approvalResolver: { id, decision in
+            approvalResolver: { id, decision, provenance in
                 await capture.recordDecision(id: id, decision: decision)
                 _ = try await SwiftNativeApprovalInbox(root: root)
-                    .resolve(id, decision: decision, decidedBy: "telegram-test")
+                    .resolve(id, decision: decision, provenance: provenance)
                 try await NativeClient.annotateApprovalExecution(
                     id: id,
                     executedAction: .object([
@@ -129,6 +129,8 @@ struct TelegramApprovalFilerTests {
         let resolved = try await SwiftNativeApprovalInbox(root: root).get(approvalId)
         #expect(resolved.status == "resolved")
         #expect(resolved.decision == "approved")
+        #expect(resolved.decidedBy == "telegram_verified_user")
+        #expect(resolved.resolutionProvenance == .telegram(chatID: "77", userID: "11"))
     }
 
     @Test func applyResolvedChatToolApproval_replaysExactApprovedToolAndAnnotatesRecord() async throws {

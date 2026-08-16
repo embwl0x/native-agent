@@ -38,7 +38,6 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-import CapabilityFoundry
 
 enum MCPResultEvidence {
     static let maxProjectionBytes = 8 * 1024

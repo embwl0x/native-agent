@@ -87,6 +87,10 @@ MemoryV2; Fluid Context is rebuildable circulation; cognition and organism
 state are bounded advisory layers; all actions still cross trust and approval
 boundaries. No subsystem becomes a second hidden agent.
 
+For a step-by-step account of what is resident, what is selected, when the
+model is called, how lazy tools enter the same turn, and what settles afterward,
+read [Anatomy of a NativeAgent Turn](docs/ANATOMY_OF_A_TURN.md).
+
 Read [docs/NORTHSTAR.md](docs/NORTHSTAR.md) for the product philosophy and
 [docs/ARCHITECTURE_BLUEPRINT.md](docs/ARCHITECTURE_BLUEPRINT.md) for the source
 ownership map.
@@ -301,6 +305,7 @@ script/                           build, test, install, evaluation, and release 
 
 ## Documentation
 
+- [Anatomy of a NativeAgent Turn](docs/ANATOMY_OF_A_TURN.md) — from message acceptance through resident context, model/tool execution, and durable settlement
 - [User and Agent Guide](docs/USER_GUIDE.md) — compact setup and complete operating map
 - [Capabilities](docs/CAPABILITIES.md) — readable current system tour
 - [North Star](docs/NORTHSTAR.md) — one mind, no theater, fluid digital processes

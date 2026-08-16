@@ -91,13 +91,24 @@ extension ChatView {
                     byteSize: capture.byteSize
                 )
                 let attachments = capturedAttachments + [attachment]
-                let currentAttachmentIds = Set(pendingAttachments.map(\.id))
-                if text == capturedDraft && currentAttachmentIds == capturedAttachmentIds {
-                    text = ""
-                    pendingAttachments = []
-                }
                 scrollCoordinator.forceFollow()
-                await appModel.sendChat(prompt, attachments: attachments, sessionId: captureSessionId)
+                let acceptance = await appModel.startActiveChatTurn(
+                    prompt,
+                    attachments: attachments,
+                    expectedSessionId: captureSessionId
+                )
+                switch acceptance {
+                case .accepted, .queued:
+                    let currentAttachmentIds = Set(pendingAttachments.map(\.id))
+                    guard text == capturedDraft,
+                          currentAttachmentIds == capturedAttachmentIds
+                    else { return }
+                    text = ""
+                    appModel.commitChatDraft("", sessionId: captureSessionId)
+                    pendingAttachments = []
+                case .rejected(let message):
+                    showToast(message)
+                }
             } catch {
                 showToast(error.localizedDescription)
             }

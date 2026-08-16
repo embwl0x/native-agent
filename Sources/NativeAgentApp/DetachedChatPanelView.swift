@@ -18,6 +18,8 @@
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
+import NativeAgentCore
+import PersistenceCore
 
 struct DetachedChatPanelView: View {
     let sessionId: String
@@ -143,6 +145,35 @@ struct DetachedChatPanelView: View {
             panelDraft = appModel.chatDraft(for: sessionId)
             await appModel.loadDetachedSessionMessages(sessionId)
             inputFocused = true
+        }
+        // Telegram, Slack, iOS, bridge, and local turns all converge on the
+        // canonical transcript. Watch that exact file while this panel is
+        // mounted so every surface appears live without an idle refresh loop.
+        .task(id: "detached-transcript:\(sessionId)") {
+            guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
+                return
+            }
+            let transcript = PersistenceCore.defaultDataRoot()
+                .appendingPathComponent("chat/messages", isDirectory: true)
+                .appendingPathComponent("\(safeSessionId).jsonl")
+            await ViewFileRefreshTask.run(
+                paths: [transcript],
+                debounceDelay: .milliseconds(100)
+            ) {
+                await appModel.refreshDetachedChatMessagesAfterTurn(sessionId: sessionId)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .chatTurnCompleted)) { note in
+            guard let completedSessionId = note.object as? String,
+                  completedSessionId == sessionId
+            else { return }
+            let alreadyRefreshed = (note.userInfo?["messagesAlreadyRefreshed"] as? Bool) == true
+            Task {
+                await appModel.refreshDetachedChatMessagesAfterTurn(
+                    sessionId: sessionId,
+                    messagesAlreadyRefreshed: alreadyRefreshed
+                )
+            }
         }
         .onDisappear {
             // F1: invalidate any scroll scheduled against the now-dead proxy
@@ -565,12 +596,23 @@ struct DetachedChatPanelView: View {
                     name: capture.name,
                     byteSize: capture.byteSize
                 )
-                let currentAttachmentIds = Set(pendingAttachments.map(\.id))
-                if draft == capturedDraft && currentAttachmentIds == capturedAttachmentIds {
+                let acceptance = await appModel.startChatTurnForSession(
+                    prompt,
+                    attachments: capturedAttachments + [attachment],
+                    sessionId: sessionId
+                )
+                switch acceptance {
+                case .accepted, .queued:
+                    let currentAttachmentIds = Set(pendingAttachments.map(\.id))
+                    guard draft == capturedDraft,
+                          currentAttachmentIds == capturedAttachmentIds
+                    else { return }
                     draft = ""
+                    appModel.commitChatDraft("", sessionId: sessionId)
                     pendingAttachments = []
+                case .rejected(let message):
+                    showToast(message)
                 }
-                await appModel.sendChat(prompt, attachments: capturedAttachments + [attachment], sessionId: sessionId)
             } catch {
                 showToast(error.localizedDescription)
             }

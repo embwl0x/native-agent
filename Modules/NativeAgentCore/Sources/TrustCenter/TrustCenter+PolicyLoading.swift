@@ -2,6 +2,22 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+/// One checked authority generation for a SecurityCenter decision. The
+/// normalized policy and raw user-only autonomy overrides are derived from the
+/// same saved bytes so an effect-time gate cannot splice concurrent policies.
+public struct TrustPolicyAuthorizationSnapshot: Sendable, Equatable {
+    public let policy: [String: JSONValue]
+    public let userConfiguredAutonomyOverrides: [String: JSONValue]
+
+    init(
+        policy: [String: JSONValue],
+        userConfiguredAutonomyOverrides: [String: JSONValue]
+    ) {
+        self.policy = policy
+        self.userConfiguredAutonomyOverrides = userConfiguredAutonomyOverrides
+    }
+}
+
 extension SwiftNativeTrustCenter {
     /// Reads the authoritative saved policy without conflating a missing file
     /// with damaged authority state. Missing is the only bootstrap-empty case.
@@ -139,6 +155,16 @@ extension SwiftNativeTrustCenter {
     }
 
     public func loadTrustPolicyChecked() async throws -> [String: JSONValue] {
+        let snapshot = try await loadAuthorizationSnapshotChecked()
+        return snapshot.policy
+    }
+
+    /// SecurityCenter authorization read. Keep this as a value snapshot rather
+    /// than a cache: every effect-time check still rereads canonical authority,
+    /// but all fields used by that one check come from one validated generation.
+    public func loadAuthorizationSnapshotChecked() async throws
+        -> TrustPolicyAuthorizationSnapshot
+    {
         // Fold the future spelling BEFORE type validation, not just before the
         // normalize merge — otherwise a `workshopPolicy` block skips the
         // nested type checks the legacy spelling gets (defaults only carry the
@@ -147,7 +173,16 @@ extension SwiftNativeTrustCenter {
         let saved = WorkshopPolicyBlockVocabulary.foldToWireKey(
             try Self.loadRawPolicyChecked(at: trustPolicyURL))
         try Self.validateKnownAuthorityPolicyTypes(saved, against: defaultTrustPolicy())
-        return normalizedTrustPolicy(saved: saved)
+        let overrides: [String: JSONValue]
+        if case .object(let value)? = saved["toolAutonomy"] {
+            overrides = value
+        } else {
+            overrides = [:]
+        }
+        return TrustPolicyAuthorizationSnapshot(
+            policy: normalizedTrustPolicy(saved: saved),
+            userConfiguredAutonomyOverrides: overrides
+        )
     }
 
     public func loadTrustPolicy() async -> [String: JSONValue] {
@@ -180,13 +215,24 @@ extension SwiftNativeTrustCenter {
         return ta
     }
 
+    /// Read one raw user-configured tier through the checked authority seam.
+    /// Missing means no explicit override; corrupt authority throws rather than
+    /// looking like a fresh/default policy.
+    public func userConfiguredAutonomyLevel(for tool: String) async throws -> String? {
+        let snapshot = try await loadAuthorizationSnapshotChecked()
+        guard case .string(let tier)? = snapshot.userConfiguredAutonomyOverrides[tool] else {
+            return nil
+        }
+        return tier
+    }
+
     private var trustPolicyURL: URL {
         dataRoot
             .appendingPathComponent("trust", isDirectory: true)
             .appendingPathComponent("policy.json")
     }
 
-    private func normalizedTrustPolicy(saved savedDict: [String: JSONValue]) -> [String: JSONValue] {
+    func normalizedTrustPolicy(saved savedDict: [String: JSONValue]) -> [String: JSONValue] {
         let defaults = defaultTrustPolicy()
         var merged = defaults
         // Wave 4 read-both (phase A): a saved policy written by a future build

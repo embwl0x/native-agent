@@ -137,36 +137,24 @@ struct WorkshopOutcomeScoreboardPureSuite {
     }
 
     @Test
-    func onlyTriggerSourceSegmentsTheGoldenCohort() {
+    func onlyTriggerSourceSegmentsOneCohort() {
         let c = wkA.addingTimeInterval(60)
         let samples = [
-            sample("g1", created: c, status: "completed", triggerSource: "golden_eval"),
-            sample("g2", created: c, status: "failed",    triggerSource: "golden_eval"),
+            sample("g1", created: c, status: "completed", triggerSource: "controlled_eval"),
+            sample("g2", created: c, status: "failed",    triggerSource: "controlled_eval"),
             sample("u1", created: c, status: "completed", triggerSource: "manual"),
             sample("u2", created: c, status: "completed", triggerSource: "trigger:inbox"),
         ]
         // Unfiltered: all 4.
         #expect(WorkshopOutcomeScoreboard.weekly(from: samples)[0].total == 4)
-        // Golden cohort only: 2 (1 completed of 2 terminal → 50%).
-        let golden = WorkshopOutcomeScoreboard.weekly(from: samples, onlyTriggerSource: "golden_eval")
-        #expect(golden.count == 1)
-        #expect(golden[0].total == 2)
-        #expect(golden[0].completed == 1)
-        #expect(golden[0].completionRate == 0.5)
+        // Selected cohort only: 2 (1 completed of 2 terminal → 50%).
+        let selected = WorkshopOutcomeScoreboard.weekly(from: samples, onlyTriggerSource: "controlled_eval")
+        #expect(selected.count == 1)
+        #expect(selected[0].total == 2)
+        #expect(selected[0].completed == 1)
+        #expect(selected[0].completionRate == 0.5)
         // A cohort with no members → empty (not a crash, not all-of-them).
         #expect(WorkshopOutcomeScoreboard.weekly(from: samples, onlyTriggerSource: "nope").isEmpty)
-    }
-
-    @Test
-    func goldenEvalJobsAreReadOnlyAndTagged() {
-        #expect(!GoldenEvalJobs.jobs.isEmpty)
-        for job in GoldenEvalJobs.jobs {
-            #expect(job.triggerSource == GoldenEvalJobs.triggerSource)
-            #expect(job.triggerSource == "golden_eval")
-            #expect(job.trustRequired == "none")   // read-only, no approval-tier needed
-            #expect(!job.objective.isEmpty)
-            #expect(!job.title.isEmpty)
-        }
     }
 
     @Test

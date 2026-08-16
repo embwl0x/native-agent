@@ -13,6 +13,8 @@ source "$ROOT/script/lib/plist_types.sh"
 source "$ROOT/script/lib/provisioning_profile_contract.sh"
 # shellcheck source=lib/release_bundle_gates.sh
 source "$ROOT/script/lib/release_bundle_gates.sh"
+# shellcheck source=lib/release_symbols.sh
+source "$ROOT/script/lib/release_symbols.sh"
 APP_NAME="NativeAgent"
 PRODUCT="NativeAgentApp"
 REQUIRE_NOTARIZED=false
@@ -477,6 +479,9 @@ if [[ "$SPARKLE_FEED_PUBLISHED" == "true" ]]; then
 elif [[ "$SPARKLE_AUTO_CHECKS" == "true" ]]; then
   fail "SUEnableAutomaticChecks is true with no published feed — background checks would 404"
 fi
+
+release_assert_executable_stripped "$EXECUTABLE" \
+  || fail "release executable contains non-external symbols"
 
 require_dir "$RESOURCES"
 require_file "$RESOURCES/VERSION"

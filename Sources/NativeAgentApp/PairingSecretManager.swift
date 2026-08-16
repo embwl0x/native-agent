@@ -3,6 +3,7 @@
 import Foundation
 import Security
 import NativeAgentShared
+import PersistenceCore
 
 private enum PairingKVSPublishResult: Sendable {
     case skippedCurrent
@@ -11,36 +12,56 @@ private enum PairingKVSPublishResult: Sendable {
 
 enum PairingSecretManager {
     private static var secretURL: URL {
-        // Phase 11c: pairing secret goes into <repo>/data/ via shared resolver.
-        let dir = NativeAgentPaths.dataRoot
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
-        return dir.appendingPathComponent("icloud_pairing_secret.bin")
+        NativeAgentPaths.dataRoot.appendingPathComponent("icloud_pairing_secret.bin")
     }
 
-    /// Loads the existing 32-byte secret from disk, or generates + persists a new one.
-    /// Thread-safe: reading/writing a single small file is atomic enough for our use.
-    static func loadOrGenerateSecret() -> Data {
-        let url = secretURL
-        if let existing = try? Data(contentsOf: url), existing.count == 32 {
-            // PATCH-2026-05-08: review-fix-r2 Re-apply 0600 on existing files
-            // — files migrated from older builds may have looser perms.
-            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
-            return existing
+    /// Loads the exact regular 0600 32-byte secret, or durably creates one when
+    /// and only when it is missing. Existing invalid state remains untouched
+    /// and makes pairing unavailable until the user deliberately repairs it.
+    static func loadOrGenerateSecret() throws -> Data {
+        try loadOrGenerateSecret(at: secretURL)
+    }
+
+    /// Internal injection seam for exact persistence-boundary tests.
+    static func loadOrGenerateSecret(at url: URL) throws -> Data {
+        try CheckedFixedSizeSecretFile.loadOrCreate(at: url, byteCount: 32) {
+            var bytes = [UInt8](repeating: 0, count: 32)
+            let status = SecRandomCopyBytes(kSecRandomDefault, 32, &bytes)
+            guard status == errSecSuccess else {
+                throw NSError(
+                    domain: NSOSStatusErrorDomain,
+                    code: Int(status),
+                    userInfo: [NSLocalizedDescriptionKey: "secure random generation failed"]
+                )
+            }
+            return Data(bytes)
         }
-        var bytes = [UInt8](repeating: 0, count: 32)
-        guard SecRandomCopyBytes(kSecRandomDefault, 32, &bytes) == errSecSuccess else {
-            preconditionFailure("NativeAgent could not generate a secure iCloud pairing secret")
+    }
+
+    /// Explicit, atomic rotation. The prior canonical bytes remain active if
+    /// generation, persistence, verification, or cleanup fails.
+    static func rotateSecret() throws -> Data {
+        try rotateSecret(at: secretURL)
+    }
+
+    static func rotateSecret(at url: URL) throws -> Data {
+        try CheckedFixedSizeSecretFile.replace(at: url, byteCount: 32) {
+            var bytes = [UInt8](repeating: 0, count: 32)
+            let status = SecRandomCopyBytes(kSecRandomDefault, 32, &bytes)
+            guard status == errSecSuccess else {
+                throw NSError(
+                    domain: NSOSStatusErrorDomain,
+                    code: Int(status),
+                    userInfo: [NSLocalizedDescriptionKey: "secure random generation failed"]
+                )
+            }
+            return Data(bytes)
         }
-        let secret = Data(bytes)
-        try? secret.write(to: url, options: .atomic)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
-        return secret
     }
 
     /// Base-64 string of the current secret (for display / manual entry on iOS).
-    static func currentSecretBase64() -> String {
-        loadOrGenerateSecret().base64EncodedString()
+    static func currentSecretBase64() throws -> String {
+        try loadOrGenerateSecret().base64EncodedString()
     }
 
     // Phase 14e-iCloud HMAC self-heal: monotonic pairing_secret_version stamped
@@ -56,11 +77,28 @@ enum PairingSecretManager {
     /// iOS can detect stale secrets and re-fetch. Always publishes (no skip)
     /// when called from the signature-mismatch self-heal path — caller controls
     /// when to bump.
-    static func publishMaterialToKVS(forceBumpVersion: Bool = false) async {
-        guard await CloudKitHealth.shared.likelyHealthy() else {
-            return
+    @discardableResult
+    static func publishMaterialToKVS(forceBumpVersion: Bool = false) async -> Bool {
+        let secret: Data
+        do {
+            secret = try loadOrGenerateSecret()
+        } catch {
+            NSLog("[PairingBootstrap] Pairing unavailable; refusing KVS publish: \(error.localizedDescription)")
+            return false
         }
-        let secretB64 = currentSecretBase64()
+        return await publishMaterialToKVS(secret, forceBumpVersion: forceBumpVersion)
+    }
+
+    @discardableResult
+    static func publishMaterialToKVS(
+        _ secret: Data,
+        forceBumpVersion: Bool = false
+    ) async -> Bool {
+        guard secret.count == 32 else { return false }
+        let secretB64 = secret.base64EncodedString()
+        guard await CloudKitHealth.shared.likelyHealthy() else {
+            return false
+        }
 
         // gpt-5.5 review fix (MED-3): the old order set local KVS keys AND
         // bumped secretVersionKey BEFORE synchronize(); a synchronize timeout
@@ -89,13 +127,15 @@ enum PairingSecretManager {
         switch result {
         case .skippedCurrent:
             NSLog("[PairingBootstrap] KVS already has current HMAC secret — skipping publish")
+            return true
         case .published(let nextVersion, let synced):
             NSLog(
                 "[PairingBootstrap] Published HMAC pairing_secret_version=%d to KVS (synchronize=%@)",
                 nextVersion, synced ? "ok" : "deferred"
             )
+            return synced
         case nil:
-            return
+            return false
         }
     }
 
@@ -106,11 +146,19 @@ enum PairingSecretManager {
     /// not fall back to unsigned material.
     @discardableResult
     static func publishMaterial(to transport: DeviceSyncTransport) async -> Bool {
-        let secret = loadOrGenerateSecret()
-        guard secret.count == 32 else {
-            NSLog("[PairingBootstrap] Refusing to publish malformed canonical HMAC material")
+        let secret: Data
+        do {
+            secret = try loadOrGenerateSecret()
+        } catch {
+            NSLog("[PairingBootstrap] Pairing unavailable; refusing device publish: \(error.localizedDescription)")
             return false
         }
+        return await publishMaterial(secret, to: transport)
+    }
+
+    @discardableResult
+    static func publishMaterial(_ secret: Data, to transport: DeviceSyncTransport) async -> Bool {
+        guard secret.count == 32 else { return false }
         do {
             try await transport.publishPairing(secret: secret)
             NSLog("[PairingBootstrap] Published canonical HMAC material through device transport")
@@ -121,8 +169,14 @@ enum PairingSecretManager {
         }
     }
 
-    /// Delete the secret file so the next call to loadOrGenerateSecret() creates a fresh one.
-    static func deleteSecret() {
-        try? FileManager.default.removeItem(at: secretURL)
+    /// Delete only a currently valid canonical secret after explicit user
+    /// confirmation. Invalid or non-regular state remains preserved.
+    static func deleteSecret() throws {
+        try deleteSecret(at: secretURL)
+    }
+
+    static func deleteSecret(at url: URL) throws {
+        _ = try loadOrGenerateSecret(at: url)
+        try FileManager.default.removeItem(at: url)
     }
 }

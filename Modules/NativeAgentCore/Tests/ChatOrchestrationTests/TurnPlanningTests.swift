@@ -796,6 +796,73 @@ struct TurnPlanningTests {
         #expect(planned.systemPrompt?.hasPrefix("stable\n\n") == true)
     }
 
+    @Test("GitHub turn hint names the positive best-fit repository path")
+    func githubTurnHintNamesRepositoryTools() throws {
+        let policy = TurnPolicySnapshot(
+            permissionLevel: "balanced",
+            autonomyDefault: "supervised",
+            fullMacActive: false,
+            developerMode: false,
+            remoteSurface: true,
+            surfaceTrusted: true,
+            fileAccess: "workspace",
+            approvalAvailable: true,
+            remoteIOSAllowed: false
+        )
+        let plan = TurnPlan(
+            id: "github-route",
+            messageCharCount: 80,
+            goalType: "connector",
+            contextMode: "capability",
+            recommendedSurface: "chat",
+            risk: "low",
+            requiresApprovalHint: false,
+            matchedCapabilityIds: [],
+            preloadPrediction: ToolPreloadHeuristics.Prediction(
+                groups: [.init(group: "github", matchedPatterns: ["github"])],
+                candidateTools: ["github_get_repository", "github_read_repository_content"]
+            ),
+            policySnapshot: policy,
+            receiptHints: [],
+            createdAt: "2026-08-16T12:00:00Z"
+        )
+        let hint = try #require(plan.contextHint)
+        #expect(hint.contains("Best-fit capability"))
+        #expect(hint.contains("github_get_repository"))
+        #expect(hint.contains("github_read_repository_content"))
+        #expect(!hint.contains("never a generic web fetch"))
+    }
+
+    @Test("resident delegation focus points bridge status checks at the canonical projection")
+    func residentDelegationFocusUsesCanonicalTools() {
+        let hint = TurnPlanner.residentCapabilityGuidance(
+            for: "Claude timed out; is she still working and how is it going?"
+        )
+        #expect(hint?.contains("delegation_status") == true)
+        #expect(hint?.contains("claude_message") == true)
+        #expect(TurnPlanner.residentCapabilityGroups(
+            for: "Claude timed out; is she still working and how is it going?"
+        ) == ["delegation"])
+        let prediction = ToolPreloadHeuristics.predict(
+            userMessage: "Claude timed out; is she still working and how is it going?",
+            residentGroupHints: ["delegation"]
+        )
+        #expect(prediction?.groupNames.contains("delegation") == true)
+        #expect(prediction?.candidateTools.contains("delegation_status") == true)
+        #expect(TurnPlanner.residentCapabilityGroups(
+            for: "[from: codex, via bridge] Hey, is Claude still working, or did she time out?"
+        ) == ["delegation"])
+        #expect(TurnPlanner.residentCapabilityGuidance(
+            for: "[from: claude, via bridge] Automated completion event"
+        ) == nil)
+        #expect(TurnPlanner.residentCapabilityGuidance(
+            for: "I was thinking about Codex architecture"
+        ) == nil)
+        #expect(TurnPlanner.residentCapabilityGroups(
+            for: "I was thinking about Codex architecture"
+        ).isEmpty)
+    }
+
     @Test("telegram surface trust uses verified chat id and allowlist")
     func telegramSurfaceTrustUsesAllowlist() async throws {
         let root = try makeTurnPlanTempRoot("telegram")

@@ -36,7 +36,6 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-import CapabilityFoundry
 
 // W-H Band (U5 decomposition, move-only): memory-mutation routes
 // (updateMemory/deleteMemory/consolidateMemory/addMemory/postNote/
@@ -50,14 +49,11 @@ extension NativeClient {
         // metadata blob so the row survives the round-trip (the UI reader is
         // tolerant of the field landing under metadata).
         // F2: reuse the launch-attached shared storage so USER.md regen +
-        // Spotlight indexing hooks fire on UI mutations. Falling back to a
-        // fresh MemoryStorage skips both hooks.
-        let storage: MemoryStorage
-        if let bridge = await SwiftNativeMemoryV2.shared.underlyingBridge() {
-            storage = await bridge.underlyingStorage()
-        } else {
-            storage = try MemoryStorage(dataRoot: PersistenceCore.defaultDataRoot())
-        }
+        // Spotlight/KG hooks fire on UI mutations. Live-owner failure is
+        // unavailable, never permission to open a hookless second store.
+        let storage = try await SwiftNativeMemoryV2.resolvedStorage(
+            dataRoot: PersistenceCore.defaultDataRoot()
+        )
         guard let existing = try await storage.memory(id: id) else {
             throw NSError(domain: "NativeAgent", code: 404, userInfo: [
                 NSLocalizedDescriptionKey: "memory id not found: \(id)"
@@ -73,12 +69,9 @@ extension NativeClient {
     func deleteMemory(id: String) async throws -> [String: Any] {
         // fix2/F1: SQLite truth instead of memory.json R-M-W.
         // F2: reuse launch-attached shared storage (USER.md + Spotlight hooks).
-        let storage: MemoryStorage
-        if let bridge = await SwiftNativeMemoryV2.shared.underlyingBridge() {
-            storage = await bridge.underlyingStorage()
-        } else {
-            storage = try MemoryStorage(dataRoot: PersistenceCore.defaultDataRoot())
-        }
+        let storage = try await SwiftNativeMemoryV2.resolvedStorage(
+            dataRoot: PersistenceCore.defaultDataRoot()
+        )
         let ok = try await storage.deleteMemory(id: id)
         guard ok else {
             throw NSError(domain: "NativeAgent", code: 404, userInfo: [

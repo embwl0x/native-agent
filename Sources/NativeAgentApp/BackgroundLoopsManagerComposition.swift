@@ -236,6 +236,18 @@ public actor BackgroundLoopsManager {
         return await coreManager.runTickOnce(loopId: loopId)
     }
 
+    /// Due-aware wake used by AppKit's background activity scheduler. Unlike
+    /// `runTickOnce`, this never force-runs an early weekly loop; Core reads the
+    /// same durable cadence that drives its periodic registration and then
+    /// coalesces any race through the same per-loop execution gate.
+    @discardableResult
+    public func runTickIfDue(loopId: String) async -> LoopTickOutcome {
+        if !(await coreManager.isRunning(loopId: loopId)) {
+            await start(loops: assembleLoops())
+        }
+        return await coreManager.runTickIfDue(loopId: loopId)
+    }
+
     /// Loop ids this facade can rebuild in place. Everything else is bound to
     /// state captured at assembly time and only re-reads its config on launch.
     static let hotReloadableLoopIDs: Set<String> = [
@@ -325,14 +337,22 @@ public actor MemorySpotlightBootstrap {
         let marker = PersistenceCore.defaultDataRoot()
             .appendingPathComponent("memory")
             .appendingPathComponent(".spotlight_reindexed")
-        if FileManager.default.fileExists(atPath: marker.path) {
-            didReindex = true
-            return
-        }
         guard let bridge = await SwiftNativeMemoryV2.shared.underlyingBridge() else {
             return
         }
         let storage = await bridge.underlyingStorage()
+        let generation: String
+        do {
+            generation = try await storage.projectionGenerationFingerprint()
+        } catch {
+            return
+        }
+        if let markerData = try? Data(contentsOf: marker),
+           String(data: markerData, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) == generation {
+            didReindex = true
+            return
+        }
         let memories: [StoredMemory]
         do {
             memories = try await storage.listMemories(persona: nil, status: "active", limit: nil)
@@ -345,42 +365,40 @@ public actor MemorySpotlightBootstrap {
         let client: any SpotlightIndexClient = MockSpotlightIndexClient()
         #endif
         let indexer = SwiftNativeMemoryIndexer(client: client)
-        let batch = memories.map { (id: $0.id, text: $0.content, kind: $0.status as String?) }
+        let batch = memories
+            .filter { !$0.id.hasPrefix(SwiftNativeMemoryV2.skillPointerIDPrefix) }
+            .map { (id: $0.id, text: $0.content, kind: $0.status as String?) }
         do {
+            // A generation mismatch is a reconciliation, not an additive
+            // refresh. Clear the derived domain first so deleted canonical rows
+            // cannot survive forever behind an old one-shot marker.
+            try await indexer.removeAll()
             try await indexer.indexBatch(batch)
+            let completedGeneration = try await storage.projectionGenerationFingerprint()
+            guard completedGeneration == generation else {
+                // Canonical memory moved during the rebuild. Leave the old
+                // marker untouched so the next launch retries from truth.
+                return
+            }
         } catch {
             return
         }
-        didReindex = true
-        try? FileManager.default.createDirectory(
-            at: marker.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        FileManager.default.createFile(atPath: marker.path, contents: Data("ok\n".utf8))
+        do {
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(
+                Data((generation + "\n").utf8),
+                to: marker
+            )
+            didReindex = true
+        } catch {
+            // Index is usable, but no durable generation proof means restart
+            // must reconcile again rather than trust an uncertain projection.
+        }
     }
 }
 
-// MARK: - UserMDGenerator.shared
-//
-// MemoryV2+UserMDGen.swift defines the real actor with
-// `regenerate(persona:)`. The spec calls `UserMDGenerator.shared.regenerate()`
-// with no args, so add a shared instance + zero-arg overload here.
+// MARK: - UserMDGenerator convenience
 
 extension UserMDGenerator {
-    /// Lazily-built process-wide generator. Throws are swallowed (the
-    /// storage open is the only fallible step) — on failure the launch
-    /// hook treats regenerate() as a no-op via the wrapping try?.
-    public static let shared: UserMDGenerator? = {
-        guard let storage = try? MemoryStorage(dataRoot: NativeAgentPaths.dataRoot) else {
-            return nil
-        }
-        return UserMDGenerator(
-            storage: storage,
-            dataRoot: NativeAgentPaths.dataRoot,
-            personaRoot: NativeAgentPaths.personaRoot
-        )
-    }()
-
     /// Zero-arg shorthand the launch hook uses.
     public func regenerate() async throws -> URL {
         try await self.regenerate(persona: MemoryV2Defaults.personaID)

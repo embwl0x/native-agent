@@ -554,6 +554,23 @@ struct CloudKitDeviceTransportPullCursorTests {
         )
         #expect(next == previous)
     }
+
+    @Test func emptyCursorPersistenceIsThrottledButRecordProgressIsImmediate() {
+        let persisted = now.addingTimeInterval(-60)
+        #expect(!CloudKitDeviceTransport.shouldPersistPullCursor(
+            immediately: false, lastPersistenceAt: persisted, now: now
+        ))
+        #expect(CloudKitDeviceTransport.shouldPersistPullCursor(
+            immediately: true, lastPersistenceAt: persisted, now: now
+        ))
+        #expect(CloudKitDeviceTransport.shouldPersistPullCursor(
+            immediately: false,
+            lastPersistenceAt: now.addingTimeInterval(
+                -CloudKitDeviceTransport.emptyCursorPersistenceInterval
+            ),
+            now: now
+        ))
+    }
 }
 
 // An UNCONFIGURED CloudKitDeviceTransport (CloudKit entitlement absent) must
@@ -665,7 +682,8 @@ struct CloudKitCrashGuardTests {
         let t = DeviceSyncTransportResolver.makeCloudKitTransport(
             role: .mac, containerIdentifier: "iCloud.example.test",
             environment: ["NATIVE_AGENT_DEVICE_SYNC": "kvs"],
-            hasEntitlement: { true })
+            hasEntitlement: { true },
+            grantsContainer: { _ in true })
         #expect(t == nil)
     }
 
@@ -675,7 +693,17 @@ struct CloudKitCrashGuardTests {
         let t = DeviceSyncTransportResolver.makeCloudKitTransport(
             role: .mac, containerIdentifier: "iCloud.example.test",
             environment: ["NATIVE_AGENT_DEVICE_SYNC": "cloudkit"],
-            hasEntitlement: { false })
+            hasEntitlement: { false },
+            grantsContainer: { _ in true })
+        #expect(t == nil)
+    }
+
+    @Test func factoryDegradesToNilWhenExactContainerIsAbsent() {
+        let t = DeviceSyncTransportResolver.makeCloudKitTransport(
+            role: .mac, containerIdentifier: "iCloud.example.expected",
+            environment: ["NATIVE_AGENT_DEVICE_SYNC": "cloudkit"],
+            hasEntitlement: { true },
+            grantsContainer: { $0 == "iCloud.example.other" })
         #expect(t == nil)
     }
 
@@ -686,7 +714,8 @@ struct CloudKitCrashGuardTests {
         let t = DeviceSyncTransportResolver.makeCloudKitTransport(
             role: .mac, containerIdentifier: "iCloud.example.test",
             environment: ["NATIVE_AGENT_DEVICE_SYNC": "cloudkit"],
-            hasEntitlement: { true })
+            hasEntitlement: { true },
+            grantsContainer: { $0 == "iCloud.example.test" })
         #expect(t != nil)
         #expect(t?.role == .mac)
     }

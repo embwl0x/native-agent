@@ -358,5 +358,6 @@ private func organismSignal(
 
     #expect(snapshot.signalCount == 1)
     #expect(snapshot.chemicalState.confidence > ChemicalState.neutral.confidence)
+    #expect(snapshot.reflexCandidates.isEmpty, "routine signals must not compile generic reflex proposals")
     #expect(projection.generatedAt == clock.now())
 }

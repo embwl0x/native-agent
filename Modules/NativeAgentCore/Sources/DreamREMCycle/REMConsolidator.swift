@@ -197,34 +197,33 @@ public actor REMConsolidator {
         let markerURL = dataRoot
             .appendingPathComponent("harness", isDirectory: true)
             .appendingPathComponent("last_weekly_rem_run")
-        try? FileManager.default.createDirectory(
-            at: markerURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let lockCore = SwiftNativePersistenceCore()
         // Unique claim token = freshness timestamp + a per-run UUID (gpt-5.5
         // review). The timestamp drives the 6-day freshness check (parse the
         // FIRST whitespace token); the UUID makes the marker a unique claim id
         // so the failure rollback compare-and-restores EXACTLY our claim and
         // can never clobber a concurrent force-run that re-claimed in the same
         // second. The prior marker is captured UNDER the claim lock so the
-        // rollback restores exactly what our claim overwrote.
+        // rollback restores exactly what our claim overwrote. The shared
+        // PersistenceCore reservation fails CLOSED on an unreadable marker,
+        // lock failure, or stamp-write failure: weekly LLM work never runs
+        // without first owning durable exclusion.
         let claimToken = "\(ISO8601DateFormatter().string(from: now)) \(UUID().uuidString)"
-        let claim = (try? await lockCore.withFileLock(markerURL) { () -> (Bool, Data?) in
-            let existing = try? Data(contentsOf: markerURL)
-            if !force,
-               let data = existing,
-               let text = String(data: data, encoding: .utf8),
-               let firstToken = text.split(separator: " ", maxSplits: 1).first,
-               let stamp = ISO8601DateFormatter().date(
-                   from: String(firstToken).trimmingCharacters(in: .whitespacesAndNewlines)),
-               now.timeIntervalSince(stamp) < 6 * 86_400 {
-                return (false, existing)
+        let reservation = await reserveOncePerPeriod(at: markerURL, stamp: claimToken) { stored in
+            if force { return false }
+            guard let stored else { return false }
+            guard let firstToken = stored.split(separator: " ", maxSplits: 1).first,
+                  let priorRun = ISO8601DateFormatter().date(
+                    from: String(firstToken).trimmingCharacters(in: .whitespacesAndNewlines)
+                  ) else {
+                throw PersistenceCoreError.ioFailure(
+                    "weekly REM marker is malformed: \(markerURL.path)"
+                )
             }
-            try? claimToken.data(using: .utf8)?.write(to: markerURL, options: .atomic)
-            return (true, existing)
-        }) ?? (true, (try? Data(contentsOf: markerURL))) // lock failure: prefer running
-        let shouldRun = claim.0
-        let priorMarker = claim.1
-        guard shouldRun else {
+            return now.timeIntervalSince(priorRun) < 6 * 86_400
+        }
+        let rollback: @Sendable () async -> Void
+        switch reservation {
+        case .alreadyReserved:
             FileHandle.standardError.write(Data(
                 "REMConsolidator: weekly REM already ran within 6 days — skipping\n".utf8
             ))
@@ -237,13 +236,14 @@ public actor REMConsolidator {
                 evidenceDatesMin: REMConstants._REM_MIN_EVIDENCE_DATES,
                 tombstoneSkips: 0, growthMDEvicted: 0, archivedEntries: 0
             )
+        case .failed(let error):
+            FileHandle.standardError.write(Data(
+                "REMConsolidator: weekly reservation failed closed: \(error)\n".utf8
+            ))
+            throw error
+        case .reserved(_, let restore):
+            rollback = restore
         }
-        // loop-A finding (2026-06-13): the marker rollback used to run in a
-        // `defer` OUTSIDE the claim flock. An unlocked restore can clobber a
-        // newer claim a concurrent force-run wrote between our claim and our
-        // failure, reopening the weekly window for an extra consolidation.
-        // Wrap the body so the rollback runs under the SAME flock and only
-        // restores when the marker still holds OUR stamp (compare-and-restore).
         do {
 
         // (2) Read last-7-day entries by mtime.
@@ -374,19 +374,7 @@ public actor REMConsolidator {
             archivedEntries: moved
         )
         } catch {
-            // Run failed — restore the weekly marker so the retry isn't
-            // suppressed, but ONLY if the marker still holds OUR claim stamp.
-            // Compare-and-restore under the SAME flock that guards the claim, so
-            // a concurrent force-run's newer claim is never clobbered.
-            try? await lockCore.withFileLock(markerURL) {
-                let current = try? Data(contentsOf: markerURL)
-                guard current == Data(claimToken.utf8) else { return }
-                if let priorMarker {
-                    try? priorMarker.write(to: markerURL, options: .atomic)
-                } else {
-                    try? FileManager.default.removeItem(at: markerURL)
-                }
-            }
+            await rollback()
             throw error
         }
     }

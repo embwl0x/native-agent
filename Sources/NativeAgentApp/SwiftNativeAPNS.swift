@@ -358,10 +358,6 @@ actor SwiftNativeAPNSSender {
         if !swiftTokens.isEmpty {
             return dedupedTokens(swiftTokens)
         }
-        let recoveredTokens = filteredTokens(await loadICloudProcessedTokens(), config: config)
-        if !recoveredTokens.isEmpty {
-            return dedupedTokens(recoveredTokens)
-        }
         return dedupedTokens(filteredTokens(await loadLegacyTokens(dataRoot: dataRoot), config: config))
     }
 
@@ -434,74 +430,6 @@ actor SwiftNativeAPNSSender {
                 updatedAt: Self.string(obj["lastSeen"]) ?? Self.string(obj["updatedAt"])
             )
         }
-    }
-
-    private func loadICloudProcessedTokens() async -> [APNSToken] {
-        let fm = FileManager.default
-        var byDeviceId: [String: APNSToken] = [:]
-        for inboxURL in Self.iCloudInboxCandidateURLs() {
-            guard let files = try? fm.contentsOfDirectory(
-                at: inboxURL,
-                includingPropertiesForKeys: nil
-            ) else {
-                continue
-            }
-            for file in files where file.lastPathComponent.hasPrefix("processed_")
-                && file.lastPathComponent.hasSuffix(".json.done") {
-                let raw = await persistence.readJSON(file, defaultValue: .object([:]))
-                guard case .object(let obj) = raw,
-                      Self.string(obj["action"]) == "registerPushToken",
-                      case .object(let payload)? = obj["payload"] else {
-                    continue
-                }
-                guard let token = Self.string(payload["token"])?.trimmingCharacters(in: .whitespacesAndNewlines),
-                      !token.isEmpty else {
-                    continue
-                }
-                let deviceId = Self.string(payload["deviceId"])
-                    ?? Self.string(payload["device_id"])
-                    ?? "ios"
-                let updatedAt = Self.string(obj["createdAt"])
-                let recovered = APNSToken(
-                    deviceId: deviceId,
-                    token: token,
-                    environment: Self.string(payload["environment"]) ?? Self.string(payload["sandbox"]),
-                    bundleId: Self.string(payload["bundleId"]) ?? Self.string(payload["bundle_id"]),
-                    source: "icloud_processed_register_push_token",
-                    updatedAt: updatedAt
-                )
-                if let existing = byDeviceId[deviceId],
-                   !Self.isNewerToken(recovered, than: existing) {
-                    continue
-                }
-                byDeviceId[deviceId] = recovered
-            }
-        }
-        return Array(byDeviceId.values).sorted { $0.deviceId < $1.deviceId }
-    }
-
-    private static func iCloudInboxCandidateURLs() -> [URL] {
-        // C10 (tightness-sweep 2026-07-17): resolve the container via
-        // iCloudBridge's single owner (the `url(forUbiquityContainerIdentifier:)`
-        // API) first, and fall back to the deterministic hand-built path — the
-        // same fallback semantics this code had before (it used ONLY the
-        // hand-built path). Both are safe to call here: this is an off-main
-        // async token-load path, and the API resolver is `nonisolated`.
-        // Runs oldest-behavior-preserving: the hand-built path is always
-        // included so a signed-out/unmounted container still resolves.
-        var candidates: [URL] = []
-        var seenPaths: Set<String> = []
-        func add(_ documentsURL: URL) {
-            let inbox = documentsURL.appendingPathComponent("inbox", isDirectory: true)
-            if seenPaths.insert(inbox.standardizedFileURL.path).inserted {
-                candidates.append(inbox)
-            }
-        }
-        if let apiDocuments = iCloudBridge.ubiquityDocumentsURL() {
-            add(apiDocuments)
-        }
-        add(iCloudBridge.hardcodedDocumentsURL())
-        return candidates
     }
 
     private static func payload(
@@ -577,18 +505,6 @@ actor SwiftNativeAPNSSender {
             return nil
         }
         return max(0, Int(now.timeIntervalSince(date)))
-    }
-
-    private static func isNewerToken(_ lhs: APNSToken, than rhs: APNSToken) -> Bool {
-        guard let lhsUpdatedAt = lhs.updatedAt,
-              let lhsDate = ISO8601DateFormatter().date(from: lhsUpdatedAt) else {
-            return false
-        }
-        guard let rhsUpdatedAt = rhs.updatedAt,
-              let rhsDate = ISO8601DateFormatter().date(from: rhsUpdatedAt) else {
-            return true
-        }
-        return lhsDate > rhsDate
     }
 
     private struct APNSConfig: Sendable {

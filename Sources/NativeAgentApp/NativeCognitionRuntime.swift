@@ -17,7 +17,6 @@ struct CognitiveObservatoryDetail: Sendable {
     var thoughtSuggestions: [CognitiveThoughtSuggestion]
     var episodes: [CognitiveEpisodeReference]
     var schemaProposals: [CognitiveSchemaProposal]
-    var identityProposals: [CognitiveIdentityProposal]
     var standingViews: [CognitiveStandingView]
     var developmentalTimeline: [CognitiveDevelopmentalTimelineEvent]
     var reflections: [CognitiveReflectionReceipt]
@@ -944,11 +943,15 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
             projection: organism.projection,
             at: fixedAt
         )
-        let capsule = await substrate.prepareFrozenCapsule(capsuleRequest, at: fixedAt)
+        let preparedCapsule = await substrate.prepareFrozenCapsulePresentation(
+            capsuleRequest,
+            at: fixedAt
+        )
         return CognitiveTurnProjection(
             fixedAt: fixedAt,
-            capsule: capsule,
-            posture: organism.posture
+            capsule: preparedCapsule?.capsule,
+            posture: organism.posture,
+            capsulePresentationCommit: preparedCapsule?.presentationCommit
         )
     }
 
@@ -976,6 +979,10 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
                let line = Self.bodyLine(inCapsuleDynamicContext: capsule.dynamicContext) {
                 lastInjectedBodyLine = line
                 lastInjectedBodyLineAt = projection.fixedAt
+            }
+            if request.mode == .inject,
+               let presentationCommit = projection.capsulePresentationCommit {
+                _ = await substrate.applyCapsulePresentationCommit(presentationCommit)
             }
             // W7/P6 — the envelope stash rides the same certification: this
             // request served a real live turn. The frozen capsule compile is a
@@ -1321,7 +1328,6 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
             thoughtSuggestions: await substrate.thoughtSuggestionSnapshot(surface: "observatory"),
             episodes: await substrate.episodeSnapshot(),
             schemaProposals: await substrate.schemaProposalSnapshot(),
-            identityProposals: await substrate.identityProposalSnapshot(),
             standingViews: await substrate.standingViewSnapshot(),
             developmentalTimeline: await substrate.developmentalTimelineSnapshot(),
             reflections: await substrate.reflectionReceiptSnapshot(),
@@ -1537,12 +1543,6 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
         await substrate.recordReceipt(kind: "user.clear_transient_state")
         publishRuntimeChange(reason: "transient_clear:completed")
         return .cleared
-    }
-
-    func resolveIdentityProposal(id: UUID, accepted: Bool) async {
-        _ = await substrate.resolveIdentityProposal(id: id, accepted: accepted)
-        scheduleDirtyMicrocycle(reason: "identity_proposal_resolution")
-        publishRuntimeChange(reason: "proposal:identity_resolved")
     }
 
     func resolveSchemaProposal(id: UUID, accepted: Bool) async {

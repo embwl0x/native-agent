@@ -39,7 +39,6 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-import CapabilityFoundry
 
 extension NativeClient {
     func runBrowser(url: String, dryRun: Bool) async throws -> BrowserRun {
@@ -557,27 +556,11 @@ extension NativeClient {
         detail: String,
         root: URL = SwiftNativeApprovalInbox.defaultDataRoot()
     ) async throws {
-        let path = root
-            .appendingPathComponent("workflows", isDirectory: true)
-            .appendingPathComponent("approvals", isDirectory: true)
-            .appendingPathComponent("requests.json")
-        let persistence = SwiftNativePersistenceCore()
-        try await persistence.withFileLock(path) {
-            let raw = await persistence.readJSON(path, defaultValue: .array([]))
-            guard case .array(var rows) = raw else { return }
-            for idx in rows.indices {
-                guard case .object(var obj) = rows[idx],
-                      case .string(let rowID)? = obj["id"],
-                      rowID == id else {
-                    continue
-                }
-                obj["executedAction"] = executedAction
-                obj["detail"] = .string(detail)
-                rows[idx] = .object(obj)
-                break
-            }
-            try await persistence.writeJSON(.array(rows), to: path)
-        }
+        _ = try await SwiftNativeApprovalInbox(root: root).annotateExecution(
+            id,
+            executedAction: executedAction,
+            detail: detail
+        )
     }
 
     // W-H Band 1 lift (move-only): visibility raised private→internal for the
@@ -586,14 +569,6 @@ extension NativeClient {
         guard case .object(let obj) = value else { return nil }
         if case .string(let s)? = obj[key] { return s }
         return nil
-    }
-
-    static func browserNowISO(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(identifier: "UTC")
-        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS'+00:00'"
-        return formatter.string(from: date)
     }
 
     func cancelBrowserRun(id: String?) async throws -> BrowserRun {

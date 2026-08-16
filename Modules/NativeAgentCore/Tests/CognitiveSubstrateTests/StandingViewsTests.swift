@@ -129,9 +129,9 @@ struct StandingViewsTests {
                 "a .proposed view must never surface: \(capsule.dynamicContext)")
     }
 
-    /// A single reflection carrying BOTH a `schema:` and a `view:` line splits correctly:
-    /// one schema proposal + one standing view, both counted.
-    @Test func viewAndSchemaLinesSplitCorrectly() async throws {
+    /// Reflection owns only standing views. Old schema tags are ignored; REM
+    /// replay remains the sole schema-lineage producer.
+    @Test func schemaTagIsIgnoredWhileViewStillForms() async throws {
         let now = Date(timeIntervalSince1970: 20_500_000)
         let clock = Clock(now)
         let (store, _) = try makeStore("split")
@@ -143,9 +143,9 @@ struct StandingViewsTests {
             request: req,
             resultSummary: "A quiet pass.\nschema: treat late-night pings as low-urgency\nview: I trust the work more when I have verified it myself",
             provider: "test"))
-        #expect(receipt.proposalIds.count == 2, "both lines counted: \(receipt.proposalIds.count)")
+        #expect(receipt.proposalIds.count == 1)
         #expect((await s.standingViewSnapshot()).count == 1, "exactly one standing view")
-        #expect((await s.schemaProposalSnapshot()).count == 1, "exactly one schema proposal")
+        #expect((await s.schemaProposalSnapshot()).isEmpty)
     }
 
     // MARK: - (2) approval seam — surface / no-surface
@@ -165,7 +165,7 @@ struct StandingViewsTests {
         // Proposed: the Inner line EXISTS (the transient takeaway — thoughtSeedsEnabled)
         // and is NOT the view. Asserting presence keeps the skip-assertion below
         // non-vacuous (gpt-5.5 review, 2026-07-02).
-        let beforeInner = innerLines(await s.compileCapsule(request("continue")))
+        let beforeInner = innerLines(await s.compileCapsule(request("interface")))
         #expect(beforeInner.count == 1, "pre-approval the takeaway seed must be the Inner line: \(beforeInner)")
         #expect(beforeInner.allSatisfy { !$0.contains("I keep User's interface short") },
                 "proposed view must not be the Inner line: \(beforeInner)")
@@ -174,7 +174,7 @@ struct StandingViewsTests {
         let resolved = try #require(await s.resolveStandingView(id: id, approved: true))
         #expect(resolved.status == .active)
 
-        let capsule = await s.compileCapsule(request("continue"))
+        let capsule = await s.compileCapsule(request("keep the interface short"))
         let inner = innerLines(capsule)
         #expect(inner.count == 1, "at most ONE Inner line total: \(inner)")
         let line = try #require(inner.first)
@@ -182,6 +182,34 @@ struct StandingViewsTests {
                 "the active view must BE the Inner line: \(line)")
         #expect(!line.contains("distinct takeaway sentence"),
                 "the transient takeaway seed must be skipped when a view is active: \(line)")
+    }
+
+    @Test func activeViewInnerLineIsRelevantAndCanaryRollsBackWithoutStateChange() async throws {
+        let now = Date(timeIntervalSince1970: 21_500_000)
+        let clock = Clock(now)
+        let (store, _) = try makeStore("relevance-canary")
+        let s = substrate(store: store, clock: clock)
+        try await s.restorePersistentState()
+        let receipt = try #require(await formView(
+            s,
+            prose: "A fresh takeaway about ordinary conversation.",
+            viewBody: "Verified interface choices should stay simple and legible",
+            at: now
+        ))
+        let id = try #require(receipt.proposalIds.first)
+        _ = try #require(await s.resolveStandingView(id: id, approved: true))
+
+        let relevant = await s.compileCapsule(request("keep the interface legible"))
+        #expect(relevant.dynamicContext.contains("Verified interface choices"))
+        let unrelated = await s.compileCapsule(request("how was your morning?"))
+        #expect(!unrelated.dynamicContext.contains("Verified interface choices"))
+
+        var rollback = config()
+        rollback.standingViewCapsuleRelevanceEnabled = false
+        await s.configure(rollback)
+        let legacy = await s.compileCapsule(request("how was your morning?"))
+        #expect(legacy.dynamicContext.contains("Verified interface choices"))
+        #expect((await s.standingViewSnapshot()).first { $0.id == id }?.status == .active)
     }
 
     @Test func rejectedViewRetiresAndNeverSurfaces() async throws {
@@ -269,7 +297,7 @@ struct StandingViewsTests {
         #expect(restored.count == 1, "the active view must restore from its artifact")
         #expect(restored.first?.id == id)
 
-        let capsule = await second.compileCapsule(request("continue"))
+        let capsule = await second.compileCapsule(request("was that silence focused?"))
         #expect(capsule.dynamicContext.contains("I read User's silence as focus"),
                 "the restored active view must still surface: \(capsule.dynamicContext)")
     }

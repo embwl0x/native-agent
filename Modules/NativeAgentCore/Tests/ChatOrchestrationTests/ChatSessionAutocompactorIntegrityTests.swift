@@ -7,6 +7,51 @@ import Testing
 
 @Suite("Chat transcript autocompaction integrity")
 struct ChatSessionAutocompactorIntegrityTests {
+    @Test("manual force bypasses automatic gates but keeps canonical safety path")
+    func manualForceUsesCanonicalCompactor() async throws {
+        let fixture = try Fixture(name: "manual-force")
+        let original = try (0..<4).reduce(into: Data()) { payload, index in
+            payload.append(try row(
+                role: index.isMultiple(of: 2) ? "user" : "assistant",
+                content: "short message \(index)"
+            ))
+        }
+        try original.write(to: fixture.messagesURL)
+
+        let compactor = ChatSessionAutocompactor(
+            dataRoot: fixture.root,
+            config: ChatSessionAutocompactionConfig(
+                enabled: false,
+                thresholdTokens: 200_000,
+                keepCount: 2,
+                distillEnabled: false
+            )
+        )
+        let automatic = try await compactor.compactIfNeeded(
+            sessionId: fixture.sessionID,
+            model: "gpt-5.6",
+            surface: "chat",
+            runId: nil
+        )
+        #expect(!automatic.compacted)
+        #expect(try Data(contentsOf: fixture.messagesURL) == original)
+
+        let manual = try await compactor.compactIfNeeded(
+            sessionId: fixture.sessionID,
+            model: "gpt-5.6",
+            surface: "chat",
+            runId: nil,
+            trigger: "manual_request",
+            force: true
+        )
+        #expect(manual.compacted)
+        #expect(manual.trigger == "manual_request")
+        #expect(manual.messagesBefore == 4)
+        #expect(manual.messagesAfter == 3)
+        #expect(manual.messagesReplaced == 2)
+        #expect(try fixture.backupFiles().count == 1)
+    }
+
     @Test("mixed valid and malformed JSONL fails closed without rewriting")
     func mixedMalformedTranscriptIsPreserved() async throws {
         let fixture = try Fixture(name: "mixed-malformed")

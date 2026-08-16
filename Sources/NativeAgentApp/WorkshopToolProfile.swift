@@ -32,6 +32,20 @@ public actor WorkshopArtifactCollector {
     public func written() -> [String] { paths }
 }
 
+public actor WorkshopProgressCollector {
+    public struct Report: Sendable, Equatable {
+        public let disposition: DeskWorkDisposition
+        public let summary: String
+    }
+    private var report: Report?
+    public init() {}
+    func record(disposition: DeskWorkDisposition, summary: String) {
+        let clean = summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        report = Report(disposition: disposition, summary: String(clean.prefix(600)))
+    }
+    public func latest() -> Report? { report }
+}
+
 /// The membrane. A `ToolDispatchClient` that ceilings a workshop session's tool
 /// use to a hard allowlist and implements the one workshop-only write tool with
 /// canonical-path containment.
@@ -43,19 +57,24 @@ public struct WorkshopToolProfile: ToolDispatchClient {
     /// `inner`, so a generic `write_file` is unreachable.
     let artifactWriter: WorkshopArtifactWriter
     let collector: WorkshopArtifactCollector
+    let progressCollector: WorkshopProgressCollector
 
     public init(
         inner: any ToolDispatchClient,
         artifactWriter: WorkshopArtifactWriter,
-        collector: WorkshopArtifactCollector = WorkshopArtifactCollector()
+        collector: WorkshopArtifactCollector = WorkshopArtifactCollector(),
+        progressCollector: WorkshopProgressCollector = WorkshopProgressCollector()
     ) {
         self.inner = inner
         self.artifactWriter = artifactWriter
         self.collector = collector
+        self.progressCollector = progressCollector
     }
 
     /// The dedicated workshop write tool — the ONLY write beyond desk ops.
     public static let artifactToolName = "workshop_artifact_write"
+    public static let artifactReadToolName = "workshop_artifact_read"
+    public static let progressToolName = "workshop_progress"
 
     /// The hard read/desk allowlist. Snake_case to match the dispatcher's
     /// built-in names. Conservative on purpose: anything not here (and not the
@@ -83,12 +102,18 @@ public struct WorkshopToolProfile: ToolDispatchClient {
     /// artifact writer. `workshop_artifact_write` is deliberately NOT in
     /// `allowed` (that set gates delegation to `inner`); it is handled here.
     static func isPermitted(_ tool: String) -> Bool {
-        tool == artifactToolName || allowed.contains(tool)
+        tool == artifactToolName || tool == artifactReadToolName || tool == progressToolName || allowed.contains(tool)
     }
 
     public func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         if tool == Self.artifactToolName {
             return try await handleArtifactWrite(input)
+        }
+        if tool == Self.artifactReadToolName {
+            return try handleArtifactRead(input)
+        }
+        if tool == Self.progressToolName {
+            return try await handleProgress(input)
         }
         guard Self.allowed.contains(tool) else {
             throw WorkshopMembraneError.toolNotPermitted(tool)
@@ -100,6 +125,8 @@ public struct WorkshopToolProfile: ToolDispatchClient {
         let names = (try? await inner.listAvailableTools()) ?? []
         var out = names.filter { Self.allowed.contains($0) }
         out.append(Self.artifactToolName)
+        out.append(Self.artifactReadToolName)
+        out.append(Self.progressToolName)
         return out
     }
 
@@ -107,6 +134,8 @@ public struct WorkshopToolProfile: ToolDispatchClient {
         let schemas = (try? await inner.listAvailableToolSchemas()) ?? []
         var out = schemas.filter { Self.allowed.contains($0.name) }
         out.append(Self.artifactWriteSchema)
+        out.append(Self.artifactReadSchema)
+        out.append(Self.progressSchema)
         return out
     }
 
@@ -140,6 +169,46 @@ public struct WorkshopToolProfile: ToolDispatchClient {
         )
     }()
 
+    static let artifactReadSchema: LLMToolSchema = {
+        let dict: [String: Any] = [
+            "type": "object",
+            "properties": ["path": [
+                "type": "string",
+                "description": "Relative path under this same Desk handle's Workshop folder.",
+            ]],
+            "required": ["path"],
+            "additionalProperties": false,
+        ]
+        let data = (try? JSONSerialization.data(withJSONObject: dict)) ?? Data("{}".utf8)
+        return LLMToolSchema(
+            name: artifactReadToolName,
+            description: "Read one prior artifact owned by this Desk handle (maximum 64 KiB).",
+            parametersJSON: data
+        )
+    }()
+
+    static let progressSchema: LLMToolSchema = {
+        let dict: [String: Any] = [
+            "type": "object",
+            "properties": [
+                "disposition": [
+                    "type": "string",
+                    "enum": ["progress", "goal_satisfied", "blocked", "abandon"],
+                    "description": "The honest state of the Desk pursuit after this bounded session.",
+                ],
+                "summary": ["type": "string", "description": "A compact factual receipt (maximum 600 characters)."],
+            ],
+            "required": ["disposition", "summary"],
+            "additionalProperties": false,
+        ]
+        let data = (try? JSONSerialization.data(withJSONObject: dict)) ?? Data("{}".utf8)
+        return LLMToolSchema(
+            name: progressToolName,
+            description: "Record a typed Desk-owned progress disposition. Call once near the end of the session.",
+            parametersJSON: data
+        )
+    }()
+
     private func handleArtifactWrite(_ input: [String: JSONValue]) async throws -> JSONValue {
         guard Set(input.keys) == Set(["path", "content"]) else {
             throw WorkshopMembraneError.badArtifactArgs("only 'path' and 'content' are accepted")
@@ -157,6 +226,32 @@ public struct WorkshopToolProfile: ToolDispatchClient {
             "path": .string(written.relativePath),
             "bytes": .int(Int64(content.utf8.count)),
         ])
+    }
+
+    private func handleArtifactRead(_ input: [String: JSONValue]) throws -> JSONValue {
+        guard Set(input.keys) == Set(["path"]), case .string(let path)? = input["path"] else {
+            throw WorkshopMembraneError.badArtifactArgs("workshop_artifact_read requires only 'path'")
+        }
+        let read = try artifactWriter.read(relativePath: path)
+        return .object([
+            "status": .string("ok"),
+            "path": .string(read.relativePath),
+            "content": .string(read.content),
+            "bytes": .int(Int64(read.bytes)),
+            "truncated": .bool(read.truncated),
+        ])
+    }
+
+    private func handleProgress(_ input: [String: JSONValue]) async throws -> JSONValue {
+        guard Set(input.keys) == Set(["disposition", "summary"]),
+              case .string(let raw)? = input["disposition"],
+              let disposition = DeskWorkDisposition(rawValue: raw),
+              case .string(let summary)? = input["summary"],
+              !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw WorkshopMembraneError.badArtifactArgs("workshop_progress requires a valid disposition and non-empty summary")
+        }
+        await progressCollector.record(disposition: disposition, summary: summary)
+        return .object(["status": .string("ok"), "disposition": .string(disposition.rawValue)])
     }
 }
 
@@ -209,6 +304,12 @@ public struct WorkshopArtifactWriter: Sendable {
     }
 
     public struct Written: Equatable { public let relativePath: String; public let url: URL }
+    public struct Read: Equatable {
+        public let relativePath: String
+        public let content: String
+        public let bytes: Int
+        public let truncated: Bool
+    }
 
     /// Resolve a caller-supplied relative path against the handle root with full
 /// containment. Does NOT write — pure, so the containment rule is unit-
@@ -313,6 +414,52 @@ public struct WorkshopArtifactWriter: Sendable {
         return target
     }
 
+    public func read(relativePath: String, maximumBytes: Int = 65_536) throws -> Read {
+        let components = try Self.validatedPathComponents(relativePath)
+        let dataFD = Darwin.open(dataRoot.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard dataFD >= 0 else { throw Self.posixError("open data root") }
+        defer { Darwin.close(dataFD) }
+        var directoryFD = try Self.openDirectoryComponent("workshop", parentFD: dataFD, create: false)
+        defer { Darwin.close(directoryFD) }
+        let handleFD = try Self.openDirectoryComponent(try Self.validateSafeComponent(handle), parentFD: directoryFD, create: false)
+        Darwin.close(directoryFD)
+        directoryFD = handleFD
+        for component in components.dropLast() {
+            let next = try Self.openDirectoryComponent(component, parentFD: directoryFD, create: false)
+            Darwin.close(directoryFD)
+            directoryFD = next
+        }
+        let leaf = components[components.count - 1]
+        let fileFD = leaf.withCString { Darwin.openat(directoryFD, $0, O_RDONLY | O_NOFOLLOW | O_CLOEXEC) }
+        guard fileFD >= 0 else { throw Self.posixError("open artifact") }
+        defer { Darwin.close(fileFD) }
+        var statValue = stat()
+        guard Darwin.fstat(fileFD, &statValue) == 0, (statValue.st_mode & S_IFMT) == S_IFREG else {
+            throw WorkshopMembraneError.badArtifactArgs("artifact is not a regular file")
+        }
+        let limit = max(1, maximumBytes)
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: min(8192, limit + 1))
+        while data.count <= limit {
+            let requested = min(buffer.count, limit + 1 - data.count)
+            let count = buffer.withUnsafeMutableBytes { raw in
+                Darwin.read(fileFD, raw.baseAddress, requested)
+            }
+            if count < 0 {
+                if errno == EINTR { continue }
+                throw Self.posixError("read artifact")
+            }
+            if count == 0 { break }
+            data.append(contentsOf: buffer.prefix(count))
+        }
+        let truncated = data.count > limit
+        if truncated { data = data.prefix(limit) }
+        guard let content = String(data: data, encoding: .utf8) else {
+            throw WorkshopMembraneError.badArtifactArgs("artifact is not UTF-8 text")
+        }
+        return Read(relativePath: components.joined(separator: "/"), content: content, bytes: data.count, truncated: truncated)
+    }
+
     private static func validatedPathComponents(_ rawPath: String) throws -> [String] {
         let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
@@ -367,8 +514,7 @@ public struct WorkshopArtifactWriter: Sendable {
         )
     }
 
-    /// The single-component safety guard, mirroring
-    /// `SwiftNativeWorkshopCheckpointStore.validateMissionIdAsSafeComponent`.
+    /// The membrane's single-component path-safety guard.
     static func validateSafeComponent(_ raw: String) throws -> String {
         let id = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !id.isEmpty else { throw WorkshopMembraneError.unsafeComponent(raw) }

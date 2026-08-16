@@ -287,21 +287,60 @@ extension CognitiveSubstrate {
 
     // MARK: - Capsule surfacing (called from innerStateCapsuleLines)
 
-    /// The Inner line from the most-recently-updated ACTIVE standing view, or nil when none
-    /// is active. A settled view beats a fresh reflection takeaway — the capsule uses this in
-    /// place of the transient takeaway seed line (never in addition to it), so a `.proposed`
-    /// or `.retired` view NEVER surfaces and the total Inner-line count stays ≤ 1.
-    func activeStandingViewInnerLine() -> String? {
-        guard let view = standingViews.values
+    /// Frozen candidates for the durable `Inner` line. Each candidate carries
+    /// the exact concern vocabulary the existing semantic-appraisal matcher
+    /// assigned to that view at capture time, so a later frozen render never
+    /// rereads live views or affect.
+    func standingViewCapsuleCandidates() -> [CognitiveStandingViewCapsuleCandidate] {
+        let concerns = appraisalConcerns()
+        return standingViews.values
             .filter({ $0.status == .active })
             .sorted(by: { lhs, rhs in
                 if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
                 return lhs.id.uuidString < rhs.id.uuidString
             })
-            .first else { return nil }
-        let text = capsuleLineText(view.body, maxCharacters: 180)
-        guard !text.isEmpty else { return nil }
-        return "- Inner: \(text)"
+            .compactMap { view in
+                let text = capsuleLineText(view.body, maxCharacters: 180)
+                guard !text.isEmpty else { return nil }
+                let lowered = "\(view.title) \(view.body)".lowercased()
+                let keywords = concerns
+                    .filter { Self.concernMatches($0, in: lowered) }
+                    .flatMap(\.keywords)
+                return CognitiveStandingViewCapsuleCandidate(
+                    id: view.id,
+                    line: "- Inner: \(text)",
+                    concernKeywords: Array(Set(keywords)).sorted(),
+                    updatedAt: view.updatedAt
+                )
+            }
+    }
+
+    /// Select at most one durable view for this turn. The canary is entirely
+    /// presentation-side: disabling it restores the historical newest-active
+    /// line, while active views continue to shape appraisal/disposition either
+    /// way. With the canary on, unrelated chat falls through to the fresher
+    /// reflection takeaway instead of repeating one old worldview every turn.
+    func activeStandingViewInnerLine(
+        relevantTo userMessage: String,
+        candidates frozenCandidates: [CognitiveStandingViewCapsuleCandidate]? = nil,
+        relevanceEnabled: Bool? = nil
+    ) -> String? {
+        let candidates = frozenCandidates ?? standingViewCapsuleCandidates()
+        guard let newest = candidates.first else { return nil }
+        let enabled = relevanceEnabled ?? configuration.standingViewCapsuleRelevanceEnabled
+        guard enabled else { return newest.line }
+        let lowered = userMessage.lowercased()
+        guard !lowered.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return candidates.first { candidate in
+            candidate.concernKeywords.contains { lowered.contains($0) }
+        }?.line
+    }
+
+    /// Compatibility read for non-turn diagnostics. It intentionally retains
+    /// the historical newest-active behavior because no user message exists to
+    /// establish relevance.
+    func activeStandingViewInnerLine() -> String? {
+        activeStandingViewInnerLine(relevantTo: "", relevanceEnabled: false)
     }
 
     // MARK: - Surfaces

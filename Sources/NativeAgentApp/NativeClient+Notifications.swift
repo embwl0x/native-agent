@@ -40,7 +40,6 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-import CapabilityFoundry
 
 extension Notification.Name {
     static let nativeAgentTurnNotice = Notification.Name("nativeagent.turn.notice")

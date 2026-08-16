@@ -132,33 +132,23 @@ public actor SwiftNativeManifestSigner {
 
     // MARK: - key
 
-    /// Load existing signing key from data/tools/.manifest_signing_key, or
-    /// generate a fresh 32-byte key (chmod 0o600) if missing or too short.
-    /// Uses NativeAgent's Swift-owned manifest signing key.
+    /// Load the exact regular 0600 signing key, or durably create it when and
+    /// only when the key is missing. Existing invalid authority is unavailable
+    /// and remains byte-preserved; it is never silently rotated.
     public func loadOrCreateSigningKey() throws -> Data {
-        let dir = dataRoot.appendingPathComponent("tools", isDirectory: true)
-        let keyPath = dir.appendingPathComponent(".manifest_signing_key")
+        let keyPath = dataRoot
+            .appendingPathComponent("tools", isDirectory: true)
+            .appendingPathComponent(".manifest_signing_key")
         do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        } catch {
-            throw ManifestSigningError.ioFailed("mkdir tools/: \(error.localizedDescription)")
-        }
-        if FileManager.default.fileExists(atPath: keyPath.path) {
-            if let data = try? Data(contentsOf: keyPath), data.count >= 32 {
-                return data
+            return try CheckedFixedSizeSecretFile.loadOrCreate(at: keyPath, byteCount: 32) {
+                let key = SymmetricKey(size: .bits256)
+                return key.withUnsafeBytes { Data($0) }
             }
-        }
-        let key = SymmetricKey(size: .bits256)
-        let bytes = key.withUnsafeBytes { Data($0) }
-        do {
-            try bytes.write(to: keyPath, options: [.atomic])
-            try FileManager.default.setAttributes(
-                [.posixPermissions: 0o600], ofItemAtPath: keyPath.path
-            )
+        } catch let error as CheckedFixedSizeSecretFile.Unavailable {
+            throw ManifestSigningError.keyUnavailable(error.localizedDescription)
         } catch {
-            throw ManifestSigningError.ioFailed("write key: \(error.localizedDescription)")
+            throw ManifestSigningError.keyUnavailable(error.localizedDescription)
         }
-        return bytes
     }
 
     // MARK: - sign / verify

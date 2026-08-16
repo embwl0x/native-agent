@@ -117,9 +117,12 @@ struct SettingsViewFull: View {
         .refreshable { await store.refresh() }
         .confirmationDialog("Replace the current pairing?", isPresented: $showRePairConfirm, titleVisibility: .visible) {
             Button("Re-pair", role: .destructive) {
-                bridgeClient.disconnect()
-                pairingStore.clearPairing()
-                showRePairSheet = true
+                if pairingStore.clearPairing() {
+                    bridgeClient.disconnect()
+                    showRePairSheet = true
+                } else {
+                    repairResult = "The signing key could not be removed securely. Pairing was left unchanged."
+                }
             }
             Button("Cancel", role: .cancel) {}
         } message: {

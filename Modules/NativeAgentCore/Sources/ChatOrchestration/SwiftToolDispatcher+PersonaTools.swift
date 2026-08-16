@@ -198,16 +198,20 @@ extension SwiftToolDispatcher {
         )
         if let turn = ChatTurnRuntimeContext.current,
            !turn.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            // Report a SELF-CONSISTENT pair: the live turn model and the provider
-            // inferred from that SAME model. Do NOT cross it with active.json's
-            // provider — under a mixed config (surface requests model X but the
-            // active provider serves model Y) that produces a contradictory stamp
-            // like {model: gpt-5.5, name: anthropic_oauth_direct}. The active
-            // provider is reported separately as `surface_active_provider` so the
-            // agent can SEE a config divergence rather than be lied to.
-            let surfaceActiveProvider = await router.activeProvidersForSurfaces()[turn.surface]
+            // Report the exact transport admitted with this turn. Model-family
+            // inference cannot distinguish API-key, OAuth-direct, Codex, or an
+            // OpenRouter route serving the same upstream model.
+            let snapshot = try? await router.checkedRoutingSnapshot()
+            let surfaceActiveProvider = snapshot.flatMap {
+                ProviderRoutingSurfaceLookup.value($0.activeProviders, turn.surface)
+            }
             return .object([
-                "name": .string(router.inferProviderForModel(turn.model) ?? surfaceActiveProvider ?? "unknown"),
+                "name": .string(
+                    turn.providerID
+                        ?? router.inferProviderForModel(turn.model)
+                        ?? surfaceActiveProvider
+                        ?? "unknown"
+                ),
                 "model": .string(turn.model),
                 "surface": .string(turn.surface),
                 "surface_active_provider": surfaceActiveProvider.map { JSONValue.string($0) } ?? .null,
@@ -216,10 +220,16 @@ extension SwiftToolDispatcher {
         }
         // Outside a turn there is no turn model in play; report the chat-surface
         // configured model as the best available answer.
-        if let pref = try? await router.modelForSurface("chat"), !pref.model.isEmpty {
-            let surfaceActiveProvider = await router.activeProvidersForSurfaces()["chat"]
+        if let snapshot = try? await router.checkedRoutingSnapshot(),
+           let pref = ProviderRoutingSurfaceLookup.value(snapshot.preferences, "chat")
+                ?? snapshot.preferences["chat"],
+           !pref.model.isEmpty {
+            let surfaceActiveProvider = ProviderRoutingSurfaceLookup.value(
+                snapshot.activeProviders,
+                "chat"
+            )
             return .object([
-                "name": .string(router.inferProviderForModel(pref.model) ?? surfaceActiveProvider ?? "unknown"),
+                "name": .string(surfaceActiveProvider ?? router.inferProviderForModel(pref.model) ?? "unknown"),
                 "model": .string(pref.model),
                 "surface": .string("chat"),
                 "surface_active_provider": surfaceActiveProvider.map { JSONValue.string($0) } ?? .null,

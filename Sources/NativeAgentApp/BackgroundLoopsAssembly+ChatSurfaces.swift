@@ -17,6 +17,24 @@ import SelfImprovement
 // MARK: - Chat Surface Loops
 
 extension BackgroundLoopsAssembly {
+    private static func withChatTranscriptCompletionSignal<T>(
+        sessionID: String,
+        operation: () async throws -> T
+    ) async rethrows -> T {
+        do {
+            let value = try await operation()
+            await MainActor.run {
+                NotificationCenter.default.post(name: .chatTurnCompleted, object: sessionID)
+            }
+            return value
+        } catch {
+            await MainActor.run {
+                NotificationCenter.default.post(name: .chatTurnCompleted, object: sessionID)
+            }
+            throw error
+        }
+    }
+
     static func makeSlackSocketModeLoopIfConfigured(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> SlackSocketModeLoop? {
@@ -43,23 +61,25 @@ extension BackgroundLoopsAssembly {
             // binding is REMOVED. Socket mode carries no request signature;
             // slack origin trust now comes from the explicit slack allowlist
             // in SecurityCenter.assessOrigin (mirroring telegram).
-            let response = try await ChatToolSessionContext.$verifiedChatId.withValue(inbound.channelId) {
-                try await ChatToolSessionContext.$verifiedUserId.withValue(inbound.userId) {
-                try await ChatToolSessionContext.$replyRoute.withValue(replyRoute) {
-                    try await client.chat(
-                        message: prompt,
-                        sessionId: sessionId,
-                        // The chat facade admits the complete checked tuple
-                        // once; surface shells provide no stale partial pick.
-                        model: "",
-                        reasoningEffort: "",
-                        fileAccess: "auto",
-                        attachments: [],
-                        persona: NativeAgentNotificationDefaults.agentDisplayName(dataRoot: dataRoot),
-                        surface: "slack",
-                        suppressUserAppend: false
-                    )
-                }
+            let response = try await withChatTranscriptCompletionSignal(sessionID: sessionId) {
+                try await ChatToolSessionContext.$verifiedChatId.withValue(inbound.channelId) {
+                    try await ChatToolSessionContext.$verifiedUserId.withValue(inbound.userId) {
+                        try await ChatToolSessionContext.$replyRoute.withValue(replyRoute) {
+                            try await client.chat(
+                                message: prompt,
+                                sessionId: sessionId,
+                                // The chat facade admits the complete checked tuple
+                                // once; surface shells provide no stale partial pick.
+                                model: "",
+                                reasoningEffort: "",
+                                fileAccess: "auto",
+                                attachments: inbound.attachments,
+                                persona: NativeAgentNotificationDefaults.agentDisplayName(dataRoot: dataRoot),
+                                surface: "slack",
+                                suppressUserAppend: false
+                            )
+                        }
+                    }
                 }
             }
             return SlackSocketModeReply(
@@ -179,26 +199,27 @@ extension BackgroundLoopsAssembly {
             // allowlist trust even when the active session is a bare UUID
             // (post-/new), not the legacy `telegram:<chatId>` form. See
             // ChatToolSessionContext.
-            let response = try await ChatToolSessionContext.$verifiedChatId.withValue(String(chatId)) {
-                try await ChatToolSessionContext.$verifiedUserId.withValue(
-                    context.fromUserId.map(String.init)
-                ) {
-                    try await ChatToolSessionContext.$verifiedSessionId.withValue(sessionId) {
-                        try await ChatToolSessionContext.$replyRoute.withValue(replyRoute) {
-                            try await client.chat(
-                                message: effectiveText,
-                                sessionId: sessionId,
-                                // The facade freezes provider/model/effort/tier
-                                // before branch selection and context assembly.
-                                model: "",
-                                reasoningEffort: "",
-                                fileAccess: "auto",
-                                attachments: chatAttachments,
-                                persona: persona,
-                                surface: "telegram",
-                                suppressUserAppend: context.suppressUserAppend,
-                                progress: { event in
-                                    switch event {
+            let response = try await withChatTranscriptCompletionSignal(sessionID: sessionId) {
+                try await ChatToolSessionContext.$verifiedChatId.withValue(String(chatId)) {
+                    try await ChatToolSessionContext.$verifiedUserId.withValue(
+                        context.fromUserId.map(String.init)
+                    ) {
+                        try await ChatToolSessionContext.$verifiedSessionId.withValue(sessionId) {
+                            try await ChatToolSessionContext.$replyRoute.withValue(replyRoute) {
+                                try await client.chat(
+                                    message: effectiveText,
+                                    sessionId: sessionId,
+                                    // The facade freezes provider/model/effort/tier
+                                    // before branch selection and context assembly.
+                                    model: "",
+                                    reasoningEffort: "",
+                                    fileAccess: "auto",
+                                    attachments: chatAttachments,
+                                    persona: persona,
+                                    surface: "telegram",
+                                    suppressUserAppend: context.suppressUserAppend,
+                                    progress: { event in
+                                        switch event {
                                         case .toolUse(let name, let input):
                                             await progress(.toolUse(name: name, input: input))
                                         case .toolResult(let name, let output):
@@ -220,9 +241,10 @@ extension BackgroundLoopsAssembly {
                                             await progress(.textDelta(accumulated: deltaAccumulator.append(chunk)))
                                         case .final, .error:
                                             break
+                                        }
                                     }
-                                }
-                            )
+                                )
+                            }
                         }
                     }
                 }
@@ -268,7 +290,7 @@ extension BackgroundLoopsAssembly {
 
 }
 
-private struct TelegramProviderRoutingBridge: ProviderRoutingRef, Sendable {
+struct TelegramProviderRoutingBridge: ProviderRoutingRef, Sendable {
     let routing: SwiftNativeProviderRouting
     let dataRoot: URL
 
@@ -300,30 +322,31 @@ private struct TelegramProviderRoutingBridge: ProviderRoutingRef, Sendable {
     }
 
     func saveModelSelection(surface: String, provider: String?, model: String) async throws {
-        var body: [String: JSONValue] = [
-            "surface": .string(surface),
-            "model": .string(model),
-        ]
-        if let provider,
-           !provider.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            try await NativeClient.writeActiveProvider(
-                surface: surface,
-                providerID: provider,
-                dataRoot: dataRoot
-            )
-            body["inferProvider"] = .bool(false)
-        } else {
-            body["inferProvider"] = .bool(true)
-        }
-        _ = try await routing.saveModelConfig(.object(body))
+        let explicitProvider = provider?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let admittedProvider = explicitProvider?.isEmpty == false
+            ? explicitProvider
+            : routing.inferProviderForModel(model)
+        try await routing.saveSurfaceConfiguration(
+            surface: surface,
+            model: model,
+            reasoningEffort: nil,
+            serviceTier: nil,
+            providerId: admittedProvider
+        )
     }
 
     func modelMenuForSurface(_ surface: String) async -> TelegramModelMenu? {
-        guard let current = await modelForSurface(surface) else {
+        guard let snapshot = try? await routing.checkedRoutingSnapshot(),
+              let preference = snapshot.preferences[surface] else {
             return nil
         }
-        let active = await routing.activeProvidersForSurfaces()
-        let currentProvider = active[surface] ?? current.provider
+        let current = (
+            model: preference.model,
+            provider: snapshot.activeProviders[surface]
+                ?? routing.inferProviderForModel(preference.model)
+                ?? "unknown"
+        )
+        let currentProvider = current.provider
         guard let providers = try? await routing.listProviders() else {
             return nil
         }
@@ -395,24 +418,16 @@ private struct TelegramProviderRoutingBridge: ProviderRoutingRef, Sendable {
         )
     }
 
-    private static func providerIdsMatch(_ lhs: String, _ rhs: String) -> Bool {
+    static func providerIdsMatch(_ lhs: String, _ rhs: String) -> Bool {
         normalizeProviderId(lhs) == normalizeProviderId(rhs)
     }
 
     private static func normalizeProviderId(_ raw: String) -> String {
         switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "anthropic", "anthropic_oauth_direct", "anthropic_mcp":
-            return "anthropic"
-        case "openai", "openai_oauth_direct":
-            return "openai"
         case "xai", "xai_oauth_direct", "xai-oauth", "grok-oauth", "x-ai-oauth", "xai-grok-oauth":
-            return "xai"
+            return "xai_oauth_direct"
         case "moonshot", "kimi":
             return "moonshot"
-        case "openrouter":
-            return "openrouter"
-        case "codex":
-            return "codex"
         default:
             return raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         }
@@ -559,17 +574,8 @@ struct TelegramMemoryWriterBridge: TelegramMemoryWriteRef, Sendable {
         self.dataRoot = dataRoot
         if let memory {
             self.memory = memory
-        } else if dataRoot.standardizedFileURL
-            == PersistenceCore.defaultDataRoot().standardizedFileURL {
-            self.memory = .shared
-        } else if let storage = try? MemoryStorage(dataRoot: dataRoot) {
-            self.memory = SwiftNativeMemoryV2(
-                embedder: ManagedEmbeddingProvider(dataRoot: dataRoot),
-                storage: MemoryStorageBridge(storage: storage)
-            )
         } else {
-            // Fail closed rather than falling back to the live singleton.
-            self.memory = SwiftNativeMemoryV2()
+            self.memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
         }
     }
 

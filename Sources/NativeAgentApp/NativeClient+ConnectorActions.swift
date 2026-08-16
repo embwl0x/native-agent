@@ -40,13 +40,13 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-import CapabilityFoundry
 
 extension NativeClient {
     func runConnectorAction(
         id: String,
         dryRun: Bool,
         input: [String: JSONValue] = [:],
+        externalSendIdempotencyKey: String? = nil,
         dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot()
     ) async throws -> ConnectorActionReceipt {
         let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -60,6 +60,7 @@ extension NativeClient {
             descriptor: descriptor,
             dryRun: dryRun,
             input: input,
+            externalSendIdempotencyKey: externalSendIdempotencyKey,
             dataRoot: dataRoot
         )
     }
@@ -68,6 +69,8 @@ extension NativeClient {
         descriptor: ConnectorActionDescriptor,
         dryRun: Bool,
         input: [String: JSONValue] = [:],
+        externalSendIdempotencyKey: String? = nil,
+        approvedReplayApprovalID: String? = nil,
         dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot()
     ) async throws -> ConnectorActionReceipt {
         if !dryRun,
@@ -76,6 +79,7 @@ extension NativeClient {
                 invokedAs: descriptor.id,
                 input: input,
                 surface: "connector_action",
+                idempotencyKey: externalSendIdempotencyKey,
                 dataRoot: dataRoot
             )
             return try await Self.appendConnectorActionReceipt(
@@ -88,8 +92,12 @@ extension NativeClient {
             )
         }
 
-        if descriptor.requiresApproval, !dryRun {
-            let approval = try await Self.createConnectorActionApproval(descriptor, dataRoot: dataRoot)
+        if descriptor.requiresApproval, !dryRun, approvedReplayApprovalID == nil {
+            let approval = try await Self.createConnectorActionApproval(
+                descriptor,
+                input: input,
+                dataRoot: dataRoot
+            )
             return try await Self.appendConnectorActionReceipt(
                 descriptor: descriptor,
                 status: "pending_approval",
@@ -107,6 +115,14 @@ extension NativeClient {
         }
 
         if !dryRun {
+            if let approvalID = approvedReplayApprovalID {
+                try await Self.validateApprovedConnectorReplay(
+                    approvalID: approvalID,
+                    descriptor: descriptor,
+                    input: input,
+                    dataRoot: dataRoot
+                )
+            }
             let output: JSONValue
             var receiptStatus = "completed"
             switch descriptor.id {
@@ -249,7 +265,7 @@ extension NativeClient {
                 descriptor: descriptor,
                 status: receiptStatus,
                 dryRun: false,
-                approvalId: nil,
+                approvalId: approvedReplayApprovalID,
                 output: output,
                 dataRoot: dataRoot
             )
@@ -680,8 +696,24 @@ extension NativeClient {
 
     static func createConnectorActionApproval(
         _ descriptor: ConnectorActionDescriptor,
+        input: [String: JSONValue],
         dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot()
     ) async throws -> ApprovalRecord {
+        let payload: JSONValue = .object([
+            "kind": .string("connector_action_v1"),
+            "surface": .string("connector_action"),
+            "actionId": .string(descriptor.id),
+            "connectorId": .string(descriptor.connectorId),
+            "name": .string(descriptor.name ?? descriptor.id),
+            "risk": .string(descriptor.risk),
+            "input": .object(input),
+        ])
+        let payloadBytes = try payload.serializedData(pretty: false)
+        guard payloadBytes.count <= 65_536 else {
+            throw NSError(domain: "NativeAgentConnectorApproval", code: 413, userInfo: [
+                NSLocalizedDescriptionKey: "Connector approval input exceeds the 64 KiB replay limit."
+            ])
+        }
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         return try await inbox.create(.object([
             "title": .string("Approve \(descriptor.name ?? descriptor.id)"),
@@ -690,14 +722,53 @@ extension NativeClient {
             "reason": .string("Connector action \(descriptor.id) requires approval before any external side effect can run."),
             "remoteResolvable": .bool(true),
             "localOnly": .bool(false),
-            "payload": .object([
-                "surface": .string("connector_action"),
-                "actionId": .string(descriptor.id),
-                "connectorId": .string(descriptor.connectorId),
-                "name": .string(descriptor.name ?? descriptor.id),
-                "risk": .string(descriptor.risk),
-            ]),
+            "payload": payload,
         ]))
+    }
+
+    struct ConnectorActionApprovalReplay: Sendable {
+        let actionID: String
+        let connectorID: String
+        let surface: String
+        let input: [String: JSONValue]
+    }
+
+    static func connectorActionApprovalReplay(from record: ApprovalRecord) -> ConnectorActionApprovalReplay? {
+        guard record.action.hasPrefix("connector.action."),
+              case .object(let payload) = record.payload,
+              payload["kind"] == .string("connector_action_v1"),
+              case .string(let actionID)? = payload["actionId"],
+              record.action == "connector.action.\(actionID)",
+              case .string(let connectorID)? = payload["connectorId"],
+              case .string(let surface)? = payload["surface"],
+              surface == "connector_action",
+              case .object(let input)? = payload["input"] else {
+            return nil
+        }
+        return ConnectorActionApprovalReplay(
+            actionID: actionID,
+            connectorID: connectorID,
+            surface: surface,
+            input: input
+        )
+    }
+
+    static func validateApprovedConnectorReplay(
+        approvalID: String,
+        descriptor: ConnectorActionDescriptor,
+        input: [String: JSONValue],
+        dataRoot: URL
+    ) async throws {
+        let record = try await SwiftNativeApprovalInbox(root: dataRoot).get(approvalID)
+        guard record.status == "resolved", record.decision == "approved",
+              let replay = connectorActionApprovalReplay(from: record),
+              replay.actionID == descriptor.id,
+              replay.connectorID == descriptor.connectorId,
+              replay.input == input else {
+            throw NSError(domain: "NativeAgentConnectorApproval", code: 403, userInfo: [
+                NSLocalizedDescriptionKey: "Connector execution no longer matches the exact approved payload."
+            ])
+        }
     }
 
     static func appendConnectorActionReceipt(

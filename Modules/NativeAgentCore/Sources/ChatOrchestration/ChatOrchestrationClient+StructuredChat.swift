@@ -949,6 +949,8 @@ extension SwiftNativeChatOrchestrationClient {
             // request's own ceiling, never the substrate's.
             maximumCharacters: ContextBudgetPolicy.resolve(
                 model: LLMCallContext.admittedModel,
+                providerID: LLMCallContext.providerId,
+                dataRoot: dataRoot,
                 surface: surface
             ).capsuleChars,
             allowNonLiveProjection: Self.shouldProjectCognitiveStateForTrustedBridgeEnvelope(

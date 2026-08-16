@@ -15,15 +15,6 @@ import NativeAgentShared
 import UIKit
 #endif
 
-struct MacBridgeHTTPError: LocalizedError, Sendable {
-    let statusCode: Int
-    let detail: String
-
-    var errorDescription: String? {
-        detail.isEmpty ? "Mac runtime returned HTTP \(statusCode)." : detail
-    }
-}
-
 private final class DeviceSourceKeyCache: @unchecked Sendable {
     private let lock = NSLock()
     private var value: String?
@@ -382,7 +373,7 @@ final class MacBridgeClient: ObservableObject {
         return Self.projectChatRecords(records)
     }
 
-    private static func projectChatRecords(_ records: [ChatMessageRecord]) -> [ChatMessage] {
+    static func projectChatRecords(_ records: [ChatMessageRecord]) -> [ChatMessage] {
         // eval3/T3 data-flow:
         // iOS send → BridgeMessage.attachments → Mac Swift runtime forwarding
         //   → ChatOrchestrationClient.appendMessage writes

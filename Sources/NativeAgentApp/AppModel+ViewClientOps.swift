@@ -54,8 +54,18 @@ extension AppModel {
         try await client.getSessionContext(sessionId: sessionId, model: model)
     }
 
-    func compactSession(sessionId: String, force: Bool = false) async throws -> CompactionResult {
-        try await client.compactSession(sessionId: sessionId, force: force)
+    func compactSession(
+        sessionId: String,
+        model: String? = nil,
+        providerID: String? = nil,
+        force: Bool = false
+    ) async throws -> CompactionResult {
+        try await client.compactSession(
+            sessionId: sessionId,
+            model: model,
+            providerID: providerID,
+            force: force
+        )
     }
 
     func postContextFeedback(

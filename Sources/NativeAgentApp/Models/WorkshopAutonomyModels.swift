@@ -132,26 +132,6 @@ extension WorkshopExecutionRecord {
 
 // WorkshopCounts, ConnectorSummary, TrustSummary moved to NativeAgentShared.
 
-struct CommandSummary: Codable, Hashable {
-    var health: RuntimeHealth
-    var codexAuth: CodexAuthStatus
-    var executionCounts: WorkshopCounts
-    var activeExecutions: [WorkshopExecutionRecord]
-    var recentActivity: [ActivityEvent]
-    var nextJobs: [SchedulerJob]
-    var connectorSummary: ConnectorSummary
-    var autonomyCommandCenter: AutonomyCommandCenterSummary?
-    var coordinationSummary: CoordinationSummary?
-    var trustSummary: TrustSummary
-    var latestEval: EvalRun?
-
-    enum CodingKeys: String, CodingKey {
-        case health, codexAuth, recentActivity, nextJobs, connectorSummary
-        case autonomyCommandCenter, coordinationSummary, trustSummary, latestEval
-        case executionCounts = "missionCounts" // compatibility wire ID
-        case activeExecutions = "activeMissions" // compatibility wire ID
-    }
-}
 
 struct CoordinationSummary: Codable, Hashable {
     var status: String?

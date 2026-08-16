@@ -229,29 +229,30 @@ extension ChatStore {
            let args = pendingSendArgs[pendingId],
            !retriedSignatureCorrelations.contains(pendingId),
            let client = pendingRetryClient {
+            // Reserve the one refresh attempt before suspension so repeated
+            // forged/duplicate rejection envelopes cannot queue replay tasks.
             retriedSignatureCorrelations.insert(pendingId)
-            pendingSendArgs.removeValue(forKey: pendingId)
-            pendingICloudPlaceholders.removeValue(forKey: pendingId)
-            pendingTimeouts.removeValue(forKey: pendingId)?.cancel()
-            pendingPolls.removeValue(forKey: pendingId)?.cancel()
-            streamingHintsByMessageId.removeValue(forKey: placeholderId)
-            if let idx = messages.firstIndex(where: { $0.id == placeholderId }) {
-                messages.remove(at: idx)
-            }
-            isLoading = false
-            errorBanner = nil
-            // 2026-07-21 audit: refreshFromKVS is async now (KVS synchronize
-            // runs under a timeout off the MainActor). F3-H1 (round-3 audit):
-            // the retry send MUST run AFTER the refresh completes, otherwise it
-            // re-signs with the STALE secret while the detached refresh Task is
-            // still suspended at the KVS synchronize — the single retry slot is
-            // already consumed above, so the second signature_invalid rejection
-            // falls through to failPendingReply and the message is permanently
-            // dropped on exactly the stale-secret event this path exists to
-            // heal. ChatStore is @MainActor, so this Task inherits MainActor
-            // isolation and send() (a ChatStore method) runs correctly here.
             Task {
-                _ = await pairingStoreRef?.refreshFromKVS()
+                guard await pairingStoreRef?.refreshFromKVS() == true else {
+                    failPendingReply(
+                        pendingId: pendingId,
+                        placeholderId: placeholderId,
+                        placeholderText: "(Mac reply rejected — re-pair this iPhone with the Mac)",
+                        banner: "Pairing out of sync — re-pair?"
+                    )
+                    pendingSendArgs.removeValue(forKey: pendingId)
+                    return
+                }
+                pendingSendArgs.removeValue(forKey: pendingId)
+                pendingICloudPlaceholders.removeValue(forKey: pendingId)
+                pendingTimeouts.removeValue(forKey: pendingId)?.cancel()
+                pendingPolls.removeValue(forKey: pendingId)?.cancel()
+                streamingHintsByMessageId.removeValue(forKey: placeholderId)
+                if let idx = messages.firstIndex(where: { $0.id == placeholderId }) {
+                    messages.remove(at: idx)
+                }
+                isLoading = false
+                errorBanner = nil
                 send(
                     text: args.text,
                     client: client,
@@ -274,15 +275,16 @@ extension ChatStore {
         pendingSendArgs.removeValue(forKey: pendingId)
     }
 
-    /// Phase 14e-iCloud HMAC self-heal: receive an unsigned signature_invalid_resync
-    /// hint from Mac. PairingStore.refreshFromKVS() already runs at the bridge
-    /// dispatcher layer; here we just trigger a one-shot replay of any pending
-    /// send tied to the rejected message id in the hint metadata.
+    /// An unsigned resync envelope is only delivered here after the bridge
+    /// durably installed a different KVS key. Never trust its attacker-controlled
+    /// correlation metadata; retry the locally-owned pending send instead.
     func receiveICloudResyncHint(_ hint: BridgeMessage, client: MacBridgeClient) {
-        let rejectedId = hint.metadata?["rejectedMessageId"] ?? hint.correlationID ?? ""
-        guard !rejectedId.isEmpty,
+        _ = hint
+        guard let rejectedId = pendingSendArgs.keys.first(where: {
+                  pendingICloudPlaceholders[$0] != nil
+                    && !retriedSignatureCorrelations.contains($0)
+              }),
               let args = pendingSendArgs[rejectedId],
-              !retriedSignatureCorrelations.contains(rejectedId),
               let placeholderId = pendingICloudPlaceholders[rejectedId]
         else { return }
         retriedSignatureCorrelations.insert(rejectedId)

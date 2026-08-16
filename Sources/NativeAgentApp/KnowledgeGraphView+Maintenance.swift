@@ -88,7 +88,9 @@ extension KnowledgeGraphView {
         defer { gcRunning = false }
         gcStatus = nil
         do {
-            let storage = try MemoryStorage(dataRoot: PersistenceCore.defaultDataRoot())
+            let storage = try await SwiftNativeMemoryV2.resolvedStorage(
+                dataRoot: PersistenceCore.defaultDataRoot()
+            )
             let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: await storage.path)
             let facts = try await listGCFacts(storage)
             let report = try await indexer.collectGarbage(liveFacts: facts, apply: false)
@@ -114,7 +116,9 @@ extension KnowledgeGraphView {
         do {
             // Re-list immediately before applying so the live set is fresh;
             // the GC re-scans inside its write transaction as well.
-            let storage = try MemoryStorage(dataRoot: PersistenceCore.defaultDataRoot())
+            let storage = try await SwiftNativeMemoryV2.resolvedStorage(
+                dataRoot: PersistenceCore.defaultDataRoot()
+            )
             let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: await storage.path)
             let facts = try await listGCFacts(storage)
             // The confirmation dialog the user just clicked IS the approval —

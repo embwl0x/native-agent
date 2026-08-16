@@ -163,7 +163,11 @@ extension SwiftNativeApprovalInbox: InjectionApprovalSpendingInbox {
                 underlying: "injection spend store unreadable: \(error.localizedDescription)"
             )
         }
-        if data.isEmpty { return [:] }
+        guard !data.isEmpty else {
+            throw ApprovalInboxError.malformedResponse(
+                "injection spend store exists but is empty"
+            )
+        }
         let raw: JSONValue
         do {
             raw = try JSONValue.parse(data)
@@ -175,8 +179,25 @@ extension SwiftNativeApprovalInbox: InjectionApprovalSpendingInbox {
         guard case .object(let root) = raw else {
             throw ApprovalInboxError.malformedResponse("injection spend store is not a JSON object")
         }
+        guard root["schema"] == .string(injectionSpendSchema) else {
+            throw ApprovalInboxError.malformedResponse(
+                "injection spend store has an unsupported schema"
+            )
+        }
         guard case .object(let spends)? = root["spends"] else {
             throw ApprovalInboxError.malformedResponse("injection spend store has no spends map")
+        }
+        for (id, value) in spends {
+            guard !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  case .object(let marker) = value,
+                  case .string(let digest)? = marker["digest"], !digest.isEmpty,
+                  case .string(let tool)? = marker["tool"], !tool.isEmpty,
+                  case .string(let surface)? = marker["surface"], !surface.isEmpty,
+                  case .string(let spentAt)? = marker["spentAt"], !spentAt.isEmpty else {
+                throw ApprovalInboxError.malformedResponse(
+                    "injection spend store contains a malformed marker"
+                )
+            }
         }
         return spends
     }

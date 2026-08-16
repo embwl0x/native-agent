@@ -5,31 +5,6 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-extension CognitiveMemoryProposalCandidate {
-    func toJSON() -> JSONValue {
-        .object([
-            "id": .string(id.uuidString),
-            "text": .string(text),
-            "source": .string(source),
-            "confidence": .double(confidence),
-            "kind": .string(kind),
-            "evidenceNodeIds": .array(evidenceNodeIds.map { .string($0.uuidString) }),
-        ])
-    }
-}
-
-extension CognitiveMemoryProposalStageReceipt {
-    func toJSON() -> JSONValue {
-        var obj: [String: JSONValue] = [
-            "candidateId": .string(candidateId.uuidString),
-            "status": .string(status),
-        ]
-        if let externalProposalId { obj["externalProposalId"] = .string(externalProposalId) }
-        if let error { obj["error"] = .string(error) }
-        return .object(obj)
-    }
-}
-
 extension CognitiveAffectState {
     func toJSON(
         lastUserPresenceAt: Date? = nil,
@@ -96,19 +71,6 @@ extension CognitiveSchemaProposal {
             "evidenceNodeIds": .array(evidenceNodeIds.map { .string($0.uuidString) }),
             "externalEvidenceIds": .array(externalEvidenceIds.map { .string($0) }),
             "lineageId": .string(lineageId),
-        ])
-    }
-}
-
-extension CognitiveIdentityProposal {
-    func toJSON() -> JSONValue {
-        .object([
-            "id": .string(id.uuidString),
-            "claim": .string(claim),
-            "evidenceCount": .int(Int64(evidenceCount)),
-            "status": .string(status.rawValue),
-            "createdAt": .double(createdAt.timeIntervalSince1970),
-            "evidenceNodeIds": .array(evidenceNodeIds.map { .string($0.uuidString) }),
         ])
     }
 }

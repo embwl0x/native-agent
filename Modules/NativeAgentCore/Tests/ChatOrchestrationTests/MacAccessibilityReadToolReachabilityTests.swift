@@ -62,7 +62,7 @@ private func axFullMacPolicy(accessibilityAllowed: Bool) -> JSONValue {
 // no-approval contract, so every reachability property asserted here must hold
 // for it too. Its own W3.5-specific surface (schema shape, action mapping,
 // mark plumbing) is pinned in MacFusedViewToolReachabilityTests.
-private let axToolNames = ["mac_ax_status", "mac_ax_tree", "mac_ax_find", "mac_view"]
+private let axToolNames = ["mac_ax_status", "mac_ax_tree", "mac_ax_find", "mac_view", "mac_attention"]
 
 // MARK: - Catalog reachability
 
@@ -170,6 +170,11 @@ func macAXReadTools_schemasDeclareTheDocumentedParameters() async throws {
     #expect(Set(tree.keys) == ["max_nodes", "max_depth"])
     let find = try properties("mac_ax_find")
     #expect(Set(find.keys) == ["role", "title", "value", "limit"])
+    let attention = try properties("mac_attention")
+    #expect(Set(attention.keys) == [
+        "mode", "session", "after_sequence", "wait_ms", "duration_seconds",
+        "full_screen", "max_marks", "max_text_items", "max_image_bytes",
+    ])
 }
 
 // MARK: - Dispatch mapping
@@ -244,7 +249,7 @@ func macAXReadTools_resolveToAutoWithNoApprovalTier() async throws {
         Issue.record("expected toolAutonomy object in the default trust policy")
         return
     }
-    for actionId in ["mac.ax_status", "mac.ax_tree", "mac.ax_find", "mac.view"] {
+    for actionId in ["mac.ax_status", "mac.ax_tree", "mac.ax_find", "mac.view", "mac.attention"] {
         #expect(autonomy[actionId] == .string("auto"),
                 "\(actionId) must carry an explicit auto tier in the Trust Center defaults")
     }
@@ -314,7 +319,7 @@ func macAXReadActions_areInTheBridgeDispatchableSet() {
     // NativeClient+CutoverSeams' HTTP/iOS-remote route 404s any action outside
     // this set. Gating it on macControlAllActions (daemon parity only) is what
     // made ax_* unreachable on the bridge path.
-    for action in ["ax_status", "ax_tree", "ax_find", "view"] {
+    for action in ["ax_status", "ax_tree", "ax_find", "view", "attention"] {
         #expect(macControlDispatchableActions.contains(action),
                 "\(action) must be in macControlDispatchableActions or the bridge route 404s it")
         #expect(!macControlAllActions.contains(action),

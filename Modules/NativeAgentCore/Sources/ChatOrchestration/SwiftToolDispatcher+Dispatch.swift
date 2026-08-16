@@ -319,6 +319,14 @@ extension SwiftToolDispatcher {
             return try await GitHubConnectorActions.status(input: input, dataRoot: dataRoot)
         case "github_list_repos":
             return try await GitHubConnectorActions.listRepos(input: input, dataRoot: dataRoot)
+        case "github_list_notifications":
+            return try await GitHubConnectorActions.listNotifications(input: input, dataRoot: dataRoot)
+        case "github_get_repository":
+            return try await GitHubConnectorActions.getRepository(input: input, dataRoot: dataRoot)
+        case "github_read_repository_content":
+            return try await GitHubConnectorActions.readRepositoryContent(input: input, dataRoot: dataRoot)
+        case "github_list_commits":
+            return try await GitHubConnectorActions.listCommits(input: input, dataRoot: dataRoot)
         case "github_list_issues":
             return try await GitHubConnectorActions.listIssues(input: input, dataRoot: dataRoot)
         case "github_search":

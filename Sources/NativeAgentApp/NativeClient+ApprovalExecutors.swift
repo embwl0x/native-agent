@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import Observation
 import Darwin
 import AppKit
@@ -37,7 +38,6 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-import CapabilityFoundry
 
 // W-H Band 1 (U5 decomposition, move-only): approval executors +
 // reconciles extracted verbatim from NativeClient.swift (formerly the
@@ -161,7 +161,7 @@ extension NativeClient {
                     // (gpt-5.5 HIGH — silently flipping approved here would
                     // recreate approved-but-unwritten permanently, with a
                     // success annotation blocking the reconcile).
-                    proposalText = await store.loadAll()
+                    proposalText = store.loadAll()
                         .first { $0.id == proposalId }?.proposalText ?? ""
                 }
                 guard !proposalText.isEmpty else {
@@ -275,6 +275,7 @@ extension NativeClient {
             dataRoot: dataRoot,
             kinds: productionApprovalReconcileKinds())
         await reconcileUnappliedChatToolApprovalExecutions(dataRoot: dataRoot)
+        await reconcileUnappliedConnectorActionApprovals(dataRoot: dataRoot)
     }
 
     /// Scan core, split out so tests can run it against a fixture root with
@@ -506,6 +507,141 @@ extension NativeClient {
         }
     }
 
+    static func reconcileUnappliedConnectorActionApprovals(
+        dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot()
+    ) async {
+        let inbox = SwiftNativeApprovalInbox(root: dataRoot)
+        let resolved: [ApprovalRecord]
+        do {
+            resolved = try await inbox.list(filter: .resolved)
+        } catch {
+            NSLog("[approvalReconcile] connector approval scan failed: \(String(describing: error))")
+            return
+        }
+        let client = NativeClient(baseURL: "")
+        for record in resolved
+        where record.action.hasPrefix("connector.action.") && record.executedAction == nil {
+            _ = await client.applyResolvedConnectorAction(from: record, dataRoot: dataRoot)
+        }
+    }
+
+    /// Execute the exact bounded connector input carried by the approval. The
+    /// return value controls visible-card archival: an uncertain or refused
+    /// effect stays visible instead of presenting an approved card as done.
+    private func applyResolvedConnectorAction(
+        from record: ApprovalRecord,
+        dataRoot: URL
+    ) async -> Bool {
+        guard record.status == "resolved", let decision = record.decision else { return false }
+        guard decision == "approved" else {
+            try? await Self.annotateApprovalExecution(
+                id: record.id,
+                executedAction: .object([
+                    "op": .string("connector_action_replay"),
+                    "action": .string(record.action),
+                    "status": .string(decision),
+                ]),
+                detail: "Connector action \(decision); no connector call ran.",
+                root: dataRoot
+            )
+            return true
+        }
+
+        guard let replay = Self.connectorActionApprovalReplay(from: record),
+              let descriptor = connectorActionDescriptors().first(where: {
+                  $0.id == replay.actionID && $0.connectorId == replay.connectorID
+              }) else {
+            try? await Self.annotateApprovalExecution(
+                id: record.id,
+                executedAction: .object([
+                    "op": .string("connector_action_replay"),
+                    "action": .string(record.action),
+                    "status": .string("failed"),
+                    "error": .string("approval has no valid bounded replay payload or registered executor"),
+                ]),
+                detail: "FAILED: connector approval has no valid bounded replay payload or registered executor; no connector call ran.",
+                root: dataRoot
+            )
+            return false
+        }
+
+        let inbox = SwiftNativeApprovalInbox(root: dataRoot)
+        switch await inbox.consumeApprovedEffect(
+            id: record.id,
+            digest: Self.approvalEffectDigest(record.payload),
+            action: replay.actionID,
+            surface: replay.surface
+        ) {
+        case .spent:
+            break
+        case .alreadySpent:
+            if (try? await inbox.get(record.id).executedAction) == nil {
+                try? await Self.annotateApprovalExecution(
+                    id: record.id,
+                    executedAction: .object([
+                        "op": .string("connector_action_replay"),
+                        "action": .string(replay.actionID),
+                        "status": .string("outcome_unknown"),
+                        "error": .string("execution already started; automatic replay refused"),
+                    ]),
+                    detail: "Connector action may have started before interruption; it was not replayed automatically.",
+                    root: dataRoot
+                )
+            }
+            return false
+        case .unavailable:
+            try? await Self.annotateApprovalExecution(
+                id: record.id,
+                executedAction: .object([
+                    "op": .string("connector_action_replay"),
+                    "action": .string(replay.actionID),
+                    "status": .string("blocked"),
+                    "error": .string("durable execution fence unavailable"),
+                ]),
+                detail: "Connector action was blocked before execution because its durable replay fence was unavailable.",
+                root: dataRoot
+            )
+            return false
+        }
+
+        do {
+            let receipt = try await runConnectorAction(
+                descriptor: descriptor,
+                dryRun: false,
+                input: replay.input,
+                approvedReplayApprovalID: record.id,
+                dataRoot: dataRoot
+            )
+            try? await Self.annotateApprovalExecution(
+                id: record.id,
+                executedAction: .object([
+                    "op": .string("connector_action_replay"),
+                    "action": .string(replay.actionID),
+                    "status": .string(receipt.status),
+                    "receiptId": .string(receipt.id),
+                ]),
+                detail: "Connector action \(replay.actionID) finished after approval with status \(receipt.status).",
+                root: dataRoot
+            )
+            return ["completed", "succeeded", "ok"].contains(
+                receipt.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            )
+        } catch {
+            try? await Self.annotateApprovalExecution(
+                id: record.id,
+                executedAction: .object([
+                    "op": .string("connector_action_replay"),
+                    "action": .string(replay.actionID),
+                    "status": .string("outcome_unknown"),
+                    "error": .string(String(describing: error)),
+                ]),
+                detail: "Connector action did not produce a verified receipt after approval; outcome is unknown and it was not retried.",
+                root: dataRoot
+            )
+            return false
+        }
+    }
+
     /// Recover only the historical failure where a resolved persona approval
     /// was rejected before the inner tool ran because replay asked the dynamic
     /// persona guard for a second approval without a filer. Other failed side
@@ -560,6 +696,57 @@ extension NativeClient {
                 detail: "\(replay.toolName) \(decision); no tool execution run.",
                 root: dataRoot)
             return
+        }
+
+        // Injection approvals have their own capability-specific durable spend
+        // inside InjectionApprovalVerifier. Every other generic approved tool
+        // spends here, immediately before dispatch. A crash can therefore
+        // leave an unknown outcome, but it cannot turn one approval into a
+        // second effect after restart.
+        if !MacInjectionToolNames.isInjectionTool(replay.toolName) {
+            let inbox = SwiftNativeApprovalInbox(root: dataRoot)
+            let digest = approvalEffectDigest(rec.payload)
+            switch await inbox.consumeApprovedEffect(
+                id: rec.id,
+                digest: digest,
+                action: replay.toolName,
+                surface: replay.surface
+            ) {
+            case .spent:
+                break
+            case .alreadySpent:
+                if (try? await inbox.get(rec.id).executedAction) == nil {
+                    try? await annotateApprovalExecution(
+                        id: rec.id,
+                        executedAction: .object([
+                            "op": .string("chat_tool_approval_replay"),
+                            "tool": .string(replay.toolName),
+                            "surface": .string(replay.surface),
+                            "status": .string("outcome_unknown"),
+                            "error": .string("execution already started; automatic replay refused"),
+                        ]),
+                        detail: "\(replay.toolName) may have started before interruption; it was not replayed automatically.",
+                        root: dataRoot
+                    )
+                }
+                return
+            case .unavailable:
+                if (try? await inbox.get(rec.id).executedAction) == nil {
+                    try? await annotateApprovalExecution(
+                        id: rec.id,
+                        executedAction: .object([
+                            "op": .string("chat_tool_approval_replay"),
+                            "tool": .string(replay.toolName),
+                            "surface": .string(replay.surface),
+                            "status": .string("blocked"),
+                            "error": .string("durable execution fence unavailable"),
+                        ]),
+                        detail: "\(replay.toolName) was blocked before execution because its durable replay fence was unavailable.",
+                        root: dataRoot
+                    )
+                }
+                return
+            }
         }
 
         do {
@@ -667,7 +854,10 @@ extension NativeClient {
 
         let resultStatus = jsonString(executedAction, "status") ?? "succeeded"
         let normalizedStatus = resultStatus.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let ok = !["failed", "error", "denied", "rejected", "canceled", "cancelled"].contains(normalizedStatus)
+        let ok = ![
+            "failed", "error", "denied", "rejected", "canceled", "cancelled",
+            "blocked", "outcome_unknown",
+        ].contains(normalizedStatus)
         let resultPreview = jsonString(executedAction, "resultPreview")
             .map(TurnTraceRedactor.redactText)
         let statusSummary = ok
@@ -732,6 +922,11 @@ extension NativeClient {
         } catch {
             NSLog("[approvals] outcome receipt persist failed for \(rec.id): \(error)")
         }
+    }
+
+    private static func approvalEffectDigest(_ payload: JSONValue) -> String {
+        let bytes = (try? payload.serializedData(pretty: false)) ?? Data()
+        return SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
     }
 
     private static func approvalResultPreview(_ value: JSONValue, limit: Int = 1400) -> String {
@@ -975,7 +1170,11 @@ extension NativeClient {
         }
     }
 
-    func resolveApproval(id: String, decision: String) async throws -> ApprovalRequest {
+    func resolveApproval(
+        id: String,
+        decision: String,
+        provenance: ApprovalResolutionProvenance = .local(decidedBy: "mac_ui")
+    ) async throws -> ApprovalRequest {
         // F6 (eval E06 fix-2): unify on the SwiftNativeApprovalInbox actor
         // (Modules/.../ApprovalInbox), which reads/writes
         // <dataRoot>/workflows/approvals/requests.json under flock. The
@@ -994,7 +1193,11 @@ extension NativeClient {
                 NSLocalizedDescriptionKey: "unknown decision verb: \(decision)"
             ])
         }
-        let rec = try await inbox.resolve(id, decision: decisionEnum, decidedBy: "mac_ui")
+        let rec = try await inbox.resolve(
+            id,
+            decision: decisionEnum,
+            provenance: provenance
+        )
         var shouldArchiveVisibleCard = true
         if rec.action == "browser.open_url" {
             if decisionEnum == .approved {
@@ -1079,19 +1282,11 @@ extension NativeClient {
                     "error": .string("no executor wired"),
                 ]),
                 detail: "FAILED: no executor wired for nextgen actions")
-        } else if rec.action.hasPrefix("connector.action."), decisionEnum == .approved {
-            // Older generic connector cards carried only labels, not replay
-            // input. They cannot execute safely; keep the card visible and say
-            // so instead of archiving an approved-but-never-run action.
-            shouldArchiveVisibleCard = false
-            try? await Self.annotateApprovalExecution(
-                id: rec.id,
-                executedAction: .object([
-                    "action": .string(rec.action),
-                    "status": .string("failed"),
-                    "error": .string("legacy connector approval has no replay payload"),
-                ]),
-                detail: "FAILED: legacy connector approval has no bounded replay payload; no connector call ran")
+        } else if rec.action.hasPrefix("connector.action.") {
+            shouldArchiveVisibleCard = await applyResolvedConnectorAction(
+                from: rec,
+                dataRoot: SwiftNativeApprovalInbox.defaultDataRoot()
+            )
         }
         // Retire the visible inbox CARD carrying this approval (card id ==
         // approval id for rem.proposal / self-improvement cards). Lives HERE,

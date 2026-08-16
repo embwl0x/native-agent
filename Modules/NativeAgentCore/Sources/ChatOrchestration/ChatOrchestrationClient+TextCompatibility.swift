@@ -220,7 +220,7 @@ extension SwiftNativeChatOrchestrationClient {
 
     private nonisolated static func isAnthropicTextCompatibilitySurface(_ surface: String) -> Bool {
         let compatibleSurfaces: Set<String> = [
-            "chat", "telegram", "ios", "icloud", "iphone", "ipad", "mobile"
+            "chat", "telegram", "slack", "ios", "icloud", "iphone", "ipad", "mobile"
         ]
         return compatibleSurfaces.contains(surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
     }
@@ -368,25 +368,11 @@ extension SwiftNativeChatOrchestrationClient {
             surface: surface,
             dataRoot: dataRoot
         )
-        // Tool-routing hint (2026-07-19, Kimi K3 Telegram incident): the
-        // preload machinery loaded github_* for "look at my github" yet the
-        // model fetched github.com with generic web tools and spent turns
-        // ANNOUNCING instead of acting — the loaded tools were discoverable
-        // only by reading a large schema block. Non-Claude models on this
-        // text-compat path need the route said PLAINLY, adjacent to the
-        // request. Provider-visible only: the persisted transcript keeps the
-        // raw `message` (appendMessage above), so this never pollutes history
-        // or re-sends on later turns (turn-scoped, rebuilt fresh each turn).
-        let preloadedThisTurn = turnActiveTools.subtracting(preloadActiveTools)
-        let toolRoutingHint: String = preloadedThisTurn.isEmpty ? "" : {
-            let names = preloadedThisTurn.sorted().prefix(12).joined(separator: ", ")
-            return "\n\n[tool routing — loaded and ready for THIS turn: \(names). "
-                + "Use the purpose-built tool for the request (github_* for GitHub, "
-                + "never a generic web fetch of the provider's website). Act in this "
-                + "reply: emit the <tool_use> marker now — do not answer that you "
-                + "WILL check or are 'on it' without the call.]"
-        }()
-        let routedComposed = composed + toolRoutingHint
+        // Route focus now lives in TurnPlan's dynamic system segment, shared
+        // by structured and text-compatible providers. Keeping it there makes
+        // the cue identical across Mac, Telegram, Slack, and bridge surfaces,
+        // and avoids a second, request-appended set of behavioral fences.
+        let routedComposed = composed
 
         var accumulated = ""
         var pendingDelta = ""

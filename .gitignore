@@ -118,6 +118,12 @@ persona/*/AGENTS.md.*.bak
 # Phase 11: runtime state stays local — entire data/ is gitignored except .gitkeep
 data/
 !data/.gitkeep
+# MiniLM's CoreML package uses Apple's required case-sensitive `Data/` payload
+# directory. On default macOS filesystems the broad runtime rule above also
+# matched that build resource, leaving fresh private clones without the model.
+# Keep this one verified package payload reproducible in source control.
+!Modules/NativeAgentCore/Sources/MemoryV2/Resources/minilm.mlpackage/Data/
+!Modules/NativeAgentCore/Sources/MemoryV2/Resources/minilm.mlpackage/Data/**
 
 # Phase 11b: Workspace — Agent's work product (drafts, scratch, generated files)
 # Contents are gitignored; .gitkeep preserves the directory in the repo.

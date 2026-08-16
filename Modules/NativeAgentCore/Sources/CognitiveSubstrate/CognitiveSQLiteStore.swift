@@ -37,10 +37,11 @@ struct CognitiveReceiptWrite: Sendable, Equatable {
     var payload: JSONValue
 }
 
-/// Minimum newest rows retained from each live artifact family before generic
-/// age-based pruning may spend that family. The totals fit beneath the default
-/// artifact cap; if a caller supplies a smaller cap, the hard cap still wins
-/// deterministically after every unprotected row has been spent.
+/// Minimum newest rows retained from each active or migration-compatible
+/// artifact family before generic age-based pruning may spend that family. The
+/// totals fit beneath the default artifact cap; if a caller supplies a smaller
+/// cap, the hard cap still wins deterministically after every unprotected row
+/// has been spent.
 private let cognitiveProtectedArtifactMinimums: [String: Int] = [
     "affect": 1,
     "disposition": 1,
@@ -49,6 +50,8 @@ private let cognitiveProtectedArtifactMinimums: [String: Int] = [
     "episode": 64,
     "schema_proposal": 64,
     "standing_view": 60,
+    // Retired from resident cognition, but old rows remain byte-preserved for
+    // backup/migration readers rather than being silently deleted at store open.
     "identity_proposal": 32,
     "developmental_timeline": 128,
     "reflection_receipt": 32,
@@ -516,7 +519,8 @@ public actor CognitiveSQLiteStore {
             // restorePersistentState restores from. Net effect in the wild: her
             // durable inner life was amputated to skip-noise on every prune cycle
             // (live store 2026-07-09: 510/516 artifacts were receipt mirrors; zero
-            // views/seeds/episodes survived). Receipts live in cognitive_receipts
+            // views/seeds/episodes survived). Legacy identity-proposal rows are
+            // also retained for migration compatibility. Receipts live in cognitive_receipts
             // (10k cap) — the one copy is the right copy.
         }
     }

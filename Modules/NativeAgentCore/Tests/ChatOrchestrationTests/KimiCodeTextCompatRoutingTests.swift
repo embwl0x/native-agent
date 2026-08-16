@@ -27,4 +27,11 @@ struct KimiCodeTextCompatRoutingTests {
         #expect(!SwiftNativeChatOrchestrationClient.shouldUseAnthropicTextStreamingCompatibility(
             model: "kimi-for-coding", surface: "dream"))
     }
+
+    @Test func slackUsesTheSameAnthropicTextToolContractAsChat() {
+        for model in ["claude-sonnet-5", "kimi-for-coding"] {
+            #expect(SwiftNativeChatOrchestrationClient.shouldUseAnthropicTextStreamingCompatibility(
+                model: model, surface: "slack"))
+        }
+    }
 }

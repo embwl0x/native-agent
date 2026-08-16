@@ -276,6 +276,8 @@ extension SwiftNativeTrustCenter {
         // still apply.
         "mac.view": .string("auto"),
         "mac_view": .string("auto"),
+        "mac.attention": .string("auto"),
+        "mac_attention": .string("auto"),
         // W7 — mac_nudge sits with them: one bare mouse move, no click, no
         // keystroke, no app state changed, so there is nothing to approve.
         // Pinned under BOTH spellings for the same reason the injection pair

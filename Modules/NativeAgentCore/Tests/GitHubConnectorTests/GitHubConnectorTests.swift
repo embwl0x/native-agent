@@ -81,6 +81,105 @@ import PersistenceCore
     }
 }
 
+@Test func githubRepositoryIdentityAcceptsFullNameAndRepositoryURL() throws {
+    #expect(try GitHubConnectorActions.repositoryIdentity([
+        "repo": .string("deepseek-ai/deepseek-harness")
+    ]).fullName == "deepseek-ai/deepseek-harness")
+    #expect(try GitHubConnectorActions.repositoryIdentity([
+        "url": .string("https://github.com/deepseek-ai/deepseek-harness/tree/main")
+    ]).fullName == "deepseek-ai/deepseek-harness")
+    #expect(try GitHubConnectorActions.repositoryIdentity([
+        "owner": .string("deepseek-ai"),
+        "repo": .string("deepseek-harness.git"),
+    ]).fullName == "deepseek-ai/deepseek-harness")
+}
+
+@Test func githubRepositoryIdentityAndPathsRejectUnsafeShapes() throws {
+    #expect(throws: GitHubConnectorError.self) {
+        _ = try GitHubConnectorActions.repositoryIdentity([
+            "url": .string("https://example.com/deepseek-ai/deepseek-harness")
+        ])
+    }
+    #expect(throws: GitHubConnectorError.self) {
+        _ = try GitHubConnectorActions.repositoryIdentity([
+            "repo": .string("deepseek-ai/deepseek-harness/extra")
+        ])
+    }
+    #expect(throws: GitHubConnectorError.self) {
+        _ = try GitHubConnectorActions.repositoryContentPath(.string("Sources/../Secrets"))
+    }
+}
+
+@Test func githubRepositoryContentProjectionBoundsTextAndRefusesBinary() throws {
+    let text = String(repeating: "abc", count: 20_000)
+    let projected = GitHubConnectorActions.repositoryContent([
+        "name": "README.md",
+        "path": "README.md",
+        "size": text.utf8.count,
+        "encoding": "base64",
+        "content": Data(text.utf8).base64EncodedString(),
+    ], maxCharacters: 12_000)
+    #expect(projected["contentAvailable"] as? Bool == true)
+    #expect((projected["content"] as? String)?.count == 12_000)
+    #expect(projected["contentCharacters"] as? Int == text.count)
+    #expect(projected["contentTruncated"] as? Bool == true)
+
+    let binary = GitHubConnectorActions.repositoryContent([
+        "name": "asset.bin",
+        "encoding": "base64",
+        "content": Data([0, 1, 2, 3]).base64EncodedString(),
+    ], maxCharacters: 12_000)
+    #expect(binary["contentAvailable"] as? Bool == false)
+    #expect(binary["contentKind"] as? String == "binary_or_oversized")
+}
+
+@Test func githubRepositoryEntryProjectionIsCompactAndBounded() {
+    let source: [[String: Any]] = (0..<150).map { index in
+        [
+            "name": "file-\(index).swift",
+            "path": "Sources/file-\(index).swift",
+            "sha": "sha-\(index)",
+            "size": index,
+            "type": "file",
+            "download_url": String(repeating: "x", count: 10_000),
+        ]
+    }
+    let projected = GitHubConnectorActions.repositoryEntries(source, limit: 100)
+    #expect(projected.rows.count == 100)
+    #expect(projected.sourceCount == 150)
+    #expect(projected.truncated)
+    #expect(projected.rows[0]["download_url"] == nil)
+}
+
+@Test func githubNotificationProjectionIsCompactAndBounded() {
+    let source: [[String: Any]] = (0..<30).map { index in
+        [
+            "id": "notification-\(index)",
+            "reason": "review_requested",
+            "unread": true,
+            "updated_at": "2026-08-14T10:00:00Z",
+            "subscription_url": String(repeating: "private-noise", count: 100),
+            "subject": [
+                "title": "Review \(index)",
+                "type": "PullRequest",
+                "url": "https://api.github.com/repos/owner/repo/pulls/\(index)",
+            ],
+            "repository": [
+                "id": index,
+                "full_name": "owner/repo",
+                "html_url": "https://github.com/owner/repo",
+                "permissions": ["admin": true],
+            ],
+        ]
+    }
+    let projected = GitHubConnectorActions.notificationRows(source, limit: 20)
+    #expect(projected.rows.count == 20)
+    #expect(projected.sourceCount == 30)
+    #expect(projected.truncated)
+    #expect(projected.rows[0]["subscription_url"] == nil)
+    #expect((projected.rows[0]["repository"] as? [String: Any])?["permissions"] == nil)
+}
+
 @Test func githubConnectorErrorsCarryRateLimitWithoutSecrets() {
     let error = GitHubConnectorError.http(
         status: 403,

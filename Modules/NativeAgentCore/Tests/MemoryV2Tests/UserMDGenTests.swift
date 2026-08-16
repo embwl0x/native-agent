@@ -98,6 +98,26 @@ struct UserMDGenTests {
         #expect(!text.contains("old auto body"))
     }
 
+    @Test func partialPreambleMarkerRefusesWithoutChangingBytes() async throws {
+        let store = try MemoryStorage()
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let personaRoot = root.appendingPathComponent("persona", isDirectory: true)
+        let target = personaRoot.appendingPathComponent("USER.md")
+        try FileManager.default.createDirectory(
+            at: target.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let damaged = Data((UserMDGenerator.preambleStartMarker + "\nkeep me\n").utf8)
+        try damaged.write(to: target)
+        _ = try await store.insertMemory(StoredMemory(content: "new fact", source: "chat"))
+
+        let generator = UserMDGenerator(storage: store, dataRoot: root, personaRoot: personaRoot)
+        await #expect(throws: UserMDGeneratorError.self) {
+            _ = try await generator.regenerate()
+        }
+        #expect(try Data(contentsOf: target) == damaged)
+    }
+
     @Test func personaRootProjectionUsesCanonicalPartitionForCustomDisplayName() async throws {
         let store = try MemoryStorage()
         let root = tmpRoot()

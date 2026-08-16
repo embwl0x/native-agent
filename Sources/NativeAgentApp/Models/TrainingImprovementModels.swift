@@ -14,13 +14,6 @@ struct TrainingArtifact: Identifiable, Codable, Hashable {
     var summary: String?
 }
 
-struct FailureExplanation: Codable, Hashable {
-    var category: String
-    var summary: String
-    var safeToRetry: Bool
-    var nextAction: String
-}
-
 struct ResearchResult: Identifiable, Codable, Hashable {
     var id: String { url }
     var title: String

@@ -45,6 +45,9 @@ struct TurnInspectorView: View {
         .navigationBarTitleDisplayMode(.inline)
         .onAppear { Task { await store.refresh() } }
         .refreshable { await store.refresh() }
+        .onChange(of: sync.turnSummaries) { _, file in
+            store.applySyncedFile(file)
+        }
     }
 }
 
@@ -121,5 +124,9 @@ final class TurnInspectorStore: ObservableObject {
     func refresh() async {
         await iCloudSyncEngine.shared.refreshTurnSummariesSnapshot()
         file = iCloudSyncEngine.shared.turnSummaries
+    }
+
+    func applySyncedFile(_ next: TurnSummaryFile?) {
+        file = next
     }
 }

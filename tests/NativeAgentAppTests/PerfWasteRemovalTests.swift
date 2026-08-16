@@ -198,8 +198,8 @@ struct GitHubTrackingReplayGateTests {
         await runtime.processConnectorChangesIfChanged(refreshed: false)
         #expect(await runtime._testConnectorReplayCount() == 1)
 
-        // Nine further 300s ticks with nothing moving on disk. Pre-fix each of
-        // these decoded and reduced the entire op log.
+        // Nine further event/repair offers with nothing moving on disk.
+        // Pre-fix each offer decoded and reduced the entire op log.
         for _ in 0..<9 {
             await runtime.processConnectorChangesIfChanged(refreshed: false)
         }

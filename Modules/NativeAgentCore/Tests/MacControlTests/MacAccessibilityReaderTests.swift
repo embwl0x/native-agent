@@ -444,7 +444,7 @@ private func _bool(_ value: JSONValue?) -> Bool? {
     }
     // W3.5 added the fused view at the SAME read tier: no CGEvent, no AX
     // mutation, no approval — just structure plus a picture of it.
-    #expect(macControlAccessibilityReadActions == ["ax_status", "ax_tree", "ax_find", "view"])
+    #expect(macControlAccessibilityReadActions == ["ax_status", "ax_tree", "ax_find", "view", "attention"])
 }
 
 @Test func injectionActionsAreImplementedAsOfW2() {

@@ -260,6 +260,7 @@ struct OrganismLivingDynamicsTests {
                 signal: livingSignal(
                     .toolSucceeded,
                     source: "tool.search",
+                    trustRisk: "low",
                     at: now.addingTimeInterval(Double(offset))
                 ),
                 to: state
@@ -321,13 +322,19 @@ private final class LivingDynamicsClock: @unchecked Sendable {
 private func livingSignal(
     _ kind: SomaticSignalKind,
     source: String = "provider",
+    trustRisk: String? = nil,
     at date: Date
 ) -> SomaticSignal {
-    SomaticSignal(
+    var metadata: [String: JSONValue] = [:]
+    if let trustRisk {
+        metadata["trustRisk"] = .string(trustRisk)
+    }
+    return SomaticSignal(
         id: UUID(),
         kind: kind,
         sourceOrgan: source,
         occurredAt: date,
-        intensity: 1
+        intensity: 1,
+        metadata: metadata
     )
 }

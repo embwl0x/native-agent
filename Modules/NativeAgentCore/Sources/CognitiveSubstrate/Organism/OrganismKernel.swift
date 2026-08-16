@@ -136,11 +136,10 @@ public actor OrganismKernel {
                     at: ingestedAt
                 )
         }
-        reflexState = OrganismReflexCompiler.applying(
-            signal: bounded,
-            to: reflexState,
-            limits: configuration.reflexLimits
-        )
+        // Historical reflex rows remain readable/reviewable, including any
+        // explicitly approved low-risk bias. Routine tool/provider/Desk signals
+        // no longer compile generic prose proposals: prediction, chemistry, and
+        // body-schema caution above already carry their real behavioral effect.
         signalCount += 1
         // Quiet physiology follows when the signal reached this organism, not
         // an untrusted/delayed source timestamp. The anchor is monotonic so an

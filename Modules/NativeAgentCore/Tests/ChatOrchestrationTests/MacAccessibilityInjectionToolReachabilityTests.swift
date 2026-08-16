@@ -170,14 +170,23 @@ func macInjectionTools_schemasSayPlainlyWhatTheyDo() async throws {
               case .object(let props)? = parsed["properties"] else { return [:] }
         return props
     }
-    #expect(Set(try properties("mac_keystroke").keys) == ["text", "keys"])
-    #expect(Set(try properties("mac_scroll").keys) == ["dx", "dy", "x", "y", "units"])
+    let attentionTokenKeys: Set<String> = ["attention_session", "attention_user_sequence"]
+    #expect(Set(try properties("mac_keystroke").keys)
+        == Set(["text", "keys"]).union(attentionTokenKeys))
+    #expect(Set(try properties("mac_click").keys)
+        == Set(["x", "y", "button", "count", "double", "from", "to", "duration_ms", "mark", "view"])
+            .union(attentionTokenKeys))
+    #expect(Set(try properties("mac_scroll").keys)
+        == Set(["dx", "dy", "x", "y", "units"]).union(attentionTokenKeys))
+    #expect(Set(try properties("mac_wake").keys)
+        == Set(["key_tap", "settle_ms", "full_screen"]).union(attentionTokenKeys))
     // W3.5: `mark`+`view` is the second legal way to name the target, so the
     // property set grew — and `path` stopped being schema-required, because a
     // mark is the preferred form. The handler still refuses a call that names
     // NEITHER (SwiftNativeMacControlTests.axActRejectsAMalformedPath and
     // MacScreenViewTests.axActRefusesAMarkAndAConflictingPathInTheSameCall).
-    #expect(Set(try properties("mac_ax_act").keys) == ["path", "action", "value", "mark", "view"])
+    #expect(Set(try properties("mac_ax_act").keys)
+        == Set(["path", "action", "value", "mark", "view"]).union(attentionTokenKeys))
     // Acting on an unspecified element must still be impossible — but since
     // W3.5 there are TWO ways to specify it (mark+view, or path), so neither
     // can be schema-required alone. The requirement moved into the handler,

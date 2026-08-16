@@ -39,7 +39,6 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-import CapabilityFoundry
 
 extension NativeClient {
     func runNextGenAction(id: String, dryRun: Bool) async throws -> NextGenActionResponse {

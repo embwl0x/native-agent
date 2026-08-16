@@ -327,14 +327,81 @@ struct ManifestSignerTests {
     #expect(key == stored)
 }
 
-@Test func loadOrCreateSigningKey_regenerates_if_short() async throws {
+@Test func loadOrCreateSigningKey_rejects_short_existing_key_without_rotation() async throws {
     let root = try makeTempDataRoot()
     defer { try? FileManager.default.removeItem(at: root) }
-    try stageSigningKey(at: root, bytes: Data(repeating: 0x01, count: 8))
+    let invalid = Data(repeating: 0x01, count: 8)
+    try stageSigningKey(at: root, bytes: invalid)
     let signer = SwiftNativeManifestSigner(dataRoot: root)
-    let key = try await signer.loadOrCreateSigningKey()
-    #expect(key.count == 32)
-    #expect(key != Data(repeating: 0x01, count: 32))
+    await #expect(throws: ManifestSigningError.self) {
+        _ = try await signer.loadOrCreateSigningKey()
+    }
+    let keyPath = root.appendingPathComponent("tools/.manifest_signing_key")
+    #expect(try Data(contentsOf: keyPath) == invalid)
+}
+
+@Test func loadOrCreateSigningKey_rejects_oversized_existing_key_without_rotation() async throws {
+    let root = try makeTempDataRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let invalid = Data(repeating: 0x02, count: 33)
+    try stageSigningKey(at: root, bytes: invalid)
+    let signer = SwiftNativeManifestSigner(dataRoot: root)
+    await #expect(throws: ManifestSigningError.self) {
+        _ = try await signer.loadOrCreateSigningKey()
+    }
+    let keyPath = root.appendingPathComponent("tools/.manifest_signing_key")
+    #expect(try Data(contentsOf: keyPath) == invalid)
+}
+
+@Test func loadOrCreateSigningKey_rejects_wrong_mode_without_repair() async throws {
+    let root = try makeTempDataRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let stored = Data(repeating: 0x42, count: 32)
+    try stageSigningKey(at: root, bytes: stored)
+    let keyPath = root.appendingPathComponent("tools/.manifest_signing_key")
+    try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: keyPath.path)
+    let signer = SwiftNativeManifestSigner(dataRoot: root)
+    await #expect(throws: ManifestSigningError.self) {
+        _ = try await signer.loadOrCreateSigningKey()
+    }
+    #expect(try Data(contentsOf: keyPath) == stored)
+    let attributes = try FileManager.default.attributesOfItem(atPath: keyPath.path)
+    #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o644)
+}
+
+@Test func loadOrCreateSigningKey_rejects_symlink_without_touching_target() async throws {
+    let root = try makeTempDataRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let tools = root.appendingPathComponent("tools", isDirectory: true)
+    try FileManager.default.createDirectory(at: tools, withIntermediateDirectories: true)
+    let target = root.appendingPathComponent("outside-key")
+    let stored = Data(repeating: 0x55, count: 32)
+    try stored.write(to: target)
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target.path)
+    let keyPath = tools.appendingPathComponent(".manifest_signing_key")
+    try FileManager.default.createSymbolicLink(at: keyPath, withDestinationURL: target)
+
+    let signer = SwiftNativeManifestSigner(dataRoot: root)
+    await #expect(throws: ManifestSigningError.self) {
+        _ = try await signer.loadOrCreateSigningKey()
+    }
+    #expect(try FileManager.default.destinationOfSymbolicLink(atPath: keyPath.path) == target.path)
+    #expect(try Data(contentsOf: target) == stored)
+}
+
+@Test func loadOrCreateSigningKey_rejects_nonregular_existing_state() async throws {
+    let root = try makeTempDataRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let keyPath = root.appendingPathComponent("tools/.manifest_signing_key")
+    try FileManager.default.createDirectory(at: keyPath, withIntermediateDirectories: true)
+    let marker = keyPath.appendingPathComponent("preserve-me")
+    try Data("marker".utf8).write(to: marker)
+
+    let signer = SwiftNativeManifestSigner(dataRoot: root)
+    await #expect(throws: ManifestSigningError.self) {
+        _ = try await signer.loadOrCreateSigningKey()
+    }
+    #expect(try Data(contentsOf: marker) == Data("marker".utf8))
 }
 
 @Test func sign_produces_signatureVersion_2() async throws {
@@ -665,6 +732,108 @@ struct SwiftNativeTrustPolicyTests {
     #expect(ta["custom.tool"] != nil)
     #expect(ta["mac.shell"] != nil, "default tool autonomy entry must survive merge")
     #expect(ta["search.*"] != nil)
+}
+
+@Test func checkedAuthorizationSnapshotKeepsPolicyAndRawOverridesOnOneGeneration() async throws {
+    let root = try makeTempPolicyRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try stageSavedPolicy(at: root, .object([
+        "permissionLevel": .string("full_mac_os"),
+        "toolAutonomy": .object(["write_file": .string("blocked")]),
+    ]))
+    let trust = SwiftNativeTrustCenter(dataRoot: root)
+
+    let snapshot = try await trust.loadAuthorizationSnapshotChecked()
+    try stageSavedPolicy(at: root, .object([
+        "permissionLevel": .string("balanced"),
+        "toolAutonomy": .object(["write_file": .string("auto")]),
+    ]))
+
+    #expect(snapshot.policy["permissionLevel"] == .string("full_mac_os"))
+    #expect(snapshot.userConfiguredAutonomyOverrides["write_file"] == .string("blocked"))
+}
+
+@Test func updateTrustConsumesFullMacDurationIntentInsideCanonicalMutation() async throws {
+    let root = try makeTempPolicyRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try stageSavedPolicy(at: root, .object([
+        "permissionLevel": .string("full_mac_os"),
+        "fullMacConfirmedAt": .string("2026-08-16T12:00:00Z"),
+    ]))
+    let trust = SwiftNativeTrustCenter(dataRoot: root)
+
+    let updated = try await trust.applyPolicyPatchChecked([
+        "fullMacMaxDurationHours": .double(48),
+        "fullMacNeverExpires": .bool(false),
+        "fullMacExpiresAt": .string(""),
+        SwiftNativeTrustCenter.fullMacExpiryDurationIntentKey: .double(48),
+    ])
+
+    #expect(updated["fullMacExpiresAt"] == .string("2026-08-18T12:00:00+00:00"))
+    let raw = try SwiftNativeTrustCenter.loadRawPolicyChecked(
+        at: root.appendingPathComponent("trust/policy.json")
+    )
+    #expect(raw[SwiftNativeTrustCenter.fullMacExpiryDurationIntentKey] == nil)
+    #expect(raw["fullMacExpiresAt"] == .string("2026-08-18T12:00:00+00:00"))
+}
+
+@Test func compareAndSetToolAutonomyPreservesSiblingsAndRefusesTightenedTier() async throws {
+    let root = try makeTempPolicyRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try stageSavedPolicy(at: root, .object([
+        "enableAutonomy": .bool(true),
+        "toolAutonomy": .object([
+            "memory_search": .string("confirm"),
+            "write_file": .string("blocked"),
+        ]),
+    ]))
+    let trust = SwiftNativeTrustCenter(dataRoot: root)
+
+    let changed = try await trust.compareAndSetToolAutonomy(
+        tool: "memory_search",
+        expectedCurrentTiers: ["confirm"],
+        newTier: "auto"
+    )
+    let refused = try await trust.compareAndSetToolAutonomy(
+        tool: "write_file",
+        expectedCurrentTiers: ["confirm", "supervised"],
+        newTier: "auto"
+    )
+
+    #expect(changed)
+    #expect(!refused)
+    let raw = try SwiftNativeTrustCenter.loadRawPolicyChecked(
+        at: root.appendingPathComponent("trust/policy.json")
+    )
+    guard case .object(let autonomy)? = raw["toolAutonomy"] else {
+        Issue.record("missing raw toolAutonomy")
+        return
+    }
+    #expect(autonomy["memory_search"] == .string("auto"))
+    #expect(autonomy["write_file"] == .string("blocked"))
+    #expect(raw["enableAutonomy"] == .bool(true))
+}
+
+@Test func compareAndSetToolAutonomyPreservesCorruptAuthorityBytes() async throws {
+    let root = try makeTempPolicyRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let path = root.appendingPathComponent("trust/policy.json")
+    try FileManager.default.createDirectory(
+        at: path.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+    )
+    let damaged = Data("{not-json".utf8)
+    try damaged.write(to: path)
+    let trust = SwiftNativeTrustCenter(dataRoot: root)
+
+    await #expect(throws: (any Error).self) {
+        _ = try await trust.compareAndSetToolAutonomy(
+            tool: "memory_search",
+            expectedCurrentTiers: ["confirm"],
+            newTier: "auto"
+        )
+    }
+    #expect(try Data(contentsOf: path) == damaged)
 }
 
 @Test func loadTrustPolicy_agentBridgeTools_areEasyWorkspaceHelpers() async throws {

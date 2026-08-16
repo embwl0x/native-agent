@@ -3,8 +3,9 @@ import Testing
 @testable import NativeAgentApp
 
 // B2.4 + B2.6 (prerelease campaign): the Cognition Observatory's 19 panels were
-// split — approval-shaped panels to Activity, read-only internals to Diagnostics
-// ▸ Cognition, the inert Identity Proposals panel deleted — and Turn Inspector +
+// split — the standing-view approval panel and read-only REM replay lineage to
+// Activity, read-only internals to Diagnostics ▸ Cognition, the inert Identity
+// Proposals panel deleted — and Turn Inspector +
 // DeskView's debug disclosures folded into Diagnostics. These source-scraping
 // pins guard the LOSSLESS-disposition contract: every panel lands exactly one
 // place (or its deletion is justified), and nothing is double-rendered.
@@ -38,18 +39,52 @@ struct CognitionSurfaceSplitDispositionTests {
         #expect(!proposals.contains("func schemaProposals("))
     }
 
-    @Test func activitySurfaceOwnsTheMigratedApprovals() throws {
+    @Test func retiredCognitionExperimentsHaveNoProductionRuntimePath() throws {
+        let repositoryRoot = try AppSourceScraping.repositoryRoot()
+        let appSources = try AppSourceScraping.swiftSourceContents(
+            under: try AppSourceScraping.appSourcesRoot()
+        )
+        let cognitionSources = try AppSourceScraping.swiftSourceContents(
+            under: repositoryRoot.appendingPathComponent(
+                "Modules/NativeAgentCore/Sources/CognitiveSubstrate",
+                isDirectory: true
+            )
+        )
+        let production = (appSources + cognitionSources).map(\.source).joined(separator: "\n")
+
+        #expect(!production.contains("func groundWithMemoryAndKnowledgeGraph("))
+        #expect(!production.contains("func groundExternalContext("))
+        #expect(!production.contains("func stageMemoryProposalCandidate("))
+        #expect(!production.contains("func proposeIdentity("))
+        #expect(!production.contains("func resolveIdentityProposal("))
+        #expect(!production.contains("private var identityProposals"))
+        #expect(!FileManager.default.fileExists(atPath: repositoryRoot
+            .appendingPathComponent("Sources/NativeAgentApp/NativeCognitionRuntime+ExternalGrounding.swift")
+            .path))
+    }
+
+    @Test func activitySurfaceOwnsStandingViewApprovalsAndReadOnlyREMLineage() throws {
         let activity = try AppSourceScraping.appSource("ActivityView.swift")
         let proposalsView = try AppSourceScraping.appSource("CognitionProposalsView.swift")
         // Activity has the new section + destination.
         #expect(activity.contains("case cognitionProposals"))
         #expect(activity.contains("CognitionProposalsView()"))
         #expect(activity.contains("CognitionProposalsFeed.pending()"))
-        // The destination renders BOTH migrated approval panels with resolve wiring.
+        // Standing views remain the only cognition-owned approval path.
         #expect(proposalsView.contains("resolveStandingView(id:"))
-        #expect(proposalsView.contains("resolveSchemaProposal(id:"))
         #expect(proposalsView.contains("Standing Views"))
-        #expect(proposalsView.contains("Schema Proposals"))
+        // Replay schemas remain visible for provenance, but REM is their canonical
+        // owner: this surface has no schema resolver or hidden approve/reject path.
+        #expect(proposalsView.contains("REM Replay Lineage"))
+        #expect(proposalsView.contains("canonical Dream/REM approval path"))
+        #expect(!proposalsView.contains("resolveSchemaProposal(id:"))
+
+        let schemaStart = try #require(proposalsView.range(of: "private func schemaProposalsBody"))
+        let schemaTail = proposalsView[schemaStart.lowerBound...]
+        let inlineCardsStart = try #require(schemaTail.range(of: "// MARK: - Inline preview card"))
+        let schemaSection = schemaTail[..<inlineCardsStart.lowerBound]
+        #expect(!schemaSection.contains("Button("))
+        #expect(!schemaSection.contains("resolve"))
     }
 
     // MARK: - Read-only internals + Inspector become Diagnostics segments

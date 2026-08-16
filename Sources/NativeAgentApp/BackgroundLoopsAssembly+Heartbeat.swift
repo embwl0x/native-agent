@@ -14,6 +14,7 @@ import WorkshopExecution
 import TrustCenter
 import MacControl
 import SelfImprovement
+import NotificationInbox
 
 // MARK: - Heartbeat and Self-Healing
 
@@ -689,32 +690,9 @@ extension BackgroundLoopsAssembly {
             "status": .string("unread"),
             "read_at": .null,
         ])
-        let persistence = SwiftNativePersistenceCore()
         do {
-            let inserted = try await persistence.withFileLock(inboxPath) { () async throws -> Bool in
-                let lines = try InboxRewriteGuard.readLines(inboxPath)
-                guard InboxRewriteGuard.rewriteIsSafe(lines: lines, path: inboxPath) else {
-                    InboxRewriteGuard.refuse("HeartbeatLoop", path: inboxPath)
-                    return false
-                }
-                var mutated: [Data] = []
-                mutated.reserveCapacity(lines.count + 1)
-                var found = false
-                for line in lines {
-                    guard case .object(let obj)? = line.row,
-                          case .string(let id)? = obj["id"],
-                          id == cardId else {
-                        // Other rows AND undecodable lines: verbatim.
-                        mutated.append(line.raw)
-                        continue
-                    }
-                    mutated.append(Data(try card.serialize(pretty: false).utf8))
-                    found = true
-                }
-                if !found { mutated.append(Data(try card.serialize(pretty: false).utf8)) }
-                try InboxRewriteGuard.writeLines(mutated, to: inboxPath)
-                return !found
-            }
+            let inserted = try await LiveNotificationInbox(path: inboxPath)
+                .upsert(card, id: cardId)
             if inserted {
                 await InboxPushNotifier.notifyIfAttentionWorthy(
                     dataRoot: dataRoot,
@@ -1018,18 +996,8 @@ extension BackgroundLoopsAssembly {
             "status": .string("unread"),
             "read_at": .null,
         ])
-        let persistence = SwiftNativePersistenceCore()
-        let inserted = try await persistence.withFileLock(inboxPath) { () async throws -> Bool in
-            let rows = try await persistence.tailJSONL(inboxPath, limit: Int.max, maxBytes: nil)
-            let exists = rows.contains { row in
-                guard case .object(let obj) = row,
-                      case .string(let id)? = obj["id"] else { return false }
-                return id == approvalId
-            }
-            if exists { return false }
-            try await persistence.appendJSONL(card, to: inboxPath)
-            return true
-        }
+        let inserted = try await LiveNotificationInbox(path: inboxPath)
+            .appendUnique(card, id: approvalId)
         if inserted {
             await InboxPushNotifier.notifyIfAttentionWorthy(
                 dataRoot: dataRoot,

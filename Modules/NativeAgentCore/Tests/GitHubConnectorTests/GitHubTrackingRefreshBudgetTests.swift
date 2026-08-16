@@ -35,6 +35,92 @@ private final class FakeClock: @unchecked Sendable {
 }
 
 @Test
+func trackingDeadlineUsesCanonicalLearnedDeskCadence() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("GitHubTrackingDeadline-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(
+        at: root.appendingPathComponent("connectors/github", isDirectory: true),
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let refreshed = Date(timeIntervalSince1970: 1_800_000_000)
+    let refreshedISO = ISO8601DateFormatter().string(from: refreshed)
+    let refKey = "owner/repo#pr#7"
+    let persistence = SwiftNativePersistenceCore()
+    try await persistence.writeJSON(
+        .object([
+            "version": .int(2),
+            "project": .string("NativeAgent"),
+            "mode": .string("repository"),
+            "repositories": .array([.object([
+                "fullName": .string("owner/repo"),
+                "name": .string("repo"),
+                "htmlURL": .string("https://github.com/owner/repo"),
+            ])]),
+            "refreshIntervalMinutes": .int(15),
+            "staleAfterHours": .int(72),
+            "updatedAt": .string(refreshedISO),
+        ]),
+        to: root.appendingPathComponent("connectors/github/tracking.json")
+    )
+    try await persistence.writeJSON(
+        .object([
+            "version": .int(2),
+            "project": .string("NativeAgent"),
+            "refreshedAt": .string(refreshedISO),
+            "entities": .array([.object([
+                "key": .string(refKey),
+                "repository": .string("owner/repo"),
+                "number": .int(7),
+                "kind": .string("pull_request"),
+                "title": .string("Tighten cadence"),
+                "state": .string("open"),
+                "updatedAt": .string(refreshedISO),
+                "url": .string("https://github.com/owner/repo/pull/7"),
+            ])]),
+        ]),
+        to: root.appendingPathComponent("connectors/github/tracking_snapshot.json")
+    )
+
+    // Three changes make a 4h EWMA trustworthy. The cadence owner's 0.5 poll
+    // factor therefore stretches the configured 15m floor to an exact 2h.
+    let stat = DeskRefObservationStat(
+        refKey: refKey,
+        firstObservedAt: refreshedISO,
+        lastObservedAt: refreshedISO,
+        lastChangeAt: refreshedISO,
+        observations: 4,
+        changes: 3,
+        ewmaChangeIntervalSec: 4 * 60 * 60,
+        lastFingerprint: "head-4"
+    )
+    _ = try await DeskCadenceStore(dataRoot: root).updating { _ in
+        (DeskCadenceStats(refs: [refKey: stat]), ())
+    }
+
+    let now = refreshed.addingTimeInterval(60)
+    let deadline = await GitHubConnectorActions.nextTrackingRefreshDeadline(
+        after: now,
+        dataRoot: root
+    )
+    #expect(deadline == refreshed.addingTimeInterval(2 * 60 * 60))
+}
+
+@Test
+func trackingDeadlineIsAbsentWithoutCanonicalConfigOrSnapshot() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("GitHubTrackingDeadlineMissing-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    #expect(
+        await GitHubConnectorActions.nextTrackingRefreshDeadline(after: Date(), dataRoot: root)
+            == nil
+    )
+}
+
+@Test
 func slowRepositoryCannotConsumeTheWholeTick() async throws {
     let start = Date(timeIntervalSince1970: 1_700_000_000)
     let clock = FakeClock(start)

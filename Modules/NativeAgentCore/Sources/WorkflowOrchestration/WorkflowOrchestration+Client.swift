@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import CryptoKit
 import ApprovalInbox
 import MCPDispatcher
@@ -9,6 +10,13 @@ import Research
 import SystemOps
 import ToolExecution
 
+private enum WorkflowOrchestrationProcessIdentity {
+    /// One identity for the lifetime of this process. All clients in the live
+    /// app share it, so a read-side reconciliation can never mistake another
+    /// in-process client's currently executing step for a restart orphan.
+    static let current = UUID().uuidString.lowercased()
+}
+
 // MARK: - SwiftNative impl
 
 public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestrationClient, MotorActionReadModelProviding {
@@ -18,6 +26,8 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
     private let uuid: @Sendable () -> String
     private let useFileLock: Bool
     private let memoryOwner: SwiftNativeMemoryV2
+    private let afterStepAttemptPersisted: (@Sendable (_ runId: String, _ stepId: String) throws -> Void)?
+    private let processIdentity: String
 
     /// - Parameters:
     ///   - root: the native data root (the dir that contains `workflows/`).
@@ -33,28 +43,18 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
         memoryOwner: SwiftNativeMemoryV2? = nil,
         now: @escaping @Sendable () -> String = { WorkflowOrchestrationClock.nowISO() },
         uuid: @escaping @Sendable () -> String = { UUID().uuidString.lowercased() },
-        useFileLock: Bool = true
+        useFileLock: Bool = true,
+        afterStepAttemptPersisted: (@Sendable (_ runId: String, _ stepId: String) throws -> Void)? = nil,
+        processIdentity: String? = nil
     ) {
         self.root = root
         self.persistence = persistence
-        self.memoryOwner = memoryOwner ?? Self.makeMemoryOwner(dataRoot: root)
+        self.memoryOwner = memoryOwner ?? SwiftNativeMemoryV2.resolvedOwner(dataRoot: root)
         self.now = now
         self.uuid = uuid
         self.useFileLock = useFileLock
-    }
-
-    private static func makeMemoryOwner(dataRoot: URL) -> SwiftNativeMemoryV2 {
-        guard dataRoot.standardizedFileURL
-            != PersistenceCore.defaultDataRoot().standardizedFileURL else {
-            return .shared
-        }
-        guard let storage = try? MemoryStorage(dataRoot: dataRoot) else {
-            return SwiftNativeMemoryV2()
-        }
-        return SwiftNativeMemoryV2(
-            embedder: ManagedEmbeddingProvider(dataRoot: dataRoot),
-            storage: MemoryStorageBridge(storage: storage)
-        )
+        self.afterStepAttemptPersisted = afterStepAttemptPersisted
+        self.processIdentity = processIdentity ?? WorkflowOrchestrationProcessIdentity.current
     }
 
     /// Test-only root-confinement seam; exposes only the SQLite location.
@@ -437,9 +437,83 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
     }
 
     public func listWorkflowRuns() async throws -> [JSONValue] {
+        // Repair only durable bookkeeping before presenting the run list. An
+        // active attempt means the process crossed the dispatch boundary but
+        // did not durably record an outcome; replaying it could duplicate an
+        // irreversible effect, so recovery parks it for explicit review.
+        try await reconcileInterruptedWorkflowRuns()
         // Python: list(reversed(tail_jsonl(runs_path, 50)))
         let tail = try await persistence.tailJSONL(runsPath, limit: 50, maxBytes: 1_048_576)
         return tail.reversed()
+    }
+
+    private func reconcileInterruptedWorkflowRuns(only runId: String? = nil) async throws {
+        let directory = root.appendingPathComponent("workflows/run_state", isDirectory: true)
+        let paths: [URL]
+        if let runId {
+            paths = [runStatePath(runId)]
+        } else {
+            paths = (try? FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ).filter { $0.pathExtension == "json" }) ?? []
+        }
+
+        var repaired: [JSONValue] = []
+        for path in paths where FileManager.default.fileExists(atPath: path.path) {
+            let repair: @Sendable () async throws -> JSONValue? = { [self] in
+                let current = await persistence.readJSON(path, defaultValue: .object([:]))
+                guard stateString(current, "status") == "running",
+                      case .object(let attempt)? = objectField(current, "activeStepAttempt"),
+                      !attempt.isEmpty,
+                      case .string(let ownerIdentity)? = attempt["ownerIdentity"],
+                      !ownerIdentity.isEmpty,
+                      ownerIdentity != processIdentity,
+                      case .int(let ownerPIDRaw)? = attempt["ownerPID"] else {
+                    return nil
+                }
+                let ownerPID = pid_t(truncatingIfNeeded: ownerPIDRaw)
+                if ownerPID > 0, ownerPID != Darwin.getpid() {
+                    errno = 0
+                    if Darwin.kill(ownerPID, 0) == 0 || errno == EPERM {
+                        return nil
+                    }
+                }
+                var interruptedAttempt = JSONValue.object(attempt)
+                interruptedAttempt = setField(interruptedAttempt, "phase", .string("interrupted_unknown_outcome"))
+                interruptedAttempt = setField(interruptedAttempt, "recoveredAt", .string(now()))
+                var next = setField(current, "status", .string("blocked"))
+                next = setField(next, "blockedReason", .string("interrupted_after_step_dispatch"))
+                next = setField(next, "recoveryRequired", .bool(true))
+                next = setField(next, "activeStepAttempt", interruptedAttempt)
+                next = setField(next, "activeStepTimeoutSeconds", .null)
+                next = setField(next, "updatedAt", .string(now()))
+                try await persistence.writeJSON(next, to: path)
+                return next
+            }
+            let result: JSONValue?
+            if useFileLock {
+                result = try await persistence.withFileLock(path, repair)
+            } else {
+                result = try await repair()
+            }
+            if let result { repaired.append(result) }
+        }
+
+        for state in repaired {
+            let run = WorkflowRunState.publicRun(state)
+            try await appendRun(run)
+            try await appendTrace(
+                kind: "workflow.v2.interrupted",
+                title: stateString(state, "workflowName") == "None" ? stateString(state, "id") : stateString(state, "workflowName"),
+                payload: [
+                    "workflowRunId": .string(stateString(state, "id")),
+                    "status": .string("blocked"),
+                    "reason": .string("interrupted_after_step_dispatch"),
+                ]
+            )
+        }
     }
 
     /// Mirror of Runtime.record_activity for the workflow.save side-effect:
@@ -485,8 +559,7 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
         let built = try WorkflowCreate.buildRecord(body: body, now: stampNow, uuid: { uuidFactory() })
         let workflowId = built.id
         let workflow = built.record
-        // Python's record_trace uses len(normalized_steps) — the UNCAPPED count.
-        let uncappedStepCount = built.stepCount
+        let stepCount = built.stepCount
 
         // 2. Persist into the registry. Python:
         //      with file_lock(self.workflows_path):
@@ -542,12 +615,11 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
         )
         //    record_trace("workflow.save", name,
         //      {"workflowId": workflow_id, "stepCount": len(normalized_steps)})
-        // stepCount = the UNCAPPED normalized count (Python uses len(normalized_
-        // steps), NOT len(workflow["steps"]) which is the [:24]-capped list).
+        // This is exact: oversized definitions refuse before persistence.
         try await appendTrace(
             kind: "workflow.save",
             title: name,
-            payload: ["workflowId": .string(workflowId), "stepCount": .int(Int64(uncappedStepCount))]
+            payload: ["workflowId": .string(workflowId), "stepCount": .int(Int64(stepCount))]
         )
         return workflow
     }
@@ -1434,6 +1506,7 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
             "completedAt": .null,
             "approvalId": .null,
             "activeStepTimeoutSeconds": .null,
+            "activeStepAttempt": .null,
         ])
         return try await continueWorkflowV2(workflow: workflow, state: state)
     }
@@ -1552,15 +1625,25 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
                 // dispatch. The shared motor reader must not infer it later
                 // from a workflow definition that may have changed.
                 let activeTimeout = normalizedStepTimeoutSeconds(step)
+                let attemptId = UUID().uuidString.lowercased()
                 state = setField(
                     state,
                     "activeStepTimeoutSeconds",
                     activeTimeout > 0 ? .int(Int64(activeTimeout)) : .null
                 )
+                state = setField(state, "activeStepAttempt", .object([
+                    "id": .string(attemptId),
+                    "stepId": .string(stepId),
+                    "phase": .string("dispatch_intent_persisted"),
+                    "ownerIdentity": .string(processIdentity),
+                    "ownerPID": .int(Int64(Darwin.getpid())),
+                    "startedAt": .string(now()),
+                ]))
                 state = setField(state, "updatedAt", .string(now()))
                 if try await !saveWorkflowState(state) {
                     return try await workflowTerminalTakeover(state)
                 }
+                try afterStepAttemptPersisted?(runId, stepId)
                 let receipt = await executeStepWithRetry(
                     workflow: workflow,
                     step: step,
@@ -1569,6 +1652,7 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
                 )
                 receipts.append(receipt)
                 state = setField(state, "activeStepTimeoutSeconds", .null)
+                state = setField(state, "activeStepAttempt", .null)
                 if objectString(receipt, "status") == "waiting_approval" {
                     state = setField(state, "status", .string("waiting_approval"))
                     state = setField(state, "approvalId", objectField(receipt, "approvalId") ?? .null)
@@ -1644,10 +1728,16 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
         let resolvedEngine = (
             engineVersion?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
             ? engineVersion!
-            : objectString(workflow, "engineVersion", fallback: "1")
+            : objectString(workflow, "engineVersion", fallback: "2")
         )
         let resolvedObjective = workflowObjective(objective, workflow: workflow)
-        if ["2", "v2", "2.0"].contains(resolvedEngine) {
+        let hasApprovalGate = objectArray(workflow, "steps").contains { step in
+            objectBool(step, "requiresApproval") || objectString(step, "kind") == "approval"
+        }
+        // Heal saved v1 approval workflows at the live boundary. V1 can file
+        // an approval but owns no resumable state file, so executing it would
+        // create a permanent dead-end. Dry runs retain their legacy receipts.
+        if ["2", "v2", "2.0"].contains(resolvedEngine) || (execute && hasApprovalGate) {
             return try await runWorkflowV2(
                 workflow: workflow,
                 objective: resolvedObjective,
@@ -1664,6 +1754,7 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
 
     public func resumeWorkflowRun(id: String) async throws -> JSONValue {
         let runId = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        try await reconcileInterruptedWorkflowRuns(only: runId)
         var state = try await loadState(runId)
         guard stateString(state, "status") == "waiting_approval" else {
             return WorkflowRunState.publicRun(state)
@@ -1680,11 +1771,83 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
                 NSLocalizedDescriptionKey: "Workflow approval has not been approved (approval record missing)"
             ])
         }
-        guard approval.decision == "approved" else {
+        if approval.decision == ApprovalDecision.denied.rawValue ||
+            approval.decision == ApprovalDecision.canceled.rawValue {
+            let decision = approval.decision ?? ApprovalDecision.denied.rawValue
+            let terminalStatus = decision == ApprovalDecision.canceled.rawValue ? "canceled" : "failed"
+            let statePath = runStatePath(runId)
+            let settle: @Sendable () async throws -> JSONValue? = { [self] in
+                let current = try await loadState(runId)
+                guard stateString(current, "status") == "waiting_approval",
+                      stateString(current, "approvalId") == approvalId else {
+                    return nil
+                }
+                var receipts = objectArray(current, "steps")
+                if let waitingIndex = receipts.lastIndex(where: {
+                    objectString($0, "status") == "waiting_approval" &&
+                    objectString($0, "approvalId") == approvalId
+                }) {
+                    receipts[waitingIndex] = setField(receipts[waitingIndex], "status", .string(terminalStatus))
+                    receipts[waitingIndex] = setField(
+                        receipts[waitingIndex],
+                        "detail",
+                        .string(decision == ApprovalDecision.canceled.rawValue ? "Approval canceled." : "Approval denied.")
+                    )
+                }
+                var terminal = setField(current, "status", .string(terminalStatus))
+                terminal = setField(terminal, "steps", .array(receipts))
+                terminal = setField(terminal, "approvalId", .null)
+                terminal = setField(terminal, "completedAt", .string(now()))
+                terminal = setField(terminal, "updatedAt", .string(now()))
+                if terminalStatus == "failed" {
+                    terminal = setField(terminal, "failedStepId", .string(
+                        receipts.last.map { objectString($0, "id") } ?? ""
+                    ))
+                }
+                try await persistence.writeJSON(terminal, to: statePath)
+                return terminal
+            }
+            let terminal: JSONValue?
+            if useFileLock {
+                terminal = try await persistence.withFileLock(statePath, settle)
+            } else {
+                terminal = try await settle()
+            }
+            guard let terminal else {
+                return WorkflowRunState.publicRun(try await loadState(runId))
+            }
+            let run = WorkflowRunState.publicRun(terminal)
+            try await appendRun(run)
+            try await appendTrace(
+                kind: "workflow.v2.approval_resolved",
+                title: stateString(terminal, "workflowName") == "None" ? runId : stateString(terminal, "workflowName"),
+                payload: [
+                    "workflowRunId": .string(runId),
+                    "approvalId": .string(approvalId),
+                    "decision": .string(decision),
+                    "status": .string(terminalStatus),
+                ]
+            )
+            return run
+        }
+        guard approval.decision == ApprovalDecision.approved.rawValue else {
             throw NSError(domain: "WorkflowOrchestration", code: -403, userInfo: [
                 NSLocalizedDescriptionKey: "Workflow approval has not been approved"
             ])
         }
+        let workflow = try await workflowByID(stateString(state, "workflowId"))
+        let currentIndex = Int(WorkflowCreate.pyInt(objectField(state, "currentStepIndex") ?? .int(0)))
+        let steps = objectArray(workflow, "steps").filter {
+            if case .object = $0 { return true }
+            return false
+        }
+        let gatedStep: JSONValue? = steps.indices.contains(currentIndex) ? steps[currentIndex] : nil
+        let gatedStepId = gatedStep.map {
+            truthyString(objectField($0, "id"), fallback: String(currentIndex))
+        } ?? String(currentIndex)
+        let hasRealEffect = gatedStep.map {
+            truthyString(objectField($0, "kind"), fallback: "manual") != "approval"
+        } ?? false
         // Claim the run BEFORE dispatching any side-effecting work. Two
         // concurrent resume calls can both pass the waiting_approval read
         // above; the compare-and-swap below — performed under the same
@@ -1703,6 +1866,22 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
                 return nil
             }
             var claimed = setField(current, "status", .string("running"))
+            if hasRealEffect, let gatedStep {
+                let activeTimeout = normalizedStepTimeoutSeconds(gatedStep)
+                claimed = setField(
+                    claimed,
+                    "activeStepTimeoutSeconds",
+                    activeTimeout > 0 ? .int(Int64(activeTimeout)) : .null
+                )
+                claimed = setField(claimed, "activeStepAttempt", .object([
+                    "id": .string(UUID().uuidString.lowercased()),
+                    "stepId": .string(gatedStepId),
+                    "phase": .string("dispatch_intent_persisted"),
+                    "ownerIdentity": .string(processIdentity),
+                    "ownerPID": .int(Int64(Darwin.getpid())),
+                    "startedAt": .string(now()),
+                ]))
+            }
             claimed = setField(claimed, "updatedAt", .string(now()))
             try await persistence.writeJSON(claimed, to: statePath)
             return claimed
@@ -1720,14 +1899,7 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
             return WorkflowRunState.publicRun(try await loadState(runId))
         }
         state = claimed
-        let workflow = try await workflowByID(stateString(state, "workflowId"))
         var receipts = objectArray(state, "steps")
-        let currentIndex = Int(WorkflowCreate.pyInt(objectField(state, "currentStepIndex") ?? .int(0)))
-        let steps = objectArray(workflow, "steps").filter {
-            if case .object = $0 { return true }
-            return false
-        }
-        let gatedStep: JSONValue? = steps.indices.contains(currentIndex) ? steps[currentIndex] : nil
         if let gatedStep,
            truthyString(objectField(gatedStep, "kind"), fallback: "manual") != "approval" {
             // The approval cleared the gate, but the step's real work has not
@@ -1736,16 +1908,7 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
             // the resolved approval threaded through so an exact-match
             // MCP-risk gate does not re-file (blockers 1 + 3). Record the
             // REAL execution receipt in place of the waiting_approval one.
-            let activeTimeout = normalizedStepTimeoutSeconds(gatedStep)
-            state = setField(
-                state,
-                "activeStepTimeoutSeconds",
-                activeTimeout > 0 ? .int(Int64(activeTimeout)) : .null
-            )
-            state = setField(state, "updatedAt", .string(now()))
-            if try await !saveWorkflowState(state) {
-                return try await workflowTerminalTakeover(state)
-            }
+            try afterStepAttemptPersisted?(runId, gatedStepId)
             let executed = await executeStepWithRetry(
                 workflow: workflow,
                 step: gatedStep,
@@ -1755,6 +1918,7 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
                 resolvedApproval: approval
             )
             state = setField(state, "activeStepTimeoutSeconds", .null)
+            state = setField(state, "activeStepAttempt", .null)
             if let waitingIdx = receipts.lastIndex(where: { objectString($0, "status") == "waiting_approval" }) {
                 receipts[waitingIdx] = executed
             } else {
@@ -1804,6 +1968,7 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
                     break
                 }
             }
+            state = setField(state, "activeStepAttempt", .null)
         }
         let nextIndex = currentIndex + 1
         state = setField(state, "steps", .array(receipts))

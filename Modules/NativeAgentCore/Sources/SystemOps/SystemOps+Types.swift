@@ -153,75 +153,6 @@ public struct GitStashRecoverOpResult: Sendable, Equatable {
     }
 }
 
-/// One subsystem row of `GET /v1/system/health_card`. Byte-faithful mirror of
-/// the dict the daemon's `_add(...)` closure builds inside `Runtime.health_card`
-///: `{id,label,status,detail[,fixAction]}`.
-///
-/// WAVE 39 W10 (§6.201): this is the FIRST genuinely-portable health_card slice
-/// to get a tested Swift building block (the crash-reports-24h slice). It is a
-/// PURE HELPER — NOT wired into any live route, NO flag, NO NativeClient seam.
-/// The composite `/v1/system/health_card` route STAYS daemon-side and HTTP
-/// (see the NOT-PORTABLE doc block above): the card's value is the single
-/// coherent live-process snapshot, and a partial port that drops the 3 HARD-
-/// blocked live slices (uptime-clock / scheduler-thread-liveness / executor-
-/// stats) would silently misreport — the [[feedback_run_dont_just_build]]
-/// failure. This struct exists so the eventual full port (once chatOrchestration
-/// + triggerScheduler + backgroundLoops own their live state Swift-side) has
-/// the file-backed slices already built + tested, not re-audited from scratch.
-public struct HealthCardSubsystem: Sendable, Equatable {
-    public let id: String
-    public let label: String
-    /// "ok" | "warn" | "error" — the daemon's three-level status (L28652-L28656).
-    public let status: String
-    public let detail: String
-    /// Optional remediation hint; omitted from JSON when nil OR empty, exactly
-    /// like the daemon's `if fix_action: s["fixAction"] = fix_action` (L28651) —
-    /// Python's truthiness drops an empty string too (gpt-5.5 wave-39 review).
-    public let fixAction: String?
-
-    public init(id: String, label: String, status: String, detail: String, fixAction: String? = nil) {
-        self.id = id
-        self.label = label
-        self.status = status
-        self.detail = detail
-        self.fixAction = fixAction
-    }
-
-    public func toJSON() -> JSONValue {
-        var obj: [String: JSONValue] = [
-            "id": .string(id),
-            "label": .string(label),
-            "status": .string(status),
-            "detail": .string(detail),
-        ]
-        // Mirror Python `if fix_action:` — falsy (nil OR "") omits the key.
-        if let fixAction, !fixAction.isEmpty {
-            obj["fixAction"] = .string(fixAction)
-        }
-        return .object(obj)
-    }
-}
-
-public struct CrashReportOpResult: Sendable, Equatable {
-    public let stored: Bool
-    public let path: String
-    public let improvementSpawned: Bool
-
-    public init(stored: Bool, path: String, improvementSpawned: Bool) {
-        self.stored = stored
-        self.path = path
-        self.improvementSpawned = improvementSpawned
-    }
-
-    public func toJSON() -> JSONValue {
-        .object([
-            "stored": .bool(stored),
-            "path": .string(path),
-            "improvementSpawned": .bool(improvementSpawned),
-        ])
-    }
-}
-
 // MARK: - Errors
 
 public enum SystemOpsError: Error, Sendable, Equatable, LocalizedError {
@@ -273,15 +204,6 @@ public protocol SystemRebuildClient: Sendable {
 
 public protocol GitStashRecoverClient: Sendable {
     func gitStashRecover(label: String) async throws -> GitStashRecoverOpResult
-}
-
-public protocol CrashReportClient: Sendable {
-    func postCrashReport(
-        traceback: String,
-        stderrTail: String,
-        exitCode: Int?,
-        capturedAt: String?
-    ) async throws -> CrashReportOpResult
 }
 
 // MARK: - Subprocess seam (test-injectable)

@@ -2079,6 +2079,46 @@ public func makeProviderRouting(
 
 // MARK: - Public model lookup
 
+/// Verified context window for the exact admitted provider/model tuple.
+/// Returns nil when this build has no evidence for that tuple; callers that
+/// size prompt material must use their conservative floor rather than treating
+/// the UI gauge's unknown-model fallback as a measured capability.
+public func verifiedContextLength(
+    forModel modelId: String,
+    providerID: String?,
+    dataRoot: URL? = nil
+) -> Int? {
+    let model = modelId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !model.isEmpty else { return nil }
+    guard let rawProvider = providerID?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !rawProvider.isEmpty else {
+        return FirstPartyModelCatalog.descriptor(for: model)?.contextLength
+            ?? verifiedOpenRouterContextLength(forModel: model)
+    }
+    let provider = rawProvider.lowercased()
+    if provider == "openrouter" {
+        return dataRoot.flatMap {
+            OpenRouterModelCatalog.cachedDescriptor(for: model, dataRoot: $0)?.contextLength
+        } ?? verifiedOpenRouterContextLength(forModel: model)
+    }
+    let firstPartyProviders: Set<String> = [
+        "openai", "codex", "openai_oauth_direct",
+        "anthropic", "anthropic_oauth_direct", "anthropic_mcp",
+        "xai", "xai_oauth_direct", "xai-oauth", "grok-oauth", "x-ai-oauth", "xai-grok-oauth",
+        "moonshot", "kimi", "kimi-code",
+    ]
+    guard firstPartyProviders.contains(provider) else { return nil }
+    return FirstPartyModelCatalog.descriptor(for: model, providerID: provider)?.contextLength
+}
+
+private func verifiedOpenRouterContextLength(forModel modelId: String) -> Int? {
+    switch modelId {
+    case "meta-llama/llama-3.3-70b-instruct": return 131_072
+    case "anthropic/claude-sonnet-5": return 1_000_000
+    default: return nil
+    }
+}
+
 /// Context-window budget (input-token cap) for a known model id. Single
 /// source of truth used by the chat-context status bar. Returns 200_000 for
 /// any unknown id so the UI shows the safer of the two values rather than 0.

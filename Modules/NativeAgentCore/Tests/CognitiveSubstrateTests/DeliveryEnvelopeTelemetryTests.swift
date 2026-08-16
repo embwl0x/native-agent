@@ -215,6 +215,44 @@ struct DeliveryEnvelopeTelemetryTests {
         #expect(fields["replyCharacters"] == .int(200))
     }
 
+    @Test("assistant completion uses original reply count metadata, not capped summary")
+    func completionEventUsesOriginalReplyCountMetadata() async throws {
+        let (s, root) = try await substrate()
+        let session = "s-original-length"
+        await s.stashDeliveryEnvelopeForCommittedTurn(
+            CognitiveCapsuleRequest(
+                surface: "chat", userMessage: "hey", sessionId: session, mode: .inject),
+            at: now
+        )
+        await s.ingest(CognitiveEvent(
+            id: "completion-original-length",
+            kind: .assistantTurnCompleted,
+            subject: CognitiveSubjectReference(type: "chat.assistant_turn", id: "turn-1"),
+            sourceClass: .selfReported,
+            occurredAt: now.addingTimeInterval(2),
+            summary: String(repeating: "x", count: 500),
+            importance: 0.5,
+            metadata: [
+                "sessionId": .string(session),
+                CognitiveSubstrate.replyCharacterCountMetadataKey: .int(640),
+            ]
+        ))
+
+        let path = root.appendingPathComponent("logs/delivery_envelope_telemetry.jsonl")
+        var text = ""
+        for _ in 0..<100 {
+            text = (try? String(contentsOf: path, encoding: .utf8)) ?? ""
+            if text.contains("\"replyCharacters\"") { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let row = try #require(text.split(separator: "\n").last)
+        guard case .object(let fields) = try JSONValue.parse(Data(row.utf8)) else {
+            Issue.record("telemetry row is not an object")
+            return
+        }
+        #expect(fields["replyCharacters"] == .int(640))
+    }
+
     /// A completion from a different session is not the reply this envelope was
     /// computed for — the same rule the reaction linkage already enforces.
     @Test("a cross-session or stale completion logs nothing")

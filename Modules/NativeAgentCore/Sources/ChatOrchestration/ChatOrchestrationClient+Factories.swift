@@ -371,21 +371,13 @@ private struct SwiftNativeMemoryV2RecallingAdapter: MemoryRecalling {
 /// Opening that store may fail; the unwired actor preserves MemoryV2's existing
 /// fail-closed behavior instead of falling back to the live singleton.
 func makeChatMemoryRecaller(dataRoot: URL) -> any MemoryRecalling {
-    if dataRoot == PersistenceCore.defaultDataRoot() {
-        return SwiftNativeMemoryV2RecallingAdapter(memory: .shared)
-    }
-    guard let storage = try? MemoryStorage(dataRoot: dataRoot) else {
-        return SwiftNativeMemoryV2RecallingAdapter(memory: SwiftNativeMemoryV2())
-    }
-    let memory = SwiftNativeMemoryV2(
-        embedder: ManagedEmbeddingProvider(dataRoot: dataRoot),
-        storage: MemoryStorageBridge(storage: storage)
+    SwiftNativeMemoryV2RecallingAdapter(
+        memory: SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
     )
-    return SwiftNativeMemoryV2RecallingAdapter(memory: memory)
 }
 
 func makeChatMemoryPromoter(dataRoot: URL) -> (any MemoryPromoting)? {
-    dataRoot == PersistenceCore.defaultDataRoot()
+    SwiftNativeMemoryV2.usesDefaultDataRoot(dataRoot)
         ? AdaptiveMemoryPromoterAdapter()
         : nil
 }

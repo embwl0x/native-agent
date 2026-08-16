@@ -376,6 +376,59 @@ func REMConsolidator_stages_one_approval_per_proposal_and_marker_skip_rerun_does
 }
 
 @Test
+func REMConsolidator_corrupt_weekly_marker_fails_closed_before_llm_or_artifacts() async throws {
+    let (dataRoot, personaRoot) = tempREMRoot()
+    defer { try? FileManager.default.removeItem(at: dataRoot.deletingLastPathComponent()) }
+    try seedREMInputs(dataRoot: dataRoot, personaRoot: personaRoot)
+    let marker = dataRoot.appendingPathComponent("harness/last_weekly_rem_run")
+    try FileManager.default.createDirectory(
+        at: marker.deletingLastPathComponent(), withIntermediateDirectories: true
+    )
+    let corrupt = Data("not-a-weekly-timestamp".utf8)
+    try corrupt.write(to: marker)
+    let llm = MockLLMClient(scriptedResponses: ["[]"])
+    let consolidator = REMConsolidator(
+        dataRoot: dataRoot,
+        personaRoot: personaRoot,
+        llm: llm,
+        gate: DreamREMGatePolicy(remCycleEnabled: true),
+        clock: { remTestNow }
+    )
+
+    await #expect(throws: (any Error).self) {
+        _ = try await consolidator.runWeeklyREM()
+    }
+    #expect(llm.callCount == 0)
+    #expect(try Data(contentsOf: marker) == corrupt)
+    #expect(!FileManager.default.fileExists(
+        atPath: dataRoot.appendingPathComponent("rem_proposals.jsonl").path
+    ))
+}
+
+@Test
+func REMConsolidator_concurrent_drivers_admit_exactly_one_llm_pass() async throws {
+    let (dataRoot, personaRoot) = tempREMRoot()
+    defer { try? FileManager.default.removeItem(at: dataRoot.deletingLastPathComponent()) }
+    try seedREMInputs(dataRoot: dataRoot, personaRoot: personaRoot)
+    let llm = MockLLMClient(scriptedResponses: ["[]"])
+    let first = REMConsolidator(
+        dataRoot: dataRoot, personaRoot: personaRoot, llm: llm,
+        gate: DreamREMGatePolicy(remCycleEnabled: true), clock: { remTestNow }
+    )
+    let second = REMConsolidator(
+        dataRoot: dataRoot, personaRoot: personaRoot, llm: llm,
+        gate: DreamREMGatePolicy(remCycleEnabled: true), clock: { remTestNow }
+    )
+
+    async let a = first.runWeeklyREM()
+    async let b = second.runWeeklyREM()
+    let reports = try await [a, b]
+
+    #expect(llm.callCount == 1)
+    #expect(reports.filter { $0.proposalsGenerated == 0 }.count == 2)
+}
+
+@Test
 func REMConsolidator_runWeeklyREM_imports_legacy_harness_file_before_pass() async throws {
     let (dataRoot, personaRoot) = tempREMRoot()
     for name in ["SOUL.md", "VOICE.md", "GROWTH.md"] {

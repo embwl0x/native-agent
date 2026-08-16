@@ -194,11 +194,11 @@ public enum WorkshopDeskReceiptBridge {
                 guard !existing.contains(where: {
                     $0.executionId == receipt.executionId && $0.status == receipt.status
                 }) else { return }
-                try await persistence.appendJSONL(receipt.toJSON(), to: receiptPath)
+                try await persistence.appendJSONLDurable(receipt.toJSON(), to: receiptPath)
             }
         } catch {
-            // Desk reconciliation below is still safe and idempotent; a later
-            // terminal replay can fill a missing receipt.
+            FileHandle.standardError.write(Data(
+                "Workshop Desk receipt write failed for \(record.id): \(error)\n".utf8))
         }
 
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
@@ -206,12 +206,21 @@ public enum WorkshopDeskReceiptBridge {
               let item = state.items.first(where: { $0.handle == handle }) else { return }
         let note = "[\(record.status)] \(summary)"
         if !item.notes.contains(where: { $0.text == note }) {
-            _ = try? await store.appendNote(handle, text: note)
+            do {
+                _ = try await store.appendNote(handle, text: note)
+            } catch {
+                FileHandle.standardError.write(Data(
+                    "Workshop Desk note settlement failed for \(record.id): \(error)\n".utf8))
+            }
         }
         switch record.status {
         case "completed", "done", "succeeded":
             if record.verification?.status == .satisfied, !item.status.isTerminal {
-                _ = try? await store.closeItem(handle, outcomeSummary: summary)
+                do { _ = try await store.closeItem(handle, outcomeSummary: summary) }
+                catch {
+                    FileHandle.standardError.write(Data(
+                        "Workshop Desk completion settlement failed for \(record.id): \(error)\n".utf8))
+                }
             } else if !item.status.isTerminal {
                 // A model/tool sequence finishing is not evidence that its
                 // claimed effect happened. Keep the durable commitment open
@@ -225,20 +234,34 @@ public enum WorkshopDeskReceiptBridge {
                 } else {
                     reason = "Workshop finished without an exact verification record."
                 }
-                _ = try? await store.setStatus(
-                    handle,
-                    status: .blocked,
-                    blockedReason: reason,
-                    waitingOn: "domain verification"
-                )
+                guard item.status != .blocked
+                        || item.blockedReason != reason
+                        || item.waitingOn != "domain verification" else { break }
+                do {
+                    _ = try await store.setStatus(handle, status: .blocked,
+                                                  blockedReason: reason,
+                                                  waitingOn: "domain verification")
+                } catch {
+                    FileHandle.standardError.write(Data(
+                        "Workshop Desk verification settlement failed for \(record.id): \(error)\n".utf8))
+                }
             }
         case "cancelled", "canceled":
             if !item.status.isTerminal {
-                _ = try? await store.closeItem(handle, outcomeSummary: summary, canceled: true)
+                do { _ = try await store.closeItem(handle, outcomeSummary: summary, canceled: true) }
+                catch {
+                    FileHandle.standardError.write(Data(
+                        "Workshop Desk cancellation settlement failed for \(record.id): \(error)\n".utf8))
+                }
             }
         case "failed":
-            if !item.status.isTerminal {
-                _ = try? await store.setStatus(handle, status: .blocked, blockedReason: summary)
+            if !item.status.isTerminal,
+               item.status != .blocked || item.blockedReason != summary {
+                do { _ = try await store.setStatus(handle, status: .blocked, blockedReason: summary) }
+                catch {
+                    FileHandle.standardError.write(Data(
+                        "Workshop Desk failure settlement failed for \(record.id): \(error)\n".utf8))
+                }
             }
         default:
             break

@@ -131,6 +131,23 @@ struct ContentView: View {
             let screen = (note.userInfo?["screen"] as? String) ?? "activity"
             openActivityFromNotification(screen: screen)
         }
+        .onChange(of: sync.approvals) { _, _ in
+            approvalsStore.applySyncedApprovalsFromSnapshot(
+                animated: true,
+                notifyNewPending: true
+            )
+        }
+        .onChange(of: sync.inboxItems) { _, _ in
+            inboxStore.applySyncedInboxFromSnapshot(
+                animated: true,
+                notifyNewArrivals: true
+            )
+            Task {
+                await NativeAgentActivityNotificationCleaner.pruneDeliveredNotifications(
+                    activeInboxItems: inboxStore.items
+                )
+            }
+        }
         .task {
             if openedFromNotificationLaunch {
                 // Let the launch/tap transition settle before touching iCloud
@@ -139,8 +156,11 @@ struct ContentView: View {
             } else {
                 await refreshActivityBadgesIfAllowed()
             }
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: pairingStore.usesICloudTransport ? 15_000_000_000 : 5_000_000_000)
+            // CloudKit/KVS snapshot groups are owner-driven. Retain the sampled
+            // fallback only for the legacy direct bridge, which has no complete
+            // snapshot publication owner.
+            while !Task.isCancelled, !pairingStore.usesICloudTransport {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
                 await refreshActivityBadgesIfAllowed()
             }
         }

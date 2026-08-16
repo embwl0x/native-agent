@@ -30,6 +30,55 @@ private func span(
     )
 }
 
+/// Deliberately simple O(bucketCount * spanCount) reference retained in tests.
+/// It protects the chronological sweep from becoming a clever-but-wrong
+/// optimization around overlaps, clipping, event proration, or DST boundaries.
+private func referenceBuckets(
+    spans: [ActivitySpan], from: Double, to: Double,
+    grain: ActivityRollups.Grain, timezone: TimeZone
+) -> [ActivityBucket] {
+    let ordered = spans.sorted {
+        if $0.startedAt != $1.startedAt { return $0.startedAt < $1.startedAt }
+        return $0.id < $1.id
+    }
+    var result: [ActivityBucket] = []
+    for boundary in ActivityRollups.bucketBoundaries(
+        from: from, to: to, grain: grain, timezone: timezone
+    ) {
+        let windowStart = max(boundary.start, from)
+        let windowEnd = min(boundary.end, to)
+        var seconds: [String: Double] = [:]
+        var names: [String: String] = [:]
+        var counts: [String: Int] = [:]
+        var events: [String: Double] = [:]
+        for row in ordered {
+            let spanEnd = row.endedAt ?? row.lastSeenAt
+            let overlapStart = max(row.startedAt, windowStart)
+            let overlapEnd = min(spanEnd, windowEnd)
+            let overlap = overlapEnd - overlapStart
+            guard overlap > 0 else { continue }
+            let duration = max(spanEnd - row.startedAt, 0)
+            seconds[row.bundleId, default: 0] += overlap
+            names[row.bundleId] = row.appName
+            counts[row.bundleId, default: 0] += 1
+            events[row.bundleId, default: 0] += Double(row.eventCount)
+                * (duration > 0 ? overlap / duration : 1)
+        }
+        for (bundleID, duration) in seconds.sorted(by: {
+            if $0.value != $1.value { return $0.value > $1.value }
+            return $0.key < $1.key
+        }) {
+            result.append(ActivityBucket(
+                start: boundary.start, end: boundary.end,
+                bundleId: bundleID, appName: names[bundleID] ?? bundleID,
+                seconds: duration, spanCount: counts[bundleID] ?? 0,
+                eventCount: events[bundleID] ?? 0
+            ))
+        }
+    }
+    return result
+}
+
 // MARK: - DST
 
 @Test("DST: the 25-hour day has 25 hourly buckets and a 90,000 s daily bucket")
@@ -136,6 +185,39 @@ func bucketsClampToQueryWindow() {
     )
     #expect(buckets.count == 1)
     #expect(buckets[0].seconds == 3600)
+}
+
+@Test("chronological sweep matches the simple reference across shuffled overlapping spans")
+func chronologicalSweepMatchesReference() {
+    let start = midnight(2025, 11, 2, in: newYork) - 1800
+    let end = start + 30 * 3600
+    var seed: UInt64 = 0xA11CE
+    func random(_ upperBound: Int) -> Int {
+        seed = seed &* 6_364_136_223_846_793_005 &+ 1
+        return Int((seed >> 32) % UInt64(upperBound))
+    }
+    var rows: [ActivitySpan] = []
+    for index in 0..<600 {
+        let rowStart = start - 7200 + Double(random(34 * 3600))
+        let duration = Double(1 + random(5 * 3600))
+        rows.append(ActivitySpan(
+            id: "random-\(index)", startedAt: rowStart,
+            endedAt: rowStart + duration, lastSeenAt: rowStart + duration,
+            bundleId: "com.test.\(random(9))", appName: "App \(index % 11)",
+            eventCount: random(80), closeReason: .appChange, tzOffsetMin: 0
+        ))
+    }
+    // Exercise the public function with source rows in a hostile order; the
+    // store happens to return chronological rows, but the pure seam promises
+    // correctness for any caller-provided fixture.
+    rows.reverse()
+    let expected = referenceBuckets(
+        spans: rows, from: start, to: end, grain: .hourly, timezone: newYork
+    )
+    let actual = ActivityRollups.buckets(
+        spans: rows, from: start, to: end, grain: .hourly, timezone: newYork
+    )
+    #expect(actual == expected)
 }
 
 // MARK: - Top-N truncation

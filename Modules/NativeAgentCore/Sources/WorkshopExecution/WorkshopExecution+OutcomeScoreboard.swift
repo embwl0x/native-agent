@@ -21,9 +21,8 @@ import PersistenceCore   // SwiftNativePersistenceCore + readJSONL (timeline sca
 // v1 metrics come entirely from WorkshopExecutionRecord (status, createdAt, updatedAt,
 // plan, stepsCompleted, rerunCount). `fromStub` (planner-fallback / plan
 // quality) lives in timeline.jsonl, not the record, so stub-rate is a
-// documented v2 follow-up. A golden-jobs RUNNER that fires fixed jobs on a
-// schedule (denser, controlled signal) is a later refinement that feeds the
-// SAME samples into this same aggregator.
+// documented v2 follow-up. The retired synthetic-job runner is deliberately
+// absent; this read side continues to score real persisted work.
 
 /// One Workshop execution distilled to the fields the scoreboard scores. Dates are
 /// pre-parsed so the aggregator core stays PURE and timezone-deterministic
@@ -40,9 +39,8 @@ public struct WorkshopOutcomeSample: Sendable, Equatable {
     public var completedSteps: Int
     public var rerunCount: Int
     /// `trigger_source` of the Workshop execution ("manual" / "trigger:<name>" /
-    /// "golden_eval" / …). Lets the scoreboard segment a CONTROLLED cohort
-    /// (the golden-eval jobs) from organic user Workshop executions for a clean
-    /// week-over-week signal.
+    /// another historical source). Lets the scoreboard segment any persisted
+    /// cohort without owning a producer for that cohort.
     public var triggerSource: String
     /// The planner FAILED for this execution (threw / returned non-JSON / 0 valid
     /// steps) and fell back to a deterministic stub plan — a PLAN-QUALITY signal.
@@ -169,8 +167,8 @@ public enum WorkshopOutcomeScoreboard {
     /// THE scoreboard number. Deterministic, no I/O, no clock reads — fully
     /// unit-testable.
     /// `onlyTriggerSource` (when non-nil) restricts the aggregate to Workshop executions
-    /// whose `triggerSource` matches — e.g. "golden_eval" for the CONTROLLED
-    /// golden-jobs cohort, isolating its trend from organic user Workshop executions.
+    /// whose `triggerSource` matches, isolating one persisted cohort from other
+    /// Workshop executions.
     public static func weekly(
         from samples: [WorkshopOutcomeSample], onlyTriggerSource: String? = nil
     ) -> [WeeklyOutcomeStats] {
@@ -292,37 +290,6 @@ public enum WorkshopOutcomeScoreboard {
     }
 }
 
-/// Fixed, READ-ONLY "golden" executions — the CONTROLLED cohort for MEASURE v2
-/// (north-star). Organic single-user execution volume is too sparse for a stable
-/// week-over-week trend; submitting the SAME jobs on a cadence gives the
-/// scoreboard comparable data points. They exercise the real plan→step path
-/// (planner + recall + synthesis) with innocuous, side-effect-free objectives,
-/// and are tagged `triggerSource` so `weeklyOutcomeStats(onlyTriggerSource:)`
-/// can isolate their trend. Submitted ONLY when the golden-eval loop is
-/// explicitly enabled (it costs planner/step tokens — off by default).
-public enum GoldenEvalJobs {
-    public static let triggerSource = "golden_eval"
-
-    public static let jobs: [WorkshopExecutionSpec] = [
-        WorkshopExecutionSpec(
-            title: "Golden eval: self-summary",
-            objective: "Summarize what you currently know about the user in 3 concise "
-                + "bullet points. This is a read-only self-check — do not modify, send, "
-                + "or create anything.",
-            triggerSource: triggerSource,
-            trustRequired: "none"
-        ),
-        WorkshopExecutionSpec(
-            title: "Golden eval: proactive ideas",
-            objective: "Propose 3 things you could proactively help the user with today "
-                + "based on recent context. Read-only — list the ideas, do not take any "
-                + "action on them.",
-            triggerSource: triggerSource,
-            trustRequired: "none"
-        ),
-    ]
-}
-
 extension WorkshopOutcomeScoreboard {
     /// Compact, LLM-readable rendering of the recent weeks for the weekly
     /// self-improvement pass — so the improvement brain reasons over the REAL
@@ -374,7 +341,7 @@ extension SwiftNativeWorkshopRunner {
     /// Weekly outcome aggregate over the handle-keyed Workshop receipt feed.
     /// During staged migration, live tasks and daemon-era history without a
     /// directed-task receipt fall back to the compatibility execution records.
-    /// `onlyTriggerSource` (e.g. "golden_eval") restricts to one cohort.
+    /// `onlyTriggerSource` restricts the aggregate to one historical cohort.
     public func weeklyOutcomeStats(
         onlyTriggerSource: String? = nil
     ) async -> [WeeklyOutcomeStats] {

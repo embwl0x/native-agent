@@ -321,7 +321,7 @@ extension SwiftToolDispatcher {
     /// when a native tool answers the same question with structure, no approval
     /// queue, and no subprocess. Appended to the shell/bash schema DESCRIPTIONS
     /// only — dispatch, gating, and every other tool's behavior are unchanged.
-    static let nativeToolPreferenceGuidance = "Prefer a native tool when one already covers the need: session_search for past conversations, github_* for GitHub repo/issue/PR reads, read_file and list_dir for file and directory reads."
+    static let nativeToolPreferenceGuidance = "Best fits: session_search for past conversations; delegation_status for bridge progress; github_* for GitHub repositories, notifications, issues, and pull requests; git_status/git_log/git_diff for routine repo evidence; read_file/list_dir for direct file reads."
 
     /// NativeAgent's own MCP endpoint remains available to external MCP
     /// clients and the MCP UI, but advertising it back to NativeAgent's LLM
@@ -688,7 +688,7 @@ extension SwiftToolDispatcher {
             ),
             requestedSchema(
                 name: "tool_load",
-                description: "Load exact tool schemas for this tool-loop turn by category or name. Resident routing preloads high-confidence groups before the first model call; use this fallback only when the needed tool was not already supplied.",
+                description: "Expand this tool-loop turn with an additional tool category or exact names. Tools already attached to the request are ready to call directly; resident routing supplies high-confidence groups before the first model call.",
                 parametersJSON: params(
                     properties: [
                         ("session_id", strSchema("The chat session id whose loaded-tools list to mutate. Required.")),
@@ -1009,6 +1009,69 @@ extension SwiftToolDispatcher {
                         ("affiliation", strSchema("Optional GitHub affiliation filter, e.g. owner,collaborator,organization_member.")),
                         ("sort", strSchema("Optional sort field, e.g. updated, created, pushed, full_name.")),
                         ("direction", strSchema("Optional direction, asc or desc.")),
+                    ],
+                    required: []
+                )
+            ),
+            requestedSchema(
+                name: "github_list_notifications",
+                description: "List bounded GitHub notifications for the connected account through the native API, optionally scoped to one repository. Use for overnight activity, mentions, reviews, assignments, and CI-related notification checks.",
+                parametersJSON: params(
+                    properties: [
+                        ("repo", strSchema("Optional repository as owner/name or a github.com repository URL.")),
+                        ("owner", strSchema("Optional owner when repo is only the repository name.")),
+                        ("url", strSchema("Optional github.com repository URL when repo is omitted.")),
+                        ("all", boolSchema("Include read notifications; default false.")),
+                        ("participating", boolSchema("Only notifications where the user is directly participating or mentioned; default false.")),
+                        ("since", strSchema("Optional inclusive ISO-8601 timestamp.")),
+                        ("before", strSchema("Optional exclusive ISO-8601 timestamp.")),
+                        ("limit", intSchema("Maximum compact notifications, 1-20; default 20.")),
+                        ("page", intSchema("GitHub pagination page; default 1.")),
+                    ],
+                    required: []
+                )
+            ),
+            requestedSchema(
+                name: "github_get_repository",
+                description: "Start a GitHub repository inspection through the connected API. Returns bounded repository metadata, the root layout, and README text in one call. Accepts owner/name or a github.com repository URL.",
+                parametersJSON: params(
+                    properties: [
+                        ("repo", strSchema("Repository as owner/name or a github.com repository URL.")),
+                        ("owner", strSchema("Optional owner when repo is only the repository name.")),
+                        ("url", strSchema("Optional github.com repository URL when repo is omitted.")),
+                    ],
+                    required: []
+                )
+            ),
+            requestedSchema(
+                name: "github_read_repository_content",
+                description: "Read a GitHub repository file or list a directory through the connected API, with bounded text and compact entries. Use after github_get_repository to inspect relevant source or documentation paths.",
+                parametersJSON: params(
+                    properties: [
+                        ("repo", strSchema("Repository as owner/name or a github.com repository URL.")),
+                        ("owner", strSchema("Optional owner when repo is only the repository name.")),
+                        ("url", strSchema("Optional github.com repository URL when repo is omitted.")),
+                        ("path", strSchema("Repository-relative file or directory path. Omit for root.")),
+                        ("ref", strSchema("Optional branch, tag, or commit SHA.")),
+                        ("max_characters", intSchema("Maximum text characters for a file, 1000-100000; default 30000.")),
+                    ],
+                    required: []
+                )
+            ),
+            requestedSchema(
+                name: "github_list_commits",
+                description: "List recent commits for a GitHub repository through the connected API, optionally filtered by branch/ref, path, or time.",
+                parametersJSON: params(
+                    properties: [
+                        ("repo", strSchema("Repository as owner/name or a github.com repository URL.")),
+                        ("owner", strSchema("Optional owner when repo is only the repository name.")),
+                        ("url", strSchema("Optional github.com repository URL when repo is omitted.")),
+                        ("ref", strSchema("Optional branch, tag, or commit SHA.")),
+                        ("path", strSchema("Optional repository-relative path filter.")),
+                        ("since", strSchema("Optional inclusive ISO-8601 timestamp.")),
+                        ("until", strSchema("Optional exclusive ISO-8601 timestamp.")),
+                        ("limit", intSchema("Maximum compact commits, 1-20; default 10.")),
+                        ("page", intSchema("GitHub pagination page; default 1.")),
                     ],
                     required: []
                 )
@@ -2457,6 +2520,24 @@ extension SwiftToolDispatcher {
                         required: []
                     )
                 ),
+                requestedSchema(
+                    name: "mac_attention",
+                    description: "Pay continuous, explicit attention to this Mac without a polling loop or another model. `start` installs a passive, on-device event observer for a bounded time and returns a fresh fused screen view. `next` waits efficiently for physical pointer/keyboard/scroll activity or an app change (up to wait_ms), then returns one fresh fused view; keyboard CONTENT is never captured, only an activity pulse. Physical user input always wins: it immediately invalidates the old view and motor tools refuse with yielded_to_user until you call `next` and re-observe. `status` reports the live session; `stop` removes every observer and forgets the ephemeral state. While active, pass the returned attention.session and attention.user_sequence as attention_session and attention_user_sequence on every Mac motor action. Read-only perception under the Full Mac Accessibility gate; the screenshot half also needs Screen Recording permission.",
+                    parametersJSON: params(
+                        properties: [
+                            ("mode", enumStringSchema(["start", "next", "status", "stop"], "Attention operation. Defaults to status.")),
+                            ("session", strSchema("Session id returned by start. Required for next.")),
+                            ("after_sequence", intSchema("For next: wait only for activity newer than this attention sequence.")),
+                            ("wait_ms", intSchema("For next: event-driven wait before refreshing anyway, 0-15000ms. Defaults to 1500.")),
+                            ("duration_seconds", intSchema("For start: bounded observer lifetime, 15-1800 seconds. Defaults to 300.")),
+                            ("full_screen", boolSchema("Capture the whole display instead of the focused window.")),
+                            ("max_marks", intSchema("Maximum numbered elements, with the same cap as mac_view.")),
+                            ("max_text_items", intSchema("Maximum visible text items, with the same cap as mac_view.")),
+                            ("max_image_bytes", intSchema("Maximum encoded PNG bytes, with the same cap as mac_view.")),
+                        ],
+                        required: []
+                    )
+                ),
             ])
         }
         // W7 — the ambient activity watcher's query tool. The description's job
@@ -2467,7 +2548,7 @@ extension SwiftToolDispatcher {
             schemas.append(contentsOf: [
                 requestedSchema(
                     name: "activity_query",
-                    description: "Summarise which Mac apps were in use over a time range, from a local, on-device activity log the user explicitly opted into. It knows WHICH APP was frontmost and FOR HOW LONG — not what was done inside it, not what was typed, and not the contents of any field. Where the user enabled window titles, a secret-redacted title may appear on example spans; treat it as a weak hint, not a description of the work, and never quote it as fact about content. Apps on the user's exclusion list are absent from the answer entirely, even for days when they were still being recorded, so totals can legitimately be lower than a full day. The answer is capped at 50 rows and states in `truncated` anything it dropped — read that field before describing the result as complete. Read-only, deterministic, and Mac-local: it is refused on iPhone/Telegram/Slack. If Activity Capture is off in Trust Center this tool refuses rather than returning an empty day; do not read a refusal as \"nothing happened\".",
+                    description: "Summarise which Mac apps were in use over a time range, from a local, on-device activity log the user explicitly opted into and separately allowed this selected AI provider to read. It knows WHICH APP was frontmost and FOR HOW LONG — not what was done inside it, not what was typed, and not the contents of any field. Where the user enabled window titles, a secret-redacted title may appear on example spans; treat it as a weak hint, not a description of the work, and never quote it as fact about content. Apps on the user's exclusion list are absent from the answer entirely, even for days when they were still being recorded, so totals can legitimately be lower than a full day. The answer is capped at 50 rows and refuses rather than silently truncating an over-dense source range. Read-only and deterministic; the store is never exposed to iPhone/Telegram/Slack/iCloud/bridges. If capture or Agent Access is off in Trust Center this tool refuses rather than returning an empty day; do not read a refusal as \"nothing happened\".",
                     parametersJSON: params(
                         properties: [
                             ("range", strSchema("Named range: today, yesterday, last_hour, last_24_hours, last_7_days, last_30_days. Defaults to today. Ignored when `from` is given.")),
@@ -2514,6 +2595,8 @@ extension SwiftToolDispatcher {
                         properties: [
                             ("text", strSchema("Literal text to type, character by character. Any Unicode; layout-independent.")),
                             ("keys", strSchema("Space-separated key chords, e.g. \"cmd+shift+4\" or \"escape\" or \"cmd+a cmd+c\". Modifiers: cmd, shift, opt, ctrl, fn. Named keys: return, tab, escape, space, delete, forward_delete, home, end, pageup, pagedown, up, down, left, right, f1-f20.")),
+                            ("attention_session", strSchema("Required while mac_attention is active: its current session id.")),
+                            ("attention_user_sequence", intSchema("Required while mac_attention is active: the user_sequence from its latest observed fused view.")),
                         ],
                         required: []
                     )
@@ -2530,8 +2613,11 @@ extension SwiftToolDispatcher {
                             ("double", boolSchema("Shorthand for count:2.")),
                             ("from", pointSchema("Drag start point. Give both from and to to drag instead of click.")),
                             ("to", pointSchema("Drag end point.")),
+                            ("duration_ms", intSchema("For a drag: smooth local movement duration, 80-2000ms. Defaults to 240ms; no extra model calls.")),
                             ("mark", intSchema("A number from the latest mac_view legend. Clicks that element's centre; needs `view` too. Preferred over x/y.")),
                             ("view", strSchema("The `view` id mac_view returned with that mark. A mark from any earlier view is refused — take a fresh mac_view instead.")),
+                            ("attention_session", strSchema("Required while mac_attention is active: its current session id.")),
+                            ("attention_user_sequence", intSchema("Required while mac_attention is active: the user_sequence from its latest observed fused view.")),
                         ],
                         required: []
                     )
@@ -2546,6 +2632,8 @@ extension SwiftToolDispatcher {
                             ("x", intSchema("Optional screen x to move the pointer to before scrolling.")),
                             ("y", intSchema("Optional screen y to move the pointer to before scrolling.")),
                             ("units", enumStringSchema(["line", "pixel"], "Scroll units. Defaults to line.")),
+                            ("attention_session", strSchema("Required while mac_attention is active: its current session id.")),
+                            ("attention_user_sequence", intSchema("Required while mac_attention is active: the user_sequence from its latest observed fused view.")),
                         ],
                         required: []
                     )
@@ -2560,6 +2648,8 @@ extension SwiftToolDispatcher {
                             ("value", strSchema("When given, set the element's value to this text instead of performing an action. For text fields.")),
                             ("mark", intSchema("A number from the latest mac_view legend, addressing the same element its legend row names. Needs `view` too. Use instead of `path`.")),
                             ("view", strSchema("The `view` id mac_view returned with that mark. A mark from any earlier view is refused — take a fresh mac_view instead.")),
+                            ("attention_session", strSchema("Required while mac_attention is active: its current session id.")),
+                            ("attention_user_sequence", intSchema("Required while mac_attention is active: the user_sequence from its latest observed fused view.")),
                         ],
                         required: []
                     )
@@ -2572,6 +2662,8 @@ extension SwiftToolDispatcher {
                             ("key_tap", boolSchema("Also tap the left shift key, which types nothing but wakes some sleeping displays a mouse move alone does not. Off by default; try it if a first wake reports dismissed:false.")),
                             ("settle_ms", intSchema("How long to wait after the nudge before capturing, 0-3000ms. Defaults to 700, which is enough for the screensaver to finish tearing down. Raise it if the returned view still shows the saver.")),
                             ("full_screen", boolSchema("Capture the whole screen instead of just the frontmost window, same as mac_view.")),
+                            ("attention_session", strSchema("Required while mac_attention is active: its current session id.")),
+                            ("attention_user_sequence", intSchema("Required while mac_attention is active: the user_sequence from its latest observed fused view.")),
                         ],
                         required: []
                     )

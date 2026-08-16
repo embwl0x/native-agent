@@ -76,7 +76,9 @@ extension CognitiveSubstrate {
     func semanticAppraisal(
         for event: CognitiveEvent,
         post: CognitiveAffectState,
-        precomputedAppraisal: AffectAppraisal? = nil
+        precomputedAppraisal: AffectAppraisal? = nil,
+        precomputedWarmthBoost: Double? = nil,
+        precomputedStandingViewConcerns: [AppraisalConcern]? = nil
     ) -> SemanticAppraisal {
         let now = dependencies.now()
         // Audit C3 (2026-07-09): text-derived dims read USER-authored words only —
@@ -196,7 +198,10 @@ extension CognitiveSubstrate {
         // active views now contribute lived concerns of their own, so an event
         // touching her own settled words registers where it previously could
         // only register through one of the shipped six.
-        let activeViewHit = activeStandingViewTagHit(in: event.summary) ? 1.0 : 0.0
+        let activeViewHit = activeStandingViewTagHit(
+            in: event.summary,
+            concerns: precomputedStandingViewConcerns
+        ) ? 1.0 : 0.0
         a.goalRelevance = clamp(0.45 * event.importance + 0.30 * kindBase
             + 0.20 * continuity + 0.10 * activeViewHit)
 
@@ -206,7 +211,11 @@ extension CognitiveSubstrate {
         // event confirming a held view lands MORE right, one trampling it
         // lands more wrong, and conflict leaves its own mark in the valence
         // term. Zero matched views (the sparse-views norm) contributes 0.
-        a.worldviewStance = standingViewStance(in: event.summary, textValence: text.valence)
+        a.worldviewStance = standingViewStance(
+            in: event.summary,
+            textValence: text.valence,
+            concerns: precomputedStandingViewConcerns
+        )
         a.worldviewConflict = max(0, -a.worldviewStance)
         a.goalCongruence = Self.clampSigned(0.45 * outcomeSign + 0.75 * text.valence
             + 0.25 * relief - 0.25 * unresolvedRecentFailure
@@ -242,7 +251,8 @@ extension CognitiveSubstrate {
         // -- relationship -------------------------------------------------------
         let isLiveChat = event.kind == .userMessageReceived || event.kind == .userCorrection
         let userRecent = lastUserPresenceAt.map { now.timeIntervalSince($0) < 30 * 60 } ?? false
-        let lexicalRelational = text.warmth != 0 || relationalWarmthBoost(in: event.summary) > 0
+        let warmthBoost = precomputedWarmthBoost ?? relationalWarmthBoost(in: event.summary)
+        let lexicalRelational = text.warmth != 0 || warmthBoost > 0
         a.relationshipStake = clamp((isLiveChat ? 0.6 : 0)
             + (lexicalRelational ? 0.3 : 0)
             + (userRecent && event.kind == .assistantTurnCompleted ? 0.1 : 0)
@@ -303,14 +313,17 @@ extension CognitiveSubstrate {
     /// contributes a LIVED concern made of its own distinctive words, an event
     /// touching what she actually settled now registers here, where before it
     /// could only register through one of the shipped six.
-    func activeStandingViewTagHit(in text: String) -> Bool {
+    func activeStandingViewTagHit(
+        in text: String,
+        concerns precomputedConcerns: [AppraisalConcern]? = nil
+    ) -> Bool {
         let lower = text.lowercased()
         guard !lower.isEmpty else { return false }
         // Both loops below iterate ACTIVE views, so with none there is nothing to
         // hit and the concern derivation is pure cost on the ingest hot path.
         // (Zero active views is still the wild norm.)
         guard standingViews.values.contains(where: { $0.status == .active }) else { return false }
-        let concerns = appraisalConcerns()
+        let concerns = precomputedConcerns ?? appraisalConcerns()
         for view in standingViews.values where view.status == .active {
             let viewText = "\(view.title) \(view.body)".lowercased()
             for concern in concerns
@@ -334,7 +347,11 @@ extension CognitiveSubstrate {
     /// stays out of it (review 18dc59cc4670).
     static let worldviewStanceValenceMargin = 0.12
 
-    func standingViewStance(in text: String, textValence: Double) -> Double {
+    func standingViewStance(
+        in text: String,
+        textValence: Double,
+        concerns precomputedConcerns: [AppraisalConcern]? = nil
+    ) -> Double {
         guard abs(textValence) >= Self.worldviewStanceValenceMargin else { return 0 }
         let lower = text.lowercased()
         guard !lower.isEmpty else { return 0 }
@@ -377,7 +394,7 @@ extension CognitiveSubstrate {
         // the ingest hot path — and with no active views there is nothing to
         // match, so skip the derivation entirely.
         guard standingViews.values.contains(where: { $0.status == .active }) else { return 0 }
-        let concerns = appraisalConcerns()
+        let concerns = precomputedConcerns ?? appraisalConcerns()
         var aggregate = 0.0
         var matched = 0
         for view in standingViews.values where view.status == .active {

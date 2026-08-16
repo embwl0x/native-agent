@@ -10,9 +10,22 @@ struct ModelAwareAutocompactionTests {
     func thresholdClamp() {
         let config = ChatSessionAutocompactionConfig(thresholdTokens: 200_000)
 
-        #expect(config.effectiveThresholdTokens(forModel: "claude-fable-5") == 200_000)
-        #expect(config.effectiveThresholdTokens(forModel: "gpt-5.6-sol") == 148_800)
-        #expect(config.effectiveThresholdTokens(forModel: "gpt-5.4") == 51_200)
+        #expect(config.effectiveThresholdTokens(
+            forModel: "claude-fable-5",
+            providerID: "anthropic_oauth_direct"
+        ) == 200_000)
+        #expect(config.effectiveThresholdTokens(
+            forModel: "gpt-5.6-sol",
+            providerID: "openai_oauth_direct"
+        ) == 148_800)
+        #expect(config.effectiveThresholdTokens(
+            forModel: "gpt-5.4",
+            providerID: "openai_oauth_direct"
+        ) == 108_800)
+        #expect(config.effectiveThresholdTokens(
+            forModel: "unverified-model",
+            providerID: "unverified-provider"
+        ) == 200_000)
     }
 
     @Test("small-window model compacts before a global threshold can exceed its window")
@@ -34,7 +47,7 @@ struct ModelAwareAutocompactionTests {
                 "id": .string("message-\(index)"),
                 "sessionId": .string(sessionID),
                 "role": .string(index.isMultiple(of: 2) ? "user" : "assistant"),
-                "content": .string("MESSAGE-\(index) " + String(repeating: "x", count: 8_000)),
+                "content": .string("MESSAGE-\(index) " + String(repeating: "x", count: 16_000)),
                 "createdAt": .string("2026-07-10T12:00:\(String(format: "%02d", index))Z"),
             ])
             data.append(Data((try row.serialize(pretty: false) + "\n").utf8))
@@ -52,11 +65,12 @@ struct ModelAwareAutocompactionTests {
             sessionId: sessionID,
             model: "gpt-5.4",
             surface: "chat",
-            runId: "small-window-run"
+            runId: "small-window-run",
+            providerID: "openai_oauth_direct"
         )
 
         #expect(outcome.compacted)
-        #expect(outcome.thresholdTokens == 51_200)
+        #expect(outcome.thresholdTokens == 108_800)
         #expect(outcome.estimatedTokensBefore > outcome.thresholdTokens)
         #expect(outcome.messagesAfter < outcome.messagesBefore)
     }

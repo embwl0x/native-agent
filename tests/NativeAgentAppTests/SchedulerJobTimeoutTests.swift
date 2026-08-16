@@ -98,6 +98,31 @@ func timeoutRace_cancelsAbandonedBodyOnTimeout() async throws {
     #expect(await observedCancellation.get())
 }
 
+@Test("timeout body-exit hook fires only after a non-cooperative loser really exits")
+func timeoutRace_bodyExitHookTracksActualLifecycle() async throws {
+    let gate = NonCooperativeBodyGate()
+    let exited = ObservedFlag()
+    let outcome = await raceAgainstTimeout(
+        seconds: 0.05,
+        onBodyExit: { Task { await exited.set() } }
+    ) { () -> String in
+        await gate.wait()
+        return "finished"
+    }
+    guard case .timedOut = outcome else {
+        Issue.record("expected .timedOut, got \(outcome)")
+        return
+    }
+    #expect(await exited.get() == false)
+
+    await gate.release()
+    let deadline = Date().addingTimeInterval(10)
+    while await exited.get() == false, Date() < deadline {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(await exited.get(), "body lifecycle stayed quarantined after the real child exit")
+}
+
 // MARK: - Parent-cancellation propagation (W3b Finding 2)
 
 @Test
@@ -173,6 +198,23 @@ private func mapOutcomeToTag<T>(_ o: TimeoutRaceOutcome<T>) -> TimeoutRaceOutcom
     case .failure(let m): return .failure(m)
     case .timedOut: return .timedOut
     case .cancelled: return .cancelled
+    }
+}
+
+private actor NonCooperativeBodyGate {
+    private var released = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        guard !released else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func release() {
+        released = true
+        let parked = waiters
+        waiters.removeAll()
+        parked.forEach { $0.resume() }
     }
 }
 

@@ -263,16 +263,30 @@ struct OperationalSettingsPresentationTests {
         #expect(lifecycle.contains("loadProcessedIds()"))
     }
 
-    @Test func snapshotProjectionWaitsForDriveTransportSelection() throws {
+    @Test func manualChatCompactionUsesCanonicalCoreOwner() throws {
+        let adapter = try AppSourceScraping.appSource("NativeClient+ChatCompaction.swift")
+        let mixedExportFile = try AppSourceScraping.appSource("NativeClient+ExportWorkshopInbox.swift")
+
+        #expect(adapter.contains("Self.residentMacChatClient.compactSession("))
+        #expect(adapter.contains("name: .chatTurnCompleted"))
+        #expect(!adapter.contains("payload.write("))
+        #expect(!adapter.contains("copyItem(at:"))
+        #expect(!mixedExportFile.contains("func compactSession("))
+    }
+
+    @Test func liveCloudKitTransportSkipsLegacyDriveStartup() throws {
         let bridge = try AppSourceScraping.appSource("iCloudBridge.swift")
         let call = "MacSyncEngine.shared.startCloudKitSnapshotProjection()"
         #expect(bridge.components(separatedBy: call).count - 1 == 1)
 
-        let fallback = try #require(bridge.range(of: "guard let containerURL else"))
-        let projection = try #require(bridge.range(of: call))
+        let transport = try #require(bridge.range(of: "if deviceTransport != nil"))
+        let firstProjection = try #require(bridge.range(of: call))
+        let legacyLookup = try #require(bridge.range(of: "setupTask = Task.detached(priority: .utility)"))
         let drive = try #require(bridge.range(of: "MacSyncEngine.shared.start(docsURL: docsURL)"))
-        #expect(projection.lowerBound > fallback.lowerBound)
-        #expect(projection.lowerBound < drive.lowerBound)
+        #expect(firstProjection.lowerBound > transport.lowerBound)
+        #expect(firstProjection.lowerBound < legacyLookup.lowerBound)
+        #expect(legacyLookup.lowerBound < drive.lowerBound)
+        #expect(bridge.contains("if self.deviceTransport != nil {\n                    _ = await self.drainDeviceTransport()"))
     }
 
     // Source readers (appSource / repositoryRoot) live in the shared

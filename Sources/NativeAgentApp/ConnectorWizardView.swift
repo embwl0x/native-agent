@@ -108,6 +108,9 @@ struct ConnectorWizardView: View {
     @State private var githubToken: String = ""
     @State private var slackToken: String = ""
     @State private var slackAppToken: String = ""
+    @State private var slackAllowedChannels: String = ""
+    @State private var slackAllowedUsers: String = ""
+    @State private var slackRequireMention = true
     @State private var notionToken: String = ""
     @State private var isSavingGitHubToken = false
     @State private var isSavingSlackToken = false
@@ -180,6 +183,9 @@ struct ConnectorWizardView: View {
         .task {
             state.provider = provider
             state.providerDisplayName = displayName
+            if provider.lowercased() == "slack" {
+                loadSlackIngressPolicy()
+            }
             await loadRegistrationStatus()
         }
         .onDisappear {
@@ -381,6 +387,18 @@ struct ConnectorWizardView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+            NativePanel(title: "Who Can Message Your Agent", systemImage: "person.badge.shield.checkmark") {
+                VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
+                    TextField("Allowed channel IDs, such as C0123", text: $slackAllowedChannels)
+                        .textFieldStyle(.roundedBorder)
+                    TextField("Allowed user IDs, such as U0123", text: $slackAllowedUsers)
+                        .textFieldStyle(.roundedBorder)
+                    Toggle("Require an @mention in channels and group chats", isOn: $slackRequireMention)
+                    Text("Add at least one channel or user. Inbound Slack chat stays safely off when both lists are empty; direct messages never require an @mention.")
+                        .font(NativeAgentFont.label)
+                        .foregroundStyle(.secondary)
+                }
+            }
             NativePanel(title: "Useful Slack Scopes", systemImage: "checklist") {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("channels:read, groups:read, im:read, mpim:read")
@@ -399,18 +417,12 @@ struct ConnectorWizardView: View {
                     }
                 }
                 .buttonStyle(.bordered)
-                Button(isSavingSlackToken ? "Saving..." : "Save Token") {
+                Button(isSavingSlackToken ? "Saving..." : "Save Slack Settings") {
                     state.flowTask?.cancel()
                     state.flowTask = Task { await saveSlackToken() }
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(
-                    isSavingSlackToken
-                    || (
-                        slackToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        && slackAppToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    )
-                )
+                .disabled(isSavingSlackToken)
             }
         }
     }
@@ -681,7 +693,13 @@ struct ConnectorWizardView: View {
         isSavingSlackToken = true
         defer { isSavingSlackToken = false }
 
-        let result = await NativeOAuthFlow.saveSlackToken(slackToken, appToken: slackAppToken)
+        let result = await NativeOAuthFlow.saveSlackToken(
+            slackToken,
+            appToken: slackAppToken,
+            allowedChannelIds: parseSlackIDs(slackAllowedChannels),
+            allowedUserIds: parseSlackIDs(slackAllowedUsers),
+            requireMention: slackRequireMention
+        )
         guard !Task.isCancelled else { return }
         if result.ok {
             slackToken = ""
@@ -693,6 +711,20 @@ struct ConnectorWizardView: View {
             state.errorMessage = result.error ?? "Slack token save failed."
             state.step = .error
         }
+    }
+
+    private func loadSlackIngressPolicy() {
+        let policy = SlackSocketModeConfig.loadIngressPolicy()
+        slackAllowedChannels = policy.allowedChannelIds.sorted().joined(separator: ", ")
+        slackAllowedUsers = policy.allowedUserIds.sorted().joined(separator: ", ")
+        slackRequireMention = policy.requireMention
+    }
+
+    private func parseSlackIDs(_ raw: String) -> Set<String> {
+        Set(raw.split { $0 == "," || $0 == ";" || $0.isWhitespace }
+            .map(String.init)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty })
     }
 
     private func saveGitHubToken() async {

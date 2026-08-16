@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - Hermetic data-root helper (test hermeticity)
 //
-// Several BackgroundLoops types (`GoldenEvalLoop`, `SelfHealingHook`,
+// Several BackgroundLoops types (`SelfHealingHook`,
 // `WeeklySelfImprovementLoop`, …) default their `dataRoot:` to
 // `PersistenceCore.defaultDataRoot()`, which under `swift test` resolves to the
 // LIVE data root (the repo's `data/` via the CWD walk-up, or

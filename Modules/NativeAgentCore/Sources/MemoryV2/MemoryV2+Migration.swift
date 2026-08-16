@@ -246,7 +246,12 @@ public actor MemoryV2Migrator {
         // Re-runs are safe because every insert is existence-gated.
         if report.requiredFailures == 0 {
             if let data = ISO8601DateFormatter().string(from: Date()).data(using: .utf8) {
-                try? data.write(to: markerFile, options: .atomic)
+                do {
+                    try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: markerFile)
+                } catch {
+                    report.errors.append("MemoryV2Migrator: completion sentinel could not be written: \(error)")
+                    report.requiredFailures += 1
+                }
             }
         } else {
             report.errors.append(
@@ -284,6 +289,7 @@ public actor MemoryV2Migrator {
         for record in records {
             guard !record.id.isEmpty else {
                 report.errors.append("memory: skipped record with empty id")
+                report.requiredFailures += 1
                 continue
             }
             do {
@@ -313,7 +319,9 @@ public actor MemoryV2Migrator {
                 return try decoder.decode(MemoryRecord.self, from: bytes)
             }
         }
-        return []
+        throw MemoryStorageError.databaseUnavailable(
+            "legacy memory.json object is missing the required 'memories' array"
+        )
     }
 
     // MARK: legacy notes.jsonl
@@ -323,19 +331,40 @@ public actor MemoryV2Migrator {
     /// elsewhere and are handled by `migrateProposals`.
     private func migrateLegacyNotes(storage: any MemoryV2Storage, into report: inout MigrationReport) async {
         let fm = FileManager.default
-        guard let entries = try? fm.contentsOfDirectory(
-            at: memoryDir,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ) else { return }
+        let entries: [URL]
+        do {
+            entries = try fm.contentsOfDirectory(
+                at: memoryDir,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            )
+        } catch {
+            // A missing legacy directory is a clean fresh install. An existing
+            // directory that cannot be enumerated is not equivalent to empty.
+            if fm.fileExists(atPath: memoryDir.path) {
+                report.errors.append("memory legacy directory exists but is unreadable: \(error)")
+                report.requiredFailures += 1
+            }
+            return
+        }
 
         for dir in entries {
             guard ((try? dir.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false) else {
                 continue
             }
             let notesFile = dir.appendingPathComponent("notes.jsonl")
-            guard let data = try? Data(contentsOf: notesFile),
-                  let text = String(data: data, encoding: .utf8) else {
+            guard fm.fileExists(atPath: notesFile.path) else { continue }
+            let data: Data
+            do {
+                data = try Data(contentsOf: notesFile)
+            } catch {
+                report.errors.append("notes.jsonl \(notesFile.path): exists but is unreadable: \(error)")
+                report.requiredFailures += 1
+                continue
+            }
+            guard let text = String(data: data, encoding: .utf8) else {
+                report.errors.append("notes.jsonl \(notesFile.path): is not valid UTF-8")
+                report.requiredFailures += 1
                 continue
             }
             for (offset, rawLine) in text.split(whereSeparator: \.isNewline).enumerated() {
@@ -344,6 +373,14 @@ public actor MemoryV2Migrator {
                 do {
                     let value = try JSONValue.parse(Data(line.utf8))
                     guard let legacy = LegacyNoteImport(raw: value, notesPath: notesFile.path) else {
+                        if case .object(let object) = value,
+                           case .bool(true)? = object["_test_fixture"] {
+                            continue
+                        }
+                        report.errors.append(
+                            "notes.jsonl \(notesFile.lastPathComponent)#\(offset + 1): required id/text fields are missing or invalid"
+                        )
+                        report.requiredFailures += 1
                         continue
                     }
                     let vector = (try await embedder.embed([legacy.text])).first ?? []

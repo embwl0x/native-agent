@@ -233,30 +233,6 @@ public struct ContextFeedbackReducer: Sendable {
     }
 }
 
-/// Authority is a primary ordering key. Utility can refine peers at the same
-/// authority but can never promote a frequently retrieved weak claim over a
-/// stronger one. Privacy remains an eligibility gate, never a score.
-public enum ContextFeedbackRanker {
-    public static func eligible(
-        _ states: [ContextFeedbackAtomState],
-        allowedPrivacy: Set<ContextPrivacy>
-    ) -> [ContextFeedbackAtomState] {
-        states.filter { allowedPrivacy.contains($0.privacy) }.sorted(by: ranksBefore)
-    }
-
-    public static func ranksBefore(
-        _ lhs: ContextFeedbackAtomState,
-        _ rhs: ContextFeedbackAtomState
-    ) -> Bool {
-        if lhs.authority.rank != rhs.authority.rank {
-            return lhs.authority.rank > rhs.authority.rank
-        }
-        if lhs.utility != rhs.utility { return lhs.utility > rhs.utility }
-        if lhs.decay != rhs.decay { return lhs.decay > rhs.decay }
-        return lhs.atomID < rhs.atomID
-    }
-}
-
 private extension ContextFeedbackReducer {
     struct MutableState {
         let atomID: ContextAtomID

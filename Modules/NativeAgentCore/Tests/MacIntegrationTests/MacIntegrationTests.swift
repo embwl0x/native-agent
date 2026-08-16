@@ -167,4 +167,100 @@ final class MacIntegrationTests: XCTestCase {
         let mutatedAllowed = await store.allows(MacIntegrationID.calendar, mode: .read)
         XCTAssertFalse(mutatedAllowed)
     }
+
+    func testSignedIOSMutationPersistsAxesAndProvenanceInOneGeneration() async throws {
+        let tmp = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let store = MacIntegrationPermissionStore(dataRoot: tmp)
+        let result = try await store.setWithReceipt(
+            integrationId: MacIntegrationID.mail,
+            read: false,
+            write: true,
+            actionID: "action-123",
+            surface: "ios_icloud",
+            provenance: .signedIOS(clientID: "paired-client-1")
+        )
+        XCTAssertEqual(result, MacIntegrationPermission(read: false, write: true))
+
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: storePath(tmp))) as? [String: Any]
+        )
+        let mail = try XCTUnwrap(object[MacIntegrationID.mail] as? [String: Any])
+        XCTAssertEqual(mail["read"] as? Bool, false)
+        XCTAssertEqual(mail["write"] as? Bool, true)
+        let receipts = try XCTUnwrap(object["_mutationReceipts"] as? [[String: Any]])
+        let receipt = try XCTUnwrap(receipts.last)
+        XCTAssertEqual(receipt["actionId"] as? String, "action-123")
+        XCTAssertEqual(receipt["surface"] as? String, "ios_icloud")
+        XCTAssertEqual((receipt["before"] as? [String: Any])?["read"] as? Bool, true)
+        XCTAssertEqual((receipt["after"] as? [String: Any])?["write"] as? Bool, true)
+        let provenance = try XCTUnwrap(receipt["provenance"] as? [String: Any])
+        XCTAssertEqual(provenance["kind"] as? String, "signed_ios")
+        XCTAssertEqual(provenance["clientId"] as? String, "paired-client-1")
+    }
+
+    func testInvalidReceiptProvenanceLeavesPermissionBytesUnchanged() async throws {
+        let tmp = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let store = MacIntegrationPermissionStore(dataRoot: tmp)
+        try await store.set(integrationId: MacIntegrationID.calendar, read: true, write: false)
+        let before = try Data(contentsOf: storePath(tmp))
+
+        do {
+            _ = try await store.setWithReceipt(
+                integrationId: MacIntegrationID.calendar,
+                read: false,
+                write: true,
+                actionID: "",
+                surface: "ios_icloud",
+                provenance: .signedIOS(clientID: "paired-client-1")
+            )
+            XCTFail("expected invalid receipt refusal")
+        } catch { }
+        XCTAssertEqual(try Data(contentsOf: storePath(tmp)), before)
+    }
+
+    func testRetriedRemoteActionCannotRevertANewerChoice() async throws {
+        let tmp = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let store = MacIntegrationPermissionStore(dataRoot: tmp)
+        _ = try await store.setWithReceipt(
+            integrationId: MacIntegrationID.messages,
+            read: true,
+            write: true,
+            actionID: "remote-action-1",
+            surface: "ios_icloud",
+            provenance: .signedIOS(clientID: "paired-client-1")
+        )
+        _ = try await store.setWithReceipt(
+            integrationId: MacIntegrationID.messages,
+            read: false,
+            write: false,
+            actionID: "local-action-2",
+            surface: "mac_ui",
+            provenance: .local()
+        )
+        let replay = try await store.setWithReceipt(
+            integrationId: MacIntegrationID.messages,
+            read: true,
+            write: true,
+            actionID: "remote-action-1",
+            surface: "ios_icloud",
+            provenance: .signedIOS(clientID: "paired-client-1")
+        )
+        XCTAssertEqual(replay, MacIntegrationPermission(read: false, write: false))
+        do {
+            _ = try await store.setWithReceipt(
+                integrationId: MacIntegrationID.messages,
+                read: false,
+                write: true,
+                actionID: "remote-action-1",
+                surface: "ios_icloud",
+                provenance: .signedIOS(clientID: "paired-client-1")
+            )
+            XCTFail("expected action-id payload mismatch refusal")
+        } catch { }
+        let recovered = try await store.currentChecked()[MacIntegrationID.messages]
+        XCTAssertEqual(recovered, MacIntegrationPermission(read: false, write: false))
+    }
 }

@@ -49,7 +49,6 @@ struct ChatView: View {
     @State private var photoLoadTask: Task<Void, Never>?
     @State private var photoLoadGeneration = 0
     @State private var suppressNextEmptyPhotoSelection = false
-    @State private var chatSessionSnapshotLoop: Task<Void, Never>?
     @State private var closingPinnedSessionIDs: Set<String> = []
 
     private let maxPendingPhotos = 4
@@ -83,7 +82,11 @@ struct ChatView: View {
 
     private var effectiveMainSessionID: String? {
         store.mainSessionID
-            ?? sync.sessions.first(where: { NativeAgentICloudBridgeConstants.isMobileSourceKey($0.sourceKey) && $0.archived != true })?.id
+            ?? sync.sessions.first(where: {
+                (NativeAgentICloudBridgeConstants.isMobileSourceKey($0.sourceKey)
+                    || (($0.source ?? "").lowercased() == "ios" && ($0.sourceKey ?? "").isEmpty))
+                    && $0.archived != true
+            })?.id
     }
 
     private var mainSessionTitle: String {
@@ -108,6 +111,20 @@ struct ChatView: View {
         chatBody
             .onChange(of: sync.surfaceModels) { _, _ in
                 adoptSurfaceModelPreferenceFromSync()
+            }
+            .onChange(of: sync.chatTranscripts) { _, _ in
+                applyPublishedTranscriptToVisibleSession()
+            }
+            .onChange(of: sync.sessions) { _, _ in
+                reconcilePublishedChatSessions()
+            }
+            .onChange(of: sync.pinnedChatSessions) { _, _ in
+                reconcilePublishedChatSessions()
+            }
+            .onChange(of: store.isLoading) { _, isLoading in
+                if !isLoading {
+                    reconcilePublishedChatSessions()
+                }
             }
     }
 
@@ -326,7 +343,6 @@ struct ChatView: View {
                     selectedModel = "gpt-5.6-sol"
                 }
                 adoptSurfaceModelPreferenceFromSync()
-                startChatSessionSnapshotLoop()
                 // Wire TTS callback into store
                 store.onReply = { [voiceOutput] text in
                     voiceOutput.speak(text)
@@ -373,7 +389,6 @@ struct ChatView: View {
             // PATCH-2026-05-11: foreground-refresh — pull latest history when app foregrounds.
             .onChange(of: scenePhase) { _, newPhase in
                 if newPhase == .active {
-                    startChatSessionSnapshotLoop()
                     Task {
                         await bridgeClient.pollICloudRepliesNow()
                         await sync.refreshChatSessionListSnapshot()
@@ -383,12 +398,9 @@ struct ChatView: View {
                         )
                         store.refresh(using: bridgeClient, fallbackMessages: currentSnapshotMessages())
                     }
-                } else {
-                    stopChatSessionSnapshotLoop()
                 }
             }
             .onDisappear {
-                stopChatSessionSnapshotLoop()
                 guard !store.hasPendingICloudReplies && !store.isLoading else { return }
                 bridgeClient.removeICloudReplyObserver(iCloudReplyObserverID)
                 bridgeClient.removeICloudReplyRejectionObserver(iCloudRejectionObserverID)
@@ -1128,15 +1140,7 @@ struct ChatView: View {
 
     private func snapshotMessages(for sessionID: String?) -> [ChatMessage]? {
         guard let records = sync.transcriptRecords(for: sessionID) else { return nil }
-        let mapped = records.compactMap { record -> ChatMessage? in
-            guard record.role == "user" || record.role == "assistant" else { return nil }
-            let role: ChatMessage.Role = record.role == "user" ? .user : .assistant
-            return ChatMessage(
-                id: UUID(uuidString: record.id) ?? UUID(),
-                role: role,
-                text: record.content
-            )
-        }
+        let mapped = MacBridgeClient.projectChatRecords(records)
         return mapped.isEmpty ? nil : mapped
     }
 
@@ -1144,20 +1148,17 @@ struct ChatView: View {
         snapshotMessages(for: store.selectedSessionID ?? effectiveMainSessionID)
     }
 
-    private func refreshVisibleChatSessionSnapshots() async {
-        let beforePinnedIds = sync.pinnedChatSessions.map(\.id)
-        let selectedForFallback = store.selectedSessionID ?? effectiveMainSessionID
-        await sync.refreshChatSessionListSnapshot()
+    private func reconcilePublishedChatSessions() {
         adoptMainSessionFromSnapshots()
-        let afterPinnedIds = sync.pinnedChatSessions.map(\.id)
-        reconcileExternallyRemovedPinnedSession(afterPinnedIDs: Set(afterPinnedIds))
-        if let selectedForFallback,
-           beforePinnedIds != afterPinnedIds || sync.transcriptRecords(for: selectedForFallback) == nil {
-            await sync.refreshChatTranscriptsSnapshot()
-        }
-        if store.messages.isEmpty {
-            store.refresh(using: bridgeClient, fallbackMessages: currentSnapshotMessages())
-        }
+        reconcileExternallyRemovedPinnedSession(
+            afterPinnedIDs: Set(sync.pinnedChatSessions.map(\.id))
+        )
+    }
+
+    private func applyPublishedTranscriptToVisibleSession() {
+        let sessionID = store.selectedSessionID ?? effectiveMainSessionID
+        guard let messages = snapshotMessages(for: sessionID) else { return }
+        store.applyMacTranscriptSnapshot(messages, sessionID: sessionID)
     }
 
     private func reconcileExternallyRemovedPinnedSession(afterPinnedIDs: Set<String>) {
@@ -1170,22 +1171,6 @@ struct ChatView: View {
             using: bridgeClient,
             fallbackMessages: snapshotMessages(for: effectiveMainSessionID)
         )
-    }
-
-    private func startChatSessionSnapshotLoop() {
-        guard chatSessionSnapshotLoop == nil else { return }
-        chatSessionSnapshotLoop = Task { @MainActor in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 5_000_000_000)
-                guard !Task.isCancelled else { break }
-                await refreshVisibleChatSessionSnapshots()
-            }
-        }
-    }
-
-    private func stopChatSessionSnapshotLoop() {
-        chatSessionSnapshotLoop?.cancel()
-        chatSessionSnapshotLoop = nil
     }
 
     private func selectChatSessionTab(_ tab: ChatSessionTab) {

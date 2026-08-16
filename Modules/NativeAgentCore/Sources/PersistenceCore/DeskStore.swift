@@ -810,7 +810,13 @@ public struct SwiftNativeDeskStore: Sendable {
     /// receipt (appended as a note on the pursuit). REFUSES an unknown
     /// reservation id (a receipt must ride a real reservation — H5).
     @discardableResult
-    public func completeWorkSession(_ handle: String, reservationId: String, receipt: String) async throws -> DeskOp {
+    public func completeWorkSession(
+        _ handle: String,
+        reservationId: String,
+        receipt: String,
+        disposition: DeskWorkDisposition? = nil,
+        artifactRefs: [String] = []
+    ) async throws -> DeskOp {
         try await persistence.withFileLock(opsPath) {
             let feed = try await readFeedUnlocked()
             let state = Self.compact(base: feed.base, feed.ops)
@@ -818,13 +824,84 @@ public struct SwiftNativeDeskStore: Sendable {
                 throw DeskError.unknownHandle(handle)
             }
             guard item.isPursuit else { throw DeskError.notAPursuit(handle: handle) }
+            let body: DeskOpBody = if let disposition {
+                .settleWorkSession(
+                    reservationId: reservationId,
+                    receipt: receipt,
+                    disposition: disposition,
+                    artifactRefs: Array(artifactRefs.prefix(16))
+                )
+            } else {
+                .completeWorkSession(reservationId: reservationId, receipt: receipt)
+            }
             let op = DeskOp(
                 ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs),
                 handle: handle,
-                body: .completeWorkSession(reservationId: reservationId, receipt: receipt)
+                body: body
             )
             // Single gate: reservation-exists AND not-already-complete live in
             // the validator so the generic append path enforces them too.
+            try Self.validatePursuitInvariants(op, in: state, viaGenericPath: false)
+            _ = try await appendAndRecompactUnlocked(op, feed: feed)
+            return op
+        }
+    }
+
+    /// Reserve a typed attempt directly on a non-pursuit Desk item. This is the
+    /// admission lane for owner-authored cadence work; it deliberately does
+    /// not mutate the pursuit payload or impersonate agent volition.
+    @discardableResult
+    public func reserveWorkAttempt(
+        _ handle: String,
+        lane: DeskWorkAttempt.Lane,
+        day: String,
+        slot: String
+    ) async throws -> String {
+        try await persistence.withFileLock(opsPath) {
+            let feed = try await readFeedUnlocked()
+            let state = Self.compact(base: feed.base, feed.ops)
+            guard let item = state.items.first(where: { $0.handle == handle }) else {
+                throw DeskError.unknownHandle(handle)
+            }
+            guard !item.status.isTerminal, !item.isPursuit else {
+                throw DeskError.notAPursuit(handle: handle)
+            }
+            let attemptId = DeskClock.workAttemptId(handle: handle, lane: lane, day: day, slot: slot)
+            if item.workAttempts.contains(where: { $0.attemptId == attemptId }) { return attemptId }
+            let op = DeskOp(
+                ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs),
+                handle: handle,
+                body: .reserveWorkAttempt(attemptId: attemptId, lane: lane, day: day, slot: slot)
+            )
+            try Self.validatePursuitInvariants(op, in: state, viaGenericPath: false)
+            _ = try await appendAndRecompactUnlocked(op, feed: feed)
+            return attemptId
+        }
+    }
+
+    /// Idempotently settle one typed attempt. Replaying the same terminal
+    /// result after a crash is a no-op rather than a duplicate Desk note.
+    @discardableResult
+    public func completeWorkAttempt(
+        _ handle: String,
+        attemptId: String,
+        receipt: String
+    ) async throws -> DeskOp? {
+        try await persistence.withFileLock(opsPath) {
+            let feed = try await readFeedUnlocked()
+            let state = Self.compact(base: feed.base, feed.ops)
+            guard let item = state.items.first(where: { $0.handle == handle }) else {
+                throw DeskError.unknownHandle(handle)
+            }
+            guard let attempt = item.workAttempts.first(where: { $0.attemptId == attemptId }) else {
+                throw DeskError.unknownReservation(reservationId: attemptId, handle: handle)
+            }
+            if attempt.completedAt != nil { return nil }
+            let op = DeskOp(
+                ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs),
+                handle: handle,
+                body: .completeWorkAttempt(attemptId: attemptId, receipt: receipt)
+            )
             try Self.validatePursuitInvariants(op, in: state, viaGenericPath: false)
             _ = try await appendAndRecompactUnlocked(op, feed: feed)
             return op
@@ -1027,6 +1104,44 @@ public struct SwiftNativeDeskStore: Sendable {
             guard !item.status.isTerminal, item.updatedAt == expectedUpdatedAt else { return false }
             let status: DeskStatus = canceled ? .canceled : .done
             var op = DeskOp(handle: handle, body: .closeItem(outcomeSummary: outcomeSummary, status: status))
+            try Self.validateHierarchyTransition(op, in: state, allowArchive: false)
+            try Self.validatePursuitInvariants(op, in: state, viaGenericPath: false)
+            op.ts = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
+            _ = try await appendAndRecompactUnlocked(op, feed: feed)
+            return true
+        }
+    }
+
+    /// Close a pursuit only when the exact completed reservation durably owns a
+    /// typed `goal_satisfied` outcome and the item has not changed since the
+    /// caller verified its handle-scoped artifacts. This is the sole automatic
+    /// completion path; prose is never interpreted as completion evidence.
+    @discardableResult
+    public func closePursuitIfGoalSatisfied(
+        _ handle: String,
+        reservationId: String,
+        expectedUpdatedAt: String,
+        outcomeSummary: String
+    ) async throws -> Bool {
+        try await persistence.withFileLock(opsPath) {
+            let feed = try await readFeedUnlocked()
+            let state = Self.compact(base: feed.base, feed.ops)
+            guard let item = state.items.first(where: { $0.handle == handle }) else {
+                throw DeskError.unknownHandle(handle)
+            }
+            guard item.isPursuit, !item.status.isTerminal,
+                  item.updatedAt == expectedUpdatedAt,
+                  let reservation = item.pursuit?.reservations.first(where: {
+                      $0.reservationId == reservationId
+                  }),
+                  reservation.completedAt != nil,
+                  reservation.disposition == .goalSatisfied else {
+                return false
+            }
+            var op = DeskOp(
+                handle: handle,
+                body: .closeItem(outcomeSummary: outcomeSummary, status: .done)
+            )
             try Self.validateHierarchyTransition(op, in: state, allowArchive: false)
             try Self.validatePursuitInvariants(op, in: state, viaGenericPath: false)
             op.ts = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
@@ -1355,6 +1470,22 @@ public struct SwiftNativeDeskStore: Sendable {
         p.workSessionsToday = p.reservations.filter { $0.day == newestDay }.count
     }
 
+    static func nextCadenceRefresh(after completedAt: String, cadence: Cadence) -> String? {
+        guard let completed = DeskClock.parseISO(completedAt) else { return nil }
+        let seconds: TimeInterval
+        switch cadence.mode {
+        case .daily:
+            seconds = 24 * 60 * 60
+        case .weekly:
+            seconds = 7 * 24 * 60 * 60
+        case .tick:
+            seconds = cadence.interval.flatMap(DeskProjection.parseDuration) ?? 2 * 60 * 60
+        default:
+            return cadence.nextRefreshAt
+        }
+        return DeskClock.nowISO(completed.addingTimeInterval(seconds))
+    }
+
     /// Count of OPEN (non-terminal) origin=agent pursuits in `state`. The
     /// open-pursuit cap keys on exactly this — a terminal (done/canceled/
     /// abandoned) pursuit doesn't count, but reopening one does (it re-enters
@@ -1415,12 +1546,17 @@ public struct SwiftNativeDeskStore: Sendable {
             if p.reservations.filter({ $0.day == day }).count >= maxWorkSessionsPerPursuitPerDay {
                 throw DeskError.workSessionCapReached(scope: "per-pursuit (2/day)", limit: maxWorkSessionsPerPursuitPerDay, handle: op.handle)
             }
-            let global = state.items.reduce(0) { $0 + ($1.pursuit?.reservations.filter { $0.day == day }.count ?? 0) }
+            let global = state.items.reduce(0) { count, row in
+                count
+                    + (row.pursuit?.reservations.filter { $0.day == day }.count ?? 0)
+                    + row.workAttempts.filter { $0.day == day }.count
+            }
             if global >= maxWorkSessionsGlobalPerDay {
                 throw DeskError.workSessionCapReached(scope: "workshop (6/day)", limit: maxWorkSessionsGlobalPerDay, handle: op.handle)
             }
 
-        case let .completeWorkSession(reservationId, _):
+        case let .completeWorkSession(reservationId, _),
+             let .settleWorkSession(reservationId, _, _, _):
             guard let item = state.items.first(where: { $0.handle == op.handle }),
                   item.isPursuit, let p = item.pursuit else {
                 throw DeskError.notAPursuit(handle: op.handle)
@@ -1432,6 +1568,34 @@ public struct SwiftNativeDeskStore: Sendable {
             // can't be re-closed into a duplicate work receipt.
             if res.completedAt != nil {
                 throw DeskError.reservationAlreadyComplete(reservationId: reservationId, handle: op.handle)
+            }
+
+        case let .reserveWorkAttempt(attemptId, lane, day, _):
+            guard lane == .ownerCadence,
+                  let item = state.items.first(where: { $0.handle == op.handle }),
+                  !item.status.isTerminal, !item.isPursuit else {
+                throw DeskError.unknownHandle(op.handle)
+            }
+            if item.workAttempts.contains(where: { $0.attemptId == attemptId }) { return }
+            if item.workAttempts.filter({ $0.day == day }).count >= 1 {
+                throw DeskError.workSessionCapReached(scope: "per-owner-item (1/day)", limit: 1, handle: op.handle)
+            }
+            let global = state.items.reduce(0) { count, row in
+                count
+                    + (row.pursuit?.reservations.filter { $0.day == day }.count ?? 0)
+                    + row.workAttempts.filter { $0.day == day }.count
+            }
+            if global >= maxWorkSessionsGlobalPerDay {
+                throw DeskError.workSessionCapReached(scope: "workshop (6/day)", limit: maxWorkSessionsGlobalPerDay, handle: op.handle)
+            }
+
+        case let .completeWorkAttempt(attemptId, _):
+            guard let item = state.items.first(where: { $0.handle == op.handle }),
+                  let attempt = item.workAttempts.first(where: { $0.attemptId == attemptId }) else {
+                throw DeskError.unknownReservation(reservationId: attemptId, handle: op.handle)
+            }
+            if attempt.completedAt != nil {
+                throw DeskError.reservationAlreadyComplete(reservationId: attemptId, handle: op.handle)
             }
 
         case let .setStatus(status, _, _):
@@ -1800,6 +1964,43 @@ public struct SwiftNativeDeskStore: Sendable {
                 p.lastWorkedAt = op.ts
                 Self.recomputePursuitCounters(&p)
                 item.pursuit = p
+                item.updatedAt = op.ts
+                byHandle[op.handle] = item
+            case let .settleWorkSession(reservationId, receipt, disposition, artifactRefs):
+                guard var item = byHandle[op.handle], var p = item.pursuit else { continue }
+                if let idx = p.reservations.firstIndex(where: { $0.reservationId == reservationId }) {
+                    p.reservations[idx].receipt = receipt
+                    p.reservations[idx].completedAt = op.ts
+                    p.reservations[idx].disposition = disposition
+                    p.reservations[idx].artifactRefs = Array(artifactRefs.prefix(16))
+                }
+                Self.appendNoteCapped(&item, DeskNote(ts: op.ts, text: receipt))
+                p.lastWorkedAt = op.ts
+                Self.recomputePursuitCounters(&p)
+                item.pursuit = p
+                item.updatedAt = op.ts
+                byHandle[op.handle] = item
+            case let .reserveWorkAttempt(attemptId, lane, day, slot):
+                guard var item = byHandle[op.handle] else { continue }
+                if !item.workAttempts.contains(where: { $0.attemptId == attemptId }) {
+                    item.workAttempts.append(DeskWorkAttempt(
+                        attemptId: attemptId,
+                        lane: lane,
+                        day: day,
+                        slot: slot,
+                        reservedAt: op.ts
+                    ))
+                }
+                item.updatedAt = op.ts
+                byHandle[op.handle] = item
+            case let .completeWorkAttempt(attemptId, receipt):
+                guard var item = byHandle[op.handle],
+                      let index = item.workAttempts.firstIndex(where: { $0.attemptId == attemptId }) else { continue }
+                item.workAttempts[index].receipt = receipt
+                item.workAttempts[index].completedAt = op.ts
+                Self.appendNoteCapped(&item, DeskNote(ts: op.ts, text: receipt))
+                item.cadence.lastRefreshAt = op.ts
+                item.cadence.nextRefreshAt = Self.nextCadenceRefresh(after: op.ts, cadence: item.cadence)
                 item.updatedAt = op.ts
                 byHandle[op.handle] = item
             case let .setBlockedOn(handles):

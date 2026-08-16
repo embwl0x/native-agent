@@ -222,38 +222,42 @@ public actor SwiftNativeSecurityCenter {
         origin: SecurityOriginContext,
         enforceAutonomy: Bool = true
     ) async -> SecurityToolEnvelope {
-        let policy: [String: JSONValue]
         do {
-            policy = try await trustCenter.loadTrustPolicyChecked()
-        } catch {
-            let canonicalTool = Self.canonicalToolName(tool)
-            return SecurityToolEnvelope(
-                id: UUID().uuidString,
-                createdAt: Self.isoTimestamp(clock()),
-                tool: canonicalTool,
-                surface: origin.surface,
+            let snapshot = try await trustCenter.loadAuthorizationSnapshotChecked()
+            let evaluatedAt = clock()
+            return await evaluateTool(
+                tool: tool,
+                input: input,
                 origin: origin,
-                originTrusted: false,
-                originTrustReason: "saved trust policy is unavailable",
-                capabilities: [],
-                risk: SecurityRisk.critical.rawValue,
-                autonomyLevel: "blocked",
-                signedToolKnown: false,
-                rollbackRequired: true,
-                decision: .block,
-                allowed: false,
-                requiresApproval: false,
-                reasons: ["saved trust policy is unavailable: \(error.localizedDescription)"],
-                untrustedInputKeys: Array(Set(Self.promptInjectionKeys(in: .object(input)))).sorted(),
-                redactedInputPreview: Self.redactValue(.object(input)),
-                auditReceiptsEnabled: true
+                enforceAutonomy: enforceAutonomy,
+                snapshot: snapshot,
+                evaluatedAt: evaluatedAt
+            )
+        } catch {
+            return unavailablePolicyEnvelope(
+                tool: tool,
+                input: input,
+                origin: origin,
+                error: error,
+                evaluatedAt: clock()
             )
         }
+    }
+
+    private func evaluateTool(
+        tool: String,
+        input: [String: JSONValue],
+        origin: SecurityOriginContext,
+        enforceAutonomy: Bool,
+        snapshot: TrustPolicyAuthorizationSnapshot,
+        evaluatedAt: Date
+    ) async -> SecurityToolEnvelope {
+        let policy = snapshot.policy
         let security = Self.object(policy["securityPolicy"])
         let developerMode = Self.bool(policy["developerMode"], default: false)
         let filePolicy = Self.object(policy["filePolicy"])
         let connectorPolicy = Self.object(policy["connectorPolicy"])
-        let fullMac = Self.fullMacActive(policy: policy, now: clock())
+        let fullMac = Self.fullMacActive(policy: policy, now: evaluatedAt)
         let canonicalTool = Self.canonicalToolName(tool)
         let trustedRoots = Self.trustedWorkspaceRoots(
             policy: policy,
@@ -266,7 +270,13 @@ public actor SwiftNativeSecurityCenter {
             dataRoot: dataRoot,
             trustedWorkspaceRoots: trustedRoots
         )
-        let originAssessment = await assessOrigin(origin)
+        // Origin trust is part of this exact authorization generation. In
+        // particular, iOS trust lives inside trust/policy.json; rereading that
+        // file here could splice Full Mac from generation A with paired-iOS
+        // trust from generation B, authorizing a combination that never
+        // existed. Connector-owned Telegram/Slack allowlists remain live reads
+        // from their own authority domains.
+        let originAssessment = await assessOrigin(origin, policy: policy)
         let trustedLocalAgentBridge =
             Self.localAgentBridgeToolNames.contains(canonicalTool)
             && (!originAssessment.isRemote || originAssessment.trusted)
@@ -283,7 +293,7 @@ public actor SwiftNativeSecurityCenter {
         let autonomyLevel = resolveAutonomyLevel(
             tool: canonicalTool,
             policy: policy,
-            userOverrides: await trustCenter.userConfiguredAutonomyOverrides(),
+            userOverrides: snapshot.userConfiguredAutonomyOverrides,
             origin: origin,
             originAssessment: originAssessment,
             profile: profile,
@@ -490,7 +500,7 @@ public actor SwiftNativeSecurityCenter {
             reasons.append("app notification tool is allowed by security policy")
         }
 
-        let now = Self.isoTimestamp(clock())
+        let now = Self.isoTimestamp(evaluatedAt)
         return SecurityToolEnvelope(
             id: UUID().uuidString,
             createdAt: now,
@@ -520,17 +530,74 @@ public actor SwiftNativeSecurityCenter {
         origin: SecurityOriginContext,
         enforceAutonomy: Bool = true
     ) async -> UnifiedPolicyDecision {
-        let policy = await trustCenter.loadTrustPolicy()
-        let envelope = await evaluateTool(
-            tool: tool,
-            input: input,
+        do {
+            let snapshot = try await trustCenter.loadAuthorizationSnapshotChecked()
+            let evaluatedAt = clock()
+            let envelope = await evaluateTool(
+                tool: tool,
+                input: input,
+                origin: origin,
+                enforceAutonomy: enforceAutonomy,
+                snapshot: snapshot,
+                evaluatedAt: evaluatedAt
+            )
+            return envelope.unifiedPolicyDecision(
+                fullMacActive: Self.fullMacActive(
+                    policy: snapshot.policy,
+                    now: evaluatedAt
+                ),
+                developerMode: Self.bool(
+                    snapshot.policy["developerMode"],
+                    default: false
+                ),
+                expiresAt: Self.fullMacExpiresAt(policy: snapshot.policy)
+            )
+        } catch {
+            let envelope = unavailablePolicyEnvelope(
+                tool: tool,
+                input: input,
+                origin: origin,
+                error: error,
+                evaluatedAt: clock()
+            )
+            return envelope.unifiedPolicyDecision(
+                fullMacActive: false,
+                developerMode: false,
+                expiresAt: nil
+            )
+        }
+    }
+
+    private func unavailablePolicyEnvelope(
+        tool: String,
+        input: [String: JSONValue],
+        origin: SecurityOriginContext,
+        error: any Error,
+        evaluatedAt: Date
+    ) -> SecurityToolEnvelope {
+        let canonicalTool = Self.canonicalToolName(tool)
+        return SecurityToolEnvelope(
+            id: UUID().uuidString,
+            createdAt: Self.isoTimestamp(evaluatedAt),
+            tool: canonicalTool,
+            surface: origin.surface,
             origin: origin,
-            enforceAutonomy: enforceAutonomy
-        )
-        return envelope.unifiedPolicyDecision(
-            fullMacActive: Self.fullMacActive(policy: policy, now: clock()),
-            developerMode: Self.bool(policy["developerMode"], default: false),
-            expiresAt: Self.fullMacExpiresAt(policy: policy)
+            originTrusted: false,
+            originTrustReason: "saved trust policy is unavailable",
+            capabilities: [],
+            risk: SecurityRisk.critical.rawValue,
+            autonomyLevel: "blocked",
+            signedToolKnown: false,
+            rollbackRequired: true,
+            decision: .block,
+            allowed: false,
+            requiresApproval: false,
+            reasons: ["saved trust policy is unavailable: \(error.localizedDescription)"],
+            untrustedInputKeys: Array(
+                Set(Self.promptInjectionKeys(in: .object(input)))
+            ).sorted(),
+            redactedInputPreview: Self.redactValue(.object(input)),
+            auditReceiptsEnabled: true
         )
     }
 
@@ -590,7 +657,10 @@ public actor SwiftNativeSecurityCenter {
         )
     }
 
-    private func assessOrigin(_ origin: SecurityOriginContext) async -> OriginAssessment {
+    private func assessOrigin(
+        _ origin: SecurityOriginContext,
+        policy: [String: JSONValue]
+    ) async -> OriginAssessment {
         let surfaceProfile = ConversationSurfaceProfile(origin.surface)
         let surface = surfaceProfile.id
         // Defense-in-depth (gpt-5.5 review, 2026-06-09): a KNOWN remote chat
@@ -635,7 +705,6 @@ public actor SwiftNativeSecurityCenter {
             return OriginAssessment(trusted: false, reason: "slack origin is not in allowlist", isRemote: true)
         }
         if surfaceProfile.isIOSRemote {
-            let policy = await trustCenter.loadTrustPolicy()
             let iosRemote = Self.object(policy["iosRemotePolicy"])
             // 2026-07-21 audit fix: decoupled the mac_control feature flag
             // from the SecurityCenter trust root. The previous

@@ -3237,6 +3237,10 @@ func swiftToolDispatcher_tool_load_reports_github_tools() async throws {
     #expect(obj["status"] == .string("ok"))
     #expect(loaded.contains(.string("github_status")))
     #expect(loaded.contains(.string("github_list_repos")))
+    #expect(loaded.contains(.string("github_list_notifications")))
+    #expect(loaded.contains(.string("github_get_repository")))
+    #expect(loaded.contains(.string("github_read_repository_content")))
+    #expect(loaded.contains(.string("github_list_commits")))
     #expect(loaded.contains(.string("github_list_issues")))
     #expect(loaded.contains(.string("github_search")))
     #expect(loaded.contains(.string("github_list_pull_requests")))
@@ -5687,16 +5691,20 @@ func agentIntrospect_providerStamp_reports_live_turn_model() async throws {
         .appendingPathComponent("providerStamp-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
 
-    // Inside a turn the bound live model wins; with no active.json the provider
-    // is inferred from the model. This is what agent_introspect reports to Agent.
+    // Inside a turn the exact admitted transport wins. Model inference cannot
+    // distinguish API-key, OAuth-direct, Codex, and OpenRouter routes.
     let live = await ChatTurnRuntimeContext.$current.withValue(
-        .init(model: "claude-opus-4-8", surface: "telegram")
+        .init(
+            model: "gpt-5.6",
+            surface: "telegram",
+            providerID: "openai_oauth_direct"
+        )
     ) {
         await SwiftToolDispatcher.providerStamp(dataRoot: root)
     }
     guard case .object(let obj) = live else { Issue.record("not an object"); return }
-    #expect(obj["model"] == .string("claude-opus-4-8"))
-    #expect(obj["name"] == .string("anthropic_oauth_direct"))
+    #expect(obj["model"] == .string("gpt-5.6"))
+    #expect(obj["name"] == .string("openai_oauth_direct"))
     #expect(obj["surface"] == .string("telegram"))
     #expect(obj["source"] == .string("live_turn"))
 
@@ -6610,6 +6618,7 @@ func chatClient_optionalCognitiveObserverReceivesBoundedRedactedEvents() async t
     #expect(events.first?.summary.contains("sk-" + "abcdefghijklmnopqrstuvwxyz123456") == false)
     #expect(events.first?.summary.contains("[REDACTED_OPENAI_KEY]") == true)
     #expect(events.last?.subject.id == "read_file")
+    #expect(events.last?.metadata["trustRisk"] == .string("low"))
     #expect(events.last?.summary.contains("OPENAI_API_KEY=abcdefghijklmnopqrstuvwxyz") == false)
     #expect(events.last?.summary.contains("[REDACTED_NAMED_SECRET]") == true)
 }
@@ -6974,7 +6983,7 @@ func chatClient_assistantCognitiveEventsUseTurnScopedSubject() async throws {
     try await client.appendMessage(
         sessionId: "s-cognition",
         role: "assistant",
-        content: "Perfect order of operations.",
+        content: String(repeating: "x", count: 640),
         runId: "run-1",
         attachments: []
     )
@@ -6985,6 +6994,8 @@ func chatClient_assistantCognitiveEventsUseTurnScopedSubject() async throws {
     #expect(event.subject.type == "chat.assistant_turn")
     #expect(event.subject.id.hasPrefix("s-cognition:"))
     #expect(event.metadata["role"] == .string("assistant"))
+    #expect(event.summary.count == 500)
+    #expect(event.metadata[CognitiveSubstrate.replyCharacterCountMetadataKey] == .int(640))
     #expect(event.sourceClass == .selfReported)
 }
 

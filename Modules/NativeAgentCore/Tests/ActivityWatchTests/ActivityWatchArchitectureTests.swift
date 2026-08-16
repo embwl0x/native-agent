@@ -580,9 +580,9 @@ func activityStoreIsNotSynced() throws {
             Comment(rawValue: """
             \(path) NAMES "\(ActivityWatchPaths.directoryName)".
 
-            Activity data never leaves this Mac. That is the constraint the whole feature was \
-            approved under, and it is also why `activity_query` refuses on remote surfaces — \
-            syncing the store would make that refusal pointless.
+            The activity store never leaves this Mac. It is never synced or exposed through a \
+            remote surface. A separately consented bounded answer may be sent to the selected \
+            chat provider, but syncing the store would bypass that per-use boundary.
             """)
         )
     }
@@ -668,4 +668,3 @@ func httpBridgesAreRefused() throws {
         #expect(!ConversationSurfaceProfileShim(surface).isRemote)
     }
 }
-

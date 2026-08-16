@@ -15,6 +15,7 @@ import WorkshopExecution
 import TrustCenter
 import MacControl
 import SelfImprovement
+import NotificationInbox
 
 // MARK: - Dreams and Memory Loops
 
@@ -202,27 +203,8 @@ extension BackgroundLoopsAssembly {
             "status": .string("unread"),
             "read_at": .null,
         ])
-        let persistence = SwiftNativePersistenceCore()
-        let inserted = try await persistence.withFileLock(inboxPath) { () async throws -> Bool in
-            // Scan-before-append inside the same critical section: the
-            // stager's crash-retry path re-ensures the card for an existing
-            // approval id, and a duplicate card would render twice in the UI.
-            // Scan errors propagate (stage fails, retried next pass) — a
-            // swallowed read failure here would append the duplicate anyway.
-            // WHOLE-file scan: notifications/inbox.jsonl is uncapped, so any
-            // bounded window could miss an old card and dup it (gpt-5.5
-            // review 2026-06-10). The path runs only on stager retry — rare.
-            let rows = try await persistence.tailJSONL(
-                inboxPath, limit: Int.max, maxBytes: nil)
-            let exists = rows.contains { row in
-                guard case .object(let obj) = row,
-                      case .string(let id)? = obj["id"] else { return false }
-                return id == approvalId
-            }
-            if exists { return false }
-            try await persistence.appendJSONL(card, to: inboxPath)
-            return true
-        }
+        let inserted = try await LiveNotificationInbox(path: inboxPath)
+            .appendUnique(card, id: approvalId)
         if inserted {
             await InboxPushNotifier.notifyIfAttentionWorthy(
                 dataRoot: dataRoot,
@@ -281,9 +263,8 @@ extension BackgroundLoopsAssembly {
         // MemoryConsolidator the same way the manual "Run hygiene" path does,
         // and advances <dataRoot>/memory/hygiene_last_run.json. Same loopId,
         // so NSBackgroundActivityScheduler's "memory_consolidation" slot and
-        // runTickOnce routing are untouched. The MemoryConsolidationLoop TYPE
-        // stays in the BackgroundLoops module (tests pin it); only the
-        // production wiring retires.
+        // runTickOnce routing are untouched. The retired JSONL loop type was
+        // removed; this is the sole implementation behind the live slot.
         MemoryConsolidationHygieneRunner(dataRoot: dataRoot)
     }
 
@@ -315,19 +296,10 @@ extension BackgroundLoopsAssembly {
     static func makeDreamMemoryDeltaProvider(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> DreamMemoryDeltaProvider {
-        let standardized = dataRoot.standardizedFileURL
-        let memory: SwiftNativeMemoryV2 = {
-            if standardized == PersistenceCore.defaultDataRoot().standardizedFileURL {
-                return .shared
-            }
-            guard let storage = try? MemoryStorage(dataRoot: standardized) else {
-                return SwiftNativeMemoryV2()
-            }
-            return SwiftNativeMemoryV2(
-                embedder: MockEmbeddingProvider(),
-                storage: MemoryStorageBridge(storage: storage)
-            )
-        }()
+        let memory = SwiftNativeMemoryV2.resolvedOwner(
+            dataRoot: dataRoot,
+            alternateRootEmbedder: MockEmbeddingProvider()
+        )
         return { @Sendable in
             // The daemon-era design fed `layer="persona_feedback"` deltas.
             // The current Swift chat path doesn't write that tag, AND the

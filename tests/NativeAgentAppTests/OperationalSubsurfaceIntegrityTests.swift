@@ -486,12 +486,25 @@ func dreamRetryBacksOffPerAttemptThenParksWithReceipt() async throws {
         if case .int(let n)? = obj[key] { return Int(n) }
         return nil
     }
+    func restoreClaim() async throws {
+        let raw = await runner.persistence.readJSON(runner.jobsPath, defaultValue: .array([]))
+        guard case .array(var rows) = raw, case .object(var obj)? = rows.first else { return }
+        obj["activeOccurrence"] = .object([
+            "key": .string(job.occurrenceKey),
+            "dueEpoch": .int(Int64(job.dueEpoch)),
+            "claimedAt": .string(SchedulerDueJobRunner.iso(base)),
+            "state": .string("claimed"),
+        ])
+        rows[0] = .object(obj)
+        try await runner.persistence.writeJSON(.array(rows), to: runner.jobsPath)
+    }
 
     // Attempts 1…cap all back off (retryCount climbs, a retry floor is stamped,
     // never parked). Each attempt is a fresh due-job pass a few minutes apart,
     // same calendar day.
     for attempt in 1...SchedulerDueJobRunner.maxRetryAttemptsPerDay {
         let runDate = base.addingTimeInterval(Double(attempt) * 60)
+        try await restoreClaim()
         try await runner.update(job: job, result: retryableError(), at: runDate)
         let obj = await firstJob()
         #expect(intField(obj, "retryCount") == attempt)
@@ -506,6 +519,7 @@ func dreamRetryBacksOffPerAttemptThenParksWithReceipt() async throws {
 
     // One more retryable failure the same day trips the cap → PARK.
     let parkDate = base.addingTimeInterval(Double(SchedulerDueJobRunner.maxRetryAttemptsPerDay + 1) * 60)
+    try await restoreClaim()
     try await runner.update(job: job, result: retryableError(), at: parkDate)
     let parked = await firstJob()
     #expect(parked["retryParkedDateKey"] != nil)
@@ -523,6 +537,7 @@ func dreamRetryBacksOffPerAttemptThenParksWithReceipt() async throws {
         detail: "dream pass wrote 1 entry",
         output: .object(["entriesWritten": .int(1)])
     )
+    try await restoreClaim()
     try await runner.update(job: job, result: success, at: parkDate.addingTimeInterval(3600))
     let healed = await firstJob()
     #expect(healed["retryCount"] == nil)

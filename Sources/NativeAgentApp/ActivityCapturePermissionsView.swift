@@ -37,6 +37,8 @@ struct ActivityCapturePermissionsView: View {
                 Divider()
                 titleControls
                 Divider()
+                modelAccessControl
+                Divider()
                 exclusionList
                 Divider()
                 retentionAndWipe
@@ -125,7 +127,7 @@ struct ActivityCapturePermissionsView: View {
                 )
                 .foregroundStyle(.secondary)
                 Label(
-                    "Never leaves this Mac: no iCloud, no backup, no export, no sync to your iPhone. The agent can only read it when you ask it to.",
+                    "The store never leaves this Mac: no iCloud, backup, export, or iPhone sync. Sending an answer to your selected AI provider is a separate, default-off choice below.",
                     systemImage: "lock.circle"
                 )
                 .foregroundStyle(.secondary)
@@ -148,6 +150,25 @@ struct ActivityCapturePermissionsView: View {
                     .foregroundStyle(.secondary)
                 Spacer()
             }
+        }
+    }
+
+    private var modelAccessControl: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Agent Access")
+                .font(.subheadline.weight(.semibold))
+            Toggle(
+                "Let the agent answer from activity history",
+                isOn: Binding(
+                    get: { controller.policy.allowModelAccess },
+                    set: { controller.setModelAccessEnabled($0) }
+                )
+            )
+            .disabled(!controller.policy.captureEnabled)
+            Text("Off by default. When on, an activity answer requested in chat is sent to the AI provider selected for that chat so the agent can discuss it. The database and full history remain local; only the bounded answer leaves the Mac. Turn this off to keep every activity answer on-device.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 

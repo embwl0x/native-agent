@@ -37,6 +37,8 @@ source "$ROOT/script/lib/release_quarantine.sh"
 source "$ROOT/script/lib/provisioning_profile_contract.sh"
 # shellcheck source=lib/release_bundle_gates.sh
 source "$ROOT/script/lib/release_bundle_gates.sh"
+# shellcheck source=lib/release_symbols.sh
+source "$ROOT/script/lib/release_symbols.sh"
 APP_NAME="NativeAgent"
 PRODUCT="NativeAgentApp"
 DRY_RUN=false
@@ -397,6 +399,7 @@ if [[ "$NATIVEAGENT_NEEDS_PUBLIC_SCRUB" == "true" ]]; then
     NATIVEAGENT_PROVISIONING_PROFILE="$CHILD_PROFILE" \
     NATIVEAGENT_SPARKLE_ED_PRIV_KEY="$CHILD_SPARKLE_KEY" \
     NATIVEAGENT_PRIVACY_DENYLIST_FILE="$CHILD_PRIVACY_DENYLIST" \
+    NATIVEAGENT_RELEASE_SYMBOL_ARCHIVE_DIR="$ROOT/.runtime/release-symbols/$VERSION/$NATIVEAGENT_SOURCE_REVISION" \
       "$PUBLIC_EXPORT_DIR/script/release.sh" "$@"
   )
   CHILD_RC=$?
@@ -413,7 +416,7 @@ if [[ "$NATIVEAGENT_NEEDS_PUBLIC_SCRUB" == "true" ]]; then
   # in place as the provenance record for the artifacts.
   mkdir -p "$ROOT/dist"
   _copied=()
-  for _artifact in "$APP_NAME.app" "$APP_NAME.app.zip" "$APP_NAME-$VERSION.dmg" "$APP_NAME-$VERSION.dmg.zip"; do
+  for _artifact in "$APP_NAME.app" "$APP_NAME.app.zip" "$APP_NAME-$VERSION.dmg" "$APP_NAME-$VERSION.dmg.zip" "$APP_NAME-$VERSION.test-receipt.json" "$APP_NAME-$VERSION.release-attestation.json"; do
     if [[ -e "$PUBLIC_EXPORT_DIR/dist/$_artifact" ]]; then
       rm -rf "${ROOT:?}/dist/$_artifact"
       cp -R "$PUBLIC_EXPORT_DIR/dist/$_artifact" "$ROOT/dist/$_artifact"
@@ -434,6 +437,22 @@ if [[ "$NATIVEAGENT_NEEDS_PUBLIC_SCRUB" == "true" ]]; then
     echo "    WARNING: no artifacts found under $PUBLIC_EXPORT_DIR/dist to copy back." >&2
   fi
   exit 0
+fi
+
+# A production artifact is allowed to start only after the complete canonical
+# gate has passed against this exact clean commit. The receipt is written by
+# test.sh after its final source-stability check, and the iOS lane is mandatory
+# here rather than a graceful simulator skip. Dry-run remains the fast package
+# rehearsal and intentionally does not mint release proof.
+RELEASE_TEST_RECEIPT=""
+if [[ "$DRY_RUN" == "false" ]]; then
+  RELEASE_TEST_RECEIPT="$ROOT/.runtime/release-test-receipts/$NATIVEAGENT_SOURCE_REVISION.json"
+  echo "==> Proving exact release source with the complete Mac + required iOS gate..."
+  NATIVE_AGENT_REQUIRE_IOS_PROJECT_REPRODUCIBLE=1 \
+    "$ROOT/script/test.sh" --require-ios --release-receipt "$RELEASE_TEST_RECEIPT"
+  [[ -s "$RELEASE_TEST_RECEIPT" ]] \
+    || { echo "ERROR: canonical test gate returned without a release receipt." >&2; exit 1; }
+  assert_full_release_source_unchanged
 fi
 
 # Validate the chosen entitlements up front so a bad file fails BEFORE the slow
@@ -657,9 +676,14 @@ if [[ "$PUBLISH_APPCAST" == "true" ]]; then
   release_quarantine_register "$QUARANTINE_DIR" "$APP_NAME.app.zip" >/dev/null
   release_quarantine_register "$QUARANTINE_DIR" "$APP_NAME-$VERSION.dmg" >/dev/null
   release_quarantine_register "$QUARANTINE_DIR" "$APP_NAME-$VERSION.dmg.zip" >/dev/null
+  release_quarantine_register "$QUARANTINE_DIR" "$APP_NAME-$VERSION.test-receipt.json" >/dev/null
+  release_quarantine_register "$QUARANTINE_DIR" "$APP_NAME-$VERSION.release-attestation.json" >/dev/null
   # A stale ship-ready copy from an earlier successful release must not be
   # mistaken for this build's output later on.
-  rm -f "$ROOT/dist/$APP_NAME-$VERSION.dmg" "$ROOT/dist/$APP_NAME-$VERSION.dmg.zip"
+  rm -f "$ROOT/dist/$APP_NAME-$VERSION.dmg" \
+    "$ROOT/dist/$APP_NAME-$VERSION.dmg.zip" \
+    "$ROOT/dist/$APP_NAME-$VERSION.test-receipt.json" \
+    "$ROOT/dist/$APP_NAME-$VERSION.release-attestation.json"
   rm -rf "$ROOT/dist/$APP_NAME.app" "$ROOT/dist/$APP_NAME.app.zip"
 fi
 rm -rf "$BUNDLE"
@@ -1121,6 +1145,17 @@ if [[ "$_gate_rc" -ne 0 ]]; then
   exit 1
 fi
 
+# Preserve symbolication privately, then remove local symbols from the shipped
+# executable before signing. Public-export children write directly into the
+# private controller's ignored .runtime archive via the environment above;
+# dSYMs never enter the app, DMG, appcast, or GitHub release payload.
+RELEASE_SYMBOL_ARCHIVE_DIR="${NATIVEAGENT_RELEASE_SYMBOL_ARCHIVE_DIR:-$ROOT/.runtime/release-symbols/$VERSION/$NATIVEAGENT_SOURCE_REVISION}"
+echo "==> Archiving dSYM and stripping local executable symbols..."
+release_archive_symbols_and_strip \
+  "$BUNDLE/Contents/MacOS/$PRODUCT" \
+  "$RELEASE_SYMBOL_ARCHIVE_DIR" \
+  "$PRODUCT"
+
 # RELEASE-2026-05-06: step 5 — codesign
 echo "==> Codesigning..."
 sign_nested_plain() {
@@ -1259,6 +1294,34 @@ else
     --require-sparkle-key
 fi
 
+# Bind the exact final DMG bytes to the clean-source canonical test receipt and
+# the notarization/stapling gates that just passed. The publisher uploads and
+# reads this file back byte-for-byte with the appcast and DMG.
+STAGED_TEST_RECEIPT="$STAGE_DIR/$APP_NAME-$VERSION.test-receipt.json"
+cp -f "$RELEASE_TEST_RECEIPT" "$STAGED_TEST_RECEIPT"
+chmod 0644 "$STAGED_TEST_RECEIPT"
+RELEASE_ATTESTATION="$STAGE_DIR/$APP_NAME-$VERSION.release-attestation.json"
+if [[ "${NATIVEAGENT_SKIP_DMG_SIGN:-0}" == "1" ]]; then
+  DMG_SIGNATURE_REQUIRED=false
+  DMG_NOTARIZED=false
+  DMG_STAPLED=false
+else
+  DMG_SIGNATURE_REQUIRED=true
+  DMG_NOTARIZED=true
+  DMG_STAPLED=true
+fi
+"$ROOT/script/create_release_attestation.sh" \
+  --dmg "$DMG_PATH" \
+  --test-receipt "$STAGED_TEST_RECEIPT" \
+  --source-revision "$NATIVEAGENT_SOURCE_REVISION" \
+  --version "$VERSION" \
+  --dmg-signature-required "$DMG_SIGNATURE_REQUIRED" \
+  --dmg-notarized "$DMG_NOTARIZED" \
+  --dmg-stapled "$DMG_STAPLED" \
+  --out "$RELEASE_ATTESTATION"
+export NATIVEAGENT_PUBLISH_ATTESTATION="$RELEASE_ATTESTATION"
+export NATIVEAGENT_PUBLISH_TEST_RECEIPT="$STAGED_TEST_RECEIPT"
+
 # A2.1-2026-07-24: step 10b — generate + EdDSA-sign the Sparkle appcast, and
 # publish it when asked. This runs AFTER notarize/staple so the enclosure length
 # and signature cover the exact bytes users download. It is fatal on failure:
@@ -1321,6 +1384,13 @@ if cp -f "$DMG_PATH" "$SHARED_DMG"; then
   echo "    Shared DMG updated."
 else
   echo "    WARNING: could not write $SHARED_DMG (release itself still succeeded)." >&2
+fi
+
+if [[ -n "$RELEASE_TEST_RECEIPT" ]]; then
+  PUBLIC_TEST_RECEIPT="$ROOT/dist/$APP_NAME-$VERSION.test-receipt.json"
+  cp -f "$RELEASE_TEST_RECEIPT" "$PUBLIC_TEST_RECEIPT"
+  chmod 0644 "$PUBLIC_TEST_RECEIPT"
+  echo "==> Exact-commit test receipt: $PUBLIC_TEST_RECEIPT"
 fi
 
 echo ""

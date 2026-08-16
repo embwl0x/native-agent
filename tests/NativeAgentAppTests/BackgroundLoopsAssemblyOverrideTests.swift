@@ -2,8 +2,7 @@
 // the "memory_consolidation" slot must be proven on the loop PRODUCTION
 // registers. assembleAllLoops() registers what
 // BackgroundLoopsAssembly.makeMemoryConsolidationLoop returns —
-// MemoryConsolidationHygieneRunner — not the BackgroundLoops module's
-// retired MemoryConsolidationLoop the old module-side test pinned. Resolve
+// MemoryConsolidationHygieneRunner. Resolve
 // through the factory (the exact expression assembleAllLoops calls) and
 // assert through `any LoopRunner` so the pin exercises the dynamic-dispatch
 // path the scheduler's `tickTimeoutOverride ?? tickTimeout` resolution uses.
@@ -54,7 +53,7 @@ import BackgroundLoops
     try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: tmp) }
 
-    let loop: any LoopRunner = BackgroundLoopsAssembly.makeGitHubTrackingLoop(
+    let loop: any EventDeadlineLoopRunner = BackgroundLoopsAssembly.makeGitHubTrackingLoop(
         dataRoot: tmp,
         intervalSeconds: 42
     )
@@ -65,4 +64,27 @@ import BackgroundLoops
     #expect(loop.tickTimeoutOverride == 600)
     await loop.tick()
     #expect(!FileManager.default.fileExists(atPath: tmp.appendingPathComponent("connectors/github/tracking_snapshot.json").path))
+}
+
+@Test func github_tracking_default_is_event_deadline_driven_with_slow_repair() {
+    let loop: any EventDeadlineLoopRunner = BackgroundLoopsAssembly.makeGitHubTrackingLoop()
+    #expect(loop.loopId == "github_tracking")
+    #expect(loop.interval == 6 * 60 * 60)
+    #expect(loop.eventCoalescingDelay == 0.5)
+}
+
+@Test func github_tracking_watches_every_canonical_input_store_file() {
+    let root = URL(fileURLWithPath: "/tmp/nativeagent-github-physiology")
+    let relative = Set(
+        BackgroundLoopsAssembly.githubTrackingWatchedPaths(dataRoot: root)
+            .map { $0.path.replacingOccurrences(of: root.path + "/", with: "") }
+    )
+    #expect(relative == [
+        "connectors/github/tracking.json",
+        "connectors/github/tracking_snapshot.json",
+        "desk/desk_ops.jsonl",
+        "desk/desk_ops_base.json",
+        "workshop/github_command/ops.jsonl",
+        "workshop/github_command/ops_base.json",
+    ])
 }

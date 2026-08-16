@@ -27,7 +27,8 @@ private func makeConfig(historyPollEnabled: Bool = false) -> SlackSocketModeConf
         historyPollInterval: 60,
         historyConversationRefreshInterval: 600,
         allowedChannelIds: [],
-        allowedUserIds: []
+        allowedUserIds: [],
+        requireMention: true
     )
 }
 
@@ -65,6 +66,81 @@ private func outbound(_ recorder: OutboundRecorder) -> SlackSocketModeOutbound {
         postMessage: { await recorder.record($0) },
         uploadFile: { await recorder.record($0) }
     )
+}
+
+private final class SlackAttachmentURLProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var body = Data()
+    nonisolated(unsafe) static var authorization: String?
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        Self.authorization = request.value(forHTTPHeaderField: "Authorization")
+        let response = HTTPURLResponse(
+            url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+            headerFields: [
+                "Content-Type": "image/png",
+                "Content-Length": String(Self.body.count),
+            ]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Self.body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
+}
+
+private actor SlackInboundCapture {
+    private(set) var message: SlackInboundMessage?
+    func set(_ message: SlackInboundMessage) { self.message = message }
+}
+
+@Test
+func slackLoop_downloadsBoundedInboundImageAndPassesItToChat() async throws {
+    let root = try makeLifecycleRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let bytes = Data([0x89, 0x50, 0x4e, 0x47])
+    SlackAttachmentURLProtocol.body = bytes
+    SlackAttachmentURLProtocol.authorization = nil
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [SlackAttachmentURLProtocol.self]
+    let session = URLSession(configuration: configuration)
+    let capture = SlackInboundCapture()
+    let recorder = OutboundRecorder()
+    let loop = SlackSocketModeLoop(
+        config: makeConfig(),
+        dataRoot: root,
+        session: session,
+        outbound: outbound(recorder),
+        chatHandler: { inbound in
+            await capture.set(inbound)
+            return SlackSocketModeReply(text: "seen")
+        }
+    )
+    let inbound = SlackInboundMessage(
+        eventId: "T1:C1:2.000",
+        teamId: "T1",
+        channelId: "C1",
+        userId: "U1",
+        eventType: "message",
+        text: "what is this?",
+        ts: "2.000",
+        threadTs: nil,
+        channelType: "channel",
+        isDirectMessage: false,
+        files: [SlackInboundFile(
+            downloadURL: "https://files.slack.com/files-pri/test.png",
+            mimeType: "image/png",
+            name: "test.png",
+            byteSize: bytes.count
+        )]
+    )
+
+    #expect(await loop.handleInbound(inbound))
+    let received = await capture.message
+    #expect(received?.attachments.count == 1)
+    #expect(received?.attachments.first?.byteSize == bytes.count)
+    #expect(received?.attachments.first?.base64 == bytes.base64EncodedString())
+    #expect(SlackAttachmentURLProtocol.authorization == "Bearer xoxb-test")
 }
 
 // MARK: - LOOPS-2 (a): a failed delivery must stay retryable
@@ -350,6 +426,34 @@ func slackHistoryPoll_resumesIntervalPollingWhenSocketUnhealthy() {
             pollInterval: pollInterval,
             safetyInterval: safetyInterval
         ) == .socketUnhealthy
+    )
+}
+
+@Test
+func slackHistoryPoll_sleepsToExactHealthDeadline() {
+    #expect(
+        SlackSocketModeLoop.historyPollDeadline(
+            socketHealthy: true,
+            lastPollAt: t0,
+            pollInterval: pollInterval,
+            safetyInterval: safetyInterval
+        ) == t0.addingTimeInterval(safetyInterval)
+    )
+    #expect(
+        SlackSocketModeLoop.historyPollDeadline(
+            socketHealthy: false,
+            lastPollAt: t0,
+            pollInterval: pollInterval,
+            safetyInterval: safetyInterval
+        ) == t0.addingTimeInterval(pollInterval)
+    )
+    #expect(
+        SlackSocketModeLoop.historyPollDeadline(
+            socketHealthy: true,
+            lastPollAt: nil,
+            pollInterval: pollInterval,
+            safetyInterval: safetyInterval
+        ) == nil
     )
 }
 

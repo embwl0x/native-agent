@@ -39,7 +39,6 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-import CapabilityFoundry
 
 extension NativeClient {
     /// When THIS runtime started. `ProcessInfo.systemUptime` measures the
@@ -251,16 +250,6 @@ extension NativeClient {
             ),
             createdAt: nowISO
         )
-    }
-
-    func getCapabilityFoundry() async throws -> CapabilityFoundrySummary {
-        // Swift-native foundry readout for the Mac panel. Backlog
-        // implementation is intentionally not a read-side side effect; action
-        // execution stays behind explicit self-improvement/promotion gates.
-        let impl = makeCapabilityFoundryClient()
-        let result = try await impl.capabilityFoundrySummary()
-        let data = try result.toJSON().serializedData(pretty: false)
-        return try JSONDecoder().decode(CapabilityFoundrySummary.self, from: data)
     }
 
     func getWorkflows() async throws -> [WorkflowRecord] {

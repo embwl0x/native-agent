@@ -1238,39 +1238,19 @@ public enum MemoryConsolidationGate {
 
     // MARK: - Approval annotation (memory.repair convention)
 
-    /// Stamp `executedAction` + a human `detail` onto an approval record so
-    /// a terminal swap decision never reads as silently executed — the
-    /// exact convention NativeClient.annotateApprovalExecution uses for
-    /// memory.repair. There is NO inbox-protocol method for this
-    /// (NativeClient writes requests.json directly under the persistence
-    /// flock); ApprovalInbox is outside this slice's fence, so the gate
-    /// carries the same file-level write. Best-effort: an annotation
-    /// failure is logged, never fatal to the swap outcome.
+    /// Stamp `executedAction` + a human `detail` through ApprovalInbox's
+    /// checked mutation seam so consolidation never becomes a second writer
+    /// for requests.json. Best-effort: an annotation failure is logged, never
+    /// fatal to the already-known swap outcome.
     static func annotateApproval(
         dataRoot: URL, id: String, executedAction: JSONValue, detail: String
     ) async {
-        let path = dataRoot
-            .appendingPathComponent("workflows", isDirectory: true)
-            .appendingPathComponent("approvals", isDirectory: true)
-            .appendingPathComponent("requests.json")
-        let persistence = SwiftNativePersistenceCore()
         do {
-            try await persistence.withFileLock(path) {
-                let raw = await persistence.readJSON(path, defaultValue: .array([]))
-                guard case .array(var rows) = raw else { return }
-                for idx in rows.indices {
-                    guard case .object(var obj) = rows[idx],
-                          case .string(let rowID)? = obj["id"],
-                          rowID == id else {
-                        continue
-                    }
-                    obj["executedAction"] = executedAction
-                    obj["detail"] = .string(detail)
-                    rows[idx] = .object(obj)
-                    break
-                }
-                try await persistence.writeJSON(.array(rows), to: path)
-            }
+            _ = try await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
+                id,
+                executedAction: executedAction,
+                detail: detail
+            )
         } catch {
             logger.error("consolidation gate: approval annotation failed for \(id, privacy: .public): \(String(describing: error), privacy: .public)")
         }

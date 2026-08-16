@@ -38,7 +38,7 @@ import ToolExecution
 // PURE persistence + two side-effects (record_activity + record_trace) — NO
 // engine. It normalizes the request body into a workflow record (slugify id +
 // per-step normalization, the `[:120]`/`[:1000]`/`[:200]`/`[:160]`/`[:80]`
-// code-point caps, the steps[:24] cap, the empty-steps "plan" default), does a
+// code-point caps, loud refusal above 24 steps, the empty-steps "plan" default), does a
 // flock-wrapped read->merge->filter-same-id->append->write of registry.json
 // (the SAME _list_workflows_locked merge as listWorkflows, then the create
 // overwrite — all in ONE lock acquisition), then emits the activity feed +
@@ -50,7 +50,8 @@ import ToolExecution
 // by the W12 flock work. See CUTOVER_PLAN.md §6.97.
 //
 // WIRED (2026-06-03): POST /v1/workflows/run and /resume now execute in Swift.
-// The v1 path writes dry-run/live receipts and the v2 path owns the
+// The v1 path remains for legacy dry-run and approval-free live receipts. Any
+// approval-bearing live v1 definition is healed onto v2, which owns the
 // continue_workflow_v2 state machine: conditions, dependsOn blocking, retry
 // attempts, approval pause/resume, output-key wiring, run-state persistence,
 // terminal cancel/rollback stale-write guards, run ledger appends, and traces.
@@ -89,12 +90,12 @@ public protocol WorkflowOrchestrationClient: Sendable {
     /// GET /v1/workflows/runs — returns the last 50 run records, newest first.
     func listWorkflowRuns() async throws -> [JSONValue]
     /// POST /v1/workflows/run — run a workflow in Swift. Mirrors
-    /// Runtime.run_workflow's v1/v2 split; unsupported `tool_run` steps fail
-    /// the step rather than pretending execution happened.
+    /// Uses durable v2 by default and heals legacy approval-bearing live runs
+    /// onto it; unsupported `tool_run` steps fail rather than pretending.
     func runWorkflow(id: String, objective: String, execute: Bool, engineVersion: String?, variables: JSONValue?) async throws -> JSONValue
-    /// POST /v1/workflows/resume — resume a v2 run that is waiting on an approval.
-    /// Mirrors Runtime.resume_workflow_run, which re-enters continue_workflow_v2
-    /// from the next step after the approval has been marked approved.
+    /// POST /v1/workflows/resume — resolve or resume a v2 run waiting on an
+    /// approval. Approved gates continue; denied/canceled gates settle the run
+    /// durably. A recovered in-flight attempt is never replayed blindly.
     func resumeWorkflowRun(id: String) async throws -> JSONValue
     /// POST /v1/workflows/cancel — mark a run-state terminal as `canceled`,
     /// persist, and return the public run view. Mirrors Runtime.cancel_workflow_run.

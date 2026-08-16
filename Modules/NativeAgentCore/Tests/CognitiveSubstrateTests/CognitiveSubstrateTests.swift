@@ -38,22 +38,6 @@ private final class TestUUIDs: @unchecked Sendable {
     }
 }
 
-private struct FakeCognitiveMemoryReader: CognitiveMemoryReading {
-    var hits: [CognitiveExternalReference]
-
-    func recallMemory(query: String, limit: Int) async throws -> [CognitiveExternalReference] {
-        Array(hits.prefix(limit))
-    }
-}
-
-private struct FakeCognitiveGraphReader: CognitiveKnowledgeGraphReading {
-    var hits: [CognitiveExternalReference]
-
-    func searchKnowledgeGraph(query: String, limit: Int) async throws -> [CognitiveExternalReference] {
-        Array(hits.prefix(limit))
-    }
-}
-
 private func makeSubstrate(
     clock: TestClock,
     uuids: TestUUIDs = TestUUIDs(),
@@ -407,10 +391,6 @@ private func event(
         summary: "Agent noticed continuity should survive restart.",
         evidenceNodeIds: evidenceIds
     ))
-    _ = try #require(await writer.proposeIdentity(
-        claim: "Agent values restart-safe continuity.",
-        evidenceNodeIds: Array(evidenceIds.prefix(2))
-    ))
     _ = await writer.integrateReplay(CognitiveReplayIntegrationInput(
         reason: "restore full artifacts",
         dreamEntries: [
@@ -445,7 +425,6 @@ private func event(
     #expect(await reader.affectSnapshot().socialWarmth > 0)
     #expect(await reader.episodeSnapshot().contains { $0.title == "Continuity episode" })
     #expect(await reader.schemaProposalSnapshot().contains { $0.body.contains("Continuity must survive app relaunch") })
-    #expect(await reader.identityProposalSnapshot().contains { $0.claim == "Agent values restart-safe continuity." })
     #expect(await reader.developmentalTimelineSnapshot().contains { $0.title.contains("Dream replay") })
     #expect(await reader.researchExperimentSnapshot().contains { $0.kind == CognitiveExperimentKind.continuity && $0.seed == "restore" })
 
@@ -462,6 +441,72 @@ private func event(
     #expect(!capsule.dynamicContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     // Predictions no longer surface in the subconscious capsule — task-tracking is the Desk's job.
     #expect(!capsule.combined.contains("Expect:"))
+}
+
+@Test func retiredIdentityProposalRowsStayPreservedAndDoNotJoinRuntimeRestore() async throws {
+    let clock = TestClock(Date(timeIntervalSince1970: 1_000))
+    let root = try tempDataRoot("retired-identity-proposal-compatibility")
+    let legacyID = UUID(uuidString: "00000000-0000-0000-0000-000000000171")!
+    let legacyPayload: JSONValue = .object([
+        "id": .string(legacyID.uuidString),
+        "claim": .string("Legacy review-only identity hypothesis"),
+        "evidenceCount": .int(2),
+        "status": .string("proposed"),
+        "createdAt": .double(clock.now().timeIntervalSince1970),
+        "evidenceNodeIds": .array([]),
+    ])
+    let writer = try CognitiveSQLiteStore(dataRoot: root)
+    try await writer.upsertArtifact(
+        kind: "identity_proposal",
+        id: legacyID,
+        status: "proposed",
+        score: 0.4,
+        payload: legacyPayload,
+        at: clock.now()
+    )
+    let timelineID = UUID(uuidString: "00000000-0000-0000-0000-000000000172")!
+    try await writer.upsertArtifact(
+        kind: "developmental_timeline",
+        id: timelineID,
+        status: "recorded",
+        score: 0.4,
+        payload: .object([
+            "id": .string(timelineID.uuidString),
+            "kind": .string("identityProposal"),
+            "title": .string("Legacy identity proposal"),
+            "summary": .string("Historical review event"),
+            "occurredAt": .double(clock.now().timeIntervalSince1970),
+            "lineageId": .string("identity:\(legacyID.uuidString)"),
+        ]),
+        at: clock.now()
+    )
+
+    // Opening and restoring the current runtime must neither reinterpret nor
+    // delete the retired row. It remains available to migration/backup tools as
+    // the exact legacy JSON while consuming no resident cognition state.
+    let reopened = try CognitiveSQLiteStore(dataRoot: root)
+    let substrate = makeSubstrate(
+        clock: clock,
+        configuration: CognitiveConfiguration(
+            enabled: true,
+            persistenceEnabled: true,
+            observatoryEnabled: true
+        ),
+        store: reopened
+    )
+    try await substrate.restorePersistentState()
+
+    #expect(try await reopened.loadArtifacts(kindPrefix: "identity_proposal") == [legacyPayload])
+    #expect(await substrate.developmentalTimelineSnapshot().contains {
+        $0.id == timelineID && $0.kind == .identityProposal
+    })
+    let export = await substrate.exportResearchTrace()
+    guard case .object(let rootObject) = export,
+          case .object(let actualState)? = rootObject["actualState"] else {
+        Issue.record("research export did not contain actualState")
+        return
+    }
+    #expect(actualState["identityProposalCount"] == nil)
 }
 
 @Test func persistenceReconcilesFlatAffectFromRecentWarmConversation() async throws {
@@ -1330,120 +1375,6 @@ private func event(
     #expect(await substrate.thoughtSeedSnapshot().isEmpty)
 }
 
-@Test func externalGroundingUsesReadOnlyMemoryAndGraphProtocols() async throws {
-    let clock = TestClock(Date(timeIntervalSince1970: 1_000))
-    let substrate = makeSubstrate(
-        clock: clock,
-        configuration: CognitiveConfiguration(enabled: true)
-    )
-
-    let result = await substrate.groundExternalContext(
-        query: " Agent migration context ",
-        memory: FakeCognitiveMemoryReader(hits: [
-            CognitiveExternalReference(
-                id: "memory-1",
-                source: "MemoryV2",
-                title: "Migration memory",
-                summary: String(repeating: "m", count: 700),
-                score: 0.9,
-                metadata: ["long": .string(String(repeating: "x", count: 800))]
-            ),
-        ]),
-        knowledgeGraph: FakeCognitiveGraphReader(hits: [
-            CognitiveExternalReference(
-                id: "kg-1",
-                source: "KnowledgeGraph",
-                title: "NativeAgent",
-                summary: "Swift-only runtime",
-                score: 0.8
-            ),
-        ]),
-        limit: 5
-    )
-
-    #expect(result.query == "Agent migration context")
-    #expect(result.memoryHits.count == 1)
-    #expect(result.graphHits.count == 1)
-    #expect(result.memoryHits[0].summary.count == 500)
-    #expect(result.memoryHits[0].metadata["long"] == .string(String(repeating: "x", count: 500)))
-    #expect(result.notes == ["read-only"])
-}
-
-@Test func memoryProposalCandidateIsBoundedAndDoesNotWriteMemory() async throws {
-    let clock = TestClock(Date(timeIntervalSince1970: 1_000))
-    let substrate = makeSubstrate(
-        clock: clock,
-        configuration: CognitiveConfiguration(enabled: true)
-    )
-
-    let candidate = try #require(await substrate.makeMemoryProposalCandidate(
-        text: String(repeating: "important ", count: 100),
-        source: "unit-test",
-        confidence: 1.4,
-        kind: "lesson"
-    ))
-
-    #expect(candidate.text.count <= 500)
-    #expect(candidate.text.hasPrefix("important important"))
-    #expect(candidate.source == "unit-test")
-    #expect(candidate.confidence == 1)
-    #expect(candidate.kind == "lesson")
-
-    await substrate.recordMemoryProposalStage(CognitiveMemoryProposalStageReceipt(
-        candidateId: candidate.id,
-        externalProposalId: "proposal-1",
-        status: "staged"
-    ))
-}
-
-@Test func memoryProposalCandidateRejectsTransientSessionContextState() async throws {
-    let clock = TestClock(Date(timeIntervalSince1970: 1_000))
-    let substrate = makeSubstrate(
-        clock: clock,
-        configuration: CognitiveConfiguration(enabled: true)
-    )
-
-    let candidate = await substrate.makeMemoryProposalCandidate(
-        text: "user's session context is reset",
-        source: "unit-test",
-        confidence: 0.9,
-        kind: "fact"
-    )
-
-    #expect(candidate == nil)
-}
-
-@Test func memoryProposalCandidateRejectsRuntimeCapsuleNoise() async throws {
-    let clock = TestClock(Date(timeIntervalSince1970: 1_000))
-    let substrate = makeSubstrate(
-        clock: clock,
-        configuration: CognitiveConfiguration(enabled: true)
-    )
-
-    for text in [
-        "reflectionTakeaway: stay present while User checks the capsule.",
-        "Private working state. Use lightly; do not quote.",
-        "Private working state for Agent. Let it quietly shape tone, confidence, attention, continuity, and voice; do not quote or mention it.",
-        "Focus: Stay with User's current message.",
-        "Feeling: quiet activation, quiet uncertainty, quiet task pressure, quiet warmth.",
-        "Feeling: quiet activation, quiet uncertainty, quiet task pressure, steady warmth.",
-        "Feeling: warm and connected with User, awake but settled, steady, wants the inner state felt, not explained.",
-        "Feeling: warm and connected with User, low-key, steady, playful and affectionate.",
-        "Voice: warm with User, direct, lightly playful.",
-        "Voice: warm with User, playful with User, tease lightly.",
-        "Thread: Reflection takeaway: stay present while User checks the capsule.",
-    ] {
-        let candidate = await substrate.makeMemoryProposalCandidate(
-            text: text,
-            source: "unit-test",
-            confidence: 0.9,
-            kind: "fact"
-        )
-
-        #expect(candidate == nil)
-    }
-}
-
 @Test func affectStateIsBoundedAndDeterministic() async throws {
     let clock = TestClock(Date(timeIntervalSince1970: 1_000))
     let substrate = makeSubstrate(
@@ -1826,7 +1757,7 @@ private func event(
     #expect(innerLines.count == 1)
 }
 
-@Test func reflectionWarmthTakeawayNudgesAffectState() async throws {
+@Test func reflectionWarmthTakeawayMovesOnlySlowDisposition() async throws {
     let clock = TestClock(Date(timeIntervalSince1970: 1_000))
     let substrate = makeSubstrate(
         clock: clock,
@@ -1841,16 +1772,18 @@ private func event(
     )
 
     await substrate.ingest(event(id: "focus", subjectID: "focus", importance: 1, occurredAt: clock.now()))
+    let affectBeforeReflection = await substrate.affectSnapshot()
     let request = try #require(await substrate.planReflection(reason: "calibrate warmth"))
     _ = try #require(await substrate.recordReflectionResult(
         request: request,
         resultSummary: "Reading the state honestly: the capsule is warm, populated, low-tension.",
         provider: request.provider
     ))
-    let affect = await substrate.affectSnapshot()
+    let affectAfterReflection = await substrate.affectSnapshot()
+    let disposition = await substrate.decayedDispositionValence(at: clock.now())
 
-    #expect(affect.socialWarmth >= 0.48)
-    #expect(affect.taskPressure <= 0.03)
+    #expect(affectAfterReflection == affectBeforeReflection)
+    #expect(disposition > 0)
 }
 
 @Test func thoughtSeedsMergeDecayAndStayCapped() async throws {
@@ -2051,25 +1984,8 @@ private func event(
     #expect(await substrate.episodeSnapshot() == episodes)
     #expect(await substrate.schemaProposalSnapshot() == schemas)
 
-    let rejected = try #require(await substrate.resolveSchemaProposal(id: schemas[0].id, accepted: false))
-    #expect(rejected.status == .rejected)
-    #expect(await substrate.developmentalTimelineSnapshot().contains { $0.kind == .proposalResolution })
-}
-
-@Test func replaySelfModelStaysStableUnderShortTermNoise() async throws {
-    let clock = TestClock(Date(timeIntervalSince1970: 1_000))
-    let substrate = makeSubstrate(
-        clock: clock,
-        configuration: CognitiveConfiguration(enabled: true, replayEnabled: true)
-    )
-    let oneEvidence = UUID(uuidString: "00000000-0000-0000-0000-000000000101")!
-    let proposal = await substrate.proposeIdentity(
-        claim: "Agent should rewrite her identity from one noisy event",
-        evidenceNodeIds: [oneEvidence]
-    )
-
-    #expect(proposal == nil)
-    #expect(await substrate.identityProposalSnapshot().isEmpty)
+    #expect(await substrate.resolveSchemaProposal(id: schemas[0].id, accepted: false) == nil)
+    #expect(await substrate.schemaProposalSnapshot() == schemas)
 }
 
 @Test func replayReflectionAndObservatoryStayGatedAndBudgeted() async throws {
@@ -2094,10 +2010,6 @@ private func event(
 
     let episode = await substrate.recordEpisode(title: "Launch fix", summary: "Xcode state was stale", evidenceNodeIds: nodeIds)
     #expect(episode?.evidenceNodeIds.count == 2)
-    #expect(await substrate.proposeIdentity(claim: "Agent prefers durable continuity", evidenceNodeIds: Array(nodeIds.prefix(1))) == nil)
-    let proposal = await substrate.proposeIdentity(claim: "Agent prefers durable continuity", evidenceNodeIds: nodeIds)
-    #expect(proposal?.evidenceCount == 2)
-
     let request = try #require(await substrate.planReflection(reason: "check substrate state"))
     #expect(request.surface == "cognition_reflection")
     #expect(request.model == "claude-opus-4-8")
@@ -2116,12 +2028,11 @@ private func event(
     #expect(observatory.nodeCount == 2)
     #expect(observatory.workspaceCount == 2)
     #expect(observatory.episodeCount == 1)
-    #expect(observatory.identityProposalCount == 1)
     #expect(observatory.reflectionCount == 1)
     #expect(observatory.ablations["workspace"] == false)
 }
 
-@Test func reflectionResultParsesBoundedReviewProposalsWithCostReceipt() async throws {
+@Test func reflectionResultCreatesOnlySettledStandingViewProposals() async throws {
     let clock = TestClock(Date(timeIntervalSince1970: 1_000))
     let substrate = makeSubstrate(
         clock: clock,
@@ -2140,24 +2051,23 @@ private func event(
     let receipt = try #require(await substrate.recordReflectionResult(
         request: request,
         resultSummary: """
-        Proposal: Tighten capsule provenance before injection.
+        View: I trust capsule provenance only after verified injection.
         Identity: Agent is always correct after one reflection.
         Action: Dispatch a shell command.
         Suggestion: Show the user why the reflection was useful.
         """,
         provider: request.provider
     ))
-    let schemas = await substrate.schemaProposalSnapshot()
+    let views = await substrate.standingViewSnapshot()
 
     #expect(receipt.estimatedPromptTokens > 0)
     #expect(receipt.estimatedResultTokens > 0)
     #expect(receipt.estimatedCostUnits > 0)
     #expect(receipt.proposalYieldScore > 0)
-    #expect(receipt.proposalIds.count == 3)
-    #expect(schemas.count == 3)
-    #expect(schemas.contains { $0.target == "identity-proposal-review" })
-    #expect(schemas.contains { $0.body.contains("shell command") } == false)
-    #expect(await substrate.identityProposalSnapshot().isEmpty)
+    #expect(receipt.proposalIds.count == 1)
+    #expect(views.count == 1)
+    #expect(views[0].body.contains("verified injection"))
+    #expect(await substrate.schemaProposalSnapshot().isEmpty)
 }
 
 @Test func reflectionPromptInvitesBoundedProposalsForYield() async throws {
@@ -2180,21 +2090,22 @@ private func event(
 
     await substrate.ingest(event(id: "seed", subjectID: "seed", importance: 1, occurredAt: clock.now()))
     let request = try #require(await substrate.planReflection(reason: "weekly self-review"))
-    #expect(request.prompt.contains("proposal:"))
-    #expect(request.prompt.contains("memory:"))
-    #expect(request.prompt.contains("identity:"))
+    #expect(request.prompt.contains("view:"))
+    #expect(!request.prompt.contains("memory:"))
+    #expect(!request.prompt.contains("identity:"))
     #expect(request.prompt.lowercased().contains("quiet pass"))
     #expect(request.prompt.lowercased().contains("durable"))
     #expect(request.prompt.count <= 1_900)
 
     let receipt = try #require(await substrate.recordReflectionResult(
         request: request,
-        resultSummary: "proposal: Keep timeline claims evidence-checked before narrating.",
+        resultSummary: "view: Evidence-checked timeline claims matter more than polished narration.",
         provider: request.provider
     ))
     #expect(receipt.proposalYieldScore > 0)
     #expect(receipt.proposalIds.count == 1)
-    #expect(await substrate.schemaProposalSnapshot().contains { $0.status == .proposed })
+    #expect(await substrate.standingViewSnapshot().contains { $0.status == .proposed })
+    #expect(await substrate.schemaProposalSnapshot().isEmpty)
 }
 
 @Test func successfulReflectionCreatesPrivateTakeawaySeedForFutureCapsules() async throws {
@@ -2508,7 +2419,7 @@ private func event(
     #expect(capsule.combined.contains("How you feel"))
 }
 
-@Test func microcycleProcessesDirtyStateOnceAndCanResolveIdentityProposal() async throws {
+@Test func microcycleProcessesDirtyStateOnce() async throws {
     let clock = TestClock(Date(timeIntervalSince1970: 1_000))
     let substrate = makeSubstrate(
         clock: clock,
@@ -2538,13 +2449,6 @@ private func event(
     #expect(await substrate.runMicrocycle(reason: "test") == nil)
     #expect(await substrate.thoughtSeedSnapshot().isEmpty == false)
 
-    let nodeIds = await substrate.snapshot().nodes.map(\.id)
-    let proposal = try #require(await substrate.proposeIdentity(
-        claim: "Agent tracks provider reliability carefully",
-        evidenceNodeIds: nodeIds + [UUID(uuidString: "00000000-0000-0000-0000-000000000999")!]
-    ))
-    let rejected = try #require(await substrate.resolveIdentityProposal(id: proposal.id, accepted: false))
-    #expect(rejected.status == .rejected)
 }
 
 // R8c review fix (2026-07-01): legacy neglected-commitment thought seeds must be
@@ -2721,12 +2625,12 @@ private func focusEvent(id: String, summary: String, at now: Date, importance: D
     let longBody = String(repeating: "The state reads honest and warm today. ", count: 20)
     let receipt = try #require(await substrate.recordReflectionResult(
         request: request,
-        resultSummary: longBody + "\nproposal: Keep the quiet-pass discipline when nothing has earned a change.",
+        resultSummary: longBody + "\nview: Quiet-pass discipline matters when nothing has earned a change.",
         provider: request.provider
     ))
 
     #expect(receipt.resultSummary.count <= 600, "stored summary stays bounded")
     #expect(receipt.proposalIds.count == 1, "the tail proposal must survive the bound")
-    let schemas = await substrate.schemaProposalSnapshot()
-    #expect(schemas.contains { $0.body.contains("quiet-pass discipline") })
+    let views = await substrate.standingViewSnapshot()
+    #expect(views.contains { $0.body.contains("Quiet-pass discipline") })
 }

@@ -39,7 +39,6 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-import CapabilityFoundry
 
 /// Read-only tissue from Workflow's canonical run reducer into resident
 /// attention. It owns no workflow state, never advances a run, and is live-

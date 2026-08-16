@@ -39,7 +39,6 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-import CapabilityFoundry
 
 extension NativeClient {
     func getNextGenSummary() async throws -> NextGenSummary {
@@ -267,7 +266,7 @@ extension NativeClient {
         var activeCount = 0
         var pinnedCount = 0
         var pendingProposals: Int? = nil
-        if let storage = try? MemoryStorage(dataRoot: dataRoot) {
+        if let storage = try? await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot) {
             if let all = try? await storage.listMemories(persona: nil, status: nil, limit: nil) {
                 memCount = all.count
                 for m in all {
@@ -392,7 +391,7 @@ extension NativeClient {
         let root = PersistenceCore.defaultDataRoot()
 
         if dryRun {
-            let storage = try MemoryStorage(dataRoot: root)
+            let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: root)
             let before = (try? await storage.listMemories(persona: nil, status: nil, limit: nil).count) ?? 0
             let pending = (try? await storage.listProposals(status: "pending").count) ?? 0
             let now = Date()

@@ -130,7 +130,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
             ?? (dataRoot == PersistenceCore.defaultDataRoot()
                 ? .shared
                 : ActiveToolsStore(dataRoot: dataRoot))
-        self.memoryV2 = memoryV2 ?? Self.makeMemoryOwner(dataRoot: dataRoot)
+        self.memoryV2 = memoryV2 ?? SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
         self.knowledgeGraphPath = knowledgeGraphPath ?? dataRoot
             .appendingPathComponent("memory", isDirectory: true)
             .appendingPathComponent("knowledge_graph.json")
@@ -148,17 +148,6 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
         self.claudeMessageWakeupOverride = claudeMessageWakeupOverride
         self.ompMessageWakeupHelperOverride = ompMessageWakeupHelperOverride
         self.ompMessageWakeupOverride = ompMessageWakeupOverride
-    }
-
-    private static func makeMemoryOwner(dataRoot: URL) -> SwiftNativeMemoryV2 {
-        guard dataRoot != PersistenceCore.defaultDataRoot() else { return .shared }
-        guard let storage = try? MemoryStorage(dataRoot: dataRoot) else {
-            return SwiftNativeMemoryV2()
-        }
-        return SwiftNativeMemoryV2(
-            embedder: ManagedEmbeddingProvider(dataRoot: dataRoot),
-            storage: MemoryStorageBridge(storage: storage)
-        )
     }
 
     private func cachedBuiltInToolSchemas(

@@ -40,7 +40,6 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-import CapabilityFoundry
 
 @MainActor
 extension AppModel {
@@ -726,6 +725,7 @@ extension AppModel {
                     let session = try await api.createChatSession(title: "New Chat", sourceKey: "app")
                     activeChatSessionId = session.id
                     chatSessions = [session]
+                    MacSyncEngine.shared.requestChatSnapshotPublication(includeTranscripts: false)
                 }
                 UserDefaults.standard.set(activeChatSessionId, forKey: "activeChatSessionId")
             }
@@ -799,6 +799,53 @@ extension AppModel {
         if let receipt {
             setLatestContextReceipt(receipt, for: sessionId)
         }
+    }
+
+    /// Refresh a visible detached transcript after a turn completed on another
+    /// surface. This mirrors the active-chat refresh without changing the main
+    /// selection and never replaces a slot while a newer local stream owns it.
+    @MainActor
+    func refreshDetachedChatMessagesAfterTurn(
+        sessionId: String,
+        messagesAlreadyRefreshed: Bool = false
+    ) async {
+        guard !sessionId.isEmpty,
+              DetachedChatWindowController.shared.isDetached(sessionId),
+              !streamingSessions.contains(sessionId)
+        else { return }
+        var messages: [ChatMessage]?
+        if !messagesAlreadyRefreshed {
+            do {
+                messages = try await client.getChatMessages(sessionId: sessionId)
+            } catch {
+                detachedChatRefreshStatus[sessionId] = Self.nextRefreshStatus(
+                    previous: detachedChatRefreshStatus[sessionId],
+                    failedEndpoints: ["messages"],
+                    at: Date()
+                )
+                return
+            }
+        }
+        let receipt = try? await client.getLatestContextReceipt(sessionId: sessionId)
+        guard DetachedChatWindowController.shared.isDetached(sessionId),
+              !streamingSessions.contains(sessionId)
+        else { return }
+        if let messages {
+            applyLoadedChatMessages(messages, for: sessionId)
+        }
+        if let receipt {
+            setLatestContextReceipt(receipt, for: sessionId)
+        }
+        detachedChatRefreshStatus[sessionId] = Self.nextRefreshStatus(
+            previous: detachedChatRefreshStatus[sessionId],
+            failedEndpoints: [],
+            at: Date()
+        )
+        detachedChatContextReceiptRefreshStatus[sessionId] = Self.nextRefreshStatus(
+            previous: detachedChatContextReceiptRefreshStatus[sessionId],
+            failedEndpoints: receipt == nil ? ["context receipt"] : [],
+            at: Date()
+        )
     }
 
     /// Apply a disk snapshot of `sessionId`'s messages over the in-memory list.
@@ -950,6 +997,7 @@ extension AppModel {
             chatMessages = []
             latestContextReceipt = nil
             statusText = "New chat session ready"
+            MacSyncEngine.shared.requestChatSnapshotPublication(includeTranscripts: false)
         } catch {
             statusText = "New chat failed: \(error.localizedDescription)"
         }
@@ -972,6 +1020,7 @@ extension AppModel {
                 chatSessions[index] = updated
             }
             statusText = "Renamed chat session"
+            MacSyncEngine.shared.requestChatSnapshotPublication(includeTranscripts: false)
         } catch {
             statusText = "Rename failed: \(error.localizedDescription)"
         }

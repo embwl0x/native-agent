@@ -191,7 +191,12 @@ struct ContextFillBar: View {
         lastError = nil
         do {
             _ = try await appModel
-                .compactSession(sessionId: sessionId, force: true)
+                .compactSession(
+                    sessionId: sessionId,
+                    model: appModel.chatModel,
+                    providerID: appModel.chatProvider,
+                    force: true
+                )
             await refresh()
         } catch {
             lastError = error.localizedDescription

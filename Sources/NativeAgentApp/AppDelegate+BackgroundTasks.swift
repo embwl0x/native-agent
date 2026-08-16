@@ -52,8 +52,12 @@ extension AppDelegate {
             activity.qualityOfService = .utility
             activity.schedule { completion in
                 Task.detached(priority: .utility) {
-                    await BackgroundLoopsManager.shared.runTickOnce(loopId: loopId)
-                    completion(.finished)
+                    let outcome = await BackgroundLoopsManager.shared.runTickIfDue(loopId: loopId)
+                    if case .failed = outcome {
+                        completion(.deferred)
+                    } else {
+                        completion(.finished)
+                    }
                 }
             }
         }

@@ -191,6 +191,8 @@ private func makeProfile(root: URL, handle: String = "desk_test") -> WorkshopToo
     let names = Set(try await profile.listAvailableToolSchemas().map(\.name))
     #expect(names.contains("read_file"))
     #expect(names.contains(WorkshopToolProfile.artifactToolName))
+    #expect(names.contains(WorkshopToolProfile.artifactReadToolName))
+    #expect(names.contains(WorkshopToolProfile.progressToolName))
     #expect(!names.contains("mac_control"), "the model must never even SEE a forbidden tool")
     #expect(!names.contains("write_file"))
     #expect(!names.contains("tool_catalog"), "generic discovery must not reveal/re-expand the inner catalog")
@@ -285,6 +287,8 @@ private func makeProfile(root: URL, handle: String = "desk_test") -> WorkshopToo
         #expect(!exposed.contains("mac_control"))
         #expect(exposed.isSubset(of: WorkshopToolProfile.allowed.union([
             WorkshopToolProfile.artifactToolName,
+            WorkshopToolProfile.artifactReadToolName,
+            WorkshopToolProfile.progressToolName,
         ])))
     }
 }
@@ -372,6 +376,61 @@ private func makeProfile(root: URL, handle: String = "desk_test") -> WorkshopToo
             tool: WorkshopToolProfile.artifactToolName,
             input: ["path": .string("../../escape.md"), "content": .string("x")],
             surface: "workshop")
+    }
+}
+
+@Test func l12_artifactReaderIsHandleScopedAndRejectsTraversalAndSymlinks() async throws {
+    let root = makeTempRoot(); defer { try? FileManager.default.removeItem(at: root) }
+    let own = WorkshopArtifactWriter(dataRoot: root, handle: "desk_own")
+    _ = try own.write(relativePath: "notes/prior.md", content: "prior evidence")
+    let profile = makeProfile(root: root, handle: "desk_own")
+    let result = try await profile.dispatch(
+        tool: WorkshopToolProfile.artifactReadToolName,
+        input: ["path": .string("notes/prior.md")],
+        surface: "workshop"
+    )
+    guard case .object(let object) = result else { Issue.record("missing read result"); return }
+    #expect(object["content"] == .string("prior evidence"))
+
+    await #expect(throws: WorkshopMembraneError.self) {
+        _ = try await profile.dispatch(
+            tool: WorkshopToolProfile.artifactReadToolName,
+            input: ["path": .string("../desk_other/private.md")],
+            surface: "workshop"
+        )
+    }
+    let outside = root.appendingPathComponent("outside.md")
+    try Data("outside".utf8).write(to: outside)
+    let link = try own.rootURL().appendingPathComponent("linked.md")
+    try FileManager.default.createSymbolicLink(at: link, withDestinationURL: outside)
+    await #expect(throws: (any Error).self) {
+        _ = try await profile.dispatch(
+            tool: WorkshopToolProfile.artifactReadToolName,
+            input: ["path": .string("linked.md")], surface: "workshop"
+        )
+    }
+}
+
+@Test func workshopProgressIsTypedAndDoesNotInferCompletionFromProse() async throws {
+    let root = makeTempRoot(); defer { try? FileManager.default.removeItem(at: root) }
+    let progress = WorkshopProgressCollector()
+    let profile = WorkshopToolProfile(
+        inner: PermissiveInner(),
+        artifactWriter: WorkshopArtifactWriter(dataRoot: root, handle: "desk_progress"),
+        progressCollector: progress
+    )
+    _ = try await profile.dispatch(
+        tool: WorkshopToolProfile.progressToolName,
+        input: ["disposition": .string("goal_satisfied"), "summary": .string("verified the deliverable")],
+        surface: "workshop"
+    )
+    #expect(await progress.latest()?.disposition == .goalSatisfied)
+    await #expect(throws: WorkshopMembraneError.self) {
+        _ = try await profile.dispatch(
+            tool: WorkshopToolProfile.progressToolName,
+            input: ["disposition": .string("probably done"), "summary": .string("looks good")],
+            surface: "workshop"
+        )
     }
 }
 
@@ -465,7 +524,9 @@ private func makeProfile(root: URL, handle: String = "desk_test") -> WorkshopToo
     }
     let request = WorkshopSessionRequest(handle: item.handle, reservationId: res, title: "t", promptSeed: "work")
     #expect(await WorkshopSession(dataRoot: root, store: store, turnExecutor: executor).run(request).status == .completed)
-    #expect(await WorkshopSession(dataRoot: root, store: store, turnExecutor: executor).run(request).status == .refused)
+    // A replay may project the already-durable terminal result, but it must
+    // never execute the provider/tool turn a second time.
+    #expect(await WorkshopSession(dataRoot: root, store: store, turnExecutor: executor).run(request).status == .completed)
     #expect(await calls.value() == 1, "a visible reservation id authorizes at most one execution attempt")
 }
 

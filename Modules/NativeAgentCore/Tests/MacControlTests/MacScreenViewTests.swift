@@ -67,6 +67,29 @@ private struct _NeverRenderer: MacScreenImageRenderer {
     }
 }
 
+private final class _InterruptingDragSink: MacEventSink, @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [MacMouseEvent] = []
+    private var interrupted = false
+    let source: AttentionManualSource
+
+    init(source: AttentionManualSource) { self.source = source }
+    var isAvailable: Bool { true }
+    var mouse: [MacMouseEvent] { lock.lock(); defer { lock.unlock() }; return events }
+    func post(key: MacKeyEvent) {}
+    func post(scroll: MacScrollEvent) {}
+    func post(mouse event: MacMouseEvent) {
+        lock.lock()
+        events.append(event)
+        let shouldInterrupt = event.phase == .drag && !interrupted
+        if shouldInterrupt { interrupted = true }
+        lock.unlock()
+        if shouldInterrupt {
+            source.emit(MacAttentionActivity(kind: .pointerPressed))
+        }
+    }
+}
+
 private struct _ViewElement {
     var attributes: MacAXAttributes?
     var children: [Int]
@@ -767,6 +790,232 @@ private func _client(
     #expect(placements.count == 3)
     let send = try #require(placements.first { $0.mark == 3 })
     #expect(send.x == 1200 && send.y == 1000 && send.w == 200 && send.h == 80)
+}
+
+@Test func attentionRunsTheIntegratedObserveYieldReobserveActCycle() async throws {
+    let capture = _StubCaptureSource(shot: _shot())
+    let renderer = _StubRenderer(baseBytes: 100_000)
+    let viewStore = MacScreenViewStore()
+    let attentionStore = MacAttentionSessionStore(screenViewStore: viewStore)
+    let attentionSource = AttentionManualSource()
+    let sink = _RecordingEventSink()
+    let client = SwiftNativeMacControl(
+        accessibilitySource: _composeWindowSource(),
+        eventSink: sink,
+        screenCaptureSource: capture,
+        screenImageRenderer: renderer,
+        screenViewStore: viewStore,
+        attentionEventSource: attentionSource,
+        attentionStore: attentionStore
+    )
+
+    let started = try await client.dispatch(action: "attention", body: [
+        "mode": .string("start"),
+        "duration_seconds": .int(60),
+    ])
+    #expect(started.ok)
+    #expect(started.action == "attention")
+    let startedObject = _object(started.output)
+    guard case .object(let attention)? = startedObject["attention"],
+          case .string(let session)? = attention["session"],
+          case .int(let initialUserSequence)? = attention["user_sequence"],
+          case .string(let staleView)? = startedObject["view"] else {
+        Issue.record("start did not return one fused view plus attention token")
+        return
+    }
+    #expect(initialUserSequence == 0)
+
+    // A real physical-input pulse retires the exact view the model just saw.
+    attentionSource.emit(MacAttentionActivity(kind: .pointerPressed))
+    _ = try #require(await waitForUserSequence(1, store: attentionStore))
+    let yielded = try await client.dispatch(action: "click", body: [
+        "mark": .int(1),
+        "view": .string(staleView),
+        "attention_session": .string(session),
+        "attention_user_sequence": .int(initialUserSequence),
+    ])
+    #expect(!yielded.ok)
+    #expect(yielded.httpStatus == 409)
+    #expect(_string(yielded.output, "status") == "yielded_to_user")
+    #expect(sink.mouse.isEmpty)
+
+    // Re-observation produces a new scene token and acknowledges only the
+    // user activity that happened before that capture.
+    let refreshed = try await client.dispatch(action: "attention", body: [
+        "mode": .string("next"),
+        "session": .string(session),
+        "after_sequence": .int(0),
+        "wait_ms": .int(0),
+    ])
+    #expect(refreshed.ok)
+    let refreshedObject = _object(refreshed.output)
+    guard case .object(let refreshedAttention)? = refreshedObject["attention"],
+          case .int(let refreshedUserSequence)? = refreshedAttention["user_sequence"],
+          case .string(let freshView)? = refreshedObject["view"] else {
+        Issue.record("next did not return a fresh fused view plus attention token")
+        return
+    }
+    #expect(refreshedUserSequence == 1)
+    #expect(freshView != staleView)
+
+    let acted = try await client.dispatch(action: "click", body: [
+        "mark": .int(1),
+        "view": .string(freshView),
+        "attention_session": .string(session),
+        "attention_user_sequence": .int(refreshedUserSequence),
+    ])
+    #expect(acted.ok)
+    #expect(sink.mouse.map(\.phase) == [MacMousePhase.move, .down, .up])
+    // Motor completion retires the acted-on scene even without human input.
+    #expect(await viewStore.latestViewId() == nil)
+
+    let stopped = try await client.dispatch(action: "attention", body: ["mode": .string("stop")])
+    #expect(stopped.ok)
+    #expect(_string(stopped.output, "status") == "stopped")
+    #expect(attentionSource.observation.isStopped)
+}
+
+@Test func humanTakeoverMidDragReleasesTheButtonAndStopsTheGesture() async throws {
+    let capture = _StubCaptureSource(shot: _shot())
+    let renderer = _StubRenderer(baseBytes: 100_000)
+    let viewStore = MacScreenViewStore()
+    let attentionStore = MacAttentionSessionStore(screenViewStore: viewStore)
+    let attentionSource = AttentionManualSource()
+    let sink = _InterruptingDragSink(source: attentionSource)
+    let client = SwiftNativeMacControl(
+        accessibilitySource: _composeWindowSource(),
+        eventSink: sink,
+        screenCaptureSource: capture,
+        screenImageRenderer: renderer,
+        screenViewStore: viewStore,
+        attentionEventSource: attentionSource,
+        attentionStore: attentionStore
+    )
+    let started = try await client.dispatch(action: "attention", body: [
+        "mode": .string("start"),
+        "duration_seconds": .int(60),
+    ])
+    let startedObject = _object(started.output)
+    guard case .object(let attention)? = startedObject["attention"],
+          case .string(let session)? = attention["session"],
+          case .int(let userSequence)? = attention["user_sequence"] else {
+        Issue.record("missing attention token")
+        return
+    }
+
+    let result = try await client.dispatch(action: "click", body: [
+        "from": .object(["x": .int(10), "y": .int(20)]),
+        "to": .object(["x": .int(500), "y": .int(300)]),
+        "duration_ms": .int(500),
+        "attention_session": .string(session),
+        "attention_user_sequence": .int(userSequence),
+    ])
+    #expect(!result.ok)
+    #expect(_string(result.output, "status") == "yielded_to_user")
+    let events = sink.mouse
+    #expect(events.prefix(2).map(\.phase) == [.move, .down])
+    #expect(events.contains { $0.phase == .drag })
+    #expect(events.last?.phase == .up, "takeover must never strand a synthesized button-down")
+    #expect(events.count < 34, "the local drag path must stop rather than finishing after takeover")
+}
+
+@Test func appChangeRefusalAsksForARefreshWithoutClaimingHumanTakeover() async throws {
+    let viewStore = MacScreenViewStore()
+    let attentionStore = MacAttentionSessionStore(screenViewStore: viewStore)
+    let attentionSource = AttentionManualSource()
+    let sink = _RecordingEventSink()
+    let client = SwiftNativeMacControl(
+        accessibilitySource: _composeWindowSource(),
+        eventSink: sink,
+        screenCaptureSource: _StubCaptureSource(shot: _shot()),
+        screenImageRenderer: _StubRenderer(baseBytes: 100_000),
+        screenViewStore: viewStore,
+        attentionEventSource: attentionSource,
+        attentionStore: attentionStore
+    )
+    let started = try await client.dispatch(action: "attention", body: [
+        "mode": .string("start"),
+        "duration_seconds": .int(60),
+    ])
+    let startedObject = _object(started.output)
+    guard case .object(let attention)? = startedObject["attention"],
+          case .string(let session)? = attention["session"],
+          case .int(let userSequence)? = attention["user_sequence"],
+          case .string(let view)? = startedObject["view"] else {
+        Issue.record("missing attention token")
+        return
+    }
+
+    attentionSource.emit(MacAttentionActivity(kind: .appChanged))
+    _ = try #require(await attentionStore.waitForActivity(
+        sessionId: session,
+        after: 0,
+        timeoutMilliseconds: 2_000,
+        now: Date()
+    ))
+    let refused = try await client.dispatch(action: "click", body: [
+        "mark": .int(1),
+        "view": .string(view),
+        "attention_session": .string(session),
+        "attention_user_sequence": .int(userSequence),
+    ])
+    #expect(!refused.ok)
+    #expect(_string(refused.output, "status") == "refresh_required")
+    #expect(refused.error?.contains("scene_changed") == true)
+    #expect(refused.error?.contains("human_takeover") == false)
+    #expect(sink.mouse.isEmpty)
+
+    _ = try await client.dispatch(action: "attention", body: ["mode": .string("stop")])
+}
+
+@Test func cancellingAnAttentionWaitReturnsPromptlyWithoutCapturingAnotherView() async throws {
+    let capture = _StubCaptureSource(shot: _shot())
+    let renderer = _StubRenderer(baseBytes: 100_000)
+    let viewStore = MacScreenViewStore()
+    let attentionStore = MacAttentionSessionStore(screenViewStore: viewStore)
+    let attentionSource = AttentionManualSource()
+    let client = SwiftNativeMacControl(
+        accessibilitySource: _composeWindowSource(),
+        eventSink: _RecordingEventSink(),
+        screenCaptureSource: capture,
+        screenImageRenderer: renderer,
+        screenViewStore: viewStore,
+        attentionEventSource: attentionSource,
+        attentionStore: attentionStore
+    )
+    let started = try await client.dispatch(action: "attention", body: [
+        "mode": .string("start"),
+        "duration_seconds": .int(60),
+    ])
+    guard case .object(let attention)? = _object(started.output)["attention"],
+          case .string(let session)? = attention["session"],
+          case .int(let sequence)? = attention["sequence"] else {
+        Issue.record("missing attention token")
+        return
+    }
+    let initialRenderCount = renderer.box.calls.count
+    #expect(initialRenderCount == 1)
+
+    let waiting = Task {
+        try await client.dispatch(action: "attention", body: [
+            "mode": .string("next"),
+            "session": .string(session),
+            "after_sequence": .int(sequence),
+            "wait_ms": .int(15_000),
+        ])
+    }
+    try await Task.sleep(for: .milliseconds(10))
+    waiting.cancel()
+    let cancelled = try await waiting.value
+    #expect(!cancelled.ok)
+    #expect(cancelled.httpStatus == 499)
+    #expect(cancelled.error == "attention_wait_cancelled")
+    #expect(
+        renderer.box.calls.count == initialRenderCount,
+        "a cancelled wait must not take another screenshot"
+    )
+
+    _ = try await client.dispatch(action: "attention", body: ["mode": .string("stop")])
 }
 
 @Test func viewLegendTiesEachMarkToTheRealElementPath() async throws {

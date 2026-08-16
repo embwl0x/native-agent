@@ -37,7 +37,6 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-import CapabilityFoundry
 
 // W-H Band (U5 decomposition, move-only): tool-dispatch + chat-message ops
 // (dispatchTool/dispatchToolData, clearChatMessages, deleteChatMessage,
@@ -134,30 +133,6 @@ extension NativeClient {
         f.timeZone = TimeZone(secondsFromGMT: 0)
         f.dateFormat = "yyyyMMdd-HHmmss"
         return f.string(from: date)
-    }
-
-    // W-H lift (move-only): private->internal so root compactSession reaches it.
-    static func compactionSummary(for rows: [JSONValue]) -> String {
-        var lines: [String] = []
-        lines.append("[NativeAgent compacted \(rows.count) earlier message(s).]")
-        for row in rows {
-            guard case .object(let obj) = row else { continue }
-            let role: String = {
-                if case .string(let s)? = obj["role"] { return s }
-                return "message"
-            }()
-            let content: String = {
-                if case .string(let s)? = obj["content"] { return s }
-                return ""
-            }()
-            let normalized = content
-                .replacingOccurrences(of: "\n", with: " ")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !normalized.isEmpty else { continue }
-            lines.append("\(role): \(String(normalized.prefix(500)))")
-            if lines.joined(separator: "\n").count > 12_000 { break }
-        }
-        return String(lines.joined(separator: "\n").prefix(12_000))
     }
 
     // PATCH-2026-05-08 / DAEMON-DEAD PORT (2026-06-02): write a cancel marker at

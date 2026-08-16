@@ -30,8 +30,8 @@
 // button and the approved `run_memory_hygiene` op (both via
 // NativeClient.runMemoryHygiene).
 //
-// The MemoryConsolidationLoop TYPE stays in the BackgroundLoops module
-// (tests pin it); only the production WIRING retires.
+// The retired JSONL loop type and its isolated tests are gone; this runner is
+// the only implementation behind the canonical scheduler slot.
 
 import Foundation
 import ApprovalInbox
@@ -72,7 +72,7 @@ enum MemoryConsolidationHygiene {
     @discardableResult
     static func runOnce(dataRoot: URL, approvedDirectRun: Bool) async throws -> MemoryHygieneReport {
         guard approvedDirectRun else { throw DirectRunNotApprovedError() }
-        let storage = try MemoryStorage(dataRoot: dataRoot)
+        let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
         let before = (try? await storage.listMemories(persona: nil, status: nil, limit: nil).count) ?? 0
         let consolidator = MemoryConsolidator(storage: storage)
         // Honest-status fix (2026-07-24): consolidation is GATED — it builds a
@@ -255,9 +255,8 @@ struct MemoryConsolidationHygieneRunner: LoopRunner {
     /// U5 W-D fix-round (gpt-5.5 NEEDS_FIX): the 3600s budget must live on
     /// THIS type — it is what assembleAllLoops actually registers for the
     /// "memory_consolidation" slot. The override previously existed only on
-    /// the retired MemoryConsolidationLoop (BackgroundLoops module), whose
-    /// production wiring is gone, so the registered loop silently rode the
-    /// scheduler's 300s default. The weekly tick is normally a cheap
+    /// the retired JSONL loop rather than this registered type, so the live
+    /// slot silently rode the scheduler's 300s default. The weekly tick is normally a cheap
     /// approval-card staging pass, but it takes the inbox file lock and
     /// scans the pending set — give it the same wide weekly-loop budget as
     /// its siblings rather than gambling on the default.
@@ -322,7 +321,7 @@ struct MemoryConsolidationHygieneRunner: LoopRunner {
             .appendingPathComponent("memory", isDirectory: true)
             .appendingPathComponent("memory.sqlite")
         if FileManager.default.fileExists(atPath: memoryStorePath.path),
-           let storage = try? MemoryStorage(dataRoot: dataRoot),
+           let storage = try? await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot),
            let indexer = try? SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: await storage.path),
            let facts = try? await MemoryConsolidationHygiene.listGCFacts(storage),
            let preview = try? await indexer.collectGarbage(liveFacts: facts, apply: false) {

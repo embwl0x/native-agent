@@ -217,6 +217,38 @@ public struct CognitiveCapsule: Sendable, Equatable {
     }
 }
 
+/// Pure result of rendering one live injection against a frozen presentation
+/// state. The substrate applies it only after the provider accepts that exact
+/// turn; previews, reflections, failures, and retries merely discard it.
+public struct CognitiveCapsulePresentationCommit: Sendable, Equatable {
+    public let fixedAt: Date
+    public let expected: CognitiveCapsulePresentationState
+    public let next: CognitiveCapsulePresentationState
+
+    public init(
+        fixedAt: Date,
+        expected: CognitiveCapsulePresentationState,
+        next: CognitiveCapsulePresentationState
+    ) {
+        self.fixedAt = fixedAt
+        self.expected = expected
+        self.next = next
+    }
+}
+
+public struct CognitivePreparedCapsule: Sendable, Equatable {
+    public let capsule: CognitiveCapsule
+    public let presentationCommit: CognitiveCapsulePresentationCommit?
+
+    public init(
+        capsule: CognitiveCapsule,
+        presentationCommit: CognitiveCapsulePresentationCommit? = nil
+    ) {
+        self.capsule = capsule
+        self.presentationCommit = presentationCommit
+    }
+}
+
 /// Bounded, immutable turn-scoped composition of the existing cognition and
 /// organism owners. This is a read value, not a new state owner or global
 /// transaction; effect-time authority remains independently revalidated.
@@ -224,15 +256,18 @@ public struct CognitiveTurnProjection: Sendable, Equatable {
     public let fixedAt: Date
     public let capsule: CognitiveCapsule?
     public let posture: OrganismBehaviorPosture?
+    public let capsulePresentationCommit: CognitiveCapsulePresentationCommit?
 
     public init(
         fixedAt: Date,
         capsule: CognitiveCapsule?,
-        posture: OrganismBehaviorPosture?
+        posture: OrganismBehaviorPosture?,
+        capsulePresentationCommit: CognitiveCapsulePresentationCommit? = nil
     ) {
         self.fixedAt = fixedAt
         self.capsule = capsule
         self.posture = posture
+        self.capsulePresentationCommit = capsulePresentationCommit
     }
 
     public var isEmpty: Bool { capsule == nil && posture == nil }
@@ -365,37 +400,6 @@ public struct CognitiveEpisodeReference: Sendable, Equatable, Identifiable {
     }
 }
 
-public enum CognitiveIdentityProposalStatus: String, Sendable, Equatable, CaseIterable {
-    case proposed
-    case accepted
-    case rejected
-}
-
-public struct CognitiveIdentityProposal: Sendable, Equatable, Identifiable {
-    public var id: UUID
-    public var claim: String
-    public var evidenceCount: Int
-    public var status: CognitiveIdentityProposalStatus
-    public var createdAt: Date
-    public var evidenceNodeIds: [UUID]
-
-    public init(
-        id: UUID,
-        claim: String,
-        evidenceCount: Int,
-        status: CognitiveIdentityProposalStatus = .proposed,
-        createdAt: Date,
-        evidenceNodeIds: [UUID] = []
-    ) {
-        self.id = id
-        self.claim = claim
-        self.evidenceCount = max(0, evidenceCount)
-        self.status = status
-        self.createdAt = createdAt
-        self.evidenceNodeIds = evidenceNodeIds
-    }
-}
-
 public enum CognitiveSchemaProposalStatus: String, Sendable, Equatable, CaseIterable {
     case proposed
     case accepted
@@ -484,6 +488,8 @@ public struct CognitiveStandingView: Sendable, Equatable, Identifiable {
 public enum CognitiveDevelopmentalTimelineKind: String, Sendable, Equatable, CaseIterable {
     case dreamEpisode
     case schemaProposal
+    /// Read compatibility for developmental timeline rows written by the
+    /// retired identity-proposal experiment. No production path emits it.
     case identityProposal
     case proposalResolution
     case replayRun
@@ -785,7 +791,6 @@ public struct CognitiveObservatorySnapshot: Sendable, Equatable {
     public var workspaceCount: Int
     public var thoughtSeedCount: Int
     public var episodeCount: Int
-    public var identityProposalCount: Int
     public var reflectionCount: Int
     public var affect: CognitiveAffectState
     public var ablations: [String: Bool]
@@ -796,7 +801,6 @@ public struct CognitiveObservatorySnapshot: Sendable, Equatable {
         workspaceCount: Int,
         thoughtSeedCount: Int,
         episodeCount: Int,
-        identityProposalCount: Int,
         reflectionCount: Int,
         affect: CognitiveAffectState,
         ablations: [String: Bool]
@@ -806,7 +810,6 @@ public struct CognitiveObservatorySnapshot: Sendable, Equatable {
         self.workspaceCount = workspaceCount
         self.thoughtSeedCount = thoughtSeedCount
         self.episodeCount = episodeCount
-        self.identityProposalCount = identityProposalCount
         self.reflectionCount = reflectionCount
         self.affect = affect
         self.ablations = ablations
