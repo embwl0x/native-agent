@@ -26,7 +26,9 @@ context in a bounded RAM arena. That includes:
   skills, projects, Desk, and other enabled sources.
 - **Selection index:** A fast in-memory map used to find which pieces matter for
   this particular message.
-- **Live inner state:** The current cognition and organism state, when enabled.
+- **Live inner state:** When Subconscious is enabled, the current cognition and
+  organism state can be distilled into a small private capsule that helps the
+  agent carry its felt state and continuity into the turn.
 - **Capability map:** Which tools, skills, connectors, and providers exist,
   which are ready, and which are permitted.
 
@@ -195,6 +197,44 @@ or an excuse to narrate internal machinery.
 Preparing a projection does not spend it. Presentation bookkeeping is
 committed only after the provider has actually accepted a successful turn, so
 a failed call cannot consume state that the model never received.
+
+#### The optional subconscious capsule
+
+The capsule is the small part of the subconscious that can be handed directly
+to the model for the current turn. NativeAgent compiles it locally in Swift
+from the frozen, already-resident projection; compiling it does **not** make an
+extra LLM call. Optional budgeted background reflection may use the configured
+model when enabled, but that is a separate background lane rather than part of
+capsule compilation.
+
+Depending on what is relevant and currently available, the bounded capsule may
+carry:
+
+- a short felt fingerprint, such as the current emotional texture and
+  attention quality;
+- one relevant `Inner` view or reflective takeaway;
+- a continuity cue when the agent is returning to an ongoing felt thread;
+- a compact `Body` signal from the optional organism kernel; and
+- a restrained voice or self-exemplar echo when it helps the response land
+  naturally.
+
+The model receives this as private inner context under a compact `How you
+feel:` heading. It is meant to color the agent's tone, judgment, and sense of
+continuity—not to be quoted, announced, or treated as a script. Repetition and
+relevance gates keep an unchanged feeling from becoming a verbal tic, and
+lower-priority lines drop first when the capsule reaches its configured bound.
+
+The capsule never grants authority, edits persona, or promotes a feeling into
+memory or fact. TrustCenter, approvals, tools, and canonical stores retain the
+same boundaries whether the capsule is on or off.
+
+Subconscious is optional. The Settings screen provides a master Subconscious
+switch; turning it off disables the cognitive projection and sends no capsule.
+The advanced Cognition Observatory also exposes separate **Capsule injection**
+and **Organism body kernel** switches. This lets an installation keep cognitive
+state while withholding it from model turns, or use the capsule without the
+organism's body line. Ordinary persona, memory, Fluid Context, tools, and chat
+continue to work when these optional layers are disabled.
 
 ### Lazy tools and skills
 
