@@ -2,8 +2,10 @@
 
 This is the compact operating map for a NativeAgent installation. It is meant
 for both the person using the app and the configured agent running inside it.
-For implementation detail, see [CAPABILITIES.md](CAPABILITIES.md); for current
-limitations, see [../PROJECT_STATUS.md](../PROJECT_STATUS.md).
+For the connected context, memory, action, growth, delegation, and surface
+lifecycles, see [NativeAgent Internal Workings](INTERNAL_WORKINGS.md). For the
+product map, see [CAPABILITIES.md](CAPABILITIES.md); for current limitations,
+see [../PROJECT_STATUS.md](../PROJECT_STATUS.md).
 
 ## What NativeAgent is
 

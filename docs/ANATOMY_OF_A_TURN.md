@@ -411,6 +411,7 @@ verification keep that action honest.
 
 ## Related reading
 
+- [NativeAgent Internal Workings](INTERNAL_WORKINGS.md)
 - [User and Agent Guide](USER_GUIDE.md)
 - [Capabilities](CAPABILITIES.md)
 - [Architecture Blueprint](ARCHITECTURE_BLUEPRINT.md)

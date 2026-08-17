@@ -6,6 +6,8 @@ This document is the readable product map. It describes what NativeAgent
 currently does without requiring a tour through every Swift target. Exact
 source owners live in [ARCHITECTURE_BLUEPRINT.md](ARCHITECTURE_BLUEPRINT.md),
 and incomplete work stays explicit in [../PROJECT_STATUS.md](../PROJECT_STATUS.md).
+For one connected account of how the major lifecycles cooperate, read
+[NativeAgent Internal Workings](INTERNAL_WORKINGS.md).
 
 ## The system in one sentence
 
