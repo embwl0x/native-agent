@@ -102,7 +102,7 @@ struct CoreMLEmbedderTests {
 struct CoreMLEmbedderDeploymentFloorTests {
     @Test("bundled mlmodel spec version stays loadable on the app's minimum macOS")
     func bundledSpecVersionMatchesAppFloor() throws {
-        // The app ships with LSMinimumSystemVersion 14.0 and CoreML spec
+        // The app ships with LSMinimumSystemVersion 26.0 and CoreML spec
         // version 8 is the newest macOS 14 can load. A regenerated model
         // built with newer coremltools defaults (spec 9+ → macOS 15) would
         // pass every test on a current dev Mac and then fail to load for

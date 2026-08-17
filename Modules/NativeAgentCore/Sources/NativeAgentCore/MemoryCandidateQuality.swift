@@ -132,6 +132,13 @@ public enum MemoryCandidateQuality {
     /// on these ("...and User loved it"); a regex capture ending there is a
     /// clipped sentence ("user likes how sometimes she").
     private static let automaticTailStopwords: Set<String> = [
+        // 2026-08-16 ("…think of some other" escape): determiner/quantifier
+        // tails reject for AUTOMATIC extraction only. Deliberate stores keep
+        // them — "prefers Signal over any other" is a legit sentence ending
+        // (same lesson as his/her/who: lexical ambiguity over-rejects the
+        // deliberate lane, and chat.commit_memory is her GOOD lane).
+        "other", "another", "more", "most", "such", "several", "certain",
+        "few", "fewer", "each", "every", "either", "neither",
         "i", "me", "we", "us", "you", "he", "him", "she", "they", "them",
         "it", "its", "mine", "yours", "hers", "theirs", "ours", "that",
         "his", "her", "who",

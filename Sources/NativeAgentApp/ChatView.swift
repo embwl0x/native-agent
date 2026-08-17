@@ -681,7 +681,7 @@ struct ChatView: View {
                                     .font(NativeAgentFont.tag)
                                     .padding(.horizontal, 10)
                                     .padding(.vertical, 6)
-                                    .background(.ultraThinMaterial, in: Capsule())
+                                    .glassEffect(.regular.interactive(), in: Capsule())  // Liquid Feel W2
                             }
                             .buttonStyle(.borderless)
                             .padding(.horizontal, 18)

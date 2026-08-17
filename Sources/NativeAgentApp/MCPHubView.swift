@@ -165,6 +165,7 @@ struct MCPHubView: View {
         .background(isSelected ? Color.accentColor.opacity(0.15) : Color.clear)
         .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         .contentShape(Rectangle())
+        .naInteractive(radius: 6)
         .onTapGesture {
             appModel.selectedMCPServerId = server.id
             Task { await appModel.loadMCPDetails(server) }

@@ -470,7 +470,7 @@ struct InboxCardView: View {
                 .frame(width: 200, alignment: .leading)
             }
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.naFeel)
         .frame(width: 224)
     }
 }
@@ -581,7 +581,7 @@ struct InboxItemDetailSheet: View {
                                             .padding(.vertical, 8)
                                             .background(item.severityColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
                                         }
-                                        .buttonStyle(.plain)
+                                        .buttonStyle(.naFeel)
                                     }
                                 }
                             }
@@ -895,7 +895,7 @@ struct InboxListRow: View {
     }
 
     var body: some View {
-        GlassCard(tint: item.isUnread ? item.severityColor : nil) {
+        GlassCard(tint: item.isUnread ? item.severityColor : nil, scrollRow: true) {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(alignment: .top, spacing: 10) {
                     ZStack(alignment: .topTrailing) {
@@ -953,6 +953,7 @@ struct InboxListRow: View {
                 }
             }
         }
+        .naInteractive()
         .onTapGesture { showDetail = true }
         .listRowBackground(Color.clear)
         .listRowSeparator(.hidden)

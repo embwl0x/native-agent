@@ -126,7 +126,7 @@ struct ActivityView: View {
                                 .font(NativeAgentFont.label)
                                 .foregroundStyle(.orange)
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(.naFeel)
                     }
                 } header: {
                     Text("Needs your eyes")
@@ -158,7 +158,7 @@ struct ActivityView: View {
                                 .font(NativeAgentFont.label)
                                 .foregroundStyle(.blue)
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(.naFeel)
                     }
                 }
 
@@ -185,7 +185,7 @@ struct ActivityView: View {
                                 .font(NativeAgentFont.label)
                                 .foregroundStyle(.indigo)
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(.naFeel)
                     }
                 }
 
@@ -229,7 +229,7 @@ struct ActivityView: View {
                                 .font(NativeAgentFont.label)
                                 .foregroundStyle(.indigo)
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(.naFeel)
                     }
                 }
 
@@ -261,7 +261,7 @@ struct ActivityView: View {
                                 .font(NativeAgentFont.label)
                                 .foregroundStyle(.purple)
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(.naFeel)
                     }
                 }
             }

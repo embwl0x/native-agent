@@ -400,7 +400,7 @@ runs the real publish path offline against a stub release host.
 4. In the export, run `./script/release_github.sh --preflight`.
 5. Run `./script/release_github.sh`; it performs build, signing, notarization,
    appcast signing, draft upload/readback, publication, and public URL proof.
-6. Test the exact promoted DMG on a fresh supported arm64 macOS 14+ VM.
+6. Test the exact promoted DMG on a fresh supported arm64 macOS 26+ VM.
 
 Users with NativeAgent installed will see an update prompt automatically on next check.
 

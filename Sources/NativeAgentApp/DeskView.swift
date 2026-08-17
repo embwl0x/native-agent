@@ -833,7 +833,7 @@ struct DeskView: View {
                         .font(.caption2)
                         .lineLimit(1)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.naFeel)
                 .foregroundStyle(action.opensExternally ? Color.accentColor : Color.secondary)
                 .help(action.opensExternally ? "Open" : "Copy")
             }
@@ -853,7 +853,7 @@ struct DeskView: View {
                 Text(notice.text).font(.caption).lineLimit(3)
                 Spacer(minLength: 0)
                 Button { actionNotice = nil } label: { Image(systemName: "xmark") }
-                    .buttonStyle(.plain).foregroundStyle(.tertiary)
+                    .buttonStyle(.naFeel).foregroundStyle(.tertiary)
             }
             .padding(10)
             .background(
@@ -1011,7 +1011,7 @@ struct DeskView: View {
                                  ? AnyShapeStyle(Color.orange)
                                  : AnyShapeStyle(nagConfig.enabled ? Color.accentColor : Color.secondary))
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.naFeel)
         .help("Nagging — what pings you, and when")
         .popover(isPresented: $showingNagsPanel, arrowEdge: .bottom) {
             DeskNagsPanel(
@@ -1107,7 +1107,7 @@ struct DeskView: View {
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.orange)
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(.naFeel)
                     .padding(.top, 2)
                 }
             }
@@ -1272,6 +1272,7 @@ struct DeskView: View {
             .padding(.vertical, 6).padding(.horizontal, 10)
             .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 8))
             .contentShape(Rectangle())
+            .naInteractive(radius: 8)
             .onTapGesture { toggle(toggleKey, expanded: expanded) }
             if expanded {
                 ForEach(waiting, id: \.itemId) { ghItemRow($0) }
@@ -1522,6 +1523,7 @@ struct DeskView: View {
                                   lineWidth: selectedHandle == item.handle ? 2 : 1)
             )
             .contentShape(Rectangle())
+            .naInteractive(radius: 10)
             .onTapGesture { toggleSelection(item.handle) }
             .id(item.handle)
         }
@@ -1591,6 +1593,7 @@ struct DeskView: View {
         .padding(.vertical, 8).padding(.horizontal, 10)
         .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
         .contentShape(Rectangle())
+        .naInteractive(radius: 8)
         .onTapGesture { toggle(toggleKey, expanded: expanded) }
         if expanded {
             ForEach(group.items, id: \.handle) { child in
@@ -1628,7 +1631,7 @@ struct DeskView: View {
                         .font(.caption.weight(.medium))
                         .foregroundStyle(.secondary)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.naFeel)
                 .padding(.leading, 4)
             }
         }
@@ -1724,6 +1727,7 @@ struct DeskView: View {
         }
         .padding(.vertical, 8).padding(.horizontal, 10)
         .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+        .naInteractive(radius: 8)
     }
 
     // MARK: one item row (indented by nesting depth)
@@ -1785,6 +1789,7 @@ struct DeskView: View {
         .background(depth == 0 ? Color.primary.opacity(0.04) : Color.clear,
                     in: RoundedRectangle(cornerRadius: 8))
         .selectionHighlight(selectedHandle == item.handle)
+        .naInteractive(radius: 8)
         .padding(.leading, CGFloat(depth) * 18)
         // Anchor for `proxy.scrollTo` — arrows, palette matches and blocker
         // pills all land through the same id.
@@ -1848,7 +1853,7 @@ struct DeskView: View {
                             .lineLimit(1).truncationMode(.tail)
                             .capsuleTag(.orange)
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(.naFeel)
                     .help("Go to the item this is waiting on")
                 }
                 // Rare, and worse than an ordinary block: nothing here can ever

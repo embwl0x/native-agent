@@ -17,7 +17,7 @@ runtime. The mobile app is a secure companion, not a second agent.
 
 ## First setup
 
-1. Install and open NativeAgent on an Apple-silicon Mac running macOS 14 or
+1. Install and open NativeAgent on an Apple-silicon Mac running macOS 26 or
    newer, then complete onboarding.
 2. Open **Providers**, connect at least one provider, and choose the provider,
    model, Think level, and Fast preference for ordinary chat. Provider choices

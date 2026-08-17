@@ -234,6 +234,7 @@ struct SessionRow: View {
     var onRenameEnd: ((String?) -> Void)? = nil
 
     @State private var hovering = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @State private var draftTitle = ""
     @FocusState private var titleFocused: Bool
@@ -298,10 +299,21 @@ struct SessionRow: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
         .background {
+            // Liquid Feel W1: the row answers the cursor — hover fill on
+            // unselected rows, spring-animated (reduce-motion aware).
             RoundedRectangle(cornerRadius: 8)
-                .fill(selected ? AnyShapeStyle(Color.accentColor.opacity(0.16)) : AnyShapeStyle(Color.clear))
+                .fill(selected
+                    ? AnyShapeStyle(Color.accentColor.opacity(0.16))
+                    : AnyShapeStyle(Color.primary.opacity(hovering ? 0.07 : 0)))
         }
+        .animation(
+            NativeAgentMotion.respecting(NativeAgentMotion.snappy, reduceMotion: reduceMotion),
+            value: hovering
+        )
         .onHover { hovering = $0 }
+        // LazyVStack recycles rows by identity — clear hover on disappear so a
+        // recycled row can't reappear pre-lit with the rename pencil showing.
+        .onDisappear { hovering = false }
     }
 
     @ViewBuilder

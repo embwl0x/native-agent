@@ -82,7 +82,7 @@ struct DeskCommandPaletteView: View {
                 Button { text = "" } label: {
                     Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.naFeel)
                 .help("Clear")
             }
         }
@@ -173,6 +173,7 @@ struct DeskCommandPaletteView: View {
             }
         }
         .padding(.vertical, 3)
+        .naInteractive(radius: 8)
         .listRowBackground(
             isHighlighted ? Color.accentColor.opacity(0.16) : Color.clear
         )

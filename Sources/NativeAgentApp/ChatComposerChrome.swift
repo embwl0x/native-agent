@@ -69,7 +69,7 @@ struct ChatEmptyState: View {
                             .font(NativeAgentFont.label)
                             .padding(.horizontal, NativeAgentSpacing.md)
                             .padding(.vertical, NativeAgentSpacing.sm)
-                            .background(.ultraThinMaterial, in: Capsule())
+                            .glassEffect(.regular.interactive(), in: Capsule())  // Liquid Feel W2
                             .overlay(Capsule().strokeBorder(NativeAgentBrand.accent.opacity(0.25), lineWidth: 0.8))
                     }
                     .buttonStyle(.borderless)
@@ -305,7 +305,7 @@ struct NextGenChip: View {
             }
             .padding(.horizontal, NativeAgentSpacing.sm)
             .padding(.vertical, NativeAgentSpacing.xs)
-            .background(.ultraThinMaterial, in: Capsule())
+            .glassEffect(.regular.interactive(), in: Capsule())  // Liquid Feel W2
             .overlay(
                 Capsule()
                     .strokeBorder(

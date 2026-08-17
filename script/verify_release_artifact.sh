@@ -436,7 +436,7 @@ require_plist_value "$INFO" "CFBundleExecutable" "$PRODUCT"
 require_plist_value "$INFO" "CFBundleShortVersionString" "$VERSION"
 require_plist_value "$INFO" "CFBundleVersion" "$VERSION"
 require_plist_value "$INFO" "CFBundlePackageType" "APPL"
-require_plist_value "$INFO" "LSMinimumSystemVersion" "14.0"
+require_plist_value "$INFO" "LSMinimumSystemVersion" "26.0"
 require_plist_value "$INFO" "UTExportedTypeDeclarations:0:UTTypeIdentifier" "com.nativeagent.chat-session"
 
 SPARKLE_KEY="$(plist_value "$INFO" "SUPublicEDKey")"

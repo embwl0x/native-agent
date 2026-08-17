@@ -875,7 +875,7 @@ cat > "$BUNDLE/Contents/Info.plist" <<PLIST
     </dict>
   </array>
   <key>LSMinimumSystemVersion</key>
-  <string>14.0</string>
+  <string>26.0</string>
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSPrincipalClass</key>

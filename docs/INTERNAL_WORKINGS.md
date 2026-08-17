@@ -104,6 +104,16 @@ One immutable Fluid Context generation is leased for the complete provider and
 tool loop. A source update in the middle of the turn cannot splice two context
 generations together. A later turn receives the newer generation.
 
+The resulting provider request is also arranged for economical prefix reuse:
+stable persona, pins, and the current lazy-tool contract come before changing
+memory, history, inner state, and the current request. Long tool loops reuse
+one prepared turn context, pin the advertised text-compatible tool set and
+turn clock, and append results instead of rebuilding earlier bytes. Supported
+providers can therefore charge reusable input at their cached-token rate while
+the current turn remains fresh. The exact prompt-cache/KV-cache distinction,
+provider behavior, cache-break protections, and measured proof are documented
+in [How prompt caching reduces token cost](ANATOMY_OF_A_TURN.md#how-prompt-caching-reduces-token-cost).
+
 The optional subconscious capsule is compiled locally in Swift from the same
 frozen turn epoch. It can carry a bounded felt fingerprint, relevant inner
 view, continuity cue, organism body signal, or restrained voice echo. It does

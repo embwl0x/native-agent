@@ -275,6 +275,108 @@ runtime selects from resident structures and sends the resulting packet to the
 configured external or account-backed provider. The user's provider terms and
 data-processing rules still apply.
 
+### How prompt caching reduces token cost
+
+NativeAgent saves model input cost in two complementary ways:
+
+1. **Send fewer tokens.** Fluid Context selects a compact relevant packet;
+   conversation history and tool results are bounded; inactive tools and full
+   skill bodies stay lazy; and long sessions are compacted before their entire
+   history becomes a permanent input cost.
+2. **Pay the provider's cached-input rate for reusable tokens.** NativeAgent
+   deliberately keeps the reusable beginning of the request byte-for-byte
+   stable so a supported provider can reuse its previously processed prefix.
+
+Conceptually, the request is arranged like this:
+
+```text
+[tool definitions + stable identity/persona + REM pins + lazy-tool contract]
+                              cache boundary
+[selected Fluid Context + memory + history + capsule + current request + new tool results]
+```
+
+The first region changes rarely. The second region is supposed to change: it
+contains what is relevant now. Keeping that volatile material after the stable
+prefix means fresh memory and inner context do not unnecessarily invalidate
+the reusable identity and capability mass.
+
+#### Prompt cache and KV cache
+
+The model provider owns the actual inference cache, commonly implemented with
+reusable prefix/KV state. NativeAgent does not store Anthropic's or OpenAI's KV
+tensors and does not describe a local RAM index as a model KV cache. Instead,
+it constructs requests that let the provider's prompt/prefix cache reuse that
+internal work.
+
+- **Anthropic:** NativeAgent places explicit ephemeral `cache_control`
+  breakpoints after reusable tool definitions, identity/system material, and
+  eligible conversation boundaries. Anthropic reports cache-creation and
+  cache-read input tokens separately.
+- **OpenAI Responses:** NativeAgent supplies a stable, exact per-session
+  `prompt_cache_key`; OpenAI performs prefix caching and reports
+  `cached_tokens` when reuse occurs.
+- **Other providers:** NativeAgent preserves the same stable-first request
+  shape, but cache availability, retention, pricing, and telemetry remain a
+  capability of the selected provider.
+
+A prompt-cache hit does not make the agent stale. Only the unchanged prefix is
+reused. The selected Fluid Context, recalled memory, conversation tail,
+subconscious capsule, current message, and new tool results remain current.
+Prompt caching also does not shrink the model's context window by itself; the
+bounded selection, lazy loading, history policy, and compaction do that.
+
+#### How NativeAgent avoids breaking the cache
+
+Provider prefix caches match exact request content and order. A harmless-looking
+timestamp, reordered schema, or changing sentence near the front can turn the
+rest of the request into full-price uncached input. NativeAgent protects the
+prefix at several boundaries:
+
+1. **One canonical stable/dynamic split.** Persona, natural-expression
+   guidance, REM-approved pins, and the current lazy-tool contract precede
+   per-turn recall and history. A session digest that once changed the stable
+   block across sessions now lives at the head of the dynamic block.
+2. **Byte-faithful provider encoding.** The split is a cache-layout hint, not
+   a prompt rewrite. Before using separate blocks, an adapter verifies that
+   they reassemble into the exact combined prompt. A mismatch falls back to
+   the original combined request rather than changing model-visible content.
+3. **One immutable Fluid Context generation per turn.** The selected generation
+   is leased through the complete model/tool loop. Mid-turn source changes
+   compile for a later turn instead of splicing new bytes into this one.
+4. **One context build across a text-compatible tool loop.** Later tool rounds
+   reuse the first round's prepared `TurnContext`; tool results append through
+   the conversation rather than causing persona, memory, capsule, and Fluid
+   Context to be rebuilt and reshuffled.
+5. **A pinned advertised tool set.** In the text-compatible lane, loading a
+   tool does not silently grow the cacheable tool catalog halfway through the
+   turn. The `tool_load` result carries the newly loaded schemas for immediate
+   use, while the dispatcher still rereads canonical readiness at effect time.
+   A provider-native lane may intentionally refresh its tools array when that
+   array is the model's only valid tool-call channel.
+6. **A frozen turn clock.** Time remains accurate for the turn, but crossing a
+   minute boundary during a long tool loop cannot rewrite an earlier dynamic
+   block and invalidate the accumulated prefix.
+7. **Append-only tool conversation.** Each assistant tool request and bounded
+   tool result is appended. Supported Anthropic requests mark the current and,
+   when useful, previous request boundaries so the next round can read the
+   established prefix and create only the new delta.
+8. **No speculative cache writes for one-shot work.** The Anthropic API-key
+   adapter omits its combined-system cache breakpoint for an unbound one-shot
+   call when a later read is unlikely, preventing a write premium with no
+   expected payoff.
+
+These protections matter most on multi-step work. During implementation, one
+21-round tool turn repeatedly rebuilt changing context and produced **369,217
+cache-creation tokens**. After the tool catalog, clock, and complete turn
+context were stabilized, a five-round acceptance turn built context once and
+reported cache reads increasing from **0 → 13,650 → 15,023 → 15,805 → 17,049**
+tokens, while later rounds created only their small appended deltas.
+
+NativeAgent records `cacheReadInputTokens`,
+`cacheCreationInputTokens`, input/output tokens, time to first token, and a
+SHA-256 prompt fingerprint in its turn telemetry. This lets a cache hit or
+regression be measured rather than inferred from similar-looking prompts.
+
 ## 5. The model answers or requests a tool
 
 If the model can answer from the supplied context, the turn may require only

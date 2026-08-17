@@ -878,7 +878,7 @@ private struct TrustPresetButton: View {
             .padding(NativeAgentSpacing.md)
             .background(tint.opacity(0.08), in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous))
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.naFeel)
     }
 }
 

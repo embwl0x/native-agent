@@ -59,7 +59,7 @@ struct SkillLifecycleView: View {
                 } label: {
                     Label("Refresh", systemImage: "arrow.clockwise")
                 }
-                .buttonStyle(.borderless)
+                .buttonStyle(.naFeel)
             }
             .padding(.horizontal, NativeAgentSpacing.xl)
             .padding(.top, NativeAgentSpacing.lg)
@@ -91,7 +91,7 @@ struct SkillLifecycleView: View {
                         .foregroundStyle(.secondary)
                     Spacer()
                     Button("Dismiss") { appModel.skillManifestError = nil }
-                        .buttonStyle(.borderless)
+                        .buttonStyle(.naFeel)
                 }
                 .padding(.horizontal, NativeAgentSpacing.xl)
                 .padding(.vertical, NativeAgentSpacing.sm)
@@ -254,6 +254,7 @@ private struct SkillRow: View {
         .padding(.vertical, 10).padding(.horizontal, 12)
         .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
         .contentShape(Rectangle())
+        .naInteractive(radius: 8)
         .onTapGesture { onRead() }
     }
 }
@@ -580,7 +581,7 @@ private struct BoundedSkillText: View {
                 Button(expanded ? "Collapse preview" : "Show full preview") {
                     expanded.toggle()
                 }
-                .buttonStyle(.borderless)
+                .buttonStyle(.naFeel)
                 Text("\(text.count - visibleText.count) characters hidden to keep the review sheet responsive.")
                     .font(.caption)
                     .foregroundStyle(.tertiary)

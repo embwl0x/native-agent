@@ -6,7 +6,9 @@ import PackageDescription
 let package = Package(
     name: "NativeAgent",
     platforms: [
-        .macOS(.v14)
+        // USER 2026-08-16: Liquid Glass floor — "no one is using mac os 14".
+        // Public DMG minimum rises with this; deliberate.
+        .macOS("26.0")
     ],
     products: [
         .executable(name: "NativeAgentApp", targets: ["NativeAgentApp"])

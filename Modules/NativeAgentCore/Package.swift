@@ -227,7 +227,7 @@ let subsystemTargets: [Target] = subsystems.flatMap { name -> [Target] in
 
 let package = Package(
     name: "NativeAgentCore",
-    platforms: [.macOS(.v14)],
+    platforms: [.macOS("26.0")],  // USER 2026-08-16: Liquid Glass floor
     products: products,
     dependencies: [
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "7.0.0"),

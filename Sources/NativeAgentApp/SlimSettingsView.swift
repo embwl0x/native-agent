@@ -171,7 +171,7 @@ struct SlimSettingsView: View {
                         }
                         .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(.naFeel)
                 } footer: {
                     Text("Semantic memory embeddings and the Subconscious background loops. Most people never need to change these.")
                         .font(.caption2).foregroundStyle(.secondary)
@@ -729,7 +729,7 @@ private struct EmbeddingsSettingsSection: View {
                     } label: {
                         Label("Retry Memory Status", systemImage: "arrow.clockwise")
                     }
-                    .buttonStyle(.borderless)
+                    .buttonStyle(.naFeel)
                     .font(.caption)
                     .disabled(loading)
                 }
@@ -978,7 +978,7 @@ private struct EmbeddingsSettingsSection: View {
                     } label: {
                         Label("Release now", systemImage: "xmark.circle")
                     }
-                    .buttonStyle(.borderless)
+                    .buttonStyle(.naFeel)
                     .font(.caption)
                     .disabled(releasingMemory)
                 }

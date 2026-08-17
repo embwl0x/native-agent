@@ -193,7 +193,7 @@ write_bundle_plist() { # $1 = XML for NativeAgentUpdateFeedPublished
   <key>CFBundleShortVersionString</key><string>$REPO_VERSION</string>
   <key>CFBundleVersion</key><string>$REPO_VERSION</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>LSMinimumSystemVersion</key><string>14.0</string>
+  <key>LSMinimumSystemVersion</key><string>26.0</string>
   <key>UTExportedTypeDeclarations</key><array><dict><key>UTTypeIdentifier</key><string>com.nativeagent.chat-session</string></dict></array>
   <key>SUFeedURL</key><string>https://updates.nativeagent.dev/appcast.xml</string>
   <key>NativeAgentUpdateFeedPublished</key>$1

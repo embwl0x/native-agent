@@ -171,3 +171,61 @@ struct ArticleFoldDedupTests {
         #expect(first.id != second.id)
     }
 }
+
+// 2026-08-16 live escape: "user's whole thing is I was just trying to think of
+// some other" reached User's approval card. Two independent holes, both pinned.
+@Suite("Proposal hygiene — parrot-clause and determiner-tail escape")
+struct ParrotClauseEscapeTests {
+    @Test func liveEscapeStringRejectsAtTheQualityGate() {
+        let reason = MemoryCandidateQuality.rejectionReason(
+            text: "user's whole thing is I was just trying to think of some other",
+            source: "adaptive-promoter:session"
+        )
+        #expect(reason != nil, "determiner tail 'other' must reject for ANY source")
+    }
+
+    @Test func determinerTailsRejectForAutomaticSourcesOnly() {
+        // Automatic extraction: a determiner tail is always a truncation.
+        for tail in ["some other", "several", "more"] {
+            let reason = MemoryCandidateQuality.rejectionReason(
+                text: "user prefers \(tail)",
+                source: "adaptive-promoter:session"
+            )
+            #expect(reason != nil, "automatic '\(tail)' tail must reject")
+        }
+        // Deliberate lane (chat.commit_memory — her GOOD lane, User 2026-08-17):
+        // these are legit sentence endings and must survive.
+        for content in [
+            "User prefers Signal over any other",
+            "User tracks upstream forks himself, among several",
+            "User wants updates weekly, not more",
+        ] {
+            let reason = MemoryCandidateQuality.rejectionReason(
+                text: content,
+                source: "chat.commit_memory"
+            )
+            #expect(reason == nil, "deliberate save '\(content)' must pass, got \(reason ?? "nil")")
+        }
+    }
+
+    @Test func extractorNeverParrotsFirstPersonClauseAsAttribute() async {
+        let extractor = RuleBasedFactExtractor()
+        let candidates = await extractor.extract(
+            userMessage: "my whole thing is I was just trying to think of some other names for it",
+            assistantMessage: ""
+        )
+        #expect(
+            candidates.isEmpty,
+            "discourse-noun attr + first-person clause value must produce zero candidates, got \(candidates.map(\.content))"
+        )
+    }
+
+    @Test func legitPossessiveAttributesStillExtract() async {
+        let extractor = RuleBasedFactExtractor()
+        let candidates = await extractor.extract(
+            userMessage: "my favorite color is forest green",
+            assistantMessage: ""
+        )
+        #expect(candidates.contains { $0.content == "user's favorite color is forest green" })
+    }
+}

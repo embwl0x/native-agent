@@ -131,7 +131,7 @@ existing authority.
 ## Requirements
 
 - Apple-silicon Mac
-- macOS 14 or newer
+- macOS 26 (Tahoe) or newer
 - Xcode or the matching Swift 6 command-line toolchain
 - Git
 - An AI provider account; ChatGPT OAuth can use an existing subscription

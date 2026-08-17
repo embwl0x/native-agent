@@ -80,6 +80,18 @@ public struct RuleBasedFactExtractor: AdaptiveFactExtractor {
             let a = attr.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             // Skip overly generic / pronouncey openers.
             if ["name"].contains(a) { continue }
+            // 2026-08-16 (live escape: "my whole thing is I was just trying to
+            // think of some other…" → staged as an "attribute"): an attribute
+            // VALUE must be a noun phrase, not quoted first-person speech. A
+            // value opening with a pronoun+clause is the user narrating, and
+            // the capture cap then chops it mid-thought — parrot, not fact.
+            let valueLower = value.lowercased()
+            if valueLower.range(of: #"^(?:i|we|you|they|he|she|it)\b"#, options: .regularExpression) != nil {
+                continue
+            }
+            // Discourse nouns ("my whole thing/point/deal is…") frame speech;
+            // they are never stable user attributes.
+            if a.hasSuffix("thing") || ["point", "deal", "take", "vibe"].contains(a) { continue }
             if a.hasPrefix("favorite") || a.hasPrefix("favourite") {
                 emit("user's \(a) is \(value)", score: 0.80, kind: "preference")
             } else {

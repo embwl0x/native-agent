@@ -225,6 +225,9 @@ struct InlineStatusDot: View {
 /// Neutral material card with an optional semantic or identity edge.
 struct GlassCard<Content: View>: View {
     var tint: Color? = nil
+    /// Rows inside scrolling Lists render material instead of live glass —
+    /// per-row glassEffect is a scroll-perf hazard (gpt-5.5 MED, InboxView).
+    var scrollRow: Bool = false
     @ViewBuilder var content: () -> Content
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorSchemeContrast) private var colorSchemeContrast
@@ -235,24 +238,40 @@ struct GlassCard<Content: View>: View {
             ? (colorSchemeContrast == .increased ? 0.72 : 0.34)
             : (colorSchemeContrast == .increased ? 0.28 : 0.10)
 
-        content()
-            .padding(NativeAgentLayout.cardPadding)
-            .background {
-                if reduceTransparency {
+        // Liquid Feel W2 (2026-08-16): GlassCard renders REAL Liquid Glass on
+        // the macOS 26 floor — every card in the app upgrades through this one
+        // seam. Reduce-transparency keeps the opaque fallback.
+        if reduceTransparency || scrollRow {
+            content()
+                .padding(NativeAgentLayout.cardPadding)
+                .background {
                     RoundedRectangle(cornerRadius: NativeAgentRadius.card, style: .continuous)
-                        .fill(Color(nsColor: .controlBackgroundColor))
-                } else {
-                    RoundedRectangle(cornerRadius: NativeAgentRadius.card, style: .continuous)
-                        .fill(.thinMaterial)
+                        .fill(reduceTransparency
+                            ? AnyShapeStyle(Color(nsColor: .controlBackgroundColor))
+                            : AnyShapeStyle(.thinMaterial))
                 }
-            }
-            .overlay {
-                RoundedRectangle(cornerRadius: NativeAgentRadius.card, style: .continuous)
-                    .strokeBorder(
-                        edgeColor.opacity(edgeOpacity),
-                        lineWidth: colorSchemeContrast == .increased ? 1 : 0.75
-                    )
-            }
+                .overlay {
+                    RoundedRectangle(cornerRadius: NativeAgentRadius.card, style: .continuous)
+                        .strokeBorder(
+                            edgeColor.opacity(edgeOpacity),
+                            lineWidth: colorSchemeContrast == .increased ? 1 : 0.75
+                        )
+                }
+        } else {
+            content()
+                .padding(NativeAgentLayout.cardPadding)
+                .glassEffect(
+                    tint.map { Glass.regular.tint($0.opacity(0.12)) } ?? .regular,
+                    in: RoundedRectangle(cornerRadius: NativeAgentRadius.card, style: .continuous)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: NativeAgentRadius.card, style: .continuous)
+                        .strokeBorder(
+                            edgeColor.opacity(edgeOpacity * 0.6),
+                            lineWidth: colorSchemeContrast == .increased ? 1 : 0.75
+                        )
+                }
+        }
     }
 }
 
