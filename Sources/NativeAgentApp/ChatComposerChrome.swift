@@ -81,106 +81,146 @@ struct ChatEmptyState: View {
     }
 }
 
-// PATCH-2026-05-09: chat-ux-polish — Thinking indicator shown in composer area while waiting
-struct ChatThinkingRow: View {
-    var personaName: String
-    var onStop: () -> Void
+/// One compact, shared composer action hierarchy for main and detached chat.
+/// Voice, screen capture, and attachments remain first-class actions (and keep
+/// their command-menu shortcuts), but no longer occupy three permanent buttons
+/// beside every draft. Stop and Send stay immediately visible because they are
+/// the live-turn controls whose timing matters.
+struct MacChatComposerControlStrip<InputContent: View>: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    let isListening: Bool
+    let screenCaptureAllowed: Bool
+    let screenCaptureDisabled: Bool
+    let pendingAttachmentCount: Int
+    let isRunning: Bool
+    let canSend: Bool
+    let onToggleVoice: () -> Void
+    let onCaptureScreen: () -> Void
+    let onAttach: () -> Void
+    let onStop: () -> Void
+    let onSend: () -> Void
+    let inputContent: InputContent
+
+    init(
+        isListening: Bool,
+        screenCaptureAllowed: Bool,
+        screenCaptureDisabled: Bool,
+        pendingAttachmentCount: Int,
+        isRunning: Bool,
+        canSend: Bool,
+        onToggleVoice: @escaping () -> Void,
+        onCaptureScreen: @escaping () -> Void,
+        onAttach: @escaping () -> Void,
+        onStop: @escaping () -> Void,
+        onSend: @escaping () -> Void,
+        @ViewBuilder inputContent: () -> InputContent
+    ) {
+        self.isListening = isListening
+        self.screenCaptureAllowed = screenCaptureAllowed
+        self.screenCaptureDisabled = screenCaptureDisabled
+        self.pendingAttachmentCount = pendingAttachmentCount
+        self.isRunning = isRunning
+        self.canSend = canSend
+        self.onToggleVoice = onToggleVoice
+        self.onCaptureScreen = onCaptureScreen
+        self.onAttach = onAttach
+        self.onStop = onStop
+        self.onSend = onSend
+        self.inputContent = inputContent()
+    }
+
+    private var optionsAccessibilityLabel: String {
+        var parts = ["Message options"]
+        if isListening { parts.append("voice input active") }
+        if pendingAttachmentCount > 0 {
+            parts.append("\(pendingAttachmentCount) attachment\(pendingAttachmentCount == 1 ? "" : "s")")
+        }
+        return parts.joined(separator: ", ")
+    }
 
     var body: some View {
-        GlassCard(tint: NativeAgentBrand.accent) {
-            HStack(spacing: NativeAgentSpacing.sm) {
-                PulsingDot(color: NativeAgentBrand.accent, size: 7, animates: true)
-                Text("\(personaName) is thinking\u{2026}")
-                    .font(NativeAgentFont.label)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button {
-                    onStop()
+        GlassCard(tint: NativeAgentBrand.accent.opacity(0.2)) {
+            HStack(alignment: .bottom, spacing: NativeAgentSpacing.sm) {
+                Menu {
+                    Button(action: onToggleVoice) {
+                        Label(
+                            isListening ? "Stop Listening" : "Voice Input",
+                            systemImage: isListening ? "mic.fill" : "mic"
+                        )
+                    }
+
+                    Button(action: onCaptureScreen) {
+                        Label(
+                            screenCaptureAllowed ? "Show Agent My Screen" : "Enable Screen Capture in Trust",
+                            systemImage: "camera.viewfinder"
+                        )
+                    }
+                    .disabled(screenCaptureDisabled)
+
+                    Button(action: onAttach) {
+                        Label("Attach Image or File…", systemImage: "paperclip")
+                    }
                 } label: {
-                    Label("Cancel", systemImage: "xmark.circle.fill")
-                        .font(NativeAgentFont.tag)
-                        .foregroundStyle(.secondary)
+                    ZStack(alignment: .topTrailing) {
+                        Image(systemName: isListening ? "mic.fill" : "plus.circle")
+                            .foregroundStyle(isListening ? Color.red : Color.primary)
+                            .frame(width: 30, height: 30)
+                            .contentShape(Rectangle())
+
+                        if pendingAttachmentCount > 0 {
+                            Text("\(pendingAttachmentCount)")
+                                .font(NativeAgentFont.tag)
+                                .foregroundStyle(.white)
+                                .padding(3)
+                                .background(NativeAgentBrand.accent, in: Circle())
+                                .offset(x: 6, y: -6)
+                        }
+                    }
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("Voice, screen capture, and attachments")
+                .accessibilityLabel(optionsAccessibilityLabel)
+
+                inputContent
+
+                if isRunning {
+                    Button(action: onStop) {
+                        Image(systemName: "stop.fill")
+                            .font(.system(size: 13, weight: .semibold))
+                            .frame(width: 34, height: 34)
+                            .background(
+                                Color.red.opacity(0.85),
+                                in: RoundedRectangle(cornerRadius: NativeAgentRadius.control)
+                            )
+                            .foregroundStyle(.white)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Stop generation")
+                    .accessibilityLabel("Stop generation")
+                }
+
+                Button(action: onSend) {
+                    Image(systemName: "paperplane.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                        .frame(width: 34, height: 34)
+                        .background(
+                            canSend ? NativeAgentBrand.accentDeep : Color.secondary.opacity(0.18),
+                            in: RoundedRectangle(cornerRadius: NativeAgentRadius.control)
+                        )
+                        .foregroundStyle(canSend ? .white : .secondary)
                 }
                 .buttonStyle(.borderless)
-                .help("Cancel generation")
+                .disabled(!canSend)
+                .animation(
+                    NativeAgentMotion.respecting(NativeAgentMotion.snappy, reduceMotion: reduceMotion),
+                    value: canSend
+                )
+                .help(isRunning ? "Queue message to send next" : "Send message")
+                .accessibilityLabel(isRunning ? "Queue message to send next" : "Send message")
             }
         }
-    }
-}
-
-// PATCH-2026-05-09: chat-ux-polish — Compact meta row above composer: persona / model / reasoning
-struct ComposerMetaRow: View {
-    var appModel: AppModel
-
-    var body: some View {
-        HStack(spacing: NativeAgentSpacing.sm) {
-            Image(systemName: "person.crop.circle")
-                .font(NativeAgentFont.tag)
-                .foregroundStyle(.tertiary)
-            Text(appModel.agentDisplayName)
-                .font(NativeAgentFont.tag)
-                .foregroundStyle(.secondary)
-
-            Text("\u{2022}")
-                .font(NativeAgentFont.tag)
-                .foregroundStyle(.quaternary)
-
-            Image(systemName: "cpu")
-                .font(NativeAgentFont.tag)
-                .foregroundStyle(.tertiary)
-            Text(modelDisplayName(appModel.chatModel))
-                .font(NativeAgentFont.tag)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-
-            if !appModel.chatReasoningEffort.isEmpty {
-                Text("\u{2022}")
-                    .font(NativeAgentFont.tag)
-                    .foregroundStyle(.quaternary)
-                Text(effortDisplayName(appModel.chatReasoningEffort))
-                    .font(NativeAgentFont.tag)
-                    .foregroundStyle(.secondary)
-            }
-
-            Spacer()
-        }
-    }
-
-    /// Prefer the provider catalog's display name ("Claude Fable 5") over
-    /// the raw id; fall back to prefix-trimming for models the catalog
-    /// doesn't know.
-    private func modelDisplayName(_ id: String) -> String {
-        for provider in appModel.providersList {
-            if let model = provider.models.first(where: { $0.id == id }) {
-                let name = model.name.trimmingCharacters(in: .whitespaces)
-                if !name.isEmpty { return name }
-            }
-        }
-        return shortModelName(id)
-    }
-
-    /// "xhigh" → "XHigh" (matches the Brain bar's tier labels); other tiers
-    /// plain-capitalize.
-    private func effortDisplayName(_ raw: String) -> String {
-        raw.lowercased() == "xhigh" ? "XHigh" : raw.capitalized
-    }
-
-    private func shortModelName(_ model: String) -> String {
-        // Trim common long prefixes for display compactness
-        let replacements: [(String, String)] = [
-            ("gpt-", "GPT-"),
-            ("claude-", "Claude "),
-            ("openai/", ""),
-            ("anthropic/", ""),
-        ]
-        var result = model
-        for (prefix, replacement) in replacements {
-            if result.hasPrefix(prefix) {
-                result = replacement + result.dropFirst(prefix.count)
-                break
-            }
-        }
-        return result
     }
 }
 

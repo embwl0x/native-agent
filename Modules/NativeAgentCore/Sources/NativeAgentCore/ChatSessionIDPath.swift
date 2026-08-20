@@ -18,6 +18,11 @@ public enum NativeAgentChatSessionID {
         if value == "." || value == ".." || value.hasPrefix(".") { return false }
         if value.contains("/") || value.contains("\\") || value.contains("\0") { return false }
         if value.contains("..") { return false }
+        if value.unicodeScalars.contains(where: {
+            CharacterSet.controlCharacters.contains($0)
+        }) {
+            return false
+        }
         return true
     }
 }

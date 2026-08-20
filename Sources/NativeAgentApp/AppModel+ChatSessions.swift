@@ -683,10 +683,18 @@ extension AppModel {
             if chatSessionIndexRefreshFailed {
                 chatSessionIndexRefreshFailed = false
             }
+            let knownSessionIds = Set(refreshed.map(\.id))
+            if !chatTurnLifecycleRepairCompleted {
+                await repairChatTurnLifecyclesIfNeeded(
+                    knownSessionIds: knownSessionIds
+                ) { identity in
+                    await self.readCanonicalChatTurnTerminalProof(identity: identity)
+                }
+            }
             guard refreshed != chatSessions else { return }
             chatSessions = refreshed
             pruneChatDrafts()
-            pruneStaleSessionChatState(knownSessionIds: Set(refreshed.map(\.id)))
+            pruneStaleSessionChatState(knownSessionIds: knownSessionIds)
         } catch {
             if !chatSessionIndexRefreshFailed {
                 chatSessionIndexRefreshFailed = true
@@ -730,15 +738,29 @@ extension AppModel {
                 UserDefaults.standard.set(activeChatSessionId, forKey: "activeChatSessionId")
             }
             migrateEmptySessionChatState(to: activeChatSessionId)
+            let knownSessionIds = Set(chatSessions.map(\.id))
+            await repairChatTurnLifecyclesIfNeeded(
+                knownSessionIds: knownSessionIds
+            ) { identity in
+                await self.readCanonicalChatTurnTerminalProof(identity: identity)
+            }
             pruneChatDrafts()
             // 2026-07-21 audit fix: prune per-session message/receipt caches
             // for sessions the list no longer reports — mirrors the stale-draft
             // prune above, same low-frequency hook.
-            pruneStaleSessionChatState(knownSessionIds: Set(chatSessions.map(\.id)))
+            pruneStaleSessionChatState(knownSessionIds: knownSessionIds)
             let targetSessionId = activeChatSessionId
             let messages = try await api.getChatMessages(sessionId: targetSessionId)
             let receipt = try? await api.getLatestContextReceipt(sessionId: targetSessionId)
             guard activeChatSessionId == targetSessionId else { return }
+            guard !streamingSessions.contains(targetSessionId),
+                  activeChatTurnLifecycleIDsBySession[targetSessionId] == nil else {
+                // A live turn owns this slot. Disk is necessarily behind its
+                // optimistic bubble/deltas, so a full Chat reload must not
+                // replace the stream's exact message identity mid-turn.
+                chatStateLoadFailed = false
+                return
+            }
             applyLoadedChatMessages(messages, for: targetSessionId)
             latestContextReceipt = receipt
             chatStateLoadFailed = false

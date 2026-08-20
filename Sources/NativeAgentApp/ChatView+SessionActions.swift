@@ -62,11 +62,24 @@ extension ChatView {
         }
     }
 
-    // chat-smoothness phase 4: one visibility truth for the floating thinking
-    // row — the overlay, its animation, and the "Latest" button lift all key
+    // chat-smoothness phase 4: one visibility truth for the floating live-turn
+    // card — the overlay, its animation, and the "Latest" button lift all key
     // off this so they can never disagree.
+    //
+    // Desk 658.11: that truth is now the lifecycle owner's own projection, not
+    // `isBusy`. Session keying already fences other sessions' work, and a turn
+    // that ended without provable terminal evidence (including one repaired at
+    // relaunch) keeps its honest card instead of vanishing with the busy flag.
+    //
+    // Desk 658.12: approvals join that same truth. A turn that ended cleanly
+    // while its approval is still pending (or ended unproven) keeps the card,
+    // because that question has no other home in the transcript.
     var showThinkingRow: Bool {
-        appModel.isBusy && (appModel.currentChatTaskSessionId == nil || appModel.currentChatTaskSessionId == appModel.activeChatSessionId)
+        MacChatTurnCardProjection.isVisible(
+            appModel.chatTurnLifecycle(for: appModel.activeChatSessionId),
+            sessionId: appModel.activeChatSessionId,
+            approvals: appModel.approvals
+        )
     }
 
     func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool, delay: TimeInterval, force: Bool = false) {

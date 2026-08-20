@@ -8,6 +8,9 @@ struct ChatFocusedCommandActions {
     let attach: () -> Void
     let toggleVoice: () -> Void
     let focusComposer: () -> Void
+    let focusTranscriptSearch: () -> Void
+    let findNext: () -> Void
+    let findPrevious: () -> Void
 }
 
 private struct ChatFocusedCommandActionsKey: FocusedValueKey {
@@ -37,6 +40,16 @@ struct ChatFocusedCommands: Commands {
                 .disabled(actions == nil)
             Button("Focus Composer", action: { actions?.focusComposer() })
                 .keyboardShortcut("l", modifiers: .command)
+                .disabled(actions == nil)
+            Divider()
+            Button("Find in Conversation…", action: { actions?.focusTranscriptSearch() })
+                .keyboardShortcut("f", modifiers: .command)
+                .disabled(actions == nil)
+            Button("Find Next", action: { actions?.findNext() })
+                .keyboardShortcut("g", modifiers: .command)
+                .disabled(actions == nil)
+            Button("Find Previous", action: { actions?.findPrevious() })
+                .keyboardShortcut("g", modifiers: [.command, .shift])
                 .disabled(actions == nil)
         }
     }

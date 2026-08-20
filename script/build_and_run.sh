@@ -130,8 +130,16 @@ if [[ "${NATIVE_AGENT_SWIFTPM_DISABLE_SANDBOX:-0}" == "1" ]]; then
 fi
 
 swift build ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} --package-path "$ROOT"
+swift build ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} \
+  --package-path "$ROOT" --product NativeAgentChromeRelay
 
-BIN="$(swift build ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} --package-path "$ROOT" --show-bin-path)/$PRODUCT"
+BIN_DIR="$(swift build ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} --package-path "$ROOT" --show-bin-path)"
+BIN="$BIN_DIR/$PRODUCT"
+CHROME_RELAY_BIN="$BIN_DIR/NativeAgentChromeRelay"
+[[ -x "$CHROME_RELAY_BIN" ]] || {
+  echo "[chrome-relay] ERROR: expected executable missing: $CHROME_RELAY_BIN" >&2
+  exit 1
+}
 # Stage + sign into a TEMP bundle and only swap it into dist/NativeAgent.app
 # after the shared signing owner passes deep verification. Every fallible step (resource staging,
 # provisioning checks, codesign, verification) therefore runs while the
@@ -146,6 +154,8 @@ rm -rf "$BUNDLE"
 trap 'rm -rf "$ROOT/dist/.$APP_NAME.app.staging.$$"' EXIT
 mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
 cp "$BIN" "$BUNDLE/Contents/MacOS/$PRODUCT"
+cp "$CHROME_RELAY_BIN" "$BUNDLE/Contents/MacOS/NativeAgentChromeRelay"
+chmod 0755 "$BUNDLE/Contents/MacOS/NativeAgentChromeRelay"
 if [[ -f "$ROOT/VERSION" ]]; then
   cp "$ROOT/VERSION" "$BUNDLE/Contents/Resources/VERSION"
 fi

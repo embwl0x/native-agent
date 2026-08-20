@@ -284,6 +284,32 @@ import PersistenceCore
     ], combinedStatus: [:]) == "failed")
 }
 
+@Test func githubCheckSummarySeparatesMaintainerReviewGateFromTechnicalFailure() {
+    let maintainerOnly: [String: Any] = [
+        "check_runs": [
+            ["name": "Review label gate", "status": "completed", "conclusion": "failure"],
+            ["name": "All required checks pass", "status": "completed", "conclusion": "failure"],
+            ["name": "Python tests", "status": "completed", "conclusion": "success"],
+        ],
+    ]
+    #expect(GitHubConnectorActions.testCheckSummary(
+        maintainerOnly,
+        combinedStatus: ["state": "pending", "total_count": 0, "statuses": []]
+    ) == "maintainer_blocked")
+
+    let technicalToo: [String: Any] = [
+        "check_runs": [
+            ["name": "Review label gate", "status": "completed", "conclusion": "failure"],
+            ["name": "All required checks pass", "status": "completed", "conclusion": "failure"],
+            ["name": "Python tests", "status": "completed", "conclusion": "failure"],
+        ],
+    ]
+    #expect(GitHubConnectorActions.testCheckSummary(
+        technicalToo,
+        combinedStatus: ["state": "pending", "total_count": 0, "statuses": []]
+    ) == "failed")
+}
+
 @Test func githubCheckSummaryHandlesSuccessfulOrAbsentSignals() {
     #expect(GitHubConnectorActions.testCheckSummary(
         ["check_runs": []],
@@ -441,6 +467,7 @@ import PersistenceCore
     #expect(object["mode"] == .string("contributions"))
     #expect(object["contributorLogin"] == .string("contributor"))
     #expect(object["discoveryQuery"] == nil)
+    #expect(object["refreshIntervalMinutes"] == .int(5))
 }
 
 @Test func githubExplicitRepositoryPersistenceReplacesPriorSet() async throws {
@@ -615,6 +642,7 @@ private func deltaEntity(
     updatedAt: String,
     checks: String,
     stale: Bool,
+    mergeable: String = "clean",
     signals: [String] = [],
     humanDecisionOwner: String? = nil,
     detailFetchedAt: String? = DeskClock.nowISO()
@@ -641,6 +669,7 @@ private func deltaEntity(
         "state": .string(state), "updatedAt": .string(updatedAt),
         "url": .string("https://github.com/owner/repo/pull/\(number)"),
         "reviewState": .string("approved"), "checks": .string(checks),
+        "mergeable": .string(mergeable),
         "needsUser": .bool(false), "blocked": .bool(false), "stale": .bool(stale),
         "detailFetchedAt": detailFetchedAt.map { JSONValue.string($0) } ?? .null,
         "commandObservation": .object(observation),
@@ -688,6 +717,39 @@ private func deltaEntity(
         prior: prior, searchUpdatedAt: "2026-07-15T12:30:00Z", staleHours: 100_000
     )
     #expect(value == .object(["decision": .string("fetch")]))
+}
+
+@Test func githubDeltaReFetchesWhenLiveMergeabilityFindsBaseBranchConflict() {
+    let prior = deltaEntity(
+        state: "open", updatedAt: "2026-07-15T10:00:00Z",
+        checks: "passing", stale: false, mergeable: "clean"
+    )
+    let value = GitHubConnectorActions.testDeltaCarryDecision(
+        prior: prior,
+        searchUpdatedAt: "2026-07-15T10:00:00Z",
+        staleHours: 100_000,
+        liveMergeableState: "dirty"
+    )
+    #expect(value == .object(["decision": .string("fetch")]))
+
+    let indeterminate = GitHubConnectorActions.testDeltaCarryDecision(
+        prior: prior,
+        searchUpdatedAt: "2026-07-15T10:00:00Z",
+        staleHours: 100_000,
+        liveMergeableState: "unknown"
+    )
+    #expect(indeterminate == .object(["decision": .string("fetch")]))
+
+    guard case .object(let clean) = GitHubConnectorActions.testDeltaCarryDecision(
+        prior: prior,
+        searchUpdatedAt: "2026-07-15T10:00:00Z",
+        staleHours: 100_000,
+        liveMergeableState: "clean"
+    ), case .string(let decision)? = clean["decision"] else {
+        Issue.record("expected the unchanged clean PR to remain carryable")
+        return
+    }
+    #expect(decision == "carry")
 }
 
 @Test func githubDeltaFullFetchesWithoutPriorEntity() {
@@ -876,4 +938,102 @@ private func tempRoot() throws -> URL {
     #expect(stat.observations == 1)
     #expect(stat.changes == 0, "the first fingerprint is a baseline, not a change")
     #expect(stat.lastFingerprint?.contains("stale") == false)
+}
+
+/// Cross-review finding (2026-08-17, HIGH): the mergeability probe's FAILURE
+/// path set `mergeability = [:]` and logged "preserving prior", after which the
+/// carry decision saw `liveMergeableState: nil`, skipped the new guard entirely,
+/// and carried the prior `clean` snapshot forward. That reopens the exact
+/// stale-conflict blind spot the probe exists to close — and it reopens it
+/// during rate-limit/network trouble, which the 5-minute cadence plus per-PR
+/// probing makes MORE likely, not less.
+@Test func githubDeltaRefusesCarryWhenMergeabilityEvidenceIsMissing() {
+    let prior = deltaEntity(
+        state: "open", updatedAt: "2026-07-15T10:00:00Z",
+        checks: "passing", stale: false, mergeable: "clean"
+    )
+    // Same row that carries happily with evidence present…
+    let withEvidence = GitHubConnectorActions.testDeltaCarryDecision(
+        prior: prior, searchUpdatedAt: "2026-07-15T10:00:00Z", staleHours: 100_000,
+        liveMergeableState: "clean"
+    )
+    guard case .object(let carried) = withEvidence,
+          case .string("carry")? = carried["decision"] else {
+        Issue.record("evidence-present clean row must still carry")
+        return
+    }
+    // …must FETCH when the probe produced no entry for it.
+    let probeFailed = GitHubConnectorActions.testDeltaCarryDecision(
+        prior: prior, searchUpdatedAt: "2026-07-15T10:00:00Z", staleHours: 100_000,
+        liveMergeableState: nil, mergeabilityEvidenceMissing: true
+    )
+    #expect(probeFailed == .object(["decision": .string("fetch")]),
+            "no evidence is not evidence of clean — force the detail read")
+}
+
+// MARK: - Cross-review follow-ups (2026-08-17)
+
+/// Finding 4: a 403 whose rate-limit budget is still healthy is a SECONDARY
+/// rate limit (a throttle), not exhaustion. Before this, nothing read it as
+/// back-off pressure and the 5-minute sweep kept hammering a closed window.
+@Test func githubSecondaryRateLimitIsClassifiedAndBounded() {
+    // The live desk failure shape: 403, budget healthy, no Retry-After.
+    #expect(GitHubConnectorActions.secondaryRateBackoff(
+        status: 403, message: "You have exceeded a secondary rate limit",
+        retryAfterHeader: nil, rateLimitRemaining: 4977) == 60)
+    // Retry-After is honored verbatim when sane…
+    #expect(GitHubConnectorActions.secondaryRateBackoff(
+        status: 429, message: "Too Many Requests",
+        retryAfterHeader: "12", rateLimitRemaining: nil) == 12)
+    // …and PRIMARY exhaustion (remaining 0, no secondary wording) is NOT
+    // swallowed by this gate — it keeps its own reset-stamped error.
+    #expect(GitHubConnectorActions.secondaryRateBackoff(
+        status: 403, message: "API rate limit exceeded",
+        retryAfterHeader: nil, rateLimitRemaining: 0) == nil)
+    // Ordinary failures never trip a back-off.
+    #expect(GitHubConnectorActions.secondaryRateBackoff(
+        status: 404, message: "Not Found",
+        retryAfterHeader: nil, rateLimitRemaining: 5000) == nil)
+}
+
+@Test func githubRateLimitGateOpensAndCapsBackoff() async {
+    let gate = GitHubRateLimitGate()
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    #expect(await gate.cooldownRemaining(now: now) == nil, "a fresh gate is open")
+    await gate.trip(seconds: 30, now: now)
+    #expect(await gate.cooldownRemaining(now: now) == 30)
+    // A longer window wins; a shorter one may never shorten an active back-off.
+    await gate.trip(seconds: 5, now: now)
+    #expect(await gate.cooldownRemaining(now: now) == 30)
+    // Hostile header values are capped, never honored outright.
+    await gate.trip(seconds: 86_400, now: now)
+    #expect(await gate.cooldownRemaining(now: now) == GitHubRateLimitGate.maximumBackoff)
+    // The window reopens on its own once elapsed.
+    #expect(await gate.cooldownRemaining(now: now.addingTimeInterval(400)) == nil)
+}
+
+/// gpt-5.5 MED (2026-08-17): the recovered by-id comment is OLDER than the page
+/// it rejoins, and `latestNonBotCommentAuthor` reads position, not timestamps —
+/// appending blindly made a recovered maintainer comment look like the last
+/// word, which keeps a decision label armed after the contributor already
+/// answered. Position must still mean recency.
+@Test func githubRecoveredIssueCommentKeepsAscendingOrder() {
+    let rows: [[String: Any]] = [
+        ["id": 700, "created_at": "2026-08-01T10:00:00Z", "user": ["login": "maintainer"]],
+        ["id": 900, "created_at": "2026-08-03T10:00:00Z", "user": ["login": "author"]],
+    ]
+    // The array a caller would build by appending a recovered older row last.
+    var appended = rows
+    appended.append(["id": 650, "created_at": "2026-07-30T09:00:00Z", "user": ["login": "maintainer"]])
+    appended.sort { lhs, rhs in
+        let l = (lhs["created_at"] as? String) ?? ""
+        let r = (rhs["created_at"] as? String) ?? ""
+        return l == r
+            ? ((lhs["id"] as? Int) ?? 0) < ((rhs["id"] as? Int) ?? 0)
+            : l < r
+    }
+    let logins = appended.compactMap { ($0["user"] as? [String: Any])?["login"] as? String }
+    #expect(logins == ["maintainer", "maintainer", "author"],
+            "the contributor's reply must remain the last word after recovery")
+    #expect(GitHubCommandObservationBuilder.latestNonBotCommentAuthor(appended) == "author")
 }

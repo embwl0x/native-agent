@@ -73,6 +73,50 @@ enum MobileInboxProjection {
     }
 }
 
+enum MobileDeskProjection {
+    static let maximumRows = 300
+    static let maximumNotesPerItem = 5
+    static let maximumEncodedBytes = 512 * 1024
+
+    static func data(from items: [DeskItem], encoder: JSONEncoder) throws -> (data: Data, included: Int) {
+        var records = items.sorted {
+            if $0.status.isTerminal != $1.status.isTerminal { return !$0.status.isTerminal }
+            if $0.pinned != $1.pinned { return $0.pinned }
+            return $0.updatedAt > $1.updatedAt
+        }.prefix(maximumRows).map { item in
+            MobileDeskItem(
+                handle: item.handle,
+                alias: item.alias,
+                parent: item.parent,
+                kind: item.kind.rawValue,
+                status: item.status.rawValue,
+                project: String(item.project.prefix(200)),
+                title: String(item.title.prefix(500)),
+                summary: item.summary.map { String($0.prefix(2_000)) },
+                openedAt: item.openedAt,
+                updatedAt: item.updatedAt,
+                closedAt: item.closedAt,
+                pinned: item.pinned,
+                blockedReason: item.blockedReason.map { String($0.prefix(1_000)) },
+                waitingOn: item.waitingOn.map { String($0.prefix(200)) },
+                blockedOn: Array(item.blockedOn.prefix(25)),
+                deferUntil: item.deferUntil,
+                origin: item.origin.rawValue,
+                requiresOwnerInput: item.requiresOwnerInput,
+                recentNotes: item.notes.suffix(maximumNotesPerItem).map {
+                    MobileDeskNote(timestamp: $0.ts, text: String($0.text.prefix(2_000)))
+                }
+            )
+        }
+        while true {
+            let data = try encoder.encode(records)
+            if data.count <= maximumEncodedBytes { return (data, records.count) }
+            guard !records.isEmpty else { return (data, 0) }
+            records.removeLast()
+        }
+    }
+}
+
 private enum SnapshotFileWriteResult {
     case unchanged
     case changed
@@ -204,10 +248,12 @@ extension MacSyncEngine {
             // Approvals have their own APNS lane. Generic blocked work,
             // provider caution, reflex review, and other body trouble stay
             // visible as attention but must not manufacture a user request.
+            var deskItems: [DeskItem]?
             do {
                 let desk = try await SwiftNativeDeskStore(
                     dataRoot: PersistenceCore.defaultDataRoot()
                 ).liveState()
+                deskItems = desk.items
                 let ownerDecisionCount = LivingAttentionPolicy.ownerDecisionDeskCount(in: desk.items)
                 organismLivingStatus.needsUser = ownerDecisionCount > 0
                 organismLivingStatus.needsAttention = (organismLivingStatus.needsAttention ?? false)
@@ -279,6 +325,14 @@ extension MacSyncEngine {
                 try? FileManager.default.removeItem(
                     at: snapshotDir.appendingPathComponent("missions.json")
                 )
+            }
+            if let deskItems {
+                do {
+                    let projection = try MobileDeskProjection.data(from: deskItems, encoder: encoder)
+                    await writeData(projection.data, to: "desk.json")
+                } catch {
+                    recordFetchFailure("desk", error)
+                }
             }
             if let skills { await write(skills, to: "skills_snapshot.json") }
             if let toolCatalog {

@@ -15,6 +15,7 @@ Modules/NativeAgentCore/Sources/MCPDispatcher/MCPHTTPTransport.swift	*	1	timeout
 Modules/NativeAgentCore/Sources/MCPDispatcher/MCPSubprocess+Pool.swift	*	1	event_deadline	MCPSubprocessPool.idleDeadline
 Modules/NativeAgentCore/Sources/MCPDispatcher/MCPSubprocess+Process.swift	*	1	timeout_retry_deadline	MCPSubprocessProcess
 Modules/NativeAgentCore/Sources/MacControl/MacControl+Client.swift	*	5	timeout_retry_deadline	MacControlOperationOwner
+Modules/NativeAgentCore/Sources/MacControl/MacControl+Adapters.swift	*	1	timeout_retry_deadline	SystemAppControlAdapterFocusVerificationDeadline
 Modules/NativeAgentCore/Sources/MacControl/MacAttention.swift	*	2	event_deadline	MacAttentionSessionStore.expiryAndWaitDeadlines
 Modules/NativeAgentCore/Sources/MacControl/TrustedRemoteEffectNodes.swift	*	2	timeout_retry_deadline	TrustedRemoteEffectNodeProcessDeadline
 Modules/NativeAgentCore/Sources/NativeAgentCore/ProcessTreeReaper.swift	*	1	timeout_retry_deadline	ProcessTreeReaper
@@ -38,6 +39,7 @@ Modules/NativeAgentCore/Sources/SelfImprovement/SelfImprovementOrchestrator.swif
 Modules/NativeAgentCore/Sources/SwarmRuns/SwarmExecutor.swift	*	1	timeout_retry_deadline	SwarmExecutorWait
 Modules/NativeAgentCore/Sources/SystemOps/SystemOps+Types.swift	*	1	timeout_retry_deadline	SystemOpsDeadline
 Modules/NativeAgentCore/Sources/TelegramBot/TelegramPollLoop+ChatProgress.swift	*	2	external_protocol_poll	TelegramProgressTransport
+Modules/NativeAgentCore/Sources/TelegramBot/TelegramPollLoop.swift	*	1	external_protocol_poll	TelegramTurnProgressCardDriver.cadence
 Modules/NativeAgentCore/Sources/TelegramBot/TelegramVoiceTranscription.swift	*	2	timeout_retry_deadline	TelegramTranscriptionProcess
 Modules/NativeAgentCore/Sources/ToolExecution/ToolExecution+RunSandbox.swift	*	2	timeout_retry_deadline	ToolSandboxProcess
 Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration+Client.swift	*	1	timeout_retry_deadline	WorkflowAttemptOwner
@@ -48,6 +50,7 @@ Sources/NativeAgentApp/AppDelegate+Launch.swift	*	1	timeout_retry_deadline	Launc
 Sources/NativeAgentApp/AppModel+ChatSessions.swift	*	1	visible_ui	ChatSessionSelectionUI
 Sources/NativeAgentApp/AppModel+GraphCapabilityActions.swift	*	1	visible_ui	GraphCapabilityUI
 Sources/NativeAgentApp/BrowserWindow.swift	*	5	timeout_retry_deadline	BrowserIPCAndNavigationOwner
+Sources/NativeAgentApp/ChromeControlRuntime.swift	Task.sleep(for: .seconds(30))	1	timeout_retry_deadline	ChromeControlChannel.requestTimeout
 Sources/NativeAgentApp/ChatComposerChrome.swift	*	1	visible_ui	ChatComposerUI
 Sources/NativeAgentApp/ChatMessageListView.swift	*	1	visible_ui	ChatMessageListUI
 Sources/NativeAgentApp/ChatViewStateCoordinators.swift	*	2	visible_ui	ChatScrollUI
@@ -59,6 +62,7 @@ Sources/NativeAgentApp/DetachedChatPanelView.swift	*	2	visible_ui	DetachedChatPa
 Sources/NativeAgentApp/Diagnostics/CKLandmine.swift	*	2	external_protocol_poll	CloudKitDiagnosticTransport
 Sources/NativeAgentApp/InstalledPhysiologySoakRecorder.swift	*	2	event_deadline	InstalledPhysiologySoakRecorder.coalescedBatchFlushAndBoundedDurabilityBarrier
 Sources/NativeAgentApp/MacAppleScriptBridge+Runtime.swift	*	1	timeout_retry_deadline	AppleScriptProcessDeadline
+Sources/NativeAgentApp/MacChatTranscriptSearch.swift	*	1	visible_ui	MacChatTranscriptSearchController.queryDebounce
 Sources/NativeAgentApp/MacControlBridge.swift	*	5	timeout_retry_deadline	MacControlBridgeProcessAndConnectionOwner
 Sources/NativeAgentApp/MacIntegrationView.swift	*	1	visible_ui	MacIntegrationUI
 Sources/NativeAgentApp/MacPairingView.swift	*	2	visible_ui	MacPairingUI

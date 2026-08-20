@@ -1,1 +1,4 @@
-Initial App Store release of the NativeAgent companion for Mac.
+NativeAgent 0.4.1 keeps the iPhone and iPad companion aligned with the latest
+Mac runtime. This update improves cross-device reliability, connection and
+health visibility, background message handling, Workshop continuity, and voice
+input stability.

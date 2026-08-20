@@ -531,3 +531,94 @@ final class MockLLMClientForGate: LLMClient, @unchecked Sendable {
         "mock"
     }
 }
+
+// MARK: - Desk 658.12: the session an approval RECORD is filed under
+
+/// Captures what a filer can actually see at FILING time. The real
+/// `NativeAgentChatApprovalFiler` writes exactly this into
+/// `payload.origin.sessionId`, so whatever this mock records is what a chat
+/// surface later has to match its card against.
+private actor FilingSessionCapturingFiler: NonBlockingApprovalFiler {
+    private(set) var observedSessionId: String??
+
+    func fileApprovalRequest(
+        toolName: String,
+        surface: String,
+        payload: JSONValue,
+        reason: String
+    ) async throws -> String {
+        observedSessionId = ChatToolSessionContext.verifiedSessionId
+        return "approval-1"
+    }
+
+    func awaitResolution(id: String) async throws -> ApprovalDecision {
+        Issue.record("non-blocking filer should not await resolution in dispatcher path")
+        return .denied
+    }
+
+    func pendingApprovalResult(
+        id: String,
+        toolName: String,
+        surface: String,
+        payload: JSONValue,
+        reason: String
+    ) async -> JSONValue {
+        .object(["status": .string("waiting_approval"), "approvalId": .string(id)])
+    }
+
+    func observed() -> String?? { observedSessionId }
+}
+
+private func fileApprovalCapturingSession(
+    dispatcherSessionId: String?
+) async throws -> String?? {
+    let tools = MockToolDispatchClient(scripted: ["risky.tool": .string("SHOULD_NOT_RUN")])
+    let trust = MockAutonomyResolver(levels: ["risky.tool": "confirm"])
+    let filer = FilingSessionCapturingFiler()
+    let gate = AutonomyGate(trust: trust, approvalFiler: filer)
+    let root = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("filing_session_\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let dispatcher = AutonomyGatedDispatcher(
+        inner: tools,
+        gate: gate,
+        approvalFiler: filer,
+        securityCenter: SwiftNativeSecurityCenter(dataRoot: root),
+        hasFiler: true,
+        verifiedSessionId: dispatcherSessionId
+    )
+    _ = try await dispatcher.dispatch(tool: "risky.tool", input: [:], surface: "chat")
+    #expect(tools.dispatches.isEmpty)
+    return await filer.observed()
+}
+
+/// The bug this fixes: an approval is filed BEFORE any tool runs, so it never
+/// saw the session binding `runInner` installs. Remote transports bind the
+/// session around their own `chat()` call, but the local Mac chat path has no
+/// outer binding — so every Mac chat approval was written with a null origin
+/// session and no chat surface could ever match it back to its conversation.
+@Test
+func autonomyGatedDispatcher_filesTheApprovalUnderTheTurnsOwnSession() async throws {
+    let observed = try await fileApprovalCapturingSession(dispatcherSessionId: "mac-chat-session")
+    #expect(observed == .some("mac-chat-session"))
+}
+
+/// NEGATIVE CONTROL: with no session to file under, the record still carries
+/// none. This fills a nil; it never invents an identity.
+@Test
+func autonomyGatedDispatcher_inventsNoSessionWhenTheTurnHasNone() async throws {
+    let observed = try await fileApprovalCapturingSession(dispatcherSessionId: nil)
+    #expect(observed == .some(nil))
+}
+
+/// A transport that verified the session against its own identity is the
+/// better authority; this must never overwrite it with the locally resolved
+/// one. Telegram/Slack origins keep filing exactly as they did.
+@Test
+func autonomyGatedDispatcher_neverOverwritesATransportVerifiedSession() async throws {
+    let observed = try await ChatToolSessionContext.$verifiedSessionId
+        .withValue("telegram-verified-session") {
+            try await fileApprovalCapturingSession(dispatcherSessionId: "locally-resolved-session")
+        }
+    #expect(observed == .some("telegram-verified-session"))
+}

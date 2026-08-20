@@ -4,6 +4,7 @@ import CognitiveSubstrate
 import MacIntegration
 import NativeAgentCore
 import NativeAgentShared
+import PersistenceCore
 import ProviderRouting
 
 @MainActor
@@ -137,6 +138,40 @@ struct MacSyncActionRouter {
 
         do {
             switch action.action {
+            case "createDeskItem":
+                let kindRaw = (payload["kind"] ?? "plan").lowercased()
+                let project = (payload["project"] ?? "General").trimmingCharacters(in: .whitespacesAndNewlines)
+                let title = (payload["title"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let summary = payload["summary"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard let kind = DeskKind(rawValue: kindRaw), !project.isEmpty, !title.isEmpty,
+                      project.count <= 200, title.count <= 500, (summary?.count ?? 0) <= 2_000 else {
+                    return observed(["status": "error", "code": "invalid_desk_item", "message": "Desk kind, project, title, or summary is invalid."])
+                }
+                let item = try await SwiftNativeDeskStore(dataRoot: PersistenceCore.defaultDataRoot())
+                    .createItem(kind: kind, project: project, title: title, summary: summary)
+                return observed(["status": "ok", "handle": item.handle, "alias": item.alias])
+
+            case "setDeskItemStatus":
+                let handle = (payload["handle"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let statusRaw = (payload["status"] ?? "").lowercased()
+                guard handle.hasPrefix("desk_"), handle.count <= 64,
+                      let status = DeskStatus(rawValue: statusRaw), status != .blocked else {
+                    return observed(["status": "error", "code": "invalid_desk_status", "message": "Desk handle or status is invalid."])
+                }
+                _ = try await SwiftNativeDeskStore(dataRoot: PersistenceCore.defaultDataRoot())
+                    .setStatus(handle, status: status)
+                return observed(["status": "ok", "handle": handle, "deskStatus": status.rawValue])
+
+            case "appendDeskItemNote":
+                let handle = (payload["handle"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let note = (payload["text"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                guard handle.hasPrefix("desk_"), handle.count <= 64, !note.isEmpty, note.count <= 2_000 else {
+                    return observed(["status": "error", "code": "invalid_desk_note", "message": "Desk handle or note is invalid."])
+                }
+                _ = try await SwiftNativeDeskStore(dataRoot: PersistenceCore.defaultDataRoot())
+                    .appendNote(handle, text: note)
+                return observed(["status": "ok", "handle": handle])
+
             case "submitWorkshopTask", "submitMission":
                 let title = payload["title"] ?? "iOS Desk Task"
                 let objective = payload["objective"] ?? ""

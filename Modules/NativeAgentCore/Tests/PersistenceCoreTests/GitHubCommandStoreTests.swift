@@ -491,7 +491,7 @@ struct GitHubCommandStoreTests {
         #expect(correlated.first?.dispatchReceipt?.messageId == intent2.dispatchId)
     }
 
-    @Test("APNS claims exist only for terminal success or a real blocker and survive restart")
+    @Test("APNS claims actionable watcher events, terminal success, and real blockers once")
     func notificationBoundaryAndDedup() async throws {
         let root = try root(); defer { try? FileManager.default.removeItem(at: root) }
         let store = GitHubCommandStore(dataRoot: root)
@@ -502,7 +502,12 @@ struct GitHubCommandStoreTests {
         _ = try await store.observe(observation(version: "quiet", waiting: .ci))
         #expect(try await store.claimNotification(itemId: detected.itemId) == nil)
         _ = try await store.observe(observation(version: "ci-1", signals: [.ciFailure]))
-        #expect(try await store.claimNotification(itemId: detected.itemId) == nil)
+        let actionable = try #require(try await store.claimNotification(itemId: detected.itemId))
+        #expect(actionable.kind == .actionable)
+        #expect(actionable.title == "GitHub needs attention")
+        #expect(actionable.body.contains("example/widgets #42"))
+        #expect(actionable.body.contains("ci failure"))
+        #expect(try await GitHubCommandStore(dataRoot: root).claimNotification(itemId: detected.itemId) == nil)
         let receipt = try await dispatch(store, itemId: detected.itemId)
         #expect(try await store.claimNotification(itemId: detected.itemId) == nil)
         _ = try await store.recordCallback(

@@ -216,6 +216,19 @@ extension SwiftNativeSecurityCenter {
         "browser.read_text",
         "browser.read_links",
         "browser.screenshot",
+        "browser.chrome_acquire",
+        "browser.chrome_navigate",
+        "browser.chrome_snapshot",
+        "browser.chrome_click",
+        "browser.chrome_fill",
+        "browser.chrome_type",
+        "browser.chrome_select",
+        "browser.chrome_keypress",
+        "browser.chrome_set_checked",
+        "browser.chrome_double_click",
+        "browser.chrome_wait",
+        "browser.chrome_scroll",
+        "browser.chrome_release",
         // Read-only app health summaries. Their dispatchers redact secrets and
         // Telegram identifiers before results enter model context.
         "doctor_status",
@@ -356,6 +369,10 @@ extension SwiftNativeSecurityCenter {
             "browser.read_text",
             "browser.read_links",
             "browser.screenshot",
+            "browser.chrome_snapshot",
+            "browser.chrome_wait",
+            "browser.chrome_scroll",
+            "browser.chrome_release",
         ]
         if browserReadTools.contains(tool) {
             add("safe_read", .low)
@@ -367,6 +384,20 @@ extension SwiftNativeSecurityCenter {
         }
         if tool == "browser.open_url" || tool == "browser.navigate" {
             add("network_read", .medium)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
+        if tool == "browser.chrome_acquire" || tool == "browser.chrome_navigate" {
+            add("network_read", .medium)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
+        if tool == "browser.chrome_click"
+            || tool == "browser.chrome_fill"
+            || tool == "browser.chrome_type"
+            || tool == "browser.chrome_select"
+            || tool == "browser.chrome_keypress"
+            || tool == "browser.chrome_set_checked"
+            || tool == "browser.chrome_double_click" {
+            add("browser_interaction", .high)
             return ToolProfile(capabilities: capabilities, risk: risk)
         }
         if tool == "reflex_review" {
@@ -393,6 +424,11 @@ extension SwiftNativeSecurityCenter {
         if builderProcessTools.contains(tool) {
             add("shell", .critical)
             add("process_spawn", .critical)
+            // A shell is broad by design, but mutating macOS's permission
+            // authority is not ordinary builder work. Classify the concrete
+            // effect from the command body so SecurityCenter can apply a hard
+            // approval floor even while Full Mac/YOLO remains available for
+            // normal autonomous builds and repairs.
             if tool == "apply_patch" || tool == "git" || tool == "swift_build" || tool == "swift_test" {
                 add("filesystem_write", .high)
             }
@@ -401,6 +437,12 @@ extension SwiftNativeSecurityCenter {
                 // artifacts, snapshot files, etc.).
                 add("destructive", .high)
             }
+        }
+        // Keep the effect classifier outside the builder-name membership so
+        // catalog aliases (`mac.shell` / `mac_shell`) receive the same floor.
+        if commandMutatesSystemPermissionAuthority(tool: tool, input: input) {
+            add("system_permission_reset", .critical)
+            add("destructive", .critical)
         }
         let agentSubprocessTools: Set<String> = ["invoke_claude", "invoke_codex"]
         if agentSubprocessTools.contains(tool) {
@@ -594,6 +636,40 @@ extension SwiftNativeSecurityCenter {
             add("secret_input", .high)
         }
         return ToolProfile(capabilities: capabilities, risk: risk)
+    }
+
+    /// Pure effect classifier for commands that mutate the host permission
+    /// authority. This is deliberately not an LLM instruction or word-choice
+    /// constraint: the Trust boundary evaluates the exact tool arguments at
+    /// effect time. It catches the supported `tccutil reset` path plus direct
+    /// mutation attempts against TCC.db. False positives only request a human
+    /// confirmation; false negatives would let an agent silently revoke its
+    /// own capabilities.
+    static func commandMutatesSystemPermissionAuthority(
+        tool: String,
+        input: [String: JSONValue]
+    ) -> Bool {
+        let normalizedTool = tool.lowercased()
+        guard ["shell", "bash", "mac.shell", "mac_shell"].contains(normalizedTool) else {
+            return false
+        }
+        let command = string(input["cmd"])
+            ?? string(input["command"])
+            ?? ""
+        let lower = command.lowercased()
+        if lower.contains("tccutil"),
+           lower.range(of: #"\breset\b"#, options: .regularExpression) != nil {
+            return true
+        }
+        guard lower.contains("tcc.db") else { return false }
+
+        // Reading the TCC database is diagnostic evidence, not a permission
+        // change. In particular, `sqlite3 ...TCC.db "SELECT ..."` must stay
+        // autonomous under Full Mac. Require an actual mutating SQL or file
+        // operation instead of treating the mere presence of `sqlite3` as a
+        // write. Word boundaries avoid accidental matches inside paths/text.
+        let mutationPattern = #"\b(delete|update|insert|replace|drop|alter|create|vacuum|reindex|rm|mv|cp|truncate|chmod|chown|dd)\b"#
+        return lower.range(of: mutationPattern, options: .regularExpression) != nil
     }
 
     static func canonicalToolName(_ raw: String) -> String {

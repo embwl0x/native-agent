@@ -21,6 +21,13 @@ private typealias DriveFolder = NativeAgentICloudBridgeConstants.DriveFolder
 @MainActor
 final class iCloudBridge: ObservableObject {
     static let shared = iCloudBridge()
+    /// Silent CloudKit pushes are best-effort, even after APNs registration
+    /// succeeds. Keep the Mac-side safety pull responsive so one missed wake
+    /// cannot strand an already-sent iPhone turn until the phone's 180-second
+    /// watchdog fires. This is deliberately the same for development and
+    /// distribution builds; successful registration proves capability, not
+    /// delivery of every individual wake.
+    nonisolated static let responsiveDeviceDrainFallbackSeconds: TimeInterval = 8
 
     // MARK: Published state
 
@@ -350,19 +357,20 @@ final class iCloudBridge: ObservableObject {
         }
     }
 
-    /// APNs registration is a runtime capability: release builds normally have
-    /// it, while local development builds may not. Keep a low-rate integrity
-    /// fallback even with push so a lost notification never strands a message.
+    /// APNs registration is a runtime capability, not per-message delivery
+    /// proof. A VM missed a valid silent wake in production and the former
+    /// five-minute fallback let an iPhone turn outlive its 180-second watchdog.
+    /// Keep the responsive safety pull after registration as well as failure.
     func cloudKitPushRegistrationSucceeded() {
         guard deviceTransport != nil else { return }
-        startDeviceDrainFallback(every: 5 * 60)
+        startDeviceDrainFallback(every: Self.responsiveDeviceDrainFallbackSeconds)
     }
 
     func cloudKitPushRegistrationFailed(_ error: Error) {
         guard deviceTransport != nil else { return }
         NSLog("[iCloudBridge] CloudKit push unavailable; retaining polling fallback: %@",
               error.localizedDescription)
-        startDeviceDrainFallback(every: 8)
+        startDeviceDrainFallback(every: Self.responsiveDeviceDrainFallbackSeconds)
     }
 
     func recognizesCloudKitRemoteNotification(_ userInfo: [AnyHashable: Any]) -> Bool {

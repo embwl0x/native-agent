@@ -1,7 +1,7 @@
 import Foundation
 
-// Trusted repository-checkout resolution, shared by the GitHub Command lane and
-// the codex_message `repository` opt-in.
+// Trusted repository-checkout resolution for explicit codex_message repository
+// selection. The GitHub watcher never invokes this resolver.
 //
 // The trust anchor is the remote, not the name. A caller names an owner/name
 // GitHub repository -- never a filesystem path -- and this resolver only

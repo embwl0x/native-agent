@@ -197,6 +197,8 @@ extension iCloudSyncEngine {
             await refreshCatalogSnapshot()
         case .chat:
             await refreshChatTranscriptsSnapshot()
+        case .desk:
+            await refreshDeskSnapshot()
         case .activity:
             await refreshActivitySnapshot()
         case .advanced:

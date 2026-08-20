@@ -15,6 +15,7 @@ public enum GitHubCommandItemKind: String, Codable, Sendable, CaseIterable {
 
 public enum GitHubCommandActionSignal: String, Codable, Sendable, CaseIterable, Hashable {
     case reviewComment = "review_comment"
+    case issueComment = "issue_comment"
     case changesRequested = "changes_requested"
     case ciFailure = "ci_failure"
     case conflict
@@ -182,11 +183,8 @@ public struct GitHubCommandReviewThreadEvidence: Codable, Sendable, Equatable {
     }
 }
 
-/// Bounded, dispatch-ready evidence captured during the canonical GitHub read.
-/// GitHub Command hands this resident evidence to temporary Codex cognition so
-/// the worker does not have to reconstruct the actionable event from a bare PR
-/// number. It is descriptive only; TrustCenter and live GitHub verification
-/// retain all write and settlement authority.
+/// Bounded descriptive evidence captured during the canonical GitHub read for
+/// Desk inspection and watcher notifications. It grants no action authority.
 public struct GitHubCommandActionEvidence: Codable, Sendable, Equatable {
     public let signal: GitHubCommandActionSignal
     public let identifier: String
@@ -353,6 +351,7 @@ public struct GitHubCommandNotificationReceipt: Codable, Sendable, Equatable {
 }
 
 public enum GitHubCommandNotificationKind: String, Codable, Sendable {
+    case actionable
     case success
     case blocker
 }
@@ -1449,7 +1448,18 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
                 // preserved evidence, neutralize the stale claims, and leave
                 // the item's state exactly where fresher truth put it.
                 var staleNeutralized = false
+                // The empty set is a subset of everything, so a QUIET
+                // observation (no signals at all) used to satisfy this guard
+                // and skip routing entirely — leaving items parked forever on
+                // whatever state they were last in. Live cost: two of User's
+                // PRs sat in attention(verification_read_failed) with fresh,
+                // clean, zero-signal observations arriving every sweep; one of
+                // them had already CLOSED upstream and still never resolved.
+                // Neutralization only makes sense for an observation that
+                // actually CLAIMS actionability from stale thread evidence;
+                // a quiet reading is real news and must route (2026-08-18).
                 if preserved != observation,
+                   !observation.signals.isEmpty,
                    observation.signals.isSubset(of: [.reviewComment, .changesRequested]),
                    preserved.reviewThreads?.contains(where: \.isActionable) == false {
                     staleNeutralized = true
@@ -1739,7 +1749,18 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
             }
             if dispatched.contains(eventKey) {
                 // Polling must never redispatch the same actionable event.
-                if case .attention = item.state { return }
+                //
+                // READ-FAILURE RECOVERY (live defect, 2026-08-17): a
+                // `verification_read_failed` parking is a statement about OUR
+                // eyes, not about the work — GitHub 503s/404s during a blip
+                // pushed 5 of User's items into attention and this early return
+                // kept them there permanently, because reaching this line at
+                // all proves reads are working again. Every other attention
+                // reason IS a claim about the work (codex failed, verification
+                // failed, dispatch failed) and stays sticky; only the
+                // can't-see reason re-derives from the live truth below.
+                if case .attention(let reason) = item.state,
+                   reason != .verificationReadFailed { return }
                 // An event that already settled through verification into
                 // waiting_upstream must not bounce back to attention on an
                 // identical re-observation. Only a NEW actionableEventVersion
@@ -1873,7 +1894,7 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
             }
         case .notificationClaimed(let itemId, let intent):
             guard let item = state.item(itemId), notificationIntent(for: item) == intent else {
-                throw GitHubCommandStoreError.invalidTransition("notification is outside the success/blocker boundary")
+                throw GitHubCommandStoreError.invalidTransition("notification is outside the watcher notification boundary")
             }
         case .notificationRecorded(let itemId, let receipt):
             guard state.item(itemId)?.notificationClaims.contains(receipt.dedupKey) == true else {
@@ -1897,6 +1918,19 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
     private static func notificationIntent(for item: GitHubCommandItem) -> GitHubCommandNotificationIntent? {
         let version = item.observation?.actionableEventVersion ?? item.observation?.observedVersion ?? item.updatedAt
         switch item.state {
+        case .needsCodex:
+            guard let eventKey = item.observation?.actionableEventKey else { return nil }
+            let signals = item.observation?.signals.map(\.rawValue).sorted().joined(separator: ", ") ?? "action needed"
+            return GitHubCommandNotificationIntent(
+                dedupKey: "\(item.itemId)+\(eventKey)+actionable",
+                itemId: item.itemId,
+                kind: .actionable,
+                title: "GitHub needs attention",
+                body: Self.bounded(
+                    "\(item.repository) #\(item.number): \(item.title) (\(signals.replacingOccurrences(of: "_", with: " "))).",
+                    limit: 260
+                )
+            )
         case .resolved:
             guard item.dispatchReceipt != nil, let receipt = item.finalReceipt, !receipt.isEmpty else { return nil }
             let key = "\(item.itemId)+\(version)+success"

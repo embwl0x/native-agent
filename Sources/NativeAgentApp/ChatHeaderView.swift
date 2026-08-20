@@ -27,6 +27,7 @@ struct ChatHeaderView: View {
     @Binding var showContext: Bool
     @Binding var showConversationControls: Bool
     var onRename: (String) -> Void = { _ in }
+    var onFind: () -> Void = {}
     @State private var isRenamingTitle = false
     @State private var titleDraft = ""
     @FocusState private var titleFocused: Bool
@@ -95,6 +96,16 @@ struct ChatHeaderView: View {
                 .help(tooltipDetail)
                 .accessibilityLabel("NextGen status: \(tooltipDetail)")
             }
+
+            Button(action: onFind) {
+                Image(systemName: "magnifyingglass")
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Search conversation (Command-F)")
+            .accessibilityLabel("Search conversation")
 
             Button {
                 withAnimation(.easeOut(duration: 0.16)) {

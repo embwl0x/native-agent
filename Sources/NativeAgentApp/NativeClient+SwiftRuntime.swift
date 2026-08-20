@@ -254,9 +254,26 @@ extension NativeClient {
                 decision: rec.decision,
                 payloadPreview: rec.payloadPreview,
                 localOnly: rec.localOnly,
-                remoteResolvable: rec.remoteResolvable
+                remoteResolvable: rec.remoteResolvable,
+                chatOriginSessionId: NativeClient.chatApprovalOriginSessionId(rec.payload)
             )
         }
+    }
+
+    /// The canonical inbox already records which conversation asked for a chat
+    /// tool approval (`NativeAgentChatApprovalFiler` writes
+    /// `payload.origin.sessionId`). This mapping stops dropping it on the way
+    /// to the app so surfaces can key on it; it reads the record and invents
+    /// nothing. Only `chat_tool_approval` records carry a chat origin — every
+    /// other kind stays nil rather than borrowing a lookalike field.
+    nonisolated static func chatApprovalOriginSessionId(_ payload: JSONValue) -> String? {
+        guard case .object(let fields) = payload,
+              case .string(let kind)? = fields["kind"],
+              kind == "chat_tool_approval",
+              case .object(let origin)? = fields["origin"],
+              case .string(let sessionId)? = origin["sessionId"] else { return nil }
+        let trimmed = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     func swiftListMCPConsents() async throws -> [MCPConsentRecord] {

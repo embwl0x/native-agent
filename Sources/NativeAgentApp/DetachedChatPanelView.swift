@@ -24,7 +24,6 @@ import PersistenceCore
 struct DetachedChatPanelView: View {
     let sessionId: String
     @Environment(AppModel.self) private var appModel
-    // chat-smoothness phase 6: respect Reduce Motion on the typing-chip fade.
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     // The detached panel is hosted by AppKit, NOT by the SwiftUI Scene that
@@ -68,6 +67,9 @@ struct DetachedChatPanelView: View {
     @State private var voiceInput = VoiceInputController()
     @State private var voiceDraftBeforeListening = ""
     @FocusState private var inputFocused: Bool
+    @State private var transcriptSearch = MacChatTranscriptSearchController()
+    @State private var showTranscriptSearch = false
+    @State private var transcriptSearchFocusRequest: UInt = 0
 
     // H5 (gpt-5.5 review, 2026-07-09): same treatment as ChatView's composer —
     // in-progress text lives in view-local @State, so a keystroke here no
@@ -123,6 +125,46 @@ struct DetachedChatPanelView: View {
         // Her real name (persona profile), not the chatPersona style
         // quick-switch which reads "Custom"/"AI".
         appModel.agentDisplayName
+    }
+
+    private func openTranscriptSearch() {
+        showTranscriptSearch = true
+        transcriptSearchFocusRequest &+= 1
+        transcriptSearch.replaceSource(messages: messages, sessionID: sessionId)
+    }
+
+    private func closeTranscriptSearch() {
+        showTranscriptSearch = false
+    }
+
+    private func findNextTranscriptMatch() {
+        guard showTranscriptSearch else {
+            openTranscriptSearch()
+            return
+        }
+        _ = transcriptSearch.selectNext()
+    }
+
+    private func findPreviousTranscriptMatch() {
+        guard showTranscriptSearch else {
+            openTranscriptSearch()
+            return
+        }
+        _ = transcriptSearch.selectPrevious()
+    }
+
+    private func refreshTranscriptSearchIfPresented() {
+        guard showTranscriptSearch else { return }
+        transcriptSearch.replaceSource(messages: messages, sessionID: sessionId)
+    }
+
+    private func refreshTranscriptSearchTailIfPresented() {
+        guard showTranscriptSearch else { return }
+        transcriptSearch.replaceLastMessage(
+            messages.last,
+            ordinal: messages.count - 1,
+            sessionID: sessionId
+        )
     }
 
     var body: some View {
@@ -183,6 +225,15 @@ struct DetachedChatPanelView: View {
             // eats typed text (the main window adopts it on session switch).
             appModel.commitChatDraft(panelDraft, sessionId: sessionId)
         }
+        .focusedSceneValue(\.chatCommandActions, ChatFocusedCommandActions(
+            send: send,
+            attach: attachFromClipboardOrPickFile,
+            toggleVoice: toggleVoice,
+            focusComposer: { inputFocused = true },
+            focusTranscriptSearch: openTranscriptSearch,
+            findNext: findNextTranscriptMatch,
+            findPrevious: findPreviousTranscriptMatch
+        ))
     }
 
     // MARK: - Scrollback
@@ -210,21 +261,19 @@ struct DetachedChatPanelView: View {
                     } else {
                         // Reuse the main chat's grouped render path so tool
                         // pills, approval cards, and bubbles look identical.
-                        ChatMessageListView(messages: messages, sessionId: sessionId, isStreaming: isBusy)
+                        ChatMessageListView(
+                            messages: messages,
+                            sessionId: sessionId,
+                            isStreaming: isBusy,
+                            highlightedMessageID: showTranscriptSearch
+                                ? transcriptSearch.selectedMessageID
+                                : nil
+                        )
                     }
-                    // phase 6: scoped fade for the detached typing chip (mirrors
-                    // the main-list pattern) so it doesn't pop in/out.
-                    let showDetachedTyping = isBusy && (messages.last?.role != "assistant"
-                        || (messages.last?.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true))
-                    ZStack {
-                        if showDetachedTyping {
-                            TypingIndicator(personaName: appModel.agentDisplayName)
-                                .transition(.opacity)
-                        }
-                    }
-                    .animation(
-                        NativeAgentMotion.respecting(NativeAgentMotion.snappy, reduceMotion: reduceMotion),
-                        value: showDetachedTyping)
+                    // Desk 658.11: the detached typing chip is retired. Turn
+                    // progress has exactly one surface now — MacChatTurnCardHost
+                    // above the composer — so this window and the main window
+                    // show the same one thing instead of stacking two.
                     Color.clear.frame(height: 1).id(detachedBottomAnchor)
                         // Inside the LazyVStack this spacer is only realized
                         // when the viewport is at/near the bottom, so its
@@ -257,6 +306,20 @@ struct DetachedChatPanelView: View {
             // aligns content SHORTER than the viewport, and a lone empty-state
             // card shoved to the bottom of a 600pt panel reads as broken.
             .modifier(DetachedScrollAnchorModifier(isEmpty: messages.isEmpty))
+            .safeAreaInset(edge: .top, spacing: 0) {
+                if showTranscriptSearch {
+                    MacChatTranscriptSearchBar(
+                        controller: transcriptSearch,
+                        focusRequest: transcriptSearchFocusRequest,
+                        onDismiss: closeTranscriptSearch
+                    )
+                    .transition(
+                        reduceMotion
+                            ? .identity
+                            : .move(edge: .top).combined(with: .opacity)
+                    )
+                }
+            }
             // Messages-style resize: if the user was at the bottom when the
             // resize STARTED, snap the latest message back to the composer
             // once the size settles; if they'd scrolled up to read history,
@@ -288,8 +351,15 @@ struct DetachedChatPanelView: View {
                 }
             )
             .onChange(of: messages.count) {
-                withAnimation(.easeOut(duration: 0.18)) {
-                    proxy.scrollTo(detachedBottomAnchor, anchor: .bottom)
+                if showTranscriptSearch {
+                    refreshTranscriptSearchIfPresented()
+                } else {
+                    withAnimation(NativeAgentMotion.respecting(
+                        .easeOut(duration: 0.18),
+                        reduceMotion: reduceMotion
+                    )) {
+                        proxy.scrollTo(detachedBottomAnchor, anchor: .bottom)
+                    }
                 }
             }
             .onChange(of: messages.last?.content) {
@@ -297,12 +367,36 @@ struct DetachedChatPanelView: View {
                 // message-COUNT path above stays immediate and animated: an
                 // append is one event, not a 14 Hz stream, and deferring it
                 // would be a visible timing change on bubble entrance.
-                scrollCoordinator.scrollToBottom(
-                    proxy,
-                    bottomAnchor: detachedBottomAnchor,
-                    animated: false,
-                    delay: 0
-                )
+                if showTranscriptSearch {
+                    refreshTranscriptSearchTailIfPresented()
+                } else {
+                    scrollCoordinator.scrollToBottom(
+                        proxy,
+                        bottomAnchor: detachedBottomAnchor,
+                        animated: false,
+                        delay: 0
+                    )
+                }
+            }
+            .onChange(of: messages.last?.id) {
+                refreshTranscriptSearchTailIfPresented()
+            }
+            .onChange(of: messages.first?.id) {
+                refreshTranscriptSearchIfPresented()
+            }
+            .onChange(of: transcriptSearch.selectionRevision) { _, _ in
+                guard showTranscriptSearch,
+                      let messageID = transcriptSearch.selectedMessageID
+                else { return }
+                withAnimation(NativeAgentMotion.respecting(
+                    .easeOut(duration: 0.16),
+                    reduceMotion: reduceMotion
+                )) {
+                    proxy.scrollTo(
+                        MacChatTranscriptSearch.scrollTargetID(for: messageID),
+                        anchor: .center
+                    )
+                }
             }
         }
     }
@@ -381,9 +475,16 @@ struct DetachedChatPanelView: View {
                 }
             }
 
-            if isBusy {
-                DetachedThinkingRow(
-                    personaName: appModel.agentDisplayName,
+            // Desk 658.11: the same shared live-turn card as the main window.
+            // Keyed on THIS window's session, so a concurrent turn in another
+            // session (detached or main) can never render here.
+            if MacChatTurnCardProjection.isVisible(
+                appModel.chatTurnLifecycle(for: sessionId),
+                sessionId: sessionId,
+                approvals: appModel.approvals
+            ) {
+                MacChatTurnCardHost(
+                    sessionId: sessionId,
                     onStop: { appModel.stopChatStream(sessionId: sessionId) }
                 )
             }
@@ -398,108 +499,49 @@ struct DetachedChatPanelView: View {
                     .transition(.opacity)
             }
 
-            HStack(alignment: .bottom, spacing: 8) {
-                Button {
-                    toggleVoice()
-                } label: {
-                    Image(systemName: voiceInput.isListening ? "mic.fill" : "mic")
-                        .foregroundStyle(voiceInput.isListening ? Color.red : Color.primary)
-                        .frame(width: 28, height: 28)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.borderless)
-                .help(voiceInput.isListening ? "Stop listening" : "Voice input")
-                .accessibilityLabel(voiceInput.isListening ? "Stop listening" : "Voice input")
-
-                Button {
-                    captureScreen()
-                } label: {
-                    Image(systemName: "camera.viewfinder")
-                        .frame(width: 28, height: 28)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.borderless)
-                .help(screenCaptureAllowed ? "Show agent my screen" : "Enable screen capture in Trust -> Multimodal Capabilities")
-                .accessibilityLabel("Show agent my screen")
-                .disabled(isBusy || isCapturing || !screenCaptureAllowed)
-
-                ZStack(alignment: .topTrailing) {
-                    Button {
-                        attachFromClipboardOrPickFile()
-                    } label: {
-                        Image(systemName: "paperclip")
-                            .frame(width: 28, height: 28)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Attach image or file")
-                    .accessibilityLabel("Attach image or file")
-
-                    if !pendingAttachments.isEmpty {
-                        Text("\(pendingAttachments.count)")
-                            .font(NativeAgentFont.tag)
-                            .foregroundStyle(.white)
-                            .padding(3)
-                            .background(NativeAgentBrand.accent, in: Circle())
-                            .offset(x: 6, y: -6)
-                    }
-                }
-
+            MacChatComposerControlStrip(
+                isListening: voiceInput.isListening,
+                screenCaptureAllowed: screenCaptureAllowed,
+                screenCaptureDisabled: isBusy || isCapturing || !screenCaptureAllowed,
+                pendingAttachmentCount: pendingAttachments.count,
+                isRunning: isBusy,
+                canSend: canSend,
+                onToggleVoice: toggleVoice,
+                onCaptureScreen: captureScreen,
+                onAttach: attachFromClipboardOrPickFile,
+                onStop: { appModel.stopChatStream(sessionId: sessionId) },
+                onSend: send
+            ) {
                 TextField(
                     voiceInput.isListening ? "" : "Message \(personaName)…",
                     text: draftBinding,
                     axis: .vertical
                 )
                 .textFieldStyle(.plain)
-                .lineLimit(1...6)
+                .lineLimit(1...5)
                 .fixedSize(horizontal: false, vertical: true)
                 .focused($inputFocused)
                 .foregroundStyle(voiceInput.isListening ? .secondary : .primary)
                 .italic(voiceInput.isListening)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 9)
-                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel))
                 .onSubmit(send)
                 .onChange(of: voiceInput.transcript) { _, newVal in
                     if !newVal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         draft = composeVoiceDraft(newVal)
                     }
                 }
-
-                if isBusy {
-                    Button {
-                        appModel.stopChatStream(sessionId: sessionId)
-                    } label: {
-                        Image(systemName: "stop.fill")
-                            .foregroundStyle(.white)
-                            .frame(width: 28, height: 28)
-                            .background(Color.red.opacity(0.85), in: Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .help("Stop generation")
-                }
-
-                Button(action: send) {
-                    Image(systemName: "arrow.up.circle.fill")
-                        .font(.system(size: 24))
-                        .foregroundStyle(canSend ? Color.accentColor : Color.secondary)
-                }
-                .buttonStyle(.plain)
-                .disabled(!canSend)
-                .help(isBusy ? "Queue message to send next" : "Send message")
             }
 
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
-        .animation(NativeAgentMotion.snappy, value: draft)
-        .animation(NativeAgentMotion.snappy, value: pendingAttachments.count)
-        .focusedSceneValue(\.chatCommandActions, ChatFocusedCommandActions(
-            send: send,
-            attach: attachFromClipboardOrPickFile,
-            toggleVoice: toggleVoice,
-            focusComposer: { inputFocused = true }
-        ))
+        .animation(
+            NativeAgentMotion.respecting(NativeAgentMotion.snappy, reduceMotion: reduceMotion),
+            value: draft
+        )
+        .animation(
+            NativeAgentMotion.respecting(NativeAgentMotion.snappy, reduceMotion: reduceMotion),
+            value: pendingAttachments.count
+        )
     }
 
     private var canSend: Bool {
@@ -725,28 +767,6 @@ private struct DetachedScrollAnchorModifier: ViewModifier {
             content
                 .defaultScrollAnchor(anchor)
         }
-    }
-}
-
-private struct DetachedThinkingRow: View {
-    var personaName: String
-    var onStop: () -> Void
-
-    var body: some View {
-        HStack(spacing: 8) {
-            ProgressView()
-                .controlSize(.small)
-            Text("\(personaName) is thinking")
-                .font(NativeAgentFont.tag)
-                .foregroundStyle(.secondary)
-            Spacer()
-            Button("Stop", systemImage: "stop.fill", action: onStop)
-                .buttonStyle(.borderless)
-                .foregroundStyle(.red)
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
-        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
     }
 }
 

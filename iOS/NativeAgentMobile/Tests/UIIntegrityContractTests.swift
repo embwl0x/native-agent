@@ -129,7 +129,7 @@ final class UIIntegrityContractTests: XCTestCase {
     func testSnapshotGroupsDriveVisibleStoresWithoutCloudPolling() throws {
         let setup = try Self.source("iCloudSyncEngine+Setup.swift")
         let content = try Self.source("ContentView.swift")
-        let workshop = try Self.source("WorkshopView.swift")
+        let desk = try Self.source("DeskView.swift")
         let memory = try Self.source("MemoryView.swift")
         let advanced = try Self.source("AdvancedView.swift")
         let inspector = try Self.source("TurnInspectorView.swift")
@@ -138,7 +138,8 @@ final class UIIntegrityContractTests: XCTestCase {
         XCTAssertTrue(setup.contains("await refreshActivitySnapshot()"))
         XCTAssertTrue(setup.contains("await refreshCatalogSnapshot()"))
         XCTAssertTrue(content.contains("while !Task.isCancelled, !pairingStore.usesICloudTransport"))
-        XCTAssertTrue(workshop.contains(".onChange(of: sync.workshopTasks)"))
+        XCTAssertTrue(desk.contains("await sync.refreshDeskSnapshot()"))
+        XCTAssertTrue(desk.contains("iCloudSyncEngine.shared.setDeskItemStatus"))
         XCTAssertTrue(memory.contains(".onChange(of: sync.memories)"))
         XCTAssertTrue(advanced.contains(".onChange(of: sync.runs)"))
         XCTAssertTrue(inspector.contains(".onChange(of: sync.turnSummaries)"))

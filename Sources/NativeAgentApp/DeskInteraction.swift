@@ -64,7 +64,20 @@ enum DeskBoardLayout {
     }
 
     static func watches(_ active: [DeskItem]) -> [DeskItem] {
+        // Stalest first (desk-triage-makeover W2) — sorted HERE so rendering,
+        // arrow-key selection order, and reveal keys all share one definition
+        // (gpt-5.5 HIGH: sorting only the render path desynced ↓ from the
+        // visible list). Unparseable timestamps sort last; ties break on the
+        // raw timestamp string, then handle, so equal-date rows can't jitter
+        // between loads (gpt-5.5 MED: `sorted` is not stable).
         active.filter { !$0.isPursuit && isWatchShaped($0) }
+            .sorted { a, b in
+                let da = UserDisplayFormatters.parseISOTimestamp(a.updatedAt) ?? .distantFuture
+                let db = UserDisplayFormatters.parseISOTimestamp(b.updatedAt) ?? .distantFuture
+                if da != db { return da < db }
+                if a.updatedAt != b.updatedAt { return a.updatedAt < b.updatedAt }
+                return a.handle < b.handle
+            }
     }
 
     static func board(_ active: [DeskItem]) -> [DeskItem] {

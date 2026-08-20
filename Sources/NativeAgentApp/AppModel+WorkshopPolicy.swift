@@ -240,6 +240,20 @@ extension AppModel {
     }
 
     @MainActor
+    func saveChromeControlEnabled(_ enabled: Bool) async {
+        do {
+            let savedPolicy = try await client.saveChromeControlEnabled(enabled)
+            applySavedTrustPolicy(
+                savedPolicy,
+                status: enabled ? "Chrome control enabled" : "Chrome control disabled"
+            )
+            await ChromeControlRuntime.shared.reconcilePolicy()
+        } catch {
+            statusText = "Chrome control save failed: \(error.localizedDescription)"
+        }
+    }
+
+    @MainActor
     func saveAgentAccessMode(_ mode: String, developerMode: Bool? = nil) async {
         do {
             let savedPolicy = try await client.saveAgentAccessMode(mode, currentPolicy: trustPolicy, developerMode: developerMode)

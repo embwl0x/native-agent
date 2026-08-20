@@ -1,0 +1,594 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nativeagent.local/schemas/chrome-control-v1.json",
+  "title": "NativeAgent Chrome native-messaging protocol v1",
+  "oneOf": [
+    { "$ref": "#/$defs/request" },
+    { "$ref": "#/$defs/response" },
+    { "$ref": "#/$defs/event" }
+  ],
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{1,128}$"
+    },
+    "action": {
+      "enum": [
+        "attach",
+        "lease.acquire",
+        "lease.renew",
+        "lease.resume",
+        "lease.release",
+        "navigate",
+        "page.snapshot.read",
+        "page.element.click",
+        "page.element.fill",
+        "page.element.type",
+        "page.element.select",
+        "page.element.keypress",
+        "page.element.set_checked",
+        "page.element.double_click",
+        "page.wait",
+        "page.scroll"
+      ]
+    },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "type", "id", "action", "payload"],
+      "properties": {
+        "version": { "const": 1 },
+        "type": { "const": "request" },
+        "id": { "$ref": "#/$defs/id" },
+        "action": { "$ref": "#/$defs/action" },
+        "payload": { "type": "object" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "action": { "const": "attach" } }, "required": ["action"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/attachPayload" } } }
+        },
+        {
+          "if": { "properties": { "action": { "const": "lease.acquire" } }, "required": ["action"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/leaseAcquirePayload" } } }
+        },
+        {
+          "if": { "properties": { "action": { "const": "lease.renew" } }, "required": ["action"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/leaseRenewPayload" } } }
+        },
+        {
+          "if": { "properties": { "action": { "const": "lease.resume" } }, "required": ["action"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/leaseSequencePayload" } } }
+        },
+        {
+          "if": { "properties": { "action": { "const": "lease.release" } }, "required": ["action"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/leaseReleasePayload" } } }
+        },
+        {
+          "if": { "properties": { "action": { "const": "navigate" } }, "required": ["action"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/navigatePayload" } } }
+        },
+        {
+          "if": { "properties": { "action": { "const": "page.snapshot.read" } }, "required": ["action"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/snapshotReadPayload" } } }
+        },
+        {
+          "if": { "properties": { "action": { "const": "page.element.click" } }, "required": ["action"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/clickPayload" } } }
+        },
+        {
+          "if": { "properties": { "action": { "const": "page.element.fill" } }, "required": ["action"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/fillPayload" } } }
+        },
+        {
+          "if": { "properties": { "action": { "const": "page.element.type" } }, "required": ["action"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/typePayload" } } }
+        },
+        {
+          "if": { "properties": { "action": { "const": "page.element.select" } }, "required": ["action"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/selectPayload" } } }
+        },
+        {
+          "if": { "properties": { "action": { "const": "page.element.keypress" } }, "required": ["action"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/keypressPayload" } } }
+        },
+        {
+          "if": { "properties": { "action": { "const": "page.element.set_checked" } }, "required": ["action"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/setCheckedPayload" } } }
+        },
+        {
+          "if": { "properties": { "action": { "const": "page.element.double_click" } }, "required": ["action"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/snapshotNodePayload" } } }
+        },
+        {
+          "if": { "properties": { "action": { "const": "page.wait" } }, "required": ["action"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/waitPayload" } } }
+        },
+        {
+          "if": { "properties": { "action": { "const": "page.scroll" } }, "required": ["action"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/scrollPayload" } } }
+        }
+      ]
+    },
+    "attachPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "clientName": { "type": "string", "maxLength": 128 },
+        "clientVersion": { "type": "string", "maxLength": 64 }
+      }
+    },
+    "leaseAcquirePayload": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": {
+            "mode": { "const": "create" },
+            "initialUrl": { "$ref": "#/$defs/httpURL" },
+            "leaseDurationMs": { "$ref": "#/$defs/leaseDurationMs" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "tabId", "expectedTab"],
+          "properties": {
+            "mode": { "const": "claim" },
+            "tabId": { "type": "integer", "minimum": 0 },
+            "leaseDurationMs": { "$ref": "#/$defs/leaseDurationMs" },
+            "expectedTab": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["url", "title"],
+              "properties": {
+                "url": { "type": "string", "minLength": 1, "maxLength": 8192 },
+                "title": { "type": "string", "minLength": 1, "maxLength": 1024 }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "leaseRenewPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["leaseId", "expectedUserSequence"],
+      "properties": {
+        "leaseId": { "$ref": "#/$defs/id" },
+        "expectedUserSequence": { "type": "integer", "minimum": 0 },
+        "leaseDurationMs": { "$ref": "#/$defs/leaseDurationMs" }
+      }
+    },
+    "leaseSequencePayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["leaseId", "expectedUserSequence"],
+      "properties": {
+        "leaseId": { "$ref": "#/$defs/id" },
+        "expectedUserSequence": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "leaseReleasePayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["leaseId"],
+      "properties": {
+        "leaseId": { "$ref": "#/$defs/id" },
+        "closeCreatedTab": { "type": "boolean" }
+      }
+    },
+    "navigatePayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["leaseId", "expectedUserSequence", "url"],
+      "properties": {
+        "leaseId": { "$ref": "#/$defs/id" },
+        "expectedUserSequence": { "type": "integer", "minimum": 0 },
+        "url": { "$ref": "#/$defs/httpURL" }
+      }
+    },
+    "snapshotReadPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["leaseId"],
+      "properties": {
+        "leaseId": { "$ref": "#/$defs/id" },
+        "maxNodes": { "type": "integer", "minimum": 1, "maximum": 500 },
+        "maxTextChars": { "type": "integer", "minimum": 1, "maximum": 50000 }
+      }
+    },
+    "clickPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["leaseId", "expectedUserSequence", "snapshotId", "nodeId"],
+      "properties": {
+        "leaseId": { "$ref": "#/$defs/id" },
+        "expectedUserSequence": { "type": "integer", "minimum": 0 },
+        "snapshotId": { "$ref": "#/$defs/id" },
+        "nodeId": { "$ref": "#/$defs/id" },
+        "button": { "const": "left" }
+      }
+    },
+    "fillPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["leaseId", "expectedUserSequence", "snapshotId", "nodeId", "value"],
+      "properties": {
+        "leaseId": { "$ref": "#/$defs/id" },
+        "expectedUserSequence": { "type": "integer", "minimum": 0 },
+        "snapshotId": { "$ref": "#/$defs/id" },
+        "nodeId": { "$ref": "#/$defs/id" },
+        "value": { "type": "string", "maxLength": 50000 }
+      }
+    },
+    "typePayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["leaseId", "expectedUserSequence", "snapshotId", "nodeId", "text"],
+      "properties": {
+        "leaseId": { "$ref": "#/$defs/id" },
+        "expectedUserSequence": { "type": "integer", "minimum": 0 },
+        "snapshotId": { "$ref": "#/$defs/id" },
+        "nodeId": { "$ref": "#/$defs/id" },
+        "text": { "type": "string", "maxLength": 50000 },
+        "delayMs": { "type": "integer", "minimum": 0, "maximum": 250 }
+      }
+    },
+    "snapshotNodePayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["leaseId", "expectedUserSequence", "snapshotId", "nodeId"],
+      "properties": {
+        "leaseId": { "$ref": "#/$defs/id" },
+        "expectedUserSequence": { "type": "integer", "minimum": 0 },
+        "snapshotId": { "$ref": "#/$defs/id" },
+        "nodeId": { "$ref": "#/$defs/id" }
+      }
+    },
+    "selectPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["leaseId", "expectedUserSequence", "snapshotId", "nodeId", "values"],
+      "properties": {
+        "leaseId": { "$ref": "#/$defs/id" },
+        "expectedUserSequence": { "type": "integer", "minimum": 0 },
+        "snapshotId": { "$ref": "#/$defs/id" },
+        "nodeId": { "$ref": "#/$defs/id" },
+        "values": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "items": { "type": "string", "maxLength": 1024 }
+        }
+      }
+    },
+    "keypressPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["leaseId", "expectedUserSequence", "snapshotId", "nodeId", "key"],
+      "properties": {
+        "leaseId": { "$ref": "#/$defs/id" },
+        "expectedUserSequence": { "type": "integer", "minimum": 0 },
+        "snapshotId": { "$ref": "#/$defs/id" },
+        "nodeId": { "$ref": "#/$defs/id" },
+        "key": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^(?:(?:Alt|Control|Meta|Shift)\\+)*(?:Enter|Tab|Escape|ArrowDown|ArrowUp|ArrowLeft|ArrowRight|Home|End|PageUp|PageDown|Backspace|Delete|Space|A)$"
+        }
+      }
+    },
+    "setCheckedPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["leaseId", "expectedUserSequence", "snapshotId", "nodeId", "checked"],
+      "properties": {
+        "leaseId": { "$ref": "#/$defs/id" },
+        "expectedUserSequence": { "type": "integer", "minimum": 0 },
+        "snapshotId": { "$ref": "#/$defs/id" },
+        "nodeId": { "$ref": "#/$defs/id" },
+        "checked": { "type": "boolean" }
+      }
+    },
+    "waitPayload": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["leaseId", "expectedUserSequence", "condition", "snapshotId", "nodeId", "state"],
+          "properties": {
+            "leaseId": { "$ref": "#/$defs/id" },
+            "expectedUserSequence": { "type": "integer", "minimum": 0 },
+            "condition": { "const": "element_state" },
+            "snapshotId": { "$ref": "#/$defs/id" },
+            "nodeId": { "$ref": "#/$defs/id" },
+            "state": { "enum": ["visible", "hidden", "enabled", "disabled"] },
+            "timeoutMs": { "type": "integer", "minimum": 100, "maximum": 10000 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["leaseId", "expectedUserSequence", "condition"],
+          "properties": {
+            "leaseId": { "$ref": "#/$defs/id" },
+            "expectedUserSequence": { "type": "integer", "minimum": 0 },
+            "condition": { "const": "navigation_settled" },
+            "timeoutMs": { "type": "integer", "minimum": 100, "maximum": 10000 },
+            "settleMs": { "type": "integer", "minimum": 0, "maximum": 2000 }
+          }
+        }
+      ]
+    },
+    "scrollPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["leaseId", "expectedUserSequence", "deltaX", "deltaY"],
+      "properties": {
+        "leaseId": { "$ref": "#/$defs/id" },
+        "expectedUserSequence": { "type": "integer", "minimum": 0 },
+        "snapshotId": { "$ref": "#/$defs/id" },
+        "targetNodeId": { "$ref": "#/$defs/id" },
+        "deltaX": { "type": "number", "minimum": -100000, "maximum": 100000 },
+        "deltaY": { "type": "number", "minimum": -100000, "maximum": 100000 }
+      },
+      "dependentRequired": {
+        "targetNodeId": ["snapshotId"]
+      }
+    },
+    "httpURL": {
+      "type": "string",
+      "maxLength": 8192,
+      "pattern": "^https?://"
+    },
+    "leaseDurationMs": {
+      "type": "integer",
+      "minimum": 30000,
+      "maximum": 300000
+    },
+    "tabLease": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "leaseId", "tabId", "windowId", "ownership", "state", "userSequence",
+        "createdAt", "renewedAt", "expiresAt", "originalTab"
+      ],
+      "properties": {
+        "leaseId": { "$ref": "#/$defs/id" },
+        "tabId": { "type": "integer", "minimum": 0 },
+        "windowId": { "type": "integer", "minimum": 0 },
+        "ownership": { "enum": ["created", "claimed"] },
+        "state": { "const": "active" },
+        "userSequence": { "type": "integer", "minimum": 0 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "renewedAt": { "type": "string", "format": "date-time" },
+        "expiresAt": { "type": "string", "format": "date-time" },
+        "originalTab": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["active", "title", "url"],
+          "properties": {
+            "active": { "type": "boolean" },
+            "title": { "type": "string", "maxLength": 1024 },
+            "url": { "type": "string", "maxLength": 8192 }
+          }
+        }
+      }
+    },
+    "structuredPageSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "snapshotId",
+        "leaseId",
+        "tabId",
+        "userSequence",
+        "capturedAt",
+        "url",
+        "title",
+        "language",
+        "viewport",
+        "summary",
+        "nodes",
+        "frames"
+      ],
+      "properties": {
+        "snapshotId": { "$ref": "#/$defs/id" },
+        "leaseId": { "$ref": "#/$defs/id" },
+        "tabId": { "type": "integer", "minimum": 0 },
+        "userSequence": { "type": "integer", "minimum": 0 },
+        "capturedAt": { "type": "string", "format": "date-time" },
+        "url": { "$ref": "#/$defs/httpURL" },
+        "title": { "type": "string", "maxLength": 1024 },
+        "language": { "type": "string", "maxLength": 64 },
+        "viewport": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["width", "height", "scrollX", "scrollY", "documentWidth", "documentHeight"],
+          "properties": {
+            "width": { "type": "number", "minimum": 0 },
+            "height": { "type": "number", "minimum": 0 },
+            "scrollX": { "type": "number" },
+            "scrollY": { "type": "number" },
+            "documentWidth": { "type": "number", "minimum": 0 },
+            "documentHeight": { "type": "number", "minimum": 0 }
+          }
+        },
+        "summary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["text", "nodeCount", "truncated", "truncationReasons"],
+          "properties": {
+            "text": { "type": "string", "maxLength": 50000 },
+            "nodeCount": { "type": "integer", "minimum": 0, "maximum": 500 },
+            "truncated": { "type": "boolean" },
+            "truncationReasons": {
+              "type": "array",
+              "maxItems": 16,
+              "items": { "$ref": "#/$defs/id" }
+            }
+          }
+        },
+        "nodes": {
+          "type": "array",
+          "maxItems": 500,
+          "items": { "$ref": "#/$defs/pageNode" }
+        },
+        "frames": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/pageFrame" }
+        }
+      }
+    },
+    "pageFrame": {
+      "type": "object",
+      "required": ["frameId", "parentFrameId", "url", "name", "accessible", "nodeCount"],
+      "properties": {
+        "frameId": { "type": "integer", "minimum": 0 },
+        "parentFrameId": { "type": "integer", "minimum": -1 },
+        "url": { "type": "string", "maxLength": 8192 },
+        "name": { "type": "string", "maxLength": 500 },
+        "accessible": { "type": "boolean" },
+        "nodeCount": { "type": "integer", "minimum": 0, "maximum": 500 },
+        "error": {}
+      }
+    },
+    "pageNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "nodeId",
+        "parentNodeId",
+        "frameId",
+        "kind",
+        "role",
+        "name",
+        "text",
+        "value",
+        "level",
+        "visible",
+        "states",
+        "actions",
+        "url",
+        "bounds",
+        "scrollable"
+      ],
+      "properties": {
+        "nodeId": { "$ref": "#/$defs/id" },
+        "parentNodeId": { "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "frameId": { "type": "integer", "minimum": 0 },
+        "kind": {
+          "enum": [
+            "document", "landmark", "heading", "text", "link", "button", "input",
+            "checkbox", "radio", "select", "option", "image", "list", "listitem",
+            "table", "row", "cell", "dialog", "menu", "menuitem", "tab", "tabpanel", "other"
+          ]
+        },
+        "role": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 500 },
+        "text": { "type": "string", "maxLength": 1000 },
+        "value": { "type": ["string", "null"], "maxLength": 500 },
+        "level": { "type": ["integer", "null"], "minimum": 1, "maximum": 9 },
+        "visible": { "type": "boolean" },
+        "states": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["disabled", "checked", "selected", "expanded", "editable"],
+          "properties": {
+            "disabled": { "type": "boolean" },
+            "checked": { "type": ["boolean", "null"] },
+            "selected": { "type": ["boolean", "null"] },
+            "expanded": { "type": ["boolean", "null"] },
+            "editable": { "type": "boolean" }
+          }
+        },
+        "actions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "enum": ["click", "double_click", "fill", "type", "select", "set_checked", "keypress", "wait", "scroll"] }
+        },
+        "url": { "type": ["string", "null"], "maxLength": 2048 },
+        "bounds": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["x", "y", "width", "height"],
+          "properties": {
+            "x": { "type": "number" },
+            "y": { "type": "number" },
+            "width": { "type": "number", "minimum": 0 },
+            "height": { "type": "number", "minimum": 0 }
+          }
+        },
+        "scrollable": { "type": "boolean" }
+      }
+    },
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "type", "id", "action", "ok"],
+      "properties": {
+        "version": { "const": 1 },
+        "type": { "const": "response" },
+        "id": { "$ref": "#/$defs/id" },
+        "action": { "$ref": "#/$defs/id" },
+        "ok": { "type": "boolean" },
+        "result": {},
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code", "message"],
+          "properties": {
+            "code": { "$ref": "#/$defs/id" },
+            "message": { "type": "string", "maxLength": 2048 },
+            "details": {}
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "ok": { "const": true } } },
+          "then": { "required": ["result"], "not": { "required": ["error"] } },
+          "else": { "required": ["error"], "not": { "required": ["result"] } }
+        }
+      ]
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "type", "event", "occurredAt", "payload"],
+      "properties": {
+        "version": { "const": 1 },
+        "type": { "const": "event" },
+        "event": {
+          "enum": ["lease.granted", "lease.renewed", "lease.yielded", "lease.released"]
+        },
+        "occurredAt": { "type": "string", "format": "date-time" },
+        "payload": {}
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "event": { "enum": ["lease.granted", "lease.renewed"] } },
+            "required": ["event"]
+          },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/tabLease" } } },
+          "else": { "properties": { "payload": { "$ref": "#/$defs/leaseTerminalEvent" } } }
+        }
+      ]
+    },
+    "leaseTerminalEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["leaseId", "tabId", "reason", "userSequence"],
+      "properties": {
+        "leaseId": { "$ref": "#/$defs/id" },
+        "tabId": { "type": "integer", "minimum": 0 },
+        "reason": { "$ref": "#/$defs/id" },
+        "userSequence": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

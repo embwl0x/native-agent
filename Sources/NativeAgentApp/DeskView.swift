@@ -220,7 +220,7 @@ enum DeskAttentionStrip {
             out.append(DeskAttentionLine(
                 id: "gh:\(item.itemId)",
                 icon: "arrow.triangle.pull",
-                text: "\(item.repository) #\(item.number) needs your call — see GitHub Command",
+                text: "\(item.repository) #\(item.number) needs your call — see GitHub Watcher",
                 shape: .primary,
                 needsUserDirectly: true))
         }
@@ -372,6 +372,11 @@ struct DeskView: View {
     // may disappear: unknown statuses render on the bench with their raw pill.
     @State private var executionsLane: DeskLaneState<WorkshopExecution.WorkshopExecutionRecord> = .rows([])
     @State private var loadError: String?
+    /// False until the first load() actually publishes a snapshot. Empty lanes
+    /// before that point mean "nothing has reported", not "nothing exists" —
+    /// the empty state is gated on this so it never renders during the initial
+    /// read window (no-theater: "clear" is a claim every lane must earn).
+    @State private var hasLoadedOnce = false
     @State private var expandedRoots: Set<String> = []
     @State private var showAllFinished = false
     @State private var showAllAttention = false
@@ -384,7 +389,7 @@ struct DeskView: View {
     // Derived sequencing for the CURRENT items, recomputed only in load().
     @State private var plan: DeskSequencing.Plan = DeskSequencing.Plan()
     @State private var aliasByHandle: [String: String] = [:]
-    // W2b: the GitHub Command operational lane (workshop-github-command.md).
+    // W2b: the GitHub Watcher monitoring lane (workshop-github-command.md).
     @State private var githubLane: DeskLaneState<GitHubCommandItem> = .rows([])
 
     // MARK: W5 — the interaction tier (sweep R4, desk interaction)
@@ -405,6 +410,10 @@ struct DeskView: View {
     @State private var actionInFlight = false
     @State private var actionNotice: DeskActionNotice?
     @FocusState private var benchFocused: Bool
+    /// Triage-counter navigation (desk-triage-makeover W1): a tapped counter
+    /// names its section anchor here; the ScrollViewReader in `body` performs
+    /// the scroll — same one-rule pattern as `selectedHandle`.
+    @State private var scrollTarget: String?
 
     /// A one-line receipt for the last action — the tool's OWN confirmation
     /// string (or its honest refusal), never a UI-invented "Done".
@@ -526,6 +535,13 @@ struct DeskView: View {
                         proxy.scrollTo(new, anchor: .center)
                     }
                 }
+                .onChange(of: scrollTarget) { _, new in
+                    guard let new else { return }
+                    withAnimation(.easeInOut(duration: 0.22)) {
+                        proxy.scrollTo(new, anchor: .top)
+                    }
+                    scrollTarget = nil
+                }
         }
         .navigationTitle("Desk")
         .toolbar {
@@ -577,11 +593,19 @@ struct DeskView: View {
 
                 // "The bench is clear" is a claim about the bench. It may only
                 // render when every lane actually reported — a failed read is
-                // not a clear bench (NORTHSTAR clause 2, no theater).
+                // not a clear bench (NORTHSTAR clause 2, no theater). Before the
+                // first load() round-trips, nothing has reported yet, so the
+                // same clause forbids the claim there too: an 82-item board
+                // must not open on "The desk is clear" for two seconds.
                 if items.isEmpty && allExecutions.isEmpty && githubItems.isEmpty
                     && loadError == nil && !laneUnavailable {
-                    emptyState
+                    if hasLoadedOnce {
+                        emptyState
+                    } else {
+                        loadingState
+                    }
                 } else {
+                    countersStrip
                     attentionSection
                     githubCommandSection
                     benchSection
@@ -994,10 +1018,82 @@ struct DeskView: View {
                     .font(.subheadline).foregroundStyle(.secondary)
             }
             Spacer()
-            Text(headerCounts)
-                .font(.caption).foregroundStyle(.tertiary)
             nagsButton
         }
+    }
+
+    // MARK: triage counters (desk-triage-makeover W1)
+    //
+    // The health check: four numbers that answer "what needs me, what's she
+    // doing, what am I watching, what's rotting" without reading a single row.
+    // Tinted only when nonzero so a calm desk reads calm; each card scrolls to
+    // its section. Counts come from the SAME slices the sections render from —
+    // a counter may never disagree with the list below it.
+
+    private var needsYouCount: Int {
+        approvalExecutions.count + attentionItems.count + needsUserGitHubItems.count
+    }
+
+    private static let staleThresholdDays = 7
+
+    /// Days since the item was last touched (DeskItem carries one updatedAt;
+    /// the motor timestamp is a GitHubCommandItem field, not this type's).
+    private func ageDays(_ item: DeskItem) -> Int? {
+        guard let date = Self.parseISO(item.updatedAt) else { return nil }
+        return Int(Date().timeIntervalSince(date) / 86_400)
+    }
+
+    /// Rot = WATCH items untouched past the threshold, minus blocked/flagged
+    /// (those already count against "Needs you"). Scoped to the same section
+    /// the counter scrolls to (gpt-5.5 HIGH: counting board items the tap
+    /// can't reach let the counter disagree with its target — and could aim
+    /// at an anchor that never rendered). Non-watch rows still surface their
+    /// own rot via the amber chip in `freshnessText`.
+    private var staleWatchItems: [DeskItem] {
+        watchItems.filter {
+            $0.status != .blocked && $0.status != .flag
+                && (ageDays($0) ?? 0) >= Self.staleThresholdDays
+        }
+    }
+
+    private var countersStrip: some View {
+        HStack(spacing: 10) {
+            triageCounter("Needs you", count: needsYouCount, tint: .red,
+                          symbol: "hand.raised", target: "sec-attention")
+            triageCounter("In progress", count: benchExecutions.count, tint: .blue,
+                          symbol: "hammer", target: "sec-bench")
+            triageCounter("Watching", count: watchItems.count, tint: nil,
+                          symbol: "binoculars", target: "sec-watch")
+            triageCounter("Stale \(Self.staleThresholdDays)d+", count: staleWatchItems.count,
+                          tint: .orange, symbol: "hourglass", target: "sec-watch")
+        }
+    }
+
+    private func triageCounter(_ label: String, count: Int, tint: Color?,
+                               symbol: String, target: String) -> some View {
+        let active = count > 0
+        let accent = active ? (tint ?? .primary) : Color.secondary
+        return VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 5) {
+                Image(systemName: symbol).font(.caption2)
+                Text(label).font(.caption)
+            }
+            .foregroundStyle(active && tint != nil ? AnyShapeStyle(accent) : AnyShapeStyle(.secondary))
+            Text("\(count)")
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(active ? AnyShapeStyle(.primary) : AnyShapeStyle(.tertiary))
+                .contentTransition(.numericText())
+        }
+        .padding(.vertical, 8).padding(.horizontal, 12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            active && tint != nil ? accent.opacity(0.10) : Color.primary.opacity(0.04),
+            in: RoundedRectangle(cornerRadius: 8))
+        .contentShape(Rectangle())
+        .naInteractive(radius: 8)
+        .onTapGesture { if active { scrollTarget = target } }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(label): \(count)")
     }
 
     /// C6: User's nag switch, in the UI. It shipped controllable ONLY through the
@@ -1027,15 +1123,6 @@ struct DeskView: View {
     private var nagBellSymbol: String {
         if nagConfig.isMuted(now: Date()) { return "bell.slash" }
         return nagConfig.enabled ? "bell.fill" : "bell"
-    }
-
-    private var headerCounts: String {
-        var parts: [String] = []
-        if !benchExecutions.isEmpty { parts.append("\(benchExecutions.count) in progress") }
-        if !pursuitItems.isEmpty { parts.append("\(pursuitItems.count) pursuit\(pursuitItems.count == 1 ? "" : "s")") }
-        parts.append("\(boardItems.count) on the board")
-        if !watchItems.isEmpty { parts.append("\(watchItems.count) watching") }
-        return parts.joined(separator: " · ")
     }
 
     private func sectionHeader(_ title: String, count: Int? = nil, systemImage: String) -> some View {
@@ -1082,6 +1169,19 @@ struct DeskView: View {
         .frame(maxWidth: .infinity).padding(.vertical, 44)
     }
 
+    /// Shown only in the window between first appearance and the first
+    /// completed load(). Deliberately quiet — on a populated board this is
+    /// visible for a beat or two, and a splashy spinner would flash on every
+    /// launch.
+    private var loadingState: some View {
+        VStack(spacing: 10) {
+            ProgressView().controlSize(.small)
+            Text("Reading the desk\u{2026}")
+                .font(.callout).foregroundStyle(.tertiary)
+        }
+        .frame(maxWidth: .infinity).padding(.vertical, 44)
+    }
+
     // MARK: section 1 — waiting on you (only when something actually is)
     //
     // A compact attention strip, not duplicate rows: blocked/flagged items keep
@@ -1095,6 +1195,7 @@ struct DeskView: View {
             // The count is on the header, always — so the strip states how much
             // is waiting even in the frame where most of it is collapsed.
             sectionHeader("Waiting on you", count: strip.totalItems, systemImage: "hand.raised")
+                .id("sec-attention")
             VStack(alignment: .leading, spacing: 6) {
                 ForEach(strip.visible) { line in
                     attentionRow(line)
@@ -1147,7 +1248,7 @@ struct DeskView: View {
         }
     }
 
-    // MARK: GitHub Command — the operational lane (W2b)
+    // MARK: GitHub Watcher — notification-only monitoring (W2b)
     //
     // Directly below Waiting on you, above the bench (contract position).
     // Organized by who has the next move; healthy/waiting PRs collapse.
@@ -1155,9 +1256,9 @@ struct DeskView: View {
 
     private enum GHBucket: String, CaseIterable {
         // Display bucket only — persisted state is GitHubCommandItem.state;
-        // renamed from "Needs Codex" 2026-08-01 (User-approved taste item).
-        case needsCodex = "Waiting on Codex"
-        case codexWorking = "Codex working"
+        case actionNeeded = "Action needed"
+        // Historical rows only. The watcher never creates new work.
+        case legacyWork = "Finishing prior work"
         case needsUser = "Needs you"
         case waiting = "Waiting upstream"
         case attention = "Attention"
@@ -1166,8 +1267,8 @@ struct DeskView: View {
 
     private func bucket(_ item: GitHubCommandItem) -> GHBucket {
         switch item.state {
-        case .detected, .needsCodex: return .needsCodex
-        case .codexWorking, .verifying: return .codexWorking
+        case .detected, .needsCodex: return .actionNeeded
+        case .codexWorking, .verifying: return .legacyWork
         case .needsUser: return .needsUser
         case .waitingUpstream: return .waiting
         case .attention: return .attention
@@ -1190,18 +1291,18 @@ struct DeskView: View {
         // Always visible (User, 2026-07-12: "this is just my window into
         // checking on what she's got with human eyes") — a monitoring surface
         // that hides itself when quiet reads as missing, not as quiet.
-        sectionHeader("GitHub Command", systemImage: "arrow.triangle.pull")
+        sectionHeader("GitHub Watcher", systemImage: "eye")
         if let reason = githubLane.unavailableReason {
             laneUnavailableNotice(
-                title: "GitHub Command state unavailable",
+                title: "GitHub Watcher state unavailable",
                 detail: reason)
         } else if githubItems.isEmpty {
-            Text("No tracked GitHub work in the command lane yet — items appear on the next tracking refresh, and anything actionable routes to codex automatically.")
+            Text("The watcher is quiet. Tracked GitHub changes appear here and notify you when attention is needed; nothing starts automatically.")
                 .font(.callout).foregroundStyle(.tertiary)
                 .padding(.leading, 4)
         } else {
             ghPortfolioStrip
-            ForEach([GHBucket.needsCodex, .codexWorking, .needsUser, .attention], id: \.rawValue) { bucket in
+            ForEach([GHBucket.actionNeeded, .legacyWork, .needsUser, .attention], id: \.rawValue) { bucket in
                 let rows = ghBucketItems(bucket)
                 if !rows.isEmpty {
                     ghSubheader(bucket.rawValue, count: rows.count,
@@ -1334,7 +1435,7 @@ struct DeskView: View {
     private func ghStatePill(_ item: GitHubCommandItem) -> some View {
         let (label, color): (String, Color) = {
             switch item.state {
-            case .detected, .needsCodex: return ("waiting on codex", .gray)
+            case .detected, .needsCodex: return ("action needed", .orange)
             case .codexWorking: return ("codex working", .blue)
             case .verifying: return ("verifying", .teal)
             case .needsUser: return ("needs you", .orange)
@@ -1362,6 +1463,7 @@ struct DeskView: View {
     private var benchSection: some View {
         sectionHeader("In progress", count: benchExecutions.isEmpty ? nil : benchExecutions.count,
                       systemImage: "hammer")
+            .id("sec-bench")
         if let reason = executionsLane.unavailableReason {
             // "Quiet right now" would be a lie here: the lane didn't say quiet,
             // it failed to answer.
@@ -1535,6 +1637,9 @@ struct DeskView: View {
     private var watchesSection: some View {
         if !watchItems.isEmpty {
             sectionHeader("Waiting & watches", count: watchItems.count, systemImage: "binoculars")
+                .id("sec-watch")
+            // Stalest-first ordering lives in DeskBoardLayout.watches() so the
+            // visible order and the arrow-key selection order can't diverge.
             ForEach(groups(watchItems), id: \.key) { groupView($0, section: "watch") }
         }
     }
@@ -1547,7 +1652,7 @@ struct DeskView: View {
             sectionHeader("The board", count: boardItems.count, systemImage: "list.clipboard")
             ForEach(groups(boardNonGhItems), id: \.key) { groupView($0, section: "board") }
             // GitHub rows collapse to one summary per project — the numbered
-            // PR inventory look dies here. The dedicated GitHub Command lane
+            // PR inventory look dies here. The dedicated GitHub Watcher lane
             // (routing state machine) arrives with W1's store; this is only
             // the presentation collapse.
             ForEach(ghByProject, id: \.project) { group in
@@ -1750,8 +1855,7 @@ struct DeskView: View {
                     .lineLimit(2)
                 Spacer(minLength: 4)
                 if item.pinned { Image(systemName: "pin.fill").font(.caption2).foregroundStyle(.orange) }
-                Text(relativeTime(item.updatedAt))
-                    .font(.caption2).foregroundStyle(.tertiary)
+                freshnessText(item)
                 if childCount > 0 {
                     Text("\(childCount)")
                         .font(.caption2.weight(.semibold))
@@ -1917,6 +2021,27 @@ struct DeskView: View {
 
     // MARK: relative time
 
+    /// Row freshness (desk-triage-makeover W2): a quiet active item past the
+    /// stale threshold trades its tertiary "Nd ago" for an amber "Nd stale"
+    /// chip — the same rot the Stale counter counts, visible on the row.
+    /// Blocked/flagged rows keep the plain timestamp; their urgency is already
+    /// the status pill's job.
+    @ViewBuilder
+    private func freshnessText(_ item: DeskItem) -> some View {
+        let age = ageDays(item) ?? 0
+        if age >= Self.staleThresholdDays,
+           item.status != .blocked, item.status != .flag, !item.status.isTerminal {
+            Text("\(age)d stale")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.orange)
+                .padding(.horizontal, 5).padding(.vertical, 1)
+                .background(Color.orange.opacity(0.12), in: Capsule())
+        } else {
+            Text(relativeTime(item.updatedAt))
+                .font(.caption2).foregroundStyle(.tertiary)
+        }
+    }
+
     private func relativeTime(_ iso: String) -> String {
         guard let date = Self.parseISO(iso) else { return "" }
         let seconds = max(0, Date().timeIntervalSince(date))
@@ -1995,6 +2120,10 @@ struct DeskView: View {
         }
         executionsLane = snapshot.executions
         githubLane = snapshot.githubItems
+        // Set on ANY accepted publish, error included: a completed load that
+        // failed still "reported" (the error banner owns the surface), and the
+        // empty-state gate already excludes loadError/lane-unavailable.
+        hasLoadedOnce = true
     }
 
     /// Ground truth for the silent-zero cross-check: what does the execution

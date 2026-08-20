@@ -14,6 +14,79 @@ import MacControl
 import SwarmRuns
 import MacIntegration
 
+/// Joinable ownership for one core streaming producer. Surface adapters that
+/// cancel a consumer must wait for this execution before treating the turn as
+/// settled: the producer owns cancellation/failure transcript persistence and
+/// can emit its terminal event before that write has completed.
+public struct ChatStreamExecution: @unchecked Sendable {
+    public let events: AsyncThrowingStream<TurnStreamEvent, Error>
+    private let control: ChatStreamProducerControl
+
+    fileprivate init(
+        events: AsyncThrowingStream<TurnStreamEvent, Error>,
+        control: ChatStreamProducerControl
+    ) {
+        self.events = events
+        self.control = control
+    }
+
+    public func cancel() { control.cancel() }
+    public func waitForProducerTermination() async { await control.wait() }
+}
+
+/// Lock-backed instead of actor-backed so cancellation can synchronously reach
+/// the producer from `AsyncStream.Continuation.onTermination`.
+final class ChatStreamProducerControl: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: Task<Void, Never>?
+    private var cancellationRequested = false
+    private var resolved = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func install(_ task: Task<Void, Never>) {
+        lock.lock()
+        if !resolved { self.task = task }
+        let shouldCancel = cancellationRequested
+        lock.unlock()
+        if shouldCancel { task.cancel() }
+    }
+
+    func cancel() {
+        lock.lock()
+        cancellationRequested = true
+        let task = task
+        lock.unlock()
+        task?.cancel()
+    }
+
+    func resolve() {
+        lock.lock()
+        guard !resolved else {
+            lock.unlock()
+            return
+        }
+        resolved = true
+        task = nil
+        let pending = waiters
+        waiters.removeAll(keepingCapacity: false)
+        lock.unlock()
+        pending.forEach { $0.resume() }
+    }
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            guard !resolved else {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            waiters.append(continuation)
+            lock.unlock()
+        }
+    }
+}
+
 extension SwiftNativeChatOrchestrationClient {
     // MARK: chatStream
     //
@@ -65,6 +138,35 @@ extension SwiftNativeChatOrchestrationClient {
         suppressUserAppend: Bool,
         replacementAssistantMessageID: String?
     ) -> AsyncThrowingStream<TurnStreamEvent, Error> {
+        chatStreamExecution(
+            message: message,
+            sessionId: sessionId,
+            model: model,
+            reasoningEffort: reasoningEffort,
+            fileAccess: fileAccess,
+            attachments: attachments,
+            persona: persona,
+            surface: surface,
+            suppressUserAppend: suppressUserAppend,
+            replacementAssistantMessageID: replacementAssistantMessageID
+        ).events
+    }
+
+    /// Concrete joinable form used by the Mac lifecycle owner. Existing
+    /// `chatStream` callers retain their stream-only API and cancellation
+    /// behavior; callers that own terminal truth can also join persistence.
+    public nonisolated func chatStreamExecution(
+        message: String,
+        sessionId: String?,
+        model: String,
+        reasoningEffort: String,
+        fileAccess: String,
+        attachments: [MultimodalAttachment],
+        persona: String?,
+        surface: String,
+        suppressUserAppend: Bool,
+        replacementAssistantMessageID: String? = nil
+    ) -> ChatStreamExecution {
         // Turn Inspector W1: bind the per-turn trace id ONCE around the whole
         // streaming turn. runStream branches to the text-compat loop OR the
         // structured tool loop; both (and the streamTurn / engine calls nested
@@ -80,9 +182,11 @@ extension SwiftNativeChatOrchestrationClient {
         // (crash on first chat, G4-5; the VM's timing exposed a latent race
         // that can bite real hardware). Binding inside the Task keeps push/pop
         // LIFO on the child's own stack. Same fix pattern as StructuredChat.
-        let turnId = TurnTraceContext.mintTurnId()
-        return AsyncThrowingStream { continuation in
+        let turnId = TurnTraceContext.turnId ?? TurnTraceContext.mintTurnId()
+        let control = ChatStreamProducerControl()
+        let events = AsyncThrowingStream<TurnStreamEvent, Error> { continuation in
             let task = Task { [self] in
+                defer { control.resolve() }
                 if surface == "chat", let sessionId, !sessionId.isEmpty {
                     await TurnFirstRenderRegistry.shared.register(
                         turnId: turnId,
@@ -110,8 +214,12 @@ extension SwiftNativeChatOrchestrationClient {
                         }
                 }
             }
-            continuation.onTermination = { _ in task.cancel() }
+            control.install(task)
+            continuation.onTermination = { termination in
+                if case .cancelled = termination { control.cancel() }
+            }
         }
+        return ChatStreamExecution(events: events, control: control)
     }
 
     private func runStream(

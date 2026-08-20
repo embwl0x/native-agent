@@ -1121,39 +1121,20 @@ extension SwiftToolDispatcher {
             surface: surface,
             route: ChatToolSessionContext.replyRoute
         )
-        // Trusted path A: the GitHub Command lane hands us an app-resolved
-        // absolute checkout. Still surface-gated -- chat can never set this.
-        let dispatcherSuppliedDirectory: String? = {
-            guard surface == "github-command",
-                  case .string(let raw)? = input["working_directory"] else { return nil }
-            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard value.hasPrefix("/") else { return nil }
-            let url = URL(fileURLWithPath: value).standardizedFileURL
-            var isDirectory: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
-                  isDirectory.boolValue else { return nil }
-            return url.path
-        }()
-
         let requestedDirectory: String?
-        if dispatcherSuppliedDirectory == nil {
-            switch await resolveAgentBridgeWorkingDirectory(input: input, surface: surface) {
-            case .success(let path): requestedDirectory = path
-            case .failure(let envelope): return envelope
-            }
-        } else {
-            requestedDirectory = nil
+        switch await resolveAgentBridgeWorkingDirectory(input: input, surface: surface) {
+        case .success(let path): requestedDirectory = path
+        case .failure(let envelope): return envelope
         }
 
-        // Trusted path B: any caller may name an owner/name GitHub repository.
+        // Any caller may name an owner/name GitHub repository.
         // It is NOT a path -- the app resolves it through the same
         // remote-verified resolver the GitHub Command lane uses, so the trust
         // anchor stays "this checkout's git remote really is that repo" rather
         // than "the model said so". An unresolvable or malformed repository
         // yields nil and the send proceeds with today's no-profile behavior.
         let repositoryResolvedDirectory: String? = {
-            guard dispatcherSuppliedDirectory == nil,
-                  requestedDirectory == nil,
+            guard requestedDirectory == nil,
                   case .string(let raw)? = input["repository"] else { return nil }
             let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             guard Self.isWellFormedRepositorySlug(value) else { return nil }
@@ -1165,28 +1146,23 @@ extension SwiftToolDispatcher {
             return checkout.standardizedFileURL.path
         }()
 
-        // Trusted path C: nobody named a repository, so infer one from the
+        // If nobody named a repository, infer one from the
         // request itself. Same resolver, same remote-verified trust anchor as
         // path B -- this only removes the caller's obligation to remember the
         // parameter, which is what cost the 2026-08-05 turn every GitHub path.
         let inferredRepositoryDirectory: String? = {
-            guard dispatcherSuppliedDirectory == nil,
-                  requestedDirectory == nil,
+            guard requestedDirectory == nil,
                   repositoryResolvedDirectory == nil else { return nil }
             return inferredRepositoryCheckout(fromRequestText: [text, topic ?? ""].joined(separator: "\n"))
         }()
 
-        let workingDirectory = dispatcherSuppliedDirectory
-            ?? requestedDirectory
+        let workingDirectory = requestedDirectory
             ?? repositoryResolvedDirectory
             ?? inferredRepositoryDirectory
-        // This capability marker is created only from the trusted dispatcher
-        // surface plus an app-verified checkout. It is never accepted from
-        // model-authored input, topic text, or repository-controlled prose:
-        // the inferred path carries it only because the checkout itself was
-        // resolved by remote verification, exactly as the explicit path is.
-        let executionProfile = (dispatcherSuppliedDirectory != nil
-            || repositoryResolvedDirectory != nil
+        // This capability marker is created only from a remote-verified
+        // repository checkout. It is never accepted from caller-supplied
+        // working_directory, topic text, or repository-controlled prose.
+        let executionProfile = (repositoryResolvedDirectory != nil
             || inferredRepositoryDirectory != nil)
             ? "github-command-repository-network-v1"
             : nil
@@ -1240,9 +1216,9 @@ extension SwiftToolDispatcher {
         let inboxEntry = entry
 
         let persistence = SwiftNativePersistenceCore()
-        let appendStatus: String
+        let appendResult: (status: String, priorWakeAccepted: Bool)
         do {
-            appendStatus = try await persistence.withFileLock(inboxURL) {
+            appendResult = try await persistence.withFileLock(inboxURL) {
                 let existing = try await persistence.readJSONL(inboxURL).first { row in
                     guard case .object(let object) = row else { return false }
                     return object["messageId"] == .string(messageId) || object["id"] == .string(messageId)
@@ -1259,12 +1235,16 @@ extension SwiftToolDispatcher {
                           object["conversationId"] == inboxEntry["conversationId"],
                           object["workingDirectory"] == inboxEntry["workingDirectory"],
                           object["executionProfile"] == inboxEntry["executionProfile"] else {
-                        return "conflict"
+                        return ("conflict", false)
                     }
-                    return "duplicate"
+                    let consumedAt: String? = {
+                        guard case .string(let value)? = object["consumedAt"] else { return nil }
+                        return value.isEmpty ? nil : value
+                    }()
+                    return ("duplicate", object["read"] == .bool(true) || consumedAt != nil)
                 }
                 try await persistence.appendJSONL(.object(inboxEntry), to: inboxURL)
-                return "appended"
+                return ("appended", false)
             }
         } catch {
             return .object([
@@ -1274,14 +1254,15 @@ extension SwiftToolDispatcher {
             ])
         }
         let path = inboxURL.path
-        guard appendStatus != "conflict" else {
+        guard appendResult.status != "conflict" else {
             return .object([
                 "status": .string("failed"),
                 "reason": .string("message_id_conflict"),
                 "messageId": .string(messageId),
             ])
         }
-        let deduplicated = appendStatus == "duplicate"
+        let deduplicated = appendResult.status == "duplicate"
+        let retryUnacceptedWake = deduplicated && !appendResult.priorWakeAccepted
         var response: [String: JSONValue] = [
             "status": .string("queued"),
             "messageId": .string(messageId),
@@ -1295,12 +1276,11 @@ extension SwiftToolDispatcher {
         ]
         if let workingDirectory { response["workingDirectory"] = .string(workingDirectory) }
         if let executionProfile {
-            // Make the auto-attach observable: a silently-applied profile is
+            // Make repository attachment observable: a silently-applied profile is
             // indistinguishable from a silently-missing one at the call site.
             response["executionProfile"] = .string(executionProfile)
             response["repositorySource"] = .string(
-                dispatcherSuppliedDirectory != nil ? "dispatcher"
-                    : repositoryResolvedDirectory != nil ? "repository_parameter"
+                repositoryResolvedDirectory != nil ? "repository_parameter"
                     : "inferred_from_request"
             )
         }
@@ -1314,13 +1294,19 @@ extension SwiftToolDispatcher {
             priority: priority,
             topic: topic
         )
-        if deduplicated {
-            // A duplicate message_id means this exact actionable event already
-            // queued its inbox row and fired its wakeup on first delivery.
-            // Re-poking the codex thread would double-wake it, so skip the
-            // wakeup side effect entirely and report the dedup outcome.
+        if deduplicated && !retryUnacceptedWake {
+            // The helper marks the inbox row consumed only after a Codex turn
+            // and its reply job are both durable. That is authority that the
+            // first wake really landed, so an identical resend must not poke
+            // Codex again.
             response["wakeup"] = .object(["status": .string("deduplicated")])
         } else {
+            // A row can predate its wake: inbox persistence happens first, and
+            // the app-server helper may then fail. Retrying that unconsumed row
+            // is recovery, not duplicate execution. Pinned-thread pending
+            // queues own their own message-id dedupe if the first wake was
+            // accepted but has not reached an idle point yet.
+            if retryUnacceptedWake { response["wakeupRetried"] = .bool(true) }
             let wakeup = await postCodexThreadWakeup(
                 messageId: messageId,
                 text: text,

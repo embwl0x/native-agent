@@ -435,6 +435,31 @@ private func yoloInstallConfirmPolicy(developerMode: Bool = false) -> JSONValue 
     ])
 }
 
+@Test func AutonomyGuardCharacterization_COMPOSED_permissionResetStopsBeforeShellUnderYolo() async throws {
+    let chain = try await composedChain(policy: yoloInstallConfirmPolicy())
+
+    #expect(await dispatched(
+        chain,
+        "bash",
+        input: ["cmd": .string("git status --short")]
+    ))
+    #expect(await dispatched(
+        chain,
+        "bash",
+        input: [
+            "cmd": .string(
+                "sqlite3 ~/Library/Application\\ Support/com.apple.TCC/TCC.db "
+                    + "\"SELECT client, auth_value FROM access;\"; git status --short"
+            )
+        ]
+    ))
+    #expect(!(await dispatched(
+        chain,
+        "bash",
+        input: ["cmd": .string("tccutil reset SpeechRecognition com.example.app")]
+    )))
+}
+
 @Test func AutonomyGuardCharacterization_COMPOSED_exactApprovedPersonaReplay_reachesInner() async throws {
     let input: [String: JSONValue] = [
         "kind": .string("soul"),

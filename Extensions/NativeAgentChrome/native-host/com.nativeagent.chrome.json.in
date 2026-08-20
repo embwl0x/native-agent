@@ -1,0 +1,9 @@
+{
+  "name": "com.nativeagent.chrome",
+  "description": "NativeAgent Chrome transport relay",
+  "path": "__ABSOLUTE_NATIVEAGENT_CHROME_RELAY_PATH__",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://egdbijiogeeggnmjheomgnnkhmlepfcn/"
+  ]
+}

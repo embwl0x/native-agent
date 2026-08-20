@@ -554,6 +554,9 @@ public protocol LoopRunner: Sendable {
     /// Fire-and-forget entry point. Defaulted to call `tickOutcome()` and
     /// discard the result (see extension); a loop should not implement it.
     func tick() async
+    /// Cancels and drains work that the loop intentionally owns beyond one
+    /// admitted tick. Most loops own no such work and use the default no-op.
+    func shutdown() async
 }
 
 public extension LoopRunner {
@@ -563,6 +566,8 @@ public extension LoopRunner {
     func tick() async {
         _ = await tickOutcome()
     }
+
+    func shutdown() async {}
 }
 
 /// An event-first background worker with one optional exact persisted deadline.
@@ -865,8 +870,9 @@ public actor SwiftNativeLoopScheduler {
         // is stale; without cancelling it, spawnTaskIfNeeded() would refuse
         // to spawn a new task (tasks[id] != nil) and the new loop would
         // never run.
-        if loops[id] != nil, let oldTask = tasks.removeValue(forKey: id) {
-            oldTask.cancel()
+        if let previous = loops[id] {
+            tasks.removeValue(forKey: id)?.cancel()
+            await previous.loop.shutdown()
         }
         let reg = Registration(loop: loop, registrationId: UUID())
         loops[id] = reg
@@ -882,7 +888,8 @@ public actor SwiftNativeLoopScheduler {
         if let t = tasks.removeValue(forKey: loopId) {
             t.cancel()
         }
-        loops.removeValue(forKey: loopId)
+        let removed = loops.removeValue(forKey: loopId)
+        await removed?.loop.shutdown()
         states.removeValue(forKey: loopId)
         // gpt-5.5 BLOCKING (A4.8 round 2): the transient streak state must
         // die with the registration — a replacement loop inheriting a stale
@@ -908,6 +915,9 @@ public actor SwiftNativeLoopScheduler {
             t.cancel()
         }
         tasks.removeAll()
+        for registration in loops.values {
+            await registration.loop.shutdown()
+        }
         // An orderly stop must not drop a coalesced durable stamp (A1/FIX-3).
         await flushPendingDurableState()
     }

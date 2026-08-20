@@ -3,6 +3,79 @@ import NativeAgentCore
 import PersistenceCore
 
 extension TelegramPollLoop {
+    public static let defaultSendRichMessageDraft: @Sendable (
+        String, Int, Int, TelegramInputRichMessage
+    ) async throws -> Void = {
+        token, chatId, draftId, richMessage in
+        guard let url = _tgBuildBotURL(token: token, method: "sendRichMessageDraft") else {
+            throw TelegramBotError.invalidRequest
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONValue.object([
+            "chat_id": .int(Int64(chatId)),
+            "draft_id": .int(Int64(draftId)),
+            "rich_message": richMessage.jsonValue,
+        ]).serializedData(pretty: false)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        _ = try _tgValidateResponse(
+            data,
+            response: response,
+            operation: "sendRichMessageDraft",
+            resultType: Bool.self,
+            validateResult: { $0 }
+        )
+    }
+
+    public static let defaultSendRichMessage: @Sendable (
+        String, Int, TelegramInputRichMessage
+    ) async throws -> Int = {
+        token, chatId, richMessage in
+        guard let url = _tgBuildBotURL(token: token, method: "sendRichMessage") else {
+            throw TelegramBotError.invalidRequest
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONValue.object([
+            "chat_id": .int(Int64(chatId)),
+            "rich_message": richMessage.jsonValue,
+        ]).serializedData(pretty: false)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let result = try _tgValidateResponse(
+            data,
+            response: response,
+            operation: "sendRichMessage",
+            resultType: TelegramAPIMessageResult.self
+        )
+        return result.value.messageId
+    }
+
+    public static let defaultSendMessageWithReplyMarkupReturningId:
+        @Sendable (String, Int, String, JSONValue) async throws -> Int = {
+            token, chatId, text, replyMarkup in
+            guard let url = _tgBuildBotURL(token: token, method: "sendMessage") else {
+                throw TelegramBotError.invalidRequest
+            }
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONValue.object([
+                "chat_id": .int(Int64(chatId)),
+                "text": .string(text),
+                "reply_markup": replyMarkup,
+            ]).serializedData(pretty: false)
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let result = try _tgValidateResponse(
+                data,
+                response: response,
+                operation: "sendMessage",
+                resultType: TelegramAPIMessageResult.self
+            )
+            return result.value.messageId
+        }
+
     /// chat-smoothness phase 5: sendMessage that returns the created
     /// message_id so the growing draft can edit it. Single message only —
     /// the draft window is pre-capped to one Telegram-safe chunk.
@@ -16,15 +89,13 @@ extension TelegramPollLoop {
         let body: [String: Any] = ["chat_id": chatId, "text": text]
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, resp) = try await URLSession.shared.data(for: req)
-        if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            throw TelegramBotError.underlying("sendMessage status \(http.statusCode)")
-        }
-        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let result = obj["result"] as? [String: Any],
-              let messageId = result["message_id"] as? Int else {
-            throw TelegramBotError.underlying("sendMessage response missing message_id")
-        }
-        return messageId
+        let result = try _tgValidateResponse(
+            data,
+            response: resp,
+            operation: "sendMessage",
+            resultType: TelegramAPIMessageResult.self
+        )
+        return result.value.messageId
     }
 
     /// chat-smoothness phase 5: edit the growing draft in place. Telegram
@@ -40,11 +111,13 @@ extension TelegramPollLoop {
         let body: [String: Any] = ["chat_id": chatId, "message_id": messageId, "text": text]
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, resp) = try await URLSession.shared.data(for: req)
-        if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            let bodyText = String(data: data, encoding: .utf8) ?? ""
-            if bodyText.contains("message is not modified") { return }
-            throw TelegramBotError.underlying("editMessageText status \(http.statusCode)")
-        }
+        _ = try _tgValidateResponse(
+            data,
+            response: resp,
+            operation: "editMessageText",
+            resultType: TelegramAPIMessageResult.self,
+            allowMessageNotModified: true
+        )
     }
 
     public static let defaultEditMessageTextWithReplyMarkup:
@@ -65,11 +138,13 @@ extension TelegramPollLoop {
         }
         req.httpBody = try JSONValue.object(body).serializedData(pretty: false)
         let (data, resp) = try await URLSession.shared.data(for: req)
-        if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            let bodyText = String(data: data, encoding: .utf8) ?? ""
-            if bodyText.contains("message is not modified") { return }
-            throw TelegramBotError.underlying("editMessageText status \(http.statusCode)")
-        }
+        _ = try _tgValidateResponse(
+            data,
+            response: resp,
+            operation: "editMessageText",
+            resultType: TelegramAPIMessageResult.self,
+            allowMessageNotModified: true
+        )
     }
 
     public static let defaultSendMessage: @Sendable (String, Int, String) async throws -> Void = { token, chatId, text in
@@ -87,10 +162,12 @@ extension TelegramPollLoop {
             let body: [String: Any] = ["chat_id": chatId, "text": chunk]
             req.httpBody = try JSONSerialization.data(withJSONObject: body)
             let (data, resp) = try await URLSession.shared.data(for: req)
-            if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-                throw TelegramBotError.underlying("sendMessage status \(http.statusCode)")
-            }
-            try _tgRequireSuccessfulResponse(data, operation: "sendMessage")
+            _ = try _tgValidateResponse(
+                data,
+                response: resp,
+                operation: "sendMessage",
+                resultType: TelegramAPIMessageResult.self
+            )
         }
     }
 
@@ -130,28 +207,113 @@ extension TelegramPollLoop {
         req.httpBody = body
 
         let (data, resp) = try await URLSession.shared.data(for: req)
-        if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            throw TelegramBotError.underlying("sendPhoto status \(http.statusCode)")
-        }
-        try _tgRequireSuccessfulResponse(data, operation: "sendPhoto")
+        _ = try _tgValidateResponse(
+            data,
+            response: resp,
+            operation: "sendPhoto",
+            resultType: TelegramAPIMessageResult.self
+        )
     }
 
-    /// Telegram defines success through the JSON `ok` field, not HTTP status
-    /// alone. A 2xx response that says `ok: false` must never become an accepted
-    /// completion-delivery receipt.
-    static func _tgRequireSuccessfulResponse(_ data: Data, operation: String) throws {
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              (object["ok"] as? Bool) == true else {
-            let description: String
-            if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let value = object["description"] as? String,
-               !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                description = value
-            } else {
-                description = "response missing ok=true"
+    enum TelegramValidatedResult<Result: Sendable>: Sendable {
+        case value(Result)
+        case notModified
+
+        var value: Result {
+            switch self {
+            case .value(let result): return result
+            case .notModified:
+                preconditionFailure("not-modified has no decoded result")
             }
-            throw TelegramBotError.underlying("\(operation) rejected: \(description)")
         }
+    }
+
+    /// One validation seam for every Telegram Bot API method: HTTP status is
+    /// transport evidence, while the typed response envelope and result decide
+    /// semantic success.
+    static func _tgValidateResponse<Result: Decodable & Sendable>(
+        _ data: Data,
+        response: URLResponse,
+        operation: String,
+        resultType: Result.Type,
+        allowMessageNotModified: Bool = false,
+        validateResult: (Result) -> Bool = { _ in true }
+    ) throws -> TelegramValidatedResult<Result> {
+        guard let http = response as? HTTPURLResponse else {
+            throw TelegramAPIFailure(
+                kind: .malformedResponse,
+                operation: operation,
+                telegramDescription: "missing HTTP response"
+            )
+        }
+        return try _tgValidateResponse(
+            data,
+            httpStatus: http.statusCode,
+            operation: operation,
+            resultType: resultType,
+            allowMessageNotModified: allowMessageNotModified,
+            validateResult: validateResult
+        )
+    }
+
+    static func _tgValidateResponse<Result: Decodable & Sendable>(
+        _ data: Data,
+        httpStatus: Int,
+        operation: String,
+        resultType: Result.Type,
+        allowMessageNotModified: Bool = false,
+        validateResult: (Result) -> Bool = { _ in true }
+    ) throws -> TelegramValidatedResult<Result> {
+        let envelope = try? JSONDecoder().decode(TelegramAPIResponse.self, from: data)
+        let sanitizedDescription = envelope?.description.map(_tgRedactToken)
+        let isNotModified = sanitizedDescription?
+            .localizedCaseInsensitiveContains("message is not modified") == true
+
+        guard (200..<300).contains(httpStatus) else {
+            if allowMessageNotModified, isNotModified { return .notModified }
+            throw TelegramAPIFailure(
+                kind: .httpStatus,
+                operation: operation,
+                httpStatus: httpStatus,
+                errorCode: envelope?.errorCode,
+                telegramDescription: sanitizedDescription,
+                parameters: envelope?.parameters
+            )
+        }
+
+        guard let envelope else {
+            throw TelegramAPIFailure(
+                kind: .malformedResponse,
+                operation: operation,
+                httpStatus: httpStatus,
+                telegramDescription: "response was not a Telegram API envelope"
+            )
+        }
+        guard envelope.ok else {
+            if allowMessageNotModified, isNotModified { return .notModified }
+            throw TelegramAPIFailure(
+                kind: .rejected,
+                operation: operation,
+                httpStatus: httpStatus,
+                errorCode: envelope.errorCode,
+                telegramDescription: sanitizedDescription,
+                parameters: envelope.parameters
+            )
+        }
+        guard let rawResult = envelope.result,
+              let resultData = try? rawResult.serializedData(pretty: false),
+              let result = try? JSONDecoder().decode(resultType, from: resultData),
+              validateResult(result) else {
+            throw TelegramAPIFailure(
+                kind: .malformedResult,
+                operation: operation,
+                httpStatus: httpStatus,
+                errorCode: envelope.errorCode,
+                telegramDescription: sanitizedDescription ?? "response result had an unexpected shape",
+                parameters: envelope.parameters
+            )
+        }
+        return .value(result)
     }
 
     /// Split a message into Telegram-safe chunks. Telegram's 4096 limit
@@ -207,10 +369,14 @@ extension TelegramPollLoop {
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let body: [String: Any] = ["chat_id": chatId, "action": action]
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (_, resp) = try await URLSession.shared.data(for: req)
-        if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            throw TelegramBotError.underlying("sendChatAction status \(http.statusCode)")
-        }
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        _ = try _tgValidateResponse(
+            data,
+            response: resp,
+            operation: "sendChatAction",
+            resultType: Bool.self,
+            validateResult: { $0 }
+        )
     }
 
     public static let defaultAnswerCallbackQuery: @Sendable (String, String, String) async throws -> Void = { token, callbackId, text in
@@ -226,10 +392,14 @@ extension TelegramPollLoop {
             "show_alert": false,
         ]
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (_, resp) = try await URLSession.shared.data(for: req)
-        if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            throw TelegramBotError.underlying("answerCallbackQuery status \(http.statusCode)")
-        }
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        _ = try _tgValidateResponse(
+            data,
+            response: resp,
+            operation: "answerCallbackQuery",
+            resultType: Bool.self,
+            validateResult: { $0 }
+        )
     }
 
     public static let defaultSendMessageWithReplyMarkup:
@@ -246,10 +416,13 @@ extension TelegramPollLoop {
             "reply_markup": replyMarkup,
         ])
         req.httpBody = try body.serializedData(pretty: false)
-        let (_, resp) = try await URLSession.shared.data(for: req)
-        if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            throw TelegramBotError.underlying("sendMessage status \(http.statusCode)")
-        }
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        _ = try _tgValidateResponse(
+            data,
+            response: resp,
+            operation: "sendMessage",
+            resultType: TelegramAPIMessageResult.self
+        )
     }
 
     public static let defaultSyncCommandMenu: TelegramCommandMenuSync = { token, commands in

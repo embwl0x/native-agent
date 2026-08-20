@@ -1001,10 +1001,32 @@ func appChatToolDispatcher_exposesVisibleBrowserToolsAndDispatchesStatusAlias() 
     #expect(names.contains("browser.read_text"))
     #expect(names.contains("browser.read_links"))
     #expect(names.contains("browser.screenshot"))
+    #expect(names.contains("browser.chrome_acquire"))
+    #expect(names.contains("browser.chrome_navigate"))
+    #expect(names.contains("browser.chrome_snapshot"))
+    #expect(names.contains("browser.chrome_click"))
+    #expect(names.contains("browser.chrome_fill"))
+    #expect(names.contains("browser.chrome_type"))
+    #expect(names.contains("browser.chrome_select"))
+    #expect(names.contains("browser.chrome_keypress"))
+    #expect(names.contains("browser.chrome_set_checked"))
+    #expect(names.contains("browser.chrome_double_click"))
+    #expect(names.contains("browser.chrome_wait"))
+    #expect(names.contains("browser.chrome_scroll"))
+    #expect(names.contains("browser.chrome_release"))
 
     let schemas = try await dispatcher.listAvailableToolSchemas()
     #expect(schemas.map(\.name).contains("browser.status"))
     #expect(schemas.map(\.name).contains("browser.navigate"))
+    #expect(schemas.map(\.name).contains("browser.chrome_snapshot"))
+    #expect(schemas.map(\.name).contains("browser.chrome_click"))
+    #expect(schemas.map(\.name).contains("browser.chrome_fill"))
+    #expect(schemas.map(\.name).contains("browser.chrome_type"))
+    #expect(schemas.map(\.name).contains("browser.chrome_select"))
+    #expect(schemas.map(\.name).contains("browser.chrome_keypress"))
+    #expect(schemas.map(\.name).contains("browser.chrome_set_checked"))
+    #expect(schemas.map(\.name).contains("browser.chrome_double_click"))
+    #expect(schemas.map(\.name).contains("browser.chrome_wait"))
 
     let catalog = try await dispatcher.dispatch(
         tool: "tool_catalog",
@@ -1201,6 +1223,19 @@ func appChatToolDispatcher_toolLoadBrowserCategorySkipsPersistingTurnActiveTools
         .appendingPathComponent("\(sessionId).json")
 
     let browserTurnTools: Set<String> = [
+        "browser.chrome_acquire",
+        "browser.chrome_click",
+        "browser.chrome_fill",
+        "browser.chrome_select",
+        "browser.chrome_keypress",
+        "browser.chrome_set_checked",
+        "browser.chrome_double_click",
+        "browser.chrome_navigate",
+        "browser.chrome_release",
+        "browser.chrome_scroll",
+        "browser.chrome_snapshot",
+        "browser.chrome_type",
+        "browser.chrome_wait",
         "browser.open_url",
         "browser.navigate",
         "browser.read_links",

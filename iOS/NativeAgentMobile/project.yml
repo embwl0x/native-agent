@@ -20,8 +20,8 @@ settings:
   SWIFT_STRICT_CONCURRENCY: complete
   TARGETED_DEVICE_FAMILY: "1,2"  # iPhone + iPad
   SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
-  MARKETING_VERSION: "0.3.0"
-  CURRENT_PROJECT_VERSION: "10"
+  MARKETING_VERSION: "0.4.1"
+  CURRENT_PROJECT_VERSION: "12"
   # Set DEVELOPMENT_TEAM locally in Xcode or on the xcodebuild command line
   # for device builds. Do not commit a personal Apple Developer Team ID.
   CODE_SIGN_STYLE: "Automatic"

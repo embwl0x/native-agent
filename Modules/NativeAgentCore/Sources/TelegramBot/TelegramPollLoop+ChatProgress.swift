@@ -34,38 +34,146 @@ extension TelegramPollLoop {
         }
     }
 
-    func makeProgressSink(chatId: Int, draft: TelegramDraftStreamer? = nil) -> TelegramChatProgressSink {
-        let state = TelegramProgressMessageState(maxMessages: 8)
-        let token = self.token
-        let sendMessage = self.sendMessage
-        return { event in
-            // chat-smoothness phase 5: accumulated reply text feeds the
-            // growing draft (throttled message EDITS), never the discrete
-            // progress-message path below.
-            if case .textDelta(let accumulated) = event {
-                await draft?.onDelta(accumulated)
-                return
+    func makeTurnProgressCard(
+        chatId: Int,
+        turnId: UUID,
+        errorContext: String,
+        update: TelegramUpdate?,
+        message: TelegramMessage?,
+        text: String?
+    ) -> TelegramTurnProgressCardDriver {
+        TelegramTurnProgressCardDriver(
+            token: token,
+            chatId: chatId,
+            turnId: turnId,
+            minimumEditInterval: turnCardMinimumEditIntervalSeconds,
+            heartbeatNanoseconds: turnCardHeartbeatNanoseconds,
+            stalledAfter: turnCardStalledAfterSeconds,
+            clock: turnCardClock,
+            sleeper: turnCardSleeper,
+            sendCard: sendMessageWithReplyMarkupReturningId,
+            editCard: { token, chatId, messageId, text, replyMarkup in
+                try await editMessageTextWithReplyMarkup(
+                    token,
+                    chatId,
+                    messageId,
+                    text,
+                    replyMarkup
+                )
+            },
+            recordFailure: { redactedError in
+                await recordError(
+                    context: errorContext,
+                    error: redactedError,
+                    update: update,
+                    message: message,
+                    text: text
+                )
+            },
+            persistCard: { record in
+                try await turnCardLedger.upsert(record)
+            },
+            removePersistedCard: { turnId in
+                try await turnCardLedger.remove(turnId: turnId)
             }
-            guard let text = Self.progressMessage(for: event) else { return }
-            // Heartbeats throttle through the per-turn cap; everything else that
-            // is a notice (start + terminal notices like invoke_timeout) ALWAYS
-            // sends — a dropped timeout is the silent hang we're preventing.
-            let alwaysSend: Bool = {
-                if case .notice(let kind, _) = event { return kind != "invoke_progress" }
-                return false
-            }()
-            if !alwaysSend {
-                let shouldSend = await state.shouldSend(text)
-                guard shouldSend else { return }
-            }
-            do {
-                try await sendMessage(token, chatId, text)
-            } catch {
-                FileHandle.standardError.write(
-                    Data("TelegramPollLoop: progress message send failed for chat \(chatId): \(Self._tgRedactToken(String(describing: error)))\n".utf8)
+        )
+    }
+
+    func makeAssistantDelivery(
+        chatId: Int,
+        turnId: UUID,
+        errorContext: String,
+        update: TelegramUpdate?,
+        message: TelegramMessage?,
+        text: String?
+    ) -> TelegramAssistantDeliveryDriver {
+        let ordinary = TelegramDraftStreamer(
+            token: token,
+            chatId: chatId,
+            editIntervalSeconds: draftEditIntervalSeconds,
+            sendReturningId: sendMessageReturningId,
+            editMessage: editMessageText
+        )
+        return TelegramAssistantDeliveryDriver(
+            token: token,
+            chatId: chatId,
+            turnId: turnId,
+            ordinary: ordinary,
+            sendOrdinary: sendMessage,
+            sendRichDraft: sendRichMessageDraft,
+            sendRichFinal: sendRichMessage,
+            richDraftInterval: draftEditIntervalSeconds,
+            recordFailure: { redactedError in
+                await recordError(
+                    context: errorContext,
+                    error: redactedError,
+                    update: update,
+                    message: message,
+                    text: text
                 )
             }
+        )
+    }
+
+    func makeProgressSink(
+        delivery: TelegramAssistantDeliveryDriver? = nil,
+        card: TelegramTurnProgressCardDriver
+    ) -> TelegramChatProgressSink {
+        return { event in
+            if case .textDelta(let accumulated) = event {
+                await delivery?.onDelta(accumulated)
+            }
+            await card.record(progress: event)
         }
+    }
+
+    func repairInterruptedTurnCardsIfNeeded() async {
+        let result = await turnCardRestartRepairer.repairOnce(
+            token: token,
+            editCard: editMessageTextWithReplyMarkup
+        )
+        for failure in result.failures {
+            await recordError(context: "turn_card_restart_repair", error: failure)
+        }
+    }
+
+    func deliverGeneratedImages(
+        _ imagePaths: [String],
+        chatId: Int,
+        errorContext: String,
+        update: TelegramUpdate?,
+        message: TelegramMessage?,
+        text: String?
+    ) async -> TelegramAssistantDeliveryOutcome {
+        for imagePath in imagePaths {
+            do {
+                try await sendChatAction(token, chatId, "upload_photo")
+            } catch {
+                // Native action is only a secondary status signal. Its failure
+                // does not change the photo's delivery truth.
+                FileHandle.standardError.write(Data(
+                    "TelegramPollLoop: upload_photo action failed: \(Self._tgRedactToken(String(describing: error)))\n".utf8
+                ))
+            }
+            do {
+                try await sendPhoto(token, chatId, imagePath, nil)
+            } catch {
+                let reason = TelegramTurnPresentationReducer.sanitized(String(describing: error))
+                    ?? "generated media delivery failed"
+                await recordError(
+                    context: errorContext,
+                    error: reason,
+                    update: update,
+                    message: message,
+                    text: text
+                )
+                if TelegramTurnReplyDeliveryFailure.isAmbiguous(error) {
+                    return .outcomeUnknown(reason: reason)
+                }
+                return .failed(reason: reason)
+            }
+        }
+        return .delivered(messageId: nil)
     }
 
     static func progressMessage(for event: TelegramChatProgressEvent) -> String? {

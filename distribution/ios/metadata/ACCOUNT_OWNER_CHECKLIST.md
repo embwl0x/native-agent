@@ -12,8 +12,8 @@ and cannot be completed or truthfully verified from source alone.
 - [x] Create or confirm the App Store Connect app record using the exact iOS
   production bundle ID. Do not upload a build under a temporary identifier.
 - [x] Confirm the marketing version and integer build number are greater than
-  the prior App Store Connect build. Current processed TestFlight baseline:
-  `0.3.0 (10)`.
+  the prior App Store Connect build. Approved App Store baseline: `0.3.0 (10)`.
+  Current update candidate: `0.4.1 (11)`.
 - [x] Confirm the production iCloud container and deploy its CloudKit schema to
   production before TestFlight.
 - [x] Confirm the App ID enables iCloud/CloudKit, push notifications, and
@@ -30,6 +30,8 @@ and cannot be completed or truthfully verified from source alone.
   - [x] TestFlight `0.3.0 (10)` completed Apple processing, installed on the
     physical iPhone, paired to the production CloudKit Mac build, and passed
     current chat/provider/notification testing.
+  - [ ] Upload and process update candidate `0.4.1 (11)` after its release gate
+    and physical-device verification pass.
 - Test the processed build through TestFlight on a fresh, ordinary Apple
   account paired to a release Mac build.
 - [x] Verify production iCloud/CloudKit pairing, provider/model projection,

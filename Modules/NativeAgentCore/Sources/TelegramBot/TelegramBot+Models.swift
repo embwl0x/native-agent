@@ -122,6 +122,90 @@ public struct TelegramTestResult: Sendable, Codable, Equatable {
 
 // MARK: - Errors
 
+/// Telegram's structured rate-limit / migration hints. Callers can retain
+/// these instead of scraping a human-readable error string.
+public struct TelegramAPIResponseParameters: Sendable, Codable, Equatable {
+    public let retryAfter: Int?
+    public let migrateToChatId: Int64?
+
+    public init(retryAfter: Int? = nil, migrateToChatId: Int64? = nil) {
+        self.retryAfter = retryAfter
+        self.migrateToChatId = migrateToChatId
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case retryAfter = "retry_after"
+        case migrateToChatId = "migrate_to_chat_id"
+    }
+}
+
+/// The common Telegram Bot API response envelope. `result` stays as a typed
+/// JSON value until the transport validates it for the method being called.
+public struct TelegramAPIResponse: Sendable, Codable, Equatable {
+    public let ok: Bool
+    public let result: JSONValue?
+    public let description: String?
+    public let errorCode: Int?
+    public let parameters: TelegramAPIResponseParameters?
+
+    enum CodingKeys: String, CodingKey {
+        case ok, result, description, parameters
+        case errorCode = "error_code"
+    }
+}
+
+public struct TelegramAPIMessageResult: Sendable, Codable, Equatable {
+    public let messageId: Int
+
+    enum CodingKeys: String, CodingKey {
+        case messageId = "message_id"
+    }
+}
+
+/// A semantic Telegram transport failure. The typed fields preserve retry and
+/// migration information while the description is sanitized before exposure.
+public struct TelegramAPIFailure: Error, LocalizedError, Sendable, Equatable {
+    public enum Kind: String, Sendable, Codable, Equatable {
+        case httpStatus
+        case rejected
+        case malformedResponse
+        case malformedResult
+    }
+
+    public let kind: Kind
+    public let operation: String
+    public let httpStatus: Int?
+    public let errorCode: Int?
+    public let telegramDescription: String?
+    public let parameters: TelegramAPIResponseParameters?
+
+    public init(
+        kind: Kind,
+        operation: String,
+        httpStatus: Int? = nil,
+        errorCode: Int? = nil,
+        telegramDescription: String? = nil,
+        parameters: TelegramAPIResponseParameters? = nil
+    ) {
+        self.kind = kind
+        self.operation = operation
+        self.httpStatus = httpStatus
+        self.errorCode = errorCode
+        self.telegramDescription = telegramDescription
+        self.parameters = parameters
+    }
+
+    public var errorDescription: String? {
+        var detail = "telegram: \(operation) \(kind.rawValue)"
+        if let httpStatus { detail += " (HTTP \(httpStatus))" }
+        if let errorCode { detail += " [Telegram \(errorCode)]" }
+        if let telegramDescription, !telegramDescription.isEmpty {
+            detail += ": \(telegramDescription)"
+        }
+        return detail
+    }
+}
+
 public enum TelegramBotError: Error, LocalizedError {
     case invalidRequest
     case notConfigured

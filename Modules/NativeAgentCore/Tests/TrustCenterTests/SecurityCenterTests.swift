@@ -253,6 +253,35 @@ private func makeSecurityTempRoot() throws -> URL {
     #expect(envelope.capabilities.contains("safe_read"))
 }
 
+@Test func SecurityCenter_chromeFormActsAndWaitHaveExactBuiltinProfiles() async throws {
+    let root = try makeSecurityTempRoot()
+    let center = SwiftNativeSecurityCenter(dataRoot: root)
+
+    for tool in [
+        "browser.chrome_fill", "browser.chrome_type", "browser.chrome_select",
+        "browser.chrome_keypress", "browser.chrome_set_checked", "browser.chrome_double_click",
+    ] {
+        let envelope = await center.evaluateTool(
+            tool: tool,
+            input: [:],
+            origin: SecurityOriginContext(surface: "chat")
+        )
+        #expect(envelope.tool == tool)
+        #expect(envelope.signedToolKnown)
+        #expect(envelope.risk == "high")
+        #expect(envelope.capabilities.contains("browser_interaction"))
+    }
+
+    let wait = await center.evaluateTool(
+        tool: "browser.chrome_wait",
+        input: [:],
+        origin: SecurityOriginContext(surface: "chat")
+    )
+    #expect(wait.signedToolKnown)
+    #expect(wait.risk == "low")
+    #expect(wait.capabilities.contains("safe_read"))
+}
+
 @Test func SecurityCenter_healthStatusToolsAreLowRiskReadBuiltins() async throws {
     let root = try makeSecurityTempRoot()
     let center = SwiftNativeSecurityCenter(dataRoot: root)
@@ -1267,6 +1296,84 @@ private func makeTrustedTelegramRoot(
 
     // The Developer-Mode block must NOT fire for a local origin in a yolo window.
     #expect(!envelope.reasons.contains { $0.contains("Developer Mode") })
+}
+
+/// Full Mac keeps ordinary autonomous builder work, but changing the host's
+/// permission authority is a distinct effect. The exact command is classified
+/// at dispatch time and must ask even when the saved shell override is `auto`
+/// and the outer chat gate owns normal autonomy resolution.
+@Test func SecurityCenter_systemPermissionResetHasApprovalFloorUnderTrustedYolo() async throws {
+    let (root, persistence) = try await makeTrustedTelegramRoot(
+        toolAutonomy: ["bash": .string("auto")]
+    )
+    let center = SwiftNativeSecurityCenter(dataRoot: root, persistence: persistence)
+    let origin = SecurityOriginContext(
+        surface: "telegram",
+        sessionId: "telegram:123",
+        isRemote: true
+    )
+
+    for command in [
+        "tccutil reset SpeechRecognition com.example.nativeagent",
+        "/usr/bin/tccutil reset Microphone com.example.app",
+        "sudo tccutil reset All",
+    ] {
+        let envelope = await center.evaluateTool(
+            tool: "bash",
+            input: ["cmd": .string(command)],
+            origin: origin,
+            enforceAutonomy: false
+        )
+        #expect(envelope.originTrusted)
+        #expect(envelope.decision == .ask, "\(command)")
+        #expect(envelope.requiresApproval)
+        #expect(!envelope.allowed)
+        #expect(envelope.rollbackRequired)
+        #expect(envelope.capabilities.contains("system_permission_reset"))
+        #expect(envelope.capabilities.contains("destructive"))
+        #expect(envelope.reasons.contains { $0.contains("system permission changes require explicit approval") })
+    }
+
+    let routine = await center.evaluateTool(
+        tool: "bash",
+        input: ["cmd": .string("git status --short")],
+        origin: origin,
+        enforceAutonomy: false
+    )
+    #expect(routine.decision == .allow)
+    #expect(routine.allowed)
+    #expect(!routine.capabilities.contains("system_permission_reset"))
+
+    let diagnostic = await center.evaluateTool(
+        tool: "bash",
+        input: [
+            "cmd": .string(
+                "sqlite3 ~/Library/Application\\ Support/com.apple.TCC/TCC.db "
+                    + "\"SELECT client, auth_value FROM access WHERE service='kTCCServiceSpeechRecognition';\"; "
+                    + "git status --short"
+            )
+        ],
+        origin: origin,
+        enforceAutonomy: false
+    )
+    #expect(diagnostic.decision == .allow)
+    #expect(diagnostic.allowed)
+    #expect(!diagnostic.requiresApproval)
+    #expect(!diagnostic.capabilities.contains("system_permission_reset"))
+
+    let directMutation = await center.evaluateTool(
+        tool: "bash",
+        input: [
+            "cmd": .string(
+                "sqlite3 ~/Library/Application\\ Support/com.apple.TCC/TCC.db "
+                    + "\"DELETE FROM access WHERE service='kTCCServiceSpeechRecognition';\""
+            )
+        ],
+        origin: origin,
+        enforceAutonomy: false
+    )
+    #expect(directMutation.decision == .ask)
+    #expect(directMutation.capabilities.contains("system_permission_reset"))
 }
 
 @Test func SecurityCenter_trustedTelegramYoloAllowsRoutineMemoryAndContextTools() async throws {

@@ -83,6 +83,9 @@ struct TrustCenterView: View {
                         featureGroup(title: "Multimodal", systemImage: "sparkles", tint: .blue) {
                             MultimodalPermissionsView()
                         }
+                        featureGroup(title: "Chrome Control", systemImage: "globe", tint: .orange) {
+                            ChromeControlPermissionsView()
+                        }
                         // Sweep R4 C9 — COPY ONLY. The card's own controls now
                         // read "practice runs" / "automatic review"; the title
                         // matched neither.

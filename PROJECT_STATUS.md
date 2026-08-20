@@ -1,12 +1,34 @@
 # NativeAgent Project Status
 
-Last updated: 2026-08-16
+Last updated: 2026-08-18
 
 ## Summary
 
 Public release 0.4.0 is cut; private `main` contains the subsequent integrated
 stabilization and documentation work. Source and live behavior remain
 authoritative over older release prose below.
+
+The latest private fix closes one production permission/crash chain without
+reducing autonomous builder access. Permission-authority shell mutations are
+now effect-time classified and require approval even under Full Mac; ordinary
+shell work stays autonomous. SwiftPM/XCTest helpers cannot touch the live
+GitHub Keychain vault or open password UI, while production Keychain reads are
+explicitly noninteractive. Accessibility actions run on the app main lane and
+the default test actuator is inert, preventing the background AXPress crash.
+Apple Speech authorization now uses a nonisolated completion bridge because
+TCC answers on an arbitrary queue even though prompt acquisition begins on the
+MainActor. The integrated Mac app builds and all 1,192 Mac tests in 109 suites
+pass with no SecurityAgent process; the callback regression passes from a real
+background queue. The corrected Apple Development build is installed and live:
+Speech is granted, chat is ready, Fluid Context generations match with zero
+degraded sources, the organism is enabled, and Agent returned a normal bridge
+reply. No DMG or release has been cut.
+
+The permission classifier distinguishes observation from mutation: a read-only
+`sqlite3` query of `TCC.db` remains ordinary autonomous bash under Full Mac,
+while `tccutil reset` and mutating TCC SQL keep the explicit approval floor.
+Production-shaped regressions pin both sides so diagnostics do not become a
+blanket shell gate.
 
 The newest private source adds a follow-up structural closeout without a
 new owner or model call. Manual compaction now delegates to the canonical Core
@@ -843,6 +865,16 @@ stays `verification_failed`, while resolved/outdated evidence settles and a
 reopened generation becomes new work. Ordinary chat prompts, provider choice,
 tool schemas, approvals, and dispatch paths are unchanged.
 
+GitHub Command recovery now distinguishes a durable request from an accepted
+Codex wake. If the helper fails after the inbox append, the same deterministic
+message ID retries while that row remains unconsumed; only consumed/read proof
+suppresses another helper launch. The shared GitHub check classifier also keeps
+maintainer-only review-label gates out of technical CI failure routing while
+preserving real executable failures and unexplained aggregate failures as
+actionable. These rules remove false `codex_working` receipts and repeated
+attention for PRs whose only remaining blocker belongs to an upstream
+maintainer.
+
 Installed measurement confirms the tool language is not adding a discovery
 loop: GPT-5.6 selected both a resident time read and a routed Browser action
 directly, with zero `tool_load` calls, while retaining the full 141-tool lazy
@@ -1101,28 +1133,15 @@ found low modestly faster than medium but with two transport/primary-invariant
 failures versus none for medium, so chat preserves the configured medium/high
 selection.
 
-The GitHub Command dispatch boundary now carries bounded canonical review,
-check, conflict, thread-generation, and head-SHA evidence into temporary Codex
-cognition and starts it only in a checkout whose Git remote matches the target
-repository. Repository-controlled prose is flattened and marked untrusted.
-That exact trusted dispatcher/checkout pair now mints a private execution
-capability for the unattended turn: it keeps `workspaceWrite` and approvals
-disabled, enables public network access, and makes only the checkout plus its
-resolved Git metadata writable. Ordinary `codex_message`, spoofed topic/body
-text, caller-supplied profile names, and mixed batches cannot select it. The
-app-server and bounded CLI fallback use the same policy, so GitHub Command can
-perform noninteractive `gh`/`git` reads, commits, rebases, and pushes without
-receiving full-disk write access.
-An empty terminal turn or overdue callback is outcome-unknown, so NativeAgent
-parks it visibly instead of launching duplicate work; only a completed turn
-followed by the authoritative GitHub reread may enter the existing bounded
-verification retry. This removes the short-lived `codex_busy` replay path and
-does not alter ordinary chat, provider choice, trust, approvals, receipts, or
-GitHub settlement authority. The unattended app-server client now also answers
-client-owned tool, approval, permission, interactive-input, and MCP elicitation
-requests with the protocol's explicit failure or decline result. That prevents
-headless GitHub connector calls from waiting forever without granting new
-authority; Codex can return the exact blocker and GitHub remains unsettled.
+GitHub Command is now GitHub Watcher: connector refreshes maintain canonical
+review, check, conflict, thread-generation, and head-SHA evidence for Desk and
+claim one deduplicated Apple notification when an event needs attention. The
+watcher has no Codex bridge sender, prompt builder, dispatch cycle, launch retry,
+provider call, tool call, checkout selection, or repository-write path. It
+cannot start work automatically. Explicit user/Agent turns retain ordinary
+GitHub inspection and `codex_message` tools. Historical dispatch fields and
+completion correlation remain decode-compatible only for rows that predate the
+cutover; launch recovery observes them but cannot resume them.
 
 The final adversarial pass tightened the return and physiology contracts.
 Codex completion now provides at-most-once Agent-turn admission plus

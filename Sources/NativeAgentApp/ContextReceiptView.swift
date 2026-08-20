@@ -596,25 +596,3 @@ private struct PinnedSessionTab: View {
         }
     }
 }
-
-// PATCH-2026-05-07: ui-polish TypingIndicator — PulsingDot replaces static dots
-struct TypingIndicator: View {
-    // chat-smoothness phase 4 taste catch: the chip said "NativeAgent is
-    // typing" while the floating row used the configured agent name — the persona
-    // name is the one the user knows.
-    var personaName: String = "NativeAgent"
-    var body: some View {
-        HStack(spacing: 8) {
-            PulsingDot(color: .green, size: 8)
-            Text("\(personaName) is typing")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-        .padding(10)
-        .background {
-            RoundedRectangle(cornerRadius: NativeAgentRadius.panel)
-                .fill(.regularMaterial)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}

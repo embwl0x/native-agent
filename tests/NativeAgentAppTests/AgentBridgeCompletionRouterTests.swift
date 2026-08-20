@@ -31,6 +31,32 @@ struct AgentBridgeCompletionRouterTests {
   }
 
   @Test
+  func completionRouteProjectsExactToolReplyRouteWithoutChangingTrustSurface() {
+    let route = AgentBridgeCompletionRoute(
+      surface: "telegram",
+      sessionId: "session-telegram",
+      destinationId: "1394548068",
+      threadId: "thread-1",
+      sourceKey: "source-1",
+      replyTo: "reply-1",
+      correlationId: "update-173072973"
+    )
+
+    let projected = route.chatToolReplyRoute
+    #expect(projected.surface == "telegram")
+    #expect(projected.destinationId == "1394548068")
+    #expect(projected.threadId == "thread-1")
+    #expect(projected.sourceKey == "source-1")
+    #expect(projected.replyTo == "reply-1")
+    #expect(projected.correlationId == "update-173072973")
+
+    let observed = ChatToolSessionContext.$replyRoute.withValue(projected) {
+      ChatToolSessionContext.replyRoute
+    }
+    #expect(observed == projected)
+  }
+
+  @Test
   func routesCompletionToOriginAndRefreshesSharedSession() async {
     let fixture = try! await LifecycleFixture.make()
     defer { fixture.cleanup() }

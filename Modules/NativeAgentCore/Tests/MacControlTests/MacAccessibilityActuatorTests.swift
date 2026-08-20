@@ -13,6 +13,21 @@ import NativeAgentCore
 
 // MARK: - Fakes
 
+@Test func systemAXExecutionLaneMovesBackgroundActionsToTheMainThread() async {
+    let ranOnMain = await Task.detached {
+        MacAXExecutionLane.sync { Thread.isMainThread }
+    }.value
+    #expect(ranOnMain)
+}
+
+@Test func defaultAXActSourceIsInertUnderTheTestHarness() {
+    let source = defaultMacAXActSource()
+    #expect(source.isTrusted())
+    #expect(source.resolve(path: []) == nil)
+    let synthetic = MacAXActTarget(handle: 1, role: "AXButton", actions: ["AXPress"])
+    #expect(source.perform(synthetic, action: "AXPress") == .invalidTarget)
+}
+
 final class _RecordingEventSink: MacEventSink, @unchecked Sendable {
     private let lock = NSLock()
     private var _keys: [MacKeyEvent] = []

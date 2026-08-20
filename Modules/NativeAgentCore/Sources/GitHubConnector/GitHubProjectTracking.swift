@@ -239,7 +239,7 @@ public extension GitHubConnectorActions {
         }
         let persist = bool(input["persist"]) ?? true
         let project = normalized(input["project"]) ?? suppliedQuery ?? resolved.first!.name
-        let interval = clamp(int(input["refresh_interval_minutes"], default: 15), min: 5, max: 1_440)
+        let interval = clamp(int(input["refresh_interval_minutes"], default: 5), min: 5, max: 1_440)
         let priorRepositoryCount = (try? GitHubProjectTracker.loadConfig(dataRoot: dataRoot).repositories.count) ?? 0
         if persist {
             try await GitHubProjectTracker.saveConfig(
@@ -470,7 +470,7 @@ extension GitHubConnectorActions {
                 contributorLogin: login,
                 discoveryQuery: nil,
                 repositories: tracked,
-                refreshIntervalMinutes: 15,
+                refreshIntervalMinutes: 5,
                 staleAfterHours: 72,
                 updatedAt: DeskClock.nowISO()
             ),
@@ -482,13 +482,17 @@ extension GitHubConnectorActions {
     static func testDeltaCarryDecision(
         prior: JSONValue?,
         searchUpdatedAt: String,
-        staleHours: Int
+        staleHours: Int,
+        liveMergeableState: String? = nil,
+        mergeabilityEvidenceMissing: Bool = false
     ) -> JSONValue {
         let priorEntity = prior.flatMap(TrackingEntity.fromJSON)
         if let carried = GitHubProjectTracker.carriedForwardEntity(
             prior: priorEntity,
             searchUpdatedAt: searchUpdatedAt,
-            staleHours: staleHours
+            staleHours: staleHours,
+            liveMergeableState: liveMergeableState,
+            mergeabilityEvidenceMissing: mergeabilityEvidenceMissing
         ) {
             return .object(["decision": .string("carry"), "entity": carried.json])
         }
@@ -587,7 +591,7 @@ private struct TrackingConfig: Sendable, Equatable {
             contributorLogin: contributor,
             discoveryQuery: query,
             repositories: repos,
-            refreshIntervalMinutes: intValue("refreshIntervalMinutes", 15),
+            refreshIntervalMinutes: intValue("refreshIntervalMinutes", 5),
             staleAfterHours: intValue("staleAfterHours", 72),
             updatedAt: updated
         )
@@ -1177,22 +1181,48 @@ private enum GitHubProjectTracker {
                 let key = "\(repo.fullName.lowercased())#pr#\(number)"
                 freshPRKeys.insert(key)
                 guard (row["state"] as? String) == "open" else { continue }
-                // Only PRs that actually need a detail fetch enter the GraphQL
-                // review-thread budget. Carried-forward PRs reuse the thread
-                // evidence already embedded in their prior observation.
-                if carriedForwardEntity(
+                // Base-branch movement does not bump `updated_at`, so every
+                // open authored PR enters the bounded GraphQL probe even when
+                // its expensive REST detail can otherwise be delta-carried.
+                openPullRequests.append(GitHubTrackedPullRequest(repository: repo.fullName, number: number))
+            }
+        }
+        let mergeability: [String: GitHubPullRequestMergeabilityEvidence]
+        do {
+            mergeability = try await GitHubConnectorActions.pullRequestMergeabilityEvidence(
+                for: openPullRequests,
+                dataRoot: dataRoot
+            )
+        } catch {
+            NSLog("[github-tracking] mergeability evidence failed, preserving prior: %@", error.localizedDescription)
+            mergeability = [:]
+        }
+        let detailedPullRequests = repositoryRows.flatMap { entry in
+            entry.authored.compactMap { row -> GitHubTrackedPullRequest? in
+                guard (row["state"] as? String) == "open",
+                      let number = row["number"] as? Int else { return nil }
+                let key = "\(entry.repository.fullName.lowercased())#pr#\(number)"
+                let itemId = GitHubCommandObservation.itemId(
+                    repository: entry.repository.fullName,
+                    number: number
+                )
+                guard carriedForwardEntity(
                     prior: priorByKey[key],
                     searchUpdatedAt: row["updated_at"] as? String ?? "",
-                    staleHours: config.staleAfterHours
-                ) == nil {
-                    openPullRequests.append(GitHubTrackedPullRequest(repository: repo.fullName, number: number))
-                }
+                    staleHours: config.staleAfterHours,
+                    liveMergeableState: mergeability[itemId]?.mergeableState,
+                    mergeabilityEvidenceMissing: mergeability[itemId] == nil
+                ) == nil else { return nil }
+                return GitHubTrackedPullRequest(
+                    repository: entry.repository.fullName,
+                    number: number
+                )
             }
         }
         let evidence: [String: [GitHubCommandReviewThreadEvidence]]
         do {
             evidence = try await GitHubConnectorActions.reviewThreadEvidence(
-                for: openPullRequests,
+                for: detailedPullRequests,
                 previous: previousReviewThreads,
                 dataRoot: dataRoot
             )
@@ -1218,7 +1248,13 @@ private enum GitHubProjectTracker {
                     if let carried = carriedForwardEntity(
                         prior: priorByKey[key],
                         searchUpdatedAt: row["updated_at"] as? String ?? "",
-                        staleHours: config.staleAfterHours
+                        staleHours: config.staleAfterHours,
+                        liveMergeableState: mergeability[
+                            GitHubCommandObservation.itemId(repository: repo.fullName, number: number)
+                        ]?.mergeableState,
+                        mergeabilityEvidenceMissing: mergeability[
+                            GitHubCommandObservation.itemId(repository: repo.fullName, number: number)
+                        ] == nil
                     ) {
                         entities.append(carried)
                         carriedForward += 1
@@ -1232,6 +1268,25 @@ private enum GitHubProjectTracker {
                         reviewThreads: evidence[
                             GitHubCommandObservation.itemId(repository: repo.fullName, number: number)
                         ] ?? [],
+                        mergeabilityEvidence: mergeability[
+                            GitHubCommandObservation.itemId(repository: repo.fullName, number: number)
+                        ],
+                        issueCommentNotBefore: priorByKey[key]?.detailFetchedAt.flatMap(DeskClock.parseISO),
+                        // SELF-CLEAR FIX (cross-review HIGH, 2026-08-17): the
+                        // watermark alone made a detected conversation comment
+                        // vanish on the NEXT sweep — detailFetchedAt had moved
+                        // past it — so route() fell through to the no-event
+                        // tail and knocked an item codex was actively working
+                        // from codex_working to waiting_upstream, stamping its
+                        // event settled. Carry the expected comment identity
+                        // exactly like the verification path does, so the
+                        // signal persists until the comment is really answered.
+                        expectedIssueCommentIdentifier: priorByKey[key]?.commandObservation?
+                            .actionableEvidence?.last { $0.signal == .issueComment }?.identifier,
+                        expectedIssueCommentHeadSHA: priorByKey[key]?.commandObservation?
+                            .signals.contains(.issueComment) == true
+                            ? priorByKey[key]?.commandObservation?.headSHA
+                            : nil,
                         dataRoot: dataRoot
                     )
                     detailFetched += 1
@@ -1328,11 +1383,16 @@ private enum GitHubProjectTracker {
         staleHours: Int,
         actor: String?,
         reviewThreads: [GitHubCommandReviewThreadEvidence],
+        mergeabilityEvidence: GitHubPullRequestMergeabilityEvidence? = nil,
+        issueCommentNotBefore: Date? = nil,
+        expectedIssueCommentIdentifier: String? = nil,
+        expectedIssueCommentHeadSHA: String? = nil,
         dataRoot: URL
     ) async throws -> TrackingEntity {
-        guard let pull = try await GitHubConnectorActions.call(path: "repos/\(repo)/pulls/\(number)", dataRoot: dataRoot) as? [String: Any] else {
+        guard var pull = try await GitHubConnectorActions.call(path: "repos/\(repo)/pulls/\(number)", dataRoot: dataRoot) as? [String: Any] else {
             throw GitHubConnectorError.invalidResponse("tracked pull request was not an object")
         }
+        applyMergeabilityEvidence(mergeabilityEvidence, to: &pull)
         // Reviews/review-comments paginate (bounded at 3 pages, 2026-07-21
         // audit): page-1-only reads hid a late CHANGES_REQUESTED past the
         // first 100 rows and items settled prematurely.
@@ -1353,17 +1413,23 @@ private enum GitHubProjectTracker {
         // and skip bot authors (2026-07-21 audit: a bot reply after the
         // actor's answer must not re-arm needs_user).
         var latestIssueCommentAuthor: String? = nil
+        var issueComments: Any = []
         let issueCommentCount = GitHubCommandObservationBuilder.issueCommentCount(pull: pull)
-        if issueCommentCount > 0, GitHubCommandObservationBuilder.labelDecisionArmed(
+        let decisionArmed = GitHubCommandObservationBuilder.labelDecisionArmed(
             pull: pull, repository: repo, actor: actor
-        ) {
-            let lastPage = (issueCommentCount + 9) / 10
-            let latest = try await GitHubConnectorActions.call(
-                path: "repos/\(repo)/issues/\(number)/comments",
-                params: ["per_page": "10", "page": String(lastPage)],
+        )
+        if issueCommentCount > 0,
+           decisionArmed || issueCommentNotBefore != nil || expectedIssueCommentIdentifier != nil {
+            issueComments = try await GitHubConnectorActions.issueCommentsIncludingExpected(
+                repository: repo,
+                number: number,
+                commentCount: issueCommentCount,
+                expectedIdentifier: expectedIssueCommentIdentifier,
                 dataRoot: dataRoot
             )
-            latestIssueCommentAuthor = GitHubCommandObservationBuilder.latestNonBotCommentAuthor(latest)
+            if decisionArmed {
+                latestIssueCommentAuthor = GitHubCommandObservationBuilder.latestNonBotCommentAuthor(issueComments)
+            }
         }
         return makeDetailedPREntity(
             repo: repo,
@@ -1377,8 +1443,23 @@ private enum GitHubProjectTracker {
             checkRuns: checkRuns,
             combinedStatus: combinedStatus,
             checks: checks,
-            latestIssueCommentAuthor: latestIssueCommentAuthor
+            latestIssueCommentAuthor: latestIssueCommentAuthor,
+            issueComments: issueComments,
+            issueCommentNotBefore: issueCommentNotBefore,
+            expectedIssueCommentIdentifier: expectedIssueCommentIdentifier,
+            expectedIssueCommentHeadSHA: expectedIssueCommentHeadSHA
         )
+    }
+
+    private static func applyMergeabilityEvidence(
+        _ evidence: GitHubPullRequestMergeabilityEvidence?,
+        to pull: inout [String: Any]
+    ) {
+        guard let evidence, evidence.mergeableState != "unknown",
+              let restHead = (pull["head"] as? [String: Any])?["sha"] as? String,
+              restHead == evidence.headSHA else { return }
+        pull["mergeable_state"] = evidence.mergeableState
+        pull["mergeable"] = evidence.mergeableState == "clean"
     }
 
     fileprivate static func makeDetailedPREntity(
@@ -1393,7 +1474,11 @@ private enum GitHubProjectTracker {
         checkRuns: Any,
         combinedStatus: Any,
         checks: String,
-        latestIssueCommentAuthor: String? = nil
+        latestIssueCommentAuthor: String? = nil,
+        issueComments: Any = [],
+        issueCommentNotBefore: Date? = nil,
+        expectedIssueCommentIdentifier: String? = nil,
+        expectedIssueCommentHeadSHA: String? = nil
     ) -> TrackingEntity {
         let reviewState = GitHubCommandObservationBuilder.reviewState(
             reviews,
@@ -1412,7 +1497,11 @@ private enum GitHubProjectTracker {
             actor: actor,
             staleAfterHours: staleHours,
             reviewThreads: reviewThreads,
-            latestIssueCommentAuthor: latestIssueCommentAuthor
+            latestIssueCommentAuthor: latestIssueCommentAuthor,
+            issueComments: issueComments,
+            issueCommentNotBefore: issueCommentNotBefore,
+            expectedIssueCommentIdentifier: expectedIssueCommentIdentifier,
+            expectedIssueCommentHeadSHA: expectedIssueCommentHeadSHA
         )
         let blocking = !observation.signals.isEmpty
         return TrackingEntity(
@@ -1457,8 +1546,33 @@ private enum GitHubProjectTracker {
         prior: TrackingEntity?,
         searchUpdatedAt: String,
         staleHours: Int,
+        liveMergeableState: String? = nil,
+        mergeabilityEvidenceMissing: Bool = false,
         now: Date = Date()
     ) -> TrackingEntity? {
+        // NO EVIDENCE IS NOT EVIDENCE OF CLEAN (2026-08-17 cross-review, HIGH).
+        // Every open authored PR enters the GraphQL probe, so a missing entry
+        // means the probe THREW (rate limit, network, parse) or returned
+        // partial data — not that the base branch is still mergeable. Carrying
+        // the prior `clean` snapshot there reopens the exact stale-conflict
+        // blind spot this delta path exists to close, and it reopens it
+        // precisely when the API is unhealthy. Fail to the expensive-but-
+        // honest side: force the REST detail read, which answers the question
+        // outright. The pass budget still bounds the fan-out, and rows it
+        // cannot reach fall to the "carry so nothing looks deleted" path,
+        // which reads as un-refreshed rather than falsely confirmed.
+        if mergeabilityEvidenceMissing { return nil }
+        if let liveMergeableState {
+            // UNKNOWN is an incomplete remote computation, not evidence that
+            // the prior clean state remains true. Force the exact REST detail
+            // read; the preceding GraphQL request also gives GitHub time to
+            // finish mergeability computation before that later call.
+            if liveMergeableState == "unknown"
+                || liveMergeableState == "dirty"
+                || prior?.mergeable?.lowercased() != liveMergeableState {
+                return nil
+            }
+        }
         guard let prior,
               prior.state == "open",          // only carry a still-open, detailed row
               prior.checks != "pending",       // pending CI must be re-read: checks don't bump updated_at
@@ -1876,45 +1990,7 @@ private extension GitHubConnectorActions {
 
 private func checkSummary(_ runs: Any, combinedStatus: Any) -> String {
     let rows = (runs as? [String: Any])?["check_runs"] as? [[String: Any]] ?? []
-    let normalizedConclusions = rows.compactMap { row in
-        (row["conclusion"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    }
-    let failingConclusions: Set<String> = [
-        "failure", "cancelled", "timed_out", "action_required", "startup_failure", "stale",
-    ]
-    let combinedState = ((combinedStatus as? [String: Any])?["state"] as? String)?
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-        .lowercased()
-    let combinedObject = combinedStatus as? [String: Any]
-    let combinedContextCount: Int? = {
-        if let count = combinedObject?["total_count"] as? Int { return count }
-        if let count = combinedObject?["total_count"] as? NSNumber { return count.intValue }
-        if let statuses = combinedObject?["statuses"] as? [Any] { return statuses.count }
-        return nil
-    }()
-    // GitHub's combined-status endpoint reports `pending` when there are zero
-    // legacy commit statuses. That is an empty/default projection, not a real
-    // pending required check, and must not override successful Check Runs.
-    let hasCombinedContexts = combinedContextCount.map { $0 > 0 } ?? (combinedState != nil)
-
-    // A concrete failure from either GitHub signal always wins. After that,
-    // the combined commit status is the authoritative required-check rollup:
-    // an optional/informational check run may remain queued even when GitHub
-    // reports that all required checks pass.
-    if normalizedConclusions.contains(where: failingConclusions.contains)
-        || (hasCombinedContexts && combinedState == "failure")
-        || (hasCombinedContexts && combinedState == "error") {
-        return "failed"
-    }
-    if hasCombinedContexts && combinedState == "pending" { return "pending" }
-    if hasCombinedContexts && combinedState == "success" { return "passing" }
-
-    let hasUnfinishedRun = rows.contains { row in
-        let status = (row["status"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return status != "completed" || row["conclusion"] == nil
-    }
-    if hasUnfinishedRun { return "pending" }
-    return rows.isEmpty ? "none" : "passing"
+    return GitHubCheckClassifier.state(runRows: rows, combinedStatus: combinedStatus).rawValue
 }
 
 private func issueEntity(_ row: [String: Any], repo: String, staleHours: Int, actor: String?) -> TrackingEntity? {

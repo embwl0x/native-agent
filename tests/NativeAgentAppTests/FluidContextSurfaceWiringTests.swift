@@ -116,7 +116,6 @@ struct FluidContextSurfaceWiringTests {
         let githubRuntime = try AppSourceScraping.appSource("GitHubCommandRuntime.swift")
         let liveRuntime = try AppSourceScraping.functionBody(named: "live", in: githubRuntime)
         #expect(liveRuntime.contains("guard usesLiveAppBody else"))
-        #expect(liveRuntime.contains("canonical app bridge unavailable for alternate data root"))
         #expect(liveRuntime.contains("canonical notification body unavailable for alternate data root"))
 
         let backgroundAssembly = try AppSourceScraping.appSource("BackgroundLoopsAssembly.swift")

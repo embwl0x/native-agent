@@ -97,6 +97,9 @@ struct ChatView: View {
     @State var slashFilter = ""
     // N34: FocusState so we can refocus the text field after slash-command insertion.
     @FocusState var inputFocused: Bool
+    @State var transcriptSearch = MacChatTranscriptSearchController()
+    @State var showTranscriptSearch = false
+    @State var transcriptSearchFocusRequest: UInt = 0
     // PATCH-2026-05-08: wave2-chat-ux — clear confirmation
     @State var showClearConfirm = false
     // Capability store supplies dynamic slash-command suggestions and dispatch metadata.
@@ -107,6 +110,10 @@ struct ChatView: View {
     @State var scrollCoordinator = ChatScrollCoordinator()
     @State var lastAutoReadMessageId: String?
     @State var pinnedSessionDropTargeted = false
+    /// Fences overlapping "Go to" tasks. A route may need to refresh the
+    /// session index before selection; an older click must not resume after a
+    /// newer click and become the newest AppModel selection request.
+    @State var runningSessionNavigationGeneration: UInt = 0
     @AppStorage("NativeAgent.pinnedChatSessionIds") var pinnedChatSessionIdsRaw = ""
 
     var activeSession: ChatSession? {
@@ -165,6 +172,88 @@ struct ChatView: View {
         let pinned = Set(pinnedSessionIds)
         guard !pinned.isEmpty else { return filteredSessions }
         return filteredSessions.filter { !pinned.contains($0.id) }
+    }
+
+    // 658.14: kept off the body so ChatView's already-maximal body expression
+    // does not have to type-check them.
+    private func runningSessionRoutes(_ sessionIds: [String]) -> [MacChatRunningSessionRoute] {
+        MacChatRunningSessionRoute.routes(
+            sessionIds: sessionIds,
+            sessions: appModel.chatSessions
+        )
+    }
+
+    private func goToRunningSession(_ sessionId: String) {
+        runningSessionNavigationGeneration &+= 1
+        let generation = runningSessionNavigationGeneration
+        Task { @MainActor in
+            let navigated = await MacChatRunningSessionNavigation.navigate(
+                sessionId: sessionId,
+                sessions: { appModel.chatSessions },
+                refresh: { await appModel.refreshChatSessionIndex() },
+                select: { session in
+                    await appModel.selectChatSession(session)
+                    // The selector intentionally reports errors through state
+                    // rather than throws. Verify the identity actually moved
+                    // before claiming this navigation succeeded.
+                    return appModel.activeChatSessionId == session.id
+                },
+                isCurrentIntent: {
+                    runningSessionNavigationGeneration == generation
+                }
+            )
+            guard runningSessionNavigationGeneration == generation else { return }
+            if !navigated {
+                appModel.statusText = "Running chat is not available in the session index yet"
+                showToast("Couldn’t open that running chat. Try again in a moment.")
+            }
+        }
+    }
+
+    private func openTranscriptSearch() {
+        showTranscriptSearch = true
+        transcriptSearchFocusRequest &+= 1
+        transcriptSearch.replaceSource(
+            messages: appModel.chatMessages,
+            sessionID: appModel.activeChatSessionId
+        )
+    }
+
+    private func closeTranscriptSearch() {
+        showTranscriptSearch = false
+    }
+
+    private func findNextTranscriptMatch() {
+        guard showTranscriptSearch else {
+            openTranscriptSearch()
+            return
+        }
+        _ = transcriptSearch.selectNext()
+    }
+
+    private func findPreviousTranscriptMatch() {
+        guard showTranscriptSearch else {
+            openTranscriptSearch()
+            return
+        }
+        _ = transcriptSearch.selectPrevious()
+    }
+
+    private func refreshTranscriptSearchIfPresented() {
+        guard showTranscriptSearch else { return }
+        transcriptSearch.replaceSource(
+            messages: appModel.chatMessages,
+            sessionID: appModel.activeChatSessionId
+        )
+    }
+
+    private func refreshTranscriptSearchTailIfPresented() {
+        guard showTranscriptSearch else { return }
+        transcriptSearch.replaceLastMessage(
+            appModel.chatMessages.last,
+            ordinal: appModel.chatMessages.count - 1,
+            sessionID: appModel.activeChatSessionId
+        )
     }
 
     var body: some View {
@@ -264,10 +353,17 @@ struct ChatView: View {
     @ViewBuilder
     var sessionSidebar: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
+            HStack(spacing: 6) {
                 Text("Sessions")
                     .font(.headline)
                 Spacer()
+
+                // Chat keeps one compact, conversation-relevant presence
+                // signal. Global running work and Agent's broader Today view
+                // belong to Activity rather than standing between the user
+                // and their sessions.
+                HealthCardPill()
+
                 Button {
                     Task { await appModel.archiveActiveChat() }
                 } label: {
@@ -293,16 +389,9 @@ struct ChatView: View {
                 .accessibilityLabel("New chat")
             }
 
-            // PATCH-2026-05-08: wave3-health-card Feature A — always-visible health pill
-            HealthCardPill()
-                .task {
-                    await appModel.loadHealthCard()
-                }
-
-            // PATCH-2026-05-08: wave3-whats-running Feature B — what's running panel
-            WhatsRunningPanel()
-
-            LivingStatusPanel()
+            TextField("Search sessions", text: $sessionSearch)
+                .textFieldStyle(.roundedBorder)
+                .accessibilityLabel("Search sessions")
 
             // M12 (2026-07-09): refreshForSidebarItem falls back to the previous
             // value whenever an endpoint fails, so a dead backend used to render
@@ -314,9 +403,6 @@ struct ChatView: View {
             if appModel.chatSessionIndexRefreshFailed {
                 StalePanelNotice(text: "The session list could not update, so it is showing the last known sessions.")
             }
-
-            TextField("Search sessions", text: $sessionSearch)
-                .textFieldStyle(.roundedBorder)
 
             ScrollView {
                 LazyVStack(spacing: 4) {
@@ -502,14 +588,21 @@ struct ChatView: View {
                     showConversationControls: $showConversationControls,
                     onRename: { title in
                         renameActiveChatTitle(title)
-                    }
+                    },
+                    onFind: openTranscriptSearch
                 )
                 .padding(.horizontal)
                 .padding(.vertical, 10)
                 .background(.bar)
 
                 if showConversationControls {
-                    ChatBrainControlBar()
+                    VStack(spacing: NativeAgentSpacing.sm) {
+                        ChatBrainControlBar()
+                        HStack {
+                            Spacer()
+                            CapabilitiesChip()
+                        }
+                    }
                         .padding(.horizontal)
                         .padding(.vertical, 8)
                         .background(.bar)
@@ -573,53 +666,18 @@ struct ChatView: View {
                                 )
                                 .frame(minHeight: 360)
                             } else {
-                                // B.6: ForEach lives directly in LazyVStack so lazy rendering applies.
-                                // Groups are pre-computed from the message list once.
-                                // PATCH-2026-05-09: chat-ux-polish — compute last assistant message id for hover Regenerate
-                                let lastAssistantId = appModel.chatMessages.last(where: { $0.role == "assistant" })?.id
-                                let chatGroups = MessageGrouper.groups(for: appModel.chatMessages, sessionId: appModel.activeChatSessionId)
                                 let sessionBusy = appModel.isBusy && appModel.currentChatTaskSessionId == appModel.activeChatSessionId
-                                // The live flip-box is the LAST tool group while she's
-                                // still working and her reply text hasn't started yet.
-                                let liveAssistantStarted = appModel.chatMessages.last?.role == "assistant"
-                                    && appModel.chatMessages.last?.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-                                let liveToolGroupId = (sessionBusy && !liveAssistantStarted)
-                                    ? chatGroups.last(where: { $0.isToolGroup })?.id : nil
-                                ForEach(chatGroups) { group in
-                                    if group.isToolGroup {
-                                        if group.messages.count == 1 {
-                                            let msg = group.messages[0]
-                                            let kind = msg.metadata?.kind ?? ""
-                                            if kind == "approval_pending" {
-                                                InlineApprovalCard(message: msg)
-                                            } else {
-                                                ToolPillView(message: msg)
-                                            }
-                                        } else {
-                                            // isLive: this session is streaming AND this is the last
-                                            // group -> show the live flip-through box; else collapse.
-                                            ToolCallGroup(
-                                                messages: group.messages,
-                                                isLive: liveToolGroupId != nil && group.id == liveToolGroupId
-                                            )
-                                        }
-                                    } else {
-                                        let msg = group.messages[0]
-                                        MessageBubble(
-                                            message: msg,
-                                            isLastAssistant: msg.role == "assistant" && msg.id == lastAssistantId
-                                        )
-                                        // phase 6: entrance animates ONLY when
-                                        // the append seam (appendChatMessage)
-                                        // supplies a transaction; removals and
-                                        // wholesale replaces are .identity →
-                                        // instant (no animated teardown on the
-                                        // end-of-turn id swap or session switch).
-                                        .transition(.asymmetric(
-                                            insertion: .opacity.combined(with: .offset(y: 8)),
-                                            removal: .identity))
-                                    }
-                                }
+                                // Main and detached chat share the exact grouped
+                                // transcript owner, including search row IDs and
+                                // selected-result highlighting.
+                                ChatMessageListView(
+                                    messages: appModel.chatMessages,
+                                    sessionId: appModel.activeChatSessionId,
+                                    isStreaming: sessionBusy,
+                                    highlightedMessageID: showTranscriptSearch
+                                        ? transcriptSearch.selectedMessageID
+                                        : nil
+                                )
                             }
                             // phase 4: the scroll TARGET is the clearance —
                             // scrollToBottom aligns this spacer's bottom to the
@@ -629,7 +687,7 @@ struct ChatView: View {
                             // anchor would sit OUTSIDE the scroll target and
                             // the card would still cover the last line.)
                             Color.clear
-                                .frame(height: 56)
+                                .frame(height: MacChatTurnCardMetrics.floatingClearance)
                                 .id(bottomAnchor)
                                 // Re-arm sentinel: inside the LazyVStack this
                                 // spacer only EXISTS when the viewport is at /
@@ -671,6 +729,20 @@ struct ChatView: View {
                         }
                         .allowsHitTesting(false)
                     )
+                    .safeAreaInset(edge: .top, spacing: 0) {
+                        if showTranscriptSearch {
+                            MacChatTranscriptSearchBar(
+                                controller: transcriptSearch,
+                                focusRequest: transcriptSearchFocusRequest,
+                                onDismiss: closeTranscriptSearch
+                            )
+                            .transition(
+                                reduceMotion
+                                    ? .identity
+                                    : .move(edge: .top).combined(with: .opacity)
+                            )
+                        }
+                    }
                     .overlay(alignment: .bottomTrailing) {
                         if !scrollCoordinator.autoFollow {
                             Button {
@@ -688,12 +760,16 @@ struct ChatView: View {
                             .padding(.top, 18)
                             // phase 4: lift clear of the floating thinking row
                             // while a turn streams so it stays visible/clickable.
-                            .padding(.bottom, showThinkingRow ? 56 : 18)
+                            .padding(.bottom, showThinkingRow ? MacChatTurnCardMetrics.floatingClearance : 18)
                             .transition(.opacity.combined(with: .move(edge: .bottom)))
                         }
                     }
                     .onChange(of: appModel.chatMessages.count) {
-                        scrollToBottom(proxy, animated: true, delay: 0.03)
+                        if showTranscriptSearch {
+                            refreshTranscriptSearchIfPresented()
+                        } else {
+                            scrollToBottom(proxy, animated: true, delay: 0.03)
+                        }
                     }
                     .onChange(of: appModel.isBusy) { _, isBusy in
                         // PATCH-2026-06-06: chat-upgrades — smarter auto-scroll.
@@ -704,15 +780,17 @@ struct ChatView: View {
                         // respect their position — do nothing.
                         if !isBusy {
                             turnNoticeToasts.dismissAll()
-                            if scrollCoordinator.autoFollow {
+                            if scrollCoordinator.autoFollow && !showTranscriptSearch {
                                 scrollToBottom(proxy, animated: true, delay: 0.03)
                             }
-                        } else {
+                        } else if !showTranscriptSearch {
                             // stream just started — keep current follow state
                             scrollToBottom(proxy, animated: false, delay: 0.03)
                         }
                     }
                     .onChange(of: appModel.activeChatSessionId) {
+                        showTranscriptSearch = false
+                        transcriptSearch.reset(for: appModel.activeChatSessionId)
                         turnNoticeToasts.dismissAll()
                         scrollCoordinator.forceFollow()
                         renameTitle = activeSession?.title ?? ""
@@ -727,12 +805,36 @@ struct ChatView: View {
                     // — force a scroll with enough delay for the LazyVStack
                     // to lay out the new messages.
                     .onChange(of: appModel.chatMessages.first?.id) { _, _ in
-                        scrollToBottom(proxy, animated: false, delay: 0.12, force: true)
+                        if showTranscriptSearch {
+                            refreshTranscriptSearchIfPresented()
+                        } else {
+                            scrollToBottom(proxy, animated: false, delay: 0.12, force: true)
+                        }
                     }
                     // PATCH-2026-05-06: hotpath-4 scroll as streaming deltas arrive
                     .onChange(of: appModel.chatMessages.last?.content) { _, _ in
-                        if appModel.isBusy && scrollCoordinator.autoFollow {
+                        if showTranscriptSearch {
+                            refreshTranscriptSearchTailIfPresented()
+                        } else if appModel.isBusy && scrollCoordinator.autoFollow {
                             scrollToBottom(proxy, animated: false, delay: 0.02)
+                        }
+                    }
+                    .onChange(of: appModel.chatMessages.last?.id) { _, _ in
+                        refreshTranscriptSearchTailIfPresented()
+                    }
+                    .onChange(of: transcriptSearch.selectionRevision) { _, _ in
+                        guard showTranscriptSearch,
+                              let messageID = transcriptSearch.selectedMessageID
+                        else { return }
+                        scrollCoordinator.disarmFollow()
+                        withAnimation(NativeAgentMotion.respecting(
+                            .easeOut(duration: 0.16),
+                            reduceMotion: reduceMotion
+                        )) {
+                            proxy.scrollTo(
+                                MacChatTranscriptSearch.scrollTargetID(for: messageID),
+                                anchor: .center
+                            )
                         }
                     }
                     // H4 (2026-07-09): a completed turn re-reads the active
@@ -817,8 +919,10 @@ struct ChatView: View {
                 .overlay(alignment: .bottom) {
                     ZStack {
                         if showThinkingRow {
-                            ChatThinkingRow(
-                                personaName: appModel.agentDisplayName,
+                            // Desk 658.11: the one shared live-turn card. The
+                            // detached window composes this exact host.
+                            MacChatTurnCardHost(
+                                sessionId: appModel.activeChatSessionId,
                                 onStop: { appModel.stopChatStream() }
                             )
                             .frame(maxWidth: NativeAgentLayout.maxReadableChatWidth)
@@ -832,8 +936,9 @@ struct ChatView: View {
                         NativeAgentMotion.respecting(NativeAgentMotion.snappy, reduceMotion: reduceMotion),
                         value: showThinkingRow)
                 }
+                .safeAreaInset(edge: .bottom, spacing: 0) {
 
-                Divider()
+                // (divider removed — content flows under the glass composer)
 
                 // PATCH-2026-05-09: chat-ux-polish — polished composer area
                 VStack(spacing: NativeAgentSpacing.xs) {
@@ -869,41 +974,13 @@ struct ChatView: View {
                     // OTHER sessions still streaming. With per-session state,
                     // the user can keep typing here while N background sessions
                     // run; this banner is just a friendly nudge.
-                    if appModel.anySessionStreaming {
-                        let otherRunning = appModel.streamingSessions.filter { $0 != appModel.activeChatSessionId }
-                        if !otherRunning.isEmpty {
-                            HStack(spacing: NativeAgentSpacing.sm) {
-                                Label(otherRunning.count == 1
-                                      ? "Chat running in another session"
-                                      : "\(otherRunning.count) other sessions running",
-                                      systemImage: "ellipsis.message")
-                                    .font(NativeAgentFont.tag)
-                                    .foregroundStyle(.secondary)
-                                Spacer()
-                                if otherRunning.count == 1, let onlySid = otherRunning.first {
-                                    Button("Return", systemImage: "arrow.turn.up.left") {
-                                        if let session = appModel.chatSessions.first(where: { $0.id == onlySid }) {
-                                            Task { await appModel.selectChatSession(session) }
-                                        }
-                                    }
-                                    .buttonStyle(.borderless)
-                                    Button("Stop", systemImage: "stop.fill") {
-                                        appModel.stopChatStream(sessionId: onlySid)
-                                    }
-                                    .buttonStyle(.bordered)
-                                    .tint(.red)
-                                } else {
-                                    Button("Stop Others", systemImage: "stop.fill") {
-                                        for sid in otherRunning { appModel.stopChatStream(sessionId: sid) }
-                                    }
-                                    .buttonStyle(.bordered)
-                                    .tint(.red)
-                                }
-                            }
-                            .padding(.horizontal)
-                            .transition(.opacity.combined(with: .move(edge: .bottom)))
-                        }
-                    }
+                    MacChatOtherSessionsBanner(
+                        otherRunning: appModel.streamingSessions
+                            .filter { $0 != appModel.activeChatSessionId },
+                        routes: runningSessionRoutes,
+                        onGoTo: goToRunningSession,
+                        onStop: { appModel.stopChatStream(sessionId: $0) }
+                    )
 
                     // Toast
                     if let toast = toasts.current {
@@ -923,175 +1000,85 @@ struct ChatView: View {
                             .transition(.opacity.combined(with: .move(edge: .bottom)))
                     }
 
-                    // PATCH-2026-06-06: chat-upgrades — capabilities chip surfaces
-                    // tools/connectors/screen-capture state in one tap.
-                    HStack(spacing: NativeAgentSpacing.sm) {
-                        ComposerMetaRow(appModel: appModel)
-                        CapabilitiesChip()
-                    }
-                    .frame(maxWidth: NativeAgentLayout.maxReadableChatWidth)
-                    .frame(maxWidth: .infinity)
-                    .padding(.horizontal)
+                    let screenCaptureAllowed = appModel.trustPolicy?.multimodalPolicy?.screen_capture == true
+                    let activeSessionIsRunning = appModel.isBusy || appModel.isChatStreaming
+                    let canSend = !isCapturing
+                        && (!text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            || !pendingAttachments.isEmpty)
 
-                    GlassCard(tint: NativeAgentBrand.accent.opacity(0.2)) {
-                        HStack(alignment: .bottom, spacing: NativeAgentSpacing.sm) {
-                            // Mic toggle — PulsingDot halo when listening
-                            ZStack {
-                                if voiceInput.isListening {
-                                    PulsingDot(color: .red, size: 10, animates: true)
-                                        .frame(width: 28, height: 28)
-                                        .offset(x: -1, y: -1)
-                                }
-                                Button {
-                                    toggleVoice()
-                                } label: {
-                                    Image(systemName: voiceInput.isListening ? "mic.fill" : "mic")
-                                        .foregroundStyle(voiceInput.isListening ? Color.red : Color.primary)
-                                        .frame(width: 30, height: 30)
-                                        .contentShape(Rectangle())
-                                }
-                                .buttonStyle(.borderless)
-                                .help(voiceInput.isListening ? "Stop listening" : "Voice input")
-                                .accessibilityLabel(voiceInput.isListening ? "Stop listening" : "Voice input")
+                    MacChatComposerControlStrip(
+                        isListening: voiceInput.isListening,
+                        screenCaptureAllowed: screenCaptureAllowed,
+                        screenCaptureDisabled: activeSessionIsRunning || isCapturing || !screenCaptureAllowed,
+                        pendingAttachmentCount: pendingAttachments.count,
+                        isRunning: activeSessionIsRunning,
+                        canSend: canSend,
+                        onToggleVoice: toggleVoice,
+                        onCaptureScreen: captureScreen,
+                        onAttach: attachFromClipboardOrPickFile,
+                        onStop: { appModel.stopChatStream() },
+                        onSend: send
+                    ) {
+                        TextField(
+                            voiceInput.isListening ? "" : "Ask \(appModel.agentDisplayName)",
+                            text: textBinding,
+                            axis: .vertical
+                        )
+                        .textFieldStyle(.plain)
+                        .lineLimit(1...5)
+                        .focused($inputFocused)
+                        .foregroundStyle(voiceInput.isListening ? .secondary : .primary)
+                        .italic(voiceInput.isListening)
+                        .onSubmit { send() }
+                        .onChange(of: voiceInput.transcript) { _, newVal in
+                            if !newVal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                text = composeVoiceDraft(newVal)
                             }
-
-                            let screenCaptureAllowed = appModel.trustPolicy?.multimodalPolicy?.screen_capture == true
-                            // Screen capture
-                            Button {
-                                captureScreen()
-                            } label: {
-                                Image(systemName: "camera.viewfinder")
-                                    .frame(width: 30, height: 30)
-                                    .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.borderless)
-                            .help(screenCaptureAllowed ? "Show agent my screen" : "Enable screen capture in Trust → Multimodal Capabilities")
-                            .accessibilityLabel("Show agent my screen")
-                            .disabled(appModel.isBusy || appModel.isChatStreaming || isCapturing || !screenCaptureAllowed)
-
-                            // Attach — badge shows pending count
-                            ZStack(alignment: .topTrailing) {
-                                Button {
-                                    attachFromClipboardOrPickFile()
-                                } label: {
-                                    Image(systemName: "paperclip")
-                                        .frame(width: 22, height: 22)
-                                }
-                                .buttonStyle(.borderless)
-                                .help("Attach image or file (or drag onto the input field)")
-                                .accessibilityLabel("Attach image or file")
-
-                                if !pendingAttachments.isEmpty {
-                                    Text("\(pendingAttachments.count)")
-                                        .font(NativeAgentFont.tag)
-                                        .foregroundStyle(.white)
-                                        .padding(3)
-                                        .background(NativeAgentBrand.accent, in: Circle())
-                                        .offset(x: 6, y: -6)
-                                }
-                            }
-
-                            // Text input
-                            TextField(
-                                voiceInput.isListening ? "" : "Ask \(appModel.agentDisplayName)",
-                                text: textBinding,
-                                axis: .vertical
-                            )
-                            .textFieldStyle(.plain)
-                            .lineLimit(1...5)
-                            .focused($inputFocused)
-                            .foregroundStyle(voiceInput.isListening ? .secondary : .primary)
-                            .italic(voiceInput.isListening)
-                            .onSubmit { send() }
-                            .onChange(of: voiceInput.transcript) { _, newVal in
-                                if !newVal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                    text = composeVoiceDraft(newVal)
-                                }
-                            }
-                            .onChange(of: text) { _, newVal in
-                                if newVal.hasPrefix("/") {
-                                    let afterSlash = String(newVal.dropFirst())
-                                    let hasArgsAlready = afterSlash.rangeOfCharacter(from: .whitespacesAndNewlines) != nil
-                                    let firstToken = afterSlash.components(separatedBy: .whitespacesAndNewlines).first ?? afterSlash
-                                    let lowerToken = firstToken.lowercased()
-                                    let dynamicCommandNames = capabilitiesStore.slashCommandTools().map(\.name)
-                                    let prefixMatch = !hasArgsAlready && (
-                                        lowerToken.isEmpty
-                                        || ChatSlashCommandRegistry.commandNames.contains { $0.hasPrefix(lowerToken) }
-                                        || dynamicCommandNames.contains { $0.hasPrefix(lowerToken) }
-                                    )
-                                    if prefixMatch {
-                                        slashFilter = afterSlash
-                                        showSlashMenu = true
-                                    } else {
-                                        showSlashMenu = false
-                                        slashFilter = ""
-                                    }
+                        }
+                        .onChange(of: text) { _, newVal in
+                            if newVal.hasPrefix("/") {
+                                let afterSlash = String(newVal.dropFirst())
+                                let hasArgsAlready = afterSlash.rangeOfCharacter(from: .whitespacesAndNewlines) != nil
+                                let firstToken = afterSlash.components(separatedBy: .whitespacesAndNewlines).first ?? afterSlash
+                                let lowerToken = firstToken.lowercased()
+                                let dynamicCommandNames = capabilitiesStore.slashCommandTools().map(\.name)
+                                let prefixMatch = !hasArgsAlready && (
+                                    lowerToken.isEmpty
+                                    || ChatSlashCommandRegistry.commandNames.contains { $0.hasPrefix(lowerToken) }
+                                    || dynamicCommandNames.contains { $0.hasPrefix(lowerToken) }
+                                )
+                                if prefixMatch {
+                                    slashFilter = afterSlash
+                                    showSlashMenu = true
                                 } else {
                                     showSlashMenu = false
                                     slashFilter = ""
                                 }
+                            } else {
+                                showSlashMenu = false
+                                slashFilter = ""
                             }
-                            .popover(isPresented: $showSlashMenu, arrowEdge: .bottom) {
-                                SlashCommandMenu(filter: slashFilter, onSelect: { command in
-                                    if command.hasSuffix(" ") {
-                                        text = "/" + command
-                                    } else {
-                                        handleSlashCommand(command)
-                                    }
-                                    showSlashMenu = false
-                                    inputFocused = true
-                                }, onDismiss: {
-                                    showSlashMenu = false
-                                }, extraTools: capabilitiesStore.slashCommandTools())
-                            }
-                            .background(
-                                DropZoneView(onDrop: { providers in
-                                    handleDrop(providers: providers)
-                                }, onToast: { msg in
-                                    showToast(msg)
-                                })
-                            )
-
-                            let activeSessionIsRunning = appModel.isBusy || appModel.isChatStreaming
-                            let canSend = !isCapturing
-                                && (!text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !pendingAttachments.isEmpty)
-
-                            // Stop stays independently available while the send
-                            // button keeps accepting messages into send-next.
-                            if activeSessionIsRunning {
-                                Button {
-                                    appModel.stopChatStream()
-                                } label: {
-                                    Image(systemName: "stop.fill")
-                                        .font(.system(size: 13, weight: .semibold))
-                                        .frame(width: 34, height: 34)
-                                        .background(Color.red.opacity(0.85), in: RoundedRectangle(cornerRadius: NativeAgentRadius.control))
-                                        .foregroundStyle(.white)
-                                }
-                                .buttonStyle(.borderless)
-                                .help("Stop generation")
-                                .accessibilityLabel("Stop generation")
-                            }
-
-                            Button {
-                                send()
-                            } label: {
-                                Image(systemName: "paperplane.fill")
-                                    .font(.system(size: 13, weight: .semibold))
-                                    .frame(width: 34, height: 34)
-                                    .background(
-                                        canSend ? NativeAgentBrand.accentDeep : Color.secondary.opacity(0.18),
-                                        in: RoundedRectangle(cornerRadius: NativeAgentRadius.control)
-                                    )
-                                    .foregroundStyle(canSend ? .white : .secondary)
-                            }
-                            .buttonStyle(.borderless)
-                            .disabled(!canSend)
-                            .animation(NativeAgentMotion.snappy, value: canSend)
-                            .help(activeSessionIsRunning ? "Queue message to send next" : "Send message")
-                            .accessibilityLabel(activeSessionIsRunning ? "Queue message to send next" : "Send message")
                         }
+                        .popover(isPresented: $showSlashMenu, arrowEdge: .bottom) {
+                            SlashCommandMenu(filter: slashFilter, onSelect: { command in
+                                if command.hasSuffix(" ") {
+                                    text = "/" + command
+                                } else {
+                                    handleSlashCommand(command)
+                                }
+                                showSlashMenu = false
+                                inputFocused = true
+                            }, onDismiss: {
+                                showSlashMenu = false
+                            }, extraTools: capabilitiesStore.slashCommandTools())
+                        }
+                        .background(
+                            DropZoneView(onDrop: { providers in
+                                handleDrop(providers: providers)
+                            }, onToast: { msg in
+                                showToast(msg)
+                            })
+                        )
                     }
                     // Cap the composer width and center it on the chat column
                     // instead of spanning the whole window; it still grows
@@ -1100,6 +1087,20 @@ struct ChatView: View {
                     .frame(maxWidth: .infinity)
                     .padding(.horizontal)
                     .padding(.bottom, 4)
+                }
+                .background {
+                    // Liquid Feel W2: transcript scrolls UNDER the floating
+                    // composer; this fade keeps the last lines readable while
+                    // the GlassCard refracts what passes beneath it.
+                    LinearGradient(
+                        gradient: Gradient(colors: [
+                            Color(nsColor: .windowBackgroundColor).opacity(0),
+                            Color(nsColor: .windowBackgroundColor).opacity(0.88),
+                        ]),
+                        startPoint: .top, endPoint: .bottom
+                    )
+                    .allowsHitTesting(false)
+                }
                 }
         }
         .background(.background)
@@ -1120,7 +1121,10 @@ struct ChatView: View {
             send: { if !showToolInputForm { send() } },
             attach: attachFromClipboardOrPickFile,
             toggleVoice: toggleVoice,
-            focusComposer: { inputFocused = true }
+            focusComposer: { inputFocused = true },
+            focusTranscriptSearch: openTranscriptSearch,
+            findNext: findNextTranscriptMatch,
+            findPrevious: findPreviousTranscriptMatch
         ))
     }
 

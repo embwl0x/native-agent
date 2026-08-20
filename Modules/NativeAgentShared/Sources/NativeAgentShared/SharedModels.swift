@@ -332,6 +332,12 @@ public struct ApprovalRequest: Identifiable, Codable, Hashable, Sendable {
     public var payloadPreview: String?
     public var localOnly: Bool?
     public var remoteResolvable: Bool?
+    /// Originating chat session for a `chat_tool_approval` record, carried
+    /// straight from the canonical inbox payload's `origin.sessionId`. Nil for
+    /// every other approval kind. It exists so a surface can ask "does this
+    /// approval belong to the conversation in front of me?" without opening a
+    /// second approval store of its own.
+    public var chatOriginSessionId: String?
 
     public init(
         id: String,
@@ -345,7 +351,8 @@ public struct ApprovalRequest: Identifiable, Codable, Hashable, Sendable {
         decision: String? = nil,
         payloadPreview: String? = nil,
         localOnly: Bool? = nil,
-        remoteResolvable: Bool? = nil
+        remoteResolvable: Bool? = nil,
+        chatOriginSessionId: String? = nil
     ) {
         self.id = id
         self.title = title
@@ -359,6 +366,7 @@ public struct ApprovalRequest: Identifiable, Codable, Hashable, Sendable {
         self.payloadPreview = payloadPreview
         self.localOnly = localOnly
         self.remoteResolvable = remoteResolvable
+        self.chatOriginSessionId = chatOriginSessionId
     }
 }
 

@@ -455,7 +455,22 @@ public final class SwiftAppleSpeechTranscriber: TelegramVoiceTranscribing {
     }
 
     private func recognizeOnce(url: URL, forceOnDevice: Bool) async throws -> String {
-        let status = await Self.requestSpeechAuthorization()
+        // PATCH-2026-08-18: READ, never REQUEST.
+        //
+        // This method runs HEADLESS — off an inbound Telegram update, with no
+        // active app and no window. Calling SFSpeechRecognizer.requestAuthorization
+        // here (as this code did until 2026-08-18) does NOT defer the prompt: macOS
+        // cannot render it, so it resolves the request .denied immediately, without
+        // recording a real user decision. TCC then considers the grant RESOLVED and
+        // will never ask again — so a single inbound voice note on a fresh install
+        // permanently bricked Speech Recognition for the whole app, including the
+        // in-app mic button. That is the root cause of the 130dc377 regression.
+        //
+        // The prompting sibling now lives in exactly one place:
+        // SystemPermissionPreflight.requestSpeechRecognitionIfNotDetermined(),
+        // which is @MainActor and only fires at launch/at a user's click. Here we
+        // only ever READ, and fail loudly so the caller can raise a health card.
+        let status = Self.currentSpeechAuthorization()
         guard status == .authorized else {
             throw TelegramVoiceTranscriptionError.speechPermissionDenied(Self.authorizationLabel(status))
         }
@@ -510,12 +525,14 @@ public final class SwiftAppleSpeechTranscriber: TelegramVoiceTranscribing {
             || description.contains("local speech recognition")
     }
 
-    private static func requestSpeechAuthorization() async -> SFSpeechRecognizerAuthorizationStatus {
-        await withCheckedContinuation { cont in
-            SFSpeechRecognizer.requestAuthorization { status in
-                cont.resume(returning: status)
-            }
-        }
+    /// Non-prompting class-level READ of the current grant.
+    ///
+    /// Deliberately NOT `requestAuthorization`. See recognizeOnce(url:forceOnDevice:)
+    /// for why a request fired from this headless context is destructive rather
+    /// than merely useless. If this ever needs to become a request again, it does
+    /// not — route the user to SystemPermissionPreflight instead.
+    private static func currentSpeechAuthorization() -> SFSpeechRecognizerAuthorizationStatus {
+        SFSpeechRecognizer.authorizationStatus()
     }
 
     private static func authorizationLabel(_ status: SFSpeechRecognizerAuthorizationStatus) -> String {

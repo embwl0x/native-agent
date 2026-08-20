@@ -1,0 +1,51 @@
+{
+  "manifest_version": 3,
+  "name": "NativeAgent Chrome Control",
+  "description": "A tab-scoped Chrome surface for NativeAgent.",
+  "version": "0.3.1",
+  "minimum_chrome_version": "116",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuEO0IIz9Q0B5NpUfnpA4dIRXu3cpueNZerMAmTdCjoTjU67kBW49Fq5H1VXpom3NhfvQOZcYYxOT7+Xc7y1WX8oGzp2HUcdbIdfvy76Ogz4DkX/ll1+VGCX2IVU/h2k7y9KAzcTutSJKZXH0U5ab7Uin0WqsmQTd7XGvBkk8Bsw8a7LVZEV0j0FF7B106wPB52Ub00eCTdUukopYwcu4/kzIH+I89Ml4W7uAcrkNB42cKWhScd+PVqJyeYLNOtR/bZM6K4QnVBDq729xN9rOo0wVRB12JdeVvkqEmIlimpyKb493gD6bE9gfL8DRS86vLL0S5JJfyuIQDvc0sB3ohQIDAQAB",
+  "permissions": [
+    "alarms",
+    "nativeMessaging",
+    "storage",
+    "tabs",
+    "webNavigation"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "src/user-touch.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true,
+      "match_about_blank": true,
+      "match_origin_as_fallback": true
+    },
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "src/page-agent.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true,
+      "match_about_blank": true,
+      "match_origin_as_fallback": true
+    }
+  ]
+}

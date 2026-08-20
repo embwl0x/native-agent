@@ -840,13 +840,17 @@ final class DeskStoreTests: XCTestCase {
         let b = try await store.createItem(kind: .watch, project: "na", title: "quiet one") // default quiet
         let c = try await store.createItem(kind: .plan, project: "na", title: "done one")
         _ = try await store.setNotify(c.handle, policy: NotifyPolicy(level: .urgent))
-        _ = try await store.closeItem(c.handle, outcomeSummary: "done")  // terminal -> no ping
+        _ = try await store.closeItem(c.handle, outcomeSummary: "done")
 
         let state = try await store.liveState()
         let handles = Set(DeskNotifyEvaluator.decisions(state, now: Date()).map { $0.handle })
         XCTAssertTrue(handles.contains(a.handle))    // direct + active -> fires
         XCTAssertFalse(handles.contains(b.handle))   // quiet -> no
-        XCTAssertFalse(handles.contains(c.handle))   // urgent but terminal -> no
+        // REBASELINED (desk-delegation-pushes, 2026-08-17): a FRESH close on a
+        // direct/urgent item now fires its one completion ping — that was the
+        // whole feature ("I'll let you know when it's done" made mechanical).
+        // Historical closes staying silent is pinned in DeskDelegationNotifyTests.
+        XCTAssertTrue(handles.contains(c.handle))    // urgent + just closed -> completion ping
     }
 
     func test_notify_idempotent_markNotified_no_refire_and_no_updatedAt_bump() async throws {

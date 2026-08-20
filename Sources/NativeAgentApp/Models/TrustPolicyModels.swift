@@ -76,6 +76,19 @@ struct TrustConnectorPolicy: Codable, Hashable {
     var sendExternalMessagesRequiresApproval: Bool?
 }
 
+struct TrustChromeControlPolicy: Codable, Hashable {
+    var enabled: Bool = false
+
+    init(enabled: Bool = false) {
+        self.enabled = enabled
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+    }
+}
+
 struct TrustMultimodalPolicy: Codable, Hashable {
     var screen_capture: Bool = false
     var vision_api_calls: Bool = true
@@ -120,6 +133,7 @@ struct TrustPolicy: Codable, Hashable {
     var toolPolicy: TrustToolPolicy?
     var filePolicy: TrustFilePolicy?
     var connectorPolicy: TrustConnectorPolicy?
+    var chromeControlPolicy: TrustChromeControlPolicy?
     var multimodalPolicy: TrustMultimodalPolicy?
     var fullMacNeverExpires: Bool?
     var fullMacMaxDurationHours: Double?
@@ -140,7 +154,7 @@ struct TrustPolicy: Codable, Hashable {
     enum CodingKeys: String, CodingKey {
         case permissionLevel, autonomyDefault, updatedAt, appDataRoot
         case workshopPolicy = "missionPolicy" // compatibility wire ID
-        case toolPolicy, filePolicy, connectorPolicy, multimodalPolicy
+        case toolPolicy, filePolicy, connectorPolicy, chromeControlPolicy, multimodalPolicy
         case fullMacNeverExpires, fullMacMaxDurationHours, fullMacExpiresAt, fullMacConfirmedAt
         case developerMode, enableAutonomy, trainingPolicy, promotionPolicy, memoryPolicy, macControlPolicy
     }
@@ -162,6 +176,7 @@ struct TrustPolicy: Codable, Hashable {
         toolPolicy: TrustToolPolicy? = nil,
         filePolicy: TrustFilePolicy? = nil,
         connectorPolicy: TrustConnectorPolicy? = nil,
+        chromeControlPolicy: TrustChromeControlPolicy? = nil,
         multimodalPolicy: TrustMultimodalPolicy? = nil,
         fullMacNeverExpires: Bool? = nil,
         fullMacMaxDurationHours: Double? = nil,
@@ -182,6 +197,7 @@ struct TrustPolicy: Codable, Hashable {
         self.toolPolicy = toolPolicy
         self.filePolicy = filePolicy
         self.connectorPolicy = connectorPolicy
+        self.chromeControlPolicy = chromeControlPolicy
         self.multimodalPolicy = multimodalPolicy
         self.fullMacNeverExpires = fullMacNeverExpires
         self.fullMacMaxDurationHours = fullMacMaxDurationHours
@@ -213,6 +229,7 @@ struct TrustPolicy: Codable, Hashable {
         toolPolicy = try c.decodeIfPresent(TrustToolPolicy.self, forKey: .toolPolicy)
         filePolicy = try c.decodeIfPresent(TrustFilePolicy.self, forKey: .filePolicy)
         connectorPolicy = try c.decodeIfPresent(TrustConnectorPolicy.self, forKey: .connectorPolicy)
+        chromeControlPolicy = try c.decodeIfPresent(TrustChromeControlPolicy.self, forKey: .chromeControlPolicy)
         multimodalPolicy = try c.decodeIfPresent(TrustMultimodalPolicy.self, forKey: .multimodalPolicy)
         fullMacNeverExpires = try c.decodeIfPresent(Bool.self, forKey: .fullMacNeverExpires)
         fullMacMaxDurationHours = try c.decodeIfPresent(Double.self, forKey: .fullMacMaxDurationHours)

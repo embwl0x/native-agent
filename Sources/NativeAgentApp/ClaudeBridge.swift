@@ -50,6 +50,22 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
     private static let maxRequestBodyBytes = 4 * 1024 * 1024
     private static let claudeSurfaceName = "claude-bridge"
     private static let codexSurfaceName = "codex-bridge"
+
+    /// 658.14: map a bridge sender to the surface recorded as message origin.
+    /// Every lane gets a distinct, truthful string — including lanes added
+    /// after this was written, which is why the fallback derives from the
+    /// sender instead of defaulting to any named agent.
+    static func bridgeSurfaceName(forSender sender: String) -> String {
+        switch sender {
+        case "claude": return claudeSurfaceName
+        case "codex": return codexSurfaceName
+        default:
+            let cleaned = sender
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            return cleaned.isEmpty ? "bridge" : "\(cleaned)-bridge"
+        }
+    }
     private static let connectionDeadlineSeconds: Int = 30
     /// U5 W-G (2026-06-11): upper bound on the WORK phase of /claude/message
     /// (one full LLM turn incl. tool loop). The read-phase deadline above is
@@ -1226,8 +1242,25 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         // every bridge message reads to Agent as if it came from the user.
         // Trust-but-mark: we PREFIX the user-visible text with a [from:
         // claude] tag so her system context + chat history show it.
-        // She can also see surface="claude-bridge" via the turn metadata.
+        // Human transcript readers also get a durable metadata.origin record;
+        // the model still reads the prefix as prose context.
         let sender = defaultSender
+        // 658.14: the durable, out-of-band twin of the in-band prefix below.
+        // The prefix is prose the model reads and ANYONE can type; this is the
+        // server-recorded route field a transcript reader can distinguish from
+        // prose. Authorization currently uses one shared bearer for every
+        // route, so this does not independently attest the calling process.
+        // Surface is derived from the sender rather than picked by a
+        // two-way ternary. There is a THIRD lane — defaultSender "omp" at
+        // :503 — and a `sender == "codex" ? codex : claude` test silently
+        // labelled it "claude-bridge". A provenance indicator that names the
+        // wrong lane is strictly worse than no indicator, so unknown senders
+        // get their own surface string and fall through the render
+        // allowlist's default to the honest, unattributed "Automated".
+        let origin = ChatMessageOrigin(
+            surface: Self.bridgeSurfaceName(forSender: sender),
+            agent: sender
+        )
         let text: String
         if sender == "claude" {
             text = "[from: claude, via bridge] \(rawText)"
@@ -1266,6 +1299,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                 text: text,
                 sessionId: sessionId,
                 persona: persona,
+                origin: origin,
                 started: started
             )
             return
@@ -1317,28 +1351,37 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                             )
                         }
                         let generated = try await ChatPersistenceContext
-                            .$codexCompletionBinding.withValue(
-                                CodexCompletionTranscriptBinding(
-                                    deliveryId: deliveryId,
-                                    requestDigest: completionRequestDigest,
-                                    // Canonical assistant persistence replaces
-                                    // these placeholders with executed truth.
-                                    model: "",
-                                    reasoningEffort: nil
-                                )
-                            ) {
-                                try await client.chat(
-                                    message: text,
-                                    sessionId: sessionId,
-                                    model: "",
-                                    reasoningEffort: "",
-                                    fileAccess: "auto",
-                                    attachments: [],
-                                    persona: persona,
-                                    surface: "chat",
-                                    suppressUserAppend: false
-                                )
+                            .$originProvenance.withValue(origin) {
+                          try await ChatToolSessionContext
+                            .$replyRoute.withValue(completionRoute?.chatToolReplyRoute) {
+                                try await ChatPersistenceContext
+                                    .$codexCompletionBinding.withValue(
+                                        CodexCompletionTranscriptBinding(
+                                            deliveryId: deliveryId,
+                                            requestDigest: completionRequestDigest,
+                                            // Canonical assistant persistence replaces
+                                            // these placeholders with executed truth.
+                                            model: "",
+                                            reasoningEffort: nil
+                                        )
+                                    ) {
+                                        try await client.chat(
+                                            message: text,
+                                            sessionId: sessionId,
+                                            model: "",
+                                            reasoningEffort: "",
+                                            fileAccess: "auto",
+                                            attachments: [],
+                                            persona: persona,
+                                            // Keep local bridge trust semantics. The
+                                            // TaskLocal above carries only the immutable
+                                            // reply destination for async follow-up work.
+                                            surface: "chat",
+                                            suppressUserAppend: false
+                                        )
+                                    }
                             }
+                        }
                         // The full Agent response is canonical before any external
                         // surface send begins. A retry/relaunch now resumes delivery
                         // from this cache and can never start a second model turn.
@@ -1385,17 +1428,20 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                             noWorkObserved: completion.noWorkObserved
                         )
                     }
-                    resp = try await client.chat(
-                        message: text,
-                        sessionId: sessionId,
-                        model: "",
-                        reasoningEffort: "",
-                        fileAccess: "auto",
-                        attachments: [],
-                        persona: persona,
-                        surface: "chat",
-                        suppressUserAppend: false
-                    )
+                    resp = try await ChatPersistenceContext
+                        .$originProvenance.withValue(origin) {
+                            try await client.chat(
+                                message: text,
+                                sessionId: sessionId,
+                                model: "",
+                                reasoningEffort: "",
+                                fileAccess: "auto",
+                                attachments: [],
+                                persona: persona,
+                                surface: "chat",
+                                suppressUserAppend: false
+                            )
+                        }
                 }
                 await Self.publishChatTurnCompleted(sessionID: resp.sessionId ?? sessionId)
                 let durationMs = Int(Date().timeIntervalSince(started) * 1000)
@@ -1608,6 +1654,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         text: String,
         sessionId: String?,
         persona: String?,
+        origin: ChatMessageOrigin,
         started: Date
     ) {
         let enqueueLatch = WorkLatch()
@@ -1615,12 +1662,15 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
             guard let self else { return }
             let enqueued: EnqueuedUserMessage
             do {
-                enqueued = try await client.enqueueUserMessage(
-                    message: text,
-                    sessionId: sessionId,
-                    persona: persona,
-                    surface: "chat"
-                )
+                enqueued = try await ChatPersistenceContext.$originProvenance
+                    .withValue(origin) {
+                        try await client.enqueueUserMessage(
+                            message: text,
+                            sessionId: sessionId,
+                            persona: persona,
+                            surface: "chat"
+                        )
+                    }
             } catch {
                 guard enqueueLatch.claim() else { return }
                 self.publishEvent(kind: "message_enqueue_failed", payload: [
@@ -1656,19 +1706,22 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                 // exclusion drops the pre-appended user row (else the message
                 // enters the prompt twice) and user/assistant rows correlate
                 // exactly as on the normal append-inside-turn path.
-                let resp = try await ChatPersistenceContext.$pinnedTurnRunID
-                    .withValue(enqueued.runId) {
-                        try await client.chat(
-                            message: text,
-                            sessionId: enqueued.sessionId,
-                            model: "",
-                            reasoningEffort: "",
-                            fileAccess: "auto",
-                            attachments: [],
-                            persona: persona,
-                            surface: "chat",
-                            suppressUserAppend: true
-                        )
+                let resp = try await ChatPersistenceContext.$originProvenance
+                    .withValue(origin) {
+                        try await ChatPersistenceContext.$pinnedTurnRunID
+                            .withValue(enqueued.runId) {
+                                try await client.chat(
+                                    message: text,
+                                    sessionId: enqueued.sessionId,
+                                    model: "",
+                                    reasoningEffort: "",
+                                    fileAccess: "auto",
+                                    attachments: [],
+                                    persona: persona,
+                                    surface: "chat",
+                                    suppressUserAppend: true
+                                )
+                            }
                     }
                 await Self.publishChatTurnCompleted(sessionID: resp.sessionId ?? enqueued.sessionId)
                 let durationMs = Int(Date().timeIntervalSince(started) * 1000)

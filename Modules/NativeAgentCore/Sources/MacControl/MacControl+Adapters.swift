@@ -59,6 +59,10 @@ public struct AppControlRunResult: Sendable, Equatable {
     public let processIdentifier: Int32?
     public let launched: Bool
     public let activated: Bool
+    public let activationRequestAccepted: Bool?
+    public let activationFallbackAttempted: Bool
+    public let activationFallbackSucceeded: Bool
+    public let activationFailureReason: String?
     public let terminated: Bool
     public let alreadyInDesiredState: Bool
 
@@ -69,6 +73,10 @@ public struct AppControlRunResult: Sendable, Equatable {
         processIdentifier: Int32?,
         launched: Bool,
         activated: Bool,
+        activationRequestAccepted: Bool? = nil,
+        activationFallbackAttempted: Bool = false,
+        activationFallbackSucceeded: Bool = false,
+        activationFailureReason: String? = nil,
         terminated: Bool,
         alreadyInDesiredState: Bool = false
     ) {
@@ -78,6 +86,10 @@ public struct AppControlRunResult: Sendable, Equatable {
         self.processIdentifier = processIdentifier
         self.launched = launched
         self.activated = activated
+        self.activationRequestAccepted = activationRequestAccepted
+        self.activationFallbackAttempted = activationFallbackAttempted
+        self.activationFallbackSucceeded = activationFallbackSucceeded
+        self.activationFailureReason = activationFailureReason
         self.terminated = terminated
         self.alreadyInDesiredState = alreadyInDesiredState
     }
@@ -714,12 +726,41 @@ public final class SystemAppControlAdapter: AppControlAdapter, AppStateVerificat
     @MainActor
     private static func focusAppOnMain(named query: String) async throws -> AppControlRunResult {
         if let running = runningApp(matching: query) {
-            let activated = running.activate(options: [.activateAllWindows])
+            let activationRequestAccepted = running.activate(options: [.activateAllWindows])
+            var fallbackAttempted = false
+            var fallbackSucceeded = false
+            var fallbackFailure: String?
+
+            if !activationRequestAccepted {
+                if let bundleURL = running.bundleURL {
+                    fallbackAttempted = true
+                    do {
+                        _ = try await openApplication(at: bundleURL)
+                        fallbackSucceeded = true
+                    } catch {
+                        fallbackFailure = "NSWorkspace.openApplication fallback failed: \(error)"
+                    }
+                } else {
+                    fallbackFailure = "NSWorkspace.openApplication fallback unavailable: target has no bundle URL"
+                }
+            }
+
+            let activated = await waitUntilFrontmost(matching: query)
+            let failureReason = activated ? nil : activationFailureReason(
+                activationRequestAccepted: activationRequestAccepted,
+                fallbackAttempted: fallbackAttempted,
+                fallbackSucceeded: fallbackSucceeded,
+                fallbackFailure: fallbackFailure
+            )
             return runResult(
                 requested: query,
                 app: running,
                 launched: false,
                 activated: activated,
+                activationRequestAccepted: activationRequestAccepted,
+                activationFallbackAttempted: fallbackAttempted,
+                activationFallbackSucceeded: fallbackSucceeded,
+                activationFailureReason: failureReason,
                 terminated: false
             )
         }
@@ -727,15 +768,56 @@ public final class SystemAppControlAdapter: AppControlAdapter, AppStateVerificat
             throw MacControlError.appControlFailed("app_not_found: \(query)")
         }
         let launched = try await openApplication(at: url)
-        let activated = launched.activate(options: [.activateAllWindows])
+        let activationRequestAccepted = launched.activate(options: [.activateAllWindows])
+        let activated = await waitUntilFrontmost(matching: query)
+        let failureReason = activated ? nil : activationFailureReason(
+            activationRequestAccepted: activationRequestAccepted,
+            fallbackAttempted: false,
+            fallbackSucceeded: false,
+            fallbackFailure: nil
+        )
         return runResult(
             requested: query,
             app: launched,
             fallbackURL: url,
             launched: true,
             activated: activated,
+            activationRequestAccepted: activationRequestAccepted,
+            activationFailureReason: failureReason,
             terminated: false
         )
+    }
+
+    @MainActor
+    private static func waitUntilFrontmost(matching query: String) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .milliseconds(1_500))
+        repeat {
+            if isFrontmostApplicationOnMain(matching: query) { return true }
+            if clock.now >= deadline { return false }
+            try? await Task.sleep(for: .milliseconds(50))
+        } while !Task.isCancelled
+        return false
+    }
+
+    private static func activationFailureReason(
+        activationRequestAccepted: Bool,
+        fallbackAttempted: Bool,
+        fallbackSucceeded: Bool,
+        fallbackFailure: String?
+    ) -> String {
+        var steps = ["NSRunningApplication.activate returned \(activationRequestAccepted)"]
+        if fallbackAttempted {
+            steps.append(
+                fallbackSucceeded
+                    ? "NSWorkspace.openApplication fallback completed"
+                    : (fallbackFailure ?? "NSWorkspace.openApplication fallback did not complete")
+            )
+        } else if let fallbackFailure {
+            steps.append(fallbackFailure)
+        }
+        steps.append("target was not observed frontmost within 1.5 seconds")
+        return steps.joined(separator: "; ")
     }
 
     @MainActor
@@ -850,6 +932,10 @@ public final class SystemAppControlAdapter: AppControlAdapter, AppStateVerificat
         fallbackURL: URL? = nil,
         launched: Bool,
         activated: Bool,
+        activationRequestAccepted: Bool? = nil,
+        activationFallbackAttempted: Bool = false,
+        activationFallbackSucceeded: Bool = false,
+        activationFailureReason: String? = nil,
         terminated: Bool
     ) -> AppControlRunResult {
         let name = app.localizedName ?? fallbackURL?.deletingPathExtension().lastPathComponent
@@ -861,6 +947,10 @@ public final class SystemAppControlAdapter: AppControlAdapter, AppStateVerificat
             processIdentifier: app.processIdentifier,
             launched: launched,
             activated: activated,
+            activationRequestAccepted: activationRequestAccepted,
+            activationFallbackAttempted: activationFallbackAttempted,
+            activationFallbackSucceeded: activationFallbackSucceeded,
+            activationFailureReason: activationFailureReason,
             terminated: terminated
         )
     }

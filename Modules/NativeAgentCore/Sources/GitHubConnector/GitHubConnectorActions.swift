@@ -261,6 +261,62 @@ public enum GitHubConnectorActions {
         return rows
     }
 
+    /// The last page of issue comments PLUS the expected comment when it has
+    /// fallen off that page (cross-review MED, 2026-08-17). The per-issue
+    /// endpoint lists ASCENDING, so a dispatched comment slides backwards as
+    /// newer ones arrive; once it left the final page, exact verification
+    /// silently found nothing and the lane settled work that was never
+    /// handled. One direct by-id read answers it exactly: present → the event
+    /// still stands, 404 → the comment really is gone and the signal may clear.
+    static func issueCommentsIncludingExpected(
+        repository: String,
+        number: Int,
+        commentCount: Int,
+        expectedIdentifier: String?,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) async throws -> Any {
+        guard commentCount > 0 else { return [] }
+        let lastPage = (commentCount + 99) / 100
+        let page = try await call(
+            path: "repos/\(repository)/issues/\(number)/comments",
+            params: ["per_page": "100", "page": String(lastPage)],
+            dataRoot: dataRoot
+        )
+        guard let expectedIdentifier, !expectedIdentifier.isEmpty,
+              var rows = page as? [[String: Any]] else { return page }
+        let present = rows.contains { row in
+            let id = (row["id"] as? NSNumber)?.stringValue ?? (row["id"] as? Int).map(String.init)
+            return id == expectedIdentifier
+        }
+        if present { return rows }
+        do {
+            let exact = try await call(
+                path: "repos/\(repository)/issues/comments/\(expectedIdentifier)",
+                dataRoot: dataRoot
+            )
+            if let row = exact as? [String: Any] { rows.append(row) }
+        } catch GitHubConnectorError.http(let status, _, _, _) where status == 404 {
+            // Deleted upstream: the event genuinely cleared.
+            return rows
+        }
+        // The recovered row is OLDER than the page it rejoins, and downstream
+        // consumers read this array positionally — `latestNonBotCommentAuthor`
+        // walks it in reverse to decide who spoke last (gpt-5.5 MED). Appending
+        // blindly would make a recovered maintainer comment look like the last
+        // word and keep a decision label armed after the contributor answered.
+        // Restore the endpoint's own ascending order so position still means
+        // recency for every reader.
+        rows.sort { lhs, rhs in
+            let l = (lhs["created_at"] as? String) ?? ""
+            let r = (rhs["created_at"] as? String) ?? ""
+            if l != r { return l < r }
+            let lid = (lhs["id"] as? NSNumber)?.intValue ?? (lhs["id"] as? Int) ?? 0
+            let rid = (rhs["id"] as? NSNumber)?.intValue ?? (rhs["id"] as? Int) ?? 0
+            return lid < rid
+        }
+        return rows
+    }
+
     static func call(
         path: String,
         params: [String: String] = [:],
@@ -274,6 +330,16 @@ public enum GitHubConnectorActions {
             token = explicitToken
         } else {
             token = try await loadToken(dataRoot: dataRoot)
+        }
+        // Closed back-off window: fail locally instead of adding load to a
+        // throttle we already provoked (secondary-rate circuit breaker).
+        if let remaining = await GitHubRateLimitGate.shared.cooldownRemaining() {
+            throw GitHubConnectorError.http(
+                status: 429,
+                message: "secondary rate-limit back-off active, \(Int(remaining.rounded()))s remaining",
+                rateLimitRemaining: nil,
+                rateLimitReset: nil
+            )
         }
         let url = try requestURL(path: path, params: params)
         var req = URLRequest(url: url)
@@ -315,6 +381,18 @@ public enum GitHubConnectorActions {
             let reset = http.value(forHTTPHeaderField: "X-RateLimit-Reset")
                 .flatMap(TimeInterval.init)
                 .map { ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: $0)) }
+            if let backoff = secondaryRateBackoff(
+                status: http.statusCode,
+                message: message,
+                retryAfterHeader: http.value(forHTTPHeaderField: "Retry-After"),
+                rateLimitRemaining: remaining
+            ) {
+                await GitHubRateLimitGate.shared.trip(seconds: backoff)
+                NSLog(
+                    "[github] secondary rate limit — backing off %ds (status %d, remaining %@)",
+                    Int(backoff), http.statusCode, remaining.map(String.init) ?? "n/a"
+                )
+            }
             throw GitHubConnectorError.http(
                 status: http.statusCode,
                 message: message,
@@ -424,5 +502,65 @@ enum GitHubConnectorSecretRedactor {
             )
         }
         return out
+    }
+}
+
+/// SECONDARY-RATE CIRCUIT BREAKER (cross-review MED, 2026-08-17).
+///
+/// GitHub answers a secondary-rate violation with 403 (or 429) while
+/// `X-RateLimit-Remaining` is still healthy — the "rate-limit remaining 4977"
+/// failures already visible on the desk. Nothing in the connector read that as
+/// back-off pressure, so the 5-minute contribution sweep plus a per-PR
+/// mergeability probe kept issuing calls into a closed window and stayed
+/// throttled. The gate turns that into honest degradation: once tripped, every
+/// call fails FAST and locally, repositories land in the pass's `failed` list
+/// (their prior rows carry as un-refreshed, never as freshly-confirmed), and
+/// the next sweep after the window is the natural retry.
+actor GitHubRateLimitGate {
+    static let shared = GitHubRateLimitGate()
+    private var openAgainAt: Date?
+
+    /// Longest back-off we will honor; a header asking for more is capped so a
+    /// single hostile value cannot mute monitoring for hours.
+    static let maximumBackoff: TimeInterval = 300
+
+    func cooldownRemaining(now: Date = Date()) -> TimeInterval? {
+        guard let openAgainAt, openAgainAt > now else { return nil }
+        return openAgainAt.timeIntervalSince(now)
+    }
+
+    func trip(seconds: TimeInterval, now: Date = Date()) {
+        let bounded = min(max(seconds, 1), Self.maximumBackoff)
+        let candidate = now.addingTimeInterval(bounded)
+        if let openAgainAt, openAgainAt > candidate { return }
+        openAgainAt = candidate
+    }
+
+    func reset() { openAgainAt = nil }
+}
+
+extension GitHubConnectorActions {
+    /// Seconds to back off, or nil when this failure is not a secondary-rate
+    /// signal. PURE so the classification is testable without a network.
+    static func secondaryRateBackoff(
+        status: Int,
+        message: String,
+        retryAfterHeader: String?,
+        rateLimitRemaining: Int?
+    ) -> TimeInterval? {
+        let lowered = message.lowercased()
+        let saysSecondary = lowered.contains("secondary rate limit")
+            || lowered.contains("abuse detection")
+            || lowered.contains("please wait a few minutes")
+        guard status == 429 || status == 403 else { return nil }
+        // A 403 with budget still on the clock is a THROTTLE, not exhaustion;
+        // primary exhaustion (remaining 0) keeps its reset stamp and must not
+        // be swallowed by this gate.
+        let healthyBudget = (rateLimitRemaining ?? 0) > 0
+        guard saysSecondary || status == 429 || healthyBudget else { return nil }
+        if let retryAfterHeader, let seconds = TimeInterval(retryAfterHeader), seconds > 0 {
+            return seconds
+        }
+        return 60
     }
 }

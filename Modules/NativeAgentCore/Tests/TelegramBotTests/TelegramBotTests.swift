@@ -9,6 +9,7 @@ import PersistenceCore
 // Isolated stub subclass (own handler slot) — see ConfigurableURLProtocolStub.
 
 private final class MockURLProtocol: ConfigurableURLProtocolStub {}
+private final class FailClosedMockURLProtocol: ConfigurableURLProtocolStub {}
 
 private func mockSession(_ handler: @escaping (URLRequest) throws -> (HTTPURLResponse, Data)) -> URLSession {
     MockURLProtocol.makeSession(handler: handler)
@@ -102,6 +103,12 @@ private func makeResponse(_ url: URL, _ status: Int) -> HTTPURLResponse {
 // MARK: - Phase B: longPoll + dispatchSwiftSlashCommand + TelegramPollLoop
 
 private let tokenStr = "TKN123"
+
+private let discardTurnCardSend: @Sendable (String, Int, String) async throws -> Int = { _, _, _ in
+    9_999
+}
+
+private let discardTurnCardEdit: @Sendable (String, Int, Int, String) async throws -> Void = { _, _, _, _ in }
 
 private actor TelegramTaskPriorityCapture {
     private var value: TaskPriority?
@@ -266,6 +273,17 @@ struct SwiftNativeTelegramBotPhaseBTests {
                 model: "test-transcribe",
                 latencyMilliseconds: 12
             )
+        }
+    }
+
+    /// PATCH-2026-08-18: transcriber that always fails with a supplied error.
+    /// Drives the headless-denial path — the whole point of the bug is that the
+    /// failure arrives with no human present, so the test supplies the error
+    /// rather than depending on host TCC state.
+    private struct FailingVoiceTranscriber: TelegramVoiceTranscribing {
+        let error: any Error
+        func transcribe(_ attachment: TelegramMediaAttachment) async throws -> TelegramVoiceTranscription {
+            throw error
         }
     }
 
@@ -540,6 +558,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let offline = mockSession { request in
             throw URLError(.notConnectedToInternet, userInfo: [NSURLErrorFailingURLErrorKey: request.url as Any])
         }
+        let coordinator = TelegramTurnCoordinator()
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
@@ -550,15 +569,20 @@ struct SwiftNativeTelegramBotPhaseBTests {
             offsetURL: offset,
             sendMessage: { _, _, text in await capture.send(text) },
             sendChatAction: { _, _, _ in },
+            sendMessageReturningId: discardTurnCardSend,
+            editMessageText: discardTurnCardEdit,
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
             chatHandler: { _, text in
                 await capture.call(text)
                 return "recovered reply"
             },
             typingRefreshNanoseconds: 0,
-            turnCoordinator: TelegramTurnCoordinator()
+            turnCoordinator: coordinator
         )
 
         let outcome = await loop.tickOutcome()
+        await coordinator.waitUntilAllIdle()
         let (calls, sent) = await capture.snapshot()
         guard case .completed = outcome else {
             Issue.record("expected durable replay to complete, got \(outcome)")
@@ -609,6 +633,10 @@ struct SwiftNativeTelegramBotPhaseBTests {
             offsetURL: offset,
             sendMessage: { _, _, _ in },
             sendChatAction: { _, _, _ in },
+            sendMessageReturningId: discardTurnCardSend,
+            editMessageText: discardTurnCardEdit,
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
             chatHandler: { _, _ in
                 await capture.call()
                 return "duplicate"
@@ -689,6 +717,10 @@ struct SwiftNativeTelegramBotPhaseBTests {
             offsetURL: offset,
             sendMessage: { _, _, _ in },
             sendChatAction: { _, _, _ in },
+            sendMessageReturningId: discardTurnCardSend,
+            editMessageText: discardTurnCardEdit,
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
             chatHandler: { _, _ in
                 await capture.record(Task.currentPriority)
                 return "reply"
@@ -805,10 +837,15 @@ struct SwiftNativeTelegramBotPhaseBTests {
         actor Capture {
             var sent: [(Int, String)] = []
             var answered: [(String, String)] = []
+            var edits: [(Int, Int, String, JSONValue?)] = []
             func send(_ chatId: Int, _ text: String) { sent.append((chatId, text)) }
             func answer(_ callbackId: String, _ text: String) { answered.append((callbackId, text)) }
+            func edit(_ chatId: Int, _ messageId: Int, _ text: String, _ markup: JSONValue?) {
+                edits.append((chatId, messageId, text, markup))
+            }
             func sentSnapshot() -> [(Int, String)] { sent }
             func answerSnapshot() -> [(String, String)] { answered }
+            func editSnapshot() -> [(Int, Int, String, JSONValue?)] { edits }
         }
         let capture = Capture()
         let handler = ApprovalHandlerCapture(reply: "denied")
@@ -824,6 +861,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
             offsetURL: tmp,
             sendMessage: { _, chatId, text in await capture.send(chatId, text) },
             answerCallbackQuery: { _, callbackId, text in await capture.answer(callbackId, text) },
+            editMessageTextWithReplyMarkup: { _, chatId, messageId, text, markup in
+                await capture.edit(chatId, messageId, text, markup)
+            },
             approvalHandler: handler
         )
         await loop.tick()
@@ -836,9 +876,13 @@ struct SwiftNativeTelegramBotPhaseBTests {
         #expect(answered.first?.0 == "cb-1")
         #expect(answered.first?.1 == "denied")
         let sentMessages = await capture.sentSnapshot()
-        #expect(sentMessages.count == 1)
-        #expect(sentMessages.first?.0 == 77)
-        #expect(sentMessages.first?.1 == "denied")
+        #expect(sentMessages.isEmpty)
+        let edits = await capture.editSnapshot()
+        #expect(edits.count == 1)
+        #expect(edits.first?.0 == 77)
+        #expect(edits.first?.1 == 3)
+        #expect(edits.first?.2 == "denied")
+        #expect(edits.first?.3 == TelegramTurnControlCallback.clearedReplyMarkup)
     }
 
     @Test func telegramPollLoop_approved_callback_resumesInterruptedChatWithoutAppendingSyntheticUserTurn() async throws {
@@ -878,6 +922,10 @@ struct SwiftNativeTelegramBotPhaseBTests {
             offsetURL: tmp,
             sendMessage: { _, chatId, text in await capture.send(chatId, text) },
             sendChatAction: { _, _, _ in },
+            sendMessageReturningId: discardTurnCardSend,
+            editMessageText: discardTurnCardEdit,
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
             approvalHandler: handler,
             progressChatHandler: { chatId, text, _, context in
                 await capture.chat(
@@ -1141,7 +1189,11 @@ struct SwiftNativeTelegramBotPhaseBTests {
         await coordinator.finishTurn(chatId: 77, turnId: activeId)
 
         let (sent, cancelled) = await capture.snapshot()
-        #expect(sent == ["Stopping the current Telegram turn."])
+        // A synthetic coordinator turn without a work card cannot present a
+        // confirmed terminal state. The live production path always owns a
+        // card (covered by TelegramTurnControlsTests), and does not spray a
+        // redundant standalone stop notice.
+        #expect(sent.isEmpty)
         #expect(cancelled)
     }
 
@@ -1178,6 +1230,10 @@ struct SwiftNativeTelegramBotPhaseBTests {
             offsetURL: offset,
             sendMessage: { _, _, text in await capture.send(text) },
             sendChatAction: { _, _, _ in },
+            sendMessageReturningId: discardTurnCardSend,
+            editMessageText: discardTurnCardEdit,
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
             progressChatHandler: { _, _, _, _ in
                 await capture.handlerEntered()
                 // This is the old TOCTOU window made deterministic: when the
@@ -1249,6 +1305,10 @@ struct SwiftNativeTelegramBotPhaseBTests {
             offsetURL: offset,
             sendMessage: { _, _, text in await capture.send(text) },
             sendChatAction: { _, _, _ in },
+            sendMessageReturningId: discardTurnCardSend,
+            editMessageText: discardTurnCardEdit,
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
             progressChatHandler: { _, text, _, context in
                 let count = await capture.record(text: text, suppress: context.suppressUserAppend)
                 return count == 1 ? "first reply" : "retry reply"
@@ -1294,6 +1354,10 @@ struct SwiftNativeTelegramBotPhaseBTests {
             offsetURL: offset,
             sendMessage: { _, _, text in await capture.send(text) },
             sendChatAction: { _, _, _ in },
+            sendMessageReturningId: discardTurnCardSend,
+            editMessageText: discardTurnCardEdit,
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
             chatHandler: { _, _ in "" },
             typingRefreshNanoseconds: 0,
             turnCoordinator: TelegramTurnCoordinator()
@@ -1356,6 +1420,10 @@ struct SwiftNativeTelegramBotPhaseBTests {
             offsetURL: offset,
             sendMessage: { _, _, text in await capture.send(text) },
             sendChatAction: { _, _, _ in },
+            sendMessageReturningId: discardTurnCardSend,
+            editMessageText: discardTurnCardEdit,
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
             chatHandler: { _, _ in await capture.reply() },
             typingRefreshNanoseconds: 0,
             turnCoordinator: TelegramTurnCoordinator()
@@ -1467,6 +1535,10 @@ struct SwiftNativeTelegramBotPhaseBTests {
                 await cap.append(chatId, text)
             },
             sendChatAction: { _, _, _ in },
+            sendMessageReturningId: discardTurnCardSend,
+            editMessageText: discardTurnCardEdit,
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
             chatHandler: { _, _ in throw HandlerFailure.boom }
         )
         await loop.tick()
@@ -1544,6 +1616,10 @@ struct SwiftNativeTelegramBotPhaseBTests {
                 await cap.append(chatId, text)
             },
             sendChatAction: { _, _, _ in },
+            sendMessageReturningId: discardTurnCardSend,
+            editMessageText: discardTurnCardEdit,
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
             chatHandler: { _, _ in
                 await cap.bumpHandlerCall()
                 throw UsageFailure()
@@ -1644,6 +1720,10 @@ struct SwiftNativeTelegramBotPhaseBTests {
                 await cap.append(chatId, text)
             },
             sendChatAction: { _, _, _ in },
+            sendMessageReturningId: discardTurnCardSend,
+            editMessageText: discardTurnCardEdit,
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
             chatHandler: { _, _ in
                 let call = await cap.nextHandlerCall()
                 if call == 1 { throw TransientFailure() }
@@ -1656,7 +1736,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
 
         let (sent, handlerCalls) = await cap.snapshot()
         #expect(handlerCalls == 2)
-        #expect(sent.map { $0.1 } == ["Draft stalled; retrying", "recovered"])
+        #expect(sent.map { $0.1 } == ["recovered"])
 
         let errors = try readTelegramJSONL(root, "errors.jsonl")
         #expect(errors.isEmpty)
@@ -1722,6 +1802,10 @@ struct SwiftNativeTelegramBotPhaseBTests {
             sendChatAction: { _, chatId, action in
                 await cap.appendAction(chatId, action)
             },
+            sendMessageReturningId: discardTurnCardSend,
+            editMessageText: discardTurnCardEdit,
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
             chatHandler: { _, _ in "reply" },
             typingRefreshNanoseconds: 0
         )
@@ -1803,7 +1887,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
         ])
     }
 
-    @Test func telegramPollLoop_sends_compact_progress_messages_from_progress_handler() async throws {
+    @Test func telegramPollLoop_uses_one_durable_card_without_progress_message_spray() async throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("telegram_progress_\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1820,8 +1904,19 @@ struct SwiftNativeTelegramBotPhaseBTests {
 
         actor Capture {
             var sent: [(Int, String)] = []
+            var cards: [(Int, String)] = []
+            var edits: [(Int, String)] = []
             func append(_ chatId: Int, _ text: String) { sent.append((chatId, text)) }
-            func snapshot() -> [(Int, String)] { sent }
+            func sendCard(_ chatId: Int, _ text: String) -> Int {
+                cards.append((chatId, text))
+                return 333
+            }
+            func editCard(_ messageId: Int, _ text: String) {
+                edits.append((messageId, text))
+            }
+            func snapshot() -> (sent: [(Int, String)], cards: [(Int, String)], edits: [(Int, String)]) {
+                (sent, cards, edits)
+            }
         }
         let cap = Capture()
 
@@ -1838,22 +1933,36 @@ struct SwiftNativeTelegramBotPhaseBTests {
                 await cap.append(chatId, text)
             },
             sendChatAction: { _, _, _ in },
+            sendMessageReturningId: { _, chatId, text in
+                await cap.sendCard(chatId, text)
+            },
+            editMessageText: { _, _, messageId, text in
+                await cap.editCard(messageId, text)
+            },
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
             progressChatHandler: { _, _, progress, _ in
                 await progress(.toolUse(name: "read_skill", input: .object(["name": .string("builder")])))
                 await progress(.toolUse(name: "list_skills", input: nil))
                 await progress(.toolResult(name: "read_skill", output: .string("ok")))
+                await progress(.toolUse(name: "codex_message", input: nil))
+                for index in 0..<12 {
+                    await progress(.status(text: "Progress \(index)"))
+                }
                 return "done"
             },
             typingRefreshNanoseconds: 0
         )
         await loop.tick()
 
-        let sent = await cap.snapshot()
-        #expect(sent.map { $0.1 } == [
-            "Loading skill: builder",
-            "Checking skills",
-            "done",
-        ])
+        let captured = await cap.snapshot()
+        #expect(captured.sent.map { $0.1 } == ["done"])
+        #expect(captured.cards.count == 1)
+        #expect(captured.cards[0].1.hasPrefix("Acknowledged ·"))
+        #expect(captured.edits.count > 8)
+        #expect(captured.edits.allSatisfy { $0.0 == 333 })
+        #expect(captured.edits.contains { $0.1.contains("Delegate: Codex") })
+        #expect(captured.edits.last?.1.hasPrefix("Completed ·") == true)
     }
 
     @Test func telegramPollLoop_uploads_generated_images_after_reply() async throws {
@@ -1900,6 +2009,10 @@ struct SwiftNativeTelegramBotPhaseBTests {
             sendChatAction: { _, _, action in
                 await cap.append("action:\(action)")
             },
+            sendMessageReturningId: discardTurnCardSend,
+            editMessageText: discardTurnCardEdit,
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
             progressChatHandler: { _, _, progress, _ in
                 await progress(.toolResult(
                     name: "image_generate",
@@ -1926,6 +2039,141 @@ struct SwiftNativeTelegramBotPhaseBTests {
             "action:upload_photo",
             "photo:77:\(imagePath.path):",
         ])
+    }
+
+    @Test func telegramPollLoop_richReplyKeepsOneCardOneResponseAndGeneratedMedia() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("telegram_rich_image_\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let offset = root
+            .appendingPathComponent("telegram", isDirectory: true)
+            .appendingPathComponent("last_offset.json")
+        let generatedImages = root.appendingPathComponent("generated_images", isDirectory: true)
+        try FileManager.default.createDirectory(at: generatedImages, withIntermediateDirectories: true)
+        let imagePath = generatedImages.appendingPathComponent("sample.png")
+        try Data("fake-png".utf8).write(to: imagePath)
+        let raw = #"""
+        {"ok":true,"result":[{"update_id":194,"message":{"message_id":18,"chat":{"id":77},"from":{"id":11},"text":"make a rich report","date":1}}]}
+        """#
+        let session = mockSession { req in
+            (makeResponse(req.url!, 200), Data(raw.utf8))
+        }
+
+        actor Capture {
+            var ordinary: [String] = []
+            var richDrafts: [TelegramInputRichMessage] = []
+            var richFinals: [TelegramInputRichMessage] = []
+            var cards: [String] = []
+            var cardEdits: [String] = []
+            var photos: [String] = []
+            func appendOrdinary(_ text: String) { ordinary.append(text) }
+            func richDraft(_ message: TelegramInputRichMessage) { richDrafts.append(message) }
+            func richFinal(_ message: TelegramInputRichMessage) -> Int { richFinals.append(message); return 818 }
+            func card(_ text: String) -> Int { cards.append(text); return 717 }
+            func cardEdit(_ text: String) { cardEdits.append(text) }
+            func photo(_ path: String) { photos.append(path) }
+        }
+        let capture = Capture()
+        let loop = TelegramPollLoop(
+            interval: 60,
+            token: tokenStr,
+            allowedChatIds: [77],
+            session: session,
+            dataRoot: root,
+            offsetURL: offset,
+            sendMessage: { _, _, text in await capture.appendOrdinary(text) },
+            sendPhoto: { _, _, path, _ in await capture.photo(path) },
+            sendChatAction: { _, _, _ in },
+            sendMessageReturningId: { _, _, text in await capture.card(text) },
+            sendRichMessageDraft: { _, _, _, message in await capture.richDraft(message) },
+            sendRichMessage: { _, _, message in await capture.richFinal(message) },
+            editMessageText: { _, _, _, text in await capture.cardEdit(text) },
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
+            progressChatHandler: { _, _, progress, _ in
+                await progress(.textDelta(accumulated: "# Report\nPartial"))
+                await progress(.toolResult(
+                    name: "image_generate",
+                    output: .object([
+                        "status": .string("ok"),
+                        "images": .array([.object([
+                            "path": .string(imagePath.path),
+                            "filename": .string(imagePath.lastPathComponent),
+                            "byteSize": .int(8),
+                        ])]),
+                    ])
+                ))
+                return "# Report\nComplete"
+            },
+            typingRefreshNanoseconds: 0
+        )
+
+        await loop.tick()
+
+        #expect(await capture.cards.count == 1)
+        #expect(await capture.richDrafts.count == 1)
+        #expect(await capture.richFinals.count == 1)
+        #expect(await capture.ordinary.isEmpty)
+        #expect(await capture.photos == [imagePath.path])
+        #expect(await capture.cardEdits.last?.hasPrefix("Completed ·") == true)
+        let ledgerURL = root.appendingPathComponent("telegram/work_cards.json")
+        let ledgerData = try Data(contentsOf: ledgerURL)
+        let ledgerJSON = try JSONValue.parse(ledgerData)
+        guard case .object(let ledgerObject) = ledgerJSON,
+              case .array(let cards)? = ledgerObject["cards"] else {
+            Issue.record("expected work-card ledger envelope")
+            return
+        }
+        #expect(cards.isEmpty)
+    }
+
+    @Test func telegramPollLoop_ambiguousRichFinalDoesNotDuplicateAndCardIsOutcomeUnknown() async {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("telegram_rich_ambiguous_\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let offset = root
+            .appendingPathComponent("telegram", isDirectory: true)
+            .appendingPathComponent("last_offset.json")
+        let raw = #"""
+        {"ok":true,"result":[{"update_id":195,"message":{"message_id":19,"chat":{"id":77},"from":{"id":11},"text":"reply once","date":1}}]}
+        """#
+        let session = mockSession { req in
+            (makeResponse(req.url!, 200), Data(raw.utf8))
+        }
+
+        actor Capture {
+            var ordinary: [String] = []
+            var richFinalCount = 0
+            var cardEdits: [String] = []
+            func appendOrdinary(_ text: String) { ordinary.append(text) }
+            func richFinal() throws -> Int { richFinalCount += 1; throw URLError(.networkConnectionLost) }
+            func edit(_ text: String) { cardEdits.append(text) }
+        }
+        let capture = Capture()
+        let loop = TelegramPollLoop(
+            interval: 60,
+            token: tokenStr,
+            allowedChatIds: [77],
+            session: session,
+            dataRoot: root,
+            offsetURL: offset,
+            sendMessage: { _, _, text in await capture.appendOrdinary(text) },
+            sendChatAction: { _, _, _ in },
+            sendMessageReturningId: { _, _, _ in 719 },
+            sendRichMessageDraft: { _, _, _, _ in },
+            sendRichMessage: { _, _, _ in try await capture.richFinal() },
+            editMessageText: { _, _, _, text in await capture.edit(text) },
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
+            chatHandler: { _, _ in "Maybe delivered" },
+            typingRefreshNanoseconds: 0
+        )
+
+        await loop.tick()
+
+        #expect(await capture.richFinalCount == 1)
+        #expect(await capture.ordinary.isEmpty)
+        #expect(await capture.cardEdits.last?.hasPrefix("Outcome unknown ·") == true)
     }
 
     @Test func telegramPollLoop_retries_progress_handler_without_duplicate_user_append() async throws {
@@ -1975,6 +2223,10 @@ struct SwiftNativeTelegramBotPhaseBTests {
                 await cap.appendSent(text)
             },
             sendChatAction: { _, _, _ in },
+            sendMessageReturningId: discardTurnCardSend,
+            editMessageText: discardTurnCardEdit,
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
             progressChatHandler: { _, _, _, context in
                 await cap.appendContext(context)
                 if await cap.attemptCount() == 1 {
@@ -1989,7 +2241,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
         await loop.tick()
 
         let (sent, contexts, userAppends) = await cap.snapshot()
-        #expect(sent == ["Draft stalled; retrying", "retry reply"])
+        #expect(sent == ["retry reply"])
         #expect(contexts.map(\.attemptIndex) == [0, 1])
         #expect(contexts.map(\.suppressUserAppend) == [false, true])
         #expect(contexts.map(\.fromUserId) == [11, 11])
@@ -2059,6 +2311,10 @@ struct SwiftNativeTelegramBotPhaseBTests {
                 await cap.appendSent(text)
             },
             sendChatAction: { _, _, _ in },
+            sendMessageReturningId: discardTurnCardSend,
+            editMessageText: discardTurnCardEdit,
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
             progressChatHandler: { _, _, _, _ in
                 await cap.captureOffset(offset)
                 return "done"
@@ -2115,6 +2371,10 @@ struct SwiftNativeTelegramBotPhaseBTests {
             sendChatAction: { _, chatId, action in
                 await cap.appendAction(chatId, action)
             },
+            sendMessageReturningId: discardTurnCardSend,
+            editMessageText: discardTurnCardEdit,
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
             progressChatHandler: { _, text, _, _ in
                 await cap.appendHandlerText(text)
                 return "voice reply"
@@ -2144,6 +2404,141 @@ struct SwiftNativeTelegramBotPhaseBTests {
         #expect(transcriptionRow["model"] == .string("test-transcribe"))
         #expect(replyRow["kind"] == .string("voice_reply"))
         #expect(replyRow["replyPreview"] == .string("voice reply"))
+    }
+
+    /// PATCH-2026-08-18 (root cause 130dc377): a missing macOS Speech
+    /// Recognition grant must never be a silent drop. Three things have to
+    /// happen together — the SENDER gets a chat notice, the failure is recorded,
+    /// and the app-side capability signal fires so the human at the Mac gets a
+    /// card with a route to System Settings. Asserting only the chat notice
+    /// would have passed before the fix existed.
+    @Test func telegramPollLoop_voice_speech_permission_denied_raises_capability_flag_and_user_notice() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("telegram_voice_denied_\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let offset = root
+            .appendingPathComponent("telegram", isDirectory: true)
+            .appendingPathComponent("last_offset.json")
+
+        let raw = #"""
+        {"ok":true,"result":[{"update_id":94,"message":{"message_id":8,"chat":{"id":77},"from":{"id":11},"voice":{"file_id":"VOICE_FILE_ID","file_size":10,"mime_type":"audio/ogg","duration":3},"date":1}}]}
+        """#
+        let session = mockSession { req in
+            (makeResponse(req.url!, 200), Data(raw.utf8))
+        }
+
+        actor Capture {
+            var sent: [String] = []
+            var capabilities: [String] = []
+            func appendMessage(_ text: String) { sent.append(text) }
+            func appendCapability(_ name: String) { capabilities.append(name) }
+            func snapshot() -> ([String], [String]) { (sent, capabilities) }
+        }
+        let cap = Capture()
+
+        let loop = TelegramPollLoop(
+            interval: 60,
+            token: tokenStr,
+            allowedChatIds: [5, 9, 77],
+            session: session,
+            dataRoot: root,
+            offsetURL: offset,
+            sendMessage: { _, _, text in await cap.appendMessage(text) },
+            sendChatAction: { _, _, _ in },
+            sendMessageReturningId: discardTurnCardSend,
+            editMessageText: discardTurnCardEdit,
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
+            progressChatHandler: { _, _, _, _ in "unused" },
+            voiceDownloader: FakeVoiceDownloader(bytes: Data("voice-bytes".utf8)),
+            voiceTranscriber: FailingVoiceTranscriber(
+                error: TelegramVoiceTranscriptionError.speechPermissionDenied("denied")
+            ),
+            onCapabilityDenied: { name in await cap.appendCapability(name) },
+            voiceMaxBytes: 1024 * 1024,
+            typingRefreshNanoseconds: 0
+        )
+        await loop.tick()
+
+        let (sent, capabilities) = await cap.snapshot()
+
+        // 1. The Telegram sender is told, in words that name the actual problem.
+        #expect(sent.contains { $0.contains("Speech Recognition permission is not approved") })
+
+        // 2. The app-side signal fired exactly once, naming the capability.
+        #expect(capabilities == ["speechRecognition"])
+
+        // 3. The failure is on the record with its context.
+        let errors = try readTelegramJSONL(root, "errors.jsonl")
+        #expect(errors.count == 1)
+        guard case .object(let errorRow)? = errors.first else {
+            Issue.record("expected a voice_transcription error row")
+            return
+        }
+        #expect(errorRow["context"] == .string("voice_transcription"))
+    }
+
+    /// NEGATIVE CONTROL for the test above. Without this, that test passes for
+    /// the wrong reason — a catch block that flagged EVERY failure would satisfy
+    /// it while turning the permission card into noise the user learns to
+    /// ignore. A conversion failure is a real voice failure that no System
+    /// Settings switch can fix, so it must NOT raise the capability flag.
+    // No `throws` on this one: nothing in the body throws, and Swift's typed-throws
+    // inference makes a bare `async throws` here resolve to `throws(Never)`.
+    @Test func telegramPollLoop_voice_non_permission_error_does_not_raise_capability_flag() async {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("telegram_voice_convfail_\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let offset = root
+            .appendingPathComponent("telegram", isDirectory: true)
+            .appendingPathComponent("last_offset.json")
+
+        let raw = #"""
+        {"ok":true,"result":[{"update_id":94,"message":{"message_id":8,"chat":{"id":77},"from":{"id":11},"voice":{"file_id":"VOICE_FILE_ID","file_size":10,"mime_type":"audio/ogg","duration":3},"date":1}}]}
+        """#
+        let session = mockSession { req in
+            (makeResponse(req.url!, 200), Data(raw.utf8))
+        }
+
+        actor Capture {
+            var sent: [String] = []
+            var capabilities: [String] = []
+            func appendMessage(_ text: String) { sent.append(text) }
+            func appendCapability(_ name: String) { capabilities.append(name) }
+            func snapshot() -> ([String], [String]) { (sent, capabilities) }
+        }
+        let cap = Capture()
+
+        let loop = TelegramPollLoop(
+            interval: 60,
+            token: tokenStr,
+            allowedChatIds: [5, 9, 77],
+            session: session,
+            dataRoot: root,
+            offsetURL: offset,
+            sendMessage: { _, _, text in await cap.appendMessage(text) },
+            sendChatAction: { _, _, _ in },
+            sendMessageReturningId: discardTurnCardSend,
+            editMessageText: discardTurnCardEdit,
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
+            progressChatHandler: { _, _, _, _ in "unused" },
+            voiceDownloader: FakeVoiceDownloader(bytes: Data("voice-bytes".utf8)),
+            voiceTranscriber: FailingVoiceTranscriber(
+                error: TelegramVoiceTranscriptionError.conversionFailed("ffmpeg exited 1")
+            ),
+            onCapabilityDenied: { name in await cap.appendCapability(name) },
+            voiceMaxBytes: 1024 * 1024,
+            typingRefreshNanoseconds: 0
+        )
+        await loop.tick()
+
+        let (sent, capabilities) = await cap.snapshot()
+
+        // The sender is still told something went wrong — failures are never silent.
+        #expect(sent.contains { $0.contains("I got your voice note") })
+        // But no permission card is raised: no TCC switch would fix this.
+        #expect(capabilities.isEmpty)
     }
 
     @Test func telegramPollLoop_voice_post_download_byte_cap_drops_oversized() async throws {
@@ -2187,6 +2582,10 @@ struct SwiftNativeTelegramBotPhaseBTests {
                 await cap.appendMessage(chatId, text)
             },
             sendChatAction: { _, _, _ in },
+            sendMessageReturningId: discardTurnCardSend,
+            editMessageText: discardTurnCardEdit,
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
             progressChatHandler: { _, _, _, _ in
                 await cap.bumpHandler()
                 return "should not run"
@@ -2231,9 +2630,15 @@ struct SwiftNativeTelegramBotPhaseBTests {
         actor Capture {
             var sent: [(Int, String)] = []
             var handlerCalls = 0
+            var cardSends: [String] = []
+            var cardEdits: [String] = []
             func append(_ chatId: Int, _ text: String) { sent.append((chatId, text)) }
             func bumpHandlerCall() { handlerCalls += 1 }
-            func snapshot() -> ([(Int, String)], Int) { (sent, handlerCalls) }
+            func sendCard(_ text: String) -> Int { cardSends.append(text); return 901 }
+            func editCard(_ text: String) { cardEdits.append(text) }
+            func snapshot() -> (sent: [(Int, String)], handlerCalls: Int, cardSends: [String], cardEdits: [String]) {
+                (sent, handlerCalls, cardSends, cardEdits)
+            }
         }
         let cap = Capture()
 
@@ -2250,6 +2655,10 @@ struct SwiftNativeTelegramBotPhaseBTests {
                 await cap.append(chatId, text)
             },
             sendChatAction: { _, _, _ in },
+            sendMessageReturningId: { _, _, text in await cap.sendCard(text) },
+            editMessageText: { _, _, _, text in await cap.editCard(text) },
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
             chatHandler: { _, _ in
                 await cap.bumpHandlerCall()
                 throw TransientFailure()
@@ -2259,12 +2668,12 @@ struct SwiftNativeTelegramBotPhaseBTests {
         )
         await loop.tick()
 
-        let (sent, handlerCalls) = await cap.snapshot()
-        #expect(handlerCalls == 2)
-        #expect(sent.map { $0.1 } == [
-            "Draft stalled; retrying",
-            "(drafting stalled; try again in a moment)",
-        ])
+        let captured = await cap.snapshot()
+        #expect(captured.handlerCalls == 2)
+        #expect(captured.sent.map { $0.1 } == ["(drafting stalled; try again in a moment)"])
+        #expect(captured.cardSends.count == 1)
+        #expect(captured.cardEdits.contains { $0.hasPrefix("Retrying ·") })
+        #expect(captured.cardEdits.last?.hasPrefix("Failed ·") == true)
 
         let receipts = try readTelegramJSONL(root, "receipts.jsonl")
         guard case .object(let receiptRow)? = receipts.first else {
@@ -2301,6 +2710,10 @@ struct SwiftNativeTelegramBotPhaseBTests {
             offsetURL: offset,
             sendMessage: { _, _, _ in throw SendFailure.noRoute },
             sendChatAction: { _, _, _ in },
+            sendMessageReturningId: discardTurnCardSend,
+            editMessageText: discardTurnCardEdit,
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
             chatHandler: { _, _ in "reply" }
         )
         await loop.tick()
@@ -2578,27 +2991,6 @@ struct TelegramChunkingTests {
         #expect(chunks.joined() == text)
     }
 
-    @Test func sendTransportRequiresTelegramSemanticSuccess() throws {
-        let accepted = try JSONSerialization.data(withJSONObject: [
-            "ok": true,
-            "result": ["message_id": 42],
-        ])
-        try TelegramPollLoop._tgRequireSuccessfulResponse(accepted, operation: "sendMessage")
-
-        let rejected = try JSONSerialization.data(withJSONObject: [
-            "ok": false,
-            "description": "Bad Request: chat not found",
-        ])
-        #expect(throws: (any Error).self) {
-            try TelegramPollLoop._tgRequireSuccessfulResponse(rejected, operation: "sendMessage")
-        }
-        #expect(throws: (any Error).self) {
-            try TelegramPollLoop._tgRequireSuccessfulResponse(
-                Data("not-json".utf8),
-                operation: "sendPhoto"
-            )
-        }
-    }
 }
 
 // Audit 2026-06-09 (security-adjacent): URLSession errors embed the failing
@@ -2765,6 +3157,10 @@ struct TelegramPhotoIngestTests {
             interval: 60, token: tokenStr, allowedChatIds: [77], session: session, dataRoot: root, offsetURL: offset,
             sendMessage: { _, _, text in await cap.note(text) },
             sendChatAction: { _, _, _ in },
+            sendMessageReturningId: discardTurnCardSend,
+            editMessageText: discardTurnCardEdit,
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
             attachmentChatHandler: { _, text, atts, _, _ in
                 await cap.handler(text, atts)
                 return "I see the image"
@@ -2812,6 +3208,10 @@ struct TelegramPhotoIngestTests {
             interval: 60, token: tokenStr, allowedChatIds: [77], session: session, dataRoot: root, offsetURL: offset,
             sendMessage: { _, _, _ in },
             sendChatAction: { _, _, _ in },
+            sendMessageReturningId: discardTurnCardSend,
+            editMessageText: discardTurnCardEdit,
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
             attachmentChatHandler: { _, text, atts, _, _ in await cap.handler(text, atts); return "ok" },
             photoDownloader: FakePhotoDownloader(bytes: Data("IMG".utf8), filename: "p.jpg"),
             typingRefreshNanoseconds: 0
@@ -2848,6 +3248,10 @@ struct TelegramPhotoIngestTests {
             interval: 60, token: tokenStr, allowedChatIds: [77], session: session, dataRoot: root, offsetURL: offset,
             sendMessage: { _, _, text in await cap.note(text) },
             sendChatAction: { _, _, _ in },
+            sendMessageReturningId: discardTurnCardSend,
+            editMessageText: discardTurnCardEdit,
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
             attachmentChatHandler: { _, _, _, _, _ in await cap.markHandler(); return "should not run" },
             photoDownloader: FailingPhotoDownloader(error: .oversized(reportedBytes: 20 * 1024 * 1024, capBytes: 10 * 1024 * 1024)),
             typingRefreshNanoseconds: 0
@@ -2900,6 +3304,10 @@ struct TelegramPhotoIngestTests {
             interval: 60, token: tokenStr, allowedChatIds: [77], session: session, dataRoot: root, offsetURL: offset,
             sendMessage: { _, _, text in await cap.note(text) },
             sendChatAction: { _, _, _ in },
+            sendMessageReturningId: discardTurnCardSend,
+            editMessageText: discardTurnCardEdit,
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
             attachmentChatHandler: { _, _, _, _, _ in "should not run" },
             photoDownloader: FailingPhotoDownloader(error: .httpError(status: 502)),
             typingRefreshNanoseconds: 0
@@ -2946,6 +3354,10 @@ struct TelegramPhotoIngestTests {
             interval: 60, token: tokenStr, allowedChatIds: [77], session: session, dataRoot: root, offsetURL: offset,
             sendMessage: { _, _, text in await cap.note(text) },
             sendChatAction: { _, _, _ in },
+            sendMessageReturningId: discardTurnCardSend,
+            editMessageText: discardTurnCardEdit,
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
             attachmentChatHandler: { _, _, _, _, _ in "should not run" },
             photoDownloader: nil,
             typingRefreshNanoseconds: 0
@@ -2985,7 +3397,7 @@ struct TelegramPhotoIngestTests {
     let raw = #"""
     {"ok":true,"result":[{"update_id":91,"message":{"message_id":1,"chat":{"id":9},"from":{"id":11},"text":"hello","date":1}}]}
     """#
-    let session = mockSession { req in
+    let session = FailClosedMockURLProtocol.makeSession { req in
         (makeResponse(req.url!, 200), Data(raw.utf8))
     }
     actor Flag { var called = false; func mark() { called = true }; func read() -> Bool { called } }
@@ -3010,4 +3422,128 @@ struct TelegramPhotoIngestTests {
     #expect(await flag.read() == false)
     let data = try Data(contentsOf: tmp)
     #expect(String(data: data, encoding: .utf8)?.contains("92") == true)
+}
+
+/// PATCH-2026-08-18. Pins the two facts that make the headless-orphaned-grant
+/// regression (root cause 130dc377) impossible to reintroduce silently.
+@Suite("Speech permission denial handling")
+struct TelegramSpeechPermissionGuardTests {
+
+    /// THE INVARIANT. A prompting authorization API anywhere in the TelegramBot
+    /// sources is the bug itself: this module only ever runs headless, off an
+    /// inbound update, where macOS cannot render a consent prompt and resolves
+    /// the request to a permanent .denied without asking the user. The only
+    /// legitimate prompt site in the whole app is
+    /// SystemPermissionPreflight.requestSpeechRecognitionIfNotDetermined(),
+    /// which is @MainActor and app-side. A unit test cannot observe TCC, so this
+    /// pins the fact at the SOURCE level instead — the same technique the
+    /// transcript-correction scope test already uses.
+    @Test func telegramBotSourcesNeverRequestSpeechAuthorization() throws {
+        let sourceRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // TelegramBotTests
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // NativeAgentCore
+            .appendingPathComponent("Sources/TelegramBot", isDirectory: true)
+        let files = try FileManager.default.contentsOfDirectory(
+            at: sourceRoot, includingPropertiesForKeys: nil)
+
+        var offenders: [String] = []
+        for file in files where file.pathExtension == "swift" {
+            let text = try String(contentsOf: file, encoding: .utf8)
+            // Strip comments before matching: these sources' own explanatory
+            // comments name the forbidden API on purpose, and matching them
+            // would make the guard fire on its own documentation. Done as a real
+            // scan rather than a line filter — dropping any line that STARTS
+            // with "//" would hide live code trailing a block-comment close
+            // (`/*` newline `// */ SFSpeechRecognizer.requestAuthorization {}`),
+            // a false negative in exactly the guard that must not have one.
+            if Self.strippingComments(text).contains("SFSpeechRecognizer.requestAuthorization") {
+                offenders.append(file.lastPathComponent)
+            }
+        }
+        #expect(offenders.isEmpty,
+                "headless TelegramBot sources must never call SFSpeechRecognizer.requestAuthorization; offenders: \(offenders)")
+    }
+
+    /// Removes `//` line comments and `/* */` block comments (nested-aware),
+    /// leaving only executable text. String literals are not modelled; the only
+    /// consequence would be a false POSITIVE (the guard firing on the API name
+    /// inside a literal), which fails loud rather than silent.
+    static func strippingComments(_ source: String) -> String {
+        var out = ""
+        var blockDepth = 0
+        var index = source.startIndex
+        while index < source.endIndex {
+            let rest = source[index...]
+            if blockDepth == 0, rest.hasPrefix("//") {
+                // Skip to end of line.
+                if let newline = source[index...].firstIndex(of: "\n") {
+                    out.append("\n")
+                    index = source.index(after: newline)
+                } else {
+                    index = source.endIndex
+                }
+                continue
+            }
+            if rest.hasPrefix("/*") {
+                blockDepth += 1
+                index = source.index(index, offsetBy: 2)
+                continue
+            }
+            if blockDepth > 0, rest.hasPrefix("*/") {
+                blockDepth -= 1
+                index = source.index(index, offsetBy: 2)
+                continue
+            }
+            if blockDepth == 0 {
+                out.append(source[index])
+            }
+            index = source.index(after: index)
+        }
+        return out
+    }
+
+    /// The headless path must still READ the grant and fail loudly.
+    @Test func telegramVoiceTranscriptionReadsAuthorizationStatus() throws {
+        let source = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/TelegramBot/TelegramVoiceTranscription.swift")
+        let text = try String(contentsOf: source, encoding: .utf8)
+        #expect(text.contains("SFSpeechRecognizer.authorizationStatus()"))
+    }
+
+    /// The denial predicate's full contract. Only a genuine permission denial
+    /// may raise the capability card; every other voice failure is a real
+    /// failure that no System Settings switch fixes, and flagging it would turn
+    /// the card into noise the user learns to ignore.
+    @Test func denialPredicateFiresOnlyForPermissionDenial() {
+        #expect(TelegramPollLoop.isSpeechPermissionDenial(
+            TelegramVoiceTranscriptionError.speechPermissionDenied("denied")))
+        #expect(TelegramPollLoop.isSpeechPermissionDenial(
+            TelegramVoiceTranscriptionError.speechPermissionDenied("restricted")))
+
+        // Neighbours that must NOT flag. speechUnavailable is the sharp one:
+        // its message mentions speech, so a naive string match catches it.
+        let nonDenials: [TelegramVoiceTranscriptionError] = [
+            .speechUnavailable("recognizer is not currently available"),
+            .speechRecognitionFailed("timed out"),
+            .malformedResponse,
+            .conversionFailed("ffmpeg exited 1"),
+        ]
+        for error in nonDenials {
+            #expect(!TelegramPollLoop.isSpeechPermissionDenial(error),
+                    "must not flag a capability for \(error)")
+        }
+
+        // Untyped errors fall through to the narrow string check.
+        struct Untyped: LocalizedError {
+            let errorDescription: String?
+        }
+        #expect(TelegramPollLoop.isSpeechPermissionDenial(
+            Untyped(errorDescription: "voice transcription: speech recognition permission denied: denied")))
+        #expect(!TelegramPollLoop.isSpeechPermissionDenial(
+            Untyped(errorDescription: "network connection lost")))
+    }
 }

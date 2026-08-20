@@ -654,6 +654,29 @@ extension iCloudSyncEngine {
 
     // MARK: - Higher-level mutation helpers
 
+    @discardableResult
+    func createDeskItem(kind: String, project: String, title: String, summary: String?) async throws -> [String: String]? {
+        var payload = ["kind": kind, "project": project, "title": title]
+        if let summary, !summary.isEmpty { payload["summary"] = summary }
+        return try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
+            .make(action: "createDeskItem", payload: payload)
+        ))
+    }
+
+    @discardableResult
+    func setDeskItemStatus(handle: String, status: String) async throws -> [String: String]? {
+        try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
+            .make(action: "setDeskItemStatus", payload: ["handle": handle, "status": status])
+        ))
+    }
+
+    @discardableResult
+    func appendDeskItemNote(handle: String, text: String) async throws -> [String: String]? {
+        try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
+            .make(action: "appendDeskItemNote", payload: ["handle": handle, "text": text])
+        ))
+    }
+
     // Route Workshop submission through signature retry so a
     // signature_required rejection auto-retries with a fresh signature.
     @discardableResult

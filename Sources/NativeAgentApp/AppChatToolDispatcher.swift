@@ -818,6 +818,19 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         "browser.read_text",
         "browser.read_links",
         "browser.screenshot",
+        "browser.chrome_acquire",
+        "browser.chrome_navigate",
+        "browser.chrome_snapshot",
+        "browser.chrome_click",
+        "browser.chrome_fill",
+        "browser.chrome_type",
+        "browser.chrome_select",
+        "browser.chrome_keypress",
+        "browser.chrome_set_checked",
+        "browser.chrome_double_click",
+        "browser.chrome_wait",
+        "browser.chrome_scroll",
+        "browser.chrome_release",
     ]
     private static let healthToolNames = ["doctor_status", "telegram_status"]
     private static let organismToolNames = ["reflex_review"]
@@ -880,6 +893,32 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             return "browser.read_links"
         case "browser.screenshot", "browser_screenshot", "browser.capture_screenshot", "browser_capture_screenshot":
             return "browser.screenshot"
+        case "browser.chrome_acquire", "browser_chrome_acquire", "chrome.acquire", "chrome_acquire":
+            return "browser.chrome_acquire"
+        case "browser.chrome_navigate", "browser_chrome_navigate", "chrome.navigate", "chrome_navigate":
+            return "browser.chrome_navigate"
+        case "browser.chrome_snapshot", "browser_chrome_snapshot", "chrome.snapshot", "chrome_snapshot":
+            return "browser.chrome_snapshot"
+        case "browser.chrome_click", "browser_chrome_click", "chrome.click", "chrome_click":
+            return "browser.chrome_click"
+        case "browser.chrome_fill", "browser_chrome_fill", "chrome.fill", "chrome_fill":
+            return "browser.chrome_fill"
+        case "browser.chrome_type", "browser_chrome_type", "chrome.type", "chrome_type":
+            return "browser.chrome_type"
+        case "browser.chrome_select", "browser_chrome_select", "chrome.select", "chrome_select":
+            return "browser.chrome_select"
+        case "browser.chrome_keypress", "browser_chrome_keypress", "chrome.keypress", "chrome_keypress":
+            return "browser.chrome_keypress"
+        case "browser.chrome_set_checked", "browser_chrome_set_checked", "chrome.set_checked", "chrome_set_checked":
+            return "browser.chrome_set_checked"
+        case "browser.chrome_double_click", "browser_chrome_double_click", "chrome.double_click", "chrome_double_click":
+            return "browser.chrome_double_click"
+        case "browser.chrome_wait", "browser_chrome_wait", "chrome.wait", "chrome_wait":
+            return "browser.chrome_wait"
+        case "browser.chrome_scroll", "browser_chrome_scroll", "chrome.scroll", "chrome_scroll":
+            return "browser.chrome_scroll"
+        case "browser.chrome_release", "browser_chrome_release", "chrome.release", "chrome_release":
+            return "browser.chrome_release"
         default:
             return nil
         }
@@ -1124,10 +1163,25 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
                 ("description", .string(desc)),
             ])
         }
+        func intSchema(_ desc: String) -> JSONValue {
+            obj([
+                ("type", .string("integer")),
+                ("description", .string(desc)),
+            ])
+        }
         func enumStringSchema(_ values: [String], _ desc: String) -> JSONValue {
             obj([
                 ("type", .string("string")),
                 ("enum", .array(values.map { .string($0) })),
+                ("description", .string(desc)),
+            ])
+        }
+        func stringArraySchema(_ desc: String) -> JSONValue {
+            obj([
+                ("type", .string("array")),
+                ("items", .object(["type": .string("string")])),
+                ("minItems", .int(1)),
+                ("maxItems", .int(100)),
                 ("description", .string(desc)),
             ])
         }
@@ -1251,6 +1305,189 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
                     required: []
                 )
             ),
+            LLMToolSchema(
+                name: "browser.chrome_acquire",
+                description: "Acquire a short-lived real Chrome tab lease. Creates an inactive background tab by default; claiming requires an exact tab id, URL, and title. Chrome control must be on in Trust Center.",
+                parametersJSON: params(
+                    properties: [
+                        ("mode", enumStringSchema(["create", "claim"], "Create an inactive tab or claim an exact existing tab. Defaults create.")),
+                        ("initial_url", strSchema("Optional HTTP(S) URL for a created background tab.")),
+                        ("tab_id", intSchema("Exact Chrome tab id for claim mode.")),
+                        ("expected_url", strSchema("Exact current URL for claim mode.")),
+                        ("expected_title", strSchema("Exact current title for claim mode.")),
+                        ("lease_duration_ms", intSchema("Lease duration from 30000 through 300000 milliseconds. Defaults 60000.")),
+                    ],
+                    required: []
+                )
+            ),
+            LLMToolSchema(
+                name: "browser.chrome_navigate",
+                description: "Navigate an already-leased real Chrome background tab without activating it.",
+                parametersJSON: params(
+                    properties: [
+                        ("lease_id", strSchema("Lease id from browser.chrome_acquire.")),
+                        ("expected_user_sequence", intSchema("User sequence from the lease; normally 0.")),
+                        ("url", strSchema("HTTP(S) destination.")),
+                    ],
+                    required: ["lease_id", "expected_user_sequence", "url"]
+                )
+            ),
+            LLMToolSchema(
+                name: "browser.chrome_snapshot",
+                description: "Read a structured agent-friendly snapshot of a leased real Chrome page. Returns bounded readable text and actionable node IDs; password values are omitted.",
+                parametersJSON: params(
+                    properties: [
+                        ("lease_id", strSchema("Lease id from browser.chrome_acquire.")),
+                        ("max_nodes", intSchema("Maximum structured nodes, 1 through 500.")),
+                        ("max_text_chars", intSchema("Maximum readable text characters, 1 through 50000.")),
+                    ],
+                    required: ["lease_id"]
+                )
+            ),
+            LLMToolSchema(
+                name: "browser.chrome_click",
+                description: "Click one actionable node from the exact structured Chrome snapshot that exposed it.",
+                parametersJSON: params(
+                    properties: [
+                        ("lease_id", strSchema("Lease id from browser.chrome_acquire.")),
+                        ("expected_user_sequence", intSchema("User sequence from the lease.")),
+                        ("snapshot_id", strSchema("Exact snapshot id.")),
+                        ("node_id", strSchema("Exact actionable node id.")),
+                    ],
+                    required: ["lease_id", "expected_user_sequence", "snapshot_id", "node_id"]
+                )
+            ),
+            LLMToolSchema(
+                name: "browser.chrome_scroll",
+                description: "Scroll the leased real Chrome page or a scrollable node from a structured snapshot.",
+                parametersJSON: params(
+                    properties: [
+                        ("lease_id", strSchema("Lease id from browser.chrome_acquire.")),
+                        ("expected_user_sequence", intSchema("User sequence from the lease.")),
+                        ("snapshot_id", strSchema("Snapshot id when targeting a node.")),
+                        ("target_node_id", strSchema("Optional scrollable node id.")),
+                        ("delta_x", intSchema("Horizontal scroll delta.")),
+                        ("delta_y", intSchema("Vertical scroll delta.")),
+                    ],
+                    required: ["lease_id", "expected_user_sequence", "delta_x", "delta_y"]
+                )
+            ),
+            LLMToolSchema(
+                name: "browser.chrome_fill",
+                description: "Replace the value of an editable non-password node from the exact current Chrome snapshot. Returns one outcome receipt and never retries an ambiguous dispatch.",
+                parametersJSON: params(
+                    properties: [
+                        ("lease_id", strSchema("Lease id from browser.chrome_acquire.")),
+                        ("expected_user_sequence", intSchema("User sequence from the lease.")),
+                        ("snapshot_id", strSchema("Exact current snapshot id.")),
+                        ("node_id", strSchema("Editable node id that advertised fill.")),
+                        ("value", strSchema("Replacement text, at most 50000 characters.")),
+                    ],
+                    required: ["lease_id", "expected_user_sequence", "snapshot_id", "node_id", "value"]
+                )
+            ),
+            LLMToolSchema(
+                name: "browser.chrome_type",
+                description: "Append text sequentially to an editable non-password node from the exact current Chrome snapshot. Returns one outcome receipt and never retries an ambiguous dispatch.",
+                parametersJSON: params(
+                    properties: [
+                        ("lease_id", strSchema("Lease id from browser.chrome_acquire.")),
+                        ("expected_user_sequence", intSchema("User sequence from the lease.")),
+                        ("snapshot_id", strSchema("Exact current snapshot id.")),
+                        ("node_id", strSchema("Editable node id that advertised type.")),
+                        ("text", strSchema("Text to append, at most 50000 characters.")),
+                        ("delay_ms", intSchema("Optional delay between characters, 0 through 250 milliseconds.")),
+                    ],
+                    required: ["lease_id", "expected_user_sequence", "snapshot_id", "node_id", "text"]
+                )
+            ),
+            LLMToolSchema(
+                name: "browser.chrome_select",
+                description: "Select one or more exact option values on a native select node from the current frame-aware Chrome snapshot. Returns one outcome receipt.",
+                parametersJSON: params(
+                    properties: [
+                        ("lease_id", strSchema("Lease id from browser.chrome_acquire.")),
+                        ("expected_user_sequence", intSchema("User sequence from the lease.")),
+                        ("snapshot_id", strSchema("Exact current snapshot id.")),
+                        ("node_id", strSchema("Select node id that advertised select.")),
+                        ("values", stringArraySchema("One or more exact option values; single-select nodes require exactly one.")),
+                    ],
+                    required: ["lease_id", "expected_user_sequence", "snapshot_id", "node_id", "values"]
+                )
+            ),
+            LLMToolSchema(
+                name: "browser.chrome_keypress",
+                description: "Press one bounded key or chord on a non-password node from the exact current frame-aware Chrome snapshot. Returns one outcome receipt and never retries an ambiguous dispatch.",
+                parametersJSON: params(
+                    properties: [
+                        ("lease_id", strSchema("Lease id from browser.chrome_acquire.")),
+                        ("expected_user_sequence", intSchema("User sequence from the lease.")),
+                        ("snapshot_id", strSchema("Exact current snapshot id.")),
+                        ("node_id", strSchema("Node id that advertised keypress.")),
+                        ("key", enumStringSchema([
+                            "Enter", "Tab", "Shift+Tab", "Escape", "ArrowDown", "ArrowUp",
+                            "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown",
+                            "Backspace", "Delete", "Space", "Control+A", "Meta+A"
+                        ], "Bounded key or chord.")),
+                    ],
+                    required: ["lease_id", "expected_user_sequence", "snapshot_id", "node_id", "key"]
+                )
+            ),
+            LLMToolSchema(
+                name: "browser.chrome_set_checked",
+                description: "Idempotently set a checkbox, radio, or switch node from the exact current frame-aware Chrome snapshot. Returns one outcome receipt.",
+                parametersJSON: params(
+                    properties: [
+                        ("lease_id", strSchema("Lease id from browser.chrome_acquire.")),
+                        ("expected_user_sequence", intSchema("User sequence from the lease.")),
+                        ("snapshot_id", strSchema("Exact current snapshot id.")),
+                        ("node_id", strSchema("Checkable node id that advertised set_checked.")),
+                        ("checked", boolSchema("Exact checked state to apply.")),
+                    ],
+                    required: ["lease_id", "expected_user_sequence", "snapshot_id", "node_id", "checked"]
+                )
+            ),
+            LLMToolSchema(
+                name: "browser.chrome_double_click",
+                description: "Double-click one node that advertised double_click in the exact current frame-aware Chrome snapshot. Returns one outcome receipt and never retries an ambiguous dispatch.",
+                parametersJSON: params(
+                    properties: [
+                        ("lease_id", strSchema("Lease id from browser.chrome_acquire.")),
+                        ("expected_user_sequence", intSchema("User sequence from the lease.")),
+                        ("snapshot_id", strSchema("Exact current snapshot id.")),
+                        ("node_id", strSchema("Node id that advertised double_click.")),
+                    ],
+                    required: ["lease_id", "expected_user_sequence", "snapshot_id", "node_id"]
+                )
+            ),
+            LLMToolSchema(
+                name: "browser.chrome_wait",
+                description: "Wait a bounded time for a current snapshot node state or for leased-tab navigation to settle. Returns one observational outcome receipt.",
+                parametersJSON: params(
+                    properties: [
+                        ("lease_id", strSchema("Lease id from browser.chrome_acquire.")),
+                        ("expected_user_sequence", intSchema("User sequence from the lease.")),
+                        ("condition", enumStringSchema(["element_state", "navigation_settled"], "Wait condition.")),
+                        ("snapshot_id", strSchema("Exact current snapshot id for element_state.")),
+                        ("node_id", strSchema("Node id that advertised wait for element_state.")),
+                        ("state", enumStringSchema(["visible", "hidden", "enabled", "disabled"], "Required element state.")),
+                        ("timeout_ms", intSchema("Bounded timeout from 100 through 10000 milliseconds. Defaults 5000.")),
+                        ("settle_ms", intSchema("Extra navigation quiet interval from 0 through 2000 milliseconds.")),
+                    ],
+                    required: ["lease_id", "expected_user_sequence", "condition"]
+                )
+            ),
+            LLMToolSchema(
+                name: "browser.chrome_release",
+                description: "Release a real Chrome tab lease. Claimed and active tabs remain open; an untouched inactive agent-created tab closes by default.",
+                parametersJSON: params(
+                    properties: [
+                        ("lease_id", strSchema("Lease id to release.")),
+                        ("close_created_tab", boolSchema("Close an inactive agent-created tab. Defaults true.")),
+                    ],
+                    required: ["lease_id"]
+                )
+            ),
         ]
     }
 
@@ -1344,6 +1581,12 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         input: [String: JSONValue]
     ) async throws -> JSONValue {
         let client = NativeClient(baseURL: "")
+        if actionId.hasPrefix("browser.chrome_") {
+            guard !dryRun else {
+                return .object(["status": .string("dry_run"), "action": .string(actionId)])
+            }
+            return try await runChromeControlTool(actionId: actionId, input: input)
+        }
         if actionId == "browser.status" {
             let status = try await client.getBrowserStatus()
             return try encodableJSON(status)
@@ -1354,6 +1597,155 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             input: try jsonObjectToAny(input)
         )
         return try encodableJSON(receipt)
+    }
+
+    private static func runChromeControlTool(
+        actionId: String,
+        input: [String: JSONValue]
+    ) async throws -> JSONValue {
+        let effect: ChromeControlEffect
+        var payload: [String: JSONValue] = [:]
+        func string(_ key: String) -> String? { inputString(input[key]) }
+        func integer(_ key: String) -> Int? {
+            switch input[key] {
+            case .int(let value): return Int(value)
+            case .double(let value): return Int(value)
+            case .string(let value): return Int(value)
+            default: return nil
+            }
+        }
+        switch actionId {
+        case "browser.chrome_acquire":
+            effect = .acquire
+            let mode = string("mode") ?? "create"
+            payload["mode"] = .string(mode)
+            if let value = string("initial_url") { payload["initialUrl"] = .string(value) }
+            if let value = integer("lease_duration_ms") { payload["leaseDurationMs"] = .int(Int64(value)) }
+            if mode == "claim" {
+                if let value = integer("tab_id") { payload["tabId"] = .int(Int64(value)) }
+                payload["expectedTab"] = .object([
+                    "url": .string(string("expected_url") ?? ""),
+                    "title": .string(string("expected_title") ?? ""),
+                ])
+            }
+        case "browser.chrome_navigate":
+            effect = .navigate
+            payload = [
+                "leaseId": .string(string("lease_id") ?? ""),
+                "expectedUserSequence": .int(Int64(integer("expected_user_sequence") ?? -1)),
+                "url": .string(string("url") ?? ""),
+            ]
+        case "browser.chrome_snapshot":
+            effect = .snapshot
+            payload["leaseId"] = .string(string("lease_id") ?? "")
+            if let value = integer("max_nodes") { payload["maxNodes"] = .int(Int64(value)) }
+            if let value = integer("max_text_chars") { payload["maxTextChars"] = .int(Int64(value)) }
+        case "browser.chrome_click":
+            effect = .click
+            payload = [
+                "leaseId": .string(string("lease_id") ?? ""),
+                "expectedUserSequence": .int(Int64(integer("expected_user_sequence") ?? -1)),
+                "snapshotId": .string(string("snapshot_id") ?? ""),
+                "nodeId": .string(string("node_id") ?? ""),
+            ]
+        case "browser.chrome_fill":
+            effect = .fill
+            payload = [
+                "leaseId": .string(string("lease_id") ?? ""),
+                "expectedUserSequence": .int(Int64(integer("expected_user_sequence") ?? -1)),
+                "snapshotId": .string(string("snapshot_id") ?? ""),
+                "nodeId": .string(string("node_id") ?? ""),
+                "value": .string(string("value") ?? ""),
+            ]
+        case "browser.chrome_type":
+            effect = .type
+            payload = [
+                "leaseId": .string(string("lease_id") ?? ""),
+                "expectedUserSequence": .int(Int64(integer("expected_user_sequence") ?? -1)),
+                "snapshotId": .string(string("snapshot_id") ?? ""),
+                "nodeId": .string(string("node_id") ?? ""),
+                "text": .string(string("text") ?? ""),
+            ]
+            if let value = integer("delay_ms") { payload["delayMs"] = .int(Int64(value)) }
+        case "browser.chrome_select":
+            effect = .select
+            let values: [JSONValue]
+            if case .array(let supplied)? = input["values"] {
+                values = supplied.compactMap { value in
+                    guard case .string = value else { return nil }
+                    return value
+                }
+            } else {
+                values = []
+            }
+            payload = [
+                "leaseId": .string(string("lease_id") ?? ""),
+                "expectedUserSequence": .int(Int64(integer("expected_user_sequence") ?? -1)),
+                "snapshotId": .string(string("snapshot_id") ?? ""),
+                "nodeId": .string(string("node_id") ?? ""),
+                "values": .array(values),
+            ]
+        case "browser.chrome_keypress":
+            effect = .keypress
+            payload = [
+                "leaseId": .string(string("lease_id") ?? ""),
+                "expectedUserSequence": .int(Int64(integer("expected_user_sequence") ?? -1)),
+                "snapshotId": .string(string("snapshot_id") ?? ""),
+                "nodeId": .string(string("node_id") ?? ""),
+                "key": .string(string("key") ?? ""),
+            ]
+        case "browser.chrome_set_checked":
+            effect = .setChecked
+            payload = [
+                "leaseId": .string(string("lease_id") ?? ""),
+                "expectedUserSequence": .int(Int64(integer("expected_user_sequence") ?? -1)),
+                "snapshotId": .string(string("snapshot_id") ?? ""),
+                "nodeId": .string(string("node_id") ?? ""),
+                "checked": .bool(inputBool(input["checked"], default: false)),
+            ]
+        case "browser.chrome_double_click":
+            effect = .doubleClick
+            payload = [
+                "leaseId": .string(string("lease_id") ?? ""),
+                "expectedUserSequence": .int(Int64(integer("expected_user_sequence") ?? -1)),
+                "snapshotId": .string(string("snapshot_id") ?? ""),
+                "nodeId": .string(string("node_id") ?? ""),
+            ]
+        case "browser.chrome_wait":
+            effect = .wait
+            payload = [
+                "leaseId": .string(string("lease_id") ?? ""),
+                "expectedUserSequence": .int(Int64(integer("expected_user_sequence") ?? -1)),
+                "condition": .string(string("condition") ?? ""),
+            ]
+            if let value = string("snapshot_id") { payload["snapshotId"] = .string(value) }
+            if let value = string("node_id") { payload["nodeId"] = .string(value) }
+            if let value = string("state") { payload["state"] = .string(value) }
+            if let value = integer("timeout_ms") { payload["timeoutMs"] = .int(Int64(value)) }
+            if let value = integer("settle_ms") { payload["settleMs"] = .int(Int64(value)) }
+        case "browser.chrome_scroll":
+            effect = .scroll
+            payload = [
+                "leaseId": .string(string("lease_id") ?? ""),
+                "expectedUserSequence": .int(Int64(integer("expected_user_sequence") ?? -1)),
+                "deltaX": .int(Int64(integer("delta_x") ?? 0)),
+                "deltaY": .int(Int64(integer("delta_y") ?? 0)),
+            ]
+            if let value = string("snapshot_id") { payload["snapshotId"] = .string(value) }
+            if let value = string("target_node_id") { payload["targetNodeId"] = .string(value) }
+        case "browser.chrome_release":
+            effect = .release
+            payload = [
+                "leaseId": .string(string("lease_id") ?? ""),
+                "closeCreatedTab": .bool(inputBool(input["close_created_tab"], default: true)),
+            ]
+        default:
+            throw ChromeControlRuntimeError.invalidResponse
+        }
+        let response = try await ChromeControlRuntime.shared.perform(effect, payload: payload)
+        guard case .object(let object) = response,
+              let result = object["result"] else { throw ChromeControlRuntimeError.invalidResponse }
+        return result
     }
 
     private static func defaultDoctorStatusProvider() async throws -> JSONValue {

@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import LocalAuthentication
 import NativeAgentCore
 import PersistenceCore
 import Security
@@ -12,6 +13,7 @@ public protocol GitHubCredentialVault: Sendable {
 
 public enum GitHubCredentialVaultError: Error, Sendable, LocalizedError {
     case keychain(OSStatus)
+    case testHarnessAccessRefused
     case invalidStoredValue
     case verificationFailed
     case malformedMetadata
@@ -21,6 +23,8 @@ public enum GitHubCredentialVaultError: Error, Sendable, LocalizedError {
         case .keychain(let status):
             let detail = SecCopyErrorMessageString(status, nil) as String? ?? "OSStatus \(status)"
             return "GitHub credential Keychain access failed: \(detail)."
+        case .testHarnessAccessRefused:
+            return "GitHub credential Keychain access is disabled under the test harness."
         case .invalidStoredValue:
             return "The GitHub credential in Keychain is invalid."
         case .verificationFailed:
@@ -34,14 +38,33 @@ public enum GitHubCredentialVaultError: Error, Sendable, LocalizedError {
 public struct SystemGitHubCredentialVault: GitHubCredentialVault {
     public init() {}
 
-    public func read(service: String, account: String) throws -> String? {
-        let query: [String: Any] = [
+    static var isRunningUnderTestHarness: Bool {
+        NSClassFromString("XCTestCase") != nil
+            || ProcessInfo.processInfo.processName == "swiftpm-testing-helper"
+    }
+
+    static func nonInteractiveIdentityQuery(service: String, account: String) -> [String: Any] {
+        let context = LAContext()
+        context.interactionNotAllowed = true
+        return [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-            kSecReturnData as String: true,
+            // A background agent and a test runner must never summon a login
+            // password dialog. If an item's ACL requires interaction, surface
+            // errSecInteractionNotAllowed and let the caller report degraded
+            // readiness instead of blocking the production chain.
+            kSecUseAuthenticationContext as String: context,
         ]
+    }
+
+    public func read(service: String, account: String) throws -> String? {
+        guard !Self.isRunningUnderTestHarness else {
+            throw GitHubCredentialVaultError.testHarnessAccessRefused
+        }
+        var query = Self.nonInteractiveIdentityQuery(service: service, account: account)
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        query[kSecReturnData as String] = true
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
         if status == errSecItemNotFound { return nil }
@@ -57,18 +80,22 @@ public struct SystemGitHubCredentialVault: GitHubCredentialVault {
     }
 
     public func write(_ token: String, service: String, account: String) throws {
-        let query: [String: Any] = [
+        guard !Self.isRunningUnderTestHarness else {
+            throw GitHubCredentialVaultError.testHarnessAccessRefused
+        }
+        let identity: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
         ]
+        let query = Self.nonInteractiveIdentityQuery(service: service, account: account)
         let attributes: [String: Any] = [
             kSecValueData as String: Data(token.utf8),
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
         ]
         var status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
         if status == errSecItemNotFound {
-            var item = query
+            var item = identity
             for (key, value) in attributes { item[key] = value }
             status = SecItemAdd(item as CFDictionary, nil)
             if status == errSecDuplicateItem {
@@ -81,11 +108,10 @@ public struct SystemGitHubCredentialVault: GitHubCredentialVault {
     }
 
     public func delete(service: String, account: String) throws {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
+        guard !Self.isRunningUnderTestHarness else {
+            throw GitHubCredentialVaultError.testHarnessAccessRefused
+        }
+        let query = Self.nonInteractiveIdentityQuery(service: service, account: account)
         let status = SecItemDelete(query as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw GitHubCredentialVaultError.keychain(status)

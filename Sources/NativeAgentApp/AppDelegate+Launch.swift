@@ -14,6 +14,12 @@ import Browser
 import OSLog
 
 extension AppDelegate {
+    /// Guards the once-per-launch Speech Recognition preflight below. Main-actor
+    /// isolated because its only reader/writer is
+    /// `applicationDidFinishLaunching`, which is itself @MainActor.
+    @MainActor
+    static var didRunSpeechRecognitionPreflight = false
+
     @MainActor
     func applicationDidFinishLaunching(_ notification: Notification) {
         do {
@@ -94,11 +100,47 @@ extension AppDelegate {
         NSApp.setActivationPolicy(.regular)
         NativeAgentNotifications.requestAuthorization()
 
+        // PATCH-2026-08-18: Speech Recognition acquisition path.
+        //
+        // Apple Speech became load-bearing for a HEADLESS pipeline (inbound
+        // Telegram voice notes, 130dc377) while the only code path that could
+        // raise its TCC prompt stayed behind the in-app mic button. A user who
+        // only talks to the app over Telegram never presses it, so the grant sat
+        // notDetermined forever and the background transcriber's own request
+        // resolved .denied from a context that cannot render a prompt.
+        //
+        // Here is the one moment per launch where the prompt CAN render: the app
+        // is foreground and the activation policy is already .regular. The call
+        // is a no-op unless the grant is still notDetermined, so this is not a
+        // recurring nag — TCC only ever asks once.
+        if !Self.didRunSpeechRecognitionPreflight {
+            Self.didRunSpeechRecognitionPreflight = true
+            Task.detached(priority: .utility) {
+                let logger = Logger(subsystem: "com.nativeagent.app", category: "permission-preflight")
+                // Hop back to the main actor: the prompt must be presented by
+                // the foreground app, not from this detached context.
+                let status = await SystemPermissionPreflight.requestSpeechRecognitionIfNotDetermined()
+                logger.info(
+                    "launch speech-recognition preflight: \(status.rawValue, privacy: .public)"
+                )
+                // Clear a stale "not approved" card if the grant now exists —
+                // whether it landed from the prompt above or from the user
+                // flipping the System Settings switch between launches. Without
+                // this the card outlives the condition it describes.
+                await BackgroundLoopsAssembly.retireSystemPermissionCardIfGranted(
+                    dataRoot: NativeAgentPaths.dataRoot
+                )
+            }
+        }
+
         // Process-wide app services and route retention must not depend on the
         // main SwiftUI Window appearing. The coordinator is configured from
         // NativeAgentApp.init with the shared AppModel, then started exactly
         // once from this guaranteed application lifecycle callback.
         NativeAgentAppCoordinator.shared.applicationDidFinishLaunching()
+        Task.detached(priority: .utility) {
+            await ChromeControlRuntime.shared.reconcilePolicy()
+        }
 
         // MemoryV2 Path C: one-shot JSON → SQLite migration. Idempotent;
         // a sentinel file under <dataRoot>/memory skips subsequent launches.
@@ -479,6 +521,11 @@ extension AppDelegate {
         // serialized them under a single 3s budget, so a slow cognition flush
         // starved the Core-owned loop drain of any budget at all. Independent
         // drains run concurrently and each gets the full 3s.
+        group.enter()
+        Task.detached {
+            await ChromeControlRuntime.shared.stop()
+            group.leave()
+        }
         group.enter()
         Task.detached {
             await NativeCognitionRuntime.shared.flushForTermination()

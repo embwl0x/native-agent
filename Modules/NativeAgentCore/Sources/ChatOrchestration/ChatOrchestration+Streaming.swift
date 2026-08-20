@@ -818,15 +818,17 @@ extension SwiftNativeTurnEngine {
     ///
     /// What is KEPT is everything that is model-BEHAVIOR guidance rather than
     /// wire syntax: the COMPLETION CONTRACT (this runtime has no background
-    /// execution — narrated work never happens), the tool-routing preferences
-    /// that a bare schema list doesn't convey, and the skills-authority
-    /// boundary. Those earned their place from live incidents and are just as
-    /// load-bearing when the calls are structured.
+    /// execution — narrated work never happens), the delegated-campaign
+    /// continuation contract, the tool-routing preferences that a bare schema
+    /// list doesn't convey, and the skills-authority boundary. Those earned
+    /// their place from live incidents and are just as load-bearing when the
+    /// calls are structured.
     nonisolated static func renderNativeToolInstructions() -> String {
         """
         NativeAgent Swift tool protocol (native tool use):
         - Your Swift tools are attached to this request as native tools and are ready to call directly through the tool-use channel. tool_load expands the set when a needed capability is absent.
         - COMPLETION CONTRACT: every reply must be EITHER tool call(s) OR your complete final answer. You have no background execution — work you describe but do not call never happens. A reply that only announces or narrates in-progress work ("checking now", "reading the files now", "going through it") is invalid and NativeAgent bounces it back to you. Do the work in THIS reply: make the next tool call, or deliver the finished answer.
+        \(DelegatedCampaignGuidance.rendered)
         - After NativeAgent returns a tool result, use the result to answer or make another call.
         - For recent commits use git_log, for repo state use git_status, and for diffs use git_diff. Do not ask for raw shell/git commands unless a shell tool is explicitly available.
         - Skills: list_skills is the compact manifest; read_skill lazy-loads one relevant body; save_skill is the only supported creation/update path. Never inspect or write private skill registry/body files.
@@ -864,6 +866,7 @@ extension SwiftNativeTurnEngine {
         - Do not wrap tool markers in Markdown or code fences.
         - Do not narrate fake calls such as tool_name(...), "runs git log", or "loads coding tools"; those are not executable.
         - COMPLETION CONTRACT: every reply must be EITHER tool_use marker(s) OR your complete final answer. You have no background execution — work you describe but do not call never happens. A reply that only announces or narrates in-progress work ("checking now", "reading the files now", "going through it") is invalid and NativeAgent bounces it back to you. Do the work in THIS reply: emit the next tool call, or deliver the finished answer.
+        \(DelegatedCampaignGuidance.rendered)
         - After NativeAgent returns a tool result, use the result to answer or emit another exact marker.
         - For recent commits use git_log, for repo state use git_status, and for diffs use git_diff. Do not ask for raw shell/git commands unless a shell tool is explicitly listed.
         - Skills: list_skills is the compact manifest; read_skill lazy-loads one relevant body; save_skill is the only supported creation/update path. Never inspect or write private skill registry/body files.

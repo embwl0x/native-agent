@@ -673,12 +673,14 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             let injectionSecrets = MacInjectionArgRedaction.extractSecrets(tool: tool, input: input)
             if let nonBlocking = approvalFiler as? (any NonBlockingApprovalFiler) {
                 let payload = JSONValue.object(approvalPayloadInput)
-                let approvalId = try await nonBlocking.fileApprovalRequest(
-                    toolName: tool,
-                    surface: surface,
-                    payload: payload,
-                    reason: reason
-                )
+                let approvalId = try await withFilingSession {
+                    try await nonBlocking.fileApprovalRequest(
+                        toolName: tool,
+                        surface: surface,
+                        payload: payload,
+                        reason: reason
+                    )
+                }
                 // Hand the characters to the in-memory vault keyed by the
                 // approval the human is about to look at. The replay path takes
                 // them back out exactly once. If this process dies first, the
@@ -699,13 +701,15 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                     reason: reason
                 )
             }
-            let resolved = try await gate.resolveWithApprovalDetailed(
-                toolName: tool,
-                surface: surface,
-                requestPayload: .object(approvalPayloadInput),
-                timeoutSeconds: approvalTimeoutSeconds,
-                reason: reason
-            )
+            let resolved = try await withFilingSession {
+                try await gate.resolveWithApprovalDetailed(
+                    toolName: tool,
+                    surface: surface,
+                    requestPayload: .object(approvalPayloadInput),
+                    timeoutSeconds: approvalTimeoutSeconds,
+                    reason: reason
+                )
+            }
             if !injectionSecrets.isEmpty, let filedID = resolved.approvalID {
                 await MacInjectionSecretVault.shared.store(
                     approvalID: filedID,
@@ -758,6 +762,32 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                 throw AutonomyGateError.toolDenied(reason: r)
             }
         }
+    }
+
+    /// Desk 658.12 — the session an approval RECORD is filed under.
+    ///
+    /// `runInner` binds `verifiedSessionId` for the tool call itself, but an
+    /// approval is filed BEFORE any tool runs, so a filer reading
+    /// `ChatToolSessionContext.verifiedSessionId` saw whatever the enclosing
+    /// task happened to hold. Remote transports bind it around their own
+    /// `chat()` call, so Telegram/Slack records carried an origin; the local
+    /// Mac chat path has no such outer binding, so every Mac chat approval was
+    /// written with `origin.sessionId = null` and could not be matched back to
+    /// the conversation that asked for it.
+    ///
+    /// An outer binding always wins: a transport that verified the session
+    /// against its own identity is the better authority, and this must never
+    /// overwrite it. This only fills the nil case, from the same per-turn
+    /// session the gate already resolved trust with — it invents nothing and
+    /// changes no gate decision.
+    private func withFilingSession<T>(
+        _ body: () async throws -> T
+    ) async rethrows -> T {
+        let filingSessionId = ChatToolSessionContext.verifiedSessionId ?? verifiedSessionId
+        return try await ChatToolSessionContext.$verifiedSessionId.withValue(
+            filingSessionId,
+            operation: body
+        )
     }
 
     /// THE SINGLE EXECUTION DOOR of this dispatcher, and the ONLY place in the

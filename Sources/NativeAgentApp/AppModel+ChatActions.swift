@@ -85,6 +85,88 @@ struct AppMutationResult: Equatable, Sendable {
     }
 }
 
+/// Immutable evidence that a retry still targets the same transcript tail.
+/// The provider call is intentionally admitted only after both the local
+/// projection and the canonical transcript still match this snapshot.
+struct MacChatRetrySnapshot: Equatable, Sendable {
+    let sessionId: String
+    let assistantMessageId: String
+    let priorUserMessageId: String
+    let priorUserText: String
+    let predecessorRelevantMessageId: String?
+    let isSyntheticNotice: Bool
+    let userRowPersisted: Bool
+    let inputHadAttachments: Bool
+
+    static func capture(
+        target: ChatMessage,
+        messages: [ChatMessage],
+        sessionId: String,
+        isSyntheticNotice: Bool
+    ) -> Self? {
+        guard target.role == "assistant",
+              let targetIndex = messages.firstIndex(where: { $0.id == target.id }),
+              messages.last(where: { $0.role == "assistant" })?.id == target.id,
+              !messages[(targetIndex + 1)...].contains(where: {
+                  $0.role == "user" || $0.role == "assistant"
+              }),
+              let priorUserIndex = messages[..<targetIndex].lastIndex(where: { $0.role == "user" })
+        else { return nil }
+        let priorUser = messages[priorUserIndex]
+        let priorText = priorUser.content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !priorText.isEmpty else { return nil }
+        let predecessor = messages[..<priorUserIndex]
+            .last(where: { $0.role == "user" || $0.role == "assistant" })?.id
+        return Self(
+            sessionId: sessionId,
+            assistantMessageId: target.id,
+            priorUserMessageId: priorUser.id,
+            priorUserText: priorText,
+            predecessorRelevantMessageId: predecessor,
+            isSyntheticNotice: isSyntheticNotice,
+            userRowPersisted: isSyntheticNotice
+                ? (target.metadata?.syntheticUserRowPersisted ?? true)
+                : true,
+            inputHadAttachments: priorUser.metadata?.attachments?.isEmpty == false
+                || target.metadata?.syntheticInputHadAttachments == true
+        )
+    }
+
+    func stillMatchesLocal(_ messages: [ChatMessage]) -> Bool {
+        guard let target = messages.first(where: { $0.id == assistantMessageId }) else {
+            return false
+        }
+        return Self.capture(
+            target: target,
+            messages: messages,
+            sessionId: sessionId,
+            isSyntheticNotice: isSyntheticNotice
+        ) == self
+    }
+
+    func matchesCanonical(_ messages: [ChatMessage]) -> Bool {
+        let relevant = messages.filter { $0.role == "user" || $0.role == "assistant" }
+        if isSyntheticNotice {
+            guard !relevant.contains(where: { $0.id == assistantMessageId }) else { return false }
+            if userRowPersisted {
+                guard let user = relevant.last,
+                      user.id == priorUserMessageId,
+                      user.role == "user" else { return false }
+                return user.content.trimmingCharacters(in: .whitespacesAndNewlines) == priorUserText
+            }
+            guard !relevant.contains(where: { $0.id == priorUserMessageId }) else { return false }
+            return relevant.last?.id == predecessorRelevantMessageId
+                || (relevant.isEmpty && predecessorRelevantMessageId == nil)
+        }
+
+        guard let assistantIndex = relevant.firstIndex(where: { $0.id == assistantMessageId }),
+              assistantIndex == relevant.indices.last,
+              let user = relevant[..<assistantIndex].last(where: { $0.role == "user" }),
+              user.id == priorUserMessageId else { return false }
+        return user.content.trimmingCharacters(in: .whitespacesAndNewlines) == priorUserText
+    }
+}
+
 @MainActor
 extension AppModel {
     func compactActiveChat() async -> AppMutationResult {
@@ -121,30 +203,92 @@ extension AppModel {
 
     @MainActor
     func regenerateAssistantMessage(_ message: ChatMessage) async {
-        guard message.role == "assistant", let index = chatMessages.firstIndex(where: { $0.id == message.id }) else { return }
-        let priorUser = chatMessages[..<index].last(where: { $0.role == "user" })
-        guard let priorText = priorUser?.content.trimmingCharacters(in: .whitespacesAndNewlines), !priorText.isEmpty else {
-            statusText = "Regenerate failed: no prior user message"
+        let sessionId = message.sessionId ?? activeChatSessionId
+        guard !sessionId.isEmpty,
+              chatSessions.contains(where: { $0.id == sessionId }) else {
+            statusText = "Regenerate failed: that chat session is no longer available"
             return
         }
-        let sessionId = message.sessionId ?? activeChatSessionId
-        guard !sessionId.isEmpty else { return }
+        let sessionMessages = chatMessages(for: sessionId)
+        let isSyntheticNotice = message.id.hasPrefix(Self.syntheticErrorIDPrefix)
+        guard let retrySnapshot = MacChatRetrySnapshot.capture(
+            target: message,
+            messages: sessionMessages,
+            sessionId: sessionId,
+            isSyntheticNotice: isSyntheticNotice
+        ) else {
+            statusText = "Regenerate failed: that response is no longer the current retry target"
+            return
+        }
+        guard !retrySnapshot.inputHadAttachments else {
+            // Persisted attachment rows intentionally contain summaries, not
+            // bytes. Replaying text alone would silently answer a materially
+            // different prompt, so ask for an explicit resend instead.
+            statusText = "Regenerate failed: resend the attachment to retry this turn"
+            return
+        }
+        let priorText = retrySnapshot.priorUserText
         // FIX 4: same Stop-then-quick-restart ordering barrier as sendChat.
         await awaitPendingCancelFlagWrite(for: sessionId)
+        let repairAvailable = await repairChatTurnLifecyclesIfNeeded(
+            knownSessionIds: Set(chatSessions.map(\.id))
+        ) { identity in
+            await self.readCanonicalChatTurnTerminalProof(identity: identity)
+        }
+        guard repairAvailable,
+              chatSessions.contains(where: { $0.id == sessionId }) else {
+            statusText = repairAvailable
+                ? "Regenerate failed: that chat session is no longer available"
+                : "Regenerate failed: lifecycle recovery is unavailable"
+            return
+        }
         // PATCH-2026-05-13: parallel-sessions — guard per-session, not global
         guard chatTasks[sessionId] == nil, !busySessions.contains(sessionId) else {
             statusText = "Chat is already running in that session"
             return
         }
+        // Reserve the session across canonical reads. A second ordinary send
+        // may queue, but cannot race this retry into provider execution.
+        busySessions.insert(sessionId)
         let generation = (chatTaskGenerations[sessionId] ?? 0) + 1
         chatTaskGenerations[sessionId] = generation
+        let lifecycleIdentity = MacChatTurnIdentity(
+            sessionId: sessionId,
+            turnId: TurnTraceContext.mintTurnId()
+        )
+        _ = beginChatTurnLifecycle(
+            sessionId: lifecycleIdentity.sessionId,
+            turnId: lifecycleIdentity.turnId,
+            at: Date()
+        )
+        let lifecyclePersisted = await persistChatTurnLifecycleBegin(
+            identity: lifecycleIdentity
+        )
+        let canonicalMessages = try? await client.getChatMessages(sessionId: sessionId)
+        let admissionStillCurrent = chatTurnLifecycle(for: sessionId)?.identity
+            == lifecycleIdentity
+            && chatTurnLifecycle(for: sessionId)?.cancellationRequestedAt == nil
+            && canonicalMessages.map({ retrySnapshot.matchesCanonical($0) }) == true
+            && retrySnapshot.stillMatchesLocal(chatMessages(for: sessionId))
+            && chatSessions.contains(where: { $0.id == sessionId })
+            && !Task.isCancelled
+        guard lifecyclePersisted, admissionStillCurrent else {
+            busySessions.remove(sessionId)
+            chatTaskGenerations[sessionId] = nil
+            await abandonChatTurnLifecycleBeforeAdmission(identity: lifecycleIdentity)
+            statusText = lifecyclePersisted
+                ? "Regenerate failed: the conversation changed before retry began"
+                : "Regenerate failed: the turn could not be durably admitted"
+            await drainNextQueuedChatTurnIfPossible(sessionId: sessionId)
+            return
+        }
         // Sweep R4 C7: synthetic error bubbles are in-memory only — they were
         // never written to chat/messages/<sid>.jsonl. Passing one as the
         // replacement target makes the persistence layer throw ("regenerate
         // replacement target must identify exactly one persisted message"), so
         // now that these bubbles DO render Try again, the retry has to re-send
-        // as a fresh turn and simply drop the local notice instead.
-        let isSyntheticNotice = message.id.hasPrefix(Self.syntheticErrorIDPrefix)
+        // as a fresh turn. The local notice remains until an exact canonical
+        // receipt proves that a replacement landed.
         // Whether the FAILED turn persisted the user's row decides the
         // re-send shape: the no-provider guard bails before client.chat, so
         // its bubble carries userRowPersisted=false and the retry must let
@@ -152,49 +296,149 @@ extension AppModel {
         // would drop the user's message from the persisted thread entirely
         // (gpt-5.5 review 2026-08-06, blocking). Stream/catch bubbles ran a
         // real turn, which appends the user row before the provider call.
-        let suppressUserRow = isSyntheticNotice
-            ? (message.metadata?.syntheticUserRowPersisted ?? true)
-            : true
-        if isSyntheticNotice {
-            removeChatMessage(id: message.id, from: sessionId)
-        }
+        let suppressUserRow = retrySnapshot.userRowPersisted
+        var regeneratedTurnCompleted = false
         let task = Task { @MainActor in
+            _ = applyChatTurnLifecycleInput(MacChatTurnLifecycleInput(
+                identity: lifecycleIdentity,
+                kind: .retrying(action: "Retrying response"),
+                occurredAt: Date()
+            ))
             do {
                 busySessions.insert(sessionId)
                 defer { busySessions.remove(sessionId) }
-                let reply = try await client.chat(
-                    message: priorText,
-                    sessionId: sessionId,
-                    model: chatModel,
-                    reasoningEffort: chatReasoningEffort,
-                    fileAccess: chatFileAccess,
-                    suppressUserAppend: suppressUserRow,
-                    replacementAssistantMessageId: isSyntheticNotice ? nil : message.id
+                let reply = try await TurnTraceContext.$turnId.withValue(lifecycleIdentity.turnId) {
+                    try await client.chat(
+                        message: priorText,
+                        sessionId: sessionId,
+                        model: chatModel,
+                        reasoningEffort: chatReasoningEffort,
+                        fileAccess: chatFileAccess,
+                        suppressUserAppend: suppressUserRow,
+                        replacementAssistantMessageId: isSyntheticNotice ? nil : message.id
+                    )
+                }
+                try Task.checkCancellation()
+                let freshMessages = try? await client.getChatMessages(sessionId: sessionId)
+                let terminalProof = await readCanonicalChatTurnTerminalProof(
+                    identity: lifecycleIdentity
                 )
-                if Task.isCancelled { return }
-                if activeChatSessionId == sessionId {
-                    if let freshMessages = try? await client.getChatMessages(sessionId: sessionId), !freshMessages.isEmpty {
-                        chatMessages = freshMessages
+                let settled = await settleChatTurnLifecycle(
+                    identity: lifecycleIdentity,
+                    kind: MacChatTurnLifecycleTerminalResolver.resolve(
+                        transcriptProof: terminalProof,
+                        observedSignal: .finalResponse
+                    ),
+                    at: Date()
+                )
+                let hasCanonicalTerminalReceipt: Bool
+                switch terminalProof {
+                case .completed, .failed, .canceled:
+                    hasCanonicalTerminalReceipt = true
+                case .absent, .unavailable:
+                    hasCanonicalTerminalReceipt = false
+                }
+                // A synthetic notice is the only recovery affordance when a
+                // retry fails before writing a canonical row. Keep it until an
+                // exact receipt proves that a replacement landed.
+                if !isSyntheticNotice || hasCanonicalTerminalReceipt {
+                    if let freshMessages, !freshMessages.isEmpty {
+                        setChatMessages(freshMessages, for: sessionId)
                     } else if let messages = reply.messages, !messages.isEmpty {
-                        chatMessages = messages.filter { $0.id != message.id }
-                    } else if let msg = reply.message {
-                        chatMessages.removeAll { $0.id == message.id }
-                        chatMessages.append(msg)
+                        setChatMessages(messages.filter { $0.id != message.id }, for: sessionId)
                     } else {
-                        chatMessages.removeAll { $0.id == message.id }
-                        chatMessages.append(ChatMessage(sessionId: sessionId, role: "assistant", content: reply.output, runId: reply.runId))
+                        var replacement = chatMessages(for: sessionId)
+                        replacement.removeAll { $0.id == message.id }
+                        if let msg = reply.message {
+                            replacement.append(msg)
+                        } else {
+                            replacement.append(ChatMessage(
+                                sessionId: sessionId,
+                                role: "assistant",
+                                content: reply.output,
+                                runId: reply.runId
+                            ))
+                        }
+                        setChatMessages(replacement, for: sessionId)
                     }
                 }
-                chatSessions = (try? await client.getChatSessions()) ?? chatSessions
-                if activeChatSessionId == sessionId {
-                    latestContextReceipt = try? await client.getLatestContextReceipt(sessionId: sessionId)
+                switch settled?.presentation.phase {
+                case .completed:
+                    regeneratedTurnCompleted = true
+                    statusText = "Regenerated response"
+                case .failed:
+                    statusText = "Regenerate failed"
+                case .outcomeUnknown, nil:
+                    statusText = "Regenerate outcome could not be confirmed"
+                case .canceled:
+                    break
+                default:
+                    statusText = "Regenerate outcome could not be confirmed"
                 }
-                statusText = "Regenerated response"
+                chatSessions = (try? await client.getChatSessions()) ?? chatSessions
+                setLatestContextReceipt(
+                    try? await client.getLatestContextReceipt(sessionId: sessionId),
+                    for: sessionId
+                )
             } catch {
-                if !Task.isCancelled {
-                    await loadChatState()
+                let freshMessages = try? await client.getChatMessages(sessionId: sessionId)
+                let signal: MacChatTurnObservedTerminalSignal
+                if error is CancellationError {
+                    // The text-compat facade also converts a cancellation-shaped
+                    // stream error string into CancellationError, so the type
+                    // alone is not proof. Only a genuine cancellation of THIS
+                    // task is typed evidence; otherwise the outcome is unproven
+                    // and canonical transcript evidence must decide.
+                    signal = Task.isCancelled ? .cancellationAcknowledged : .ambiguousTermination
+                } else if Task.isCancelled {
+                    signal = .none
+                } else {
+                    // The non-streaming compatibility API does not expose a
+                    // closed typed-error receipt at this boundary. Its throw
+                    // may describe routing, transport, or a post-effect
+                    // persistence failure, so canonical transcript evidence
+                    // must decide; the throw alone remains outcome-unknown.
+                    signal = .none
+                }
+                let terminalProof = await readCanonicalChatTurnTerminalProof(
+                    identity: lifecycleIdentity
+                )
+                let settled = await settleChatTurnLifecycle(
+                    identity: lifecycleIdentity,
+                    kind: MacChatTurnLifecycleTerminalResolver.resolve(
+                        transcriptProof: terminalProof,
+                        observedSignal: signal
+                    ),
+                    at: Date()
+                )
+                let hasCanonicalTerminalReceipt: Bool
+                switch terminalProof {
+                case .completed, .failed, .canceled:
+                    hasCanonicalTerminalReceipt = true
+                case .absent, .unavailable:
+                    hasCanonicalTerminalReceipt = false
+                }
+                if (!isSyntheticNotice || hasCanonicalTerminalReceipt),
+                   let freshMessages, !freshMessages.isEmpty {
+                    setChatMessages(freshMessages, for: sessionId)
+                }
+                if settled?.presentation.phase == .completed {
+                    regeneratedTurnCompleted = true
+                    statusText = "Regenerated response"
+                } else if settled?.presentation.phase == .canceled {
+                    // Preserve the existing quiet Stop behavior.
+                } else if settled?.presentation.phase == .outcomeUnknown {
+                    statusText = "Regenerate outcome could not be confirmed"
+                } else if !Task.isCancelled {
                     statusText = "Regenerate failed: \(error.localizedDescription)"
                 }
+            }
+            if let closed = closeChatTurnLifecycleIntake(
+                sessionId: sessionId,
+                turnId: lifecycleIdentity.turnId,
+                at: Date()
+            ) {
+                await persistChatTurnLifecycleUpdate(identity: closed.identity)
             }
         }
         chatTasks[sessionId] = task
@@ -206,6 +450,14 @@ extension AppModel {
             streamingSessions.remove(sessionId)
             busySessions.remove(sessionId)
         }
+        if regeneratedTurnCompleted {
+            NotificationCenter.default.post(
+                name: .chatTurnCompleted,
+                object: sessionId,
+                userInfo: ["messagesAlreadyRefreshed": true]
+            )
+        }
+        await drainNextQueuedChatTurnIfPossible(sessionId: sessionId)
     }
 
     // PATCH-2026-05-08: wave2-chat-ux slash /remember
@@ -267,10 +519,17 @@ extension AppModel {
             // PATCH-2026-05-13: parallel-sessions — cancel any in-flight task
             // for the archived session and clean up per-session state so we
             // don't leak entries in the generation/text dicts.
+            let runningTask = chatTasks[archivingId]
             if chatTasks[archivingId] != nil || streamingSessions.contains(archivingId) {
                 stopChatStream(sessionId: archivingId)
             }
-            chatTaskGenerations[archivingId] = nil
+            // Archive must not erase the exact lifecycle reservation while its
+            // producer is still committing cancellation evidence.
+            await runningTask?.value
+            if runningTask == nil,
+               activeChatTurnLifecycleIDsBySession[archivingId] == nil {
+                chatTaskGenerations[archivingId] = nil
+            }
             streamingTexts[archivingId] = nil
             streamingBubbleIds[archivingId] = nil
             streamingUserTurnIds[archivingId] = nil
@@ -425,13 +684,28 @@ extension AppModel {
         // turn's flag-clear. Awaited ahead of the busy guards so the
         // suspension can't open a guard→install re-entrancy window.
         await awaitPendingCancelFlagWrite(for: targetSessionId)
-        if requireActiveSession {
-            guard activeChatSessionId == targetSessionId,
-                  chatSessions.contains(where: { $0.id == targetSessionId })
-            else {
-                let rejection = rejectChatTurn("The active chat changed before send. Your message was not sent.")
-                return _StartedChatTurn(acceptance: rejection, task: nil)
-            }
+        let repairAvailable = await repairChatTurnLifecyclesIfNeeded(
+            knownSessionIds: Set(chatSessions.map(\.id))
+        ) { identity in
+            await self.readCanonicalChatTurnTerminalProof(identity: identity)
+        }
+        guard repairAvailable else {
+            let rejection = rejectChatTurn(
+                "Chat could not start safely because lifecycle recovery is unavailable"
+            )
+            return _StartedChatTurn(acceptance: rejection, task: nil)
+        }
+        guard chatSessions.contains(where: { $0.id == targetSessionId }) else {
+            let rejection = rejectChatTurn(
+                "That chat session is no longer available. Your message was not sent."
+            )
+            return _StartedChatTurn(acceptance: rejection, task: nil)
+        }
+        if requireActiveSession, activeChatSessionId != targetSessionId {
+            let rejection = rejectChatTurn(
+                "The active chat changed before send. Your message was not sent."
+            )
+            return _StartedChatTurn(acceptance: rejection, task: nil)
         }
         let sessionIsRunning = chatTasks[targetSessionId] != nil || busySessions.contains(targetSessionId)
         let queueDrainIsStarting = drainingChatQueueSessions.contains(targetSessionId)
@@ -463,6 +737,33 @@ extension AppModel {
         pausedChatQueueSessions.remove(targetSessionId)
         let generation = (chatTaskGenerations[targetSessionId] ?? 0) + 1
         chatTaskGenerations[targetSessionId] = generation
+        let activityIdentity = MacChatTurnIdentity(
+            sessionId: targetSessionId,
+            turnId: TurnTraceContext.mintTurnId()
+        )
+        _ = beginChatTurnLifecycle(
+            sessionId: activityIdentity.sessionId,
+            turnId: activityIdentity.turnId,
+            at: Date()
+        )
+        busySessions.insert(targetSessionId)
+        let lifecyclePersisted = await persistChatTurnLifecycleBegin(
+            identity: activityIdentity
+        )
+        let admissionStillCurrent = chatTurnLifecycle(for: targetSessionId)?.identity
+            == activityIdentity
+            && chatTurnLifecycle(for: targetSessionId)?.cancellationRequestedAt == nil
+            && !Task.isCancelled
+        guard lifecyclePersisted, admissionStillCurrent else {
+            busySessions.remove(targetSessionId)
+            chatTaskGenerations[targetSessionId] = nil
+            await abandonChatTurnLifecycleBeforeAdmission(identity: activityIdentity)
+            let rejection = rejectChatTurn(
+                "Chat could not start safely because its lifecycle receipt was not persisted"
+            )
+            await drainNextQueuedChatTurnIfPossible(sessionId: targetSessionId)
+            return _StartedChatTurn(acceptance: rejection, task: nil)
+        }
         // 2026-06-08 W0.3 fix-2 HIGH: the placeholder-id latch inside
         // _sendChatBody may migrate per-session state from `targetSessionId`
         // to a confirmed `sid`. The cleanup below has to find the task /
@@ -472,8 +773,30 @@ extension AppModel {
         // its final effective session id.
         let bodyCtx = _ChatBodyContext(initial: targetSessionId)
         let task = Task { @MainActor in
-            await _sendChatBody(text, attachments: attachments, sessionId: targetSessionId, generation: generation, ctx: bodyCtx, hideUserBubble: hideUserBubble)
+            if !Task.isCancelled {
+                _ = applyChatTurnLifecycleInput(MacChatTurnLifecycleInput(
+                    identity: activityIdentity,
+                    kind: .working(action: nil),
+                    occurredAt: Date()
+                ))
+                await _sendChatBody(
+                    text,
+                    attachments: attachments,
+                    sessionId: targetSessionId,
+                    generation: generation,
+                    ctx: bodyCtx,
+                    hideUserBubble: hideUserBubble,
+                    activityIdentity: activityIdentity
+                )
+            }
             let cleanupId = bodyCtx.effectiveSessionId
+            if let closed = closeChatTurnLifecycleIntake(
+                sessionId: cleanupId,
+                turnId: activityIdentity.turnId,
+                at: Date()
+            ) {
+                await persistChatTurnLifecycleUpdate(identity: closed.identity)
+            }
             if chatTaskGenerations[cleanupId] == generation {
                 streamingSessions.remove(cleanupId)
                 busySessions.remove(cleanupId)
@@ -512,8 +835,22 @@ extension AppModel {
     /// me" races, not for cancellation. `Task.cancel()` is sufficient.
     @MainActor
     func stopChatStream(sessionId: String? = nil, pauseQueuedTurns: Bool = true) {
-        let sid = sessionId ?? (streamingSessions.contains(activeChatSessionId) ? activeChatSessionId : (streamingSessions.first ?? activeChatSessionId))
+        // A main-window Stop always belongs to the active session. Falling
+        // back to an arbitrary background stream after the first click can
+        // cancel a different detached turn while the original is still
+        // unwinding.
+        let sid = sessionId ?? activeChatSessionId
         guard !sid.isEmpty else { return }
+        if let turnId = activeChatTurnLifecycleIDsBySession[sid],
+           let requested = requestChatTurnCancellation(
+               sessionId: sid,
+               turnId: turnId,
+               at: Date()
+           ) {
+            Task { @MainActor in
+                await persistChatTurnLifecycleUpdate(identity: requested.identity)
+            }
+        }
         if pauseQueuedTurns, !(queuedChatTurnsBySession[sid] ?? []).isEmpty {
             pausedChatQueueSessions.insert(sid)
         } else if !pauseQueuedTurns {
@@ -559,7 +896,11 @@ extension AppModel {
     /// "stop everything" affordance).
     @MainActor
     func stopAllChatStreams() {
-        let ids = Array(streamingSessions.union(Set(chatTasks.keys)))
+        let ids = Array(
+            streamingSessions
+                .union(Set(chatTasks.keys))
+                .union(Set(activeChatTurnLifecycleIDsBySession.keys))
+        )
         for sid in ids { stopChatStream(sessionId: sid) }
     }
 
@@ -659,7 +1000,15 @@ extension AppModel {
     }
 
     @MainActor
-    private func _sendChatBody(_ text: String, attachments: [MultimodalAttachment] = [], sessionId: String? = nil, generation: Int, ctx: _ChatBodyContext? = nil, hideUserBubble: Bool = false) async {
+    private func _sendChatBody(
+        _ text: String,
+        attachments: [MultimodalAttachment] = [],
+        sessionId: String? = nil,
+        generation: Int,
+        ctx: _ChatBodyContext? = nil,
+        hideUserBubble: Bool = false,
+        activityIdentity: MacChatTurnIdentity
+    ) async {
         // PATCH-2026-05-06: hotpath-4 streaming chat — add empty bubble immediately, stream deltas into it
         // PATCH-2026-05-13: parallel-sessions — only mutate `chatMessages`
         // when the active session still matches; otherwise this background
@@ -708,10 +1057,19 @@ extension AppModel {
                 // Sweep R4 C7: without metadata.error the retry gate is false and
                 // the bubble renders with no way to re-send once a provider is
                 // connected. Stamp it so "Try again" is there when it will work.
-                metadata: .syntheticError("no_provider_connected", userRowPersisted: false)
+                metadata: .syntheticError(
+                    "no_provider_connected",
+                    userRowPersisted: false,
+                    inputHadAttachments: !attachments.isEmpty
+                )
             )
             appendChatMessage(guidanceBubble, to: requestSessionId)
             statusText = "No AI provider connected — connect one in the Providers tab in the sidebar."
+            _ = await settleChatTurnLifecycle(
+                identity: activityIdentity,
+                kind: .failed(reason: "No AI provider is connected."),
+                at: Date()
+            )
             return
         }
         // PATCH-2026-05-13: parallel-sessions — track the bubble id, the
@@ -753,11 +1111,11 @@ extension AppModel {
             streamingUserTurnTexts[requestSessionId] = nil
         }
 
+        let metaBox = NativeClient.MetaBox()
         do {
             var streamedText = ""
             var lastStreamPublish = Date.distantPast
             // S.5: use lock-guarded MetaBox for safe cross-isolation metadata passing
-            let metaBox = NativeClient.MetaBox()
             let stream = client.chatStream(
                 message: trimmed.isEmpty ? "(see attachments)" : trimmed,
                 sessionId: requestSessionId,
@@ -766,7 +1124,11 @@ extension AppModel {
                 fileAccess: chatFileAccess,
                 attachments: attachments,
                 metaBox: metaBox,
-                suppressUserAppend: hideUserBubble
+                suppressUserAppend: hideUserBubble,
+                activityIdentity: activityIdentity,
+                onTurnActivity: { [weak self] activity in
+                    await self?.receiveChatTurnActivity(activity)
+                }
             )
             for try await delta in stream {
                 try Task.checkCancellation()
@@ -782,9 +1144,19 @@ extension AppModel {
                 // detached panels bound to this session); same UX as before.
                 if now.timeIntervalSince(lastStreamPublish) >= Self.chatStreamCoalesceSeconds {
                     updateChatMessageContent(id: bubbleId, in: requestSessionId, content: streamedText)
+                    _ = recordChatTurnStreamProgress(
+                        identity: activityIdentity,
+                        accumulatedUTF16Length: streamedText.utf16.count,
+                        at: now
+                    )
                     lastStreamPublish = now
                 }
             }
+            // AsyncThrowingStream cancellation may end iteration cleanly. A
+            // post-loop check prevents Stop from entering the nominal
+            // no-content/success path without observed terminal evidence.
+            try Task.checkCancellation()
+            await metaBox.waitForProducerTermination()
             guard chatTaskGenerations[requestSessionId] == generation else { return }
             // Update sessionId from metadata if returned
             let metaValue = metaBox.get()
@@ -852,6 +1224,16 @@ extension AppModel {
                     chatMessagesBySession.removeValue(forKey: requestSessionId)
                     latestContextReceiptBySession.removeValue(forKey: requestSessionId)
                     chatDrafts.removeValue(forKey: requestSessionId)
+                    _ = await settleChatTurnLifecycle(
+                        identity: MacChatTurnIdentity(
+                            sessionId: requestSessionId,
+                            turnId: activityIdentity.turnId
+                        ),
+                        kind: .outcomeUnknown(
+                            reason: "The turn reconciled into another active session without attributable terminal proof."
+                        ),
+                        at: Date()
+                    )
                     // ctx.effectiveSessionId stays at the placeholder (initial
                     // value) — outer cleanup tears down placeholder bookkeeping.
                     // requestSessionId stays at the placeholder — defer clears
@@ -901,6 +1283,26 @@ extension AppModel {
                     if let g = chatTaskGenerations.removeValue(forKey: requestSessionId) {
                         chatTaskGenerations[sid] = g
                     }
+                    let priorSessionId = requestSessionId
+                    if let rebound = migrateChatTurnLifecycleIntake(
+                        from: requestSessionId,
+                        to: sid,
+                        turnId: activityIdentity.turnId
+                    ) {
+                        let migrated = await persistChatTurnLifecycleMigration(
+                            state: rebound,
+                            from: priorSessionId
+                        )
+                        if !migrated {
+                            _ = applyChatTurnLifecycleInput(MacChatTurnLifecycleInput(
+                                identity: rebound.identity,
+                                kind: .outcomeUnknown(
+                                    reason: "The turn changed session identity without a durable lifecycle receipt."
+                                ),
+                                occurredAt: Date()
+                            ))
+                        }
+                    }
                 }
 
                 if migratingActive {
@@ -943,6 +1345,22 @@ extension AppModel {
                 setChatMessages(fresh, for: requestSessionId)
                 messagesAlreadyRefreshed = true
             }
+            let terminalIdentity = MacChatTurnIdentity(
+                sessionId: requestSessionId,
+                turnId: activityIdentity.turnId
+            )
+            let terminalProof = await readCanonicalChatTurnTerminalProof(
+                identity: terminalIdentity
+            )
+            let settled = await settleChatTurnLifecycle(
+                identity: terminalIdentity,
+                kind: MacChatTurnLifecycleTerminalResolver.resolve(
+                    transcriptProof: terminalProof,
+                    observedSignal: observedTerminalSignal(from: metaBox)
+                ),
+                at: Date()
+            )
+            if settled?.presentation.phase == .canceled { return }
             // Safety-net: if the stream produced no content AND no assistant turn landed on
             // disk for this run, append (or stash) a visible error bubble so the failure
             // isn't silent. Inverted check from "last is user" to "last is NOT assistant" so
@@ -953,15 +1371,13 @@ extension AppModel {
                 // string does NOT pass through normalizeStreamErrorForChat).
                 // audit finding #17, 2026-06-14.
                 let errorText = "No reply came back. Use Try again to retry."
-                // 2026-06-08 W0.3: with per-session storage, the active/inactive
-                // branch collapses — consult the REQUEST session's tail (not
-                // the active one) for the assistant-landed guard. Both main
-                // window and detached panels see the error bubble correctly.
-                let sessionMessages = chatMessages(for: requestSessionId)
-                // A partial/cancelled row does NOT count as a landed reply, so
-                // the no-content error bubble still surfaces (audit finding #2).
-                let assistantLanded = isCompletedAssistant(sessionMessages.last)
-                    || isCompletedAssistant(freshOnSuccess?.last)
+                let assistantLanded: Bool
+                switch terminalProof {
+                case .completed, .failed:
+                    assistantLanded = true
+                case .canceled, .absent, .unavailable:
+                    assistantLanded = false
+                }
                 if !assistantLanded {
                     let errorBubble = ChatMessage(
                         id: Self.syntheticErrorIDPrefix + UUID().uuidString,
@@ -972,7 +1388,10 @@ extension AppModel {
                         // Try again to retry" — messageNeedsRetry requires
                         // metadata.error, so without this stamp the copy named
                         // an affordance that never rendered.
-                        metadata: .syntheticError("stream_produced_no_content")
+                        metadata: .syntheticError(
+                            "stream_produced_no_content",
+                            inputHadAttachments: !attachments.isEmpty
+                        )
                     )
                     appendChatMessage(errorBubble, to: requestSessionId)
                 }
@@ -987,6 +1406,10 @@ extension AppModel {
             )
             compiledPersonality = try? await client.getCompiledPersonality(surface: "chat")
         } catch {
+            // Join the exact NativeClient producer before transcript proof or
+            // queue drain. The join intentionally ignores this consumer task's
+            // cancellation and ends only after the core stream has settled.
+            await metaBox.waitForProducerTermination()
             if Task.isCancelled {
                 guard chatTaskGenerations[requestSessionId] == generation else { return }
                 // 2026-06-08 W0.3: cancel-cleanup targets the request session
@@ -994,10 +1417,27 @@ extension AppModel {
                 // streaming should also see its empty bubble disappear and
                 // any partial tool pills land when the user stops the stream.
                 removeChatMessage(id: bubbleId, from: requestSessionId)
-                if let freshMessages = try? await client.getChatMessages(sessionId: requestSessionId),
-                   !freshMessages.isEmpty {
+                let freshMessages = try? await client.getChatMessages(sessionId: requestSessionId)
+                if let freshMessages, !freshMessages.isEmpty {
                     setChatMessages(freshMessages, for: requestSessionId)
                 }
+                let terminalIdentity = MacChatTurnIdentity(
+                    sessionId: requestSessionId,
+                    turnId: activityIdentity.turnId
+                )
+                let terminalProof = await readCanonicalChatTurnTerminalProof(
+                    identity: terminalIdentity
+                )
+                let cancellationSignal = MacChatTurnLifecycleTerminalResolver
+                    .signalAfterConsumerCancellation(observedTerminalSignal(from: metaBox))
+                _ = await settleChatTurnLifecycle(
+                    identity: terminalIdentity,
+                    kind: MacChatTurnLifecycleTerminalResolver.resolve(
+                        transcriptProof: terminalProof,
+                        observedSignal: cancellationSignal
+                    ),
+                    at: Date()
+                )
                 return
             }
             guard chatTaskGenerations[requestSessionId] == generation else { return }
@@ -1019,13 +1459,57 @@ extension AppModel {
             if let fresh = freshOnError, !fresh.isEmpty {
                 setChatMessages(fresh, for: requestSessionId)
             }
-            let sessionMessagesAfterErr = chatMessages(for: requestSessionId)
-            // A partial/cancelled row (persistPartialIfNeeded on mid-stream
-            // failure) must NOT count as a landed reply, else it suppresses the
-            // normalized failure bubble — this is the chain that defeated the
-            // shipped error surfacing (audit finding #2, 2026-06-14).
-            let assistantLandedErr = isCompletedAssistant(sessionMessagesAfterErr.last)
-                || isCompletedAssistant(freshOnError?.last)
+            let terminalIdentity = MacChatTurnIdentity(
+                sessionId: requestSessionId,
+                turnId: activityIdentity.turnId
+            )
+            let terminalProof = await readCanonicalChatTurnTerminalProof(
+                identity: terminalIdentity
+            )
+            // This branch is only reached when `Task.isCancelled` is false (the
+            // cancelled case returned above), so a CancellationError arriving
+            // here was laundered from a cancellation-shaped stream error string
+            // rather than observed as a real stop. It cannot claim a cancel.
+            let errorSignal: MacChatTurnObservedTerminalSignal = error is CancellationError
+                ? .ambiguousTermination
+                : observedTerminalSignal(from: metaBox)
+            let settled = await settleChatTurnLifecycle(
+                identity: terminalIdentity,
+                kind: MacChatTurnLifecycleTerminalResolver.resolve(
+                    transcriptProof: terminalProof,
+                    observedSignal: errorSignal
+                ),
+                at: Date()
+            )
+            // Marker-only cancellation (for example Status chrome) may not
+            // cancel this AppModel task. The typed core receipt still owns the
+            // truth; do not turn it into a retry bubble or completion notice.
+            if settled?.presentation.phase == .canceled { return }
+
+            // A remote/marker-only Stop that never cancelled this task reaches
+            // here as an ambiguous terminal with no canonical receipt (nothing
+            // streamed, so no partial row was written). Its raw transport text
+            // is literally "cancelled" — surfacing that verbatim would read as
+            // a provider crash for what the user deliberately stopped from
+            // another device. We still refuse to CLAIM a cancel we cannot
+            // prove, so say exactly what is true: the outcome is unconfirmed.
+            if errorSignal == .ambiguousTermination,
+               settled?.presentation.phase == .outcomeUnknown {
+                removeChatMessage(id: bubbleId, from: requestSessionId)
+                statusText = "Turn stopped; its outcome could not be confirmed"
+                return
+            }
+
+            // Only an exact current-turn receipt can suppress the current
+            // failure bubble. An older completed assistant at the transcript
+            // tail is unrelated evidence and must never make this turn vanish.
+            let assistantLandedErr: Bool
+            switch terminalProof {
+            case .completed, .failed:
+                assistantLandedErr = true
+            case .canceled, .absent, .unavailable:
+                assistantLandedErr = false
+            }
             if !assistantLandedErr {
                 // Carry sessionId (mirrors the no-content bubble above) so the
                 // row is correctly attributed to its session for any code that
@@ -1039,7 +1523,10 @@ extension AppModel {
                     sessionId: requestSessionId,
                     role: "assistant",
                     content: errorText,
-                    metadata: .syntheticError(error.localizedDescription)
+                    metadata: .syntheticError(
+                        error.localizedDescription,
+                        inputHadAttachments: !attachments.isEmpty
+                    )
                 )
                 appendChatMessage(errorBubble, to: requestSessionId)
             }
@@ -1069,6 +1556,23 @@ extension AppModel {
         if m.metadata?.partial == true { return false }
         if m.metadata?.cancelled == true { return false }
         return true
+    }
+
+    private func observedTerminalSignal(
+        from metaBox: NativeClient.MetaBox
+    ) -> MacChatTurnObservedTerminalSignal {
+        switch metaBox.terminalEvidence() {
+        case .finalResponse:
+            return .finalResponse
+        case .explicitFailure(let reason):
+            return .explicitFailure(reason)
+        case .cancellationAcknowledged:
+            return .cancellationAcknowledged
+        case .ambiguousTermination:
+            return .ambiguousTermination
+        case nil:
+            return .none
+        }
     }
 
     /// Maps a streaming failure to a clean, user-facing chat-bubble sentence.

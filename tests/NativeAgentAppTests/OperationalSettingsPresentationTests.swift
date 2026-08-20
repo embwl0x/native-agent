@@ -123,8 +123,13 @@ struct OperationalSettingsPresentationTests {
         }
         #expect(app.contains("CommandMenu(\"Navigate\")"))
         #expect(app.contains("NativeAgentAppCoordinator.shared.request"))
-        #expect(!chat.contains(".opacity(0)"))
-        #expect(!detachedChat.contains(".opacity(0)"))
+        // Retired shortcut controls were invisible zero-size Buttons. A
+        // transparent gradient stop is ordinary visual styling and must not
+        // trip this structural guard.
+        for source in [chat, detachedChat] {
+            #expect(!source.contains(".opacity(0).frame(width: 0, height: 0)"))
+            #expect(!source.contains(".opacity(0)\n            .frame(width: 0, height: 0)"))
+        }
         #expect(chat.contains(".focusedSceneValue(\\.chatCommandActions"))
         #expect(detachedChat.contains(".focusedSceneValue(\\.chatCommandActions"))
         #expect(focusedCommands.contains("struct ChatFocusedCommands: Commands"))

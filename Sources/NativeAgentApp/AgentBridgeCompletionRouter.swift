@@ -53,6 +53,23 @@ struct AgentBridgeCompletionRoute: Sendable, Equatable {
       correlationId: value("correlationId")
     )
   }
+
+  /// Preserve the immutable return route while Agent handles an asynchronous
+  /// builder completion. The completion itself still executes on the local
+  /// bridge/chat trust surface; this value carries delivery identity only, so
+  /// any follow-up `codex_message`/`claude_message` returns to the same
+  /// Telegram, Slack, or iOS conversation instead of silently degrading to a
+  /// Mac-only reply.
+  var chatToolReplyRoute: ChatToolSessionContext.ReplyRoute {
+    ChatToolSessionContext.ReplyRoute(
+      surface: surface,
+      destinationId: destinationId,
+      threadId: threadId,
+      sourceKey: sourceKey,
+      replyTo: replyTo,
+      correlationId: correlationId
+    )
+  }
 }
 
 struct AgentBridgeCompletionDelivery: Sendable, Equatable, Codable {

@@ -588,6 +588,18 @@ public protocol MacAXActSource: Sendable {
     func reread(_ target: MacAXActTarget) -> MacAXActTarget?
 }
 
+/// AX mutations can synchronously invoke action handlers inside the target
+/// application. SwiftUI/AppKit handlers are main-thread isolated, so issuing
+/// `AXUIElementPerformAction` from a model/tool executor can crash the target
+/// in `_dispatch_assert_queue_fail`. Keep the complete AX resolve/mutate/read
+/// transaction on the host main lane.
+enum MacAXExecutionLane {
+    static func sync<T>(_ body: () -> T) -> T {
+        if Thread.isMainThread { return body() }
+        return DispatchQueue.main.sync(execute: body)
+    }
+}
+
 #if canImport(ApplicationServices) && os(macOS)
 
 /// Live `AXUIElement` actuator. This is the only type in the module that calls
@@ -618,9 +630,15 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         return table[handle]
     }
 
-    public func isTrusted() -> Bool { AXIsProcessTrusted() }
+    public func isTrusted() -> Bool {
+        MacAXExecutionLane.sync { AXIsProcessTrusted() }
+    }
 
     public func resolve(path: [Int]) -> MacAXActTarget? {
+        MacAXExecutionLane.sync { resolveOnExecutionLane(path: path) }
+    }
+
+    private func resolveOnExecutionLane(path: [Int]) -> MacAXActTarget? {
         #if canImport(AppKit)
         guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
         let appElement = AXUIElementCreateApplication(app.processIdentifier)
@@ -640,6 +658,10 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     }
 
     public func perform(_ target: MacAXActTarget, action: String) -> MacAXActOutcome {
+        MacAXExecutionLane.sync { performOnExecutionLane(target, action: action) }
+    }
+
+    private func performOnExecutionLane(_ target: MacAXActTarget, action: String) -> MacAXActOutcome {
         guard let element = element(target.handle) else { return .invalidTarget }
         guard target.actions.contains(action) else { return .unsupported }
         NativeAgentMotorEpoch.noteAgentMotorEvent()
@@ -652,6 +674,10 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     }
 
     public func setValue(_ target: MacAXActTarget, value: String) -> MacAXActOutcome {
+        MacAXExecutionLane.sync { setValueOnExecutionLane(target, value: value) }
+    }
+
+    private func setValueOnExecutionLane(_ target: MacAXActTarget, value: String) -> MacAXActOutcome {
         guard let element = element(target.handle) else { return .invalidTarget }
         var settable: DarwinBoolean = false
         let probe = AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable)
@@ -666,6 +692,10 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     }
 
     public func reread(_ target: MacAXActTarget) -> MacAXActTarget? {
+        MacAXExecutionLane.sync { rereadOnExecutionLane(target) }
+    }
+
+    private func rereadOnExecutionLane(_ target: MacAXActTarget) -> MacAXActTarget? {
         guard let element = element(target.handle) else { return nil }
         return describe(element, reusing: target.handle)
     }
@@ -750,7 +780,20 @@ public struct UnavailableMacAXActSource: MacAXActSource {
     public func reread(_ target: MacAXActTarget) -> MacAXActTarget? { nil }
 }
 
+/// Test-only default source: available/trusted enough for reachability checks,
+/// but incapable of resolving or mutating a real host AX element.
+struct InertAvailableMacAXActSource: MacAXActSource {
+    func isTrusted() -> Bool { true }
+    func resolve(path: [Int]) -> MacAXActTarget? { nil }
+    func perform(_ target: MacAXActTarget, action: String) -> MacAXActOutcome { .invalidTarget }
+    func setValue(_ target: MacAXActTarget, value: String) -> MacAXActOutcome { .invalidTarget }
+    func reread(_ target: MacAXActTarget) -> MacAXActTarget? { nil }
+}
+
 public func defaultMacAXActSource() -> any MacAXActSource {
+    if isRunningUnderTestHarness() {
+        return InertAvailableMacAXActSource()
+    }
     #if canImport(ApplicationServices) && os(macOS)
     return SystemMacAXActSource()
     #else

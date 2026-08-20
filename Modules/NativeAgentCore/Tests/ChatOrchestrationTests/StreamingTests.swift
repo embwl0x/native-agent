@@ -207,6 +207,42 @@ func textToolCompatibilityLayout_cachesToolContractBeforeVolatileContext() throw
 }
 
 @Test
+func delegatedCampaignContract_advancesAcceptedFindings_butPreservesAuthorityCheckpoints() {
+    let context = TurnContext(
+        surface: "chat",
+        personaDocs: [:],
+        recalled: [],
+        modelId: "test-model",
+        reasoningEffort: "high",
+        toolsAvailable: ["desk_create", "codex_message"],
+        systemPrompt: "persona",
+        userMessage: "Run the campaign",
+        systemSegments: SystemPromptSegments(stable: "persona", dynamic: "")
+    )
+
+    for nativeTools in [false, true] {
+        let prompt = SwiftNativeTurnEngine.withTextToolCompatibilityInstructions(
+            context.systemPrompt,
+            context: context,
+            nativeTools: nativeTools
+        )
+
+        #expect(prompt.contains(DelegatedCampaignGuidance.acceptedFinding))
+        #expect(prompt.contains("reversible follow-through is authorized end-to-end"))
+        #expect(prompt.contains("file, route, recover, verify, and advance until independently verified done"))
+        #expect(prompt.contains("never pause to ask whether to file it, keep going, dispatch the next step, or verify it"))
+        #expect(prompt.contains(DelegatedCampaignGuidance.authorityCheckpoint))
+        #expect(prompt.contains("Stop and escalate only for a genuine operator-only boundary"))
+        #expect(prompt.contains("operator-only boundary: an approval"))
+        #expect(prompt.contains("an irreversible, destructive, or consequential external action"))
+        #expect(prompt.contains("credentials, TCC, or physical presence"))
+        #expect(prompt.contains("spending or a public commitment"))
+        #expect(prompt.contains("a real taste/scope decision after reversible work is exhausted"))
+        #expect(prompt.contains("Use the canonical approval path when available, preserve every safety gate"))
+    }
+}
+
+@Test
 func streamTurn_persona_load_failure_yields_error_event() async throws {
     let engine = makeEngine(persona: ThrowingPersonaStub())
     let streamer = MockStreamingLLMClient(chunks: ["never"])

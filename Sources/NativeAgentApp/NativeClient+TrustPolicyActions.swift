@@ -88,6 +88,12 @@ extension NativeClient {
         try await postTrustWrite(body: ["enableAutonomy": enabled])
     }
 
+    func saveChromeControlEnabled(_ enabled: Bool) async throws -> TrustPolicy {
+        try await postTrustWrite(body: [
+            "chromeControlPolicy": ["enabled": enabled]
+        ])
+    }
+
     // PATCH-2026-05-07: mac-control-ui-1 POST macControlPolicy block to /v1/trust.
     func saveMacControlPolicy(_ policy: TrustMacControlPolicy) async throws -> TrustPolicy {
         let approvalList: [String] = policy.approvalRequiredFor

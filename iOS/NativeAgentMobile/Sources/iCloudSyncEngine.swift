@@ -55,6 +55,7 @@ final class iCloudSyncEngine: ObservableObject {
     // MARK: - Published snapshots
 
     @Published var workshopTasks: [WorkshopTaskRecord] = []
+    @Published var deskItems: [MobileDeskItem] = []
     @Published var skills: [SkillRecord] = []
     @Published var memories: [MemoryRecord] = []
     @Published var memoryProposals: [MemoryProposalRecord] = []

@@ -52,12 +52,10 @@ test("trusted per-message working directory becomes the fresh thread workspace",
   assert.equal(clean.workingDirectory, dir);
   assert.equal(clean.executionProfile, "github-command-repository-network-v1");
   assert.equal(thread.cwd, canonicalDir);
-  assert.equal(thread.sandbox, "workspace-write");
+  assert.equal(thread.sandbox, "danger-full-access");
   assert.equal(turn.cwd, canonicalDir);
   assert.deepEqual(turn.sandboxPolicy, {
-    type: "workspaceWrite",
-    writableRoots: [canonicalDir, path.join(canonicalDir, ".git")],
-    networkAccess: true,
+    type: "dangerFullAccess",
   });
   assert.match(wakeup.formatPrompt(clean), /unattended GitHub bridge/i);
   fs.rmSync(dir, { recursive: true, force: true });
@@ -82,11 +80,8 @@ test("app-verified repository profile grants network from any origin surface", (
   assert.equal(clean.executionProfile, "github-command-repository-network-v1");
   assert.equal(thread.cwd, canonicalDir);
   assert.deepEqual(turn.sandboxPolicy, {
-    type: "workspaceWrite",
-    writableRoots: [canonicalDir, path.join(canonicalDir, ".git")],
-    networkAccess: true,
+    type: "dangerFullAccess",
   });
-  assert.equal(turn.sandboxPolicy.networkAccess, true);
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -288,6 +283,229 @@ test("reply wait timeouts remain pending while the rollout keeps moving", async 
   assert.equal(timeouts, 2);
   assert.equal(probeCalls, 0);
   assert.equal(execution.turnResult.status, "completed");
+});
+
+test("hang watchdog declares a frozen in-flight rollout and writes its receipt", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-hang-watchdog-"));
+  const rollout = path.join(dir, "rollout.jsonl");
+  const receipts = path.join(dir, "hang-watchdog.jsonl");
+  fs.writeFileSync(rollout, [
+    JSON.stringify({
+      timestamp: "2026-08-18T20:00:00.000Z",
+      type: "event_msg",
+      payload: { type: "task_started", turn_id: "turn-frozen" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-08-18T20:00:01.000Z",
+      type: "response_item",
+      payload: { type: "function_call", name: "shell" },
+    }),
+  ].join("\n") + "\n");
+
+  const clock = Date.parse("2026-08-18T20:05:02.000Z");
+  const lastWrite = Date.parse("2026-08-18T20:00:01.000Z");
+  const execution = await wakeup.waitForDurableTerminalExecution(
+    { threadId: "thread-frozen", turnId: "turn-frozen" },
+    { hangWatchdogMs: 5 * 60 * 1000, hangWatchdogReceiptsPath: receipts },
+    async () => {},
+    {
+      now: () => clock,
+      waitForTurnResult: async () => ({ status: "timeout", waitSource: "exact_timeout" }),
+      rolloutStallSnapshot: () => ({ path: rollout, ino: 1, size: 2, mtimeMs: lastWrite }),
+      probeTurnLiveness: async () => ({
+        serverReachable: true, turnFound: true, turnClaimsInProgress: true,
+      }),
+    }
+  );
+
+  assert.equal(execution.turnResult.status, "failed_hung");
+  assert.equal(execution.turnResult.reason, "failed-hung");
+  assert.equal(execution.turnResult.waitSource, "hang_watchdog");
+  assert.equal(execution.turnResult.noWorkObserved, false);
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(receipts, "utf8").trim()),
+    {
+      turnId: "turn-frozen",
+      rolloutPath: rollout,
+      lastWriteAt: new Date(lastWrite).toISOString(),
+      declaredAt: new Date(clock).toISOString(),
+    }
+  );
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("hang watchdog does not trip when a long turn keeps advancing its rollout mtime", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-hang-watchdog-healthy-"));
+  const rollout = path.join(dir, "rollout.jsonl");
+  const receipts = path.join(dir, "hang-watchdog.jsonl");
+  fs.writeFileSync(rollout, JSON.stringify({
+    type: "event_msg",
+    payload: { type: "task_started", turn_id: "turn-healthy-long" },
+  }) + "\n");
+
+  let clock = 1_000_000;
+  let lastWrite = clock - 500;
+  let waits = 0;
+  const execution = await wakeup.waitForDurableTerminalExecution(
+    { threadId: "thread-healthy-long", turnId: "turn-healthy-long" },
+    { hangWatchdogMs: 1000, hangWatchdogReceiptsPath: receipts },
+    async () => {},
+    {
+      now: () => clock,
+      waitForTurnResult: async () => {
+        waits += 1;
+        clock += 1000;
+        if (waits === 3) return { status: "completed", message: "done" };
+        lastWrite = clock - 100;
+        return { status: "timeout", waitSource: "exact_timeout" };
+      },
+      rolloutStallSnapshot: () => ({ path: rollout, ino: 1, size: waits + 1, mtimeMs: lastWrite }),
+      probeTurnLiveness: async () => ({
+        serverReachable: true, turnFound: true, turnClaimsInProgress: true,
+      }),
+    }
+  );
+
+  assert.equal(execution.turnResult.status, "completed");
+  assert.equal(waits, 3);
+  assert.equal(fs.existsSync(receipts), false);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("hung turn kills its exact app-server owner, clears a stale drain lock, and requeues once", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-hang-recovery-"));
+  const receipts = path.join(dir, "hang-watchdog.jsonl");
+  const drainLock = path.join(dir, ".drain.lock");
+  fs.mkdirSync(drainLock);
+  fs.writeFileSync(path.join(drainLock, "pid"), "999999\n");
+  let ownerPID = 4242;
+  let alive = true;
+  const signals = [];
+  const queued = [];
+  let drainStarts = 0;
+  const job = {
+    threadId: "thread-recover",
+    turnId: "turn-recover-1",
+    hangRetryCount: 0,
+    appServer: { pid: 4242, startIdentity: "daemon-generation-1" },
+    entries: [{ payload: { messageId: "message-recover", text: "do the work" } }],
+  };
+  const execution = {
+    threadId: job.threadId,
+    turnId: job.turnId,
+    turnResult: { status: "failed_hung" },
+  };
+
+  const recovery = await wakeup.recoverHungTurn(job, execution, {
+    hangWatchdogReceiptsPath: receipts,
+  }, {
+    now: () => Date.parse("2026-08-18T21:00:00.000Z"),
+    drainLockDir: drainLock,
+    dirLockOwnerAlive: () => false,
+    processOperations: {
+      socketOwnerPid: () => ownerPID,
+      processStartIdentity: () => "daemon-generation-1",
+      kill: (pid, signal) => {
+        signals.push({ pid, signal });
+        alive = false;
+        ownerPID = null;
+      },
+      pidAlive: () => alive,
+      sleep: async () => {},
+      startDaemon: () => { ownerPID = 4343; },
+      removeStaleSocket: () => {},
+    },
+    appendPending: async (payload, threadId, options) => {
+      queued.push({ payload, threadId, options });
+      return { alreadyQueued: false, pendingCount: 1 };
+    },
+    startDrainProcess: () => {
+      drainStarts += 1;
+      return { status: "started", pid: 5151 };
+    },
+  });
+
+  assert.equal(recovery.status, "requeued");
+  assert.equal(recovery.retryCount, 1);
+  assert.deepEqual(signals, [{ pid: 4242, signal: "SIGTERM" }]);
+  assert.equal(fs.existsSync(drainLock), false);
+  assert.equal(queued.length, 1);
+  assert.equal(queued[0].threadId, "thread-recover");
+  assert.equal(queued[0].options.hangRetryCount, 1);
+  assert.equal(queued[0].options.hungTurnId, "turn-recover-1");
+  assert.equal(drainStarts, 1);
+  const actions = fs.readFileSync(receipts, "utf8").trim().split("\n").map(JSON.parse);
+  assert.deepEqual(actions.map((row) => row.action), [
+    "app_server_killed",
+    "stale_drain_lock_cleared",
+    "app_server_respawned",
+    "hung_wake_job_requeued",
+  ]);
+  assert.equal(actions[0].pidKilled, 4242);
+  assert.equal(actions[3].retryCount, 1);
+  for (const row of actions) {
+    assert.deepEqual(Object.keys(row).sort(), ["action", "pidKilled", "retryCount", "timestamp", "turnId"]);
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("a second hang on the same message reaches the cap and never requeues", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-hang-recovery-cap-"));
+  const receipts = path.join(dir, "hang-watchdog.jsonl");
+  let ownerPID = 5252;
+  let queued = 0;
+  const recovery = await wakeup.recoverHungTurn({
+    threadId: "thread-recover",
+    turnId: "turn-recover-2",
+    hangRetryCount: 1,
+    appServer: { pid: 5252, startIdentity: "daemon-generation-2" },
+    entries: [{ payload: { messageId: "message-recover", text: "do the work" } }],
+  }, {
+    threadId: "thread-recover",
+    turnId: "turn-recover-2",
+    turnResult: { status: "failed_hung" },
+  }, {
+    hangMaxRetries: 1,
+    hangWatchdogReceiptsPath: receipts,
+  }, {
+    drainLockDir: path.join(dir, ".missing-drain.lock"),
+    processOperations: {
+      socketOwnerPid: () => ownerPID,
+      processStartIdentity: () => "daemon-generation-2",
+      kill: () => { ownerPID = null; },
+      pidAlive: () => false,
+      sleep: async () => {},
+      startDaemon: () => { ownerPID = 5353; },
+      removeStaleSocket: () => {},
+    },
+    appendPending: async () => { queued += 1; },
+    startDrainProcess: () => { throw new Error("must not start drain after retry cap"); },
+  });
+
+  assert.equal(recovery.status, "permanent_failed_hung");
+  assert.equal(recovery.retryCount, 1);
+  assert.equal(queued, 0);
+  const actions = fs.readFileSync(receipts, "utf8").trim().split("\n").map(JSON.parse);
+  assert.equal(actions.at(-1).action, "hang_retry_cap_reached");
+  assert.equal(actions.at(-1).retryCount, 1);
+  assert.equal(actions.some((row) => row.action === "hung_wake_job_requeued"), false);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("healthy turn never invokes hang auto-recovery", async () => {
+  let processCalls = 0;
+  let receiptCalls = 0;
+  const result = await wakeup.recoverHungTurn({ hangRetryCount: 0 }, {
+    threadId: "thread-healthy",
+    turnId: "turn-healthy",
+    turnResult: { status: "completed" },
+  }, {}, {
+    processOperations: { socketOwnerPid: () => { processCalls += 1; return null; } },
+    appendReceipt: async () => { receiptCalls += 1; },
+  });
+  assert.equal(result.status, "not_hung");
+  assert.equal(processCalls, 0);
+  assert.equal(receiptCalls, 0);
 });
 
 // ------------------------------------------- stalled turns (task #46, 2026-07-30)
@@ -548,7 +766,9 @@ test("a stalled verdict reads observed activity from the real rollout for resend
     JSON.stringify({ type: "response_item", payload: { type: "function_call", name: "shell" } }),
   ].join("\n") + "\n");
   const execution = await wakeup.waitForDurableTerminalExecution(
-    { threadId: "thread-act", turnId: "turn-act" }, {}, async () => {}, {
+    { threadId: "thread-act", turnId: "turn-act" },
+    { hangWatchdogMs: Number.MAX_SAFE_INTEGER },
+    async () => {}, {
       waitForTurnResult: async () => ({ status: "timeout", waitSource: "exact_timeout" }),
       rolloutStallSnapshot: () => ({ path: rollout, ino: 1, size: 2, mtimeMs: 3 }),
       probeTurnLiveness: async () => ({ serverReachable: true, turnFound: false, turnClaimsInProgress: false }),
@@ -563,7 +783,9 @@ test("a stalled verdict reads observed activity from the real rollout for resend
     { type: "event_msg", payload: { type: "task_started", turn_id: "turn-idle" } }
   ) + "\n");
   const idle = await wakeup.waitForDurableTerminalExecution(
-    { threadId: "thread-idle", turnId: "turn-idle" }, {}, async () => {}, {
+    { threadId: "thread-idle", turnId: "turn-idle" },
+    { hangWatchdogMs: Number.MAX_SAFE_INTEGER },
+    async () => {}, {
       waitForTurnResult: async () => ({ status: "timeout", waitSource: "exact_timeout" }),
       rolloutStallSnapshot: () => ({ path: noWork, ino: 1, size: 1, mtimeMs: 1 }),
       probeTurnLiveness: async () => ({ serverReachable: false, turnFound: false, turnClaimsInProgress: false }),
@@ -576,15 +798,22 @@ test("a shortened judging window actually reaches the event waiter deadline", as
   // The stall tests all stub waitForTurnResult, so none of them would catch
   // options.windowMs failing to thread through to the real waiter -- which
   // would silently restore the 1h judging cadence this fix exists to shorten.
-  const started = Date.now();
-  const result = await wakeup.waitForTurnResultEventFirst(
-    "thread-nonexistent", "turn-nonexistent", {}, null, 600
-  );
-  const elapsed = Date.now() - started;
-  assert.equal(result.status, "timeout");
-  assert.equal(result.waitSource, "exact_timeout");
-  // Default replyWaitTimeoutMs is 1h; anything near it means the arg was dropped.
-  assert.ok(elapsed < 10_000, `window override ignored: waited ${elapsed}ms`);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-short-wait-"));
+  const rollout = path.join(dir, "rollout.jsonl");
+  fs.writeFileSync(rollout, "");
+  try {
+    const started = Date.now();
+    const result = await wakeup.waitForTurnResultEventFirst(
+      "thread-nonexistent", "turn-nonexistent", { rolloutPath: rollout }, null, 600
+    );
+    const elapsed = Date.now() - started;
+    assert.equal(result.status, "timeout");
+    assert.equal(result.waitSource, "exact_timeout");
+    // Default replyWaitTimeoutMs is 1h; anything near it means the arg was dropped.
+    assert.ok(elapsed < 10_000, `window override ignored: waited ${elapsed}ms`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // --------------------------- connector schema diagnostics (2026-08-05 incident)
@@ -859,11 +1088,11 @@ fs.writeFileSync(args[outputIndex + 1], "GITHUB-FALLBACK-OK\\n");
     const canonicalDir = fs.realpathSync(dir);
     assert.equal(result.status, "completed");
     assert.equal(result.cwd, canonicalDir);
-    assert.equal(result.sandbox, "workspace-write");
+    assert.equal(result.sandbox, "danger-full-access");
     assert.equal(result.networkAccess, true);
     assert.equal(invocation.cwd, canonicalDir);
     assert.deepEqual(invocation.args.slice(0, 5), [
-      "exec", "--ephemeral", "--sandbox", "workspace-write", "-C",
+      "exec", "--ephemeral", "--sandbox", "danger-full-access", "-C",
     ]);
     assert.ok(invocation.args.includes("sandbox_workspace_write.network_access=true"));
     assert.ok(invocation.args.includes("--add-dir"));
@@ -1153,6 +1382,147 @@ test("pending drain uses a failure-specific deadline instead of a state poll", a
     );
     assert.equal(result.source, "failure_retry_deadline");
   } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("drainer heartbeat writes atomically on its configured interval", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-drainer-heartbeat-"));
+  const heartbeatPath = path.join(dir, "drainer-heartbeat.jsonl");
+  let clock = Date.parse("2026-08-18T22:00:00.000Z");
+  let timerCallback = null;
+  let timerInterval = null;
+  let cleared = false;
+  const heartbeat = wakeup.createDrainerHeartbeat({
+    drainerHeartbeatPath: heartbeatPath,
+    drainerHeartbeatMs: 1000,
+  }, {
+    pid: 6101,
+    now: () => clock,
+    pidAlive: () => { throw new Error("no prior pid should be inspected"); },
+    withLock: async (body) => body(),
+    setInterval: (callback, interval) => {
+      timerCallback = callback;
+      timerInterval = interval;
+      return { unref() {} };
+    },
+    clearInterval: () => { cleared = true; },
+  });
+  try {
+    heartbeat.update(2, null);
+    const startup = await heartbeat.start();
+    assert.equal(startup.status, "started");
+    assert.equal(timerInterval, 1000);
+
+    clock += 1000;
+    heartbeat.update(3, "turn-heartbeat");
+    await timerCallback();
+    const rows = fs.readFileSync(heartbeatPath, "utf8").trim().split("\n").map(JSON.parse);
+    assert.equal(rows.length, 2);
+    assert.deepEqual(rows[1], {
+      pid: 6101,
+      timestamp: new Date(clock).toISOString(),
+      queueDepth: 3,
+      activeTurnId: "turn-heartbeat",
+    });
+    assert.equal(fs.readdirSync(dir).some((name) => name.endsWith(".tmp")), false);
+  } finally {
+    await heartbeat.stop();
+    assert.equal(cleared, true);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("fresh heartbeat from a dead pid records takeover and starts draining", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-drainer-takeover-"));
+  const heartbeatPath = path.join(dir, "drainer-heartbeat.jsonl");
+  const clock = Date.parse("2026-08-18T22:10:00.000Z");
+  fs.writeFileSync(heartbeatPath, `${JSON.stringify({
+    pid: 6201,
+    timestamp: new Date(clock - 1000).toISOString(),
+    queueDepth: 4,
+    activeTurnId: "turn-old",
+  })}\n`);
+  let scheduled = 0;
+  const heartbeat = wakeup.createDrainerHeartbeat({
+    drainerHeartbeatPath: heartbeatPath,
+    drainerHeartbeatMs: 1000,
+    drainerHeartbeatStaleMs: 5000,
+  }, {
+    pid: 6202,
+    now: () => clock,
+    pidAlive: (pid) => {
+      assert.equal(pid, 6201);
+      return false;
+    },
+    withLock: async (body) => body(),
+    setInterval: () => {
+      scheduled += 1;
+      return { unref() {} };
+    },
+    clearInterval: () => {},
+  });
+  try {
+    heartbeat.update(4, null);
+    const startup = await heartbeat.start();
+    assert.equal(startup.status, "started");
+    assert.equal(scheduled, 1);
+    const rows = fs.readFileSync(heartbeatPath, "utf8").trim().split("\n").map(JSON.parse);
+    assert.equal(rows.at(-2).action, "dead_pid_takeover");
+    assert.equal(rows.at(-2).priorPid, 6201);
+    assert.deepEqual(rows.at(-1), {
+      pid: 6202,
+      timestamp: new Date(clock).toISOString(),
+      queueDepth: 4,
+      activeTurnId: null,
+    });
+  } finally {
+    await heartbeat.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("fresh heartbeat from a live pid writes refusal and never schedules a drain heartbeat", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-drainer-refusal-"));
+  const heartbeatPath = path.join(dir, "drainer-heartbeat.jsonl");
+  const clock = Date.parse("2026-08-18T22:20:00.000Z");
+  fs.writeFileSync(heartbeatPath, `${JSON.stringify({
+    pid: 6301,
+    timestamp: new Date(clock - 1000).toISOString(),
+    queueDepth: 2,
+    activeTurnId: "turn-live",
+  })}\n`);
+  let scheduled = 0;
+  const heartbeat = wakeup.createDrainerHeartbeat({
+    drainerHeartbeatPath: heartbeatPath,
+    drainerHeartbeatMs: 1000,
+    drainerHeartbeatStaleMs: 5000,
+  }, {
+    pid: 6302,
+    now: () => clock,
+    pidAlive: (pid) => {
+      assert.equal(pid, 6301);
+      return true;
+    },
+    withLock: async (body) => body(),
+    setInterval: () => {
+      scheduled += 1;
+      return { unref() {} };
+    },
+    clearInterval: () => {},
+  });
+  try {
+    heartbeat.update(2, null);
+    const startup = await heartbeat.start();
+    assert.equal(startup.status, "refused");
+    assert.equal(startup.reason, "live_drainer_heartbeat");
+    assert.equal(scheduled, 0);
+    const rows = fs.readFileSync(heartbeatPath, "utf8").trim().split("\n").map(JSON.parse);
+    assert.equal(rows.at(-1).action, "live_pid_refusal");
+    assert.equal(rows.at(-1).priorPid, 6301);
+    assert.equal(rows.at(-1).pid, 6302);
+  } finally {
+    await heartbeat.stop();
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -1487,31 +1857,39 @@ test("daemon cwd identity detects a workspace pathname recreated under a live da
 test("dir-lock owner liveness distinguishes live, dead, reused-pid, and missing owners", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "heal-lock-"));
   const lockDir = path.join(dir, ".daemon-heal.lock");
+  const identity = "mock-current-process-generation";
+  const operations = {
+    kill: (pid) => {
+      if (pid === process.pid) return;
+      const error = new Error("no such process");
+      error.code = "ESRCH";
+      throw error;
+    },
+    processStartIdentity: (pid) => pid === process.pid ? identity : null,
+  };
   try {
     // No lock dir / no pid file → dead.
-    assert.equal(wakeup.dirLockOwnerAlive(lockDir), false);
+    assert.equal(wakeup.dirLockOwnerAlive(lockDir, operations), false);
     fs.mkdirSync(lockDir);
-    assert.equal(wakeup.dirLockOwnerAlive(lockDir), false);
+    assert.equal(wakeup.dirLockOwnerAlive(lockDir, operations), false);
 
     // Live owner with matching start identity → alive.
-    const identity = wakeup.processStartIdentity(process.pid);
     fs.writeFileSync(path.join(lockDir, "pid"), `${process.pid}\nnow\n${identity}\n`);
-    assert.equal(wakeup.dirLockOwnerAlive(lockDir), true);
+    assert.equal(wakeup.dirLockOwnerAlive(lockDir, operations), true);
 
     // Live PID whose start identity differs → the PID was reused; dead.
     fs.writeFileSync(path.join(lockDir, "pid"), `${process.pid}\nnow\nnot-the-real-identity\n`);
-    assert.equal(wakeup.dirLockOwnerAlive(lockDir), false);
+    assert.equal(wakeup.dirLockOwnerAlive(lockDir, operations), false);
 
     // Dead owner: a child that has already exited. A recorded identity that
     // can never match pins the reused-PID guard deterministically (review
     // dcf9cf804931 finding 3 — a bare dead pid could flake on reuse).
-    const child = require("node:child_process").spawnSync("/usr/bin/true");
-    fs.writeFileSync(path.join(lockDir, "pid"), `${child.pid}\nnow\ndead-owner-identity\n`);
-    assert.equal(wakeup.dirLockOwnerAlive(lockDir), false);
+    fs.writeFileSync(path.join(lockDir, "pid"), "999999\nnow\ndead-owner-identity\n");
+    assert.equal(wakeup.dirLockOwnerAlive(lockDir, operations), false);
 
     // Garbage pid file → dead.
     fs.writeFileSync(path.join(lockDir, "pid"), "not-a-pid\n");
-    assert.equal(wakeup.dirLockOwnerAlive(lockDir), false);
+    assert.equal(wakeup.dirLockOwnerAlive(lockDir, operations), false);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -1522,12 +1900,15 @@ test("preserveLiveOwner lock steals an orphaned (dead-owner) lock immediately", 
   const lockDir = path.join(dir, ".daemon-heal.lock");
   try {
     // Orphan: lock dir whose recorded owner is a long-dead process.
-    const child = require("node:child_process").spawnSync("/usr/bin/true");
     fs.mkdirSync(lockDir);
-    fs.writeFileSync(path.join(lockDir, "pid"), `${child.pid}\nnow\ndead-owner-identity\n`);
+    fs.writeFileSync(path.join(lockDir, "pid"), "999999\nnow\ndead-owner-identity\n");
 
     let ran = false;
-    await wakeup.withDirLock(lockDir, async () => { ran = true; }, { waitMs: 0, preserveLiveOwner: true });
+    await wakeup.withDirLock(lockDir, async () => { ran = true; }, {
+      waitMs: 0,
+      preserveLiveOwner: true,
+      dirLockOwnerAlive: () => false,
+    });
     assert.equal(ran, true);
     // Lock reaped after the run.
     assert.equal(fs.existsSync(lockDir), false);
@@ -1536,7 +1917,11 @@ test("preserveLiveOwner lock steals an orphaned (dead-owner) lock immediately", 
     // acquire, not an orphan — it must NOT be stolen (acquire grace).
     fs.mkdirSync(lockDir);
     await assert.rejects(
-      wakeup.withDirLock(lockDir, async () => {}, { waitMs: 0, preserveLiveOwner: true }),
+      wakeup.withDirLock(lockDir, async () => {}, {
+        waitMs: 0,
+        preserveLiveOwner: true,
+        dirLockOwnerAlive: () => { throw new Error("acquire grace should avoid owner probe"); },
+      }),
       (error) => error && error.message === "lock_busy"
     );
     assert.equal(fs.existsSync(lockDir), true);
@@ -1544,11 +1929,14 @@ test("preserveLiveOwner lock steals an orphaned (dead-owner) lock immediately", 
 
     // A LIVE owner is never stolen: re-create the lock as ourselves and
     // expect lock_busy under waitMs 0.
-    const identity = wakeup.processStartIdentity(process.pid);
     fs.mkdirSync(lockDir);
-    fs.writeFileSync(path.join(lockDir, "pid"), `${process.pid}\nnow\n${identity}\n`);
+    fs.writeFileSync(path.join(lockDir, "pid"), `${process.pid}\nnow\nmock-current-process-generation\n`);
     await assert.rejects(
-      wakeup.withDirLock(lockDir, async () => {}, { waitMs: 0, preserveLiveOwner: true }),
+      wakeup.withDirLock(lockDir, async () => {}, {
+        waitMs: 0,
+        preserveLiveOwner: true,
+        dirLockOwnerAlive: () => true,
+      }),
       (error) => error && error.message === "lock_busy"
     );
     assert.equal(fs.existsSync(lockDir), true);

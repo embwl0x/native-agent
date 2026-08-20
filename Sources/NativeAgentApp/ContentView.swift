@@ -19,6 +19,8 @@ import CloudKit
 // PATCH-2026-05-06: ui-consolidation — default selection chat, 5 visible + Advanced disclosure sidebar
 // PATCH-2026-05-10: startup-tour-gate — tour is manual only; startup must not block chat.
 struct ContentView: View {
+    // Liquid Feel W4: page-switch transition respects Reduce Motion.
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(AppModel.self) private var appModel
     @Environment(\.scenePhase) private var scenePhase
     @SceneStorage("selection") private var selectionRaw = SidebarItem.chat.rawValue
@@ -127,6 +129,9 @@ struct ContentView: View {
                             Label("Advanced", systemImage: "chevron.right.2")
                                 .foregroundStyle(.secondary)
                                 .togglesDisclosure($showAdvanced)
+                                .padding(.vertical, 2)
+                                .contentShape(Rectangle())
+                                .naInteractive(radius: NativeAgentRadius.control)
                         }
                     }
                 }
@@ -209,6 +214,23 @@ struct ContentView: View {
                         EmptyView()  // unreachable: .normalized routes these above
                     }
                 }
+                // Liquid Feel W4: pages settle in instead of hard-cutting.
+                // id() gives each page distinct identity so the transition
+                // fires on switch; state within a page is untouched while
+                // its selection is stable.
+                .id(selection.wrappedValue.normalized)
+                .transition(
+                    reduceMotion
+                        ? .opacity
+                        : .asymmetric(
+                            insertion: .opacity.combined(with: .offset(y: 8)),
+                            removal: .opacity
+                        )
+                )
+                .animation(
+                    NativeAgentMotion.respecting(NativeAgentMotion.gentle, reduceMotion: reduceMotion),
+                    value: selection.wrappedValue.normalized
+                )
                 .task(id: "\(selectionRaw)|\(skillsToolsSectionRaw)") {
                     let item = activeContentItem
                     if item.normalized == .activity {
@@ -509,6 +531,12 @@ private struct SidebarItemLabel: View {
                     .help("Activity count is unavailable because the last refresh failed.")
             }
         }
+        // Liquid Feel (User 2026-08-17, "the tabs... no love?"): macOS sidebars
+        // paint SELECTION natively but never hover — the roll-over feel is
+        // ours to add. Rides the label so the native selection tint stays.
+        .padding(.vertical, 2)
+        .contentShape(Rectangle())
+        .naInteractive(radius: NativeAgentRadius.control)
     }
 }
 

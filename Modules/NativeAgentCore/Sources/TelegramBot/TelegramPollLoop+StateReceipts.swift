@@ -349,14 +349,14 @@ extension TelegramPollLoop {
     /// created, send a new message. Both paths persist the same receipt.
     func deliverDraftOrSendNotice(
         _ notice: String,
-        draft: TelegramDraftStreamer,
+        delivery: TelegramAssistantDeliveryDriver,
         receiptKind: String,
         sendErrorContext: String,
         update: TelegramUpdate,
         message: TelegramMessage,
         text: String
     ) async {
-        if await draft.abortDelivering(notice: notice) {
+        if await delivery.abortDelivering(notice: notice) {
             await recordReceipt(
                 kind: receiptKind,
                 update: update,

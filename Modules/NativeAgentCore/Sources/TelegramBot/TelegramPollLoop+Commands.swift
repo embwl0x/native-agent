@@ -32,11 +32,33 @@ extension TelegramPollLoop {
 
         switch parsed.definition.handler {
         case .stop:
-            let cancelled = await turnCoordinator.cancelTurn(chatId: message.chatId)
-            let reply = cancelled
-                ? "Stopping the current Telegram turn."
-                : "No Telegram turn is running for this chat."
-            await sendCommandReply(reply, kind: "slash_reply", update: update, message: message, text: text)
+            let outcome = await requestLiveTurnStop(chatId: message.chatId)
+            switch outcome {
+            case .confirmed:
+                await recordReceipt(
+                    kind: "slash_stop_confirmed",
+                    update: update,
+                    message: message,
+                    text: text,
+                    reply: "Telegram turn canceled"
+                )
+            case .outcomeUnknown:
+                await recordReceipt(
+                    kind: "slash_stop_outcome_unknown",
+                    update: update,
+                    message: message,
+                    text: text,
+                    reply: "Telegram turn cancellation could not be confirmed"
+                )
+            case .notRunning:
+                await sendCommandReply(
+                    "No Telegram turn is running for this chat.",
+                    kind: "slash_reply",
+                    update: update,
+                    message: message,
+                    text: text
+                )
+            }
             return true
 
         case .retry:
@@ -52,8 +74,18 @@ extension TelegramPollLoop {
             return true
 
         case .status:
-            let reply = await buildStatusReply(chatId: message.chatId)
-            await sendCommandReply(reply, kind: "slash_reply", update: update, message: message, text: text)
+            if await refreshLiveTurnCard(chatId: message.chatId) {
+                await recordReceipt(
+                    kind: "slash_status_card_refresh",
+                    update: update,
+                    message: message,
+                    text: text,
+                    reply: "Telegram work card refreshed"
+                )
+            } else {
+                let reply = await buildStatusReply(chatId: message.chatId)
+                await sendCommandReply(reply, kind: "slash_reply", update: update, message: message, text: text)
+            }
             return true
 
         case .model where parsed.args.isEmpty:
@@ -325,13 +357,19 @@ extension TelegramPollLoop {
             return
         }
 
-        guard let started = await turnCoordinator.startTurn(
+        guard await turnCoordinator.startTrackedTurn(
             chatId: message.chatId,
             text: last.text,
-            operation: {
-                await runRetryTurn(update: update, message: message, commandText: text, retryText: last.text)
+            operation: { turnId in
+                await runRetryTurn(
+                    turnId: turnId,
+                    update: update,
+                    message: message,
+                    commandText: text,
+                    retryText: last.text
+                )
             }
-        ) else {
+        ) != nil else {
             await sendCommandReply(
                 "A Telegram turn is already running for this chat. Use /stop before retrying.",
                 kind: "retry_busy",
@@ -341,27 +379,43 @@ extension TelegramPollLoop {
             )
             return
         }
-        await started.task.value
-        await turnCoordinator.finishTurn(chatId: message.chatId, turnId: started.id)
     }
 
     private func runRetryTurn(
+        turnId: UUID,
         update: TelegramUpdate,
         message: TelegramMessage,
         commandText: String,
         retryText: String
     ) async {
-        let draft = TelegramDraftStreamer(
-            token: token,
+        let card = makeTurnProgressCard(
             chatId: message.chatId,
-            editIntervalSeconds: draftEditIntervalSeconds,
-            sendReturningId: sendMessageReturningId,
-            editMessage: editMessageText
+            turnId: turnId,
+            errorContext: "retry_turn_card",
+            update: update,
+            message: message,
+            text: commandText
+        )
+        guard await turnCoordinator.attachCard(
+            card,
+            chatId: message.chatId,
+            turnId: turnId
+        ) else { return }
+        await card.start()
+        await card.transition(.working(action: nil))
+        await card.transition(.retrying(action: "Retrying the last message"))
+        let delivery = makeAssistantDelivery(
+            chatId: message.chatId,
+            turnId: turnId,
+            errorContext: "retry_assistant_delivery",
+            update: update,
+            message: message,
+            text: commandText
         )
         do {
             let typingTask = await startTypingHeartbeat(chatId: message.chatId)
             defer { typingTask?.cancel() }
-            let progress = makeProgressSink(chatId: message.chatId, draft: draft)
+            let progress = makeProgressSink(delivery: delivery, card: card)
             let generatedImages = TelegramGeneratedImageCollector()
             let capturingProgress: TelegramChatProgressSink = { event in
                 await generatedImages.record(event)
@@ -378,26 +432,46 @@ extension TelegramPollLoop {
             )
             try Task.checkCancellation()
             if !reply.isEmpty {
-                for chunk in await draft.finalize(reply: reply) {
-                    try await sendMessage(token, message.chatId, chunk)
-                }
-                let imagePaths = await generatedImages.snapshot()
-                for imagePath in imagePaths {
-                    do {
-                        try await sendChatAction(token, message.chatId, "upload_photo")
-                        try await sendPhoto(token, message.chatId, imagePath, nil)
-                    } catch {
-                        FileHandle.standardError.write(Data("TelegramPollLoop: generated image send failed for retry update \(update.updateId): \(Self._tgRedactToken(String(describing: error)))\n".utf8))
-                        await recordError(context: "send_generated_image", error: String(describing: error), update: update, message: message, text: commandText)
+                let deliveryOutcome = await delivery.finalize(reply: reply)
+                switch deliveryOutcome {
+                case .delivered:
+                    let imagePaths = await generatedImages.snapshot()
+                    switch await deliverGeneratedImages(
+                        imagePaths,
+                        chatId: message.chatId,
+                        errorContext: "send_generated_image",
+                        update: update,
+                        message: message,
+                        text: commandText
+                    ) {
+                    case .delivered:
+                        await recordReceipt(kind: "retry_reply", update: update, message: message, text: commandText, reply: reply)
+                        await card.transition(.completed(summary: "Reply delivered"))
+                    case .failed(let reason):
+                        await card.transition(.failed(
+                            reason: "Reply text delivered, but generated media failed: \(reason)"
+                        ))
+                    case .outcomeUnknown(let reason):
+                        await card.transition(.outcomeUnknown(
+                            reason: "Reply text delivered; generated media delivery could not be confirmed: \(reason)"
+                        ))
                     }
+                case .failed(let reason):
+                    await recordError(context: "send_retry_reply", error: reason, update: update, message: message, text: commandText)
+                    await card.transition(.failed(reason: "Reply delivery failed: \(reason)"))
+                case .outcomeUnknown(let reason):
+                    await recordError(context: "send_retry_reply_outcome_unknown", error: reason, update: update, message: message, text: commandText)
+                    await card.transition(.outcomeUnknown(
+                        reason: "Reply delivery could not be confirmed: \(reason)"
+                    ))
                 }
-                await recordReceipt(kind: "retry_reply", update: update, message: message, text: commandText, reply: reply)
             } else {
                 let notice = "(the retry came back empty - check the Mac error log)"
                 await recordError(context: "empty_retry", error: "chat handler returned empty output", update: update, message: message, text: commandText)
+                await card.transition(.failed(reason: "The retry came back empty"))
                 await deliverDraftOrSendNotice(
                     notice,
-                    draft: draft,
+                    delivery: delivery,
                     receiptKind: "empty_retry_notice",
                     sendErrorContext: "send_empty_retry_notice",
                     update: update,
@@ -407,21 +481,24 @@ extension TelegramPollLoop {
             }
         } catch is CancellationError {
             let notice = "(Telegram turn stopped.)"
-            if await draft.abortDelivering(notice: notice) {
+            await card.transition(.canceled(reason: "Stopped by user"))
+            if await delivery.abortDelivering(notice: notice) {
                 await recordReceipt(kind: "stopped_notice", update: update, message: message, text: commandText, reply: notice)
             } else {
-                do {
-                    try await sendMessage(token, message.chatId, notice)
-                    await recordReceipt(kind: "stopped_notice", update: update, message: message, text: commandText, reply: notice)
-                } catch {
-                    await recordError(context: "send_stop_notice", error: String(describing: error), update: update, message: message, text: commandText)
-                }
+                await recordReceipt(kind: "turn_canceled", update: update, message: message, text: commandText, reply: notice)
             }
         } catch {
             FileHandle.standardError.write(Data("TelegramPollLoop: retry chat handler failed for update \(update.updateId): \(Self._tgRedactToken(String(describing: error)))\n".utf8))
-            await recordError(context: "retry_chat_handler", error: String(describing: error), update: update, message: message, text: commandText)
+            await recordError(
+                context: "retry_chat_handler",
+                error: String(describing: error),
+                update: update,
+                message: message,
+                text: commandText
+            )
+            await card.transition(.failed(reason: String(describing: error)))
             let notice = Self.chatErrorNotice(for: error)
-            if await draft.abortDelivering(notice: notice) {
+            if await delivery.abortDelivering(notice: notice) {
                 await recordReceipt(kind: "error_notice", update: update, message: message, text: commandText, reply: notice)
             } else {
                 do {

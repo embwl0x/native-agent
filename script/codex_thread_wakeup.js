@@ -21,12 +21,16 @@ const QUEUE_LOCK_DIR = process.env.NATIVE_AGENT_CODEX_PENDING_LOCK ||
   path.join(BRIDGE_DIR, ".pending-wakeups.lock");
 const DRAIN_LOCK_DIR = process.env.NATIVE_AGENT_CODEX_DRAIN_LOCK ||
   path.join(BRIDGE_DIR, ".pending-wakeups-drain.lock");
+const DRAINER_HEARTBEAT_PATH = process.env.NATIVE_AGENT_CODEX_DRAINER_HEARTBEAT_PATH ||
+  path.join(BRIDGE_DIR, "drainer-heartbeat.jsonl");
 const INBOX_LOCK_DIR = process.env.NATIVE_AGENT_CODEX_INBOX_LOCK ||
   path.join(BRIDGE_DIR, ".codex-inbox.lock");
 const REPLY_JOBS_DIR = process.env.NATIVE_AGENT_CODEX_REPLY_JOBS_DIR ||
   path.join(BRIDGE_DIR, "reply-jobs");
 const REPLY_DELIVERIES_PATH = process.env.NATIVE_AGENT_CODEX_REPLY_DELIVERIES_PATH ||
   path.join(BRIDGE_DIR, "reply-deliveries.jsonl");
+const HANG_WATCHDOG_RECEIPTS_PATH = process.env.NATIVE_AGENT_CODEX_HANG_WATCHDOG_RECEIPTS_PATH ||
+  path.join(BRIDGE_DIR, "hang-watchdog.jsonl");
 const REPLY_RECOVERY_LOCK_DIR = process.env.NATIVE_AGENT_CODEX_REPLY_RECOVERY_LOCK ||
   path.join(BRIDGE_DIR, ".reply-jobs-recovery.lock");
 const BRIDGE_TOKEN_PATH = path.join(os.homedir(), ".config", "claude-bridge", "token");
@@ -141,20 +145,22 @@ function currentProcessStartIdentity() {
 /// error in the read/kill/identity chain resolves via the EPERM test, so an
 /// unreadable-but-permission-denied pid file conservatively reads as alive,
 /// while a missing or garbage pid file reads as dead.
-function dirLockOwnerAlive(lockDir) {
+function dirLockOwnerAlive(lockDir, operations = {}) {
+  const signal = operations.kill || ((pid, name) => process.kill(pid, name));
+  const identity = operations.processStartIdentity || processStartIdentity;
   let ownerAlive = false;
   try {
     const ownerFields = fs.readFileSync(path.join(lockDir, "pid"), "utf8").split("\n");
     const ownerPID = Number(ownerFields[0]);
     if (Number.isInteger(ownerPID) && ownerPID > 0) {
-      process.kill(ownerPID, 0);
+      signal(ownerPID, 0);
       ownerAlive = true;
       // A live process with a different start identity means the PID was
       // reused after the original lock owner died. Legacy locks without an
       // identity retain the conservative old behavior.
       const recordedIdentity = ownerFields[2] || null;
       if (recordedIdentity) {
-        ownerAlive = processStartIdentity(ownerPID) === recordedIdentity;
+        ownerAlive = identity(ownerPID) === recordedIdentity;
       }
     }
   } catch (ownerError) {
@@ -183,6 +189,13 @@ function numberSetting(config, key, envName, fallback) {
   const raw = env != null ? env : config[key];
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function nonnegativeIntegerSetting(config, key, envName, fallback) {
+  const env = process.env[envName];
+  const raw = env != null ? env : config[key];
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 0 ? n : fallback;
 }
 
 function stringSetting(config, key, envName, fallback) {
@@ -306,6 +319,16 @@ function socketOwnerPid() {
   return Number.isFinite(pid) && pid > 1 ? pid : null;
 }
 
+function captureAppServerIdentity() {
+  const pid = socketOwnerPid();
+  if (pid == null) return null;
+  return {
+    pid,
+    startIdentity: processStartIdentity(pid),
+    socketPath: SOCKET_PATH,
+  };
+}
+
 function parseLsofWorkingDirectory(output) {
   let pid = null;
   let inode = null;
@@ -383,8 +406,8 @@ function pidAlive(pid) {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    return Boolean(error && error.code === "EPERM");
   }
 }
 
@@ -1075,7 +1098,10 @@ function findThreadRolloutPath(threadId, config, options = {}) {
 function readLocalRolloutState(threadId, config) {
   const rolloutPath = findThreadRolloutPath(threadId, config);
   if (!rolloutPath) return null;
-  const activeStaleMs = numberSetting(config, "activeStaleMs", "NATIVE_AGENT_CODEX_ACTIVE_STALE_MS", 6 * 60 * 60 * 1000);
+  // A hung turn's signature is a rollout file that stops being written mid-flight.
+  // Liveness is judged by last write (file mtime), not turn start, so long healthy
+  // turns stay active while a frozen one goes stale after ~10 minutes.
+  const activeStaleMs = numberSetting(config, "activeStaleMs", "NATIVE_AGENT_CODEX_ACTIVE_STALE_MS", 10 * 60 * 1000);
   let text;
   try {
     text = fs.readFileSync(rolloutPath, "utf8");
@@ -1113,8 +1139,13 @@ function readLocalRolloutState(threadId, config) {
   }
 
   const freshOpenTurns = [...openTurns.values()].filter((turn) => {
-    if (!turn.startedAtMs) return true;
-    return Date.now() - turn.startedAtMs < activeStaleMs;
+    let rolloutMtimeMs = 0;
+    try {
+      rolloutMtimeMs = fs.statSync(rolloutPath).mtimeMs;
+    } catch {}
+    const lastSignalMs = Math.max(turn.startedAtMs || 0, rolloutMtimeMs);
+    if (!lastSignalMs) return true;
+    return Date.now() - lastSignalMs < activeStaleMs;
   });
   return {
     threadId,
@@ -1148,20 +1179,45 @@ function combineThreadStates(primary, secondary) {
   };
 }
 
+function stateExcludingDeclaredHungTurn(state, entry) {
+  const retryCount = Number(entry && entry.hangRetryCount || 0);
+  const hungTurnId = entry && entry.hungTurnId;
+  if (!state || retryCount <= 0 || !hungTurnId) return state;
+  const inProgressTurnIds = (state.inProgressTurnIds || []).filter((id) => id !== hungTurnId);
+  return {
+    ...state,
+    active: inProgressTurnIds.length > 0,
+    statusType: inProgressTurnIds.length > 0 ? state.statusType : "idle",
+    inProgressTurnIds,
+  };
+}
+
 function clientUserMessageIdForEntries(entries) {
+  const retryCount = Math.max(0, ...entries.map((entry) => Number(entry && entry.hangRetryCount || 0)));
+  const retrySuffix = retryCount > 0 ? `-hang-retry-${retryCount}` : "";
   if (entries.length === 1) {
     const messageId = entries[0].payload.messageId || entries[0].id || crypto.randomUUID();
-    return `nativeagent-codex-${messageId}`;
+    return `nativeagent-codex-${messageId}${retrySuffix}`;
   }
   const key = entries
     .map((entry) => entry.payload.messageId || entry.id || "")
     .join("|");
-  return `nativeagent-codex-batch-${crypto.createHash("sha256").update(key).digest("hex").slice(0, 24)}`;
+  return `nativeagent-codex-batch-${crypto.createHash("sha256").update(key).digest("hex").slice(0, 24)}${retrySuffix}`;
 }
 
-async function startTurnForEntries(client, threadId, entries, config, respectActive = true) {
+async function startTurnForEntries(
+  client,
+  threadId,
+  entries,
+  config,
+  respectActive = true,
+  ignoredActiveTurnId = null
+) {
   const resume = await client.request("thread/resume", { threadId });
-  const resumeState = threadStateFromThread(resume && resume.thread, threadId);
+  const resumeState = stateExcludingDeclaredHungTurn(
+    threadStateFromThread(resume && resume.thread, threadId),
+    ignoredActiveTurnId ? { hangRetryCount: 1, hungTurnId: ignoredActiveTurnId } : null
+  );
   if (isUnhealthyThreadState(resumeState)) {
     return unhealthyThreadResult(threadId, resumeState, { delivery: "codex_app_server_resume" });
   }
@@ -1278,7 +1334,7 @@ function executionPolicyForEntries(entries, config) {
     config,
     "sandbox",
     "NATIVE_AGENT_CODEX_WAKEUP_SANDBOX",
-    "workspace-write",
+    "danger-full-access",
     new Set(["read-only", "workspace-write", "danger-full-access"])
   );
   const trustedGitHubCwd = trustedGitHubCommandWorkingDirectory(entries);
@@ -1286,11 +1342,9 @@ function executionPolicyForEntries(entries, config) {
     const writableRoots = repositoryWritableRoots(trustedGitHubCwd);
     return {
       cwd: trustedGitHubCwd,
-      sandbox: "workspace-write",
+      sandbox: "danger-full-access",
       sandboxPolicy: {
-        type: "workspaceWrite",
-        writableRoots,
-        networkAccess: true,
+        type: "dangerFullAccess",
       },
       executionProfile: GITHUB_COMMAND_EXECUTION_PROFILE,
       networkAccess: true,
@@ -1457,6 +1511,7 @@ async function withDirLock(lockDir, fn, options = {}) {
   const waitMs = options.waitMs == null ? 2000 : options.waitMs;
   const staleMs = options.staleMs == null ? 10 * 60 * 1000 : options.staleMs;
   const preserveLiveOwner = options.preserveLiveOwner === true;
+  const ownerAlive = options.dirLockOwnerAlive || dirLockOwnerAlive;
   const deadline = Date.now() + waitMs;
   while (true) {
     try {
@@ -1482,7 +1537,7 @@ async function withDirLock(lockDir, fn, options = {}) {
             // lock ages past it immediately.
             const pidMissing = !fs.existsSync(path.join(lockDir, "pid"));
             const withinAcquireGrace = pidMissing && Date.now() - stat.mtimeMs < 2000;
-            if (!withinAcquireGrace && !dirLockOwnerAlive(lockDir)) {
+            if (!withinAcquireGrace && !ownerAlive(lockDir)) {
               fs.rmSync(lockDir, { recursive: true, force: true });
               continue;
             }
@@ -1602,6 +1657,159 @@ function writeTextAtomic(file, text) {
   }
 }
 
+function readJSONLines(file) {
+  try {
+    return fs.readFileSync(file, "utf8")
+      .split("\n")
+      .filter((line) => line.trim() !== "")
+      .flatMap((line) => {
+        try { return [JSON.parse(line)]; } catch { return []; }
+      });
+  } catch {
+    return [];
+  }
+}
+
+function appendJSONLineAtomicUnlocked(file, record) {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const lines = readJSONLines(file)
+    .slice(-4999)
+    .map((row) => JSON.stringify(row));
+  lines.push(JSON.stringify(record));
+  writeTextAtomic(file, `${lines.join("\n")}\n`);
+}
+
+function latestDrainerHeartbeat(file) {
+  const records = readJSONLines(file);
+  for (let index = records.length - 1; index >= 0; index -= 1) {
+    const row = records[index];
+    if (!row || row.action != null) continue;
+    if (!Number.isInteger(Number(row.pid)) || Number(row.pid) <= 0 || typeof row.timestamp !== "string") continue;
+    return row;
+  }
+  return null;
+}
+
+function createDrainerHeartbeat(config, options = {}) {
+  const heartbeatPath = stringSetting(
+    config,
+    "drainerHeartbeatPath",
+    "NATIVE_AGENT_CODEX_DRAINER_HEARTBEAT_PATH",
+    DRAINER_HEARTBEAT_PATH
+  );
+  const intervalMs = numberSetting(
+    config,
+    "drainerHeartbeatMs",
+    "NATIVE_AGENT_CODEX_DRAINER_HEARTBEAT_MS",
+    60 * 1000
+  );
+  const staleMs = numberSetting(
+    config,
+    "drainerHeartbeatStaleMs",
+    "NATIVE_AGENT_CODEX_DRAINER_HEARTBEAT_STALE_MS",
+    intervalMs * 3
+  );
+  const currentPID = Number(options.pid ?? process.pid);
+  const nowFn = options.now || Date.now;
+  const isPIDAlive = options.pidAlive || pidAlive;
+  const setIntervalFn = options.setInterval || setInterval;
+  const clearIntervalFn = options.clearInterval || clearInterval;
+  const heartbeatLock = `${heartbeatPath}.lock`;
+  const withHeartbeatLock = options.withLock || ((body) => withDirLock(
+    heartbeatLock,
+    body,
+    { waitMs: 2000, staleMs: staleMs, preserveLiveOwner: true }
+  ));
+  let queueDepth = 0;
+  let activeTurnId = null;
+  let timer = null;
+  let writeChain = Promise.resolve();
+  let lastWriteError = null;
+
+  function timestamp() {
+    return new Date(nowFn()).toISOString();
+  }
+
+  function heartbeatRecord() {
+    return {
+      pid: currentPID,
+      timestamp: timestamp(),
+      queueDepth,
+      activeTurnId,
+    };
+  }
+
+  async function append(record) {
+    await withHeartbeatLock(async () => appendJSONLineAtomicUnlocked(heartbeatPath, record));
+  }
+
+  function scheduleHeartbeat() {
+    writeChain = writeChain.then(async () => {
+      try {
+        await append(heartbeatRecord());
+        lastWriteError = null;
+      } catch (error) {
+        lastWriteError = error;
+      }
+    });
+    return writeChain;
+  }
+
+  return {
+    heartbeatPath,
+    intervalMs,
+    staleMs,
+    update(nextQueueDepth, nextActiveTurnId = null) {
+      const depth = Number(nextQueueDepth);
+      queueDepth = Number.isInteger(depth) && depth >= 0 ? depth : queueDepth;
+      activeTurnId = typeof nextActiveTurnId === "string" && nextActiveTurnId
+        ? nextActiveTurnId
+        : null;
+    },
+    async start() {
+      const decision = await withHeartbeatLock(async () => {
+        const prior = latestDrainerHeartbeat(heartbeatPath);
+        if (prior) {
+          const priorTimestamp = Date.parse(prior.timestamp);
+          const ageMs = Number.isFinite(priorTimestamp) ? Math.max(0, nowFn() - priorTimestamp) : Infinity;
+          if (ageMs < staleMs) {
+            const priorPID = Number(prior.pid);
+            if (isPIDAlive(priorPID)) {
+              const receipt = {
+                ...heartbeatRecord(),
+                action: "live_pid_refusal",
+                priorPid: priorPID,
+              };
+              appendJSONLineAtomicUnlocked(heartbeatPath, receipt);
+              return { status: "refused", reason: "live_drainer_heartbeat", prior, receipt };
+            }
+            appendJSONLineAtomicUnlocked(heartbeatPath, {
+              ...heartbeatRecord(),
+              action: "dead_pid_takeover",
+              priorPid: priorPID,
+            });
+          }
+        }
+        const receipt = heartbeatRecord();
+        appendJSONLineAtomicUnlocked(heartbeatPath, receipt);
+        return { status: "started", prior, receipt };
+      });
+      if (decision.status === "started") {
+        timer = setIntervalFn(() => scheduleHeartbeat(), intervalMs);
+        if (timer && typeof timer.unref === "function") timer.unref();
+      }
+      return { ...decision, heartbeatPath, intervalMs, staleMs };
+    },
+    pulse: scheduleHeartbeat,
+    async stop() {
+      if (timer != null) clearIntervalFn(timer);
+      timer = null;
+      await writeChain;
+      return { status: lastWriteError ? "failed" : "stopped", error: lastWriteError || null };
+    },
+  };
+}
+
 async function appendReplyDeliveryReceipt(receipt) {
   const lockDir = `${REPLY_DELIVERIES_PATH}.append.lock`;
   await withDirLock(lockDir, async () => {
@@ -1619,6 +1827,194 @@ async function appendReplyDeliveryReceipt(receipt) {
     }
     writeTextAtomic(REPLY_DELIVERIES_PATH, `${lines.join("\n")}\n`);
   }, { waitMs: 10000, staleMs: 10 * 60 * 1000, preserveLiveOwner: true });
+}
+
+async function appendHangWatchdogReceipt(receipt, config) {
+  const receiptsPath = stringSetting(
+    config,
+    "hangWatchdogReceiptsPath",
+    "NATIVE_AGENT_CODEX_HANG_WATCHDOG_RECEIPTS_PATH",
+    HANG_WATCHDOG_RECEIPTS_PATH
+  );
+  fs.mkdirSync(path.dirname(receiptsPath), { recursive: true, mode: 0o700 });
+  await withDirLock(`${receiptsPath}.append.lock`, async () => {
+    appendJSONL(receiptsPath, receipt);
+  }, { waitMs: 10000, staleMs: 10 * 60 * 1000, preserveLiveOwner: true });
+  return receiptsPath;
+}
+
+async function waitForPIDExit(pid, timeoutMs, operations) {
+  const deadline = operations.now() + Math.max(0, timeoutMs);
+  do {
+    if (!operations.pidAlive(pid)) return true;
+    if (operations.now() >= deadline) break;
+    await operations.sleep(Math.min(100, Math.max(1, deadline - operations.now())));
+  } while (operations.now() <= deadline);
+  return !operations.pidAlive(pid);
+}
+
+async function terminateKnownHungAppServer(job, operations = {}) {
+  const known = job && job.appServer;
+  const pid = Number(known && known.pid);
+  if (!Number.isInteger(pid) || pid <= 1) {
+    return { action: "app_server_kill_skipped_no_known_pid", pidKilled: null };
+  }
+  const ownerPID = (operations.socketOwnerPid || socketOwnerPid)();
+  if (ownerPID !== pid) {
+    return { action: "app_server_kill_skipped_owner_mismatch", pidKilled: null };
+  }
+  const identity = operations.processStartIdentity || processStartIdentity;
+  if (known.startIdentity && identity(pid) !== known.startIdentity) {
+    return { action: "app_server_kill_skipped_identity_mismatch", pidKilled: null };
+  }
+  const ops = {
+    now: operations.now || Date.now,
+    sleep: operations.sleep || sleep,
+    pidAlive: operations.pidAlive || pidAlive,
+  };
+  const signal = operations.kill || ((target, name) => process.kill(target, name));
+  try {
+    signal(pid, "SIGTERM");
+  } catch (error) {
+    return {
+      action: "app_server_kill_failed",
+      pidKilled: null,
+      error: redactDiagnosticText(String(error && error.message || error)).slice(0, 500),
+    };
+  }
+  if (await waitForPIDExit(pid, operations.termWaitMs ?? 3000, ops)) {
+    return { action: "app_server_killed", pidKilled: pid };
+  }
+  try {
+    signal(pid, "SIGKILL");
+  } catch (error) {
+    return {
+      action: "app_server_kill_failed",
+      pidKilled: null,
+      error: redactDiagnosticText(String(error && error.message || error)).slice(0, 500),
+    };
+  }
+  if (await waitForPIDExit(pid, operations.killWaitMs ?? 2000, ops)) {
+    return { action: "app_server_killed", pidKilled: pid };
+  }
+  return { action: "app_server_kill_failed_still_alive", pidKilled: null };
+}
+
+function clearStaleDrainLock(lockDir = DRAIN_LOCK_DIR, operations = {}) {
+  if (!fs.existsSync(lockDir)) {
+    return { action: "drain_lock_absent", pidKilled: null };
+  }
+  const ownerAlive = operations.dirLockOwnerAlive || dirLockOwnerAlive;
+  if (ownerAlive(lockDir)) {
+    return { action: "drain_lock_preserved_live_owner", pidKilled: null };
+  }
+  try {
+    fs.rmSync(lockDir, { recursive: true, force: true });
+    return { action: "stale_drain_lock_cleared", pidKilled: null };
+  } catch (error) {
+    return {
+      action: "stale_drain_lock_clear_failed",
+      pidKilled: null,
+      error: redactDiagnosticText(String(error && error.message || error)).slice(0, 500),
+    };
+  }
+}
+
+function respawnAppServerAfterHang(operations = {}) {
+  const owner = operations.socketOwnerPid || socketOwnerPid;
+  const existingPID = owner();
+  if (existingPID != null) {
+    return { action: "app_server_respawn_skipped_live_owner", pidKilled: null };
+  }
+  (operations.removeStaleSocket || removeStaleSocket)();
+  (operations.startDaemon || startDaemon)();
+  const restartedPID = owner();
+  return {
+    action: restartedPID == null ? "app_server_respawn_failed" : "app_server_respawned",
+    pidKilled: null,
+  };
+}
+
+async function recoverHungTurn(job, execution, config, options = {}) {
+  if (!execution || !execution.turnResult || execution.turnResult.status !== "failed_hung") {
+    return { status: "not_hung", retryCount: Number(job && job.hangRetryCount || 0) };
+  }
+  const retryCount = Math.max(0, Number(job && job.hangRetryCount || 0));
+  if (!boolSetting(config, "hangAutoRecover", "NATIVE_AGENT_CODEX_HANG_AUTORECOVER", true)) {
+    return { status: "disabled", retryCount };
+  }
+  const maxRetries = nonnegativeIntegerSetting(
+    config,
+    "hangMaxRetries",
+    "NATIVE_AGENT_CODEX_HANG_MAX_RETRIES",
+    1
+  );
+  const turnId = execution.turnId || job.turnId;
+  const nowFn = options.now || Date.now;
+  const writeReceipt = options.appendReceipt || appendHangWatchdogReceipt;
+  const receipts = [];
+  async function record(result) {
+    const receipt = {
+      turnId,
+      action: result.action,
+      pidKilled: result.pidKilled ?? null,
+      retryCount: result.retryCount ?? retryCount,
+      timestamp: new Date(nowFn()).toISOString(),
+    };
+    await writeReceipt(receipt, config);
+    receipts.push(receipt);
+    return result;
+  }
+
+  const processOperations = options.processOperations || {};
+  const killed = await record(await terminateKnownHungAppServer(job, processOperations));
+  const lock = await record(clearStaleDrainLock(options.drainLockDir || DRAIN_LOCK_DIR, {
+    dirLockOwnerAlive: options.dirLockOwnerAlive,
+  }));
+  const respawn = await record(respawnAppServerAfterHang(processOperations));
+
+  if (retryCount >= maxRetries) {
+    await record({ action: "hang_retry_cap_reached", pidKilled: null });
+    return { status: "permanent_failed_hung", retryCount, maxRetries, killed, lock, respawn, receipts };
+  }
+
+  const append = options.appendPending || appendPending;
+  const nextRetryCount = retryCount + 1;
+  const queued = [];
+  try {
+    for (const entry of Array.isArray(job.entries) ? job.entries : []) {
+      queued.push(await append(entry.payload || {}, job.threadId, {
+        hangRetryCount: nextRetryCount,
+        hungTurnId: turnId,
+      }));
+    }
+    if (queued.length === 0) throw new Error("hang_retry_entries_missing");
+  } catch (error) {
+    await record({ action: "hang_retry_requeue_failed", pidKilled: null });
+    return {
+      status: "permanent_failed_hung",
+      retryCount,
+      maxRetries,
+      killed,
+      lock,
+      respawn,
+      receipts,
+      error: redactDiagnosticText(String(error && error.message || error)).slice(0, 500),
+    };
+  }
+  const drain = (options.startDrainProcess || startDrainProcess)(config);
+  await record({ action: "hung_wake_job_requeued", pidKilled: null, retryCount: nextRetryCount });
+  return {
+    status: "requeued",
+    retryCount: nextRetryCount,
+    maxRetries,
+    killed,
+    lock,
+    respawn,
+    queued,
+    drain,
+    receipts,
+  };
 }
 
 function summarizeExecutionAttempts(attempts) {
@@ -1761,13 +2157,22 @@ async function markInboxConsumed(entries, sent) {
   };
 }
 
-async function appendPending(payload, threadId) {
+async function appendPending(payload, threadId, options = {}) {
   const cleanPayload = sanitizePayload(payload);
   const key = pendingKey(cleanPayload, threadId);
+  const requestedRetryCount = Number(options.hangRetryCount);
+  const hangRetryCount = Number.isInteger(requestedRetryCount) && requestedRetryCount >= 0
+    ? requestedRetryCount
+    : 0;
   return await withDirLock(QUEUE_LOCK_DIR, async () => {
     const queue = readPendingUnlocked();
     const existing = queue.find((entry) => entry.key === key);
     if (existing) {
+      if (hangRetryCount > Number(existing.hangRetryCount || 0)) {
+        existing.hangRetryCount = hangRetryCount;
+        if (options.hungTurnId) existing.hungTurnId = String(options.hungTurnId);
+        writePendingUnlocked(queue);
+      }
       return {
         entry: existing,
         alreadyQueued: true,
@@ -1781,6 +2186,8 @@ async function appendPending(payload, threadId) {
       payload: cleanPayload,
       addedAt: nowISO(),
       attempts: 0,
+      hangRetryCount,
+      ...(options.hungTurnId ? { hungTurnId: String(options.hungTurnId) } : {}),
     };
     queue.push(entry);
     writePendingUnlocked(queue);
@@ -1882,6 +2289,7 @@ function replyAdmissionJob(config, threadId, entries, priorTurnIds = [], options
   }
   const jobsDir = options.jobsDir || REPLY_JOBS_DIR;
   const clientUserMessageId = clientUserMessageIdForEntries(entries);
+  const hangRetryCount = Math.max(0, ...entries.map((entry) => Number(entry && entry.hangRetryCount || 0)));
   const id = stableUUID(`codex-reply:${threadId}:${clientUserMessageId}`);
   const jobPath = path.join(jobsDir, `${safeFilePart(clientUserMessageId)}-${safeFilePart(id)}.json`);
   return {
@@ -1894,10 +2302,12 @@ function replyAdmissionJob(config, threadId, entries, priorTurnIds = [], options
       threadId,
       turnId: null,
       clientUserMessageId,
+      hangRetryCount,
       priorTurnIds: [...new Set(priorTurnIds.filter(Boolean))],
       entries: entries.map((entry) => ({
         id: entry.id || null,
         key: entry.key || null,
+        hangRetryCount: Number(entry.hangRetryCount || 0),
         payload: sanitizePayload(entry.payload || {}),
       })),
     },
@@ -1968,6 +2378,7 @@ async function startTurnWithDurableReplyAdmission(
     }
     job.phase = "watching_turn";
     job.turnId = turn.id;
+    job.appServer = captureAppServerIdentity();
     job.boundAt = nowISO();
     writeJSONAtomic(reservation.jobPath, job);
     const watcher = await spawnJob(reservation.jobPath);
@@ -2001,9 +2412,12 @@ function startReplyWatcher(config, threadId, turnId, entries) {
       createdAt: nowISO(),
       threadId,
       turnId,
+      hangRetryCount: Math.max(0, ...entries.map((entry) => Number(entry && entry.hangRetryCount || 0))),
+      appServer: captureAppServerIdentity(),
       entries: entries.map((entry) => ({
         id: entry.id || null,
         key: entry.key || null,
+        hangRetryCount: Number(entry.hangRetryCount || 0),
         payload: sanitizePayload(entry.payload || {}),
       })),
     };
@@ -2891,6 +3305,12 @@ async function waitForDurableTerminalExecution(job, config, onTimeout, options =
   const snapshotFn = options.rolloutStallSnapshot || rolloutStallSnapshot;
   const probeFn = options.probeTurnLiveness || probeTurnLiveness;
   const nowFn = options.now || Date.now;
+  const hangWatchdogMs = numberSetting(
+    config,
+    "hangWatchdogMs",
+    "NATIVE_AGENT_CODEX_HANG_WATCHDOG_MS",
+    5 * 60 * 1000
+  );
   // Stall judging used to happen only at replyWaitTimeoutMs boundaries (1h), so
   // the earliest possible stalled verdict was ~2h and Agent saw dead turns sit
   // "in flight" indefinitely (2026-08-05 incident, turn
@@ -2922,8 +3342,18 @@ async function waitForDurableTerminalExecution(job, config, onTimeout, options =
     4 * 60 * 60 * 1000
   ));
   const judgingWindowMs = options.windowMs || stallIdleMs;
-  const waitOptions = { ...options, windowMs: judgingWindowMs };
   while (true) {
+    // Wake exactly when the currently visible rollout would cross the hang
+    // threshold. Rollout vnode edges still wake the inner waiter earlier; the
+    // post-wait stat below then observes the new mtime and rearms from it.
+    const beforeWait = snapshotFn(job.threadId, config);
+    const watchdogRemainingMs = beforeWait && Number.isFinite(beforeWait.mtimeMs)
+      ? Math.max(1, beforeWait.mtimeMs + hangWatchdogMs - nowFn())
+      : hangWatchdogMs;
+    const waitOptions = {
+      ...options,
+      windowMs: Math.min(judgingWindowMs, watchdogRemainingMs),
+    };
     const observed = await waitForTurnResultWithEmptyRetry(job, config, waitOptions);
     if (observed.turnResult.status !== "timeout") return observed;
 
@@ -2955,6 +3385,45 @@ async function waitForDurableTerminalExecution(job, config, onTimeout, options =
     const idleMs = currentSnapshot && Number.isFinite(currentSnapshot.mtimeMs)
       ? Math.max(0, nowFn() - currentSnapshot.mtimeMs)
       : null;
+    if (currentSnapshot && idleMs >= hangWatchdogMs) {
+      const activity = extractTurnResultFromRollout(
+        currentSnapshot.path,
+        observed.turnId,
+        { includeNonTerminal: true }
+      );
+      if (activity && activity.status === "in_flight" && activity.sawTurnStart) {
+        const declaredAt = new Date(nowFn()).toISOString();
+        const lastWriteAt = new Date(currentSnapshot.mtimeMs).toISOString();
+        const receipt = {
+          turnId: observed.turnId,
+          rolloutPath: currentSnapshot.path,
+          lastWriteAt,
+          declaredAt,
+        };
+        const receiptsPath = await appendHangWatchdogReceipt(receipt, config);
+        return {
+          ...observed,
+          turnResult: {
+            ...observed.turnResult,
+            status: "failed_hung",
+            reason: "failed-hung",
+            completedAt: declaredAt,
+            rolloutPath: currentSnapshot.path,
+            waitSource: "hang_watchdog",
+            errorMessage: `hang_watchdog: rollout unchanged for ${Math.round(idleMs)} ms`,
+            noWorkObserved: activity.toolActivityCount === 0 && !activity.hasMessage,
+            toolActivityCount: activity.toolActivityCount,
+            connectorDiagnostics: activity.connectorDiagnostics || null,
+            hangEvidence: {
+              ...receipt,
+              idleMs,
+              idleThresholdMs: hangWatchdogMs,
+              receiptsPath,
+            },
+          },
+        };
+      }
+    }
     const prior = job.stallProbe || null;
     let effectiveStagnant;
     if (!prior) {
@@ -3056,7 +3525,7 @@ function formatCodexReplyForNativeAgent(job, turnResult) {
     ? (entries.length > 1
       ? `Codex replied to ${entries.length} queued messages.`
       : "Codex replied to your message.")
-    : turnResult.status === "failed"
+    : turnResult.status === "failed" || turnResult.status === "failed_hung"
       ? (entries.length > 1
         ? `Codex wakeup failed for ${entries.length} queued messages.`
         : "Codex wakeup failed.")
@@ -3119,6 +3588,24 @@ function formatCodexReplyForNativeAgent(job, turnResult) {
       lines.push("The local record does not show whether any work executed before the stall. Treat partial work as possible: verify external state before resending.");
     }
     lines.push("NativeAgent did not automatically replay the request. Report the stall to User; retry only after an explicit decision.");
+  } else if (turnResult.status === "failed_hung") {
+    const ev = turnResult.hangEvidence || {};
+    const recovery = turnResult.hangRecovery || null;
+    const idleClause = ev.lastWriteAt
+      ? `Its rollout file stopped changing at ${ev.lastWriteAt}`
+        + (Number.isFinite(ev.idleMs) ? ` (${Math.round(ev.idleMs / 60000)} min idle).` : ".")
+      : "Its rollout file stopped changing during the active turn.";
+    lines.push(`NativeAgent's hang watchdog declared this Codex turn failed-hung. ${idleClause}`);
+    if (turnResult.noWorkObserved === true) {
+      lines.push("No tool or shell activity was recorded before the hang: the request never executed, so resending it cannot stomp partial work.");
+    } else {
+      lines.push("Partial work may exist on disk. Verify external state before resending.");
+    }
+    if (recovery && recovery.status === "permanent_failed_hung") {
+      lines.push(`NativeAgent's automatic recovery reached its retry cap (${recovery.retryCount}/${recovery.maxRetries}); this message will not be retried again.`);
+    } else {
+      lines.push("NativeAgent did not automatically replay the request.");
+    }
   } else if (turnResult.status === "failed") {
     lines.push("Codex's turn failed before a final reply landed.");
     const failureDetail = turnResult.errorMessage
@@ -3259,6 +3746,20 @@ async function deliverReplyJobUnlocked(jobPath, config) {
   } catch (error) {
     return quarantineReplyJob(jobPath, error);
   }
+  if (job.hangRecovery && job.hangRecovery.status === "requeued") {
+    try {
+      fs.unlinkSync(jobPath);
+      fsyncDirectorySync(path.dirname(jobPath));
+    } catch (error) {
+      if (!error || error.code !== "ENOENT") throw error;
+    }
+    return {
+      status: "requeued_after_hang",
+      reason: "hang_autorecovery_already_admitted",
+      jobPath,
+      retryCount: Number(job.hangRecovery.retryCount || 0),
+    };
+  }
   if (!job.turnId) {
     let admission;
     try {
@@ -3315,6 +3816,29 @@ async function deliverReplyJobUnlocked(jobPath, config) {
       writeJSONAtomic(jobPath, job);
     });
   }
+  if (!job.completedExecution && execution.turnResult.status === "failed_hung") {
+    const hangRecovery = await recoverHungTurn(job, execution, config);
+    execution.turnResult.hangRecovery = hangRecovery;
+    if (hangRecovery.status === "requeued") {
+      job.phase = "hang_requeued";
+      job.completedExecution = execution;
+      job.hangRecovery = hangRecovery;
+      delete job.lastWait;
+      delete job.stallProbe;
+      writeJSONAtomic(jobPath, job);
+      fs.unlinkSync(jobPath);
+      fsyncDirectorySync(path.dirname(jobPath));
+      return {
+        status: "requeued_after_hang",
+        reason: "hang_autorecovery",
+        jobPath,
+        threadId: execution.threadId,
+        turnId: execution.turnId,
+        retryCount: hangRecovery.retryCount,
+        drain: hangRecovery.drain,
+      };
+    }
+  }
   if (!job.completedExecution) {
     job.completedExecution = execution;
     delete job.lastWait;
@@ -3349,6 +3873,8 @@ async function deliverReplyJobUnlocked(jobPath, config) {
       codexErrorInfo: turnResult.codexErrorInfo || null,
       noWorkObserved: turnResult.noWorkObserved ?? null,
       stallEvidence: turnResult.stallEvidence || null,
+      hangEvidence: turnResult.hangEvidence || null,
+      hangRecovery: turnResult.hangRecovery || null,
       connectorDiagnostics: turnResult.connectorDiagnostics || null,
     },
   };
@@ -3397,6 +3923,8 @@ async function deliverReplyJobUnlocked(jobPath, config) {
       codexErrorInfo: turnResult.codexErrorInfo || null,
       noWorkObserved: turnResult.noWorkObserved ?? null,
       stallEvidence: turnResult.stallEvidence || null,
+      hangEvidence: turnResult.hangEvidence || null,
+      hangRecovery: turnResult.hangRecovery || null,
       connectorDiagnostics: turnResult.connectorDiagnostics || null,
       brain: turnResult.brain || null,
       messagePreview: (turnResult.message || "").slice(0, 1000),
@@ -3852,7 +4380,7 @@ async function requestFreshThreadTurnStart(payload, config) {
   }
 }
 
-async function drainPending(config) {
+async function drainPending(config, options = {}) {
   const timeoutMs = numberSetting(config, "requestTimeoutMs", "NATIVE_AGENT_CODEX_WAKEUP_REQUEST_TIMEOUT_MS", 12000);
   const drainTimeoutMs = numberSetting(config, "drainTimeoutMs", "NATIVE_AGENT_CODEX_DRAIN_TIMEOUT_MS", 30 * 60 * 1000);
   const failureRetryBaseMs = numberSetting(
@@ -3867,10 +4395,23 @@ async function drainPending(config) {
   let lastFailure = null;
   let lastReplyDelivery = null;
   let lastWakeSource = null;
+  const heartbeat = options.heartbeat || createDrainerHeartbeat(config, options.heartbeatOptions || {});
+  heartbeat.update(readPendingAtPath(PENDING_PATH).length, null);
+  const heartbeatStartup = await heartbeat.start();
+  if (heartbeatStartup.status === "refused") {
+    return {
+      status: "already_running",
+      reason: "live_drainer_heartbeat",
+      heartbeatPath: heartbeatStartup.heartbeatPath,
+      priorPid: heartbeatStartup.prior && heartbeatStartup.prior.pid || null,
+      receipt: heartbeatStartup.receipt,
+    };
+  }
 
   return await withDirLock(DRAIN_LOCK_DIR, async () => {
     while (Date.now() < deadline) {
       const queue = await withDirLock(QUEUE_LOCK_DIR, async () => readPendingUnlocked(), { waitMs: 2000 });
+      heartbeat.update(queue.length, null);
       if (queue.length === 0) {
         return { status: "drained", delivered, pendingCount: 0 };
       }
@@ -3881,15 +4422,22 @@ async function drainPending(config) {
       const busyStates = [];
       for (const entry of firstPendingPerThread(queue)) {
         try {
-          const localState = readLocalRolloutState(entry.threadId, config);
+          const localState = stateExcludingDeclaredHungTurn(
+            readLocalRolloutState(entry.threadId, config),
+            entry
+          );
           if (localState && localState.active) {
             lastBusy = localState;
             busyStates.push(localState);
+            heartbeat.update(queue.length, localState.inProgressTurnIds && localState.inProgressTurnIds[0] || null);
             continue;
           }
           const result = await withRpc(async (client) => {
             const rpcState = await readThreadState(client, entry.threadId);
-            const state = combineThreadStates(localState, rpcState);
+            const state = stateExcludingDeclaredHungTurn(
+              combineThreadStates(localState, rpcState),
+              entry
+            );
             if (isUnhealthyThreadState(state)) {
               return unhealthyThreadResult(entry.threadId, state, { delivery: "codex_app_server_thread_read" });
             }
@@ -3902,12 +4450,20 @@ async function drainPending(config) {
                 inProgressTurnIds: state.inProgressTurnIds,
               };
             }
-            return await startTurnForEntries(client, entry.threadId, [entry], config, true);
+            return await startTurnForEntries(
+              client,
+              entry.threadId,
+              [entry],
+              config,
+              true,
+              Number(entry.hangRetryCount || 0) > 0 ? entry.hungTurnId || null : null
+            );
           }, timeoutMs);
 
           if (result.status === "busy") {
             lastBusy = result;
             busyStates.push(result);
+            heartbeat.update(queue.length, result.inProgressTurnIds && result.inProgressTurnIds[0] || null);
             continue;
           }
           if (result.status === "sent") {
@@ -3916,6 +4472,7 @@ async function drainPending(config) {
             await removePending([entry.id]);
             delivered += 1;
             madeProgress = true;
+            heartbeat.update(Math.max(0, queue.length - 1), null);
             break;
           }
           lastFailure = result;
@@ -3947,6 +4504,7 @@ async function drainPending(config) {
     }
 
     const remaining = await withDirLock(QUEUE_LOCK_DIR, async () => readPendingUnlocked().length, { waitMs: 2000 });
+    heartbeat.update(remaining, lastBusy && lastBusy.inProgressTurnIds && lastBusy.inProgressTurnIds[0] || null);
     return {
       status: "pending",
       reason: "drain_timeout",
@@ -3958,7 +4516,7 @@ async function drainPending(config) {
       lastReplyDelivery,
       lastWakeSource,
     };
-  }, { waitMs: 0, staleMs: 60 * 60 * 1000 });
+  }, { waitMs: 0, staleMs: 60 * 60 * 1000, preserveLiveOwner: true }).finally(() => heartbeat.stop());
 }
 
 async function main() {
@@ -4112,6 +4670,7 @@ if (require.main === module) {
 module.exports = {
   attachConsumeAndReplyDelivery,
   brainControlsForEntries,
+  createDrainerHeartbeat,
   daemonVersionsMismatch,
   daemonWorkingDirectoryMismatch,
   daemonWorkingDirectoryState,
@@ -4140,6 +4699,7 @@ module.exports = {
   readCanonicalTurnResult,
   redactDiagnosticText,
   recoverReplyJobs,
+  recoverHungTurn,
   runCodexExecFallback,
   sanitizePayload,
   stableUUID,

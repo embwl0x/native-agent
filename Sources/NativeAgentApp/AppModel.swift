@@ -489,6 +489,15 @@ final class AppModel {
     var streamingSessions: Set<String> = []
     var chatTasks: [String: Task<Void, Never>] = [:]
     var chatTaskGenerations: [String: Int] = [:]
+    /// The one authoritative Mac presentation lifecycle for the current or
+    /// most-recent accepted turn in each session. Operational events, stop
+    /// requests, and evidence-backed terminals all reduce into this state.
+    var chatTurnLifecycleBySession: [String: MacChatTurnLifecycleState] = [:]
+    @ObservationIgnored var activeChatTurnLifecycleIDsBySession: [String: String] = [:]
+    @ObservationIgnored var chatTurnLifecycleStore = MacChatTurnLifecycleStore()
+    @ObservationIgnored var chatTurnTranscriptProofReader: any MacChatTurnTranscriptProofReading =
+        MacChatTurnTranscriptProofReader()
+    @ObservationIgnored var chatTurnLifecycleRepairCompleted = false
     /// User-authored turns waiting behind the active turn, keyed by canonical
     /// session id. They stay outside the transcript/provider path until they
     /// become active, so queued text cannot race or duplicate the running turn.

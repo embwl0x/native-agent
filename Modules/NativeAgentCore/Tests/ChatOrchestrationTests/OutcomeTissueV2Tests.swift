@@ -7,6 +7,30 @@ import Testing
 
 @Suite("Outcome Tissue V2")
 struct OutcomeTissueV2Tests {
+    @Test("response observations preserve the canonical chat session identity contract")
+    func responseObservationSessionIdentityContract() throws {
+        let maximumLengthSession = String(repeating: "s", count: 160)
+        let observation = try #require(ResponseOutcomeObservationV2.make(
+            turnID: "turn-session-contract",
+            messageID: "message-session-contract",
+            sessionID: maximumLengthSession,
+            surface: "chat",
+            observedAt: Date(timeIntervalSince1970: 1_800_000_000),
+            responsePersistence: "persisted"
+        ))
+
+        #expect(observation.sessionID == maximumLengthSession)
+        #expect(ResponseOutcomeObservationV2(jsonValue: observation.jsonValue) == observation)
+        #expect(ResponseOutcomeObservationV2.make(
+            turnID: "turn-invalid-session",
+            messageID: "message-invalid-session",
+            sessionID: "../unsafe",
+            surface: "chat",
+            observedAt: Date(timeIntervalSince1970: 1_800_000_000),
+            responsePersistence: "persisted"
+        ) == nil)
+    }
+
     @Test("response observation is closed, payload-free, and carries pre-outcome assignment")
     func responseObservationContract() throws {
         let result = TurnEngineResult(

@@ -387,8 +387,10 @@ struct WhatsRunningRow: View {
                     appModel.systemToasts.push(error: "Discard failed: \(result.error ?? "unknown error")")
                 }
             case "chat":
-                // B.5: use typed cancelChatSession which calls _encodePath
-                _ = try await api.cancelChatSession(sessionId: item.id)
+                // Route through the same AppModel owner as the composer Stop:
+                // record intent, cancel the exact task, and let observed core
+                // settlement decide canceled versus outcome-unknown.
+                appModel.stopChatStream(sessionId: item.id)
             default:
                 break
             }

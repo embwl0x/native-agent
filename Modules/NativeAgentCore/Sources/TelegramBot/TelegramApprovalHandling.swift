@@ -86,6 +86,7 @@ public struct TelegramApprovalCallback: Sendable, Equatable {
     public let callbackId: String
     public let command: TelegramApprovalCommand
     public let chatId: Int
+    public let messageId: Int
     public let fromUserId: Int?
 
     public init?(_ raw: JSONValue) {
@@ -99,15 +100,21 @@ public struct TelegramApprovalCallback: Sendable, Equatable {
             guard case .object(let from)? = obj["from"] else { return nil }
             return Self.int(from["id"])
         }()
+        let message: [String: JSONValue]? = {
+            guard case .object(let value)? = obj["message"] else { return nil }
+            return value
+        }()
         let chatId: Int? = {
-            guard case .object(let message)? = obj["message"],
-                  case .object(let chat)? = message["chat"] else { return nil }
+            guard case .object(let chat)? = message?["chat"] else { return nil }
             return Self.int(chat["id"])
         }()
-        guard let chatId else { return nil }
+        let messageId = Self.int(message?["message_id"])
+            ?? Self.int(message?["messageId"])
+        guard let chatId, let messageId else { return nil }
         self.callbackId = callbackId
         self.command = command
         self.chatId = chatId
+        self.messageId = messageId
         self.fromUserId = fromUserId
     }
 

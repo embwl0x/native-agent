@@ -64,6 +64,46 @@ struct GitHubCommandDetectionTests {
         #expect(evidence.contains { $0.signal == .conflict })
     }
 
+    @Test("review label gates wait on maintainers while real CI failures still route")
+    func reviewLabelGateIsMaintainerOwned() {
+        func observation(extraFailure: Bool) -> GitHubCommandObservation {
+            var runs: [[String: Any]] = [
+                ["id": 1, "name": "Review label gate", "status": "completed", "conclusion": "failure"],
+                ["id": 2, "name": "All required checks pass", "status": "completed", "conclusion": "failure"],
+            ]
+            if extraFailure {
+                runs.append(["id": 3, "name": "Python tests", "status": "completed", "conclusion": "failure"])
+            }
+            return GitHubCommandObservationBuilder.pullRequest(
+                repository: "sample/engine",
+                number: 92,
+                pull: [
+                    "title": "Wait for review",
+                    "state": "open",
+                    "updated_at": "2026-08-19T10:00:00Z",
+                    "mergeable_state": "clean",
+                    "head": ["sha": "head-92"],
+                ],
+                reviews: [],
+                reviewComments: [],
+                checkRuns: ["check_runs": runs],
+                combinedStatus: ["state": "pending", "total_count": 0, "statuses": []],
+                actor: "author",
+                staleAfterHours: 72
+            )
+        }
+
+        let maintainerOnly = observation(extraFailure: false)
+        #expect(maintainerOnly.signals.isEmpty)
+        #expect(maintainerOnly.actionableEventVersion == nil)
+        #expect(maintainerOnly.waitingKind == .maintainer)
+
+        let technical = observation(extraFailure: true)
+        #expect(technical.signals == [.ciFailure])
+        #expect(technical.actionableEvidence?.count == 1)
+        #expect(technical.actionableEvidence?.first?.summary == "Python tests: failure")
+    }
+
     @Test("decision labels require assignment before routing needs_user")
     func decisionLabelsRequireAssignment() {
         func observation(assignees: [[String: Any]] = []) -> GitHubCommandObservation {
@@ -263,6 +303,86 @@ struct GitHubCommandDetectionTests {
             latestIssueCommentAuthor: GitHubCommandObservationBuilder.latestNonBotCommentAuthor(botTrailing)
         )
         #expect(observation.humanDecision == nil)
+    }
+
+    @Test("new external PR conversation feedback is actionable without replaying history")
+    func externalIssueCommentDetectionUsesDetailCutoff() throws {
+        let comments: [[String: Any]] = [[
+            "id": 900,
+            "created_at": "2026-07-11T10:05:00Z",
+            "updated_at": "2026-07-11T10:05:00Z",
+            "body": "Please add cleanup-warning coverage.\nKeep the existing fallback.",
+            "html_url": "https://github.com/sample/engine/pull/91#issuecomment-900",
+            "user": ["login": "reviewer"],
+        ]]
+        func observation(cutoff: String) -> GitHubCommandObservation {
+            GitHubCommandObservationBuilder.pullRequest(
+                repository: "sample/engine",
+                number: 91,
+                pull: [
+                    "title": "Repair cleanup",
+                    "state": "open",
+                    "updated_at": "2026-07-11T10:05:00Z",
+                    "mergeable_state": "clean",
+                    "head": ["sha": "head-91"],
+                ],
+                reviews: [],
+                reviewComments: [],
+                checkRuns: ["check_runs": []],
+                combinedStatus: ["statuses": []],
+                actor: "author",
+                staleAfterHours: 72,
+                issueComments: comments,
+                issueCommentNotBefore: DeskClock.parseISO(cutoff)
+            )
+        }
+
+        let fresh = observation(cutoff: "2026-07-11T10:00:00Z")
+        #expect(fresh.signals == [.issueComment])
+        #expect(fresh.actionableEventVersion?.contains("issue_comment:900") == true)
+        let evidence = try #require(fresh.actionableEvidence?.first)
+        #expect(evidence.signal == .issueComment)
+        #expect(evidence.author == "reviewer")
+        #expect(evidence.summary.contains("cleanup-warning coverage"))
+        #expect(!evidence.summary.contains("\n"))
+
+        let historical = observation(cutoff: "2026-07-11T10:06:00Z")
+        #expect(historical.signals.isEmpty)
+    }
+
+    @Test("exact issue-comment verification settles after a new head or contributor reply")
+    func exactIssueCommentVerificationUsesHeadAndLastWord() {
+        let external: [String: Any] = [
+            "id": 900,
+            "created_at": "2026-07-11T10:05:00Z",
+            "user": ["login": "reviewer"],
+        ]
+        let response: [String: Any] = [
+            "id": 901,
+            "created_at": "2026-07-11T10:06:00Z",
+            "user": ["login": "author"],
+        ]
+        func observation(head: String, comments: [[String: Any]]) -> GitHubCommandObservation {
+            GitHubCommandObservationBuilder.pullRequest(
+                repository: "sample/engine",
+                number: 91,
+                pull: [
+                    "title": "Repair cleanup", "state": "open",
+                    "updated_at": "2026-07-11T10:06:00Z",
+                    "mergeable_state": "clean", "head": ["sha": head],
+                ],
+                reviews: [], reviewComments: [],
+                checkRuns: ["check_runs": []], combinedStatus: ["statuses": []],
+                actor: "author", staleAfterHours: 72,
+                issueComments: comments,
+                expectedIssueCommentIdentifier: "900",
+                expectedIssueCommentHeadSHA: "head-91"
+            )
+        }
+
+        #expect(observation(head: "head-91", comments: [external]).signals == [.issueComment])
+        #expect(observation(head: "head-92", comments: [external]).signals.isEmpty)
+        #expect(observation(head: "head-91", comments: [external, response]).signals.isEmpty)
     }
 
     @Test("issue decision labels also require contributor assignment")
@@ -594,6 +714,29 @@ struct GitHubCommandDetectionTests {
         #expect(thread.reviewId == 700)
     }
 
+    @Test("GraphQL mergeability defeats REST unknown after base movement")
+    func graphQLMergeabilityParsing() throws {
+        let evidence = try GitHubConnectorActions.testParseMergeabilityPage([
+            "data": [
+                "pr0": [
+                    "pullRequest": [
+                        "headRefOid": "head-7",
+                        "updatedAt": "2026-07-11T10:00:00Z",
+                        "mergeable": "CONFLICTING",
+                        "mergeStateStatus": "DIRTY",
+                    ],
+                ],
+                "rateLimit": [
+                    "cost": 1,
+                    "remaining": 4_999,
+                    "resetAt": "2026-07-12T10:00:00Z",
+                ],
+            ],
+        ])
+        #expect(evidence.headSHA == "head-7")
+        #expect(evidence.mergeableState == "dirty")
+    }
+
     private var reviewPull: [String: Any] {
         [
             "number": 7,
@@ -639,5 +782,94 @@ struct GitHubCommandDetectionTests {
             staleAfterHours: 72,
             reviewThreads: threads
         )
+    }
+}
+
+/// Cross-review HIGH (2026-08-17): the SELF-CLEAR. Sweep 1 detects a
+/// conversation comment against the prior detailFetchedAt watermark and writes
+/// a fresh stamp; sweep 2 then compares that same comment against the NEW
+/// stamp, finds nothing actionable, and route() falls through to the no-event
+/// tail — knocking an item codex is actively working from codex_working to
+/// waiting_upstream and stamping its event settled. The tracking sweep must
+/// carry the expected comment identity forward, exactly like the verification
+/// path, so the signal survives until the comment is genuinely answered.
+@Suite("GitHub issue-comment persistence across sweeps")
+struct GitHubIssueCommentSweepPersistenceTests {
+    private let comment: [String: Any] = [
+        "id": 900,
+        "created_at": "2026-07-11T10:05:00Z",
+        "body": "Please add cleanup-warning coverage.",
+        "user": ["login": "reviewer"],
+    ]
+
+    private func observation(
+        notBefore: String,
+        expectedIdentifier: String?,
+        expectedHead: String?
+    ) -> GitHubCommandObservation {
+        GitHubCommandObservationBuilder.pullRequest(
+            repository: "sample/engine",
+            number: 91,
+            pull: [
+                "title": "Repair cleanup", "state": "open",
+                "updated_at": "2026-07-11T10:05:00Z",
+                "mergeable_state": "clean", "head": ["sha": "head-91"],
+            ],
+            reviews: [], reviewComments: [],
+            checkRuns: ["check_runs": []], combinedStatus: ["statuses": []],
+            actor: "author", staleAfterHours: 72,
+            issueComments: [comment],
+            issueCommentNotBefore: DeskClock.parseISO(notBefore),
+            expectedIssueCommentIdentifier: expectedIdentifier,
+            expectedIssueCommentHeadSHA: expectedHead
+        )
+    }
+
+    /// Sweep 1: the watermark predates the comment — detected.
+    @Test func firstSweepDetectsTheComment() {
+        let first = observation(
+            notBefore: "2026-07-11T10:00:00Z", expectedIdentifier: nil, expectedHead: nil)
+        #expect(first.signals == [.issueComment])
+    }
+
+    /// Sweep 2 WITHOUT the carried identity — the regression, kept as the
+    /// explicit statement of what the watermark alone does.
+    @Test func watermarkAloneLosesTheEventOnTheNextSweep() {
+        let second = observation(
+            notBefore: "2026-07-11T10:30:00Z", expectedIdentifier: nil, expectedHead: nil)
+        #expect(second.signals.isEmpty,
+                "documented failure mode: the stamp moved past the comment")
+    }
+
+    /// Sweep 2 WITH the carried identity — the fix. The unanswered comment is
+    /// still actionable no matter how far the stamp has advanced.
+    @Test func carriedIdentityKeepsTheEventAliveUntilAnswered() {
+        let second = observation(
+            notBefore: "2026-07-11T10:30:00Z", expectedIdentifier: "900", expectedHead: "head-91")
+        #expect(second.signals == [.issueComment])
+        #expect(second.actionableEventVersion?.contains("issue_comment:900") == true)
+    }
+
+    /// …and it still SETTLES honestly once the contributor answers.
+    @Test func carriedIdentityStillSettlesOnAContributorReply() {
+        let reply: [String: Any] = [
+            "id": 901, "created_at": "2026-07-11T10:40:00Z", "user": ["login": "author"],
+        ]
+        let settled = GitHubCommandObservationBuilder.pullRequest(
+            repository: "sample/engine", number: 91,
+            pull: [
+                "title": "Repair cleanup", "state": "open",
+                "updated_at": "2026-07-11T10:40:00Z",
+                "mergeable_state": "clean", "head": ["sha": "head-91"],
+            ],
+            reviews: [], reviewComments: [],
+            checkRuns: ["check_runs": []], combinedStatus: ["statuses": []],
+            actor: "author", staleAfterHours: 72,
+            issueComments: [comment, reply],
+            issueCommentNotBefore: DeskClock.parseISO("2026-07-11T10:30:00Z"),
+            expectedIssueCommentIdentifier: "900",
+            expectedIssueCommentHeadSHA: "head-91"
+        )
+        #expect(settled.signals.isEmpty, "the author had the last word — the event is answered")
     }
 }

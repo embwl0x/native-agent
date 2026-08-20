@@ -422,7 +422,9 @@ private actor _UncancellableNotificationAdapter: NotificationCenterAdapter {
         "operationId": .string("focus-unobserved"),
         "app": .string("Safari"),
     ])
-    #expect(unobservedResult.verification == .unverified)
+    #expect(unobservedResult.ok == false)
+    #expect(unobservedResult.verification == .failed)
+    #expect(unobservedResult.error == "focus verification unavailable after activation request")
 }
 
 private actor _CommandOnlyAppControlAdapter: AppControlAdapter {

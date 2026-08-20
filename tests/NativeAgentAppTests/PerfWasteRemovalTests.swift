@@ -173,7 +173,6 @@ struct GitHubTrackingReplayGateTests {
         GitHubCommandRuntime(
             dataRoot: root,
             observationLoader: { _ in throw CancellationError() },
-            bridgeSender: { _, _, _ in throw CancellationError() },
             notificationSender: { _ in ("skipped", "") }
         )
     }

@@ -1637,19 +1637,29 @@ public actor SwiftNativeMacControl: MacControlClient {
         let started = now()
         do {
             let result = try await appControlAdapter.focusApp(named: app)
-            let ok = result.activated || result.launched
             let observedFrontmost = await (appControlAdapter as? any AppStateVerificationAdapter)?
                 .isFrontmostApplication(matching: app)
-            let verified = ok && observedFrontmost == true
+            let ok = observedFrontmost == true
+            let failureReason: String? = if ok {
+                nil
+            } else if let reason = result.activationFailureReason {
+                reason
+            } else if observedFrontmost == nil {
+                "focus verification unavailable after activation request"
+            } else {
+                "activation request returned \(result.activationRequestAccepted.map(String.init) ?? String(result.activated)); target was not observed frontmost"
+            }
             return MacControlResult(
                 ok: ok,
                 action: "focus_app",
                 output: appControlOutput(
                     result,
                     status: ok ? "focused" : "focus_failed",
-                    verified: verified
+                    verified: ok,
+                    activated: ok,
+                    failureReason: failureReason
                 ),
-                error: ok ? nil : "focus_app failed for \(app)",
+                error: failureReason,
                 durationMs: Int(now().timeIntervalSince(started) * 1000),
                 viaSwift: true
             )
@@ -1709,7 +1719,9 @@ public actor SwiftNativeMacControl: MacControlClient {
     private func appControlOutput(
         _ result: AppControlRunResult,
         status: String,
-        verified: Bool
+        verified: Bool,
+        activated: Bool? = nil,
+        failureReason: String? = nil
     ) -> JSONValue {
         .object([
             "requested": .string(result.requestedName),
@@ -1717,7 +1729,11 @@ public actor SwiftNativeMacControl: MacControlClient {
             "bundle_identifier": result.bundleIdentifier.map { .string($0) } ?? .null,
             "process_identifier": result.processIdentifier.map { .int(Int64($0)) } ?? .null,
             "launched": .bool(result.launched),
-            "activated": .bool(result.activated),
+            "activated": .bool(activated ?? result.activated),
+            "activation_request_accepted": result.activationRequestAccepted.map { .bool($0) } ?? .null,
+            "activation_fallback_attempted": .bool(result.activationFallbackAttempted),
+            "activation_fallback_succeeded": .bool(result.activationFallbackSucceeded),
+            "failure_reason": failureReason.map { .string($0) } ?? .null,
             "terminated": .bool(result.terminated),
             "already_in_desired_state": .bool(result.alreadyInDesiredState),
             "verified": .bool(verified),

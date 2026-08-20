@@ -40,6 +40,14 @@ public struct TelegramPollLoop: LoopRunner {
     let attachmentChatHandler: TelegramProgressChatHandlerWithAttachments?
     let voiceDownloader: (any TelegramMediaDownloading)?
     let voiceTranscriber: (any TelegramVoiceTranscribing)?
+    /// PATCH-2026-08-18: fires when an inbound media path fails specifically
+    /// because a macOS privacy (TCC) grant is missing — NOT for ordinary
+    /// failures like audio conversion, oversize, or transport. The Telegram
+    /// sender already gets a chat notice for every failure kind; this is the
+    /// separate app-side signal, because the person who has to go flip the
+    /// System Settings switch is at the Mac, not in the chat. Payload is the
+    /// capability name (e.g. "speechRecognition"). nil disables the signal.
+    let onCapabilityDenied: (@Sendable (String) async -> Void)?
     let voiceMaxBytes: Int
     /// Downloads inbound images (reuses the two-stage TelegramMediaDownloader).
     /// Separate from voiceDownloader so vision-in works even when voice
@@ -52,10 +60,35 @@ public struct TelegramPollLoop: LoopRunner {
     let turnCoordinator: TelegramTurnCoordinator
     // chat-smoothness phase 5: growing-draft transport + cadence.
     let sendMessageReturningId: @Sendable (_ token: String, _ chatId: Int, _ text: String) async throws -> Int
+    let sendRichMessageDraft: (@Sendable (
+        _ token: String,
+        _ chatId: Int,
+        _ draftId: Int,
+        _ richMessage: TelegramInputRichMessage
+    ) async throws -> Void)?
+    let sendRichMessage: (@Sendable (
+        _ token: String,
+        _ chatId: Int,
+        _ richMessage: TelegramInputRichMessage
+    ) async throws -> Int)?
+    let sendMessageWithReplyMarkupReturningId: @Sendable (
+        _ token: String,
+        _ chatId: Int,
+        _ text: String,
+        _ replyMarkup: JSONValue
+    ) async throws -> Int
     let editMessageText: @Sendable (_ token: String, _ chatId: Int, _ messageId: Int, _ text: String) async throws -> Void
     let sendMessageWithReplyMarkup: @Sendable (_ token: String, _ chatId: Int, _ text: String, _ replyMarkup: JSONValue) async throws -> Void
     let editMessageTextWithReplyMarkup: @Sendable (_ token: String, _ chatId: Int, _ messageId: Int, _ text: String, _ replyMarkup: JSONValue?) async throws -> Void
     let draftEditIntervalSeconds: TimeInterval
+    let turnCardMinimumEditIntervalSeconds: TimeInterval
+    let turnCardHeartbeatNanoseconds: UInt64
+    let turnCardStalledAfterSeconds: TimeInterval
+    let turnCardClock: @Sendable () -> Date
+    let turnCardSleeper: @Sendable (_ nanoseconds: UInt64) async throws -> Void
+    let turnStopConfirmationNanoseconds: UInt64
+    let turnCardLedger: TelegramTurnCardLedger
+    let turnCardRestartRepairer: TelegramTurnCardRestartRepairer
     /// U5 W-D: gates the whole tick after a longPoll transport failure so an
     /// offline Mac probes at 1s→60s (exponential, jittered) instead of every
     /// scheduler tick. Actor reference — state survives across ticks even
@@ -80,10 +113,19 @@ public struct TelegramPollLoop: LoopRunner {
         sendChatAction: @escaping @Sendable (_ token: String, _ chatId: Int, _ action: String) async throws -> Void = TelegramPollLoop.defaultSendChatAction,
         answerCallbackQuery: @escaping @Sendable (_ token: String, _ callbackId: String, _ text: String) async throws -> Void = TelegramPollLoop.defaultAnswerCallbackQuery,
         sendMessageReturningId: @escaping @Sendable (_ token: String, _ chatId: Int, _ text: String) async throws -> Int = TelegramPollLoop.defaultSendMessageReturningId,
+        sendRichMessageDraft: (@Sendable (_ token: String, _ chatId: Int, _ draftId: Int, _ richMessage: TelegramInputRichMessage) async throws -> Void)? = nil,
+        sendRichMessage: (@Sendable (_ token: String, _ chatId: Int, _ richMessage: TelegramInputRichMessage) async throws -> Int)? = nil,
+        sendMessageWithReplyMarkupReturningId: (@Sendable (_ token: String, _ chatId: Int, _ text: String, _ replyMarkup: JSONValue) async throws -> Int)? = nil,
         editMessageText: @escaping @Sendable (_ token: String, _ chatId: Int, _ messageId: Int, _ text: String) async throws -> Void = TelegramPollLoop.defaultEditMessageText,
         sendMessageWithReplyMarkup: @escaping @Sendable (_ token: String, _ chatId: Int, _ text: String, _ replyMarkup: JSONValue) async throws -> Void = TelegramPollLoop.defaultSendMessageWithReplyMarkup,
-        editMessageTextWithReplyMarkup: @escaping @Sendable (_ token: String, _ chatId: Int, _ messageId: Int, _ text: String, _ replyMarkup: JSONValue?) async throws -> Void = TelegramPollLoop.defaultEditMessageTextWithReplyMarkup,
+        editMessageTextWithReplyMarkup: (@Sendable (_ token: String, _ chatId: Int, _ messageId: Int, _ text: String, _ replyMarkup: JSONValue?) async throws -> Void)? = nil,
         draftEditIntervalSeconds: TimeInterval = 2.0,
+        turnCardMinimumEditIntervalSeconds: TimeInterval = 5,
+        turnCardHeartbeatNanoseconds: UInt64 = 7_000_000_000,
+        turnCardStalledAfterSeconds: TimeInterval = TelegramTurnPresentationRenderer.defaultStalledAfter,
+        turnCardClock: @escaping @Sendable () -> Date = Date.init,
+        turnCardSleeper: @escaping @Sendable (_ nanoseconds: UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) },
+        turnStopConfirmationNanoseconds: UInt64 = 1_500_000_000,
         syncCommandMenu: TelegramCommandMenuSync? = nil,
         approvalHandler: (any TelegramApprovalHandling)? = nil,
         chatHandler: TelegramChatHandler? = nil,
@@ -91,6 +133,7 @@ public struct TelegramPollLoop: LoopRunner {
         attachmentChatHandler: TelegramProgressChatHandlerWithAttachments? = nil,
         voiceDownloader: (any TelegramMediaDownloading)? = TelegramMediaDownloader(),
         voiceTranscriber: (any TelegramVoiceTranscribing)? = nil,
+        onCapabilityDenied: (@Sendable (String) async -> Void)? = nil,
         voiceMaxBytes: Int = TelegramConfig.defaultVoiceMaxBytes,
         photoDownloader: (any TelegramMediaDownloading)? = TelegramMediaDownloader(),
         photoMaxBytes: Int = TelegramPollLoop.defaultPhotoMaxBytes,
@@ -110,17 +153,40 @@ public struct TelegramPollLoop: LoopRunner {
         self.requireMention = requireMention
         self.bot = bot
         self.session = session
-        self.dataRoot = dataRoot ?? Self.inferDataRoot(from: offsetURL)
+        let resolvedDataRoot = dataRoot ?? Self.inferDataRoot(from: offsetURL)
+        self.dataRoot = resolvedDataRoot
         self.offsetURL = offsetURL
         self.sendMessage = sendMessage
         self.sendPhoto = sendPhoto
         self.sendChatAction = sendChatAction
         self.answerCallbackQuery = answerCallbackQuery
         self.sendMessageReturningId = sendMessageReturningId
+        self.sendRichMessageDraft = sendRichMessageDraft
+        self.sendRichMessage = sendRichMessage
+        self.sendMessageWithReplyMarkupReturningId = sendMessageWithReplyMarkupReturningId
+            ?? { token, chatId, text, _ in
+                try await sendMessageReturningId(token, chatId, text)
+            }
         self.editMessageText = editMessageText
         self.sendMessageWithReplyMarkup = sendMessageWithReplyMarkup
         self.editMessageTextWithReplyMarkup = editMessageTextWithReplyMarkup
+            ?? { token, chatId, messageId, text, _ in
+                try await editMessageText(token, chatId, messageId, text)
+            }
         self.draftEditIntervalSeconds = draftEditIntervalSeconds
+        self.turnCardMinimumEditIntervalSeconds = max(0, turnCardMinimumEditIntervalSeconds)
+        self.turnCardHeartbeatNanoseconds = turnCardHeartbeatNanoseconds
+        self.turnCardStalledAfterSeconds = max(0, turnCardStalledAfterSeconds)
+        self.turnCardClock = turnCardClock
+        self.turnCardSleeper = turnCardSleeper
+        self.turnStopConfirmationNanoseconds = turnStopConfirmationNanoseconds
+        let cardLedger = TelegramTurnCardLedger(
+            fileURL: resolvedDataRoot
+                .appendingPathComponent("telegram", isDirectory: true)
+                .appendingPathComponent("work_cards.json")
+        )
+        self.turnCardLedger = cardLedger
+        self.turnCardRestartRepairer = TelegramTurnCardRestartRepairer(ledger: cardLedger)
         self.syncCommandMenu = syncCommandMenu
         self.approvalHandler = approvalHandler
         self.chatHandler = chatHandler
@@ -128,6 +194,7 @@ public struct TelegramPollLoop: LoopRunner {
         self.attachmentChatHandler = attachmentChatHandler
         self.voiceDownloader = voiceDownloader
         self.voiceTranscriber = voiceTranscriber
+        self.onCapabilityDenied = onCapabilityDenied
         self.voiceMaxBytes = max(1, voiceMaxBytes)
         self.photoDownloader = photoDownloader
         self.photoMaxBytes = max(1, photoMaxBytes)
@@ -139,12 +206,51 @@ public struct TelegramPollLoop: LoopRunner {
         self.commandMenuBackoff = commandMenuBackoff
     }
 
+    /// True ONLY for a macOS Speech Recognition authorization denial.
+    ///
+    /// The typed case is matched FIRST — `TelegramVoiceTranscriptionError` is
+    /// the error the transcribers actually throw, and pattern-matching it is
+    /// exact. The lowercased-string fallback exists for errors that arrive
+    /// untyped (an NSError bubbled from a future backend), and is deliberately
+    /// narrow: it must not catch `.speechUnavailable`, whose message mentions
+    /// speech but is a recognizer-availability problem no TCC switch fixes.
+    static func isSpeechPermissionDenial(_ error: Error) -> Bool {
+        if let typed = error as? TelegramVoiceTranscriptionError {
+            if case .speechPermissionDenied = typed { return true }
+            // A typed error that is NOT the denial case is a definitive no —
+            // never fall through to the fuzzy string check for it.
+            return false
+        }
+        let description = [
+            (error as? LocalizedError)?.errorDescription,
+            String(describing: error)
+        ]
+        .compactMap { $0 }
+        .joined(separator: " ")
+        .lowercased()
+        return description.contains("speech recognition permission denied")
+            || description.contains("speechpermissiondenied")
+    }
+
 
     public func tick() async {
+        let turnsAlreadyRunning = await turnCoordinator.activeTurnIDs()
         _ = await tickOutcome()
+        // Direct/diagnostic callers historically observe the completed turn.
+        // The production scheduler calls tickOutcome(), which intentionally
+        // returns after admission so the next Telegram poll can receive live
+        // controls while this coordinator drains the turn independently. Do
+        // not wait on a turn that predated this tick: status/stop ingress must
+        // remain usable in direct tests and diagnostics too.
+        await turnCoordinator.waitUntilIdle(excluding: turnsAlreadyRunning)
+    }
+
+    public func shutdown() async {
+        await turnCoordinator.shutdown()
     }
 
     public func tickOutcome() async -> LoopTickOutcome {
+        await repairInterruptedTurnCardsIfNeeded()
         // U5 W-D comms resilience: while a poll-failure backoff window is
         // open, the whole tick is a no-op (one timestamp comparison). The
         // scheduler keeps its cheap 2s cadence; this gate is what turns
@@ -311,6 +417,10 @@ public struct TelegramPollLoop: LoopRunner {
 
             updateProcessing: do {
             if let callback = update.callbackQuery,
+               await handleTurnControlCallback(update: update, callback: callback) {
+                break updateProcessing
+            }
+            if let callback = update.callbackQuery,
                await handleModelSelectionCallback(update: update, callback: callback) {
                 break updateProcessing
             }
@@ -440,6 +550,17 @@ public struct TelegramPollLoop: LoopRunner {
                 } catch {
                     FileHandle.standardError.write(Data("TelegramPollLoop: voice transcription failed for update \(update.updateId): \(Self._tgRedactToken(String(describing: error)))\n".utf8))
                     await recordError(context: "voice_transcription", error: String(describing: error), update: update, message: msg, text: nil)
+                    // PATCH-2026-08-18: a missing macOS grant is not a transient
+                    // media failure — the chat notice tells the SENDER, but only
+                    // someone at the Mac can fix it. Raise the app-side signal so
+                    // the human gets a card with a route to System Settings.
+                    // Only for a genuine permission denial: conversion failures,
+                    // oversize, timeouts, malformedResponse and speechUnavailable
+                    // must NOT flag a capability, or the card becomes noise the
+                    // user learns to ignore.
+                    if Self.isSpeechPermissionDenial(error) {
+                        await onCapabilityDenied?("speechRecognition")
+                    }
                     let notice = Self.voiceTranscriptionNotice(for: error)
                     do {
                         try await sendMessage(token, msg.chatId, notice)
@@ -591,22 +712,38 @@ public struct TelegramPollLoop: LoopRunner {
             // update. Freeze that mutable local before it crosses the
             // coordinator's @Sendable task boundary.
             let turnImageAttachments = stagedImageAttachments
-            guard let started = await turnCoordinator.startTurn(
+            guard await turnCoordinator.startTrackedTurn(
                 chatId: msg.chatId,
                 text: text,
                 priority: .userInitiated,
-                operation: {
-                    let draft = TelegramDraftStreamer(
-                    token: token,
-                    chatId: msg.chatId,
-                    editIntervalSeconds: draftEditIntervalSeconds,
-                    sendReturningId: sendMessageReturningId,
-                    editMessage: editMessageText
-                )
+                operation: { turnId in
+                    let card = makeTurnProgressCard(
+                        chatId: msg.chatId,
+                        turnId: turnId,
+                        errorContext: "turn_card",
+                        update: update,
+                        message: msg,
+                        text: text
+                    )
+                    guard await turnCoordinator.attachCard(
+                        card,
+                        chatId: msg.chatId,
+                        turnId: turnId
+                    ) else { return }
+                    await card.start()
+                    await card.transition(.working(action: nil))
+                    let delivery = makeAssistantDelivery(
+                        chatId: msg.chatId,
+                        turnId: turnId,
+                        errorContext: "send_reply",
+                        update: update,
+                        message: msg,
+                        text: text
+                    )
                 do {
                     let typingTask = await startTypingHeartbeat(chatId: msg.chatId)
                     defer { typingTask?.cancel() }
-                    let progress = makeProgressSink(chatId: msg.chatId, draft: draft)
+                    let progress = makeProgressSink(delivery: delivery, card: card)
                     let generatedImages = TelegramGeneratedImageCollector()
                     let capturingProgress: TelegramChatProgressSink = { event in
                         await generatedImages.record(event)
@@ -622,24 +759,38 @@ public struct TelegramPollLoop: LoopRunner {
                     )
                     try Task.checkCancellation()
                     if !reply.isEmpty {
-                        do {
-                            for chunk in await draft.finalize(reply: reply) {
-                                try await sendMessage(token, msg.chatId, chunk)
-                            }
+                        let deliveryOutcome = await delivery.finalize(reply: reply)
+                        switch deliveryOutcome {
+                        case .delivered:
                             let imagePaths = await generatedImages.snapshot()
-                            for imagePath in imagePaths {
-                                do {
-                                    try await sendChatAction(token, msg.chatId, "upload_photo")
-                                    try await sendPhoto(token, msg.chatId, imagePath, nil)
-                                } catch {
-                                    FileHandle.standardError.write(Data("TelegramPollLoop: generated image send failed for update \(update.updateId): \(Self._tgRedactToken(String(describing: error)))\n".utf8))
-                                    await recordError(context: "send_generated_image", error: String(describing: error), update: update, message: msg, text: text)
-                                }
+                            switch await deliverGeneratedImages(
+                                imagePaths,
+                                chatId: msg.chatId,
+                                errorContext: "send_generated_image",
+                                update: update,
+                                message: msg,
+                                text: text
+                            ) {
+                            case .delivered:
+                                await recordReceipt(kind: receiptKind, update: update, message: msg, text: text, reply: reply)
+                                await card.transition(.completed(summary: "Reply delivered"))
+                            case .failed(let reason):
+                                await card.transition(.failed(
+                                    reason: "Reply text delivered, but generated media failed: \(reason)"
+                                ))
+                            case .outcomeUnknown(let reason):
+                                await card.transition(.outcomeUnknown(
+                                    reason: "Reply text delivered; generated media delivery could not be confirmed: \(reason)"
+                                ))
                             }
-                            await recordReceipt(kind: receiptKind, update: update, message: msg, text: text, reply: reply)
-                        } catch {
-                            FileHandle.standardError.write(Data("TelegramPollLoop: reply send failed for update \(update.updateId): \(Self._tgRedactToken(String(describing: error)))\n".utf8))
-                            await recordError(context: "send_reply", error: String(describing: error), update: update, message: msg, text: text)
+                        case .failed(let reason):
+                            await recordError(context: "send_reply", error: reason, update: update, message: msg, text: text)
+                            await card.transition(.failed(reason: "Reply delivery failed: \(reason)"))
+                        case .outcomeUnknown(let reason):
+                            await recordError(context: "send_reply_outcome_unknown", error: reason, update: update, message: msg, text: text)
+                            await card.transition(.outcomeUnknown(
+                                reason: "Reply delivery could not be confirmed: \(reason)"
+                            ))
                         }
                     } else {
                         // A live draft must not dangle with partial text when the
@@ -647,9 +798,10 @@ public struct TelegramPollLoop: LoopRunner {
                         // notice as a new message so the failure is never silent.
                         let notice = "(the reply came back empty - check the Mac error log)"
                         await recordError(context: "empty_reply", error: "chat handler returned empty output", update: update, message: msg, text: text)
+                        await card.transition(.failed(reason: "The reply came back empty"))
                         await deliverDraftOrSendNotice(
                             notice,
-                            draft: draft,
+                            delivery: delivery,
                             receiptKind: "empty_reply_notice",
                             sendErrorContext: "send_empty_reply_notice",
                             update: update,
@@ -659,24 +811,24 @@ public struct TelegramPollLoop: LoopRunner {
                     }
                 } catch is CancellationError {
                     let notice = "(Telegram turn stopped.)"
-                    if await draft.abortDelivering(notice: notice) {
+                    await card.transition(.canceled(reason: "Stopped by user"))
+                    if await delivery.abortDelivering(notice: notice) {
                         await recordReceipt(kind: "stopped_notice", update: update, message: msg, text: text, reply: notice)
                     } else {
-                        do {
-                            try await sendMessage(token, msg.chatId, notice)
-                            await recordReceipt(kind: "stopped_notice", update: update, message: msg, text: text, reply: notice)
-                        } catch {
-                            await recordError(context: "send_stop_notice", error: String(describing: error), update: update, message: msg, text: text)
-                        }
+                        // The canceled work card is already durable evidence.
+                        // Do not manufacture a second standalone notice when
+                        // no assistant draft exists to terminalize.
+                        await recordReceipt(kind: "turn_canceled", update: update, message: msg, text: text, reply: notice)
                     }
                 } catch {
                     FileHandle.standardError.write(Data("TelegramPollLoop: chat handler failed for update \(update.updateId): \(Self._tgRedactToken(String(describing: error)))\n".utf8))
                     await recordError(context: "chat_handler", error: String(describing: error), update: update, message: msg, text: text)
+                    await card.transition(.failed(reason: String(describing: error)))
                     let notice = Self.chatErrorNotice(for: error)
                     // Prefer editing the partial draft into the error notice; a
                     // separate message only when there's no draft (or the edit
                     // failed).
-                    if await draft.abortDelivering(notice: notice) {
+                    if await delivery.abortDelivering(notice: notice) {
                         await recordReceipt(kind: "error_notice", update: update, message: msg, text: text, reply: notice)
                     } else {
                         do {
@@ -688,7 +840,7 @@ public struct TelegramPollLoop: LoopRunner {
                     }
                 }
                 }
-            ) else {
+            ) != nil else {
                 let notice = "A Telegram turn is already running for this chat. Use /stop to cancel it before sending another message."
                 do {
                     try await sendMessage(token, msg.chatId, notice)
@@ -699,8 +851,6 @@ public struct TelegramPollLoop: LoopRunner {
                 break updateProcessing
             }
             await turnCoordinator.recordLastUserMessage(chatId: msg.chatId, text: text)
-            await started.task.value
-            await turnCoordinator.finishTurn(chatId: msg.chatId, turnId: started.id)
             }
             do {
                 let completed = try await updateInbox.transition(

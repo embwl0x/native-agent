@@ -5,6 +5,7 @@
 // <dataRoot>/security/mac_integration_permissions.json.
 import SwiftUI
 import MacIntegration
+import AVFoundation
 
 struct MacIntegrationView: View {
     @Environment(\.scenePhase) private var scenePhase
@@ -31,17 +32,47 @@ struct MacIntegrationView: View {
         case calendar
         case reminders
         case contacts
+        // PATCH-2026-08-18: Speech Recognition and Microphone were load-bearing
+        // (Telegram voice notes / the in-app mic) with NO row here, so a user
+        // had no way to see or grant them. They ride the same row helper,
+        // status keys, refresh and Grant-All path as the three above.
+        case speechRecognition = "speech_recognition"
+        case microphone
 
         var label: String {
-            rawValue.capitalized
+            switch self {
+            case .speechRecognition: return "Speech Recognition"
+            case .microphone: return "Microphone"
+            default: return rawValue.capitalized
+            }
+        }
+
+        /// Single source of truth for the pane anchors: the shared capability
+        /// vocabulary, not a second hand-maintained copy.
+        var capability: SystemPermissionCapability {
+            switch self {
+            case .calendar: return .calendars
+            case .reminders: return .reminders
+            case .contacts: return .contacts
+            case .speechRecognition: return .speechRecognition
+            case .microphone: return .microphone
+            }
         }
 
         var settingsAnchor: String {
-            switch self {
-            case .calendar: return "Privacy_Calendars"
-            case .reminders: return "Privacy_Reminders"
-            case .contacts: return "Privacy_Contacts"
-            }
+            capability.settingsAnchor ?? "Privacy_AllFiles"
+        }
+    }
+
+    /// Maps the shared `SystemPermissionStatus` onto the snake_case status
+    /// strings this view's badges and Grant/Open-Settings branches already use.
+    private static func badgeKey(_ status: SystemPermissionStatus) -> String {
+        switch status {
+        case .granted: return "granted"
+        case .denied: return "denied"
+        case .restricted: return "restricted"
+        case .notDetermined: return "not_determined"
+        case .unknown: return "unknown"
         }
     }
 
@@ -64,6 +95,11 @@ struct MacIntegrationView: View {
                     // / Notes / Music) — couldn't tell which app was missing.
                     // Each integration that needs a real macOS TCC grant now
                     // gets its own row with its own badge.
+                    // 2026-08-18: Speech Recognition first — it is the one the
+                    // headless Telegram voice path silently depends on, and the
+                    // one a user has no other way to discover is missing.
+                    tccStatusRow(label: "Speech Recognition", icon: "waveform", statusKey: "speech_recognition", frameworkPermission: .speechRecognition)
+                    tccStatusRow(label: "Microphone", icon: "mic", statusKey: "microphone", frameworkPermission: .microphone)
                     tccStatusRow(label: "Calendar", icon: "calendar", statusKey: "calendar", frameworkPermission: .calendar)
                     tccStatusRow(label: "Reminders", icon: "checklist", statusKey: "reminders", frameworkPermission: .reminders)
                     tccStatusRow(label: "Contacts", icon: "person.crop.circle", statusKey: "contacts", frameworkPermission: .contacts)
@@ -334,6 +370,7 @@ struct MacIntegrationView: View {
     // Every status key rendered as a System Permissions row above the
     // Grant All control; the CTA hides only when ALL of these are granted.
     private static let systemPermissionStatusKeys = [
+        "speech_recognition", "microphone",
         "calendar", "reminders", "contacts",
         "apple_events_mail", "apple_events_messages",
         "apple_events_notes", "apple_events_music",
@@ -470,6 +507,14 @@ struct MacIntegrationView: View {
         // Pure status queries; no prompts fired here. The three framework
         // backends (Calendar/Reminders/Contacts) are safe to query at any
         // time without triggering prompts.
+        // Speech / Microphone: class-level READS only (SFSpeechRecognizer
+        // .authorizationStatus / AVCaptureDevice.authorizationStatus). Neither
+        // prompts, so they are safe on every appear and refresh tick.
+        tccStatuses["speech_recognition"] = Self.badgeKey(
+            SystemPermissionPreflight.status(.speechRecognition))
+        tccStatuses["microphone"] = Self.badgeKey(
+            SystemPermissionPreflight.status(.microphone))
+
         tccStatuses["calendar"] = MacPIMConnectorActions.currentCalendarAuthorizationStatus()
         tccStatuses["reminders"] = MacPIMConnectorActions.currentReminderAuthorizationStatus()
         tccStatuses["contacts"] = MacContactsAdapter.currentAuthorizationStatus()
@@ -503,10 +548,32 @@ struct MacIntegrationView: View {
             status = await MacPIMConnectorActions.requestReminderAccess()
         case .contacts:
             status = await MacContactsAdapter.requestAccess()
+        case .speechRecognition:
+            // This is the acquisition path the headless Telegram voice pipeline
+            // never had. The call is a no-op unless the grant is still
+            // notDetermined — macOS refuses to re-prompt a resolved grant, so a
+            // denied state falls through to System Settings below instead of
+            // leaving the user tapping a button that does nothing.
+            status = Self.badgeKey(
+                await SystemPermissionPreflight.requestSpeechRecognitionIfNotDetermined())
+        case .microphone:
+            status = await AVCaptureDevice.requestAccess(for: .audio)
+                ? "granted"
+                : Self.badgeKey(SystemPermissionPreflight.status(.microphone))
         }
         tccStatuses[permission.rawValue] = status
 
-        if status == "not_determined" || status == "unknown" {
+        if status == "denied" || status == "restricted" {
+            // A resolved denial cannot be re-prompted. Say so AND open the pane,
+            // rather than reporting a silent no-op.
+            permissionRequestError = "\(permission.label) is already \(status) for NativeAgent, "
+                + "and macOS will not ask again once a permission has been answered. "
+                + "Opening System Settings → Privacy & Security → \(permission.label) — "
+                + "switch NativeAgent on there, then hit Refresh."
+            if let url = URL(string: SystemPermissionPreflight.settingsPanePrefix + permission.settingsAnchor) {
+                NSWorkspace.shared.open(url)
+            }
+        } else if status == "not_determined" || status == "unknown" {
             permissionRequestError = registrationFailureMessage(for: permission)
         }
     }
@@ -522,6 +589,17 @@ struct MacIntegrationView: View {
         isRequestingAll = true
         defer { isRequestingAll = false }
 
+        // Speech Recognition — first, and BEFORE the microphone prompt, because
+        // it is the grant with no other acquisition path in the whole app.
+        let speech = Self.badgeKey(
+            await SystemPermissionPreflight.requestSpeechRecognitionIfNotDetermined())
+        tccStatuses["speech_recognition"] = speech
+
+        // Microphone
+        let micGranted = await AVCaptureDevice.requestAccess(for: .audio)
+        let mic = micGranted ? "granted" : Self.badgeKey(SystemPermissionPreflight.status(.microphone))
+        tccStatuses["microphone"] = mic
+
         // Calendar
         let cal = await MacPIMConnectorActions.requestCalendarAccess()
         tccStatuses["calendar"] = cal
@@ -535,6 +613,8 @@ struct MacIntegrationView: View {
         tccStatuses["contacts"] = con
 
         let unresolvedFrameworks = [
+            ("Speech Recognition", speech),
+            ("Microphone", mic),
             ("Calendar", cal),
             ("Reminders", rem),
             ("Contacts", con),
@@ -587,6 +667,12 @@ struct MacIntegrationView: View {
             "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?\(anchor)"
         }
         var needsManualGrant: [String] = []
+        if speech == "denied" || speech == "restricted" {
+            needsManualGrant.append(privacyPaneURL("Privacy_SpeechRecognition"))
+        }
+        if mic == "denied" || mic == "restricted" {
+            needsManualGrant.append(privacyPaneURL("Privacy_Microphone"))
+        }
         if cal == "denied" || cal == "restricted" {
             needsManualGrant.append(privacyPaneURL("Privacy_Calendars"))
         }

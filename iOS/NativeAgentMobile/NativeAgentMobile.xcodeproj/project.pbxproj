@@ -38,6 +38,7 @@
 		54D8119148134FC24251CB99 /* PairingStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3D43E52C8C4199DAC2356BCD /* PairingStore.swift */; };
 		5BA4768B2DD3E94CC8B4FEB3 /* AutonomyView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1E2B29D18488D84493A47DAF /* AutonomyView.swift */; };
 		5ECB237C7940BE6E1311B346 /* MacToolsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD75935C336EE2F796BE5B69 /* MacToolsView.swift */; };
+		5F74DB49963C3CD481CA6FC4 /* DeskView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1D509DA29AB88AC50A0B2F2B /* DeskView.swift */; };
 		62DFDEE63EE427ABED7470CB /* ChatStore+Refresh.swift in Sources */ = {isa = PBXBuildFile; fileRef = F25842649A1FDAAE64B4CA84 /* ChatStore+Refresh.swift */; };
 		63CFC9F03718626BC8165F34 /* NativeAgentTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0B13C8B454295AF13C08F860 /* NativeAgentTheme.swift */; };
 		6EAF5CB317F9DC7C619DE0F3 /* MemoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C106B0DD27A62C55AE5D4BAA /* MemoryView.swift */; };
@@ -89,6 +90,7 @@
 		165696925AFEADB0B8935975 /* InboxStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InboxStoreTests.swift; sourceTree = "<group>"; };
 		18CBE44E0B3B69F288276E5D /* PushTokenSyncCacheTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PushTokenSyncCacheTests.swift; sourceTree = "<group>"; };
 		1CC8790DA9AE73BC4967EBB7 /* iCloudSyncEngine+Snapshots.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "iCloudSyncEngine+Snapshots.swift"; sourceTree = "<group>"; };
+		1D509DA29AB88AC50A0B2F2B /* DeskView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeskView.swift; sourceTree = "<group>"; };
 		1E2B29D18488D84493A47DAF /* AutonomyView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutonomyView.swift; sourceTree = "<group>"; };
 		3D43E52C8C4199DAC2356BCD /* PairingStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairingStore.swift; sourceTree = "<group>"; };
 		42B7A206A030AA1647F3F466 /* ChatStore+Sending.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ChatStore+Sending.swift"; sourceTree = "<group>"; };
@@ -184,6 +186,7 @@
 				0F579B81D5FEC50A3DFA5F50 /* ChatStore+Typewriter.swift */,
 				A42311503CD0F0653EDCC8C7 /* ChatView.swift */,
 				F8EA72092C9322CB8AA54E43 /* ContentView.swift */,
+				1D509DA29AB88AC50A0B2F2B /* DeskView.swift */,
 				0AF7849932D6EC635C3DC741 /* Haptics.swift */,
 				1615775A939079423998FCFF /* iCloudBridge.swift */,
 				925CA4E075E6B6F36698C950 /* iCloudSyncEngine.swift */,
@@ -397,6 +400,7 @@
 				2DA5F971CE503E5DE869D60B /* ChatStore.swift in Sources */,
 				177CA8E9B274A1DDC2EF7F0B /* ChatView.swift in Sources */,
 				3BC6FC2DFDBFB8A16471C14E /* ContentView.swift in Sources */,
+				5F74DB49963C3CD481CA6FC4 /* DeskView.swift in Sources */,
 				801CA6793DECF339F0E9C5E0 /* Haptics.swift in Sources */,
 				708CEED84AA652F35722D889 /* InboxView.swift in Sources */,
 				3F23797BA1B48CE20BF17D99 /* KnowledgeGraphView.swift in Sources */,
@@ -539,7 +543,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 10;
+				CURRENT_PROJECT_VERSION = 12;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
@@ -552,7 +556,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				MARKETING_VERSION = 0.3.0;
+				MARKETING_VERSION = 0.4.1;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -602,7 +606,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 10;
+				CURRENT_PROJECT_VERSION = 12;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
@@ -621,7 +625,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				MARKETING_VERSION = 0.3.0;
+				MARKETING_VERSION = 0.4.1;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;

@@ -13,6 +13,7 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
     case core
     case catalog
     case chat
+    case desk
     case activity
     case advanced
 
@@ -44,6 +45,8 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
             [
                 "chat_transcripts.json",
             ]
+        case .desk:
+            ["desk.json"]
         case .activity:
             [
                 "workshop_tasks.json",

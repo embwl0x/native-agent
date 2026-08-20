@@ -1,6 +1,8 @@
 import Foundation
+import LocalAuthentication
 import NativeAgentCore
 import PersistenceCore
+import Security
 import Testing
 @testable import GitHubConnector
 
@@ -44,6 +46,28 @@ final class TestGitHubCredentialVault: GitHubCredentialVault, @unchecked Sendabl
         return values[
             "\(GitHubCredentialStore.keychainService)|\(GitHubCredentialStore.credentialAccount(dataRoot: dataRoot))"
         ]
+    }
+}
+
+@Test func systemGitHubCredentialVaultIsNonInteractiveAndRefusesTheTestHarness() throws {
+    let query = SystemGitHubCredentialVault.nonInteractiveIdentityQuery(
+        service: "com.nativeagent.tests.never-touch-keychain.\(UUID().uuidString)",
+        account: "fixture"
+    )
+    let context = query[kSecUseAuthenticationContext as String] as? LAContext
+    #expect(context?.interactionNotAllowed == true)
+    #expect(SystemGitHubCredentialVault.isRunningUnderTestHarness)
+
+    do {
+        _ = try SystemGitHubCredentialVault().read(
+            service: "com.nativeagent.tests.never-touch-keychain.\(UUID().uuidString)",
+            account: "fixture"
+        )
+        Issue.record("the system Keychain vault must refuse every test process before Security.framework")
+    } catch GitHubCredentialVaultError.testHarnessAccessRefused {
+        // Expected: no SecItem call was made, so no password UI can appear.
+    } catch {
+        Issue.record("unexpected test-harness refusal: \(error)")
     }
 }
 

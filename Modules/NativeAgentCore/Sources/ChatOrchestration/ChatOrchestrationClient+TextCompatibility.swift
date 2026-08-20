@@ -101,9 +101,11 @@ extension SwiftNativeChatOrchestrationClient {
         // old `withValue(turnId) { Task { … } }` shape freed task-local storage
         // on the parent while the child still referenced it → the
         // swift_task_dealloc_specific crash on first chat (G4-5).
-        let turnId = TurnTraceContext.mintTurnId()
+        let turnId = TurnTraceContext.turnId ?? TurnTraceContext.mintTurnId()
+        let producerControl = ChatStreamProducerControl()
         let stream = AsyncThrowingStream<TurnStreamEvent, Error> { continuation in
             let task = Task { [self] in
+                defer { producerControl.resolve() }
                 await TurnTraceContext.$bus.withValue(turnTraceBus) {
                 await TurnTraceContext.$turnId.withValue(turnId) {
                     await runTextStreamingCompatibility(
@@ -124,11 +126,15 @@ extension SwiftNativeChatOrchestrationClient {
                 }
                 }
             }
-            continuation.onTermination = { _ in task.cancel() }
+            producerControl.install(task)
+            continuation.onTermination = { termination in
+                if case .cancelled = termination { producerControl.cancel() }
+            }
         }
 
         var finalResult: TurnEngineResult?
         var lastError: String?
+        var iterationError: Error?
         do {
             for try await event in stream {
                 await observeCognitiveProgressEvent(
@@ -150,7 +156,24 @@ extension SwiftNativeChatOrchestrationClient {
                 }
             }
         } catch {
-            let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+            iterationError = error
+            producerControl.cancel()
+        }
+
+        // The producer owns partial/cancellation persistence and may publish a
+        // terminal event before that write settles. Joining is intentionally
+        // cancellation-insensitive so regenerate cannot drain a replacement
+        // turn ahead of the old producer's canonical receipt.
+        if Task.isCancelled { producerControl.cancel() }
+        await producerControl.wait()
+
+        if Task.isCancelled || iterationError is CancellationError
+            || Self.isCancellationStreamError(lastError) {
+            throw CancellationError()
+        }
+        if let iterationError {
+            let message = (iterationError as? LocalizedError)?.errorDescription
+                ?? String(describing: iterationError)
             throw ChatOrchestrationError.underlying(message)
         }
 
@@ -178,6 +201,16 @@ extension SwiftNativeChatOrchestrationClient {
             providerCallCount: finalResult.providerCallCount
         )
         return StructuredChatExecution(response: response, turn: finalResult)
+    }
+
+    private nonisolated static func isCancellationStreamError(_ error: String?) -> Bool {
+        guard let normalized = error?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        else { return false }
+        return normalized == "cancelled"
+            || normalized == "canceled"
+            || normalized == "cancellationerror()"
     }
 
     nonisolated static func shouldUseAnthropicTextStreamingCompatibility(
@@ -274,6 +307,16 @@ extension SwiftNativeChatOrchestrationClient {
             sessionId: resolvedSession,
             observedBy: "text_compat.entry"
         )
+        let cancelFlagPath = dataRoot
+            .appendingPathComponent("chat", isDirectory: true)
+            .appendingPathComponent("sessions", isDirectory: true)
+            .appendingPathComponent(resolvedSession, isDirectory: true)
+            .appendingPathComponent("cancelled.flag")
+        // Clear only the marker inherited from a PRIOR turn, at the same
+        // acceptance boundary as the structured provider lane. A Stop written
+        // after acceptance must remain observable while persistence/context
+        // work is in flight; clearing it later can erase a real remote Stop.
+        try? FileManager.default.removeItem(at: cancelFlagPath)
         // Native vision: image attachments become per-turn DYNAMIC image blocks
         // on the CURRENT user message; the model sees the RAW message text (no
         // stringified suffix). Empty → byte-identical wire shape.
@@ -291,6 +334,10 @@ extension SwiftNativeChatOrchestrationClient {
                     persona: persona,
                     source: surface
                 )
+            } catch is CancellationError {
+                continuation.yield(.error("cancelled"))
+                continuation.finish()
+                return
             } catch {
                 continuation.yield(.error("persist user turn failed: \(error)"))
                 continuation.finish()
@@ -305,6 +352,10 @@ extension SwiftNativeChatOrchestrationClient {
                 surface: surface,
                 runId: runId
             )
+        } catch is CancellationError {
+            continuation.yield(.error("cancelled"))
+            continuation.finish()
+            return
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
             if Self.shouldPersistFailureMessage(surface: surface) {
@@ -333,16 +384,6 @@ extension SwiftNativeChatOrchestrationClient {
         async let preloadAvailableNamesTask: Set<String> = {
             Set(((try? await tools.listAvailableToolSchemas()) ?? []).map(\.name))
         }()
-
-        let cancelFlagPath = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("sessions", isDirectory: true)
-            .appendingPathComponent(resolvedSession, isDirectory: true)
-            .appendingPathComponent("cancelled.flag")
-        // A stale flag from a PRIOR cancel must not kill this turn: nothing
-        // else ever deletes it, so without this clear one tap of Stop would
-        // permanently break streaming for the session (audit 2026-06-09).
-        try? FileManager.default.removeItem(at: cancelFlagPath)
 
         // U1 step 7 fix (2026-06-10 review): this Anthropic text-compat path
         // was the one first-model-call site WITHOUT predictive preload — and
@@ -743,6 +784,9 @@ extension SwiftNativeChatOrchestrationClient {
                         return
                     }
                 }
+            } catch is CancellationError {
+                didCancel = true
+                continuation.yield(.error("cancelled"))
             } catch {
                 // Marker-wrap post-tool-effect failures so the surface retry
                 // ladder (Telegram) sees "whole-turn retry unsafe" in the event
@@ -917,8 +961,14 @@ extension SwiftNativeChatOrchestrationClient {
                 // turn; a third promise is accepted as final so a model that
                 // refuses to act can never loop. Worst case = 2 extra provider
                 // calls on a turn that was already broken for the user.
+                // R7 rides the same bounce: `**Tool: desk_read**` as the whole
+                // reply is an attempted call that never left the text channel.
                 if announceNudgeCount < 2, !preloadAvailableNames.isEmpty,
-                   ToolCallParser.looksLikeUnfulfilledActionPromise(iterAccumulated) {
+                   ToolCallParser.looksLikeUnfulfilledActionPromise(iterAccumulated)
+                    || ToolCallParser.looksLikeNarratedToolInvocation(
+                        iterAccumulated,
+                        knownToolNames: preloadAvailableNames.union(turnActiveTools)
+                    ) {
                     announceNudgeCount += 1
                     finalResult = nil
                     sawFinal = false

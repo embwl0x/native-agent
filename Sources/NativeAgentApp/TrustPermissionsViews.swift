@@ -16,6 +16,51 @@ import CoreSpotlight
 import CloudKit
 #endif
 
+struct ChromeControlPermissionsView: View {
+    @Environment(AppModel.self) private var appModel
+    @State private var enabled = false
+    @State private var isSaving = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Toggle("Chrome control", isOn: Binding(
+                    get: { enabled },
+                    set: { newValue in
+                        enabled = newValue
+                        Task {
+                            isSaving = true
+                            await appModel.saveChromeControlEnabled(newValue)
+                            isSaving = false
+                            syncFromPolicy()
+                        }
+                    }
+                ))
+                .disabled(isSaving)
+                .help("Allows Agent to use leased background tabs in your signed-in Google Chrome. Off by default.")
+                EffectTimingTag(timing: .now)
+                Spacer()
+            }
+            Text("Uses your real Chrome session. Agent creates inactive tabs or claims an exact tab, yields immediately when you touch it, and rechecks this switch before every action.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if isSaving {
+                ProgressView("Updating Chrome control…")
+                    .controlSize(.small)
+            }
+        }
+        .task { syncFromPolicy() }
+        .onChange(of: appModel.trustPolicy) { _, _ in
+            if !isSaving { syncFromPolicy() }
+        }
+    }
+
+    private func syncFromPolicy() {
+        enabled = appModel.trustPolicy?.chromeControlPolicy?.enabled ?? false
+    }
+}
+
 // PATCH-2026-05-06: multimodal-ui Sprint 3 — multimodal permission toggles.
 struct MultimodalPermissionsView: View {
     @Environment(AppModel.self) private var appModel

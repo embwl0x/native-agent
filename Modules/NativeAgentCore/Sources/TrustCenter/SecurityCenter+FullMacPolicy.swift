@@ -45,7 +45,8 @@ extension SwiftNativeSecurityCenter {
         }
         if profile.capabilities.contains("evolution_write")
             || profile.capabilities.contains("evolution_apply_trigger")
-            || profile.capabilities.contains("money") {
+            || profile.capabilities.contains("money")
+            || profile.capabilities.contains("system_permission_reset") {
             return false
         }
         if profile.capabilities.contains("external_send"),

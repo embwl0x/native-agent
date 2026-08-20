@@ -37,8 +37,8 @@ struct GitHubCommandRuntimeTests {
         )
     }
 
-    @Test("bridge payload carries canonical resident evidence and receipt gates codex_working")
-    func bridgePayloadAndReceipt() async throws {
+    @Test("actionable GitHub state notifies once and never creates a dispatch")
+    func actionableNotifiesWithoutDispatch() async throws {
         let root = try root(); defer { try? FileManager.default.removeItem(at: root) }
         let store = GitHubCommandStore(dataRoot: root)
         let recorder = RuntimeRecorder()
@@ -48,29 +48,26 @@ struct GitHubCommandRuntimeTests {
 
         await runtime.processConnectorChanges()
 
-        let payload = try #require(await recorder.payloads().first)
-        #expect(payload.contains("Handle the current actionable GitHub event for example/widgets #12."))
-        #expect(payload.contains("Canonical event key: example/widgets#12+review-12"))
-        #expect(payload.contains("Reviewed head: head-a"))
-        #expect(payload.contains("Signals: changes_requested"))
-        #expect(payload.contains("untrusted repository content"))
-        #expect(payload.contains("NativeAgent will re-read live GitHub"))
-        let working = try #require(try await store.liveState().item(item.itemId))
-        #expect(working.state == .codexWorking)
-        #expect(working.dispatchReceipt?.messageId == working.dispatchIntent?.dispatchId)
-        #expect(await recorder.notifications().isEmpty)
+        let watched = try #require(try await store.liveState().item(item.itemId))
+        #expect(watched.state == .needsCodex)
+        #expect(watched.dispatchIntent == nil)
+        #expect(watched.dispatchReceipt == nil)
+        let notifications = await recorder.notifications()
+        #expect(notifications.count == 1)
+        #expect(notifications.first?.kind == .actionable)
+        #expect(notifications.first?.title == "GitHub needs attention")
         let outcomes = await recorder.outcomes()
         #expect(outcomes.contains { $0.phase == .ready })
-        #expect(outcomes.contains { $0.phase == .waitingExternal })
 
         let countBeforeNoOpRefresh = outcomes.count
         _ = try await store.observe(actionable())
         await runtime.processConnectorChanges()
         #expect(await recorder.outcomes().count == countBeforeNoOpRefresh)
+        #expect(await recorder.notifications().count == 1)
     }
 
-    @Test("restart re-evaluates recovery-relevant work and resumes the same dispatch")
-    func restartRecovery() async throws {
+    @Test("restart refreshes actionable watcher state without resuming a reserved dispatch")
+    func restartRecoveryIsWatcherOnly() async throws {
         let root = try root(); defer { try? FileManager.default.removeItem(at: root) }
         let store = GitHubCommandStore(dataRoot: root)
         let item = try await store.observe(actionable(version: "ci-head-a"))
@@ -81,10 +78,11 @@ struct GitHubCommandRuntimeTests {
         await runtime.recoverAtLaunch()
 
         #expect(await recorder.observationReads() == [item.itemId])
-        #expect(await recorder.dispatchIds() == [beforeCrash.dispatchId])
         let recovered = try #require(try await GitHubCommandStore(dataRoot: root).liveState().item(item.itemId))
-        #expect(recovered.state == .codexWorking)
-        #expect(recovered.dispatchReceipt?.dispatchId == beforeCrash.dispatchId)
+        #expect(recovered.state == .needsCodex)
+        #expect(recovered.dispatchIntent?.dispatchId == beforeCrash.dispatchId)
+        #expect(recovered.dispatchReceipt == nil)
+        #expect(await recorder.notifications().first?.kind == .actionable)
     }
 
     @Test("restart leaves ordinary waiting-upstream rows to connector refresh")
@@ -100,7 +98,6 @@ struct GitHubCommandRuntimeTests {
         await runtime.recoverAtLaunch()
 
         #expect(await recorder.observationReads().isEmpty)
-        #expect(await recorder.dispatchIds().isEmpty)
     }
 
     @Test("callback re-reads GitHub, resolves, and emits one terminal notification")
@@ -108,10 +105,7 @@ struct GitHubCommandRuntimeTests {
         let root = try root(); defer { try? FileManager.default.removeItem(at: root) }
         let store = GitHubCommandStore(dataRoot: root)
         let item = try await store.observe(actionable())
-        let dispatchRecorder = RuntimeRecorder()
-        let dispatchRuntime = makeRuntime(root: root, recorder: dispatchRecorder)
-        await dispatchRuntime.processConnectorChanges()
-        let messageId = try #require(try await store.liveState().item(item.itemId)?.dispatchReceipt?.messageId)
+        let messageId = try await seedLegacyDispatch(store: store, itemId: item.itemId).messageId
 
         let callbackRecorder = RuntimeRecorder(observation: actionable(
             version: "merged", open: false, signals: []
@@ -161,11 +155,7 @@ struct GitHubCommandRuntimeTests {
         )
         let store = GitHubCommandStore(dataRoot: root)
         let item = try await store.observe(unresolved)
-        let dispatchRuntime = makeRuntime(root: root, recorder: RuntimeRecorder())
-        await dispatchRuntime.processConnectorChanges()
-        let messageId = try #require(
-            try await store.liveState().item(item.itemId)?.dispatchReceipt?.messageId
-        )
+        let messageId = try await seedLegacyDispatch(store: store, itemId: item.itemId).messageId
 
         // Even a changed head cannot settle the exact same unresolved thread
         // generation; only the canonical GitHub observation owns that truth.
@@ -189,39 +179,6 @@ struct GitHubCommandRuntimeTests {
         #expect(await callbackRecorder.outcomes().contains {
             $0.phase == .blocked && $0.verification == .failed
         })
-    }
-
-    @Test("a skipped wakeup records dispatch_failed and never codex_working")
-    func skippedWakeupRecordsDispatchFailed() async throws {
-        let root = try root(); defer { try? FileManager.default.removeItem(at: root) }
-        let store = GitHubCommandStore(dataRoot: root)
-        let item = try await store.observe(actionable())
-        let observation = actionable()
-        let runtime = GitHubCommandRuntime(
-            dataRoot: root,
-            observationLoader: { _ in observation },
-            bridgeSender: { _, intent, _ in
-                // A queued inbox row whose wakeup was skipped (helper missing or
-                // disabled) — no codex turn started. The real classifier must
-                // reject it as a dispatch failure.
-                let skipped: JSONValue = .object([
-                    "status": .string("queued"),
-                    "messageId": .string(intent.dispatchId),
-                    "wakeup": .object([
-                        "status": .string("skipped"),
-                        "reason": .string("helper_not_found"),
-                    ]),
-                ])
-                return try GitHubCommandRuntime.receipt(fromCodexMessageResult: skipped, intent: intent)
-            },
-            notificationSender: { _ in ("accepted", "test receipt") }
-        )
-
-        await runtime.processConnectorChanges()
-
-        let result = try #require(try await store.liveState().item(item.itemId))
-        #expect(result.state == .attention(.dispatchFailed))
-        #expect(result.dispatchReceipt == nil)
     }
 
     @Test("checkout resolver selects only a local repository with the matching GitHub remote")
@@ -276,12 +233,24 @@ struct GitHubCommandRuntimeTests {
         GitHubCommandRuntime(
             dataRoot: root,
             observationLoader: { item in try await recorder.load(item) },
-            bridgeSender: { item, intent, payload in
-                try await recorder.dispatch(item: item, intent: intent, payload: payload)
-            },
             notificationSender: { intent in try await recorder.notify(intent) },
             outcomeObserver: { model in await recorder.recordOutcome(model) }
         )
+    }
+
+    private func seedLegacyDispatch(
+        store: GitHubCommandStore,
+        itemId: String
+    ) async throws -> GitHubCommandDispatchReceipt {
+        let intent = try #require(try await store.prepareDispatch(itemId: itemId))
+        let receipt = GitHubCommandDispatchReceipt(
+            eventKey: intent.eventKey,
+            dispatchId: intent.dispatchId,
+            messageId: intent.dispatchId,
+            queuedAt: DeskClock.nowISO()
+        )
+        _ = try await store.recordDispatchSuccess(itemId: itemId, receipt: receipt)
+        return receipt
     }
 
     private func runGit(_ arguments: [String], at directory: URL) throws {
@@ -301,34 +270,24 @@ private actor RuntimeRecorder {
 
     private var observation: GitHubCommandObservation?
     private var readItemIds: [String] = []
-    private var sentPayloads: [String] = []
-    private var sentDispatchIds: [String] = []
     private var sentNotifications: [GitHubCommandNotificationIntent] = []
     private var motorOutcomes: [MotorActionReadModel] = []
+    private let failObservationReads: Bool
 
-    init(observation: GitHubCommandObservation? = nil) {
+    init(
+        observation: GitHubCommandObservation? = nil,
+        failObservationReads: Bool = false
+    ) {
         self.observation = observation
+        self.failObservationReads = failObservationReads
     }
 
     func load(_ item: GitHubCommandItem) throws -> GitHubCommandObservation {
         readItemIds.append(item.itemId)
-        guard let observation else { throw ProbeError.missingObservation }
-        return observation
-    }
-
-    func dispatch(
-        item: GitHubCommandItem,
-        intent: GitHubCommandDispatchIntent,
-        payload: String
-    ) -> GitHubCommandDispatchReceipt {
-        sentPayloads.append(payload)
-        sentDispatchIds.append(intent.dispatchId)
-        return GitHubCommandDispatchReceipt(
-            eventKey: intent.eventKey,
-            dispatchId: intent.dispatchId,
-            messageId: intent.dispatchId,
-            queuedAt: DeskClock.nowISO()
-        )
+        if failObservationReads { throw ProbeError.missingObservation }
+        if let observation { return observation }
+        guard let current = item.observation else { throw ProbeError.missingObservation }
+        return current
     }
 
     func notify(_ intent: GitHubCommandNotificationIntent) -> (String, String) {
@@ -338,8 +297,6 @@ private actor RuntimeRecorder {
 
     func recordOutcome(_ model: MotorActionReadModel) { motorOutcomes.append(model) }
 
-    func payloads() -> [String] { sentPayloads }
-    func dispatchIds() -> [String] { sentDispatchIds }
     func observationReads() -> [String] { readItemIds }
     func notifications() -> [GitHubCommandNotificationIntent] { sentNotifications }
     func outcomes() -> [MotorActionReadModel] { motorOutcomes }

@@ -148,6 +148,32 @@ public enum ChatPersistenceContext {
     /// inside the same task tree uses suppressUserAppend:false and must mint
     /// its own runId rather than inherit this one.
     @TaskLocal public static var pinnedTurnRunID: String?
+    /// Session provenance (658.14): the ORIGIN of an inbound message, on its
+    /// own channel. Deliberately NOT the `surface` parameter — `surface` is
+    /// also the tool-authorization surface (the claude/codex bridges run with
+    /// `surface: "chat"` on purpose, per User's 2026-06-13 call that the bridge
+    /// gets the same tool surface as chat), so retagging it to carry origin
+    /// would silently change what the bridge is allowed to do. Stamped onto
+    /// the USER row's metadata only; assistant rows are always hers.
+    @TaskLocal public static var originProvenance: ChatMessageOrigin?
+}
+
+/// Where an inbound chat message actually came from, recorded out-of-band so a
+/// reader does not have to trust an in-band `[from: ...]` prefix that both the
+/// human and the untrusted payload can type verbatim.
+public struct ChatMessageOrigin: Sendable, Equatable, Codable {
+    /// Transport the message arrived on, e.g. "claude-bridge", "codex-bridge".
+    public let surface: String
+    /// Server-selected bridge lane, e.g. "claude", "codex". This records the
+    /// authenticated request route; the bridge's shared bearer does not provide
+    /// a separate cryptographic attestation of the calling process. Nil when
+    /// the lane is unattributed.
+    public let agent: String?
+
+    public init(surface: String, agent: String? = nil) {
+        self.surface = surface
+        self.agent = agent
+    }
 }
 
 /// Request-scoped identity stamped on the canonical assistant row before the
@@ -674,6 +700,23 @@ extension SwiftNativeChatOrchestrationClient {
         if let persona, !persona.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             metadata["persona"] = .string(persona)
         }
+        // Session provenance (658.14). Durable, out-of-band origin marking for
+        // messages that did NOT come from the human at this Mac. Only the user
+        // row carries it: an assistant row is hers by construction, and
+        // stamping origin there would imply the reply came from the bridge.
+        let originProvenance = role == "user"
+            ? ChatPersistenceContext.originProvenance
+            : nil
+        if let origin = originProvenance {
+            var originObject: [String: JSONValue] = [
+                "surface": .string(origin.surface),
+            ]
+            if let agent = origin.agent,
+               !agent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                originObject["agent"] = .string(agent)
+            }
+            metadata["origin"] = .object(originObject)
+        }
         if canonicalAssistantCompletion,
            role == "assistant",
            let binding = ChatPersistenceContext.codexCompletionBinding,
@@ -754,6 +797,11 @@ extension SwiftNativeChatOrchestrationClient {
                         "regenerate replacement target is not an assistant message"
                     )
                 }
+                guard index == rows.indices.last else {
+                    throw ChatOrchestrationError.underlying(
+                        "regenerate replacement target is no longer the transcript tail"
+                    )
+                }
                 let priorTurnTraceID = Self.messageTurnTraceID(in: rows[index])
                 var replaced = rows
                 replaced[index] = messageRow
@@ -823,6 +871,7 @@ extension SwiftNativeChatOrchestrationClient {
             source: messageSource,
             createdAt: createdAt,
             messageId: messageId,
+            origin: originProvenance,
             recalledMemoryIds: recalledMemoryIds
         )
     }
@@ -1073,6 +1122,7 @@ extension SwiftNativeChatOrchestrationClient {
         source: String,
         createdAt: String,
         messageId: String,
+        origin: ChatMessageOrigin? = nil,
         recalledMemoryIds: [String] = []
     ) async {
         guard let cognitiveObserver else { return }
@@ -1083,7 +1133,9 @@ extension SwiftNativeChatOrchestrationClient {
         switch normalizedRole {
         case "user":
             kind = .userMessageReceived
-            sourceClass = .userStated
+            // A bridge worker is not the human. Out-of-band origin, never its
+            // forgeable text prefix, decides this trust class.
+            sourceClass = origin == nil ? .userStated : .imported
             importance = 0.65
         case "assistant":
             if content.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().hasPrefix("chat error:") {
@@ -1105,6 +1157,22 @@ extension SwiftNativeChatOrchestrationClient {
             "role": .string(normalizedRole),
             "source": .string(source),
         ]
+        if normalizedRole == "user", let origin {
+            // Keep the cognitive ledger correlated with the canonical
+            // transcript without copying attacker-sized TaskLocal strings.
+            // This is recorded route provenance, not a named-agent identity
+            // attestation (the bridge currently uses one shared bearer).
+            var cognitiveOrigin: [String: JSONValue] = [
+                "surface": .string(String(origin.surface.unicodeScalars.prefix(80))),
+            ]
+            if let agent = origin.agent {
+                let boundedAgent = String(agent.unicodeScalars.prefix(80))
+                if !boundedAgent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    cognitiveOrigin["agent"] = .string(boundedAgent)
+                }
+            }
+            metadata["origin"] = .object(cognitiveOrigin)
+        }
         if let runId { metadata["runId"] = .string(runId) }
         if kind == .providerFailure, providerLifecycleObserverInstalled {
             metadata[CognitiveSomaticSignalAdapter.somaticOwnerMetadataKey] = .string(
@@ -1128,13 +1196,29 @@ extension SwiftNativeChatOrchestrationClient {
         }
         // Chat workload class comes from surface provenance, never from topic
         // words. An ordinary user asking about the scheduler/doctor/observatory
-        // is still a live turn. The bridge's explicit provenance prefix may
-        // classify diagnostic traffic as debug/verification; the runtime then
-        // carries that class through the correlated run to tools and reply.
-        let inferredTurnKind = CognitiveTurnKind.inferred(fromSignals: [
-            source,
-            redactedSummary,
-        ])
+        // is still a live turn. Verified out-of-band bridge origin makes
+        // bounded content markers eligible to classify diagnostic traffic as
+        // debug/verification; the runtime then carries that class through the
+        // correlated run to tools and reply.
+        let classificationSignals: [String]
+        if normalizedRole == "user", let origin, Self.isTrustedBridgeOrigin(origin) {
+            // Content markers are eligible only behind a server-bound bridge
+            // lane. This is transport provenance, not a claim inferred from
+            // prose supplied by the human.
+            // The synthetic prefix keeps the existing Codex debug classifier
+            // behavior without trusting prose supplied by a Mac user.
+            classificationSignals = [
+                source,
+                origin.surface,
+                origin.agent.map { "[from: \($0), via bridge]" } ?? "",
+                redactedSummary,
+            ]
+        } else if normalizedRole == "user" {
+            classificationSignals = [source]
+        } else {
+            classificationSignals = [source, redactedSummary]
+        }
+        let inferredTurnKind = CognitiveTurnKind.inferred(fromSignals: classificationSignals)
         let turnKind: CognitiveTurnKind = switch inferredTurnKind {
         case .debug, .verification: inferredTurnKind
         case .live, .system: .live
@@ -1172,6 +1256,21 @@ extension SwiftNativeChatOrchestrationClient {
             turnKind: turnKind,
             metadata: metadata
         ))
+    }
+
+    private static func isTrustedBridgeOrigin(_ origin: ChatMessageOrigin) -> Bool {
+        let surface = origin.surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let agent = origin.agent?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        switch (surface, agent) {
+        case ("claude-bridge", "claude"),
+             ("codex-bridge", "codex"),
+             ("omp-bridge", "omp"):
+            return true
+        default:
+            return false
+        }
     }
 
     private func observeCognitiveTool(

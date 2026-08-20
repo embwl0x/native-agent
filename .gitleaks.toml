@@ -11,4 +11,8 @@ paths = [
   # mac_view secret-redaction suite: proves key-shaped strings are redacted
   # before the agent sees them, so its fixtures deliberately look like keys.
   '''Modules/NativeAgentCore/Tests/MacControlTests/MacScreenViewTests\.swift$''',
+  # Chrome Web Store extension identity. This public manifest field is named
+  # "key", but its value is intentionally shipped to keep the extension ID
+  # stable; it is not an authentication credential.
+  '''Extensions/NativeAgentChrome/manifest\.json$''',
 ]

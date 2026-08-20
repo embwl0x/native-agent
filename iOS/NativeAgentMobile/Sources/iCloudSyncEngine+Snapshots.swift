@@ -132,6 +132,7 @@ extension iCloudSyncEngine {
         guard generation == snapshotRefreshGeneration,
               lifecycle == lifecycleGeneration else { return }
         if let v = bundle.workshopTasks { workshopTasks = v }
+        if let v = bundle.deskItems { deskItems = v }
         if let v = bundle.skills { skills = v }
         if let v = bundle.memories { memories = v }
         if let v = bundle.memoryProposals { memoryProposals = v.filter(\.isPending) }
@@ -249,6 +250,7 @@ extension iCloudSyncEngine {
         guard generation == targetedRefreshGeneration,
               lifecycle == lifecycleGeneration else { return }
         if let v = bundle.workshopTasks { workshopTasks = v }
+        if let v = bundle.deskItems { deskItems = v }
         if let v = bundle.memories { memories = v }
         if let v = bundle.inboxItems {
             inboxSnapshotLoaded = true
@@ -309,6 +311,20 @@ extension iCloudSyncEngine {
         } else {
             guard lifecycle == lifecycleGeneration else { return }
             syncError = "Workshop snapshot is still downloading from iCloud. Try again in a moment."
+        }
+    }
+
+    func refreshDeskSnapshot() async {
+        guard let snapshotDir else { return }
+        let lifecycle = lifecycleGeneration
+        if let latest: [MobileDeskItem] = await Self.loadSnapshotArrayOnly(named: "desk.json", in: snapshotDir) {
+            guard lifecycle == lifecycleGeneration else { return }
+            deskItems = latest
+            lastSyncAt = Date()
+            syncError = nil
+        } else {
+            guard lifecycle == lifecycleGeneration else { return }
+            syncError = "Desk is still syncing from the Mac. Try again in a moment."
         }
     }
 
@@ -510,6 +526,7 @@ extension iCloudSyncEngine {
 
     private struct SnapshotBundle: Sendable {
         var workshopTasks: [WorkshopTaskRecord]?
+        var deskItems: [MobileDeskItem]?
         var skills: [SkillRecord]?
         var memories: [MemoryRecord]?
         var memoryProposals: [MemoryProposalRecord]?
@@ -531,6 +548,7 @@ extension iCloudSyncEngine {
 
         var loadedAnySnapshot: Bool {
             workshopTasks != nil ||
+                deskItems != nil ||
                 skills != nil ||
                 memories != nil ||
                 memoryProposals != nil ||
@@ -552,7 +570,7 @@ extension iCloudSyncEngine {
         }
 
         var loadedAllSnapshots: Bool {
-            workshopTasks != nil && skills != nil && memories != nil && memoryProposals != nil
+            workshopTasks != nil && deskItems != nil && skills != nil && memories != nil && memoryProposals != nil
                 && trainingProposals != nil && promotionCandidates != nil && trustPolicy != nil
                 && personality != nil && health != nil && organismLivingStatus != nil
                 && sessions != nil && pinnedChatSessions != nil && chatTranscripts != nil
@@ -563,6 +581,7 @@ extension iCloudSyncEngine {
 
     private struct ActivitySnapshotBundle: Sendable {
         var workshopTasks: [WorkshopTaskRecord]?
+        var deskItems: [MobileDeskItem]?
         var memories: [MemoryRecord]?
         var inboxItems: [InboxItemRecord]?
         var memoryProposals: [MemoryProposalRecord]?
@@ -571,6 +590,7 @@ extension iCloudSyncEngine {
 
         var loadedAnySnapshot: Bool {
             workshopTasks != nil ||
+                deskItems != nil ||
                 memories != nil ||
                 inboxItems != nil ||
                 memoryProposals != nil ||
@@ -579,7 +599,7 @@ extension iCloudSyncEngine {
         }
 
         var loadedAllSnapshots: Bool {
-            workshopTasks != nil && memories != nil && inboxItems != nil
+            workshopTasks != nil && deskItems != nil && memories != nil && inboxItems != nil
                 && memoryProposals != nil && trainingProposals != nil
                 && promotionCandidates != nil
         }
@@ -620,6 +640,7 @@ extension iCloudSyncEngine {
 
     private nonisolated static func loadAllSnapshots(snapshotDir: URL) async -> SnapshotBundle {
         async let workshopTasks: [WorkshopTaskRecord]? = loadSnapshotArrayOnly(named: "workshop_tasks.json", in: snapshotDir)
+        async let deskItems: [MobileDeskItem]? = loadSnapshotArrayOnly(named: "desk.json", in: snapshotDir)
         async let skills: [SkillRecord]? = loadSnapshotArrayOnly(named: "skills_snapshot.json", in: snapshotDir)
         async let memories: [MemoryRecord]? = loadSnapshotArrayOnly(named: "memories.json", in: snapshotDir)
         async let memoryProposals: [MemoryProposalRecord]? = loadSnapshotArrayOnly(named: "memory_proposals.json", in: snapshotDir)
@@ -640,6 +661,7 @@ extension iCloudSyncEngine {
         async let turnSummaries: TurnSummaryFile? = loadSnapshotObjectOnly(named: "turn_summaries.json", in: snapshotDir)
         return await SnapshotBundle(
             workshopTasks: workshopTasks,
+            deskItems: deskItems,
             skills: skills,
             memories: memories,
             memoryProposals: memoryProposals,
@@ -698,6 +720,7 @@ extension iCloudSyncEngine {
 
     private nonisolated static func loadActivitySnapshots(snapshotDir: URL) async -> ActivitySnapshotBundle {
         async let workshopTasks: [WorkshopTaskRecord]? = loadSnapshotArrayOnly(named: "workshop_tasks.json", in: snapshotDir)
+        async let deskItems: [MobileDeskItem]? = loadSnapshotArrayOnly(named: "desk.json", in: snapshotDir)
         async let memories: [MemoryRecord]? = loadSnapshotArrayOnly(named: "memories.json", in: snapshotDir)
         async let inboxItems: [InboxItemRecord]? = loadSnapshotArrayOnly(named: "inbox.json", in: snapshotDir)
         async let memoryProposals: [MemoryProposalRecord]? = loadSnapshotArrayOnly(named: "memory_proposals.json", in: snapshotDir)
@@ -705,6 +728,7 @@ extension iCloudSyncEngine {
         async let promotionCandidates: [PromotionCandidateSummary]? = loadSnapshotArrayOnly(named: "promotion_candidates.json", in: snapshotDir)
         return await ActivitySnapshotBundle(
             workshopTasks: workshopTasks,
+            deskItems: deskItems,
             memories: memories,
             inboxItems: inboxItems,
             memoryProposals: memoryProposals,

@@ -21,9 +21,9 @@ struct AdvancedView: View {
                 // ── Manage — everything the Mac sidebar promotes to primary ──
                 Section {
                     NavigationLink {
-                        WorkshopView()
+                        MobileDeskView()
                     } label: {
-                        Label("Workshop", systemImage: "target")
+                        Label("Desk", systemImage: "rectangle.3.group")
                     }
                     NavigationLink {
                         PersonalityDetailHostView()
@@ -100,7 +100,7 @@ struct AdvancedView: View {
                         HStack(spacing: 10) {
                             Image(systemName: "info.circle")
                                 .foregroundStyle(NativeAgentPalette.agentAccent)
-                            Text("Some advanced controls require a live Mac connection. Skill installs, eval runs, and Workshop policy editing are Mac-only today.")
+                            Text("Some advanced controls require a live Mac connection. Skill installs, eval runs, and Workshop policy editing are Mac-only today. Desk changes sync with the paired Mac.")
                                 .font(AppFont.label)
                                 .foregroundStyle(.secondary)
                         }

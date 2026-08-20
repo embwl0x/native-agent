@@ -106,6 +106,12 @@ actor _MockAppControlAdapter: AppControlAdapter, AppStateVerificationAdapter {
         terminated: true
     )
     var shouldThrow: Error? = nil
+    private var frontmost = true
+
+    func configureFocus(result: AppControlRunResult, frontmost: Bool) {
+        focusResult = result
+        self.frontmost = frontmost
+    }
 
     func focusApp(named name: String) async throws -> AppControlRunResult {
         calls.append(.focus(name))
@@ -120,7 +126,7 @@ actor _MockAppControlAdapter: AppControlAdapter, AppStateVerificationAdapter {
     }
 
     func isFrontmostApplication(matching name: String) async -> Bool {
-        name == focusResult.requestedName
+        frontmost && name == focusResult.requestedName
     }
 
     func isApplicationRunning(matching name: String) async -> Bool {
@@ -1039,6 +1045,70 @@ final class _MockFileManagerAdapter: FileManagerAdapter, FileStateVerificationAd
     #expect(obj["status"] == .string("focused"))
     #expect(obj["bundle_identifier"] == .string("com.apple.Safari"))
     #expect(obj["activated"] == .bool(true))
+}
+
+@Test func focusAppUsesObservedFrontmostStateWhenActivationRequestReturnsFalse() async throws {
+    let apps = _MockAppControlAdapter()
+    await apps.configureFocus(result: AppControlRunResult(
+        requestedName: "Safari",
+        matchedName: "Safari",
+        bundleIdentifier: "com.apple.Safari",
+        processIdentifier: 123,
+        launched: false,
+        activated: false,
+        activationRequestAccepted: false,
+        activationFallbackAttempted: true,
+        activationFallbackSucceeded: true,
+        terminated: false
+    ), frontmost: true)
+    let client = SwiftNativeMacControl(http: _MockHTTPClient(), appControlAdapter: apps)
+
+    let result = try await client.dispatch(action: "focus_app", body: ["app": .string("Safari")])
+
+    #expect(result.ok)
+    #expect(result.error == nil)
+    guard case .object(let output) = result.output else {
+        Issue.record("expected app-control output object")
+        return
+    }
+    #expect(output["status"] == .string("focused"))
+    #expect(output["activated"] == .bool(true))
+    #expect(output["verified"] == .bool(true))
+    #expect(output["activation_request_accepted"] == .bool(false))
+    #expect(output["activation_fallback_succeeded"] == .bool(true))
+}
+
+@Test func focusAppFailsHonestlyWhenActivationRequestReturnsFalseAndTargetNeverBecomesFrontmost() async throws {
+    let apps = _MockAppControlAdapter()
+    await apps.configureFocus(result: AppControlRunResult(
+        requestedName: "Safari",
+        matchedName: "Safari",
+        bundleIdentifier: "com.apple.Safari",
+        processIdentifier: 123,
+        launched: false,
+        activated: false,
+        activationRequestAccepted: false,
+        activationFallbackAttempted: true,
+        activationFallbackSucceeded: true,
+        activationFailureReason: "NSRunningApplication.activate returned false; NSWorkspace.openApplication fallback completed; target was not observed frontmost within 1.5 seconds",
+        terminated: false
+    ), frontmost: false)
+    let client = SwiftNativeMacControl(http: _MockHTTPClient(), appControlAdapter: apps)
+
+    let result = try await client.dispatch(action: "focus_app", body: ["app": .string("Safari")])
+
+    #expect(result.ok == false)
+    #expect(result.error?.contains("NSRunningApplication.activate returned false") == true)
+    #expect(result.error?.contains("fallback completed") == true)
+    #expect(result.error?.contains("not observed frontmost") == true)
+    guard case .object(let output) = result.output else {
+        Issue.record("expected app-control output object")
+        return
+    }
+    #expect(output["status"] == .string("focus_failed"))
+    #expect(output["activated"] == .bool(false))
+    #expect(output["verified"] == .bool(false))
+    #expect(output["failure_reason"] == .string(result.error!))
 }
 
 @Test func quitAppRunsInSwiftWithoutHTTP() async throws {

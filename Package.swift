@@ -11,7 +11,8 @@ let package = Package(
         .macOS("26.0")
     ],
     products: [
-        .executable(name: "NativeAgentApp", targets: ["NativeAgentApp"])
+        .executable(name: "NativeAgentApp", targets: ["NativeAgentApp"]),
+        .executable(name: "NativeAgentChromeRelay", targets: ["NativeAgentChromeRelay"])
     ],
     dependencies: [
         .package(
@@ -25,11 +26,21 @@ let package = Package(
         .package(path: "Modules/NativeAgentCore")
     ],
     targets: [
+        .target(
+            name: "NativeAgentChromeRelayCore",
+            path: "Sources/NativeAgentChromeRelayCore"
+        ),
+        .executableTarget(
+            name: "NativeAgentChromeRelay",
+            dependencies: ["NativeAgentChromeRelayCore"],
+            path: "Sources/NativeAgentChromeRelay"
+        ),
         .executableTarget(
             name: "NativeAgentApp",
             dependencies: [
                 .product(name: "Sparkle", package: "Sparkle"),
                 .product(name: "NativeAgentShared", package: "NativeAgentShared"),
+                "NativeAgentChromeRelayCore",
                 .product(name: "NativeAgentCore", package: "NativeAgentCore"),
                 .product(name: "ApprovalInbox", package: "NativeAgentCore"),
                 .product(name: "MCPDispatcher", package: "NativeAgentCore"),
@@ -191,8 +202,14 @@ let package = Package(
                 // menu-bar indicator are driven by ActivityPolicy, so the app
                 // tests need the type in scope to pin default-OFF behaviour.
                 .product(name: "ActivityWatch", package: "NativeAgentCore"),
+                "NativeAgentChromeRelayCore",
             ],
             path: "tests/NativeAgentAppTests"
+        ),
+        .testTarget(
+            name: "NativeAgentChromeRelayTests",
+            dependencies: ["NativeAgentChromeRelayCore"],
+            path: "tests/NativeAgentChromeRelayTests"
         )
     ]
 )

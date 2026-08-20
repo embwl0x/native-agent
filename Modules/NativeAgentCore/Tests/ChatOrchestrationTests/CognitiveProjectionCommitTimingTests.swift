@@ -929,3 +929,43 @@ func textCompat_postToolEmptyExhaustionCarriesRetryUnsafeMarker() async throws {
             "post-tool-effect terminal error must carry the retry-unsafe marker")
     #expect(errorMessage?.contains("no answer text") == true)
 }
+
+// R7 — narrated tool invocation (live incident 2026-08-17, Telegram session
+// B7ED3E77 msg #6: reply was exactly `**Tool: desk_read**`; nothing ran until
+// the user prodded). Pinned forever per the completion-contract convention.
+@Suite("Completion contract R7 — narrated tool invocation")
+struct NarratedToolInvocationDetectorTests {
+    let tools: Set<String> = ["desk_read", "recall_memory", "mac_view"]
+
+    @Test func literalLiveIncidentMatches() {
+        #expect(ToolCallParser.looksLikeNarratedToolInvocation("**Tool: desk_read**", knownToolNames: tools))
+    }
+
+    @Test func invocationFramesMatch() {
+        for reply in ["Tool: desk_read", "running desk_read", "calling desk_read(scope: all)", "desk_read(scope: all)"] {
+            #expect(ToolCallParser.looksLikeNarratedToolInvocation(reply, knownToolNames: tools), "should match: \(reply)")
+        }
+    }
+
+    @Test func completedWorkAndQuestionsNeverMatch() {
+        for reply in [
+            "I used desk_read earlier and it came back clean.",
+            "Should I run desk_read?",
+            "using desk_read I found nothing worth flagging",
+            "**Tool: bogus_tool**",
+            // Bare name with no invocation frame is a legitimate short ANSWER,
+            // not an attempted call (gpt-5.5 LOW, 2026-08-17).
+            "desk_read",
+            "`desk_read`",
+            "Use:\ndesk_read",
+            "The recommended tool is:\ndesk_read",
+            "Desk is calm — v0.4.1 shipped, watches quiet, nothing needs you. I checked with desk_read just now and the board matches what I told you this morning, all thirty items accounted for and the release cycle is closed out for good."
+        ] {
+            #expect(!ToolCallParser.looksLikeNarratedToolInvocation(reply, knownToolNames: tools), "must not match: \(reply)")
+        }
+    }
+
+    @Test func emptyCatalogNeverMatches() {
+        #expect(!ToolCallParser.looksLikeNarratedToolInvocation("**Tool: desk_read**", knownToolNames: []))
+    }
+}

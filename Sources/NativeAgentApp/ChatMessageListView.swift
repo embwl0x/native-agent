@@ -159,6 +159,9 @@ struct ChatMessageListView: View {
     /// "N tools used" summary. Callers that genuinely have no live state (the
     /// default) keep the old behaviour.
     var isStreaming: Bool = false
+    /// The current transcript-search result. Highlighting is projection-only;
+    /// it never changes or filters canonical messages.
+    var highlightedMessageID: String? = nil
 
     var body: some View {
         let lastAssistantId = messages.last(where: { $0.role == "assistant" })?.id
@@ -192,6 +195,10 @@ struct ChatMessageListView: View {
                     message: msg,
                     isLastAssistant: msg.role == "assistant" && msg.id == lastAssistantId
                 )
+                .modifier(MacChatTranscriptSearchHighlight(
+                    isHighlighted: msg.id == highlightedMessageID
+                ))
+                .id(MacChatTranscriptSearch.scrollTargetID(for: msg.id))
                 // phase 6: entrance animates ONLY when the append seam
                 // (appendChatMessage) supplies a transaction; removals and
                 // wholesale replaces are .identity → instant (no animated
@@ -200,6 +207,26 @@ struct ChatMessageListView: View {
                     insertion: .opacity.combined(with: .offset(y: 8)),
                     removal: .identity))
             }
+        }
+    }
+}
+
+private struct MacChatTranscriptSearchHighlight: ViewModifier {
+    let isHighlighted: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if isHighlighted {
+            content
+                .overlay {
+                    RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous)
+                        .strokeBorder(NativeAgentBrand.accent, lineWidth: 2)
+                        .padding(-5)
+                        .accessibilityHidden(true)
+                }
+                .accessibilityAddTraits(.isSelected)
+        } else {
+            content
         }
     }
 }
@@ -741,10 +768,13 @@ final class ChatMarkdownCache: @unchecked Sendable {
         }
         lock.unlock()
         RenderAudit.bump("markdown.parse")
-        guard let parsed = try? AttributedString(
+        guard let raw = try? AttributedString(
             markdown: content,
             options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
         ) else { return nil }
+        // Untrusted content: drop live links for any scheme outside the
+        // allowlist before the string is ever handed to a Text view.
+        let parsed = ChatLinkPolicy.sanitized(raw)
         lock.lock()
         if cache[content] == nil {
             cache[content] = parsed
@@ -842,9 +872,20 @@ struct MessageBubble: View {
     @State private var bubbleToast: String? = nil
     @State private var isHovered = false
 
-    private var isUser: Bool { message.role == "user" }
+    private var normalizedRole: String {
+        message.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+    private var isUser: Bool { normalizedRole == "user" }
+
+    private var messageProvenance: MacChatMessageProvenance? {
+        MacChatMessageProvenance.make(
+            role: message.role,
+            source: message.source,
+            origin: message.metadata?.origin
+        )
+    }
     private var displayRole: String {
-        switch message.role {
+        switch normalizedRole {
         case "user": "You"
         // The configured persona profile name — NOT the
         // chatPersona style quick-switch, which can read "Custom"/"AI".
@@ -875,6 +916,22 @@ struct MessageBubble: View {
                                 .opacity(isHovered ? 1 : 0)
                         }
                     }
+                }
+
+                // 658.14 session provenance. A user row that did not come from
+                // the human at this Mac says so, durably and above the bubble,
+                // so scrollback is readable as a trust boundary and not just as
+                // prose. The label set is closed (MacChatMessageProvenance) —
+                // no recorded string is ever interpolated into this view.
+                if isUser, let provenance = messageProvenance {
+                    HStack(spacing: NativeAgentSpacing.xs) {
+                        Image(systemName: provenance.symbol)
+                        Text(provenance.label)
+                    }
+                    .font(NativeAgentFont.tag)
+                    .foregroundStyle(provenance.isAutomated ? Color.orange : Color.secondary)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("Message origin: \(provenance.label)")
                 }
 
                 // Message content bubble
@@ -977,6 +1034,10 @@ struct MessageBubble: View {
                         .opacity(isHovered ? 1 : 0)
                         .scaleEffect(isHovered ? 1 : 0.96, anchor: isUser ? .topTrailing : .topLeading)
                         .allowsHitTesting(isHovered)
+                        // This is a pointer-only duplicate of the message's
+                        // accessibility actions below. Keeping an opacity-zero
+                        // button row in the AX tree creates phantom focus stops.
+                        .accessibilityHidden(true)
                         .animation(NativeAgentMotion.snappy, value: isHovered)
                     }
 
@@ -1027,13 +1088,21 @@ struct MessageBubble: View {
         }
         .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
         .animation(NativeAgentMotion.snappy, value: bubbleToast)
-        .accessibilityAction(named: "Copy message") {
-            ChatClipboard.copy(message.content)
-            showBubbleToast("Copied")
-        }
-        .accessibilityAction(named: "Read message aloud") {
-            if !isUser { toggleReadAloud() }
-        }
+        .modifier(MessageBubbleAccessibilityActions(
+            isUser: isUser,
+            isLastAssistant: isLastAssistant,
+            onCopy: {
+                ChatClipboard.copy(message.content)
+                showBubbleToast("Copied")
+            },
+            onReadAloud: toggleReadAloud,
+            onRegenerate: {
+                Task { await appModel.regenerateAssistantMessage(message) }
+            },
+            onFeedback: { rating in
+                postFeedback(messageId: message.id, rating: rating)
+            }
+        ))
         .onAppear { emitFirstRenderIfNeeded() }
         .onChange(of: message.content) { emitFirstRenderIfNeeded() }
         // Read-aloud failures (trust denied / not configured / auth rejected)
@@ -1095,11 +1164,49 @@ struct MessageBubble: View {
         // bubble in a non-active session still renders correctly when the
         // user switches back to view it.
         if appModel.isSessionStreaming(message.sessionId ?? appModel.activeChatSessionId) && isLastAssistant && message.role == "assistant" {
+            // Streaming stays raw: the in-flight bubble changes on every
+            // coalesce tick, so neither the block split nor the markdown parse
+            // may run here. Rich content resolves once the turn settles.
             Text(message.content)
-        } else if let attributed = ChatMarkdownCache.attributed(message.content) {
+        } else {
+            // 658.13: one pass over cached blocks. Prose keeps the existing
+            // cached inline-markdown path; fenced code becomes a real code
+            // block instead of the newline-collapsed mangle it used to be.
+            let blocks = ChatRichContentCache.blocks(message.content)
+            if blocks.count == 1, case .prose(let only) = blocks[0] {
+                // The overwhelmingly common case. Rendering it bare keeps the
+                // pre-658.13 view tree exactly as it was — no extra VStack and
+                // no ForEach per bubble across a long transcript, and the
+                // bubble still HUGS its text instead of being stretched by a
+                // full-width child.
+                proseText(only)
+            } else {
+                VStack(alignment: isUser ? .trailing : .leading, spacing: NativeAgentSpacing.sm) {
+                    // Positional identity: `blocks` is recomputed atomically
+                    // from one content string, and a message may legitimately
+                    // repeat the same snippet twice.
+                    ForEach(blocks.indices, id: \.self) { index in
+                        switch blocks[index] {
+                        case .prose(let text):
+                            proseText(text)
+                        case .code(let language, let code):
+                            ChatCodeBlockView(language: language, code: code)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Prose runs through the existing cached inline-markdown path. No width
+    /// frame: a `maxWidth: .infinity` child would stretch a short user bubble
+    /// to its full 540 pt cap instead of letting it hug its content.
+    @ViewBuilder
+    private func proseText(_ text: String) -> some View {
+        if let attributed = ChatMarkdownCache.attributed(text) {
             Text(attributed)
         } else {
-            Text(message.content)
+            Text(text)
         }
     }
 
@@ -1168,6 +1275,40 @@ struct MessageBubble: View {
             return [model, effort, access].compactMap { $0 }.joined(separator: " / ")
         }
         return model ?? effort
+    }
+}
+
+/// VoiceOver actions for a transcript message. The pointer hover bar is hidden
+/// from accessibility because it is opacity-zero until mouse hover; this is the
+/// stable keyboard/VoiceOver surface for the same commands. Most importantly,
+/// user-authored messages never advertise assistant-only actions that no-op.
+private struct MessageBubbleAccessibilityActions: ViewModifier {
+    let isUser: Bool
+    let isLastAssistant: Bool
+    let onCopy: () -> Void
+    let onReadAloud: () -> Void
+    let onRegenerate: () -> Void
+    let onFeedback: (String) -> Void
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if isUser {
+            content
+                .accessibilityAction(named: "Copy message", onCopy)
+        } else if isLastAssistant {
+            assistantActions(content)
+                .accessibilityAction(named: "Regenerate response", onRegenerate)
+        } else {
+            assistantActions(content)
+        }
+    }
+
+    private func assistantActions(_ content: Content) -> some View {
+        content
+            .accessibilityAction(named: "Copy message", onCopy)
+            .accessibilityAction(named: "Read message aloud", onReadAloud)
+            .accessibilityAction(named: "Mark response helpful") { onFeedback("up") }
+            .accessibilityAction(named: "Mark response not helpful") { onFeedback("down") }
     }
 }
 
@@ -1369,33 +1510,30 @@ private struct BubbleAction: View {
     }
 }
 
+/// Canonical debug projection used by the context-menu JSON sheet. Encoding
+/// the model itself keeps this inspection surface aligned with the transcript
+/// wire shape; a hand-maintained dictionary previously omitted
+/// `metadata.origin` and made a bridge row look indistinguishable from a local
+/// user row precisely where someone would inspect it.
+enum ChatMessageDebugJSON {
+    static func text(for message: ChatMessage) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(message),
+              let string = String(data: data, encoding: .utf8) else {
+            return "{}"
+        }
+        return string
+    }
+}
+
 // PATCH-2026-05-08: polish-wave — JSON debug sheet for message context menu
 private struct MessageJSONSheet: View {
     let message: ChatMessage
     @Environment(\.dismiss) private var dismiss
 
     private var jsonText: String {
-        var dict: [String: Any] = [
-            "id": message.id,
-            "role": message.role,
-            "content": message.content,
-        ]
-        if let sid = message.sessionId { dict["session_id"] = sid }
-        if let rid = message.runId { dict["run_id"] = rid }
-        if let src = message.source { dict["source"] = src }
-        dict["created_at"] = message.createdAt
-        if let meta = message.metadata {
-            var metaDict: [String: Any] = [:]
-            if let m = meta.model { metaDict["model"] = m }
-            if let k = meta.kind { metaDict["kind"] = k }
-            if let t = meta.toolName { metaDict["tool_name"] = t }
-            if let r = meta.resultSummary { metaDict["result_summary"] = r }
-            if let ok = meta.ok { metaDict["ok"] = ok }
-            dict["metadata"] = metaDict
-        }
-        guard let data = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]),
-              let str = String(data: data, encoding: .utf8) else { return "{}" }
-        return str
+        ChatMessageDebugJSON.text(for: message)
     }
 
     var body: some View {

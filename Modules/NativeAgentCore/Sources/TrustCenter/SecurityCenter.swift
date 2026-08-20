@@ -365,6 +365,19 @@ public actor SwiftNativeSecurityCenter {
             }
         }
 
+        // Permission-authority mutation has an unconditional approval floor.
+        // Full Mac keeps ordinary shell/build work autonomous, but neither
+        // YOLO nor a saved per-tool `auto` override may silently reset TCC and
+        // remove microphone, speech, camera, Accessibility, or other grants.
+        // This runs even for callers that resolve autonomy in the outer chat
+        // gate (`enforceAutonomy == false`), so every dispatch surface sees
+        // the same effect-time decision.
+        if decision != .block,
+           profile.capabilities.contains("system_permission_reset") {
+            decision = Self.maxDecision(decision, .ask)
+            reasons.append("system permission changes require explicit approval")
+        }
+
         if decision != .block,
            profile.risk >= .high,
            originAssessment.isRemote,

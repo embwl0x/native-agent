@@ -325,6 +325,10 @@ private struct ManagedLoopRunner: LoopRunner {
         await tickOutcome(ifDue: nil)
     }
 
+    func shutdown() async {
+        await underlying.shutdown()
+    }
+
     /// Due-aware entry used by opportunistic OS wakes. Gate ownership comes
     /// first; the durable due check comes second. That order closes the race in
     /// which a periodic tick could settle after an early due read but before
@@ -402,6 +406,10 @@ private struct DueAwareManagedLoopRunner: LoopRunner {
 
     func tickOutcome() async -> LoopTickOutcome {
         await base.tickOutcomeIfDue(isDue)
+    }
+
+    func shutdown() async {
+        await base.shutdown()
     }
 }
 

@@ -905,6 +905,59 @@ enum ToolCallParser {
         return pastTenseEdRegex.firstMatch(in: finalSentence, options: [], range: range) != nil
     }
 
+    /// R7 (live incident 2026-08-17, Telegram session B7ED3E77 msg #6): the
+    /// model announced a tool BY NAME as its whole reply — `**Tool: desk_read**`
+    /// — neither a promise sentence (R1–R6) nor a parseable marker, so it
+    /// shipped to the user as text and nothing ran until User prodded with "?".
+    /// Shape: a SHORT reply whose final line is nothing but an invocation
+    /// frame around a KNOWN tool name. Conservative on purpose: completed-work
+    /// narration ("I used desk_read earlier…") and questions never match.
+    static func looksLikeNarratedToolInvocation(
+        _ raw: String,
+        knownToolNames: Set<String>
+    ) -> Bool {
+        guard !knownToolNames.isEmpty else { return false }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.count <= 200 else { return false }
+        // A genuine question back to the user is a valid stopping point.
+        guard !trimmed.contains("?") else { return false }
+        guard let lastRaw = trimmed.split(separator: "\n").last else { return false }
+        // Strip markdown emphasis/quotes/bullets around the line.
+        let line = lastRaw
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "*_`>•- "))
+        var candidate = line.lowercased()
+        // Optional invocation frame ahead of the name.
+        var hasInvocationFrame = false
+        for prefix in ["tool call:", "tool:", "calling", "invoking", "running", "using", "call", "run"] {
+            if candidate.hasPrefix(prefix) {
+                candidate = String(candidate.dropFirst(prefix.count))
+                    .trimmingCharacters(in: .whitespaces)
+                hasInvocationFrame = true
+                break
+            }
+        }
+        let ident = candidate.prefix {
+            $0.isLetter || $0.isNumber || $0 == "_" || $0 == "."
+        }
+        guard !ident.isEmpty,
+              knownToolNames.contains(where: { $0.lowercased() == ident }) else {
+            return false
+        }
+        // The line must be ONLY frame + name (+ optional argument sketch) —
+        // a sentence continuing past the name is narration about work, not an
+        // attempted call.
+        let rest = candidate.dropFirst(ident.count)
+            .trimmingCharacters(in: .whitespaces)
+        guard rest.isEmpty || rest.hasPrefix("(") || rest.hasPrefix("with ") else {
+            return false
+        }
+        // A bare tool name with no frame and no call syntax is ambiguous — it
+        // can be a legitimate short answer ("Use:\ndesk_read"). Require either
+        // an invocation frame or explicit call shape (gpt-5.5 LOW, 2026-08-17).
+        return hasInvocationFrame || rest.hasPrefix("(")
+    }
+
     static func looksLikeUnfulfilledActionPromise(_ raw: String) -> Bool {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, trimmed.count < 600 else { return false }

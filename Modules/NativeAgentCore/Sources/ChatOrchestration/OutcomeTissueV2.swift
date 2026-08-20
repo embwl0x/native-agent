@@ -127,7 +127,8 @@ public struct ResponseOutcomeObservationV2: Codable, Sendable, Equatable {
               decoded.schema == Self.schema,
               Self.closedToken(decoded.turnID, maximum: 128) != nil,
               Self.closedToken(decoded.messageID, maximum: 128) != nil,
-              Self.closedToken(decoded.sessionID, maximum: 128) != nil,
+              NativeAgentChatSessionID.normalizedPathComponent(decoded.sessionID)
+                == decoded.sessionID,
               Self.closedToken(decoded.surface, maximum: 128) != nil,
               Self.parseDate(decoded.observedAt) != nil,
               ["persisted", "partial", "cancelled", "failed"].contains(decoded.responsePersistence),
@@ -156,7 +157,7 @@ public struct ResponseOutcomeObservationV2: Codable, Sendable, Equatable {
     ) -> Self? {
         guard let turnID = OutcomeTraceIdentity.normalized(rawTurnID),
               let messageID = closedToken(rawMessageID, maximum: 128),
-              let sessionID = closedToken(rawSessionID, maximum: 128),
+              let sessionID = NativeAgentChatSessionID.normalizedPathComponent(rawSessionID),
               let surface = closedToken(rawSurface, maximum: 128),
               ["persisted", "partial", "cancelled", "failed"].contains(responsePersistence)
         else { return nil }

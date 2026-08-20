@@ -172,6 +172,8 @@ extension SwiftNativeChatOrchestrationClient {
                 surface: surface,
                 runId: runId
             )
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
             if Self.shouldPersistFailureMessage(surface: surface) {
@@ -231,6 +233,8 @@ extension SwiftNativeChatOrchestrationClient {
                 )
             }
             }
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
             if Self.shouldPersistFailureMessage(surface: surface) {
@@ -549,6 +553,8 @@ extension SwiftNativeChatOrchestrationClient {
                 surface: surface,
                 runId: runId
             )
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
             if Self.shouldPersistFailureMessage(surface: surface) {
@@ -601,6 +607,8 @@ extension SwiftNativeChatOrchestrationClient {
                 )
             }
             }
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
             if Self.shouldPersistFailureMessage(surface: surface) {

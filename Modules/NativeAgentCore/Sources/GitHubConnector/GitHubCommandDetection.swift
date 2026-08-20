@@ -2,6 +2,84 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+enum GitHubCheckState: String, Sendable {
+    case failed
+    case pending
+    case passing
+    case none
+    case maintainerBlocked = "maintainer_blocked"
+}
+
+enum GitHubCheckClassifier {
+    static let failureConclusions: Set<String> = [
+        "failure", "cancelled", "timed_out", "action_required", "startup_failure", "stale",
+    ]
+
+    static func state(runRows: [[String: Any]], combinedStatus: Any) -> GitHubCheckState {
+        let failedRuns = runRows.filter(isFailure)
+        let combined = (combinedStatus as? [String: Any]) ?? [:]
+        let combinedRows = (combined["statuses"] as? [[String: Any]] ?? []).filter { row in
+            failureConclusions.contains(normalized(row["state"]))
+                || ["failure", "error"].contains(normalized(row["state"]))
+        }
+        let detailedFailures = failedRuns + combinedRows
+        let hasMaintainerGate = detailedFailures.contains(where: isMaintainerGate)
+        let hasTechnicalFailure = detailedFailures.contains { row in
+            !isAggregate(row) && !isMaintainerGate(row)
+        }
+        let hasUnexplainedAggregate = detailedFailures.contains(where: isAggregate)
+            && !hasMaintainerGate && !hasTechnicalFailure
+        let combinedState = normalized(combined["state"])
+        let contextCount = (combined["total_count"] as? NSNumber)?.intValue
+            ?? (combined["total_count"] as? Int)
+            ?? (combined["statuses"] as? [Any])?.count
+            ?? 0
+        let opaqueCombinedFailure = contextCount > 0
+            && ["failure", "error"].contains(combinedState)
+            && detailedFailures.isEmpty
+
+        if hasTechnicalFailure || hasUnexplainedAggregate || opaqueCombinedFailure { return .failed }
+        if hasMaintainerGate { return .maintainerBlocked }
+        if !failedRuns.isEmpty || !combinedRows.isEmpty { return .failed }
+        if contextCount > 0 && combinedState == "pending" { return .pending }
+        if contextCount > 0 && combinedState == "success" { return .passing }
+        if runRows.contains(where: { normalized($0["status"]) != "completed" || $0["conclusion"] == nil }) {
+            return .pending
+        }
+        return runRows.isEmpty ? .none : .passing
+    }
+
+    static func actionableFailureRows(_ runRows: [[String: Any]]) -> [[String: Any]] {
+        let failed = runRows.filter(isFailure)
+        let technical = failed.filter { !isAggregate($0) && !isMaintainerGate($0) }
+        return technical.isEmpty ? failed.filter { !isMaintainerGate($0) } : technical
+    }
+
+    private static func isFailure(_ row: [String: Any]) -> Bool {
+        failureConclusions.contains(normalized(row["conclusion"]))
+    }
+
+    private static func isAggregate(_ row: [String: Any]) -> Bool {
+        normalizedName(row) == "all required checks pass"
+    }
+
+    private static func isMaintainerGate(_ row: [String: Any]) -> Bool {
+        let name = normalizedName(row)
+        return name == "review label gate"
+            || name.hasSuffix(" / review label gate")
+            || name == "maintainer review gate"
+            || name == "maintainer approval gate"
+    }
+
+    private static func normalizedName(_ row: [String: Any]) -> String {
+        normalized(row["name"] ?? row["context"])
+    }
+
+    private static func normalized(_ value: Any?) -> String {
+        (value as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+    }
+}
+
 /// Converts live GitHub evidence into the connector-neutral observation the
 /// store routes. No repository name, organization, or project is special.
 enum GitHubCommandObservationBuilder {
@@ -102,7 +180,11 @@ enum GitHubCommandObservationBuilder {
         actor: String?,
         staleAfterHours: Int,
         reviewThreads: [GitHubCommandReviewThreadEvidence]? = nil,
-        latestIssueCommentAuthor: String? = nil
+        latestIssueCommentAuthor: String? = nil,
+        issueComments: Any = [],
+        issueCommentNotBefore: Date? = nil,
+        expectedIssueCommentIdentifier: String? = nil,
+        expectedIssueCommentHeadSHA: String? = nil
     ) -> GitHubCommandObservation {
         let headSHA = ((pull["head"] as? [String: Any])?["sha"] as? String) ?? ""
         let updatedAt = pull["updated_at"] as? String ?? "unknown"
@@ -118,7 +200,10 @@ enum GitHubCommandObservationBuilder {
             return associated.isEmpty || associated.contains(where: \.isActionable)
         }
         let reviewState = latestReviewState(actionableReviewRows)
-        let checks = checkState(runRows: runRows, combinedStatus: combinedStatus)
+        let checks = GitHubCheckClassifier.state(
+            runRows: runRows,
+            combinedStatus: combinedStatus
+        ).rawValue
         let mergeableState = (pull["mergeable_state"] as? String ?? "unknown").lowercased()
         let conflict = mergeableState == "dirty"
             || (pull["mergeable"] as? Bool == false && ["dirty", "blocked"].contains(mergeableState))
@@ -164,12 +249,25 @@ enum GitHubCommandObservationBuilder {
                 markers.append(threadMarker(thread))
             }
         }
+        if let comment = actionableIssueComment(
+            issueComments,
+            actor: actor,
+            headSHA: headSHA,
+            notBefore: issueCommentNotBefore,
+            expectedIdentifier: expectedIssueCommentIdentifier,
+            expectedHeadSHA: expectedIssueCommentHeadSHA
+        ) {
+            signals.insert(.issueComment)
+            markers.append("issue_comment:\(identifier(comment)):\(timestamp(comment)):\(headSHA)")
+            actionableEvidence.append(actionEvidence(
+                signal: .issueComment,
+                row: comment,
+                fallback: "A new pull-request conversation comment needs review."
+            ))
+        }
         if checks == "failed" {
             signals.insert(.ciFailure)
-            let failed = runRows.filter { row in
-                let value = ((row["conclusion"] as? String) ?? "").lowercased()
-                return ["failure", "cancelled", "timed_out", "action_required", "startup_failure", "stale"].contains(value)
-            }
+            let failed = GitHubCheckClassifier.actionableFailureRows(runRows)
             let marker = latest(failed).map { "\(identifier($0)):\(timestamp($0))" } ?? "combined"
             markers.append("ci:\(headSHA):\(marker)")
             if failed.isEmpty {
@@ -241,6 +339,7 @@ enum GitHubCommandObservationBuilder {
 
         let waiting: GitHubCommandWaitingKind
         if checks == "pending" { waiting = .ci }
+        else if checks == GitHubCheckState.maintainerBlocked.rawValue { waiting = .maintainer }
         else if reviewState == "review_required" || reviewState == "commented" { waiting = .review }
         else if checks == "passing" && reviewState == "approved" && !conflict { waiting = .readyToMerge }
         else { waiting = .maintainer }
@@ -336,26 +435,6 @@ enum GitHubCommandObservationBuilder {
         return "review_required"
     }
 
-    private static func checkState(runRows: [[String: Any]], combinedStatus: Any) -> String {
-        let conclusions = runRows.compactMap { ($0["conclusion"] as? String)?.lowercased() }
-        let failures: Set<String> = [
-            "failure", "cancelled", "timed_out", "action_required", "startup_failure", "stale",
-        ]
-        let combined = (combinedStatus as? [String: Any]) ?? [:]
-        let combinedState = (combined["state"] as? String)?.lowercased()
-        let contextCount = (combined["total_count"] as? NSNumber)?.intValue
-            ?? (combined["statuses"] as? [Any])?.count
-            ?? 0
-        if conclusions.contains(where: failures.contains)
-            || (contextCount > 0 && ["failure", "error"].contains(combinedState ?? "")) { return "failed" }
-        if contextCount > 0 && combinedState == "pending" { return "pending" }
-        if contextCount > 0 && combinedState == "success" { return "passing" }
-        if runRows.contains(where: { (($0["status"] as? String) ?? "").lowercased() != "completed" || $0["conclusion"] == nil }) {
-            return "pending"
-        }
-        return runRows.isEmpty ? "none" : "passing"
-    }
-
     private static func latest(_ rows: [[String: Any]]) -> [String: Any]? {
         rows.max { timestamp($0) < timestamp($1) }
     }
@@ -427,6 +506,51 @@ enum GitHubCommandObservationBuilder {
         )
     }
 
+    /// Ordinary PR conversation comments are not review threads, but they are
+    /// where maintainers and automated reviewers often leave concrete work.
+    /// The tracker supplies a prior detail-read cutoff so enabling this lane
+    /// never replays historical conversation. Exact dispatch/verification
+    /// reads instead name the already-routed comment and keep it actionable
+    /// only while the same head remains and the contributor has not replied.
+    private static func actionableIssueComment(
+        _ raw: Any,
+        actor: String?,
+        headSHA: String,
+        notBefore: Date?,
+        expectedIdentifier: String?,
+        expectedHeadSHA: String?
+    ) -> [String: Any]? {
+        guard let actor = actor?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !actor.isEmpty else { return nil }
+        let rows = (raw as? [[String: Any]] ?? []).filter { row in
+            guard let login = (row["user"] as? [String: Any])?["login"] as? String else {
+                return false
+            }
+            return !isBotLogin(login)
+        }
+        guard let newest = latest(rows),
+              let newestAuthor = (newest["user"] as? [String: Any])?["login"] as? String,
+              newestAuthor.caseInsensitiveCompare(actor) != .orderedSame else { return nil }
+
+        if let expectedIdentifier {
+            guard expectedIssueCommentHeadMatches(expectedHeadSHA, current: headSHA),
+                  rows.contains(where: { identifier($0) == expectedIdentifier }) else { return nil }
+            return newest
+        }
+        guard let notBefore,
+              let commentDate = DeskClock.parseISO(timestamp(newest)),
+              commentDate > notBefore else { return nil }
+        return newest
+    }
+
+    private static func expectedIssueCommentHeadMatches(
+        _ expected: String?,
+        current: String
+    ) -> Bool {
+        guard let expected, !expected.isEmpty else { return true }
+        return expected == current
+    }
+
     private static func bounded(_ text: String, limit: Int) -> String {
         // Review bodies are evidence, not prompt structure. Flatten whitespace
         // before persistence so repository-controlled text cannot manufacture
@@ -477,10 +601,26 @@ public extension GitHubConnectorActions {
                 previous: [item.itemId: item.observation?.reviewThreads ?? []],
                 dataRoot: dataRoot
             )[item.itemId] ?? []
-            guard let pull = try await call(
+            guard var pull = try await call(
                 path: "repos/\(item.repository)/pulls/\(item.number)", dataRoot: dataRoot
             ) as? [String: Any] else {
                 throw GitHubConnectorError.invalidResponse("tracked pull request was not an object")
+            }
+            let mergeability = try await pullRequestMergeabilityEvidence(
+                for: [identity],
+                dataRoot: dataRoot
+            )[item.itemId]
+            if let mergeability {
+                guard let restHead = (pull["head"] as? [String: Any])?["sha"] as? String,
+                      restHead == mergeability.headSHA else {
+                    throw GitHubConnectorError.invalidResponse(
+                        "pull request head changed during exact command observation"
+                    )
+                }
+                if mergeability.mergeableState != "unknown" {
+                    pull["mergeable_state"] = mergeability.mergeableState
+                    pull["mergeable"] = mergeability.mergeableState == "clean"
+                }
             }
             // Reviews/review-comments paginate (bounded at 3 pages,
             // 2026-07-21 audit): page-1-only reads hid a late
@@ -512,24 +652,40 @@ public extension GitHubConnectorActions {
             // read it at per_page=10 and skip bot authors (2026-07-21 audit:
             // a bot reply after the actor's answer must not re-arm needs_user).
             var latestIssueCommentAuthor: String? = nil
+            var issueComments: Any = []
+            let expectedIssueComment = item.observation?.actionableEvidence?.last {
+                $0.signal == .issueComment
+            }?.identifier
+            let expectedIssueCommentHead = item.observation?.signals.contains(.issueComment) == true
+                ? item.observation?.headSHA
+                : nil
             let issueCommentCount = GitHubCommandObservationBuilder.issueCommentCount(pull: pull)
-            if issueCommentCount > 0, GitHubCommandObservationBuilder.labelDecisionArmed(
+            let decisionArmed = GitHubCommandObservationBuilder.labelDecisionArmed(
                 pull: pull, repository: item.repository, actor: actor
-            ) {
-                let lastPage = (issueCommentCount + 9) / 10
-                let latest = try await call(
-                    path: "repos/\(item.repository)/issues/\(item.number)/comments",
-                    params: ["per_page": "10", "page": String(lastPage)],
+            )
+            if issueCommentCount > 0, decisionArmed || expectedIssueComment != nil {
+                // Exact verification must survive the expected comment sliding
+                // off the last page (cross-review MED, 2026-08-17).
+                issueComments = try await issueCommentsIncludingExpected(
+                    repository: item.repository,
+                    number: item.number,
+                    commentCount: issueCommentCount,
+                    expectedIdentifier: expectedIssueComment,
                     dataRoot: dataRoot
                 )
-                latestIssueCommentAuthor = GitHubCommandObservationBuilder.latestNonBotCommentAuthor(latest)
+                if decisionArmed {
+                    latestIssueCommentAuthor = GitHubCommandObservationBuilder.latestNonBotCommentAuthor(issueComments)
+                }
             }
             return GitHubCommandObservationBuilder.pullRequest(
                 repository: item.repository, number: item.number, pull: pull,
                 reviews: reviews, reviewComments: comments, checkRuns: runs,
                 combinedStatus: status, actor: actor, staleAfterHours: staleAfterHours,
                 reviewThreads: threadEvidence,
-                latestIssueCommentAuthor: latestIssueCommentAuthor
+                latestIssueCommentAuthor: latestIssueCommentAuthor,
+                issueComments: issueComments,
+                expectedIssueCommentIdentifier: expectedIssueComment,
+                expectedIssueCommentHeadSHA: expectedIssueCommentHead
             )
         }
     }

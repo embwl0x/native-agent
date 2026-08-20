@@ -121,6 +121,9 @@ echo "[test] build source inventory guard tests"
 echo "[test] generated artifact cleanup guard tests"
 "$ROOT/tests/scripts/generated_artifact_cleanup_guards_test.sh"
 
+echo "[test] Chrome native-host registration"
+"$ROOT/tests/scripts/chrome_native_host_install_test.sh"
+
 echo "[test] architecture blueprint drift"
 "$ROOT/script/check_architecture_blueprint.swift" --repo "$ROOT"
 
