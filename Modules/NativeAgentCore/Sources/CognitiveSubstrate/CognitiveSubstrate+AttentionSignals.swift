@@ -285,19 +285,20 @@ extension CognitiveSubstrate {
 
     /// The MemoryV2 record ids a workspace node references, if any.
     ///
-    /// Convention (this seam's contract, documented because — verified
-    /// empirically 2026-07-10 — NO live producer stamps memory record ids onto
-    /// cognitive nodes today; the substrate never imports MemoryV2, and recall
-    /// record ids live only in the ChatOrchestration turn result, not on nodes):
+    /// Convention (this seam's contract):
     ///   - metadata key `memoryRecordIds`: a JSON array of record-id strings, OR
     ///   - metadata key `memoryRecordId`: a single record-id string, OR
     ///   - a subject of type `memory` / `memory_record` whose `id` IS the record
     ///     id (the natural shape a recalled-memory node would take; `memory_record`
     ///     already exists as a projection entity kind).
-    /// Until a memory-recall→node producer (or the consumer-side wiring) stamps
-    /// one of these, this read yields nothing and the input stays inert — which
-    /// preserves the nil-when-empty, byte-identical contract. See the deliverable
-    /// risk note.
+    /// LIVE since the chat path began stamping `memoryRecordIds` onto
+    /// assistant-turn events (ChatOrchestrationClient+MessagePersistence,
+    /// deduped, capped 32; the key is priority-protected in ContinuityField's
+    /// metadata bounding). Verified against the live store + turn traces
+    /// 2026-08-20: stamped nodes present and per-turn
+    /// contextFlow.attentionWorkingAtoms > 0. An earlier note here claimed the
+    /// lane was inert — that predated the producer and cost an investigation;
+    /// re-verify from traces, not from this comment, before declaring it dead.
     static func memoryRecordIDs(from node: CognitiveNode) -> [String] {
         var ids: [String] = []
 

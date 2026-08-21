@@ -100,6 +100,11 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
     let onAttach: () -> Void
     let onStop: () -> Void
     let onSend: () -> Void
+    /// User 2026-08-20: the visible composer box is taller than the single-line
+    /// text field's own hit area, so clicks in the upper region did nothing.
+    /// The whole card is now a focus target; interactive children (menu,
+    /// stop/send) keep winning inside their own bounds.
+    var onFocusRequest: (() -> Void)?
     let inputContent: InputContent
 
     init(
@@ -114,6 +119,7 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
         onAttach: @escaping () -> Void,
         onStop: @escaping () -> Void,
         onSend: @escaping () -> Void,
+        onFocusRequest: (() -> Void)? = nil,
         @ViewBuilder inputContent: () -> InputContent
     ) {
         self.isListening = isListening
@@ -127,6 +133,7 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
         self.onAttach = onAttach
         self.onStop = onStop
         self.onSend = onSend
+        self.onFocusRequest = onFocusRequest
         self.inputContent = inputContent()
     }
 
@@ -221,6 +228,12 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
                 .accessibilityLabel(isRunning ? "Queue message to send next" : "Send message")
             }
         }
+        // The whole visible box focuses the field. contentShape covers the
+        // card padding; a click on the menu/stop/send still routes to those
+        // controls first, and a click already on the text field just
+        // re-asserts the focus it produced.
+        .contentShape(Rectangle())
+        .onTapGesture { onFocusRequest?() }
     }
 }
 

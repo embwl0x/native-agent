@@ -77,6 +77,19 @@ struct ChatView: View {
     @State var showContext = false
     @State var showConversationControls = false
     let bottomAnchor = "chat-bottom-anchor"
+    // User 2026-08-20: the floating turn card can outgrow the fixed 80pt
+    // clearance (approval row, steer affordance) and land on the streaming
+    // reply. Measure the real card height and let the clearance grow with it.
+    // The fixed constant stays as the FLOOR so idle→busy still never shifts
+    // rows; only a taller-than-default card moves the transcript up.
+    @State var turnCardMeasuredHeight: CGFloat = 0
+
+    var turnCardClearance: CGFloat {
+        // While no card shows, hold the floor: the measured height is stale
+        // from the last turn and must not keep the idle transcript inflated.
+        guard showThinkingRow else { return MacChatTurnCardMetrics.floatingClearance }
+        return max(MacChatTurnCardMetrics.floatingClearance, turnCardMeasuredHeight + 18)
+    }
 
     // Sprint 3.1 — voice input
     @State var voiceInput = VoiceInputController()
@@ -687,7 +700,7 @@ struct ChatView: View {
                             // anchor would sit OUTSIDE the scroll target and
                             // the card would still cover the last line.)
                             Color.clear
-                                .frame(height: MacChatTurnCardMetrics.floatingClearance)
+                                .frame(height: turnCardClearance)
                                 .id(bottomAnchor)
                                 // Re-arm sentinel: inside the LazyVStack this
                                 // spacer only EXISTS when the viewport is at /
@@ -760,7 +773,7 @@ struct ChatView: View {
                             .padding(.top, 18)
                             // phase 4: lift clear of the floating thinking row
                             // while a turn streams so it stays visible/clickable.
-                            .padding(.bottom, showThinkingRow ? MacChatTurnCardMetrics.floatingClearance : 18)
+                            .padding(.bottom, showThinkingRow ? turnCardClearance : 18)
                             .transition(.opacity.combined(with: .move(edge: .bottom)))
                         }
                     }
@@ -821,6 +834,17 @@ struct ChatView: View {
                     }
                     .onChange(of: appModel.chatMessages.last?.id) { _, _ in
                         refreshTranscriptSearchTailIfPresented()
+                    }
+                    // gpt-5.5 review (MEDIUM): a card that grows mid-turn (an
+                    // approval row arriving) enlarges the clearance spacer, but
+                    // with no new token to trigger a content scroll the
+                    // viewport stays aligned to the OLD clearance and the
+                    // taller card covers the tail. Re-align when the clearance
+                    // changes while follow is armed; never yank the viewport
+                    // out from under a search or a user who scrolled away.
+                    .onChange(of: turnCardClearance) { _, _ in
+                        guard showThinkingRow, scrollCoordinator.autoFollow, !showTranscriptSearch else { return }
+                        scrollToBottom(proxy, animated: false, delay: 0, force: false)
                     }
                     .onChange(of: transcriptSearch.selectionRevision) { _, _ in
                         guard showTranscriptSearch,
@@ -929,6 +953,14 @@ struct ChatView: View {
                             .frame(maxWidth: .infinity)
                             .padding(.horizontal, 32)
                             .padding(.bottom, 6)
+                            // Feed the measured height (card + bottom inset)
+                            // into the transcript clearance so a grown card
+                            // (approval / steer rows) never covers the reply.
+                            .onGeometryChange(for: CGFloat.self) { proxy in
+                                proxy.size.height
+                            } action: { height in
+                                turnCardMeasuredHeight = height
+                            }
                             .transition(.opacity)
                         }
                     }
@@ -1017,7 +1049,8 @@ struct ChatView: View {
                         onCaptureScreen: captureScreen,
                         onAttach: attachFromClipboardOrPickFile,
                         onStop: { appModel.stopChatStream() },
-                        onSend: send
+                        onSend: send,
+                        onFocusRequest: { inputFocused = true }
                     ) {
                         TextField(
                             voiceInput.isListening ? "" : "Ask \(appModel.agentDisplayName)",

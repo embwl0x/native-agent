@@ -228,6 +228,12 @@ struct GlassCard<Content: View>: View {
     /// Rows inside scrolling Lists render material instead of live glass —
     /// per-row glassEffect is a scroll-perf hazard (gpt-5.5 MED, InboxView).
     var scrollRow: Bool = false
+    /// Clear-glass variant for cards that FLOAT OVER live content (the chat
+    /// turn card): regular glass reads near-opaque over a dark transcript and
+    /// buries the text beneath (User, 2026-08-20). Reduce-transparency still
+    /// gets the fully opaque fallback — that setting is a request for MORE
+    /// opacity, never less.
+    var lightweight: Bool = false
     @ViewBuilder var content: () -> Content
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorSchemeContrast) private var colorSchemeContrast
@@ -261,7 +267,10 @@ struct GlassCard<Content: View>: View {
             content()
                 .padding(NativeAgentLayout.cardPadding)
                 .glassEffect(
-                    tint.map { Glass.regular.tint($0.opacity(0.12)) } ?? .regular,
+                    {
+                        let base: Glass = lightweight ? .clear : .regular
+                        return tint.map { base.tint($0.opacity(0.12)) } ?? base
+                    }(),
                     in: RoundedRectangle(cornerRadius: NativeAgentRadius.card, style: .continuous)
                 )
                 .overlay {

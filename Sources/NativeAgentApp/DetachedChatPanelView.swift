@@ -510,7 +510,8 @@ struct DetachedChatPanelView: View {
                 onCaptureScreen: captureScreen,
                 onAttach: attachFromClipboardOrPickFile,
                 onStop: { appModel.stopChatStream(sessionId: sessionId) },
-                onSend: send
+                onSend: send,
+                onFocusRequest: { inputFocused = true }
             ) {
                 TextField(
                     voiceInput.isListening ? "" : "Message \(personaName)…",

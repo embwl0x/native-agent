@@ -403,17 +403,21 @@ if [[ -n "$NOTES_FILE" ]]; then
   ENCLOSURE_BEFORE="$ENCLOSURE_LINE"
   NOTES_TMP="$OUT_DIR/.release-notes.fragment"
   {
-    printf '        <description><![CDATA[\n'
+    # Explicit format: Sparkle currently defaults a nil descriptionFormat to
+    # html, but this path depends on HTML rendering — say so (gpt-5.5 NIT).
+    printf '        <description sparkle:descriptionFormat="html"><![CDATA[\n'
     # CDATA cannot contain the terminator; split it if the notes ever do.
     if grep -qi '<html\|<p>\|<ul>\|<h[1-6]>' "$NOTES_FILE"; then
       sed 's/]]>/]]]]><![CDATA[>/g' "$NOTES_FILE"
     else
-      # Escaping & < > first also neutralises any "]]>" in the notes (it becomes
-      # "]]&gt;"), so the CDATA terminator cannot be closed early from here.
-      printf '<pre>'
-      sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' "$NOTES_FILE"
-      printf '</pre>'
-      printf '\n'
+      # update-dialog-polish (2026-08-20): markdown notes render as styled,
+      # appearance-following HTML instead of raw markers in a white <pre>.
+      # The converter escapes & < > FIRST (which also neutralises any "]]>"
+      # as "]]&gt;", keeping the CDATA terminator unreachable) and emits only
+      # its own tags. A converter failure fails the run — no silent fallback
+      # to the old <pre> path; ugly-notes-by-surprise is how this bug shipped.
+      swift "$ROOT/script/release_notes_html.swift" < "$NOTES_FILE" \
+        || fail "release_notes_html.swift failed to convert $NOTES_FILE."
     fi
     printf '        ]]></description>\n'
   } > "$NOTES_TMP"
@@ -424,7 +428,7 @@ if [[ -n "$NOTES_FILE" ]]; then
     /<\/item>/ && !done { while ((getline line < frag) > 0) print line; close(frag); done = 1 }
     { print }
   ' "$APPCAST_XML" > "$NOTES_APPCAST"
-  grep -q '<description>' "$NOTES_APPCAST" \
+  grep -q '<description' "$NOTES_APPCAST" \
     || fail "release notes were not inserted into the feed; refusing a silently-unchanged appcast."
   mv "$NOTES_APPCAST" "$APPCAST_XML"
   rm -f "$NOTES_TMP"

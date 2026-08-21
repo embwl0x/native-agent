@@ -508,10 +508,17 @@ out="$( cd "$ROOT" && PATH="$WORK/bin:$PATH" NATIVEAGENT_TEST_HOST_DIR="$WORK/ho
 set -e
 grep -q 'Published and VERIFIED live' <<<"$out" \
   || fail "a publish carrying release notes was rejected: $out"
-grep -q '<description>' "$WORK/out/h/appcast/appcast.xml" \
-  || fail "release notes were not embedded in the feed"
+grep -q '<description sparkle:descriptionFormat="html">' "$WORK/out/h/appcast/appcast.xml" \
+  || fail "release notes were not embedded as an explicit-format <description>"
 grep -q 'Fixed the thing' "$WORK/out/h/appcast/appcast.xml" \
   || fail "the embedded description does not carry the notes text"
+# update-dialog-polish: markdown notes go through release_notes_html.swift —
+# the styled fragment (appearance-following CSS) must be present, and raw
+# HTML in the source notes must arrive escaped, never live.
+grep -q 'class="release-notes"' "$WORK/out/h/appcast/appcast.xml" \
+  || fail "markdown notes were not converted to the styled HTML fragment"
+grep -q '&lt;b&gt;escaped&lt;/b&gt;' "$WORK/out/h/appcast/appcast.xml" \
+  || fail "HTML in markdown notes was not escaped by the converter"
 [[ "$(grep -c '<item>' "$WORK/out/h/appcast/appcast.xml")" == "1" ]] \
   || fail "embedding notes changed the feed item count"
 grep -q 'sparkle:edSignature' "$WORK/out/h/appcast/appcast.xml" \

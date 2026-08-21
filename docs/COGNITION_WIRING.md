@@ -1,5 +1,10 @@
 # Cognition Wiring — the connection map
 
+> **Start with [SUBCONSCIOUS.md](SUBCONSCIOUS.md)** — the as-built top-to-bottom
+> map of the whole subconscious/personality system (inputs → substrate →
+> organism → what enters context), verified 2026-08-20. This file is the
+> finer-grained signal-wiring companion.
+
 *Last verified against source: 2026-07-25. This is the nervous-system diagram: for
 each cognitive **mapping** (subsystem), what it **emits**, what it **consumes**,
 through which **channel**, and what **regulates** the flow. It exists so that

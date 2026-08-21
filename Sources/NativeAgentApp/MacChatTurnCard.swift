@@ -425,7 +425,9 @@ struct MacChatTurnCard: View {
     }
 
     var body: some View {
-        GlassCard(tint: tint) {
+        // lightweight: the card floats over the transcript in the main window;
+        // clear glass keeps any text it momentarily overlaps legible.
+        GlassCard(tint: tint, lightweight: true) {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(alignment: .firstTextBaseline, spacing: NativeAgentSpacing.sm) {
                     leading
