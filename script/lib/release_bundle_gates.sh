@@ -933,9 +933,12 @@ release_assert_no_leaked_data() {
   #   its "sk-mean-or-model-pooled" tail trips the sk-[A-Za-z0-9_-]{20,}
   #   alternative. Exact string-table line verified against the real staged
   #   executable 2026-08-21.
+  #   pooling=attention-mask-mean-or-model-pooled — same MiniLM constant, now
+  #   emitted with its log-field prefix in one string-table line. Exact line
+  #   verified against the real staged executable 2026-08-25.
   if [[ -n "$_secret_binary_matches" ]]; then
     local _allow_rc=0
-    _secret_binary_matches="$(grep -Fxv -e "attention-mask-mean-or-model-pooled" <<<"$_secret_binary_matches")" || _allow_rc=$?
+    _secret_binary_matches="$(grep -Fxv -e "attention-mask-mean-or-model-pooled" -e "pooling=attention-mask-mean-or-model-pooled" <<<"$_secret_binary_matches")" || _allow_rc=$?
     if [[ "$_allow_rc" -gt 1 ]]; then
       echo "ERROR: benign-literal filter FAILED — grep exited $_allow_rc. REFUSING TO SHIP." >&2
       return 1
