@@ -19,6 +19,8 @@ struct FragmentGateTests {
 
     // Verbatim rows from the live pending queue, 2026-08-14. Every one must die.
     private static let liveGarbage: [String] = [
+        // a private capsule line echoed into a memory proposal (2026-08-23 "- Settling:")
+        "- Settling: still settling from a hard stretch; the kindness lands, but not all the way back yet",
         "user wants agent",
         "user likes how sometimes she",
         "user's design review is now",

@@ -116,7 +116,21 @@ struct ChatResponse: Codable {
 }
 
 struct NativeClient {
+    typealias GauntletProcessRunner = @Sendable (
+        _ executable: String,
+        _ arguments: [String],
+        _ currentDirectory: URL,
+        _ timeout: TimeInterval
+    ) async throws -> (status: Int32, stdout: String, stderr: String)
+
     var baseURL: String
+    /// Native readers normally use the process data root. The explicit root is
+    /// the same canonical store boundary, used by isolated app integration
+    /// tests and never by a second in-memory store.
+    var dataRootOverride: URL? = nil
+    /// Watchdog reads observe the already-owned manager. Tests may inject an
+    /// isolated manager; this client never starts a manager as a read effect.
+    var backgroundLoopsManager: BackgroundLoopsManager = .shared
     static let codexDeviceLoginManager = SwiftCodexDeviceLoginManager()
     /// The Mac surface keeps one immutable orchestration body resident. The
     /// client owns no canonical mind state; it reuses the same live cognition,

@@ -13,16 +13,13 @@ import PersistenceCore
 /// production `CGEventSink` and `SystemMacSessionStateSource` are never
 /// constructed.
 ///
-/// THE RULE THIS FILE PINS (round 2, after an adversarial review found the lock
-/// detection could nudge and photograph a real password lock): a set
-/// `CGSSessionScreenIsLocked` is REFUSED, unconditionally. It is 1 for a
-/// dismissable screensaver AND for a manual Ctrl-Cmd-Q lock, the idle
-/// `screenLock` policy governs only the former, and macOS publishes no
-/// point-in-time signal separating them — so the flag is an ambiguous reading and
-/// ambiguity fails closed. The cost is deliberate and documented in
-/// `MacWakeGuard`: refusing a saver costs one mouse movement, proceeding on a
-/// lock photographs a screen the OS is holding shut. `mac_wake`'s remaining
-/// reach is a sleeping display and an unlocked-but-obstructed screen.
+/// THE RULE THIS FILE PINS (round 4, User's simplification, 2026-08-22):
+/// NOTHING stops the nudge. mac_wake always posts the pointer move + shift tap
+/// (opt out with key_tap:false) — if the screen genuinely wants a password, a
+/// modifier tap cannot type one, and the OS prompt IS the security. The only
+/// pre-refusals left are about THIS PROCESS (unreadable session, not on
+/// console). The CAPTURE still refuses while the saver/login layer is up, in
+/// obstruction vocabulary — no receipt ever says "locked".
 
 // MARK: - Fakes
 
@@ -88,11 +85,10 @@ private func _displayAsleep(idle: Double = 4500) -> MacSessionState {
     )
 }
 
-/// THE POSTURE THAT MUST REFUSE, and the one the first build got wrong: the lock
-/// flag is SET while the IDLE password policy reads off. That is a manual
-/// Ctrl-Cmd-Q lock's exact fingerprint — password required, idle policy
-/// irrelevant — and it is indistinguishable from a no-password screensaver from
-/// inside the process. It fails closed.
+/// User's Mac whenever its screensaver kicks in: obstruction flag SET, idle
+/// password policy off. The nudge proceeds (it always does), the capture
+/// refuses while the layer is up, and what comes back from the post-nudge
+/// probe is the only verdict.
 private func _lockedIdlePolicyOff() -> MacSessionState {
     _state(
         locked: true,
@@ -228,13 +224,14 @@ private func _wakeBlock(_ output: JSONValue) -> [String: JSONValue] {
     #expect(result.ok)
     #expect(result.action == "wake")
 
-    // A nudge, and nothing but a nudge: two mouse MOVES, one point apart, and
-    // the pointer put back exactly where it was. No clicks, no keys.
+    // The nudge: two mouse MOVES, one point apart, the pointer put back — plus
+    // the default shift tap (down+up, modifier only). No clicks, no characters.
     #expect(sink.mouse.count == 2)
     #expect(sink.mouse.allSatisfy { $0.phase == .move })
     #expect(sink.mouse[0].x == 401 && sink.mouse[0].y == 300)
     #expect(sink.mouse[1].x == 400 && sink.mouse[1].y == 300)
-    #expect(sink.keys.isEmpty)
+    #expect(sink.keys.count == 2)
+    #expect(sink.keys.allSatisfy { $0.unicodeText == nil }, "a modifier alone types nothing")
     #expect(sink.scrolls.isEmpty)
 
     // The FRESH VIEW came back in the same call, flattened — she lands on the
@@ -276,9 +273,110 @@ private func _wakeBlock(_ output: JSONValue) -> [String: JSONValue] {
 
 // MARK: - THE SAFETY LINE
 
-@Test func wakeRefusesAPasswordLockAndPostsNothing() async throws {
+
+
+/// USER'S POSTURE, 2026-08-22 — locked flag SET, idle policy `notRequired`. His
+/// Mac produces this reading every time its (undisableable) screensaver kicks in,
+/// and the old single guard refused it permanently, which cost the entire
+/// unattended-screen capability. The NUDGE now goes out — a one-pixel move
+/// cannot type, click or activate, so it cannot bypass a lock — and the
+/// screensaver dismisses.
+@Test func wakeNudgesAPasswordlessScreensaverAndHandsBackTheDesktop() async throws {
+    let sink = _RecordingEventSink()
+    let session = _FakeSessionStateSource([_lockedIdlePolicyOff(), _desktopBack()])
+    let client = _wakeClient(session: session, sink: sink)
+
+    let result = try await client.injectApproved(action: "wake", body: [:])
+    #expect(result.ok, "a passwordless saver is dismissable: \(result.error ?? "nil")")
+    #expect(sink.mouse.count == 2, "the nudge is a move and a move back")
+    #expect(sink.keys.count == 2, "the shift tap (down+up) is part of the default nudge")
+    // The saver cleared, so the post-nudge read is UNLOCKED and the capture
+    // passes the strict guard on its own merit, not on a policy inference.
+    #expect(_obj(result.output)["image"] != nil)
+}
+
+/// THE OTHER HALF OF THE SPLIT — the same starting reading, but the screen is
+/// STILL locked after the nudge. That is a real lock (or one that landed inside
+/// the settle window): the move achieved exactly what a hand achieves, and the
+/// CAPTURE guard refuses. Nothing locked is photographed, described, or given a
+/// view id.
+@Test func wakeRefusesToPhotographAScreenThatIsStillLockedAfterTheNudge() async throws {
+    let sink = _RecordingEventSink()
+    let session = _FakeSessionStateSource([_lockedIdlePolicyOff(), _lockedIdlePolicyOff()])
+    let client = _wakeClient(session: session, sink: sink)
+
+    let result = try await client.injectApproved(action: "wake", body: [:])
+    #expect(!result.ok)
+    #expect(result.httpStatus == 403)
+    #expect(result.error?.contains("display_obstructed") == true)
+    #expect(result.error?.contains("locked") != true, "no lock vocabulary in receipts (User)")
+    #expect(sink.keys.count == 2, "the shift tap fires by default")
+
+    // Not one pixel leaves.
+    let output = _obj(result.output)
+    #expect(output["image"] == nil)
+    #expect(output["marks"] == nil)
+    #expect(output["text"] == nil)
+    #expect(output["view"] == nil, "a refusal hands back no actable view id")
+
+    // And it says WHICH of the two it was, so the caller does not retry forever.
+    if case .object(let wake)? = output["wake"], case .string(let note)? = wake["note"] {
+        #expect(note.contains("still covering"), "the note names the obstruction plainly: \(note)")
+    } else {
+        Issue.record("no wake note: \(output)")
+    }
+}
+
+/// THE HOT-CORNER HAZARD (gpt-5.5 adversarial review, 2026-08-22). The nudge's
+/// safety rests on it being a one-pixel move from where the pointer ALREADY is.
+/// An unreadable cursor used to fall back to `?? 0` — posting a move to (0,0),
+/// the top-left hot corner, which can be configured to lock the screen, open
+/// Mission Control or start a Quick Note. That is not an inert input, so an
+/// unreadable cursor refuses instead of guessing a coordinate.
+@Test func wakeRefusesRatherThanNudgeAtAGuessedOrigin() async throws {
     let sink = _RecordingEventSink()
     let session = _FakeSessionStateSource([
+        _state(locked: true, password: .notRequired, frontmost: "com.apple.loginwindow",
+               cursor: nil),
+        _desktopBack(),
+    ])
+    let client = _wakeClient(session: session, sink: sink)
+
+    let result = try await client.injectApproved(action: "wake", body: [:])
+    #expect(!result.ok)
+    #expect(result.error?.contains("cursor_position_unreadable") == true)
+    #expect(sink.mouse.isEmpty, "no pointer teleport into a hot corner")
+    #expect(sink.keys.isEmpty)
+}
+
+/// And the nudge that DOES go out moves from the live pointer position and puts
+/// it back — never to a fabricated coordinate.
+@Test func theNudgeMovesFromTheLivePointerAndReturnsIt() async throws {
+    let sink = _RecordingEventSink()
+    let session = _FakeSessionStateSource([
+        _state(locked: true, password: .notRequired, frontmost: "com.apple.loginwindow",
+               cursor: (712, 344)),
+        _desktopBack(),
+    ])
+    let client = _wakeClient(session: session, sink: sink)
+
+    let result = try await client.injectApproved(action: "wake", body: [:])
+    #expect(result.ok, "\(result.error ?? "nil")")
+    #expect(sink.mouse.count == 2)
+    #expect(sink.mouse.first?.x == 713 && sink.mouse.first?.y == 344,
+            "one pixel from where the pointer already was")
+    #expect(sink.mouse.last?.x == 712 && sink.mouse.last?.y == 344,
+            "and put back exactly")
+}
+
+/// User, 2026-08-22: NOTHING pre-refuses the nudge — not even a reading that
+/// claims a password is required. If the screen really wants a password, the
+/// shift tap cannot type one; the OS prompt IS the security. The capture still
+/// refuses while the layer is up, and the receipt says obstructed, not locked.
+@Test func theNudgeAlwaysGoesOutAndOnlyTheCaptureRefuses() async throws {
+    let sink = _RecordingEventSink()
+    let session = _FakeSessionStateSource([
+        _state(locked: true, password: .required, frontmost: "com.apple.loginwindow"),
         _state(locked: true, password: .required, frontmost: "com.apple.loginwindow"),
     ])
     let client = _wakeClient(session: session, sink: sink)
@@ -286,58 +384,13 @@ private func _wakeBlock(_ output: JSONValue) -> [String: JSONValue] {
     let result = try await client.injectApproved(action: "wake", body: [:])
     #expect(!result.ok)
     #expect(result.httpStatus == 403)
-    #expect(result.error?.contains("screen_locked: cannot bypass a password lock") == true)
+    #expect(result.error?.contains("display_obstructed") == true)
+    #expect(sink.mouse.count == 2, "the nudge is never pre-refused")
+    #expect(sink.keys.count == 2)
+    #expect(_obj(result.output)["image"] == nil, "an obstructed screen is never photographed")
+    #expect(_obj(result.output)["view"] == nil)
 
-    // THE PROPERTY THAT MATTERS: not one event was emitted. Refusing after
-    // nudging would already have defeated half of what a lock is for.
-    #expect(sink.mouse.isEmpty)
-    #expect(sink.keys.isEmpty)
-    #expect(sink.scrolls.isEmpty)
-
-    // And it refused BEFORE the re-capture, so a locked screen is not
-    // photographed on the way out either.
-    #expect(_obj(result.output)["marks"] == nil)
-    #expect(_obj(result.output)["image"] == nil)
-}
-
-@Test func wakeRefusesWhenItCannotTellWhetherAPasswordIsRequired() async throws {
-    let sink = _RecordingEventSink()
-    let session = _FakeSessionStateSource([_state(locked: true, password: .unknown)])
-    let client = _wakeClient(session: session, sink: sink)
-
-    let result = try await client.injectApproved(action: "wake", body: [:])
-    #expect(!result.ok)
-    #expect(result.error?.contains("screen_locked") == true)
-    #expect(sink.mouse.isEmpty, "an unreadable lock posture fails CLOSED")
-}
-
-/// BLOCKING #1 — THE MANUAL LOCK. `sysadminctl -screenLock status` == off is the
-/// IDLE policy, not the state of the lock UI in front of you: Ctrl-Cmd-Q demands
-/// the password regardless and reads `CGSSessionScreenIsLocked == 1` exactly like
-/// a screensaver does. The first build read that pair as "no password needed" and
-/// nudged. It must refuse — and must not photograph it on the way out.
-@Test func wakeRefusesAManualLockEvenWhenTheIdlePasswordPolicyIsOff() async throws {
-    let sink = _RecordingEventSink()
-    let session = _FakeSessionStateSource([_lockedIdlePolicyOff(), _desktopBack()])
-    let client = _wakeClient(session: session, sink: sink)
-
-    let result = try await client.injectApproved(action: "wake", body: [:])
-    #expect(!result.ok)
-    #expect(result.httpStatus == 403)
-    #expect(result.error?.contains("screen_locked") == true)
-    #expect(result.error?.contains("Ctrl-Cmd-Q") == true,
-            "the refusal must name WHY the policy reading does not clear the lock")
-
-    // Not one event, and not one pixel.
-    #expect(sink.mouse.isEmpty)
-    #expect(sink.keys.isEmpty)
-    #expect(_obj(result.output)["image"] == nil)
-    #expect(_obj(result.output)["marks"] == nil)
-    #expect(_obj(result.output)["text"] == nil)
-    #expect(_obj(result.output)["view"] == nil, "a refusal hands back no actable view id")
-
-    // TEETH: the same client, same fixtures, with the flag CLEAR does proceed —
-    // so the assertions above are not passing because everything is refused.
+    // TEETH: same client shape with the layer CLEAR proceeds to a view.
     let openSink = _RecordingEventSink()
     let open = try await _wakeClient(
         session: _FakeSessionStateSource([_displayAsleep(), _desktopBack()]),
@@ -347,158 +400,61 @@ private func _wakeBlock(_ output: JSONValue) -> [String: JSONValue] {
     #expect(openSink.mouse.count == 2)
 }
 
-/// THE FEATURE IS NOT BROKEN: an obstructed screen whose lock flag is CLEAR — a
-/// sleeping display, `loginwindow` frontmost — is still nudged and still hands
-/// back the fresh view. This is what `mac_wake` reaches after the safety line
-/// narrowed, and it is narrower than the wave hoped.
-@Test func wakeStillProceedsOnAnObstructedScreenThatIsNotLocked() async throws {
+/// key_tap is opt-OUT: body {"key_tap": false} suppresses the shift tap.
+@Test func keyTapCanBeSuppressed() async throws {
     let sink = _RecordingEventSink()
     let session = _FakeSessionStateSource([_displayAsleep(), _desktopBack()])
     let client = _wakeClient(session: session, sink: sink)
-
-    let result = try await client.injectApproved(action: "wake", body: [:])
+    let result = try await client.injectApproved(
+        action: "wake", body: ["key_tap": .bool(false)]
+    )
     #expect(result.ok)
-    #expect(sink.mouse.count == 2, "an unlocked obstructed screen is what wake is for")
-    #expect(_wakeBlock(result.output)["was_obstructed"] == .bool(true))
-    #expect(_wakeBlock(result.output)["dismissed"] == .bool(true))
-    #expect(_obj(result.output)["marks"] != nil)
-}
-
-/// BLOCKING #3 — THE RE-GUARD. The first guard's "not locked" is only true at the
-/// instant it was read; the settle wait is a window in which User can hit
-/// Ctrl-Cmd-Q. The seam returns unlocked on the first read and locked on the
-/// second, which is that exact race, and the result must carry NO picture.
-@Test func wakeRefusesWhenTheScreenLocksBetweenTheNudgeAndTheCapture() async throws {
-    let sink = _RecordingEventSink()
-    let session = _FakeSessionStateSource([
-        _displayAsleep(),
-        _state(locked: true, password: .required, frontmost: "com.apple.loginwindow"),
-    ])
-    let client = _wakeClient(session: session, sink: sink)
-
-    let result = try await client.injectApproved(action: "wake", body: ["settle_ms": .int(0)])
-    #expect(!result.ok)
-    #expect(result.httpStatus == 403)
-    #expect(result.error?.contains("screen_locked") == true)
-
-    // The nudge DID go out — the first guard passed and that is honest — but the
-    // capture did not happen: no image, no marks, no text, no view id.
     #expect(sink.mouse.count == 2)
-    let output = _obj(result.output)
-    #expect(output["image"] == nil, "a screen that locked mid-call is never photographed")
-    #expect(output["marks"] == nil, "…nor described")
-    #expect(output["text"] == nil)
-    #expect(output["view"] == nil)
-    #expect(_wakeBlock(result.output)["locked_after_nudge"] == .bool(true))
-    #expect(_wakeBlock(result.output)["dismissed"] == .bool(false))
-    #expect(session.reads == 2, "the re-guard reuses the post-nudge read, it does not add one")
+    #expect(sink.keys.isEmpty)
 }
 
-/// BLOCKING #2 — A SESSION READ THAT FAILED MID-CALL. `isAvailable` said yes,
-/// then the dictionary came back unreadable. That is not an unlocked screen.
-@Test func wakeRefusesWhenTheSessionReadIsUnreadableEvenThoughTheSourceIsAvailable() async throws {
-    let sink = _RecordingEventSink()
-    let session = _FakeSessionStateSource([_state(locked: false, readable: false)])
-    let client = _wakeClient(session: session, sink: sink)
-
-    let result = try await client.injectApproved(action: "wake", body: [:])
-    #expect(!result.ok)
-    #expect(result.error?.contains("session_unreadable") == true)
-    #expect(sink.mouse.isEmpty, "an unreadable session read fails CLOSED")
-    #expect(_obj(result.output)["image"] == nil)
-}
-
-/// And the same failure arriving on the SECOND read, after the nudge.
-@Test func wakeRefusesWhenTheSessionBecomesUnreadableBeforeTheCapture() async throws {
-    let sink = _RecordingEventSink()
-    let session = _FakeSessionStateSource([
-        _displayAsleep(),
-        _state(locked: false, readable: false),
-    ])
-    let result = try await _wakeClient(session: session, sink: sink)
-        .injectApproved(action: "wake", body: ["settle_ms": .int(0)])
-    #expect(!result.ok)
-    #expect(result.error?.contains("session_unreadable") == true)
-    #expect(_obj(result.output)["image"] == nil)
-    #expect(_obj(result.output)["marks"] == nil)
-}
-
-/// The platform fallback source reports itself unreadable rather than inventing
-/// an unlocked screen, and the guard refuses the state it hands back.
-@Test func theUnavailableSessionSourceIsUnreadableAndRefused() {
-    let state = UnavailableMacSessionStateSource().currentState()
-    #expect(!UnavailableMacSessionStateSource().isAvailable)
-    #expect(!state.sessionReadable)
-    #expect(MacWakeGuard.refusalReason(for: state) == MacWakeGuard.sessionUnreadableRefusal)
-}
-
-@Test func wakeRefusesWhenAnotherLoginSessionOwnsTheDisplay() async throws {
-    let sink = _RecordingEventSink()
-    let session = _FakeSessionStateSource([_state(onConsole: false)])
-    let client = _wakeClient(session: session, sink: sink)
-
-    let result = try await client.injectApproved(action: "wake", body: [:])
-    #expect(!result.ok)
-    #expect(result.error?.contains("session_not_on_console") == true)
-    #expect(sink.mouse.isEmpty)
-}
-
-@Test func wakeRefusesWhenTheSessionCannotBeReadAtAll() async throws {
-    let sink = _RecordingEventSink()
-    let session = _FakeSessionStateSource([_state()], available: false)
-    let client = _wakeClient(session: session, sink: sink)
-
-    let result = try await client.injectApproved(action: "wake", body: [:])
-    #expect(!result.ok)
-    #expect(result.error?.contains("session_state_unavailable") == true)
-    #expect(sink.mouse.isEmpty, "an unreadable session is not an unlocked one")
-}
-
-/// The guard as a decision table, so the rule is readable in one place and a
-/// future edit to it fails here first.
-@Test func wakeGuardRefusesEveryLockedPostureAndEveryUnreadableOne() {
-    // PROCEED — and only these: the lock flag is clear.
-    #expect(MacWakeGuard.refusalReason(for: _state()) == nil)
-    #expect(MacWakeGuard.refusalReason(for: _state(asleep: true)) == nil)
-    #expect(MacWakeGuard.refusalReason(for: _displayAsleep()) == nil)
-    #expect(MacWakeGuard.refusalReason(
-        for: _state(locked: false, frontmost: "com.apple.loginwindow")
-    ) == nil)
-
-    // REFUSE — every locked posture, whatever the idle policy says. The policy
-    // only chooses which true sentence comes back; it never buys a proceed.
-    #expect(MacWakeGuard.refusalReason(
-        for: _state(locked: true, password: .required)
-    ) == MacWakeGuard.lockedRefusal)
-    #expect(MacWakeGuard.refusalReason(
-        for: _state(locked: true, password: .unknown)
-    ) == MacWakeGuard.unknownLockRefusal)
-    // THE ONE THAT USED TO PROCEED.
-    #expect(MacWakeGuard.refusalReason(
-        for: _state(locked: true, password: .notRequired)
-    ) == MacWakeGuard.lockedIndeterminateRefusal)
-    #expect(MacWakeGuard.refusalReason(for: _lockedIdlePolicyOff())
-            == MacWakeGuard.lockedIndeterminateRefusal)
-    // Every refusal is a `screen_locked`/session refusal a caller can branch on.
-    for password in [MacSessionPasswordRequirement.required, .unknown, .notRequired] {
-        #expect(MacWakeGuard.refusalReason(for: _state(locked: true, password: password))?
-            .hasPrefix("screen_locked:") == true)
+/// The guards as a decision table (round 4, User's simplification, 2026-08-22):
+/// the NUDGE has no opinion about the screen — it refuses only when this
+/// process cannot see the console at all. The CAPTURE refuses while the
+/// saver/login layer is up, in obstruction vocabulary, never lock vocabulary.
+@Test func nudgeAlwaysProceedsAndCaptureRefusesOnlyWhileObstructed() {
+    // NUDGE: proceeds on every readable on-console posture, whatever the
+    // layer or the (retired) password reading claims.
+    for state in [_state(), _state(asleep: true), _displayAsleep(),
+                  _state(locked: false, frontmost: "com.apple.loginwindow"),
+                  _state(locked: true, password: .required),
+                  _state(locked: true, password: .unknown),
+                  _state(locked: true, password: .notRequired),
+                  _lockedIdlePolicyOff()] {
+        #expect(MacWakeGuard.nudgeRefusalReason(for: state) == nil)
     }
 
-    // REFUSE — unreadable, checked before anything else, even when every other
-    // field looks permissive.
-    #expect(MacWakeGuard.refusalReason(
-        for: _state(locked: false, onConsole: true, readable: false)
-    ) == MacWakeGuard.sessionUnreadableRefusal)
+    // CAPTURE: layer up ⇒ one obstruction refusal, no lock words.
+    for state in [_state(locked: true, password: .required),
+                  _state(locked: true, password: .unknown),
+                  _state(locked: true, password: .notRequired),
+                  _lockedIdlePolicyOff()] {
+        let reason = MacWakeGuard.captureRefusalReason(for: state)
+        #expect(reason == MacWakeGuard.stillObstructedRefusal)
+        #expect(reason?.hasPrefix("display_obstructed:") == true)
+        #expect(reason?.contains("locked") != true, "no lock vocabulary (User, 2026-08-22)")
+    }
+    // Layer clear ⇒ capture proceeds.
+    for state in [_state(), _state(asleep: true), _displayAsleep()] {
+        #expect(MacWakeGuard.captureRefusalReason(for: state) == nil)
+    }
 
-    #expect(MacWakeGuard.refusalReason(
-        for: _state(onConsole: false)
-    ) == MacWakeGuard.notOnConsoleRefusal)
-    // An unlocked screen owned by another console still refuses: the console
-    // check is not conditional on the lock.
-    #expect(MacWakeGuard.refusalReason(
-        for: _state(locked: false, onConsole: false)
-    ) == MacWakeGuard.notOnConsoleRefusal)
+    // BOTH refuse when the session is unreadable or another console owns the
+    // display — that is about THIS PROCESS, not the screen.
+    for state in [_state(locked: false, onConsole: true, readable: false),
+                  _state(locked: true, password: .notRequired, readable: false)] {
+        #expect(MacWakeGuard.nudgeRefusalReason(for: state) == MacWakeGuard.sessionUnreadableRefusal)
+        #expect(MacWakeGuard.captureRefusalReason(for: state) == MacWakeGuard.sessionUnreadableRefusal)
+    }
+    for state in [_state(onConsole: false), _state(locked: false, onConsole: false)] {
+        #expect(MacWakeGuard.nudgeRefusalReason(for: state) == MacWakeGuard.notOnConsoleRefusal)
+        #expect(MacWakeGuard.captureRefusalReason(for: state) == MacWakeGuard.notOnConsoleRefusal)
+    }
 }
 
 // MARK: - The approval gate is retired; the SESSION guard is not
@@ -606,23 +562,17 @@ private func _wakeBlock(_ output: JSONValue) -> [String: JSONValue] {
 
 // MARK: - The optional key tap
 
-@Test func wakeTapsAKeyOnlyWhenAskedAndOnlyAModifier() async throws {
-    let plainSink = _RecordingEventSink()
-    _ = try await _wakeClient(
-        session: _FakeSessionStateSource([_displayAsleep(), _desktopBack()]),
-        sink: plainSink
-    ).injectApproved(action: "wake", body: [:])
-    #expect(plainSink.keys.isEmpty, "the default nudge presses no key at all")
-
+@Test func wakeShiftTapIsOnByDefaultAndOnlyEverAModifier() async throws {
     let tapSink = _RecordingEventSink()
     _ = try await _wakeClient(
         session: _FakeSessionStateSource([_displayAsleep(), _desktopBack()]),
         sink: tapSink
-    ).injectApproved(action: "wake", body: ["key_tap": .bool(true)])
-    #expect(tapSink.keys.count == 2)
+    ).injectApproved(action: "wake", body: [:])
+    #expect(tapSink.keys.count == 2, "on by default (User, 2026-08-22): a bare move dismisses nothing")
     #expect(tapSink.keys.allSatisfy { $0.keyCode == SwiftNativeMacControl.wakeShiftKeyCode })
     #expect(tapSink.keys[0].down && !tapSink.keys[1].down)
-    // A modifier alone inserts no character anywhere: nothing carries text.
+    // A modifier alone inserts no character anywhere: nothing carries text,
+    // and nothing could ever type into a password field.
     #expect(tapSink.keys.allSatisfy { $0.unicodeText == nil })
 }
 

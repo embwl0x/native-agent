@@ -9,6 +9,18 @@ import PersonaEngine
 import PersistenceCore
 import ProviderRouting
 
+/// A durable, single-review intent. The organism state and the cognition receipt
+/// live in separate stores, so a completed review is rolled forward from this
+/// journal rather than attempting to restore a stale whole-organism snapshot.
+private struct OrganismReflexReviewIntent: Codable, Sendable {
+    let receiptID: UUID
+    let candidateID: String
+    let decision: OrganismReflexReviewDecision
+    let note: String?
+    let reviewedBy: String
+    let source: String
+}
+
 extension NativeCognitionRuntime {
     /// Round 3 Wave A2: notable resolutions the body just felt (relief /
     /// earned disappointment) become substrate nodes with real aboutness.
@@ -155,7 +167,7 @@ extension NativeCognitionRuntime {
     }
 
     func setOrganismKernelEnabled(_ enabled: Bool) async {
-        UserDefaults.standard.set(enabled, forKey: Self.organismKernelEnabledKey)
+        preferenceDefaults.set(enabled, forKey: Self.organismKernelEnabledKey)
         await refreshConfiguration()
         if enabled {
             organismContinuityRestored = false
@@ -218,25 +230,68 @@ extension NativeCognitionRuntime {
     }
 
     func resetOrganismContinuity() async -> OrganismSnapshot {
+        await resetOrganismContinuityChecked().snapshot
+    }
+
+    /// Reset only commits after the new empty baseline is durable. The old
+    /// state remains both on disk and in memory when the writer refuses.
+    func resetOrganismContinuityChecked() async -> OrganismContinuityApplyOutcome {
+        guard let before = await organismKernel.exportPersistentState() else {
+            return OrganismContinuityApplyOutcome(
+                status: .organismDisabled,
+                snapshot: await organismKernel.snapshot(),
+                error: "The organism kernel is disabled."
+            )
+        }
         await organismKernel.clearTransientState()
+        // Reset is the explicit recovery path for a corrupt prior organism file.
+        // Permit this one atomic replacement attempt, but restore the freeze if
+        // it fails so a failed reset cannot overwrite or launder damaged bytes.
+        let wasRestoreFrozen = organismRestoreFailedHard
+        organismRestoreFailedHard = false
+        guard await persistOrganismContinuity(reason: "reset") else {
+            organismRestoreFailedHard = wasRestoreFrozen
+            await organismKernel.restorePersistentState(before)
+            return OrganismContinuityApplyOutcome(
+                status: .persistenceFailed,
+                snapshot: await organismKernel.snapshot(),
+                error: "The reset was not saved; the previous organism state was restored."
+            )
+        }
         lastInjectedBodyLine = nil
         lastInjectedBodyLineAt = nil
-        try? FileManager.default.removeItem(at: organismPersistentStateURL)
-        // Audit C1 follow-up: removing the (possibly bad) state file clears the
-        // failed-restore freeze — fresh state may persist again.
         organismRestoreFailedHard = false
-        await persistOrganismContinuity(reason: "reset")
         let snapshot = await organismKernel.snapshot()
         publishRuntimeChange(reason: "organism:reset")
-        return snapshot
+        return OrganismContinuityApplyOutcome(status: .applied, snapshot: snapshot, error: nil)
     }
 
     func settleOrganismContinuity() async -> OrganismSnapshot {
+        await settleOrganismContinuityChecked().snapshot
+    }
+
+    /// Settle is likewise a checked durable mutation. A failed writer restores
+    /// the pre-settle state instead of leaving the screen to imply success.
+    func settleOrganismContinuityChecked() async -> OrganismContinuityApplyOutcome {
+        guard let before = await organismKernel.exportPersistentState() else {
+            return OrganismContinuityApplyOutcome(
+                status: .organismDisabled,
+                snapshot: await organismKernel.snapshot(),
+                error: "The organism kernel is disabled."
+            )
+        }
         await organismKernel.settleContinuity()
-        await persistOrganismContinuity(reason: "settle")
+        guard await persistOrganismContinuity(reason: "settle") else {
+            await organismKernel.restorePersistentState(before)
+            return OrganismContinuityApplyOutcome(
+                status: .persistenceFailed,
+                snapshot: await organismKernel.snapshot(),
+                error: "The settle was not saved; the previous organism state was restored."
+            )
+        }
         let snapshot = await organismKernel.snapshot()
         publishRuntimeChange(reason: "organism:settled")
-        return snapshot
+        return OrganismContinuityApplyOutcome(status: .applied, snapshot: snapshot, error: nil)
     }
 
     func reviewOrganismReflexCandidate(
@@ -262,10 +317,38 @@ extension NativeCognitionRuntime {
         reviewedBy: String,
         source: String
     ) async -> OrganismReflexReviewApplyOutcome {
+        let normalizedID = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        if organismReflexReviewTransactionInFlight || organismReflexReviewingIDs.contains(normalizedID) {
+            let snapshot = await organismKernel.snapshot()
+            return OrganismReflexReviewApplyOutcome(
+                status: .reviewInFlight,
+                snapshot: snapshot,
+                candidate: snapshot.reflexCandidates.first { $0.id == normalizedID },
+                receipt: nil,
+                error: "That reflex review is already being saved."
+            )
+        }
+        organismReflexReviewingIDs.insert(normalizedID)
+        organismReflexReviewTransactionInFlight = true
+        defer {
+            organismReflexReviewingIDs.remove(normalizedID)
+            organismReflexReviewTransactionInFlight = false
+        }
+        if FileManager.default.fileExists(atPath: organismReflexReviewIntentURL.path) {
+            await recoverPendingOrganismReflexReviewIfNeeded()
+            if FileManager.default.fileExists(atPath: organismReflexReviewIntentURL.path) {
+                let snapshot = await organismKernel.snapshot()
+                return OrganismReflexReviewApplyOutcome(
+                    status: .persistenceFailed,
+                    snapshot: snapshot,
+                    candidate: snapshot.reflexCandidates.first { $0.id == normalizedID },
+                    receipt: nil,
+                    error: "A prior reflex review is still awaiting durable recovery."
+                )
+            }
+        }
         let beforeSnapshot = await organismKernel.snapshot()
-        guard beforeSnapshot.enabled,
-              let beforeState = await organismKernel.exportPersistentState()
-        else {
+        guard beforeSnapshot.enabled else {
             return OrganismReflexReviewApplyOutcome(
                 status: .organismDisabled,
                 snapshot: beforeSnapshot,
@@ -274,7 +357,6 @@ extension NativeCognitionRuntime {
                 error: "The organism kernel is disabled."
             )
         }
-        let normalizedID = id.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let candidateBefore = beforeSnapshot.reflexCandidates.first(where: { $0.id == normalizedID }) else {
             return OrganismReflexReviewApplyOutcome(
                 status: .candidateNotFound,
@@ -282,6 +364,15 @@ extension NativeCognitionRuntime {
                 candidate: nil,
                 receipt: nil,
                 error: "No active reflex candidate matched \(normalizedID)."
+            )
+        }
+        guard candidateBefore.reviewRequired else {
+            return OrganismReflexReviewApplyOutcome(
+                status: .notAwaitingReview,
+                snapshot: beforeSnapshot,
+                candidate: candidateBefore,
+                receipt: nil,
+                error: "That reflex candidate has already been reviewed."
             )
         }
         guard decision != .approve || candidateBefore.trustClass == .lowRisk else {
@@ -293,13 +384,46 @@ extension NativeCognitionRuntime {
                 error: "Only low-risk reflex candidates can be approved."
             )
         }
+        // The journal names a candidate by ID, so make the already-observed
+        // candidate durable before allowing an intent that must survive a
+        // process death. This is a precondition write, not a rollback point.
+        guard await persistOrganismContinuity(reason: "reflex_prepare") else {
+            return OrganismReflexReviewApplyOutcome(
+                status: .persistenceFailed,
+                snapshot: await organismKernel.snapshot(),
+                candidate: candidateBefore,
+                receipt: nil,
+                error: "The reflex candidate could not be prepared for durable review."
+            )
+        }
+        let intent = OrganismReflexReviewIntent(
+            receiptID: UUID(),
+            candidateID: normalizedID,
+            decision: decision,
+            note: note,
+            reviewedBy: reviewedBy,
+            source: source
+        )
+        do {
+            try await writeOrganismReflexReviewIntent(intent)
+        } catch {
+            return OrganismReflexReviewApplyOutcome(
+                status: .persistenceFailed,
+                snapshot: beforeSnapshot,
+                candidate: candidateBefore,
+                receipt: nil,
+                error: "The reflex review journal could not be saved: \(error.localizedDescription)"
+            )
+        }
         guard let application = await organismKernel.reviewReflexCandidate(
             id: normalizedID,
             decision: decision,
             note: note,
             reviewedBy: reviewedBy,
-            source: source
+            source: source,
+            receiptID: intent.receiptID.uuidString
         ) else {
+            try? removeOrganismReflexReviewIntent()
             return OrganismReflexReviewApplyOutcome(
                 status: .candidateNotFound,
                 snapshot: beforeSnapshot,
@@ -309,31 +433,31 @@ extension NativeCognitionRuntime {
             )
         }
 
-        let persisted = await persistOrganismContinuity(reason: "reflex:\(decision.rawValue)")
-        guard persisted else {
-            await organismKernel.restorePersistentState(beforeState)
+        // The cognitive receipt is the authority that makes this operator
+        // decision auditable, so it is the first committed half after intent.
+        // If it refuses, the journal remains and no review state is committed.
+        do {
+            try await recordOrganismReflexReviewReceipt(application.receipt, receiptID: intent.receiptID)
+        } catch {
             return OrganismReflexReviewApplyOutcome(
                 status: .persistenceFailed,
                 snapshot: await organismKernel.snapshot(),
                 candidate: candidateBefore,
                 receipt: nil,
-                error: "The reflex review could not be persisted; the in-memory change was rolled back."
+                error: "The reflex review is journaled and will finish after receipt persistence recovers."
             )
         }
-
-        await substrate.recordReceipt(
-            kind: "organism.reflex_review",
-            payload: .object([
-                "receiptId": .string(application.receipt.id),
-                "candidateId": .string(application.receipt.candidateID),
-                "decision": .string(application.receipt.decision.rawValue),
-                "reviewedBy": .string(application.receipt.reviewedBy),
-                "source": .string(application.receipt.source),
-                "trustClass": .string(application.receipt.trustClass.rawValue),
-                "autoActivationAllowed": .bool(application.receipt.autoActivationAllowed),
-                "permanentlyDeliberate": .bool(application.receipt.permanentlyDeliberate),
-            ])
-        )
+        let persisted = await persistOrganismContinuity(reason: "reflex:\(decision.rawValue)")
+        guard persisted else {
+            return OrganismReflexReviewApplyOutcome(
+                status: .persistenceFailed,
+                snapshot: await organismKernel.snapshot(),
+                candidate: candidateBefore,
+                receipt: nil,
+                error: "The reflex review is journaled and will finish after organism persistence recovers."
+            )
+        }
+        try? removeOrganismReflexReviewIntent()
         publishRuntimeChange(reason: "organism:reflex_review")
         return OrganismReflexReviewApplyOutcome(
             status: .applied,
@@ -419,6 +543,114 @@ extension NativeCognitionRuntime {
         dataRoot
             .appendingPathComponent("cognition", isDirectory: true)
             .appendingPathComponent("organism_state.json")
+    }
+
+    private var organismReflexReviewIntentURL: URL {
+        dataRoot
+            .appendingPathComponent("cognition", isDirectory: true)
+            .appendingPathComponent("organism_reflex_review_pending.json")
+    }
+
+    private func writeOrganismReflexReviewIntent(
+        _ intent: OrganismReflexReviewIntent
+    ) async throws {
+        try await Self.writeOrganismReflexReviewIntent(intent, to: organismReflexReviewIntentURL)
+    }
+
+    private func removeOrganismReflexReviewIntent() throws {
+        let url = organismReflexReviewIntentURL
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        try FileManager.default.removeItem(at: url)
+    }
+
+    /// Completes an interrupted two-store reflex review. It never restores a
+    /// whole prior organism state: regular sensory ingestion may have advanced
+    /// while a disk operation was suspended, and the journal's receipt ID makes
+    /// applying this one transition and recording its cognitive receipt safe to
+    /// repeat across relaunches.
+    func recoverPendingOrganismReflexReviewIfNeeded() async {
+        let url = organismReflexReviewIntentURL
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        let intent: OrganismReflexReviewIntent
+        do {
+            let data = try Data(contentsOf: url)
+            intent = try JSONDecoder().decode(OrganismReflexReviewIntent.self, from: data)
+        } catch {
+            await substrate.recordReceipt(
+                kind: "organism.reflex_review_recovery_failed",
+                payload: .object(["error": .string(String(describing: error))])
+            )
+            return
+        }
+
+        let receiptID = intent.receiptID.uuidString
+        var persistentState = await organismKernel.exportPersistentState()
+        var receipt = persistentState?.reflexState.reviewReceipts.first { $0.id == receiptID }
+        if receipt == nil {
+            guard let application = await organismKernel.reviewReflexCandidate(
+                id: intent.candidateID,
+                decision: intent.decision,
+                note: intent.note,
+                reviewedBy: intent.reviewedBy,
+                source: intent.source,
+                receiptID: receiptID
+            ) else {
+                await substrate.recordReceipt(
+                    kind: "organism.reflex_review_recovery_failed",
+                    payload: .object([
+                        "candidateId": .string(intent.candidateID),
+                        "receiptId": .string(receiptID),
+                        "reason": .string("candidate_not_reviewable"),
+                    ])
+                )
+                return
+            }
+            guard await persistOrganismContinuity(reason: "reflex_recovery:\(intent.decision.rawValue)") else {
+                return
+            }
+            persistentState = await organismKernel.exportPersistentState()
+            receipt = persistentState?.reflexState.reviewReceipts.first { $0.id == receiptID }
+            guard receipt != nil else { return }
+            _ = application
+        }
+        guard let receipt else { return }
+        do {
+            try await recordOrganismReflexReviewReceipt(receipt, receiptID: intent.receiptID)
+            try? removeOrganismReflexReviewIntent()
+            publishRuntimeChange(reason: "organism:reflex_review_recovered")
+        } catch {
+            // Keep the intent. The exact receipt ID turns the next launch into
+            // an idempotent retry rather than another review transition.
+        }
+    }
+
+    private func recordOrganismReflexReviewReceipt(
+        _ receipt: OrganismReflexReviewReceipt,
+        receiptID: UUID
+    ) async throws {
+        let payload: JSONValue = .object([
+            "receiptId": .string(receipt.id),
+            "candidateId": .string(receipt.candidateID),
+            "decision": .string(receipt.decision.rawValue),
+            "reviewedBy": .string(receipt.reviewedBy),
+            "source": .string(receipt.source),
+            "trustClass": .string(receipt.trustClass.rawValue),
+            "autoActivationAllowed": .bool(receipt.autoActivationAllowed),
+            "permanentlyDeliberate": .bool(receipt.permanentlyDeliberate),
+        ])
+        if let organismReflexReceiptRecorderOverride {
+            try await organismReflexReceiptRecorderOverride(
+                receiptID,
+                "organism.reflex_review",
+                payload
+            )
+        } else {
+            try await substrate.recordReceiptChecked(
+                kind: "organism.reflex_review",
+                payload: payload,
+                id: receiptID
+            )
+        }
     }
 
     func restoreOrganismContinuityIfAvailable() async {  // internal for actor extensions (move-only Wave C)
@@ -565,6 +797,20 @@ extension NativeCognitionRuntime {
             encoder.dateEncodingStrategy = .iso8601
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             let data = try encoder.encode(state)
+            try data.write(to: url, options: .atomic)
+        }.value
+    }
+
+    private nonisolated static func writeOrganismReflexReviewIntent(
+        _ intent: OrganismReflexReviewIntent,
+        to url: URL
+    ) async throws {
+        try await Task.detached(priority: .utility) {
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let data = try JSONEncoder().encode(intent)
             try data.write(to: url, options: .atomic)
         }.value
     }

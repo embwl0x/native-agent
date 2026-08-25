@@ -1,0 +1,8 @@
+[
+ "script:evals_apply_wave.swift",
+ "setting:NativeAgent.pinnedChatSessionIds",
+ "setting:cognitiveSubstrateBackgroundEnabled",
+ "setting:cognitiveSubstrateDailyReflectionBudget",
+ "setting:cognitiveSubstrateReflectionEnabled",
+ "setting:cognitiveSubstrateReflectionProvider"
+]

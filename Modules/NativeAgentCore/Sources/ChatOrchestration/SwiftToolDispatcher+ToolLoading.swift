@@ -45,24 +45,35 @@ extension SwiftToolDispatcher {
         // belong in currentlyLoaded too — otherwise the description's
         // "tools not in currentlyLoaded are not in your current tools[]
         // array" claim is false for MCP tools and misleads the LLM.
-        let currentlyLoaded = Self.alwaysOnCoreNames
-            .union(activeForTurn)
+        let modelNameSet = nameSet.subtracting(Self.legacyMacModelToolNames)
+        let currentlyLoaded = Self.normalModelToolNames(activeTools: activeForTurn)
             .union(mcpNameSet)
-            .intersection(nameSet)
+            .intersection(modelNameSet)
             .sorted()
-        let discoveryOnly = nameSet
+        let discoveryOnly = modelNameSet
             .subtracting(Self.alwaysOnCoreNames)
             .subtracting(activeForTurn)
             .subtracting(mcpNameSet)
             .sorted()
         let loadedSet = Set(currentlyLoaded)
-        let rows: [JSONValue] = schemas.map { schema in
+        let rows: [JSONValue] = schemas.filter { modelNameSet.contains($0.name) }.map { schema in
             var row: [String: JSONValue] = [
                 "name": .string(schema.name),
                 "description": .string(schema.description),
                 "dispatchable_via": .string("swift_tool_dispatcher"),
                 "load_state": .string(loadedSet.contains(schema.name) ? "loaded" : "discovery_only"),
             ]
+            if Self.skillReaderToolNames.contains(schema.name) {
+                row["tags"] = .array([.string("skill_reader")])
+            }
+            // A registry-owned bucket makes the rendered catalog reflect the
+            // dispatch table rather than a second UI-only name list. An
+            // unreviewed runtime name is never fabricated as a safe category;
+            // the mounted Tools UI renders that adverse condition explicitly.
+            row["catalog_bucket"] = .string(
+                (schema.name.hasPrefix("mcp__") ? ChatToolCatalogBucket.mcp : Self.catalogBucket(forRegisteredToolNamed: schema.name))?.rawValue
+                    ?? ChatToolCatalogBucket.unclassified.rawValue
+            )
             if let parameters = try? JSONValue.parse(schema.parametersJSON) {
                 row["parameters"] = parameters
             }
@@ -161,7 +172,7 @@ extension SwiftToolDispatcher {
             "currently_loaded": .array(currentlyLoaded.map { .string($0) }),
             "turn_active_tools": .array(turnScoped.sorted().map { .string($0) }),
             "discovery_only_tools": .array(discoveryOnly.map { .string($0) }),
-            "available_tools": .array(names.map { .string($0) }),
+            "available_tools": .array(modelNameSet.sorted().map { .string($0) }),
             "builder_available_tools": .array(availableBuilderTools.map { .string($0) }),
             "builder_policy_locked_tools": .array(lockedBuilderTools.map { .string($0) }),
             "builder_bridge_readiness": .object([
@@ -261,9 +272,21 @@ extension SwiftToolDispatcher {
         }
 
         let allTools = Set((try? await listAvailableTools()) ?? Self.builtInToolNames)
+            .subtracting(Self.legacyMacModelToolNames)
         let existing = await activeToolsStore.load(sessionId: sessionId).activeTools
         let turnScoped = LLMCallContext.turnActiveTools ?? []
         let effectiveExisting = existing.union(turnScoped)
+
+        // `mac.look` → `mac_look`: the registry id and the catalog name are one
+        // tool (see SwiftToolDispatcher.canonicalToolName). Report what was
+        // aliased so the caller learns the catalog spelling.
+        var aliased: [String: JSONValue] = [:]
+        let canonicalRequested = Set(requested.map { name -> String in
+            let canonical = Self.canonicalToolName(name) { allTools.contains($0) }
+            if canonical != name { aliased[name] = .string(canonical) }
+            return canonical
+        })
+        requested = canonicalRequested
 
         let validNames = requested.intersection(allTools)
         let notInCatalog = requested.subtracting(allTools).sorted()
@@ -300,6 +323,7 @@ extension SwiftToolDispatcher {
             "loaded": .array(validNames.sorted().map { .string($0) }),
             "not_in_catalog": .array(notInCatalog.map { .string($0) }),
             "unavailable": .array(notInCatalog.map { .string($0) }),
+            "aliased": .object(aliased),
             "already_active": .array(alreadyActive.map { .string($0) }),
             "turn_active": .array(turnActive.map { .string($0) }),
             "session_active_count": .int(Int64(newActive.count)),

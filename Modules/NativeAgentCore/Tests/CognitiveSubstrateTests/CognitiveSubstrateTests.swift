@@ -2023,10 +2023,16 @@ private func event(
     #expect(receipt?.cancelled == false)
     #expect(await substrate.planReflection(reason: "second call blocked") == nil)
 
+    // Ablation is a real read-side intervention (f04aa12e): before it fires
+    // the workspace projection carries both nodes; after, it reads empty while
+    // node/episode/reflection state stays intact and the ablation is recorded.
+    let beforeAblation = await substrate.observatorySnapshot()
+    #expect(beforeAblation.workspaceCount == 2)
+
     await substrate.setAblation("workspace", enabled: false)
     let observatory = await substrate.observatorySnapshot()
     #expect(observatory.nodeCount == 2)
-    #expect(observatory.workspaceCount == 2)
+    #expect(observatory.workspaceCount == 0)
     #expect(observatory.episodeCount == 1)
     #expect(observatory.reflectionCount == 1)
     #expect(observatory.ablations["workspace"] == false)

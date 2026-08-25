@@ -53,6 +53,7 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
     case agentOriginRequiresPursuit(handle: String)
     case genericPathCannotCreateAgent(handle: String)
     case notAPursuit(handle: String)
+    case vetoRefusedTerminal(handle: String, status: DeskStatus)
     case workSessionCapReached(scope: String, limit: Int, handle: String)
     case unknownReservation(reservationId: String, handle: String)
     case reservationAlreadyComplete(reservationId: String, handle: String)
@@ -102,6 +103,8 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
             return "desk: the generic add-item path cannot create an origin=agent pursuit (\(handle)); use openPursuit"
         case .notAPursuit(let handle):
             return "desk: \(handle) is not a self-pursuit (origin=agent, kind=project)"
+        case let .vetoRefusedTerminal(handle, status):
+            return "desk: cannot veto \(handle) — it is already terminal (status \(status.rawValue))"
         case let .workSessionCapReached(scope, limit, handle):
             return "desk: work-session cap reached — \(scope) limit \(limit) for \(handle) already met today"
         case let .unknownReservation(reservationId, handle):
@@ -955,6 +958,42 @@ public struct SwiftNativeDeskStore: Sendable {
         try await appendValidated(DeskOp(handle: handle, body: .appendNote(text: text)))
     }
 
+    /// Commit the user-facing Observatory veto as one replayable Desk op. A
+    /// note and terminal state must never be split across separate writes: on
+    /// relaunch the pursuit is either still open, or visibly canceled with its
+    /// rationale. Historical partial state is repaired by the same op, while
+    /// a completed veto is a durable no-op.
+    @discardableResult
+    public func vetoPursuit(_ handle: String, note: String) async throws -> DeskOp? {
+        let rationale = note.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rationale.isEmpty else {
+            throw DeskError.pursuitFieldMissing(reason: "veto rationale is empty")
+        }
+        return try await persistence.withFileLock(opsPath) {
+            let feed = try await readFeedUnlocked()
+            let state = Self.compact(base: feed.base, feed.ops)
+            guard let item = state.items.first(where: { $0.handle == handle }) else {
+                throw DeskError.unknownHandle(handle)
+            }
+            guard item.isPursuit else { throw DeskError.notAPursuit(handle: handle) }
+            if item.status == .canceled,
+               item.notes.contains(where: { $0.text == rationale }) {
+                return nil
+            }
+            guard !item.status.isTerminal || item.status == .canceled else {
+                throw DeskError.vetoRefusedTerminal(handle: handle, status: item.status)
+            }
+            let op = DeskOp(
+                ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs),
+                handle: handle,
+                body: .vetoPursuit(note: rationale)
+            )
+            try Self.validateHierarchyTransition(op, in: state, allowArchive: false)
+            _ = try await appendAndRecompactUnlocked(op, feed: feed)
+            return op
+        }
+    }
+
     @discardableResult
     public func setCadence(_ handle: String, cadence: Cadence) async throws -> DeskOp {
         try await appendValidated(DeskOp(handle: handle, body: .setCadence(cadence: cadence)))
@@ -1646,6 +1685,9 @@ public struct SwiftNativeDeskStore: Sendable {
                 )
             }
 
+        case .vetoPursuit:
+            try rejectTerminalParentWithOpenDescendant(op.handle, in: state)
+
         case .closeItem:
             try rejectTerminalParentWithOpenDescendant(op.handle, in: state)
 
@@ -1914,6 +1956,17 @@ public struct SwiftNativeDeskStore: Sendable {
             case let .appendNote(text):
                 guard var item = byHandle[op.handle] else { continue }
                 Self.appendNoteCapped(&item, DeskNote(ts: op.ts, text: text))
+                item.updatedAt = op.ts
+                byHandle[op.handle] = item
+            case let .vetoPursuit(note):
+                guard var item = byHandle[op.handle] else { continue }
+                item.status = .canceled
+                item.blockedReason = nil
+                item.waitingOn = nil
+                if item.closedAt == nil { item.closedAt = op.ts }
+                if !item.notes.contains(where: { $0.text == note }) {
+                    Self.appendNoteCapped(&item, DeskNote(ts: op.ts, text: note))
+                }
                 item.updatedAt = op.ts
                 byHandle[op.handle] = item
             case let .setCadence(cadence):

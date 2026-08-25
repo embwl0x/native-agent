@@ -83,7 +83,7 @@ extension ChatView {
         }
         switch builtIn?.route {
         case .clear:
-            showClearConfirm = true
+            clearConfirmation.request()
         case .compact:
             // Await and present the typed mutation result so a failed compact
             // is never reported as success on this surface.
@@ -261,9 +261,8 @@ extension ChatView {
         }
     }
 
-    // Phase 13 (item 8): Sendable-safe dispatch that accepts pre-serialized Data.
-    // Called from ToolInputForm's onSubmit closure where [String: Any] is serialized
-    // to Data before crossing the Task actor boundary, satisfying Swift 6 strict concurrency.
+    // Sendable-safe dispatch that accepts the ToolInputForm's already validated,
+    // JSON-shaped data before crossing the Task actor boundary.
     @MainActor
     func runDispatchAndRenderReceiptData(tool: String, inputData: Data) async {
         let sessionId: String? = appModel.activeChatSessionId.isEmpty ? nil : appModel.activeChatSessionId

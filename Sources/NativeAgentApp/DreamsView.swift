@@ -9,6 +9,192 @@
 //   trainingPolicy.rem_cycle_enabled       (REM gate)
 import SwiftUI
 
+/// The manual Dream action must distinguish a verified disabled policy from an
+/// unavailable diary/gate read. Both prevent a run, but only the former may be
+/// described as disabled to the person using the Dreams surface.
+enum DreamRunAvailability: Equatable {
+    case checking
+    case enabled
+    case disabled
+    case unavailable
+
+    static func resolve(
+        hasReadDiaryGate: Bool,
+        diaryLoadFailed: Bool,
+        dreamEnabledFromDiary: Bool
+    ) -> Self {
+        if diaryLoadFailed { return .unavailable }
+        guard hasReadDiaryGate else { return .checking }
+        return dreamEnabledFromDiary ? .enabled : .disabled
+    }
+
+    var canRun: Bool { self == .enabled }
+
+    var help: String {
+        switch self {
+        case .checking:
+            return "Checking dream-cycle availability."
+        case .enabled:
+            return "Run a dream reflection pass against recent sessions."
+        case .disabled:
+            return "Dream cycle is disabled. Enable the dream cycle toggle and the Trust 'dream scheduler' gate."
+        case .unavailable:
+            return "Dream-cycle availability could not be read. Refresh the diary and retry."
+        }
+    }
+}
+
+/// The Dreams surface owns several independent operations (diary reads,
+/// manual Dream/REM runs, and gate writes).  A non-nil operation error is
+/// evidence of failure even when a producer supplied no usable diagnostic;
+/// never erase that state into an empty red strip or a success-shaped surface.
+enum DreamErrorBannerPresentation {
+    struct Banner: Equatable, Sendable {
+        let text: String
+        let isTruncated: Bool
+    }
+
+    static let maximumDetailCharacters = 280
+    static let missingDetailText = "Dreams operation failed, but no diagnostic detail was returned."
+
+    static func banner(for error: String?) -> Banner? {
+        guard let error else { return nil }
+        let detail = error.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !detail.isEmpty else {
+            return .init(text: missingDetailText, isTruncated: false)
+        }
+        let isTruncated = detail.count > maximumDetailCharacters
+        let bounded = String(detail.prefix(maximumDetailCharacters))
+        return .init(text: isTruncated ? "\(bounded)…" : bounded, isTruncated: isTruncated)
+    }
+}
+
+/// The diary refresh outcome is distinct from the diary's content. An empty
+/// array after a successful read is an honest empty diary; a failed read over
+/// retained entries is stale data, and a failed first read is unavailable.
+enum DreamDiaryRefreshPresentation: Equatable {
+    case current
+    case retainedStale(entryCount: Int)
+    case unavailable
+
+    static func resolve(entries: [DreamEntry], didFail: Bool) -> Self {
+        guard didFail else { return .current }
+        return entries.isEmpty ? .unavailable : .retainedStale(entryCount: entries.count)
+    }
+
+    var banner: String? {
+        switch self {
+        case .current: return nil
+        case .retainedStale:
+            return "Couldn't refresh the diary — showing previously loaded entries."
+        case .unavailable:
+            return "Dream cycle availability couldn't be checked. Retry the diary refresh before running a dream pass."
+        }
+    }
+
+    var unavailableEmptyState: Bool { self == .unavailable }
+}
+
+/// A successful diary read can still omit individual damaged files. Keep that
+/// third state distinct from both an empty diary and a total reader failure.
+enum DreamDiaryListPresentation: Equatable {
+    case readable
+    case incomplete(unreadableEntries: Int)
+
+    static func resolve(entryCount: Int, unreadableEntries: Int) -> Self {
+        entryCount == 0 && unreadableEntries > 0
+            ? .incomplete(unreadableEntries: unreadableEntries)
+            : .readable
+    }
+
+    static func unreadableLabel(_ count: Int) -> String? {
+        guard count > 0 else { return nil }
+        return count == 1
+            ? "1 diary file in this window couldn't be read and is not shown."
+            : "\(count) diary files in this window couldn't be read and are not shown."
+    }
+}
+
+/// Serializes diary-read visibility. The newest request owns the spinner and
+/// is the only request whose response may reach the diary reconciliation code.
+/// Older reads can still finish, but their result is explicitly superseded.
+struct DreamDiaryLoadGeneration: Equatable {
+    enum Settlement: Equatable {
+        case superseded
+        case current(DreamDiaryResponse?)
+    }
+
+    private(set) var latestRequest = 0
+    private(set) var isLoading = false
+
+    mutating func begin() -> Int {
+        latestRequest &+= 1
+        isLoading = true
+        return latestRequest
+    }
+
+    mutating func settle(request: Int, response: DreamDiaryResponse?) -> Settlement {
+        guard request == latestRequest else { return .superseded }
+        isLoading = false
+        return .current(response)
+    }
+}
+
+/// The detail pane has a separate request stream from the diary list. A newer
+/// date selection owns both the result and the loading indicator; a cancelled
+/// older request must not make the newer selection look idle or overwrite its
+/// failure state.
+struct DreamEntryLoadGeneration: Equatable {
+    enum Settlement: Equatable {
+        case superseded
+        case current(DreamEntry?)
+    }
+
+    private(set) var latestRequest = 0
+    private(set) var isLoading = false
+
+    mutating func begin() -> Int {
+        latestRequest &+= 1
+        isLoading = true
+        return latestRequest
+    }
+
+    mutating func settle(request: Int, entry: DreamEntry?) -> Settlement {
+        guard request == latestRequest else { return .superseded }
+        isLoading = false
+        return .current(entry)
+    }
+
+    mutating func cancelPending() {
+        latestRequest &+= 1
+        isLoading = false
+    }
+}
+
+/// The detail pane must distinguish an unselected diary from a selected date
+/// whose fetch did not yield an entry. The latter is an unavailable read, never
+/// an instruction to select a dream again.
+enum DreamEntryDetailPresentation: Equatable {
+    case loading
+    case entry
+    case failed(String)
+    case unselected
+
+    static let missingEntryDetail = "The selected diary entry could not be read."
+
+    static func resolve(
+        selectedDate: String?,
+        hasSelectedEntry: Bool,
+        isLoading: Bool,
+        error: String?
+    ) -> Self {
+        if isLoading && !hasSelectedEntry { return .loading }
+        if hasSelectedEntry { return .entry }
+        guard selectedDate != nil else { return .unselected }
+        return .failed(error ?? missingEntryDetail)
+    }
+}
+
 struct DreamsView: View {
     @Environment(AppModel.self) private var appModel
 
@@ -18,10 +204,12 @@ struct DreamsView: View {
     @State private var selectedDate: String?
     @State private var selectedEntry: DreamEntry?
 
-    @State private var isLoadingDiary = false
-    @State private var isLoadingEntry = false
+    @State private var diaryLoadGeneration = DreamDiaryLoadGeneration()
+    @State private var entryLoadGeneration = DreamEntryLoadGeneration()
     @State private var isRunningDream = false
     @State private var isRunningRem = false
+    @State private var remPolicyLoadFailed = false
+    @State private var remRunFeedback: DreamsREMActionFeedback?
     @State private var didInitialLoad = false
 
     // Optimistic local mirrors of the two kill switches so the toggles don't snap
@@ -32,20 +220,45 @@ struct DreamsView: View {
     @State private var remCycleOn = true
     @State private var savingDream = false
     @State private var savingRem = false
-    // Generation token so a slow earlier diary load can't clobber a newer one's
-    // entries/selection/toggle reconcile (closes the toggle snap-back race).
-    @State private var diaryLoadGen = 0
-
     // Cancellable task for diary refresh so it doesn't outlive the view.
     @State private var refreshTask: Task<Void, Never>?
     @State private var entryTask: Task<Void, Never>?
+    // A failed read is neither an empty diary nor proof the scheduler is off.
+    // Keep that distinction in the mounted surface, including when a refresh
+    // fails after entries were already rendered.
+    @State private var diaryLoadFailed = false
+    // Set only by a successful diary read. `didInitialLoad` merely means a
+    // task was started, which is not evidence that the composite gate was read.
+    @State private var hasReadDiaryGate = false
+    @State private var entryLoadError: String?
+    @State private var diaryTotalEntries: Int?
+    @State private var diaryUnreadableEntries = 0
 
     private let diaryLimit = 60
+
+    private var isLoadingDiary: Bool { diaryLoadGeneration.isLoading }
+    private var isLoadingEntry: Bool { entryLoadGeneration.isLoading }
+
+    private var entryDetailPresentation: DreamEntryDetailPresentation {
+        DreamEntryDetailPresentation.resolve(
+            selectedDate: selectedDate,
+            hasSelectedEntry: selectedEntry != nil,
+            isLoading: isLoadingEntry,
+            error: entryLoadError
+        )
+    }
+
+    private var diaryListPresentation: DreamDiaryListPresentation {
+        DreamDiaryListPresentation.resolve(
+            entryCount: entries.count,
+            unreadableEntries: diaryUnreadableEntries
+        )
+    }
 
     // REM enabled state is owned by the trust policy.
     @MainActor
     private var remEnabled: Bool {
-        appModel.trustPolicy?.trainingPolicy?.rem_cycle_enabled ?? true
+        appModel.trustPolicy?.trainingPolicy?.rem_cycle_enabled == true
     }
 
     var body: some View {
@@ -53,14 +266,15 @@ struct DreamsView: View {
             controlBar
             Divider()
 
-            if let err = appModel.dreamError {
-                Text(err)
+            if let banner = DreamErrorBannerPresentation.banner(for: appModel.dreamError) {
+                Label(banner.text, systemImage: "exclamationmark.triangle.fill")
                     .font(NativeAgentFont.label)
                     .foregroundStyle(NativeAgentTheme.fail)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, NativeAgentSpacing.lg)
                     .padding(.vertical, NativeAgentSpacing.sm)
                     .background(NativeAgentTheme.fail.opacity(0.08))
+                    .accessibilityLabel("Dreams error: \(banner.text)")
             }
 
             content
@@ -72,6 +286,7 @@ struct DreamsView: View {
             // One-shot initial load. .task is cancelled automatically on disappear.
             guard !didInitialLoad else { return }
             didInitialLoad = true
+            await loadREMPolicy()
             await loadDiary(selectLatest: true)
         }
         .onDisappear {
@@ -95,10 +310,8 @@ struct DreamsView: View {
                         Label("Run Dream Now", systemImage: "moon.stars")
                     }
                 }
-                .disabled(isRunningDream || !dreamEnabledFromDiary)
-                .help(dreamEnabledFromDiary
-                      ? "Run a dream reflection pass against recent sessions."
-                      : "Dream cycle is disabled. Enable the dream cycle toggle and the Trust 'dream scheduler' gate.")
+                .disabled(isRunningDream || !canRunDream)
+                .help(dreamRunHelp)
 
                 Button {
                     runRem()
@@ -109,10 +322,8 @@ struct DreamsView: View {
                         Label("Run REM Now", systemImage: "sparkles")
                     }
                 }
-                .disabled(isRunningRem || !remEnabled)
-                .help(remEnabled
-                      ? "Run a REM consolidation pass over unconsumed dream entries."
-                      : "REM cycle is disabled. Enable the REM cycle toggle.")
+                .disabled(isRunningRem || !remRunAvailability.canRun)
+                .help(remRunAvailability.help)
 
                 Spacer()
 
@@ -176,6 +387,27 @@ struct DreamsView: View {
                 Spacer()
             }
             .font(NativeAgentFont.label)
+
+            if let banner = diaryRefreshPresentation.banner {
+                Label(banner, systemImage: "exclamationmark.triangle")
+                    .font(NativeAgentFont.label)
+                    .foregroundStyle(NativeAgentTheme.fail)
+            }
+            if let remRunFeedback {
+                Label(remRunFeedback.message, systemImage: remRunFeedback.systemImage)
+                    .font(NativeAgentFont.label)
+                    .foregroundStyle(remRunFeedback.isSuccess ? Color.secondary : NativeAgentTheme.fail)
+            }
+            if let diaryTotalEntries, diaryTotalEntries > entries.count {
+                Text("Showing \(entries.count) of \(diaryTotalEntries) dreams. Narrowing is not available in this view yet.")
+                    .font(NativeAgentFont.label)
+                    .foregroundStyle(.secondary)
+            }
+            if let label = DreamDiaryListPresentation.unreadableLabel(diaryUnreadableEntries) {
+                Label(label, systemImage: "exclamationmark.triangle")
+                    .font(NativeAgentFont.label)
+                    .foregroundStyle(.orange)
+            }
         }
         .padding(.horizontal, NativeAgentSpacing.lg)
         .padding(.vertical, NativeAgentSpacing.md)
@@ -188,12 +420,30 @@ struct DreamsView: View {
             if isLoadingDiary {
                 ProgressView("Loading dream diary…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if diaryRefreshPresentation.unavailableEmptyState {
+                NativeEmptyState(
+                    title: "Dream diary unavailable",
+                    detail: "The diary could not be read, so this is not evidence that no dreams have been recorded.",
+                    systemImage: "exclamationmark.triangle",
+                    actionTitle: "Retry",
+                    actionImage: "arrow.clockwise",
+                    action: { refresh() }
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if case .incomplete(let unreadableEntries) = diaryListPresentation {
+                NativeEmptyState(
+                    title: "Dream diary incomplete",
+                    detail: "\(unreadableEntries) diary file\(unreadableEntries == 1 ? "" : "s") could not be read, so this is not evidence that no dreams have been recorded.",
+                    systemImage: "exclamationmark.triangle",
+                    actionTitle: "Retry",
+                    actionImage: "arrow.clockwise",
+                    action: { refresh() }
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 NativeEmptyState(
                     title: "No dreams yet",
-                    detail: dreamEnabledFromDiary
-                        ? "The nightly dream cycle hasn't written an entry yet. Run a dream pass to create the first one."
-                        : "The dream cycle is currently disabled. Enable it above, or run a dream pass manually once enabled.",
+                    detail: emptyDiaryDetail,
                     systemImage: "moon.zzz"
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -205,7 +455,14 @@ struct DreamsView: View {
                     get: { selectedDate },
                     set: { newValue in
                         selectedDate = newValue
-                        if let date = newValue { loadEntry(date: date) }
+                        if let date = newValue {
+                            loadEntry(date: date)
+                        } else {
+                            entryTask?.cancel()
+                            entryLoadGeneration.cancelPending()
+                            selectedEntry = nil
+                            entryLoadError = nil
+                        }
                     }
                 )) { entry in
                     DreamDateRow(entry: entry)
@@ -223,10 +480,10 @@ struct DreamsView: View {
 
     @ViewBuilder
     private var detailPanel: some View {
-        if isLoadingEntry && selectedEntry == nil {
+        if case .loading = entryDetailPresentation {
             ProgressView("Loading entry…")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if let entry = selectedEntry {
+        } else if case .entry = entryDetailPresentation, let entry = selectedEntry {
             ScrollView {
                 VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
                     HStack(spacing: NativeAgentSpacing.sm) {
@@ -258,6 +515,18 @@ struct DreamsView: View {
                 .padding(NativeAgentSpacing.lg)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+        } else if case let .failed(entryLoadError) = entryDetailPresentation {
+            NativeEmptyState(
+                title: "Couldn't load this dream",
+                detail: entryLoadError,
+                systemImage: "exclamationmark.triangle",
+                actionTitle: "Retry",
+                actionImage: "arrow.clockwise",
+                action: {
+                    if let selectedDate { loadEntry(date: selectedDate) }
+                }
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             NativeEmptyState(
                 title: "Select a dream",
@@ -303,7 +572,10 @@ struct DreamsView: View {
     @MainActor
     private func refresh() {
         refreshTask?.cancel()
-        refreshTask = Task { await loadDiary(selectLatest: false) }
+        refreshTask = Task {
+            await loadREMPolicy()
+            await loadDiary(selectLatest: false)
+        }
     }
 
     @MainActor
@@ -321,29 +593,40 @@ struct DreamsView: View {
 
     @MainActor
     private func runRem() {
-        guard !isRunningRem else { return }
+        guard !isRunningRem, remRunAvailability.canRun else { return }
         isRunningRem = true
+        remRunFeedback = nil
         Task {
-            let ok = await appModel.runRemPass()
+            let feedback = await appModel.runRemPass()
             isRunningRem = false
-            if ok { await loadDiary(selectLatest: false) }
+            remRunFeedback = feedback
+            if feedback.isSuccess { await loadDiary(selectLatest: false) }
         }
     }
 
     // ── Loaders ───────────────────────────────────────────────────────────────
     @MainActor
     private func loadDiary(selectLatest: Bool) async {
-        diaryLoadGen += 1
-        let gen = diaryLoadGen
-        isLoadingDiary = true
-        defer { if gen == diaryLoadGen { isLoadingDiary = false } }
-        guard let response = await appModel.fetchDreamDiary(limit: diaryLimit) else {
+        let request = diaryLoadGeneration.begin()
+        let result = await appModel.fetchDreamDiary(limit: diaryLimit)
+        guard case let .current(response) = diaryLoadGeneration.settle(
+            request: request,
+            response: result
+        ) else {
             return
         }
-        // A newer loadDiary superseded this one — drop the stale result so a slow
-        // earlier load can't clobber the latest entries/selection/toggle state.
-        if Task.isCancelled || gen != diaryLoadGen { return }
+        // A current cancellation clears its spinner but must not repaint the
+        // visible diary as a reader failure or a fresh response.
+        guard !Task.isCancelled else { return }
+        guard let response else {
+            diaryLoadFailed = true
+            return
+        }
+        diaryLoadFailed = false
+        hasReadDiaryGate = true
         entries = response.entries
+        diaryTotalEntries = response.totalEntries
+        diaryUnreadableEntries = response.unreadableEntries ?? 0
         dreamEnabledFromDiary = response.enabled
         // Reconcile the optimistic toggle mirrors from the source of truth (skip
         // while a save is in flight so we don't clobber the user's pending intent).
@@ -370,26 +653,86 @@ struct DreamsView: View {
     }
 
     @MainActor
+    private func loadREMPolicy() async {
+        guard appModel.trustPolicy == nil || remPolicyLoadFailed else { return }
+        do {
+            appModel.trustPolicy = try await appModel.getTrustPolicy()
+            remPolicyLoadFailed = false
+        } catch {
+            remPolicyLoadFailed = true
+        }
+    }
+
+    @MainActor
     private func loadEntry(date: String) {
-        // Cancel any in-flight fetch FIRST so a slower older fetch can't land after
-        // a newer selection and overwrite it.
+        // Register the replacement request before cancelling the older task so
+        // its deferred completion cannot clear the newer request's spinner.
+        let request = entryLoadGeneration.begin()
         entryTask?.cancel()
+        entryLoadError = nil
         // Prefer the already-fetched diary entry (it carries full content).
         if let cached = entries.first(where: { $0.date == date }),
            !cached.content.isEmpty {
             selectedEntry = cached
+            _ = entryLoadGeneration.settle(request: request, entry: cached)
             return
         }
         // Switching to an uncached date — clear stale detail so the previous entry
         // isn't shown under the new selection while the fetch is in flight.
         selectedEntry = nil
         entryTask = Task {
-            isLoadingEntry = true
-            defer { isLoadingEntry = false }
             let fetched = await appModel.fetchDreamEntry(date: date)
+            guard case let .current(currentEntry) = entryLoadGeneration.settle(
+                request: request,
+                entry: fetched
+            ) else { return }
             // Apply only if this is still the selected date and we weren't cancelled.
             if Task.isCancelled || selectedDate != date { return }
-            if let fetched { selectedEntry = fetched }
+            if let currentEntry {
+                selectedEntry = currentEntry
+            } else {
+                entryLoadError = appModel.dreamError ?? DreamEntryDetailPresentation.missingEntryDetail
+            }
+        }
+    }
+
+    private var canRunDream: Bool {
+        dreamRunAvailability.canRun
+    }
+
+    private var dreamRunHelp: String {
+        dreamRunAvailability.help
+    }
+
+    private var dreamRunAvailability: DreamRunAvailability {
+        DreamRunAvailability.resolve(
+            hasReadDiaryGate: hasReadDiaryGate,
+            diaryLoadFailed: diaryLoadFailed,
+            dreamEnabledFromDiary: dreamEnabledFromDiary
+        )
+    }
+
+    private var remRunAvailability: DreamsREMRunAvailability {
+        DreamsREMRunAvailability.resolve(
+            policy: appModel.trustPolicy,
+            policyLoadFailed: remPolicyLoadFailed
+        )
+    }
+
+    private var diaryRefreshPresentation: DreamDiaryRefreshPresentation {
+        DreamDiaryRefreshPresentation.resolve(entries: entries, didFail: diaryLoadFailed)
+    }
+
+    private var emptyDiaryDetail: String {
+        switch dreamRunAvailability {
+        case .checking:
+            return "Checking whether the dream cycle is available."
+        case .enabled:
+            return "The nightly dream cycle hasn't written an entry yet. Run a dream pass to create the first one."
+        case .disabled:
+            return "The dream cycle is currently disabled. Enable it above, or run a dream pass manually once enabled."
+        case .unavailable:
+            return "The dream diary could not be read, so cycle availability is unavailable."
         }
     }
 

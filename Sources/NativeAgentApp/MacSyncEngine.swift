@@ -44,6 +44,7 @@ final class MacSyncEngine: ObservableObject {
     /// rebuilding the transcript for every notification.
     var chatTurnCompletedObserver: NSObjectProtocol?
     var chatTranscriptSnapshotPublicationTask: Task<Void, Never>?
+    var chatSnapshotCoalescer = MacSyncChatSnapshotCoalescerState()
     /// One exact archive-retention crossing, recalculated after each prune.
     var pruneDeadlineTask: Task<Void, Never>?
     var archiveRetentionWatcher: FileChangeWatcher?
@@ -113,10 +114,38 @@ final class MacSyncEngine: ObservableObject {
     let processedIdsCap = 5000
     var _pairingSecret: Data?
     var pairingSecretRotationInProgress = false
+    /// The production CloudKit response route. Kept as one seam so the inbox
+    /// owner can prove durable-before-send and restart resend behavior without
+    /// substituting a second action processor or a hand-built envelope.
+    var cloudKitActionResponseSender: (@Sendable ([String: String], String) async throws -> Void)?
+    /// Test-only root seam for CloudKit action bookkeeping; production keeps
+    /// the canonical NativeAgent data root.
+    var cloudKitActionStateRootOverride: URL?
+    /// Test seam for the durable completion-marker recovery path.
+    var cloudKitActionProcessedIDPersistence: (() -> Bool)?
+    /// The production observer listens on `.default`; an isolated center keeps
+    /// transcript-coalescer evaluations from subscribing to the live app.
+    let chatTurnCompletedNotificationCenter: NotificationCenter
+    /// Production always takes the real snapshot writer. The injected path is
+    /// deliberately limited to the final coalesced chat projection boundary.
+    let chatTranscriptSnapshotWriter: (@MainActor @Sendable (Bool) async -> Void)?
+    /// Isolated lifecycle evaluations persist only their digest state beneath
+    /// this injected root. Production always uses the canonical data root.
+    let stateDataRootOverride: URL?
 
     enum KVSKey {
         static let snapshotUpdated = "snapshot_updated"
         static let inboxPending = "inbox_pending"
+    }
+
+    init(
+        stateDataRootOverride: URL?,
+        chatTurnCompletedNotificationCenter: NotificationCenter = .default,
+        chatTranscriptSnapshotWriter: (@MainActor @Sendable (Bool) async -> Void)? = nil
+    ) {
+        self.stateDataRootOverride = stateDataRootOverride
+        self.chatTurnCompletedNotificationCenter = chatTurnCompletedNotificationCenter
+        self.chatTranscriptSnapshotWriter = chatTranscriptSnapshotWriter
     }
 
     enum Folder {
@@ -127,10 +156,14 @@ final class MacSyncEngine: ObservableObject {
         static let transactions = "transactions/mac"
     }
 
-    let inboxResponseKeyPrefix = "inbox_response_"
+    let inboxResponseKeyPrefix = ICloudKVSProgressWriteAdmission.inboxResponseKeyPrefix
     let inboxResponseKeyTTL: TimeInterval = 24 * 3600
     /// Backstop ceiling kept well below the hard 1024-key KVS quota.
-    let inboxResponseKeyMaxCount = 800
+    let inboxResponseKeyMaxCount = ICloudKVSProgressWriteAdmission.inboxResponseKeyCeiling
 
-    private init() {}
+    private init() {
+        stateDataRootOverride = nil
+        chatTurnCompletedNotificationCenter = .default
+        chatTranscriptSnapshotWriter = nil
+    }
 }

@@ -379,6 +379,29 @@ struct TrustMacControlPolicy: Codable, Hashable, Sendable {
     }
 }
 
+// Keep iOS tolerant of snapshots written by older Mac builds that omitted
+// newly added gates. Missing fields use the same fail-closed (or deliberate
+// display-only) defaults as the Mac-side policy mirror; malformed present
+// fields still reject the snapshot.
+extension TrustMacControlPolicy {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        applesScriptAllowed = try c.decodeIfPresent(Bool.self, forKey: .applesScriptAllowed) ?? false
+        jxaAllowed = try c.decodeIfPresent(Bool.self, forKey: .jxaAllowed) ?? false
+        shortcutsAllowed = try c.decodeIfPresent(Bool.self, forKey: .shortcutsAllowed) ?? true
+        accessibilityAllowed = try c.decodeIfPresent(Bool.self, forKey: .accessibilityAllowed) ?? false
+        systemControlAllowed = try c.decodeIfPresent(Bool.self, forKey: .systemControlAllowed) ?? false
+        fileOpsAllowed = try c.decodeIfPresent(Bool.self, forKey: .fileOpsAllowed) ?? false
+        shellAllowed = try c.decodeIfPresent(Bool.self, forKey: .shellAllowed) ?? false
+        notificationsAllowed = try c.decodeIfPresent(Bool.self, forKey: .notificationsAllowed) ?? true
+        spotlightAllowed = try c.decodeIfPresent(Bool.self, forKey: .spotlightAllowed) ?? true
+        approvalRequiredFor = try c.decodeIfPresent([String].self, forKey: .approvalRequiredFor)
+            ?? ["shell", "file_ops", "applescript", "jxa", "accessibility"]
+        remoteFromIosAllowed = try c.decodeIfPresent(Bool.self, forKey: .remoteFromIosAllowed) ?? false
+    }
+}
+
 // PATCH-2026-05-07: mac-control-ui-1 Mac Shortcut record for MacToolsView
 struct MacShortcutRecord: Identifiable, Codable, Hashable {
     var id: String { name }

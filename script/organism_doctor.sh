@@ -11,13 +11,16 @@ ORGANISM_STATE_PATH="${NATIVE_AGENT_ORGANISM_STATE_PATH:-$DATA_ROOT/cognition/or
 EVAL_PATH="${NATIVE_AGENT_ORGANISM_EVAL_PATH:-$DATA_ROOT/cognition/organism_longitudinal_eval.jsonl}"
 IOS_SNAPSHOT_PATH="${NATIVE_AGENT_ORGANISM_IOS_SNAPSHOT:-}"
 RUN_SIMULATION=0
-STRICT=0
+# Doctor is a health gate by default.  Callers that intentionally want a
+# diagnostic-only report must opt into --lenient rather than accidentally
+# treating a failed doctor as a healthy process.
+STRICT=1
 FAIL_COUNT=0
 
 usage() {
   cat >&2 <<'USAGE'
 usage:
-  script/organism_doctor.sh [--simulate] [--strict]
+  script/organism_doctor.sh [--simulate] [--strict|--lenient]
 
 Checks live NativeAgent organism health through:
   - NativeAgentApp process
@@ -35,7 +38,9 @@ Environment overrides:
   NATIVE_AGENT_ORGANISM_EVAL_PATH
 
 --simulate also runs the safe body-scenario proof loop and clears it after.
---strict exits nonzero when any check reports FAIL; warnings stay diagnostic.
+The default (and --strict) exits nonzero when any check reports FAIL; warnings
+stay diagnostic.  --lenient prints the same report but always exits zero after
+the checks complete.
 USAGE
 }
 
@@ -43,6 +48,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --simulate) RUN_SIMULATION=1 ;;
     --strict) STRICT=1 ;;
+    --lenient) STRICT=0 ;;
     -h|--help) usage; exit 0 ;;
     *) usage; exit 2 ;;
   esac
@@ -223,7 +229,7 @@ if [ -n "$snapshot_path" ] && [ -f "$snapshot_path" ]; then
     status FAIL "organism_living_status" "found but invalid JSON: $snapshot_path"
   fi
 else
-  status INFO "organism_living_status" "not found; set NATIVE_AGENT_ORGANISM_IOS_SNAPSHOT to inspect iOS snapshot directly"
+  status INFO "organism_living_status" "source absent; set NATIVE_AGENT_ORGANISM_IOS_SNAPSHOT to inspect iOS snapshot directly"
 fi
 
 section "Longitudinal Eval"
@@ -261,6 +267,8 @@ elif [ -f "$ORGANISM_STATE_PATH" ] && [ "$RUN_SIMULATION" -eq 0 ]; then
 else
   echo "Open $REPO_ROOT/docs/build_plans/nativeagent-organism-troubleshooting.md for symptom-specific checks."
 fi
+
+printf 'FAIL_COUNT=%d\n' "$FAIL_COUNT"
 
 if [ "$STRICT" -eq 1 ] && [ "$FAIL_COUNT" -gt 0 ]; then
   exit 1

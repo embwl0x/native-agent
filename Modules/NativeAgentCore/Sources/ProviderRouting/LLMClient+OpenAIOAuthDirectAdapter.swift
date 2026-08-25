@@ -252,7 +252,8 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         model: String,
         tools: [LLMToolSchema]?
     ) async throws -> String {
-        let coercedModel = Self.coerceToGPTModel(model)
+        let coercedModel = try Self.coerceToGPTModel(model)
+        let substitutedFrom = Self.substitutionTrace(requested: model, coerced: coercedModel)
         var forceTokenRefresh = false
         for attempt in 0...1 {
             try Task.checkCancellation()
@@ -328,7 +329,8 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                     streaming: false,
                     usage: parsed.usage,
                     ttftMs: nil,
-                    durationMs: durationMs
+                    durationMs: durationMs,
+                    substitutedFrom: substitutedFrom
                 )
                 return s
             case .providerError(let message):
@@ -350,9 +352,24 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
     ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
         let session = self.session
         let endpoint = self.endpoint
-        let coercedModel = Self.coerceToGPTModel(model)
         return AsyncThrowingStream { continuation in
             let task = Task {
+                // Coerce INSIDE the stream task: this is a non-throwing
+                // factory, so an unserviceable model id has to reach the
+                // caller as a thrown continuation finish rather than as a
+                // silently defaulted model (NORTHSTAR clause 2).
+                let coercedModel: String
+                let substitutedFrom: String?
+                do {
+                    coercedModel = try Self.coerceToGPTModel(model)
+                    substitutedFrom = Self.substitutionTrace(
+                        requested: model,
+                        coerced: coercedModel
+                    )
+                } catch {
+                    continuation.finish(throwing: error)
+                    return
+                }
                 var forceTokenRefresh = false
                 for attempt in 0...1 {
                     var emittedProviderOutput = false
@@ -609,7 +626,8 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                             streaming: true,
                             usage: capturedUsage,
                             ttftMs: ttftMs,
-                            durationMs: durationMs
+                            durationMs: durationMs,
+                            substitutedFrom: substitutedFrom
                         )
                         continuation.finish()
                         return
@@ -777,7 +795,8 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         // Coerce non-`gpt-` model ids to the GPT-default. The chatgpt.com
         // backend routes by model id and rejects unknown ids — `openai/...`
         // namespace prefixes need stripping (gpt-5.5 review NON-BLOCKING).
-        let coercedModel = Self.coerceToGPTModel(model)
+        let coercedModel = try Self.coerceToGPTModel(model)
+        let substitutedFrom = Self.substitutionTrace(requested: model, coerced: coercedModel)
         var forceTokenRefresh = false
         for attempt in 0...1 {
             try Task.checkCancellation()
@@ -878,7 +897,8 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                     streaming: false,
                     usage: parsed.usage,
                     ttftMs: nil,
-                    durationMs: durationMs
+                    durationMs: durationMs,
+                    substitutedFrom: substitutedFrom
                 )
                 return s
             case .providerError(let message):
@@ -1026,11 +1046,19 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
     /// Coerce a model id to a GPT id for the chatgpt.com backend. Mirrors
     /// Python's `_coerce_to_gpt_model` at L171-L177 narrowed for Swift:
     /// strip the `openai/` namespace prefix; pass `gpt-*` through; otherwise
-    /// return the default. The Python version also remaps Claude model ids
+    /// throw. The Python version also remaps Claude model ids
     /// to GPT defaults for defensive misrouting from the chat UI — we keep
     /// that behavior here so Anthropic ids that accidentally land on this
     /// adapter don't 404.
-    static func coerceToGPTModel(_ requested: String?) -> String {
+    ///
+    /// NORTHSTAR clause 2 (fail loud, no silent substitution): the enumerated
+    /// rewrites above — empty request, `openai/` strip, the legacy `gpt-5.5`
+    /// normalization, the 9-entry Claude→GPT table — all stay. What is GONE
+    /// is the terminal catch-all: an id nothing recognized (`llama-3`,
+    /// `deepseek-chat`, `o3`) used to come back as the primary GPT model, so
+    /// User's pick was replaced and billed without a word. It now throws
+    /// `modelUnavailable` naming the offending id.
+    static func coerceToGPTModel(_ requested: String?) throws -> String {
         // Reference the canonical primary-model constant from
         // NativeAgentCore.Constants instead of repeating the primary-tier
         // literal here. The single-source-of-truth test
@@ -1051,9 +1079,15 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
             }
             return r
         }()
+        // Sentinel fallback, NOT defaultGPT: normalizeModelIdStatic returns
+        // its fallback for a rejected id (illegal characters, >100 chars).
+        // With defaultGPT as the fallback that rejection came back as a
+        // `gpt-` id and sailed through the prefix check below — a second
+        // silent substitution hiding behind the first. An empty sentinel
+        // can't match any accept rule, so a rejected id reaches the throw.
         let normalized = SwiftNativeProviderRouting.normalizeModelIdStatic(
             stripped,
-            fallback: defaultGPT
+            fallback: ""
         )
         if normalized.lowercased().hasPrefix("gpt-") {
             return normalized
@@ -1075,7 +1109,18 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         if let mapped = claudeToGPT[stripped.lowercased()] {
             return mapped
         }
-        return defaultGPT
+        throw LLMError.modelUnavailable(provider: "openai_oauth_direct", model: r)
+    }
+
+    /// The requested id when an enumerated remap actually rewrote it, else
+    /// nil. Threaded onto the `llm.call` telemetry row as `substitutedFrom`
+    /// so a surviving remap (Claude→GPT table, `openai/` strip, legacy
+    /// `gpt-5.5` normalization) leaves a trace instead of being invisible.
+    static func substitutionTrace(requested: String?, coerced: String) -> String? {
+        guard let r = requested?.trimmingCharacters(in: .whitespacesAndNewlines), !r.isEmpty else {
+            return nil
+        }
+        return r == coerced ? nil : r
     }
 
     // MARK: - SSE parser (responses-API)

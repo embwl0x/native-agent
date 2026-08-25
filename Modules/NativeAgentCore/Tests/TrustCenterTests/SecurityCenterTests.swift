@@ -10,6 +10,69 @@ private func makeSecurityTempRoot() throws -> URL {
     return dir
 }
 
+/// Delegates every read to the real persistence backend but rejects audit
+/// appends, modeling disk-full/permission failure at SecurityCenter.record's
+/// actual write seam.
+private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
+    let delegate: SwiftNativePersistenceCore
+    struct WriteFailure: Error {}
+
+    func readJSON(_ path: URL, defaultValue: JSONValue) async -> JSONValue {
+        await delegate.readJSON(path, defaultValue: defaultValue)
+    }
+
+    func writeJSON(_ value: JSONValue, to path: URL) async throws {
+        try await delegate.writeJSON(value, to: path)
+    }
+
+    func appendJSONL(_ record: JSONValue, to path: URL) async throws {
+        throw WriteFailure()
+    }
+
+    func tailJSONL(_ path: URL, limit: Int, maxBytes: Int?) async throws -> [JSONValue] {
+        try await delegate.tailJSONL(path, limit: limit, maxBytes: maxBytes)
+    }
+
+    func readJSONL(_ path: URL) async throws -> [JSONValue] {
+        try await delegate.readJSONL(path)
+    }
+}
+
+// Eval coverage ledger — `core.trust.securityCenter.receiptSummary`.
+// A malformed authority receipt must disappear as unavailable evidence; it
+// must never become a fresh blank UI row on each refresh.
+@Test func SecurityCenter_receiptSummary_projectsOnlyCompleteStableReceipts() {
+    let valid: JSONValue = .object([
+        "id": .string("receipt-42"),
+        "created_at": .string("2026-08-24T12:00:00Z"),
+        "tool": .string("write_file"),
+        "surface": .string("chat"),
+        "decision": .string("confirm"),
+        "risk": .string("high"),
+        "reasons": .array([.string("outside workspace")]),
+    ])
+    let summary = SwiftNativeSecurityCenter.receiptSummary(valid)
+    #expect(summary?.id == "receipt-42")
+    #expect(summary?.at == "2026-08-24T12:00:00Z")
+    #expect(summary?.tool == "write_file")
+    #expect(summary?.surface == "chat")
+    #expect(summary?.decision == "confirm")
+    #expect(summary?.risk == "high")
+    #expect(summary?.reason == "outside workspace")
+
+    // No synthetic UUID / empty-string summary may escape for damaged rows.
+    for key in ["id", "created_at", "tool", "surface", "decision", "risk"] {
+        guard case .object(var damaged) = valid else { Issue.record("fixture is not an object"); return }
+        damaged.removeValue(forKey: key)
+        #expect(SwiftNativeSecurityCenter.receiptSummary(.object(damaged)) == nil,
+                "receipt missing \(key) must remain unavailable")
+    }
+    #expect(SwiftNativeSecurityCenter.receiptSummary(.object([
+        "id": .string(" "), "created_at": .string("now"), "tool": .string("x"),
+        "surface": .string("chat"), "decision": .string("allow"), "risk": .string("low"),
+    ])) == nil)
+}
+
 @Test func SecurityCenter_canonicalToolRiskProjectsExistingProfileWithoutAuthority() throws {
     let root = try makeSecurityTempRoot()
     defer { try? FileManager.default.removeItem(at: root) }
@@ -131,7 +194,9 @@ private func makeSecurityTempRoot() throws -> URL {
     #expect(receipts.count == 1)
 }
 
-@Test func SecurityCenter_auditAppendUsesSoftByteTriggerBeforeRotation() async throws {
+// MARK: - LEDGER: core.persistence.securityAuditEffectiveBound
+
+@Test func SecurityCenter_auditRetentionReport_exposesByteBoundNotDeferredRowCap() async throws {
     let root = try makeSecurityTempRoot()
     defer { try? FileManager.default.removeItem(at: root) }
     let auditPath = root
@@ -153,9 +218,22 @@ private func makeSecurityTempRoot() throws -> URL {
     )
     try await center.record(envelope)
 
-    let lines = try String(contentsOf: auditPath, encoding: .utf8)
-        .split(separator: "\n")
-    #expect(lines.count == seededCount + 1)
+    // The evaluation enters through the real SecurityCenter writer and reads
+    // its locked audit path; it does not infer the policy by scraping source.
+    let report = await center.auditRetentionReport()
+    #expect(report.state == .belowTrimTrigger)
+    #expect(report.effectiveBoundKind == .softByteTrimTrigger)
+    #expect(report.effectiveBoundBytes == JSONLLineCaps.securityAuditTrimTriggerBytes)
+    #expect(report.rowCapWhenTriggered == JSONLLineCaps.securityAudit)
+    #expect(report.byteCount != nil)
+    #expect(report.byteCount! < report.effectiveBoundBytes)
+    #expect(report.physicalLineCount == seededCount + 1)
+    // This over-row-cap feed is still healthy under the actual byte-triggered
+    // policy. Treating `rowCapWhenTriggered` as the effective bound would make
+    // this observation falsely report a violation.
+    #expect(report.physicalLineCount! > report.rowCapWhenTriggered)
+
+    let lines = try String(contentsOf: auditPath, encoding: .utf8).split(separator: "\n")
     guard let lastLine = lines.last else {
         Issue.record("security audit append produced no rows")
         return
@@ -166,6 +244,37 @@ private func makeSecurityTempRoot() throws -> URL {
         return
     }
     #expect(object["id"] == .string(envelope.id))
+}
+
+@Test func SecurityCenter_auditRetentionReport_marksDamagedEvidenceAndRecordFailureIsNotSuccess() async throws {
+    let root = try makeSecurityTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let auditPath = root
+        .appendingPathComponent("security", isDirectory: true)
+        .appendingPathComponent("audit.jsonl")
+    try FileManager.default.createDirectory(
+        at: auditPath.deletingLastPathComponent(), withIntermediateDirectories: true
+    )
+    // A non-final malformed row is evidence damage, not an empty/healthy feed.
+    try Data("{broken}\n{\"id\":\"good\"}\n".utf8).write(to: auditPath)
+    let center = SwiftNativeSecurityCenter(dataRoot: root)
+    let damaged = await center.auditRetentionReport()
+    #expect(damaged.state == .incompleteEvidence)
+    #expect(damaged.physicalLineCount == 2)
+    #expect(damaged.evidenceIssue?.contains("malformed") == true)
+
+    let failingCenter = SwiftNativeSecurityCenter(
+        dataRoot: root,
+        persistence: SecurityAuditAppendFailingPersistence(delegate: SwiftNativePersistenceCore())
+    )
+    let envelope = await failingCenter.evaluateTool(
+        tool: "tool_catalog",
+        input: [:],
+        origin: SecurityOriginContext(surface: "chat")
+    )
+    await #expect(throws: (any Error).self) {
+        try await failingCenter.record(envelope)
+    }
 }
 
 /// YOLO cutover 2026-08-12 (9023d24d, 84fb8201): perimeter gates entry,

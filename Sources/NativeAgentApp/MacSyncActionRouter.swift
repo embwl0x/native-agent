@@ -88,6 +88,35 @@ struct MacSyncActionRouter {
         ]
     }
 
+    /// A model-control receipt is only successful after the canonical routing
+    /// owner reads back the requested model.  The iPhone must not show a
+    /// successful remote mutation merely because the Mac accepted its inbox
+    /// message.
+    nonisolated static func canonicalSurfaceModelResponse(
+        surface: String,
+        requestedModel: String,
+        recoveredPreference: SurfacePreference?
+    ) -> [String: String] {
+        guard let recoveredPreference,
+              recoveredPreference.model == requestedModel else {
+            return [
+                "status": "error",
+                "ok": "false",
+                "applied": "false",
+                "message": "Mac could not confirm that the surface model was applied.",
+            ]
+        }
+        return [
+            "status": "ok",
+            "ok": "true",
+            "applied": "true",
+            "surface": surface,
+            "model": recoveredPreference.model,
+            "reasoning_effort": recoveredPreference.reasoningEffort,
+            "service_tier": recoveredPreference.serviceTier,
+        ]
+    }
+
     nonisolated static func unpinChatSessionID(from payload: [String: String]) -> String? {
         NativeAgentChatSessionID.normalizedPathComponent(
             payload["sessionId"] ?? payload["session_id"]
@@ -537,7 +566,16 @@ struct MacSyncActionRouter {
                         inferProvider: false
                     )
                 }
-                return ["status": "ok", "ok": "true", "surface": surface, "model": model]
+                let recovered = try await SwiftNativeProviderRouting()
+                    .checkedRoutingSnapshot()
+                return observed(Self.canonicalSurfaceModelResponse(
+                    surface: surface,
+                    requestedModel: model,
+                    recoveredPreference: ProviderRoutingSurfaceLookup.value(
+                        recovered.preferences,
+                        surface
+                    )
+                ))
 
             case "configure_surface_selection":
                 guard let request = Self.surfaceSelection(from: payload) else {

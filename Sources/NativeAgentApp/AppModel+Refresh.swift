@@ -74,6 +74,7 @@ extension AppModel {
         }
         refreshAllInFlight = true
         defer {
+            isRecordingRefreshAllFailures = false
             refreshAllInFlight = false
             if refreshAllQueued {
                 refreshAllQueued = false
@@ -84,8 +85,12 @@ extension AppModel {
         }
 
         let api = client
-        // FIX: reset before this pass so lastRefreshError reflects only the
-        // current refresh; each swallowed failure below now logs + records.
+        // Start a fresh, complete failure set for this pass. Individual lanes
+        // append their detail through `recordRefreshFailure`; a successful
+        // empty result remains a real empty projection rather than looking
+        // like one of those failures.
+        refreshAllFailureDetails.removeAll(keepingCapacity: true)
+        isRecordingRefreshAllFailures = true
         setIfChanged(\.lastRefreshError, nil)
         // Render-cost audit F11 — batching.
         //
@@ -106,30 +111,37 @@ extension AppModel {
         // concurrent user mutation gets clobbered by an older fetched value
         // from ~one section to the entire pass. Those are timing-visible
         // regressions; per-section batching gets the coalescing without them.
-        setIfChanged(\.health, try? await api.getHealth())
+        setIfChanged(\.health, await refreshPreserving("getHealth", current: health) {
+            try await api.getHealth()
+        })
         if health == nil {
             // Interim message, deliberately written before the retry await so
             // it is on screen while the retry is in flight.
             setIfChanged(\.statusText, "Swift runtime unavailable")
-            setIfChanged(\.health, try? await api.getHealth())
+            setIfChanged(\.health, await refreshPreserving("getHealth", current: health) {
+                try await api.getHealth()
+            })
         }
 
-        let fetchedRuns = await decodeLogged("getRuns", default: []) { try await api.getRuns() }
-        let fetchedActivity = await decodeLogged("getActivity", default: []) { try await api.getActivity() }
-        let fetchedExecutions = await decodeLogged("getWorkshopExecutions", default: []) { try await api.getWorkshopExecutions() }
-        let fetchedMemories = await decodeLogged("getMemories", default: []) { try await api.getMemories() }
-        let fetchedPersonality = await decodeLogged("getPersonality") { try await api.getPersonality() }
+        let fetchedRuns = await refreshPreserving("getRuns", current: runs) { try await api.getRuns() }
+        let fetchedActivity = await refreshPreserving("getActivity", current: activityEvents) { try await api.getActivity() }
+        let fetchedExecutions = await refreshPreserving("getWorkshopExecutions", current: executions) { try await api.getWorkshopExecutions() }
+        let fetchedMemories = await refreshPreserving("getMemories", current: memories) { try await api.getMemories() }
+        let fetchedPersonality = await refreshPreserving("getPersonality", current: personality) { try await api.getPersonality() }
         let fetchedPersonalityDocs = await decodeLogged("getPersonalityDocs", { try await api.getPersonalityDocs() })
-        let fetchedSkills = await decodeLogged("getSkills", default: []) { try await api.getSkills() }
-        let fetchedTools = await decodeLogged("getTools", default: []) { try await api.getTools() }
-        let fetchedCapabilitySummary = await decodeLogged("getCapabilities") { try await api.getCapabilities() }
-        let fetchedWorkflows = await decodeLogged("getWorkflows", default: []) { try await api.getWorkflows() }
-        let fetchedWorkflowRuns = await decodeLogged("getWorkflowRuns", default: []) { try await api.getWorkflowRuns() }
-        let fetchedApprovals = await decodeLogged("getApprovals", { try await api.getApprovals() })
-        let fetchedInboxItems = await decodeLogged("getInboxItems", default: []) { try await api.getInboxItems(unreadOnly: false) }
-        let fetchedMCPServers = await decodeLogged("getMCPServers", default: []) { try await api.getMCPServers() }
-        let fetchedMCPSessions = await decodeLogged("getMCPSessions", default: []) { try await api.getMCPSessions() }
-        let fetchedMCPConsent = await decodeLogged("getMCPConsent", default: []) { try await api.getMCPConsent() }
+        let fetchedSkills = await refreshPreserving("getSkills", current: skills) { try await api.getSkills() }
+        let fetchedTools = await refreshPreserving("getTools", current: tools) { try await api.getTools() }
+        let fetchedCapabilitySummary = await refreshPreserving("getCapabilities", current: capabilitySummary) { try await api.getCapabilities() }
+        let fetchedWorkflows = await refreshPreserving("getWorkflows", current: workflows) { try await api.getWorkflows() }
+        let fetchedWorkflowRuns = await refreshPreserving("getWorkflowRuns", current: workflowRuns) { try await api.getWorkflowRuns() }
+        let fetchedApprovals = await refreshPreserving("getApprovals", current: approvals) { try await api.getApprovals() }
+        // An unavailable inbox read is not an honest empty inbox. Keep the
+        // last model snapshot on failure so InboxView receives `[]` only when
+        // the real reader actually reported no cards.
+        let fetchedInboxItems = await refreshPreserving("getInboxItems", current: inboxItems) { try await api.getInboxItems(unreadOnly: false) }
+        let fetchedMCPServers = await refreshPreserving("getMCPServers", current: mcpServers) { try await api.getMCPServers() }
+        let fetchedMCPSessions = await refreshPreserving("getMCPSessions", current: mcpSessions) { try await api.getMCPSessions() }
+        let fetchedMCPConsent = await refreshPreserving("getMCPConsent", current: mcpConsent) { try await api.getMCPConsent() }
         // No `await` from here to the end of the block: one MainActor turn.
         setIfChanged(\.runs, fetchedRuns)
         setIfChanged(\.activityEvents, fetchedActivity)
@@ -144,9 +156,7 @@ extension AppModel {
         setIfChanged(\.capabilitySummary, fetchedCapabilitySummary)
         setIfChanged(\.workflows, fetchedWorkflows)
         setIfChanged(\.workflowRuns, fetchedWorkflowRuns)
-        if let freshApprovals = fetchedApprovals {
-            setIfChanged(\.approvals, freshApprovals)
-        }
+        setIfChanged(\.approvals, fetchedApprovals)
         setIfChanged(\.inboxItems, fetchedInboxItems)
         setIfChanged(\.mcpServers, fetchedMCPServers)
         setIfChanged(\.mcpSessions, fetchedMCPSessions)
@@ -162,38 +172,71 @@ extension AppModel {
         }
         if selectedMCPServerId != previousSelection {
             setIfChanged(\.mcpTools, [])
+            setIfChanged(\.mcpToolReadState, .notLoaded)
             setIfChanged(\.mcpResources, [])
+            setIfChanged(\.mcpResourceReadState, .notLoaded)
         }
         if mcpServers.isEmpty {
             setIfChanged(\.mcpTools, [])
+            setIfChanged(\.mcpToolReadState, .notLoaded)
             setIfChanged(\.mcpResources, [])
+            setIfChanged(\.mcpResourceReadState, .notLoaded)
         }
         if let server = selectedMCPServer {
             let pendingId = server.id
-            let fetchedTools: [MCPToolRecord]? = try? await api.getMCPTools(serverId: pendingId).tools
-            let fetchedResources: [MCPResourceRecord]? = try? await api.getMCPResources(serverId: pendingId).resources
+            setIfChanged(\.mcpToolReadState, .loading)
+            let fetchedTools: [MCPToolRecord]?
+            do {
+                fetchedTools = try await api.getMCPTools(serverId: pendingId).tools
+            } catch {
+                fetchedTools = nil
+                if selectedMCPServerId == pendingId {
+                    setIfChanged(\.mcpToolReadState, .unavailable(String(error.localizedDescription.prefix(240))))
+                }
+            }
+            setIfChanged(\.mcpResourceReadState, .loading)
+            let fetchedResources: [MCPResourceRecord]?
+            do {
+                fetchedResources = try await api.getMCPResources(serverId: pendingId).resources
+            } catch {
+                fetchedResources = nil
+                if selectedMCPServerId == pendingId {
+                    setIfChanged(\.mcpResourceReadState, .unavailable(String(error.localizedDescription.prefix(240))))
+                }
+            }
             if selectedMCPServerId == pendingId {
-                if let t = fetchedTools { setIfChanged(\.mcpTools, t) }
-                if let r = fetchedResources { setIfChanged(\.mcpResources, r) }
+                if let t = fetchedTools {
+                    setIfChanged(\.mcpTools, t)
+                    setIfChanged(\.mcpToolReadState, .current)
+                }
+                if let r = fetchedResources {
+                    setIfChanged(\.mcpResources, r)
+                    setIfChanged(\.mcpResourceReadState, .current)
+                }
             }
         }
+        refreshMCPHubRecentCall()
 
-        let fetchedResearchLabRuns = await decodeLogged("getResearchLabRuns", default: []) { try await api.getResearchLabRuns() }
-        let fetchedTraces = await decodeLogged("getTraces", default: []) { try await api.getTraces() }
+        let fetchedResearchLabRuns = await refreshPreserving("getResearchLabRuns", current: researchLabRuns) { try await api.getResearchLabRuns() }
+        let fetchedTraceTimeline = api.getCapabilityTraceTimeline()
         let fetchedAgentGraph = await decodeLogged("getAgentGraph") { try await api.getAgentGraph() }
-        let fetchedGraphEntities = await decodeLogged("getGraphEntities", default: []) { try await api.getGraphEntities() }
+        let fetchedGraphEntities = await refreshPreserving("getGraphEntities", current: graphEntities) { try await api.getGraphEntities() }
         let fetchedGraphStatus = await decodeLogged("getGraphStatus") { try await api.getGraphStatus() }
         let fetchedAutonomyKernel = await decodeLogged("getAutonomyKernel") { try await api.getAutonomyKernel() }
         let fetchedPersonalOS = await decodeLogged("getPersonalOS") { try await api.getPersonalOS() }
-        let fetchedCapabilityCatalog = await decodeLogged("getCapabilityCatalog", default: []) { try await api.getCapabilityCatalog() }
-        let fetchedCapabilityCatalogSources = await decodeLogged("getCapabilityCatalogSources", default: []) { try await api.getCapabilityCatalogSources() }
-        let fetchedCapabilityPackInstalls = await decodeLogged("getCapabilityPackInstalls", default: []) { try await api.getCapabilityPackInstalls() }
+        let fetchedCapabilityCatalog = await refreshPreserving("getCapabilityCatalog", current: capabilityCatalog) { try await api.getCapabilityCatalog() }
+        let fetchedCapabilityCatalogSources = await refreshPreserving("getCapabilityCatalogSources", current: capabilityCatalogSources) { try await api.getCapabilityCatalogSources() }
+        // A receipt-read failure is not an empty installed-pack list. Keep the
+        // last confirmed snapshot and let decodeLogged retain the failure for
+        // the visible refresh status; only a successful read may clear this
+        // collection to the legitimate bootstrap/empty state.
+        let fetchedCapabilityPackInstalls = await decodeLogged("getCapabilityPackInstalls") { try await api.getCapabilityPackInstalls() }
         let fetchedCapabilityTrust = await decodeLogged("getCapabilityTrust") { try await api.getCapabilityTrust() }
-        let fetchedNextGenPhases = await decodeLogged("getNextGenPhases", default: []) { try await api.getNextGenPhases() }
+        let fetchedNextGenPhases = await refreshPreserving("getNextGenPhases", current: nextGenPhases) { try await api.getNextGenPhases() }
         let fetchedPersonalityGrowth = await decodeLogged("getPersonalityGrowth") { try await api.getPersonalityGrowth() }
         let fetchedNativePower = await decodeLogged("getNativePower") { try await api.getNativePower() }
-        let fetchedNativeActions = await decodeLogged("getNativeActionRegistry", default: []) { try await api.getNativeActionRegistry().actions }
-        let fetchedNativeActionReceipts = await decodeLogged("getNativeActionReceipts", default: []) { try await api.getNativeActionReceipts() }
+        let fetchedNativeActions = await refreshPreserving("getNativeActionRegistry", current: nativeActions) { try await api.getNativeActionRegistry().actions }
+        let fetchedNativeActionReceipts = await refreshPreserving("getNativeActionReceipts", current: nativeActionReceipts) { try await api.getNativeActionReceipts() }
         let fetchedNotificationStatus = await decodeLogged("getNotificationStatus") { try await api.getNotificationStatus() }
         let fetchedBrowserRuntimeStatus = await decodeLogged("getBrowserStatus") { try await api.getBrowserStatus() }
         let fetchedMemoryVectorStatus = await decodeLogged("getMemoryVectorStatus") { try await api.getMemoryVectorStatus() }
@@ -201,25 +244,26 @@ extension AppModel {
         let fetchedConnectorActionRegistry = await decodeLogged("getConnectorActions") { try await api.getConnectorActions() }
         let fetchedImprovementGauntletStatus = await decodeLogged("getImprovementGauntlet") { try await api.getImprovementGauntlet() }
         let fetchedProductionHardening = await decodeLogged("getProductionHardening") { try await api.getProductionHardening() }
-        let fetchedProductionExports = await decodeLogged("getProductionExports", default: []) { try await api.getProductionExports() }
+        let fetchedProductionExports = await refreshPreserving("getProductionExports", current: productionExports) { try await api.getProductionExports() }
         let fetchedTrustPolicy = await decodeLogged("getTrustPolicy") { try await api.getTrustPolicy() }
-        let fetchedBackups = await decodeLogged("getBackups", default: []) { try await api.getBackups() }
-        let fetchedConnectors = await decodeLogged("getConnectors", default: []) { try await api.getConnectors() }
-        let fetchedWorkspaces = await decodeLogged("getWorkspaces", default: []) { try await api.getWorkspaces() }
-        let fetchedEvals = await decodeLogged("getEvals", default: []) { try await api.getEvals() }
+        let fetchedBackups = await refreshPreserving("getBackups", current: backups) { try await api.getBackups() }
+        let fetchedConnectors = await refreshPreserving("getConnectors", current: connectors) { try await api.getConnectors() }
+        let fetchedWorkspaces = await refreshPreserving("getWorkspaces", current: workspaces) { try await api.getWorkspaces() }
+        let fetchedEvals = await refreshPreserving("getEvals", current: evals) { try await api.getEvals() }
         let fetchedReleaseChecklist = await decodeLogged("getReleaseChecklist") { try await api.getReleaseChecklist() }
         let fetchedWatchdogStatus = await decodeLogged("getWatchdog") { try await api.getWatchdog() }
-        let fetchedTrainingArtifacts = await decodeLogged("getTrainingArtifacts", default: []) { try await api.getTrainingArtifacts() }
-        let fetchedJobs = await decodeLogged("getJobs", default: []) { try await api.getJobs() }
+        let fetchedTrainingArtifacts = await refreshPreserving("getTrainingArtifacts", current: trainingArtifacts) { try await api.getTrainingArtifacts() }
+        let fetchedJobs = await refreshPreserving("getJobs", current: jobs) { try await api.getJobs() }
         let fetchedImprovementSummary = await decodeLogged("getImprovementSummary") { try await api.getImprovementSummary() }
-        let fetchedImprovements = await decodeLogged("getImprovements", default: []) { try await api.getImprovements() }
-        let fetchedTrainingRuns = await decodeLogged("getTrainingRuns", default: []) { try await api.getTrainingRuns() }
-        let fetchedTrainingProposals = await decodeLogged("getTrainingProposals", default: []) { try await api.getTrainingProposals() }
-        let fetchedPromotionCandidates = await decodeLogged("getPromotionCandidates", default: []) { try await api.getPromotionCandidates() }
+        let fetchedImprovements = await refreshPreserving("getImprovements", current: improvements) { try await api.getImprovements() }
+        let fetchedTrainingRuns = await refreshPreserving("getTrainingRuns", current: trainingRuns) { try await api.getTrainingRuns() }
+        let fetchedTrainingProposals = await refreshPreserving("getTrainingProposals", current: trainingProposals) { try await api.getTrainingProposals() }
+        let fetchedPromotionCandidates = await refreshPreserving("getPromotionCandidates", current: promotionCandidates) { try await api.getPromotionCandidates() }
         let fetchedTelegramStatus = await decodeLogged("getTelegramStatus") { try await api.getTelegramStatus() }
         // No `await` from here to the end of the block: one MainActor turn.
         setIfChanged(\.researchLabRuns, fetchedResearchLabRuns)
-        setIfChanged(\.traces, fetchedTraces)
+        setIfChanged(\.capabilityTraceTimeline, fetchedTraceTimeline)
+        setIfChanged(\.traces, fetchedTraceTimeline.traces)
         setIfChanged(\.agentGraph, fetchedAgentGraph)
         setIfChanged(\.graphEntities, fetchedGraphEntities)
         setIfChanged(\.graphStatus, fetchedGraphStatus)
@@ -227,7 +271,9 @@ extension AppModel {
         setIfChanged(\.personalOS, fetchedPersonalOS)
         setIfChanged(\.capabilityCatalog, fetchedCapabilityCatalog)
         setIfChanged(\.capabilityCatalogSources, fetchedCapabilityCatalogSources)
-        setIfChanged(\.capabilityPackInstalls, fetchedCapabilityPackInstalls)
+        if let fetchedCapabilityPackInstalls {
+            setIfChanged(\.capabilityPackInstalls, fetchedCapabilityPackInstalls)
+        }
         setIfChanged(\.capabilityTrust, fetchedCapabilityTrust)
         // DAEMON-KILL refreshAll: /v1/nextgen/summary + /v1/nextgen/receipts retired.
         // nextGenPhases reads <dataRoot>/runtime/nextgen_phases.json natively; keep it.
@@ -281,6 +327,9 @@ extension AppModel {
         // DAEMON-KILL refreshAll: GET /v1/setup/questions retired.
         setIfChanged(\.setupQuestions, [])
         setIfChanged(\.telegramStatus, fetchedTelegramStatus)
+        if fetchedTelegramStatus != nil {
+            telegramStatusRefreshError = nil
+        }
         if let st = telegramStatus {
             // Swift-native cutover: drive the UI vars straight from the native status
             // so the Bot-token-configured badge + allowed list don't depend on
@@ -323,10 +372,7 @@ extension AppModel {
         setIfChanged(\.privacyMap, fetchedPrivacyMap)
         if let config = fetchedConfig {
             setIfChanged(\.codexAuthStatus, config.codexAuth)
-            // Not gated: `didSet`-persisted settings field (see above).
-            if let base = config.searxngBaseURL, !base.isEmpty {
-                searxngBaseURL = base
-            }
+            _ = applyRefreshedSearXNGBaseURL(config.searxngBaseURL)
             if let telegram = config.telegram {
                 setIfChanged(\.telegramTokenConfigured, telegram.tokenConfigured ?? false)
                 setIfChanged(\.telegramEnabled, telegram.enabled ?? false)

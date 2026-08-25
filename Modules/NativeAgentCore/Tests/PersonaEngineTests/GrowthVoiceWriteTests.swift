@@ -267,3 +267,34 @@ func writers_useFlockConvention() async throws {
     _ = try await engine.personaWrite(kind: "voice", content: "v", skillName: nil)
     #expect(FileManager.default.fileExists(atPath: personaRoot.appendingPathComponent("VOICE.md.lock").path))
 }
+
+// REPORTS-ONLY -> executable boundary checks (Wave 1):
+// core.misc / persona.write.growthAndVoice
+@Test("failed persona writes leave existing canonical bytes untouched")
+func growthAndVoiceFailuresDoNotPartiallyMutatePersonaFiles() async throws {
+    let root = try gvTempRoot(); defer { try? FileManager.default.removeItem(at: root) }
+    let (engine, personaRoot, _) = gvEngine(root)
+    try gvSeedSoul(personaRoot)
+    let voice = personaRoot.appendingPathComponent("VOICE.md")
+    try "stable voice".write(to: voice, atomically: true, encoding: .utf8)
+
+    await #expect(throws: PersonaWriteError.self) {
+        _ = try await engine.personaWrite(kind: "unknown-kind", content: "replacement", skillName: nil)
+    }
+    #expect(try String(contentsOf: voice, encoding: .utf8) == "stable voice")
+    #expect(try await engine.appendPersonalityGrowth(kind: "note", text: " \n ", sourceRunId: nil) == false)
+    #expect(!FileManager.default.fileExists(atPath: personaRoot.appendingPathComponent("GROWTH.md").path))
+}
+
+@Test("growth writer serializes a deterministic run identity into durable content")
+func growthWriteCarriesTheProvidedRunIdentityWithoutInventingOne() async throws {
+    let root = try gvTempRoot(); defer { try? FileManager.default.removeItem(at: root) }
+    let (engine, personaRoot, _) = gvEngine(root)
+    try gvSeedSoul(personaRoot)
+    #expect(try await engine.appendPersonalityGrowth(
+        kind: "correction", text: "be precise", sourceRunId: "run-fixed"
+    ))
+    let text = try String(contentsOf: personaRoot.appendingPathComponent("GROWTH.md"), encoding: .utf8)
+    #expect(text.contains("correction \u{B7} be precise \u{B7} run run-fixed"))
+    #expect(!text.contains("run nil"))
+}

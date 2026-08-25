@@ -4,6 +4,118 @@
 // channel and are accepted only after the Mac returns a matching verified tuple.
 import SwiftUI
 
+/// Keeps the refresh button honest once its spinner stops: a failed provider
+/// snapshot refresh remains visible instead of looking like an empty success.
+enum ProviderRefreshPresentation {
+    static func statusText(for outcome: ProviderControlsRefreshOutcome) -> String {
+        outcome.feedbackMessage ?? ""
+    }
+}
+
+/// iOS cannot import the Mac-only provider-routing module, so it retains a
+/// presentation mirror for the canonical routing surfaces. Unknown or malformed
+/// wire keys must read as a repair condition, never as a plausible prettified
+/// storage key such as `Cognition_reflection`.
+enum MobileProviderSurfaceLabelPresentation: Equatable {
+    case named(String)
+    case unrecognized(String)
+    case malformed
+
+    private static let namedLabels: [String: String] = [
+        "chat": "Chat",
+        "ios": "iPhone",
+        "telegram": "Telegram",
+        "slack": "Slack",
+        "desk": "Desk",
+        "workshop": "Workshop",
+        "missions": "Workshop",
+        "autonomy": "Autonomy",
+        "swarms": "Swarms",
+        "dream": "Dream",
+        "rem": "REM",
+        "training": "Training",
+        "memory": "Memory",
+        "heartbeat": "Heartbeat",
+        "diagnostics": "Diagnostics",
+        "cognition_reflection": "Cognition Reflection",
+        "compaction": "Compaction",
+        "self_improvement": "Self-Improvement",
+    ]
+
+    static func presentation(for rawSurface: String) -> Self {
+        let trimmed = rawSurface.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed == rawSurface, rawSurface == rawSurface.lowercased() else {
+            return .malformed
+        }
+        guard let label = namedLabels[rawSurface] else { return .unrecognized(rawSurface) }
+        return .named(label)
+    }
+
+    var text: String {
+        switch self {
+        case .named(let label): label
+        case .unrecognized(let surface): "Unrecognized surface (\(surface))"
+        case .malformed: "Surface label unavailable"
+        }
+    }
+}
+
+/// Model pins are Mac-owned and arrive in `surfaceModels`. Keep their visible
+/// state separate from an absent projection: a published pin must always be
+/// shown verbatim, while a missing row says the phone is still waiting for the
+/// Mac instead of looking like an intentional unset selection.
+enum MobileProviderSurfaceModelMenuPresentation {
+    static let unpublishedLabel = "Model not published"
+
+    static func label(for surface: String, surfaceModels: [String: SurfaceModelPref]) -> String {
+        guard let rawModel = surfaceModels[surface]?.model else {
+            return unpublishedLabel
+        }
+        let model = rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !model.isEmpty else {
+            return unpublishedLabel
+        }
+        return model
+    }
+}
+
+/// A signed action reply proves a provider test passed only when the Mac uses
+/// its explicit `ok` status. An absent or unfamiliar payload is an incomplete
+/// test result, not evidence that the connection works.
+enum ProviderConnectionTestPresentation {
+    static func feedback(status: String, successPrefix: String = "Test complete.") -> String {
+        let trimmed = status.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return "Error: Mac did not return a test result."
+        }
+        guard trimmed.lowercased() == "ok" else {
+            if ["error", "failed", "needs_credentials"].contains(trimmed.lowercased()) {
+                return "Error: \(trimmed)"
+            }
+            return "Error: Mac returned an unrecognized test status: \(trimmed)"
+        }
+        return successPrefix
+    }
+}
+
+/// Provider/model changes are optimistic. A response may arrive after the user
+/// has picked another tuple, so only the request that still owns a surface may
+/// restore its former selection.
+enum ProviderSelectionRollbackPresentation {
+    struct Selection: Equatable {
+        let providerID: String
+        let modelID: String
+    }
+
+    static func rollback(
+        currentGeneration: UInt64,
+        requestGeneration: UInt64,
+        previous: Selection
+    ) -> Selection? {
+        currentGeneration == requestGeneration ? previous : nil
+    }
+}
+
 // MARK: - Main View
 
 struct ProviderSettingsView: View {
@@ -18,9 +130,9 @@ struct ProviderSettingsView: View {
     // If you add a surface to MODEL_SURFACES, append it here too (keep order).
     // Last synced 2026-07-15.
     static let canonicalSurfaces = [
-        "chat", "ios", "telegram", "slack", "workshop", "autonomy", "swarms",
+        "chat", "ios", "telegram", "slack", "desk", "workshop", "autonomy", "swarms",
         "dream", "rem", "training", "memory", "heartbeat", "diagnostics",
-        "cognition_reflection", "compaction",
+        "cognition_reflection", "compaction", "self_improvement",
     ]
 
     /// Exact ordered surfaces accepted by the signed Mac action router.
@@ -30,6 +142,8 @@ struct ProviderSettingsView: View {
 
     // Active provider per surface (local UI state; saves on change)
     @State private var activeSurface: [String: String] = [:]
+    @State private var requestedModel: [String: String] = [:]
+    @State private var selectionGeneration: [String: UInt64] = [:]
     @State private var configSheet: ProviderInfo? = nil
     @State private var statusText = ""
     @State private var isRefreshing = false
@@ -63,13 +177,20 @@ struct ProviderSettingsView: View {
                             Picker("", selection: Binding(
                                 get: { activeSurface[surface] ?? defaultProviderID },
                                 set: { newVal in
-                                    let previous = activeSurface[surface] ?? defaultProviderID
-                                    activeSurface[surface] = newVal
-                                    sendSelection(
+                                    guard let selection = SurfaceProviderPickerPresentation.selection(
+                                        providerID: newVal,
+                                        currentModelID: sync.surfaceModels[surface]?.model,
+                                        providers: selectableProviders
+                                    ) else {
+                                        statusText = "That provider has no selectable model."
+                                        return
+                                    }
+                                    submitSelection(
                                         surface: surface,
-                                        providerId: newVal,
-                                        modelId: compatibleModel(for: surface, providerId: newVal),
-                                        previousProviderId: previous
+                                        selection: .init(
+                                            providerID: selection.providerID,
+                                            modelID: selection.modelID
+                                        )
                                     )
                                 }
                             )) {
@@ -96,11 +217,12 @@ struct ProviderSettingsView: View {
                             Menu {
                                 ForEach(selectableModels(for: activeSurface[surface] ?? defaultProviderID)) { model in
                                     Button {
-                                        sendSelection(
+                                        submitSelection(
                                             surface: surface,
-                                            providerId: activeSurface[surface] ?? defaultProviderID,
-                                            modelId: model.id,
-                                            previousProviderId: activeSurface[surface] ?? defaultProviderID
+                                            selection: .init(
+                                                providerID: activeSurface[surface] ?? defaultProviderID,
+                                                modelID: model.id
+                                            )
                                         )
                                     } label: {
                                         Text(model.id)
@@ -162,6 +284,7 @@ struct ProviderSettingsView: View {
             }
         }
         .navigationTitle("Providers")
+        .macSyncErrorBanner()
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .navigationBarTrailing) {
@@ -207,8 +330,9 @@ struct ProviderSettingsView: View {
     private func refreshProviders() async {
         isRefreshing = true
         _ = await iCloudBridge.shared.drainDeviceTransport()
-        await iCloudSyncEngine.shared.refreshProviderControlsSnapshot()
+        let outcome = await iCloudSyncEngine.shared.refreshProviderControlsSnapshot()
         seedActiveSurface()
+        statusText = ProviderRefreshPresentation.statusText(for: outcome)
         isRefreshing = false
     }
 
@@ -219,33 +343,55 @@ struct ProviderSettingsView: View {
             if let providerId = sync.surfaceModels[surface]?.providerId,
                readyProviderIds.contains(providerId) {
                 activeSurface[surface] = providerId
+                requestedModel[surface] = sync.surfaceModels[surface]?.model
             } else if let providerId = synced[surface], readyProviderIds.contains(providerId) {
                 activeSurface[surface] = providerId
+                requestedModel[surface] = selectableModels(for: providerId).first?.id
             } else if let current = activeSurface[surface],
                       readyProviderIds.contains(current) {
                 continue
             } else {
                 activeSurface[surface] = defaultProviderID
+                requestedModel[surface] = selectableModels(for: defaultProviderID).first?.id
             }
         }
     }
 
-    private func compatibleModel(for surface: String, providerId: String) -> String {
-        let models = selectableModels(for: providerId)
-        let current = sync.surfaceModels[surface]?.model
-        if let current, models.contains(where: { $0.id == current }) { return current }
-        return models.first?.id ?? ""
+    private func currentSelection(for surface: String) -> ProviderSelectionRollbackPresentation.Selection {
+        let providerID = activeSurface[surface] ?? defaultProviderID
+        let modelID = requestedModel[surface]
+            ?? sync.surfaceModels[surface]?.model
+            ?? selectableModels(for: providerID).first?.id
+            ?? ""
+        return .init(providerID: providerID, modelID: modelID)
+    }
+
+    private func submitSelection(
+        surface: String,
+        selection: ProviderSelectionRollbackPresentation.Selection
+    ) {
+        let previous = currentSelection(for: surface)
+        let requestGeneration = (selectionGeneration[surface] ?? 0) &+ 1
+        selectionGeneration[surface] = requestGeneration
+        activeSurface[surface] = selection.providerID
+        requestedModel[surface] = selection.modelID
+        sendSelection(
+            surface: surface,
+            selection: selection,
+            previous: previous,
+            requestGeneration: requestGeneration
+        )
     }
 
     private func sendSelection(
         surface: String,
-        providerId: String,
-        modelId: String,
-        previousProviderId: String
+        selection: ProviderSelectionRollbackPresentation.Selection,
+        previous: ProviderSelectionRollbackPresentation.Selection,
+        requestGeneration: UInt64
     ) {
         Task {
             do {
-                guard !modelId.isEmpty else {
+                guard !selection.modelID.isEmpty else {
                     throw NSError(
                         domain: "ProviderSettingsView",
                         code: -1,
@@ -255,15 +401,22 @@ struct ProviderSettingsView: View {
                 let preference = sync.surfaceModels[surface]
                 _ = try await iCloudSyncEngine.shared.configureSurfaceSelection(
                     surface: surface,
-                    providerId: providerId,
-                    model: modelId,
+                    providerId: selection.providerID,
+                    model: selection.modelID,
                     reasoningEffort: preference?.reasoningEffort ?? "high",
                     serviceTier: preference?.serviceTier ?? "default"
                 )
+                guard selectionGeneration[surface] == requestGeneration else { return }
                 await refreshProviders()
-                statusText = "\(surfaceLabel(surface)) now uses \(modelId)."
+                statusText = "\(surfaceLabel(surface)) now uses \(selection.modelID)."
             } catch {
-                activeSurface[surface] = previousProviderId
+                guard let restored = ProviderSelectionRollbackPresentation.rollback(
+                    currentGeneration: selectionGeneration[surface] ?? 0,
+                    requestGeneration: requestGeneration,
+                    previous: previous
+                ) else { return }
+                activeSurface[surface] = restored.providerID
+                requestedModel[surface] = restored.modelID
                 statusText = "Error: \(error.localizedDescription)"
                 iOSSystemToastCenter.shared.push(
                     error: "Couldn't update \(surfaceLabel(surface)): \(error.localizedDescription)"
@@ -273,27 +426,49 @@ struct ProviderSettingsView: View {
     }
 
     private func selectedModelLabel(for surface: String) -> String {
-        sync.surfaceModels[surface]?.model ?? "(not set)"
+        if let requested = requestedModel[surface], !requested.isEmpty { return requested }
+        return MobileProviderSurfaceModelMenuPresentation.label(
+            for: surface,
+            surfaceModels: sync.surfaceModels
+        )
     }
 
     private func surfaceLabel(_ surface: String) -> String {
-        switch surface {
-        case "chat":      return "Chat"
-        case "ios":       return "iPhone"
-        case "workshop", "missions":  return "Workshop" // Canonical + 0.3.x wire ids.
-        case "training":  return "Training"
-        case "dream":     return "Dream"
-        case "telegram":  return "Telegram"
-        case "slack":     return "Slack"
-        case "autonomy":  return "Autonomy"
-        case "swarms":    return "Swarms"
-        case "rem":       return "REM"
-        case "memory":    return "Memory"
-        case "heartbeat": return "Heartbeat"
-        case "diagnostics": return "Diagnostics"
-        case "cognition_reflection": return "Cognition Reflection"
-        default:          return surface.capitalized
+        MobileProviderSurfaceLabelPresentation.presentation(for: surface).text
+    }
+}
+
+/// Produces the only provider/model pair the surface picker may submit. A
+/// provider switch retains the current model when possible; otherwise it uses
+/// the provider's first advertised model rather than emitting a mismatched
+/// pair.
+enum SurfaceProviderPickerPresentation {
+    struct Selection: Equatable {
+        let providerID: String
+        let modelID: String
+    }
+
+    static func selection(
+        providerID: String,
+        currentModelID: String?,
+        providers: [ProviderInfo]
+    ) -> Selection? {
+        guard let provider = providers.first(where: { $0.provider_id == providerID }),
+              let fallbackModel = provider.models.first else {
+            return nil
         }
+        let modelID: String
+        if let currentModelID,
+           provider.models.contains(where: { $0.id == currentModelID }) {
+            modelID = currentModelID
+        } else {
+            modelID = fallbackModel.id
+        }
+        return Selection(providerID: providerID, modelID: modelID)
+    }
+
+    static func rollbackProviderID(previousProviderID: String) -> String {
+        previousProviderID
     }
 }
 
@@ -358,6 +533,31 @@ private struct ProviderStatusBadge: View {
 
 // MARK: - Detail / action sheet
 
+enum ProviderCapabilityPresentation {
+    struct Model: Identifiable, Equatable {
+        let id: String
+        let name: String
+        let supportsStreaming: Bool
+        let supportsVision: Bool
+        let supportsTools: Bool
+        let supportsJSONMode: Bool
+    }
+
+    static func models(from source: [ProviderModelInfo]) -> [Model] {
+        source.enumerated().map { index, model in
+            let displayName = model.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            return Model(
+                id: "\(index):\(model.id)",
+                name: displayName.isEmpty ? model.id : displayName,
+                supportsStreaming: model.supports_streaming,
+                supportsVision: model.supports_vision,
+                supportsTools: model.supports_tools,
+                supportsJSONMode: model.supports_json_mode
+            )
+        }
+    }
+}
+
 struct ProviderDetailSheet: View {
     let provider: ProviderInfo
     let onDone: () -> Void
@@ -400,16 +600,27 @@ struct ProviderDetailSheet: View {
                 }
 
                 // ── Capabilities ──────────────────────────────────────────
-                if let model = provider.models.first {
+                let capabilityModels = ProviderCapabilityPresentation.models(from: provider.models)
+                if capabilityModels.isEmpty {
                     Section {
-                        HStack(spacing: 8) {
-                            capPill("Streaming", ok: model.supports_streaming)
-                            capPill("Vision", ok: model.supports_vision)
-                            capPill("Tools", ok: model.supports_tools)
-                            capPill("JSON", ok: model.supports_json_mode)
-                        }
+                        Label("The Mac has not published model capabilities for this provider yet.", systemImage: "questionmark.circle")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
                     } header: {
-                        Label("Capabilities (\(model.name))", systemImage: "cpu")
+                        Label("Capabilities", systemImage: "cpu")
+                    }
+                } else {
+                    ForEach(capabilityModels) { model in
+                        Section {
+                            HStack(spacing: 8) {
+                                capPill("Streaming", ok: model.supportsStreaming)
+                                capPill("Vision", ok: model.supportsVision)
+                                capPill("Tools", ok: model.supportsTools)
+                                capPill("JSON", ok: model.supportsJSONMode)
+                            }
+                        } header: {
+                            Label("Capabilities (\(model.name))", systemImage: "cpu")
+                        }
                     }
                 }
 
@@ -495,14 +706,10 @@ struct ProviderDetailSheet: View {
 
     private func finish(status: String, successPrefix: String) {
         isWorking = false
-        let trimmed = status.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty || trimmed == "ok" {
-            feedbackText = successPrefix
-        } else if trimmed.lowercased().contains("error") || trimmed.lowercased().contains("failed") {
-            feedbackText = "Error: \(trimmed)"
-        } else {
-            feedbackText = "\(successPrefix) \(trimmed)"
-        }
+        feedbackText = ProviderConnectionTestPresentation.feedback(
+            status: status,
+            successPrefix: successPrefix
+        )
     }
 
     @ViewBuilder

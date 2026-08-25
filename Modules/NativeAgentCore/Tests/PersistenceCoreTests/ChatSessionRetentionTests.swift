@@ -284,6 +284,143 @@ struct ChatSessionRetentionTests {
         #expect(!kept.joined().contains("\"a-0\""))
     }
 
+    // MARK: - LEDGER: core.persistence.ChatSessionRetention.transcriptLockOrphaning
+    //
+    // THE LEAK. `withBoundedTranscriptLock` (ChatSessionRetention.swift:390) is a
+    // SECOND, private lock-sidecar implementation — independent of
+    // PersistenceCore+FileLock.swift — and it has no remove path. The archive
+    // step MOVES the transcript out of chat/messages/ and leaves
+    // `<transcript>.lock` behind forever, so the sidecar outlives the file it
+    // guarded. Live measurement on User's data root (2026-08-23): 1799 lock files
+    // under data/chat/messages, 1597 of them with NO sibling transcript — 67% of
+    // every orphan lock in the whole data root traces to this one path. One
+    // inode per archived session, forever, with no counter, no doctor check and
+    // no log line anywhere.
+    //
+    // The contrast that proves it is a bug and not a policy: TurnTraceRetention
+    // DOES sweep its locks (pinned at TurnTraceRetentionTests.swift:57) and
+    // data/turn_traces shows zero orphans.
+    //
+    // WHY THIS TEST PINS THE LEAK INSTEAD OF FORBIDDING IT: the fix is a
+    // production change and this wave is tests-only, so the honest move is exact
+    // leak ACCOUNTING — one orphan per archived transcript, never more — which
+    // makes the leak a build-visible number instead of an invisible one. It bites
+    // in both directions: a regression that leaks MORE (e.g. a lock per retry)
+    // goes red, and so does the day the sweep lands.
+    //
+    // WHEN THE SWEEP LANDS: change `orphanLocks.count == report.archivedSessions`
+    // to `orphanLocks.isEmpty` and delete this paragraph.
+    @Test func archivedTranscriptLeavesExactlyOneOrphanLockPerSession_knownLeak() throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let now = try date("2026-06-16T12:00:00Z")
+        let ids = ["keep-1", "keep-2", "archive-1", "archive-2", "archive-3"]
+        try writeSessions(root: root, rows: [
+            session("keep-1", updatedAt: "2026-06-16T11:00:00Z", messageCount: 2),
+            session("keep-2", updatedAt: "2026-06-16T10:00:00Z", messageCount: 2),
+            session("archive-1", updatedAt: "2026-06-15T09:00:00Z", messageCount: 2),
+            session("archive-2", updatedAt: "2026-06-15T08:00:00Z", messageCount: 2),
+            session("archive-3", updatedAt: "2026-06-15T07:00:00Z", messageCount: 2),
+        ])
+        for id in ids { try writeTranscript(root: root, sessionId: id) }
+
+        let messagesDir = messagePath(root: root, sessionId: "keep-1").deletingLastPathComponent()
+        // Precondition: no sidecars before the pass, so every lock counted below
+        // was minted by this run.
+        #expect(lockFiles(in: messagesDir).isEmpty)
+
+        let report = try ChatSessionRetention.enforce(
+            dataRoot: root,
+            now: now,
+            policy: ChatSessionRetentionPolicy(
+                maxActiveSessions: 2,
+                staleEmptySessionAgeSeconds: 24 * 60 * 60,
+                includeMacPinnedSessions: false
+            )
+        )
+        #expect(report.archivedSessions == 3)
+
+        // The transcripts really left the hot tier — otherwise "orphan" would be
+        // measuring nothing.
+        for id in ["archive-1", "archive-2", "archive-3"] {
+            #expect(!FileManager.default.fileExists(atPath: messagePath(root: root, sessionId: id).path))
+            #expect(FileManager.default.fileExists(atPath: archiveMessagePath(root: root, sessionId: id).path))
+        }
+
+        let locks = lockFiles(in: messagesDir)
+        let orphanLocks = locks.filter { lock in
+            let guarded = lock.deletingPathExtension()   // strip ".lock"
+            return !FileManager.default.fileExists(atPath: guarded.path)
+        }
+        // EXACT accounting: one orphan per archived transcript, and no orphan
+        // for a session that stayed hot.
+        #expect(orphanLocks.count == report.archivedSessions)
+        #expect(Set(orphanLocks.map { $0.deletingPathExtension().deletingPathExtension().lastPathComponent })
+            == ["archive-1", "archive-2", "archive-3"])
+        // Only ARCHIVED sessions ever take the transcript lock, so every sidecar
+        // in the hot directory is an orphan and no kept session minted one.
+        #expect(locks.count == 3)
+
+        // The archive index's own lock is a different animal: its feed persists,
+        // so that sidecar is not a leak. Counted separately so nobody "fixes"
+        // this by sweeping the wrong directory.
+        let archiveDir = root
+            .appendingPathComponent("chat", isDirectory: true)
+            .appendingPathComponent("archive", isDirectory: true)
+        let archiveIndexOrphans = lockFiles(in: archiveDir).filter {
+            !FileManager.default.fileExists(atPath: $0.deletingPathExtension().path)
+        }
+        #expect(archiveIndexOrphans.isEmpty)
+    }
+
+    /// The leak COMPOUNDS: a second archiving pass over fresh sessions adds one
+    /// more orphan each and never reclaims the first pass's. This is the
+    /// unbounded-growth half of the claim, stated as a delta so it cannot be
+    /// satisfied by a one-shot coincidence.
+    @Test func orphanLockCountGrowsMonotonicallyAcrossPasses_knownLeak() throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let policy = ChatSessionRetentionPolicy(
+            maxActiveSessions: 1,
+            staleEmptySessionAgeSeconds: 24 * 60 * 60,
+            includeMacPinnedSessions: false
+        )
+        let messagesDir = messagePath(root: root, sessionId: "probe").deletingLastPathComponent()
+
+        func runPass(_ pass: Int) throws -> Int {
+            let ids = ["hot-\(pass)", "cold-\(pass)a", "cold-\(pass)b"]
+            try writeSessions(root: root, rows: [
+                session(ids[0], updatedAt: "2026-06-16T11:00:00Z", messageCount: 2),
+                session(ids[1], updatedAt: "2026-06-15T09:00:00Z", messageCount: 2),
+                session(ids[2], updatedAt: "2026-06-15T08:00:00Z", messageCount: 2),
+            ])
+            for id in ids { try writeTranscript(root: root, sessionId: id) }
+            let report = try ChatSessionRetention.enforce(
+                dataRoot: root,
+                now: try date("2026-06-16T12:00:00Z"),
+                policy: policy
+            )
+            #expect(report.archivedSessions == 2)
+            return lockFiles(in: messagesDir).filter {
+                !FileManager.default.fileExists(atPath: $0.deletingPathExtension().path)
+            }.count
+        }
+
+        let afterFirst = try runPass(1)
+        let afterSecond = try runPass(2)
+        #expect(afterFirst == 2)
+        #expect(afterSecond == afterFirst + 2, "each pass leaves its archived sessions' sidecars behind")
+    }
+
+    private func lockFiles(in directory: URL) -> [URL] {
+        let entries = (try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        )) ?? []
+        return entries.filter { $0.pathExtension == "lock" }.sorted { $0.path < $1.path }
+    }
+
     private func makeTempRoot() throws -> URL {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("chat-retention-\(UUID().uuidString)", isDirectory: true)

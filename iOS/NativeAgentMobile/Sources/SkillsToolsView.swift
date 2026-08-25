@@ -1,5 +1,58 @@
 import SwiftUI
 
+enum ToolCatalogPresentation {
+    enum ContentState: Equatable {
+        case loading
+        case syncError(String)
+        case unpublished
+        case noMatches
+        case content
+    }
+    enum Status: Equatable {
+        case known(String)
+        case unknown
+    }
+
+    enum Automaticity: Equatable {
+        case automatic
+        case manual
+        case unknown
+    }
+
+    static func contentState(isLoading: Bool, error: String?, toolCount: Int, visibleCount: Int) -> ContentState {
+        if isLoading && toolCount == 0 { return .loading }
+        if toolCount == 0, let error, !error.isEmpty { return .syncError(error) }
+        if toolCount == 0 { return .unpublished }
+        if visibleCount == 0 { return .noMatches }
+        return .content
+    }
+
+    static func visibleTools(_ tools: [ToolRecord], query: String) -> [ToolRecord] {
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !needle.isEmpty else { return tools }
+        return tools.filter {
+            $0.name.localizedCaseInsensitiveContains(needle)
+                || ($0.description?.localizedCaseInsensitiveContains(needle) ?? false)
+                || ($0.kind?.localizedCaseInsensitiveContains(needle) ?? false)
+        }
+    }
+
+    static func status(for tool: ToolRecord) -> Status {
+        guard let raw = tool.status?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return .unknown
+        }
+        return .known(raw.replacingOccurrences(of: "_", with: " ").capitalized)
+    }
+
+    static func automaticity(for tool: ToolRecord) -> Automaticity {
+        switch tool.autoRun {
+        case true: return .automatic
+        case false: return .manual
+        case nil: return .unknown
+        }
+    }
+}
+
 private enum MobileSkillsToolsSection: String, CaseIterable, Identifiable {
     case skills = "Skills"
     case tools = "Tools"
@@ -43,6 +96,7 @@ struct SkillsToolsView: View {
                 }
             }
             .navigationTitle("Skills & Tools")
+            .macSyncErrorBanner()
             // Sweep R4 C11.4: skills and tools are read straight from the last
             // Mac snapshot, so "is the Mac reachable" decides whether this list
             // is current.
@@ -87,27 +141,42 @@ private struct MobileToolCatalogView: View {
     @State private var searchText = ""
 
     private var visibleTools: [ToolRecord] {
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return store.tools }
-        return store.tools.filter {
-            $0.name.localizedCaseInsensitiveContains(query)
-                || ($0.description?.localizedCaseInsensitiveContains(query) ?? false)
-                || ($0.kind?.localizedCaseInsensitiveContains(query) ?? false)
-        }
+        ToolCatalogPresentation.visibleTools(store.tools, query: searchText)
     }
 
     var body: some View {
         Group {
-            if store.isLoading && store.tools.isEmpty {
+            switch ToolCatalogPresentation.contentState(
+                isLoading: store.isLoading,
+                error: store.error,
+                toolCount: store.tools.count,
+                visibleCount: visibleTools.count
+            ) {
+            case .loading:
                 ProgressView("Loading tool catalog…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if visibleTools.isEmpty {
+            case .syncError(let message):
                 AppEmptyState(
-                    title: searchText.isEmpty ? "No tools synced" : "No tools match",
-                    systemImage: "wrench.and.screwdriver",
-                    description: store.error ?? "The paired Mac publishes the agent's trust-aware tool catalog."
+                    title: "Tool catalog unavailable",
+                    systemImage: "icloud.slash",
+                    kind: .unavailable,
+                    description: message
                 )
-            } else {
+            case .unpublished:
+                AppEmptyState(
+                    title: "No tools synced",
+                    systemImage: "wrench.and.screwdriver",
+                    kind: .unavailable,
+                    description: "The paired Mac has not published a readable tool catalog yet."
+                )
+            case .noMatches:
+                AppEmptyState(
+                    title: "No tools match",
+                    systemImage: "magnifyingglass",
+                    kind: .empty,
+                    description: "Try a different tool name, kind, or description."
+                )
+            case .content:
                 List(visibleTools) { tool in
                     ToolCatalogRow(tool: tool)
                 }
@@ -135,16 +204,16 @@ private struct MobileToolCatalogView: View {
 private struct ToolCatalogRow: View {
     let tool: ToolRecord
 
-    private var status: String {
-        let value = (tool.status ?? "on demand").replacingOccurrences(of: "_", with: " ")
-        return value.isEmpty ? "On demand" : value.capitalized
-    }
-
     private var statusColor: Color {
-        switch (tool.status ?? "").lowercased() {
-        case "active", "loaded", "available": .green
-        case "policy_locked", "blocked", "unavailable": .orange
-        default: NativeAgentPalette.agentAccent
+        switch ToolCatalogPresentation.status(for: tool) {
+        case .known(let status):
+            switch status.lowercased() {
+            case "active", "loaded", "available": return .green
+            case "policy locked", "blocked", "unavailable": return .orange
+            default: return NativeAgentPalette.agentAccent
+            }
+        case .unknown:
+            return .secondary
         }
     }
 
@@ -155,7 +224,7 @@ private struct ToolCatalogRow: View {
                     .font(AppFont.section)
                     .textSelection(.enabled)
                 Spacer()
-                Text(status)
+                Text(statusText)
                     .font(AppFont.tag)
                     .foregroundStyle(statusColor)
                     .padding(.horizontal, 8)
@@ -174,8 +243,17 @@ private struct ToolCatalogRow: View {
                 if let kind = tool.kind, !kind.isEmpty {
                     Label(kind, systemImage: "arrow.triangle.branch")
                 }
-                if tool.autoRun == true {
+                switch ToolCatalogPresentation.automaticity(for: tool) {
+                case .automatic:
                     Label("Automatic", systemImage: "bolt.fill")
+                        .foregroundStyle(.yellow)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(.yellow.opacity(0.16), in: Capsule())
+                case .manual:
+                    Label("Manual", systemImage: "hand.raised")
+                case .unknown:
+                    Label("Automation unknown", systemImage: "questionmark.circle")
                 }
             }
             .font(AppFont.tag)
@@ -183,5 +261,12 @@ private struct ToolCatalogRow: View {
         }
         .padding(.vertical, 5)
         .accessibilityElement(children: .combine)
+    }
+
+    private var statusText: String {
+        switch ToolCatalogPresentation.status(for: tool) {
+        case .known(let value): return value
+        case .unknown: return "Status unknown"
+        }
     }
 }

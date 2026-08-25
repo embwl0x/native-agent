@@ -101,6 +101,30 @@ struct MandatoryDivergence: Codable {
     let onlyInVariant: [String]
 }
 
+/// Evidence that the three score configurations actually exercised the
+/// message-coverage seam. Variant labels and configured weights are not
+/// evidence: they differ even when every candidate score is identical.
+struct ComparisonEvidence: Codable {
+    let queriesWithMessageCoverage: Int
+    let scoreChangedQueryCount: Int
+    let dynamicSelectionChangedQueryCount: Int
+
+    /// Serialized so a shell consumer can reject a report with decorative
+    /// variant metadata but no live score signal.
+    let isNonVacuous: Bool
+
+    init(
+        queriesWithMessageCoverage: Int,
+        scoreChangedQueryCount: Int,
+        dynamicSelectionChangedQueryCount: Int
+    ) {
+        self.queriesWithMessageCoverage = queriesWithMessageCoverage
+        self.scoreChangedQueryCount = scoreChangedQueryCount
+        self.dynamicSelectionChangedQueryCount = dynamicSelectionChangedQueryCount
+        self.isNonVacuous = queriesWithMessageCoverage > 0 && scoreChangedQueryCount > 0
+    }
+}
+
 struct HarnessReport: Codable {
     let generatedAt: String
     let storePath: String
@@ -120,6 +144,7 @@ struct HarnessReport: Codable {
     let limitations: [String]
     let mandatorySetIdenticalAcrossVariants: Bool
     let mandatoryDivergences: [MandatoryDivergence]
+    let comparisonEvidence: ComparisonEvidence
     let variants: [VariantReport]
 }
 
@@ -171,6 +196,9 @@ struct ContextSelectionABHarnessMain {
                 evaluated.append((index, query))
             }
         }
+        guard !evaluated.isEmpty else {
+            throw HarnessError.noEvaluableQueries(options.queries.path)
+        }
 
         let authorization = ContextSelectionAuthorization(
             allowedOrigins: [.localAuthenticated],
@@ -215,6 +243,13 @@ struct ContextSelectionABHarnessMain {
 
         // 5. Mandatory invariant: identical across variants for every query.
         let divergences = mandatoryDivergences(variantReports)
+        let comparisonEvidence = makeComparisonEvidence(variantReports)
+
+        guard comparisonEvidence.isNonVacuous else {
+            throw HarnessError.inertComparison(
+                "no message-coverage score changed across the evaluated queries"
+            )
+        }
 
         let report = HarnessReport(
             generatedAt: ISO8601DateFormatter().string(from: Date()),
@@ -239,6 +274,7 @@ struct ContextSelectionABHarnessMain {
             ],
             mandatorySetIdenticalAcrossVariants: divergences.isEmpty,
             mandatoryDivergences: divergences,
+            comparisonEvidence: comparisonEvidence,
             variants: variantReports
         )
 
@@ -247,6 +283,9 @@ struct ContextSelectionABHarnessMain {
         try encoder.encode(report).write(to: options.out, options: .atomic)
 
         printSummary(report, reportPath: options.out)
+        guard divergences.isEmpty else {
+            throw HarnessError.mandatoryInvariantFailed(divergences.count)
+        }
     }
 }
 
@@ -305,6 +344,9 @@ enum HarnessError: Error, CustomStringConvertible {
     case backupMissing
     case noActiveGeneration(String)
     case malformedQueries(String)
+    case noEvaluableQueries(String)
+    case inertComparison(String)
+    case mandatoryInvariantFailed(Int)
 
     var description: String {
         switch self {
@@ -317,6 +359,12 @@ enum HarnessError: Error, CustomStringConvertible {
         case .noActiveGeneration(let path): "no completed generation in \(path)"
         case .malformedQueries(let path):
             "expected {\"queries\": [\"...\"]} in \(path)"
+        case .noEvaluableQueries(let path):
+            "no query with at least \(minimumQueryCharacters) characters in \(path)"
+        case .inertComparison(let reason):
+            "comparison produced no usable score evidence: \(reason)"
+        case .mandatoryInvariantFailed(let count):
+            "mandatory-set invariant diverged for \(count) query/variant pair(s)"
         }
     }
 }
@@ -473,6 +521,47 @@ func makeVariantReport(variant: Variant, results: [QueryResult]) -> VariantRepor
     )
 }
 
+/// Compare the semantic result payload, not report bytes or configured
+/// metadata. Timings, labels, and the requested weight always differ, so none
+/// of those may turn an inert comparison into a passing A/B result.
+func makeComparisonEvidence(_ reports: [VariantReport]) -> ComparisonEvidence {
+    guard let baseline = reports.first else {
+        return ComparisonEvidence(
+            queriesWithMessageCoverage: 0,
+            scoreChangedQueryCount: 0,
+            dynamicSelectionChangedQueryCount: 0
+        )
+    }
+    let coverageQueries = baseline.queries.filter { query in
+        query.dynamicScores.contains { $0.messageCoverage > 0 }
+    }.count
+    var scoreChanged = Set<Int>()
+    var selectionChanged = Set<Int>()
+    for report in reports.dropFirst() {
+        for (offset, query) in report.queries.enumerated() {
+            guard offset < baseline.queries.count else { continue }
+            let baselineQuery = baseline.queries[offset]
+            if query.dynamicAtomIDs != baselineQuery.dynamicAtomIDs {
+                selectionChanged.insert(query.index)
+            }
+            let baselineTotals = Dictionary(
+                uniqueKeysWithValues: baselineQuery.dynamicScores.map { ($0.atomID, $0.total) }
+            )
+            let totals = Dictionary(
+                uniqueKeysWithValues: query.dynamicScores.map { ($0.atomID, $0.total) }
+            )
+            if baselineTotals != totals {
+                scoreChanged.insert(query.index)
+            }
+        }
+    }
+    return ComparisonEvidence(
+        queriesWithMessageCoverage: coverageQueries,
+        scoreChangedQueryCount: scoreChanged.count,
+        dynamicSelectionChangedQueryCount: selectionChanged.count
+    )
+}
+
 /// The mandatory set is authority/policy-derived — it must not move when a
 /// ranking weight moves. Any row here is a loud failure of that invariant.
 func mandatoryDivergences(_ reports: [VariantReport]) -> [MandatoryDivergence] {
@@ -535,6 +624,9 @@ func printSummary(_ report: HarnessReport, reportPath: URL) {
         + "\(report.skippedQueryCount) skipped (<\(minimumQueryCharacters) chars)")
     print("lexical-only (no query embedding); budget \(report.characterBudget)"
         + "/\(report.maximumCharacterBudget) chars")
+    print("comparison evidence: \(report.comparisonEvidence.queriesWithMessageCoverage) coverage query/queries, "
+        + "\(report.comparisonEvidence.scoreChangedQueryCount) score change(s), "
+        + "\(report.comparisonEvidence.dynamicSelectionChangedQueryCount) selection change(s)")
     print("")
     let header = pad("variant", 16) + pad("meanJaccard", 14) + pad("distinct", 10)
         + pad("meanDynAtoms", 14) + pad("p50us", 8) + pad("p95us", 8)

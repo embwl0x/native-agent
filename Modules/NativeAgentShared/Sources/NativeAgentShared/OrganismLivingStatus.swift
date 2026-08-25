@@ -1,5 +1,13 @@
 import Foundation
 
+/// Whether this file is a complete current projection or an explicit boundary
+/// condition. Consumers must not infer a calm zero from an unavailable file.
+public enum OrganismLivingStatusAvailability: String, Codable, Hashable, Sendable {
+    case live
+    case disabled
+    case unavailable
+}
+
 /// Rebuildable, read-only organism projection shared by the Mac snapshot
 /// writer and the iOS display client. Cognition remains Mac-owned; this DTO is
 /// transport tissue only and deliberately carries no behavior.
@@ -17,6 +25,16 @@ public struct OrganismLivingStatusFile: Codable, Hashable, Sendable {
     public var counters: OrganismLivingCountersFile
     public var reflexCandidates: [OrganismLivingReflexCandidateFile]?
     public var standingViewProposals: [OrganismLivingStandingViewProposalFile]?
+    /// Optional for wire compatibility with snapshots written before explicit
+    /// availability reporting. New writers always set it.
+    public var availability: OrganismLivingStatusAvailability?
+    /// A bounded machine-readable reason for `.unavailable`; never carries a
+    /// raw filesystem or desk error into the mobile snapshot.
+    public var unavailableReason: String?
+
+    public var availabilityState: OrganismLivingStatusAvailability {
+        availability ?? (enabled ? .live : .disabled)
+    }
 
     public init(
         generatedAt: Date,
@@ -31,7 +49,9 @@ public struct OrganismLivingStatusFile: Codable, Hashable, Sendable {
         body: OrganismLivingBodyFile,
         counters: OrganismLivingCountersFile,
         reflexCandidates: [OrganismLivingReflexCandidateFile]?,
-        standingViewProposals: [OrganismLivingStandingViewProposalFile]?
+        standingViewProposals: [OrganismLivingStandingViewProposalFile]?,
+        availability: OrganismLivingStatusAvailability? = nil,
+        unavailableReason: String? = nil
     ) {
         self.generatedAt = generatedAt
         self.enabled = enabled
@@ -46,6 +66,13 @@ public struct OrganismLivingStatusFile: Codable, Hashable, Sendable {
         self.counters = counters
         self.reflexCandidates = reflexCandidates
         self.standingViewProposals = standingViewProposals
+        self.availability = availability
+        self.unavailableReason = unavailableReason
+    }
+
+    public mutating func markUnavailable(reason: String) {
+        availability = .unavailable
+        unavailableReason = reason
     }
 }
 

@@ -7,11 +7,232 @@ import SwiftUI
 import MacIntegration
 import AVFoundation
 
+/// Presentation-level truth for the System Permissions card. These helpers
+/// deliberately accept only the statuses the real probes can verify; cached,
+/// stale, or invented values must keep the acquisition CTA visible.
+enum MacIntegrationSystemPermissionPresentation {
+    static let speechRecognitionKey = "speech_recognition"
+    static let microphoneKey = "microphone"
+    static let calendarKey = "calendar"
+    static let remindersKey = "reminders"
+    static let contactsKey = "contacts"
+    static let appleEventsMailKey = "apple_events_mail"
+    static let appleEventsMessagesKey = "apple_events_messages"
+    static let appleEventsNotesKey = "apple_events_notes"
+    static let appleEventsMusicKey = "apple_events_music"
+
+    static let statusKeys = [
+        speechRecognitionKey, microphoneKey,
+        calendarKey, remindersKey, contactsKey,
+        appleEventsMailKey, appleEventsMessagesKey,
+        appleEventsNotesKey, appleEventsMusicKey,
+    ]
+
+    static func allGranted(_ statuses: [String: String]) -> Bool {
+        statusKeys.allSatisfy { statuses[$0] == "granted" || statuses[$0] == "authorized" }
+    }
+
+    static func cachedAppleEventStatuses(from raw: [String: Any]) -> [String: String] {
+        raw.reduce(into: [:]) { result, item in
+            guard item.key.hasPrefix("apple_events_"), let status = item.value as? String else { return }
+            result[item.key] = status
+        }
+    }
+
+    static func appleEventStatusesForCache(_ statuses: [String: String]) -> [String: String] {
+        statuses.filter { $0.key.hasPrefix("apple_events_") }
+    }
+
+    static func loadAppleEventStatuses(from defaults: UserDefaults, key: String) -> [String: String] {
+        cachedAppleEventStatuses(from: defaults.dictionary(forKey: key) ?? [:])
+    }
+
+    static func saveAppleEventStatuses(
+        _ statuses: [String: String],
+        to defaults: UserDefaults,
+        key: String
+    ) {
+        defaults.set(appleEventStatusesForCache(statuses), forKey: key)
+    }
+
+    /// The cached paint is only a cold-start placeholder. A completed passive
+    /// TCC probe owns the final visible truth, even when it changes a prior
+    /// grant to a denial.
+    static func mergingCachedAppleEvents(
+        _ cached: [String: String],
+        withProbed probed: [String: String]
+    ) -> [String: String] {
+        cached.merging(probed) { _, probeValue in probeValue }
+    }
+}
+
+/// The only System Settings launch boundary for the Mac Integration panel.
+/// A valid deep-link URL is not proof the handoff succeeded: `NSWorkspace.open`
+/// can return false when the target pane is unavailable, so retain that result
+/// and surface it through the panel's request-failure alert.
+enum MacIntegrationSettingsDeepLink {
+    enum Outcome: Equatable {
+        case opened(SystemPermissionCapability)
+        case unavailable(SystemPermissionCapability)
+        case failed(SystemPermissionCapability)
+
+        var failureMessage: String? {
+            switch self {
+            case .opened:
+                return nil
+            case .unavailable(let capability):
+                return "NativeAgent could not find a System Settings privacy pane for \(capability.displayName)."
+            case .failed(let capability):
+                return "NativeAgent could not open System Settings → Privacy & Security → \(capability.displayName). Open System Settings manually, enable NativeAgent, then return here and refresh."
+            }
+        }
+    }
+
+    static func open(
+        _ capability: SystemPermissionCapability,
+        using opener: (URL) -> Bool = { NSWorkspace.shared.open($0) }
+    ) -> Outcome {
+        guard let url = SystemPermissionPreflight.settingsURL(for: capability) else {
+            return .unavailable(capability)
+        }
+        return opener(url) ? .opened(capability) : .failed(capability)
+    }
+}
+
+/// The persisted integration policy is an authority store, so an existing
+/// damaged file is not an empty policy. Keep its panel visible during an
+/// operator-initiated retry as well; otherwise the failure momentarily turns
+/// into a benign-looking loading state with no explanation.
+enum MacIntegrationPermissionLoadPresentation: Equatable {
+    case loading
+    case controlsAvailable
+    case unavailable(detail: String, retrying: Bool)
+
+    static func resolve(isLoading: Bool, loadError: String?) -> Self {
+        if let loadError {
+            let detail = loadError.trimmingCharacters(in: .whitespacesAndNewlines)
+            return .unavailable(
+                detail: detail.isEmpty
+                    ? "The saved Mac Integration permissions could not be loaded."
+                    : detail,
+                retrying: isLoading
+            )
+        }
+        return isLoading ? .loading : .controlsAvailable
+    }
+}
+
+private struct MacIntegrationPermissionLoadErrorPanel: View {
+    let detail: String
+    let retrying: Bool
+    let retry: () -> Void
+
+    var body: some View {
+        Section {
+            Label("Permission controls unavailable", systemImage: "exclamationmark.shield.fill")
+                .font(.headline)
+                .foregroundStyle(.red)
+            Text(detail)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("mac-integration.permissions.load-error.detail")
+            Text("All Mac Integration tool gates remain closed until the saved permission file is repaired. NativeAgent preserved the existing bytes.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button {
+                retry()
+            } label: {
+                HStack(spacing: 8) {
+                    if retrying {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                    Text(retrying ? "Rechecking saved permissions…" : "Retry Permission Load")
+                }
+            }
+            .disabled(retrying)
+            .accessibilityIdentifier("mac-integration.permissions.load-error.retry")
+            .help("Re-read the saved permission file after it has been repaired. This does not replace or rewrite it.")
+        } header: {
+            Text("Permissions")
+        }
+        .accessibilityIdentifier("mac-integration.permissions.load-error")
+    }
+}
+
+enum MacIntegrationFrameworkPermission: String, CaseIterable {
+    case calendar
+    case reminders
+    case contacts
+    // Speech Recognition and Microphone share the framework-row grant path,
+    // so failure copy must name them as specifically as Calendar et al.
+    case speechRecognition = "speech_recognition"
+    case microphone
+
+    var label: String {
+        switch self {
+        case .speechRecognition: return "Speech Recognition"
+        case .microphone: return "Microphone"
+        default: return rawValue.capitalized
+        }
+    }
+
+    /// Single source of truth for the pane anchors: the shared capability
+    /// vocabulary, not a second hand-maintained copy.
+    var capability: SystemPermissionCapability {
+        switch self {
+        case .calendar: return .calendars
+        case .reminders: return .reminders
+        case .contacts: return .contacts
+        case .speechRecognition: return .speechRecognition
+        case .microphone: return .microphone
+        }
+    }
+
+    var settingsAnchor: String {
+        capability.settingsAnchor ?? "Privacy_AllFiles"
+    }
+}
+
+/// Pure state/copy boundary for the two visually similar permission alerts.
+/// The save alert and a TCC-request failure are different user actions and
+/// remain separately gated even when both errors exist at once.
+enum MacIntegrationPermissionFailurePresentation {
+    static let saveAlertTitle = "Permission Save Failed"
+    static let requestAlertTitle = "Permission Request Failed"
+
+    static func saveAlertIsPresented(
+        persistenceError: String?,
+        requestError: String?
+    ) -> Bool {
+        persistenceError != nil
+    }
+
+    static func requestAlertIsPresented(
+        persistenceError: String?,
+        requestError: String?
+    ) -> Bool {
+        requestError != nil
+    }
+
+    static func registrationFailureMessage(for permission: MacIntegrationFrameworkPermission) -> String {
+        if permission == .calendar {
+            return "macOS rejected the Calendar permission request. Quit and reopen NativeAgent, then try Grant once more. If it still fails, reinstall the current signed build; hardened-runtime builds must include Apple's Calendar entitlement."
+        }
+        return "macOS did not register the \(permission.label) permission request. Keep NativeAgent in the foreground and try Grant once more."
+    }
+}
+
 struct MacIntegrationView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var permissions: [String: MacIntegrationPermission] = [:]
     @State private var isLoading: Bool = true
     @State private var permissionLoadError: String?
+    /// Refreshes can overlap on scene activation and the toolbar. Only the
+    /// newest read may change what this safety panel claims about the store.
+    @State private var permissionLoadGeneration = 0
     // gpt-5.5 review NEEDS_FIX: surface persistence errors instead of silently
     // swallowing them via try?. If set() throws, the toggle rolls back and the
     // alert tells the user what failed.
@@ -22,47 +243,11 @@ struct MacIntegrationView: View {
     // tool. Keys: "calendar" | "reminders" | "contacts" | "apple_events".
     @State private var tccStatuses: [String: String] = [:]
     @State private var isRequestingAll: Bool = false
-    @State private var requestingFramework: FrameworkPermission? = nil
+    @State private var requestingFramework: MacIntegrationFrameworkPermission? = nil
     @State private var permissionRequestError: String?
     /// The AppleEvents target app whose per-row Grant button is mid-prompt
     /// (so we can show a spinner + disable the other Grant buttons).
     @State private var requestingApp: String? = nil
-
-    private enum FrameworkPermission: String {
-        case calendar
-        case reminders
-        case contacts
-        // PATCH-2026-08-18: Speech Recognition and Microphone were load-bearing
-        // (Telegram voice notes / the in-app mic) with NO row here, so a user
-        // had no way to see or grant them. They ride the same row helper,
-        // status keys, refresh and Grant-All path as the three above.
-        case speechRecognition = "speech_recognition"
-        case microphone
-
-        var label: String {
-            switch self {
-            case .speechRecognition: return "Speech Recognition"
-            case .microphone: return "Microphone"
-            default: return rawValue.capitalized
-            }
-        }
-
-        /// Single source of truth for the pane anchors: the shared capability
-        /// vocabulary, not a second hand-maintained copy.
-        var capability: SystemPermissionCapability {
-            switch self {
-            case .calendar: return .calendars
-            case .reminders: return .reminders
-            case .contacts: return .contacts
-            case .speechRecognition: return .speechRecognition
-            case .microphone: return .microphone
-            }
-        }
-
-        var settingsAnchor: String {
-            capability.settingsAnchor ?? "Privacy_AllFiles"
-        }
-    }
 
     /// Maps the shared `SystemPermissionStatus` onto the snake_case status
     /// strings this view's badges and Grant/Open-Settings branches already use.
@@ -98,15 +283,15 @@ struct MacIntegrationView: View {
                     // 2026-08-18: Speech Recognition first — it is the one the
                     // headless Telegram voice path silently depends on, and the
                     // one a user has no other way to discover is missing.
-                    tccStatusRow(label: "Speech Recognition", icon: "waveform", statusKey: "speech_recognition", frameworkPermission: .speechRecognition)
-                    tccStatusRow(label: "Microphone", icon: "mic", statusKey: "microphone", frameworkPermission: .microphone)
-                    tccStatusRow(label: "Calendar", icon: "calendar", statusKey: "calendar", frameworkPermission: .calendar)
-                    tccStatusRow(label: "Reminders", icon: "checklist", statusKey: "reminders", frameworkPermission: .reminders)
-                    tccStatusRow(label: "Contacts", icon: "person.crop.circle", statusKey: "contacts", frameworkPermission: .contacts)
-                    tccStatusRow(label: "Mail",     icon: "envelope",  statusKey: "apple_events_mail",     appleEventApp: "Mail")
-                    tccStatusRow(label: "Messages", icon: "message",   statusKey: "apple_events_messages", appleEventApp: "Messages")
-                    tccStatusRow(label: "Notes",    icon: "note.text", statusKey: "apple_events_notes",    appleEventApp: "Notes")
-                    tccStatusRow(label: "Music",    icon: "music.note",statusKey: "apple_events_music",    appleEventApp: "Music")
+                    tccStatusRow(label: "Speech Recognition", icon: "waveform", statusKey: MacIntegrationSystemPermissionPresentation.speechRecognitionKey, frameworkPermission: .speechRecognition)
+                    tccStatusRow(label: "Microphone", icon: "mic", statusKey: MacIntegrationSystemPermissionPresentation.microphoneKey, frameworkPermission: .microphone)
+                    tccStatusRow(label: "Calendar", icon: "calendar", statusKey: MacIntegrationSystemPermissionPresentation.calendarKey, frameworkPermission: .calendar)
+                    tccStatusRow(label: "Reminders", icon: "checklist", statusKey: MacIntegrationSystemPermissionPresentation.remindersKey, frameworkPermission: .reminders)
+                    tccStatusRow(label: "Contacts", icon: "person.crop.circle", statusKey: MacIntegrationSystemPermissionPresentation.contactsKey, frameworkPermission: .contacts)
+                    tccStatusRow(label: "Mail",     icon: "envelope",  statusKey: MacIntegrationSystemPermissionPresentation.appleEventsMailKey,     appleEventApp: "Mail")
+                    tccStatusRow(label: "Messages", icon: "message",   statusKey: MacIntegrationSystemPermissionPresentation.appleEventsMessagesKey, appleEventApp: "Messages")
+                    tccStatusRow(label: "Notes",    icon: "note.text", statusKey: MacIntegrationSystemPermissionPresentation.appleEventsNotesKey,    appleEventApp: "Notes")
+                    tccStatusRow(label: "Music",    icon: "music.note",statusKey: MacIntegrationSystemPermissionPresentation.appleEventsMusicKey,    appleEventApp: "Music")
 
                     // Taste pass 2026-07-24: with every row above already
                     // granted, a prominent "Grant All" CTA is a dead button and
@@ -143,7 +328,11 @@ struct MacIntegrationView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
-                if isLoading {
+                switch MacIntegrationPermissionLoadPresentation.resolve(
+                    isLoading: isLoading,
+                    loadError: permissionLoadError
+                ) {
+                case .loading:
                     Section {
                         HStack {
                             ProgressView()
@@ -153,23 +342,13 @@ struct MacIntegrationView: View {
                                 .foregroundStyle(.secondary)
                         }
                     }
-                } else if let permissionLoadError {
-                    Section {
-                        Label("Permission controls unavailable", systemImage: "exclamationmark.shield.fill")
-                            .font(.headline)
-                            .foregroundStyle(.red)
-                        Text(permissionLoadError)
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Text("All Mac Integration tool gates remain closed until the saved permission file is repaired. NativeAgent preserved the existing bytes.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    } header: {
-                        Text("Permissions")
-                    }
-                } else {
+                case .unavailable(let detail, let retrying):
+                    MacIntegrationPermissionLoadErrorPanel(
+                        detail: detail,
+                        retrying: retrying,
+                        retry: { Task { await loadPermissions() } }
+                    )
+                case .controlsAvailable:
                     ForEach(MacIntegrationID.all, id: \.self) { id in
                         Section {
                             integrationRow(for: id)
@@ -226,18 +405,28 @@ struct MacIntegrationView: View {
                 .help("Re-read macOS TCC permission status. Useful after granting via System Settings.")
             }
         }
-        .alert("Permission Save Failed",
+        .alert(MacIntegrationPermissionFailurePresentation.saveAlertTitle,
                isPresented: Binding(
-                get: { persistenceError != nil },
+                get: {
+                    MacIntegrationPermissionFailurePresentation.saveAlertIsPresented(
+                        persistenceError: persistenceError,
+                        requestError: permissionRequestError
+                    )
+                },
                 set: { if !$0 { persistenceError = nil } }
                )) {
             Button("OK", role: .cancel) { persistenceError = nil }
         } message: {
             Text(persistenceError ?? "")
         }
-        .alert("Permission Request Failed",
+        .alert(MacIntegrationPermissionFailurePresentation.requestAlertTitle,
                isPresented: Binding(
-                get: { permissionRequestError != nil },
+                get: {
+                    MacIntegrationPermissionFailurePresentation.requestAlertIsPresented(
+                        persistenceError: persistenceError,
+                        requestError: permissionRequestError
+                    )
+                },
                 set: { if !$0 { permissionRequestError = nil } }
                )) {
             Button("OK", role: .cancel) { permissionRequestError = nil }
@@ -305,17 +494,23 @@ struct MacIntegrationView: View {
     // MARK: - State
 
     private func loadPermissions() async {
+        permissionLoadGeneration &+= 1
+        let generation = permissionLoadGeneration
         isLoading = true
         do {
             // Only a missing store receives bootstrap defaults. Existing
             // damaged authority state is shown as unavailable while every hot
             // tool gate remains denied.
-            permissions = try await MacIntegrationPermissionStore.shared.currentChecked()
+            let loadedPermissions = try await MacIntegrationPermissionStore.shared.currentChecked()
+            guard generation == permissionLoadGeneration else { return }
+            permissions = loadedPermissions
             permissionLoadError = nil
         } catch {
+            guard generation == permissionLoadGeneration else { return }
             permissions = [:]
             permissionLoadError = error.localizedDescription
         }
+        guard generation == permissionLoadGeneration else { return }
         isLoading = false
     }
 
@@ -369,27 +564,15 @@ struct MacIntegrationView: View {
 
     // Every status key rendered as a System Permissions row above the
     // Grant All control; the CTA hides only when ALL of these are granted.
-    private static let systemPermissionStatusKeys = [
-        "speech_recognition", "microphone",
-        "calendar", "reminders", "contacts",
-        "apple_events_mail", "apple_events_messages",
-        "apple_events_notes", "apple_events_music",
-    ]
-
     private var allSystemPermissionsGranted: Bool {
-        Self.systemPermissionStatusKeys.allSatisfy { key in
-            switch tccStatuses[key] ?? "unknown" {
-            case "granted", "authorized", "granted_offline": return true
-            default: return false
-            }
-        }
+        MacIntegrationSystemPermissionPresentation.allGranted(tccStatuses)
     }
 
     private func tccStatusRow(
         label: String,
         icon: String,
         statusKey: String,
-        frameworkPermission: FrameworkPermission? = nil,
+        frameworkPermission: MacIntegrationFrameworkPermission? = nil,
         appleEventApp: String? = nil
     ) -> some View {
         let status = tccStatuses[statusKey] ?? "unknown"
@@ -418,10 +601,7 @@ struct MacIntegrationView: View {
                     .disabled(requestingFramework != nil || requestingApp != nil)
                 } else if status == "denied" || status == "restricted" || status == "limited" {
                     Button("Open Settings") {
-                        let prefix = "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?"
-                        if let url = URL(string: prefix + permission.settingsAnchor) {
-                            NSWorkspace.shared.open(url)
-                        }
+                        openSystemSettings(permission.capability)
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
@@ -451,9 +631,7 @@ struct MacIntegrationView: View {
                     .disabled(requestingApp != nil)
                 } else if status == "denied" || status == "restricted" {
                     Button("Open Settings") {
-                        if let url = URL(string: "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Automation") {
-                            NSWorkspace.shared.open(url)
-                        }
+                        openSystemSettings(.automation)
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
@@ -487,37 +665,42 @@ struct MacIntegrationView: View {
     private static let aeStatusDefaultsKey = "nativeAgent.macIntegration.appleEvents.statusCache.v1"
 
     private static func loadCachedAppleEventsStatuses() -> [String: String] {
-        let raw = UserDefaults.standard.dictionary(forKey: aeStatusDefaultsKey) ?? [:]
-        var out: [String: String] = [:]
-        for (k, v) in raw {
-            if let s = v as? String { out[k] = s }
-        }
-        return out
+        MacIntegrationSystemPermissionPresentation.loadAppleEventStatuses(
+            from: .standard,
+            key: aeStatusDefaultsKey
+        )
     }
 
     private static func saveCachedAppleEventsStatuses(_ statuses: [String: String]) {
         // Filter to ONLY apple_events_* keys — don't persist the framework
         // ones (those re-read from the OS on every launch, so caching them
         // would just be stale).
-        let aeOnly = statuses.filter { $0.key.hasPrefix("apple_events_") }
-        UserDefaults.standard.set(aeOnly, forKey: aeStatusDefaultsKey)
+        MacIntegrationSystemPermissionPresentation.saveAppleEventStatuses(
+            statuses,
+            to: .standard,
+            key: aeStatusDefaultsKey
+        )
     }
 
     private func loadInitialTCCStatuses() async {
+        // Cold-start cache improves the initial paint but cannot become the
+        // truth source: the passive probes below overwrite it as they finish.
+        let cachedAppleEvents = Self.loadCachedAppleEventsStatuses()
+        tccStatuses.merge(cachedAppleEvents) { _, cachedValue in cachedValue }
         // Pure status queries; no prompts fired here. The three framework
         // backends (Calendar/Reminders/Contacts) are safe to query at any
         // time without triggering prompts.
         // Speech / Microphone: class-level READS only (SFSpeechRecognizer
         // .authorizationStatus / AVCaptureDevice.authorizationStatus). Neither
         // prompts, so they are safe on every appear and refresh tick.
-        tccStatuses["speech_recognition"] = Self.badgeKey(
+        tccStatuses[MacIntegrationSystemPermissionPresentation.speechRecognitionKey] = Self.badgeKey(
             SystemPermissionPreflight.status(.speechRecognition))
-        tccStatuses["microphone"] = Self.badgeKey(
+        tccStatuses[MacIntegrationSystemPermissionPresentation.microphoneKey] = Self.badgeKey(
             SystemPermissionPreflight.status(.microphone))
 
-        tccStatuses["calendar"] = MacPIMConnectorActions.currentCalendarAuthorizationStatus()
-        tccStatuses["reminders"] = MacPIMConnectorActions.currentReminderAuthorizationStatus()
-        tccStatuses["contacts"] = MacContactsAdapter.currentAuthorizationStatus()
+        tccStatuses[MacIntegrationSystemPermissionPresentation.calendarKey] = MacPIMConnectorActions.currentCalendarAuthorizationStatus()
+        tccStatuses[MacIntegrationSystemPermissionPresentation.remindersKey] = MacPIMConnectorActions.currentReminderAuthorizationStatus()
+        tccStatuses[MacIntegrationSystemPermissionPresentation.contactsKey] = MacContactsAdapter.currentAuthorizationStatus()
 
         // 2026-06-07: AppleEvents per-app is now probed PASSIVELY here
         // using AEDeterminePermissionToAutomateTarget(askUserIfNeeded:
@@ -526,17 +709,24 @@ struct MacIntegrationView: View {
         // probe returns the real state (granted / denied / not_determined
         // / unknown for apps not installed) every time. No more "unknown
         // until you click Grant All."
+        var probedAppleEvents: [String: String] = [:]
         for app in Self.appleEventsTargetApps {
             let key = "apple_events_\(app.lowercased())"
-            tccStatuses[key] = await Self.probeAppleEventApp(app)
+            probedAppleEvents[key] = await Self.probeAppleEventApp(app)
         }
+        tccStatuses.merge(
+            MacIntegrationSystemPermissionPresentation.mergingCachedAppleEvents(
+                cachedAppleEvents,
+                withProbed: probedAppleEvents
+            )
+        ) { _, probeValue in probeValue }
         // Still persist the latest values so a cold launch shows correct
         // state even before the first probe completes (the cache acts as
         // a faster initial paint while the real probes run).
         Self.saveCachedAppleEventsStatuses(tccStatuses)
     }
 
-    private func requestFrameworkGrant(_ permission: FrameworkPermission) async {
+    private func requestFrameworkGrant(_ permission: MacIntegrationFrameworkPermission) async {
         requestingFramework = permission
         defer { requestingFramework = nil }
 
@@ -570,19 +760,25 @@ struct MacIntegrationView: View {
                 + "and macOS will not ask again once a permission has been answered. "
                 + "Opening System Settings → Privacy & Security → \(permission.label) — "
                 + "switch NativeAgent on there, then hit Refresh."
-            if let url = URL(string: SystemPermissionPreflight.settingsPanePrefix + permission.settingsAnchor) {
-                NSWorkspace.shared.open(url)
-            }
+            openSystemSettings(permission.capability)
         } else if status == "not_determined" || status == "unknown" {
-            permissionRequestError = registrationFailureMessage(for: permission)
+            permissionRequestError = MacIntegrationPermissionFailurePresentation.registrationFailureMessage(for: permission)
         }
     }
 
-    private func registrationFailureMessage(for permission: FrameworkPermission) -> String {
-        if permission == .calendar {
-            return "macOS rejected the Calendar permission request. Quit and reopen NativeAgent, then try Grant once more. If it still fails, reinstall the current signed build; hardened-runtime builds must include Apple's Calendar entitlement."
+    /// Preserve a failed Settings handoff in the same visible alert used for a
+    /// failed permission request. Opening a pane is a user-facing recovery
+    /// action; returning false must never look like a successful click.
+    @discardableResult
+    private func openSystemSettings(
+        _ capability: SystemPermissionCapability,
+        opener: (URL) -> Bool = { NSWorkspace.shared.open($0) }
+    ) -> MacIntegrationSettingsDeepLink.Outcome {
+        let outcome = MacIntegrationSettingsDeepLink.open(capability, using: opener)
+        if let message = outcome.failureMessage {
+            permissionRequestError = message
         }
-        return "macOS did not register the \(permission.label) permission request. Keep NativeAgent in the foreground and try Grant once more."
+        return outcome
     }
 
     private func grantAllPermissions() async {
@@ -663,37 +859,38 @@ struct MacIntegrationView: View {
         // `com.apple.settings.PrivacySecurity.extension` works on 13+. We
         // try the new one first; NSWorkspace.open falls back gracefully if
         // the bundle isn't installed (returns false but doesn't throw).
-        func privacyPaneURL(_ anchor: String) -> String {
-            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?\(anchor)"
-        }
-        var needsManualGrant: [String] = []
+        var needsManualGrant: [SystemPermissionCapability] = []
         if speech == "denied" || speech == "restricted" {
-            needsManualGrant.append(privacyPaneURL("Privacy_SpeechRecognition"))
+            needsManualGrant.append(.speechRecognition)
         }
         if mic == "denied" || mic == "restricted" {
-            needsManualGrant.append(privacyPaneURL("Privacy_Microphone"))
+            needsManualGrant.append(.microphone)
         }
         if cal == "denied" || cal == "restricted" {
-            needsManualGrant.append(privacyPaneURL("Privacy_Calendars"))
+            needsManualGrant.append(.calendars)
         }
         if rem == "denied" || rem == "restricted" {
-            needsManualGrant.append(privacyPaneURL("Privacy_Reminders"))
+            needsManualGrant.append(.reminders)
         }
         if con == "denied" || con == "restricted" {
-            needsManualGrant.append(privacyPaneURL("Privacy_Contacts"))
+            needsManualGrant.append(.contacts)
         }
         if anyAEDenied {
-            needsManualGrant.append(privacyPaneURL("Privacy_Automation"))
+            needsManualGrant.append(.automation)
         }
         // Open one pane per stuck permission, spaced 400ms apart so the
         // user can see each window open instead of a single one stealing
         // focus. NSWorkspace.open is the standard way to open
         // x-apple.systempreferences: URLs.
-        for (i, urlStr) in needsManualGrant.enumerated() {
+        var settingsFailures: [String] = []
+        for (i, capability) in needsManualGrant.enumerated() {
             try? await Task.sleep(nanoseconds: UInt64(i * 400_000_000))
-            if let url = URL(string: urlStr) {
-                NSWorkspace.shared.open(url)
+            if let message = openSystemSettings(capability).failureMessage {
+                settingsFailures.append(message)
             }
+        }
+        if !settingsFailures.isEmpty {
+            permissionRequestError = settingsFailures.joined(separator: " ")
         }
     }
 

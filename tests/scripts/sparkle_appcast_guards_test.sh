@@ -108,8 +108,8 @@ grep -Fq 'Published and VERIFIED live' "$GENERATE" \
 if grep -Fq 'echo "==> Published: ' "$GENERATE"; then
   fail "generate_appcast.sh claims 'Published' without fetching the feed"
 fi
-grep -Fq 'refusing to claim a feed is live on the strength of an exit code' "$GENERATE" \
-  || grep -Fiq 'cannot be VERIFIED' "$GENERATE" \
+grep -Fq 'could NOT be verified live' "$GENERATE" \
+  && grep -Fq 'The release is NOT published.' "$GENERATE" \
   || fail "generate_appcast.sh no longer fails when publication cannot be verified at all"
 
 echo "[test] sparkle appcast + update-honesty guards OK"

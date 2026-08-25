@@ -315,6 +315,14 @@ struct ManifestSignerTests {
     let attrs = try FileManager.default.attributesOfItem(atPath: keyPath.path)
     let perms = (attrs[.posixPermissions] as? NSNumber)?.intValue ?? 0
     #expect(perms == 0o600)
+
+    // The public signer boundary must reuse the authority it just created.
+    // A second call that rotates the key invalidates every manifest signed by
+    // the first call, even though both calls independently look successful.
+    let reloaded = try await signer.loadOrCreateSigningKey()
+    #expect(reloaded == key, "a second signer call regenerated its authority key")
+    #expect(try Data(contentsOf: keyPath) == key,
+            "the signer returned bytes that were not durably retained")
 }
 
 @Test func loadOrCreateSigningKey_loads_existing_32_bytes() async throws {
@@ -327,17 +335,32 @@ struct ManifestSignerTests {
     #expect(key == stored)
 }
 
-@Test func loadOrCreateSigningKey_rejects_short_existing_key_without_rotation() async throws {
+@Test func loadOrCreateSigningKey_rejectsZeroAnd31ByteExistingKeysAsKeyUnavailableWithoutRotation() async throws {
     let root = try makeTempDataRoot()
     defer { try? FileManager.default.removeItem(at: root) }
-    let invalid = Data(repeating: 0x01, count: 8)
-    try stageSigningKey(at: root, bytes: invalid)
-    let signer = SwiftNativeManifestSigner(dataRoot: root)
-    await #expect(throws: ManifestSigningError.self) {
-        _ = try await signer.loadOrCreateSigningKey()
+    for byteCount in [0, 31] {
+        let stateRoot = root.appendingPathComponent("bytes-\(byteCount)", isDirectory: true)
+        let invalid = Data(repeating: 0x01, count: byteCount)
+        try stageSigningKey(at: stateRoot, bytes: invalid)
+        let signer = SwiftNativeManifestSigner(dataRoot: stateRoot)
+
+        do {
+            _ = try await signer.loadOrCreateSigningKey()
+            Issue.record("\(byteCount)-byte existing authority unexpectedly loaded or regenerated")
+        } catch let error as ManifestSigningError {
+            if case .keyUnavailable(let detail) = error {
+                #expect(!detail.isEmpty, "keyUnavailable must retain the checked-file failure detail")
+            } else {
+                Issue.record("\(byteCount)-byte authority surfaced the wrong signer error: \(error)")
+            }
+        } catch {
+            Issue.record("\(byteCount)-byte authority escaped the signer error boundary: \(error)")
+        }
+
+        let keyPath = stateRoot.appendingPathComponent("tools/.manifest_signing_key")
+        #expect(try Data(contentsOf: keyPath) == invalid,
+                "\(byteCount)-byte existing authority was altered after keyUnavailable")
     }
-    let keyPath = root.appendingPathComponent("tools/.manifest_signing_key")
-    #expect(try Data(contentsOf: keyPath) == invalid)
 }
 
 @Test func loadOrCreateSigningKey_rejects_oversized_existing_key_without_rotation() async throws {
@@ -361,8 +384,17 @@ struct ManifestSignerTests {
     let keyPath = root.appendingPathComponent("tools/.manifest_signing_key")
     try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: keyPath.path)
     let signer = SwiftNativeManifestSigner(dataRoot: root)
-    await #expect(throws: ManifestSigningError.self) {
+    do {
         _ = try await signer.loadOrCreateSigningKey()
+        Issue.record("expected an insecure signing-key mode to be rejected")
+    } catch let error as ManifestSigningError {
+        guard case let .keyUnavailable(detail) = error else {
+            Issue.record("expected keyUnavailable for insecure signing-key mode, got \(error)")
+            return
+        }
+        #expect(!detail.isEmpty)
+    } catch {
+        Issue.record("expected ManifestSigningError.keyUnavailable, got \(error)")
     }
     #expect(try Data(contentsOf: keyPath) == stored)
     let attributes = try FileManager.default.attributesOfItem(atPath: keyPath.path)

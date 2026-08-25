@@ -420,6 +420,7 @@ extension MacSyncEngine {
     /// inner-HMAC, freshness, idempotency, TrustCenter/router, receipt, and
     /// response-signing boundaries as the legacy Drive inbox.
     func processCloudKitActionMessage(_ message: BridgeMessage) async -> Bool {
+        let actionStateRoot = cloudKitActionStateRootOverride ?? NativeAgentPaths.dataRoot
         guard message.metadata?["kind"] == "icloud_action",
               let declaredID = message.metadata?["actionId"],
               let data = message.text.data(using: .utf8) else {
@@ -449,10 +450,7 @@ extension MacSyncEngine {
                 return false
             }
             do {
-                try await iCloudBridge.shared.sendCloudKitActionResponse(
-                    response,
-                    correlationID: action.msgId
-                )
+                try await sendCloudKitActionResponse(response, correlationID: action.msgId)
                 return true
             } catch {
                 syncError = "Could not resend CloudKit action response \(action.msgId): \(error.localizedDescription)"
@@ -502,7 +500,7 @@ extension MacSyncEngine {
                         eventID: action.msgId,
                         channel: .inboxAction,
                         peerCreatedAt: peerCreatedAt,
-                        dataRoot: NativeAgentPaths.dataRoot
+                        dataRoot: actionStateRoot
                     )
                 } catch {
                     NSLog("[MacSyncEngine] could not persist CloudKit action peer evidence for %@: %@",
@@ -552,18 +550,15 @@ extension MacSyncEngine {
         // restart would lose it — so leave the durable marker instead.
         recordProcessed(action.msgId)
         let commit = Self.commitCompletionBookkeeping(
-            dataRoot: NativeAgentPaths.dataRoot,
+            dataRoot: actionStateRoot,
             msgId: action.msgId,
-            processedSaved: saveProcessedIds(),
+            processedSaved: cloudKitActionProcessedIDPersistence?() ?? saveProcessedIds(),
             archiveError: nil  // CloudKit lane has no pending file to archive.
         )
         if !commit.clean { syncError = commit.syncError }
 
         do {
-            try await iCloudBridge.shared.sendCloudKitActionResponse(
-                response,
-                correlationID: action.msgId
-            )
+            try await sendCloudKitActionResponse(response, correlationID: action.msgId)
             lastInboxAt = Date()
             await writeSnapshots(forceHeavy: true)
             NotificationCenter.default.post(name: .iCloudInboxDidProcess, object: nil)
@@ -571,6 +566,20 @@ extension MacSyncEngine {
         } catch {
             syncError = "CloudKit action completed but its response is waiting to resend: \(error.localizedDescription)"
             return false
+        }
+    }
+
+    private func sendCloudKitActionResponse(
+        _ response: [String: String],
+        correlationID: String
+    ) async throws {
+        if let cloudKitActionResponseSender {
+            try await cloudKitActionResponseSender(response, correlationID)
+        } else {
+            try await iCloudBridge.shared.sendCloudKitActionResponse(
+                response,
+                correlationID: correlationID
+            )
         }
     }
 

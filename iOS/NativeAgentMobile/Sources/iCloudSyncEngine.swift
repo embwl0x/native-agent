@@ -61,6 +61,10 @@ final class iCloudSyncEngine: ObservableObject {
     @Published var memoryProposals: [MemoryProposalRecord] = []
     @Published var trainingProposals: [TrainingProposalSummary] = []
     @Published var promotionCandidates: [PromotionCandidateSummary] = []
+    /// Set only after both self-improvement projections arrive together. Empty
+    /// arrays before this point mean “not published yet”, not a measured clear
+    /// queue on the iPhone.
+    @Published var selfImprovementSnapshotPublishedAt: Date?
     @Published var trustPolicy: TrustPolicy?
     // R25 (2026-07-02): personality.json now carries the real native
     // NativeClient.getPersonality() profile (shared PersonalityProfile type,
@@ -95,6 +99,10 @@ final class iCloudSyncEngine: ObservableObject {
     let kvs = NSUbiquitousKeyValueStore.default
     var snapshotDir: URL?
     var prefersCloudKitSnapshotCache = false
+    /// Production uses Application Support. Tests can supply a disposable
+    /// cache root while still exercising the exact decode → atomic write →
+    /// refresh path used by the CloudKit status observer.
+    var cloudKitSnapshotCacheRootOverride: URL?
     var inboxDir: URL?
     var responsesDir: URL?
     var transactionDir: URL?
@@ -144,6 +152,10 @@ enum SyncError: LocalizedError {
     case persistence(String)
     /// S.4: A second sendAction arrived while a prior one is still in-flight.
     case busy(String)
+    /// The signed request reached the Mac but its effect is still held by the
+    /// canonical approval owner. This is neither success nor a retryable
+    /// transport failure.
+    case approvalRequired(String)
     case unsupported(String)
 
     var errorDescription: String? {
@@ -153,6 +165,7 @@ enum SyncError: LocalizedError {
         case .timeout(let msg): return msg
         case .persistence(let msg): return msg
         case .busy(let msg):    return msg
+        case .approvalRequired(let msg): return msg
         case .unsupported(let msg): return msg
         }
     }

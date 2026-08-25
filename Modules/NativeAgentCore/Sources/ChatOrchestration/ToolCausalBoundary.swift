@@ -90,7 +90,10 @@ public enum ToolCausalBoundary {
         // W6 — mac_wake binds for the same reason: it posted a real HID event.
         // That the same call also returns a perception result does not make it
         // a read; the mouse move it emitted is the external effect.
-        case "mac_keystroke", "mac_click", "mac_scroll", "mac_ax_act", "mac_wake":
+        // native-look item 3 — mac_act binds for the same reason: it performs a
+        // real verb through the actuator. That the same call also returns a
+        // percept does not make it a read; the press it emitted is the effect.
+        case "mac_keystroke", "mac_click", "mac_scroll", "mac_ax_act", "mac_wake", "mac_act", "act", "go":
             return (.macControl, ["operationId", "operation_id"])
         // W7 — mac_nudge is deliberately ABSENT too, and it is the one motor
         // tool here that is. A motor binding claims some domain owner can

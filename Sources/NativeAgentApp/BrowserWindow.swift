@@ -22,6 +22,12 @@ struct BrowserLink: Codable, Sendable, Hashable {
 final class BrowserNavDelegate: NSObject, WKNavigationDelegate, @unchecked Sendable {
     // Continuation is set before navigation begins and consumed on load/fail.
     var onFinish: ((Result<NavResult, Error>) -> Void)?
+    /// The one navigation whose completion may settle `onFinish`.  A newly
+    /// created WKWebView can finish its implicit about:blank navigation after
+    /// the caller has armed a real load; accepting that callback used to return
+    /// a successful result for about:blank and leave the requested page loading
+    /// invisibly in the background.
+    var expectedNavigation: WKNavigation?
     // Real status captured from the main-frame navigation response. nil when no
     // HTTP response was seen — didFinish must NOT fabricate a 200 (404/500 pages
     // load "successfully" and would persist receipts claiming success).
@@ -46,20 +52,26 @@ final class BrowserNavDelegate: NSObject, WKNavigationDelegate, @unchecked Senda
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard navigation === expectedNavigation else { return }
         let url = webView.url?.absoluteString ?? ""
         let title = webView.title ?? ""
         onFinish?(.success(NavResult(url: url, title: title, httpStatus: lastHTTPStatus)))
         onFinish = nil
+        expectedNavigation = nil
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        guard navigation === expectedNavigation else { return }
         onFinish?(.failure(error))
         onFinish = nil
+        expectedNavigation = nil
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        guard navigation === expectedNavigation else { return }
         onFinish?(.failure(error))
         onFinish = nil
+        expectedNavigation = nil
     }
 }
 
@@ -117,6 +129,14 @@ final class BrowserActiveRunRegistry {
 final class BrowserWindowController: NSObject, ObservableObject {
     static let shared = BrowserWindowController()
 
+    /// The production controller uses the canonical data root.  Tests may give
+    /// the real loopback listener a disposable root so its discovery token can
+    /// be exercised without ever touching a resident app's IPC files.
+    init(dataRoot: URL = NativeAgentPaths.dataRoot) {
+        self.dataRoot = dataRoot
+        super.init()
+    }
+
     private var window: NSWindow?
     private var webView: WKWebView?
     private let navDelegate = BrowserNavDelegate()
@@ -131,6 +151,7 @@ final class BrowserWindowController: NSObject, ObservableObject {
     private var connectionTimeouts: [ObjectIdentifier: Task<Void, Never>] = [:]
     private(set) var ipcToken: String = ""
     private(set) var ipcPort: UInt16 = 0
+    private let dataRoot: URL
 
     private static let preferredIPCPort: UInt16 = 8766
     /// Drop a connection that hasn't completed its request/response within this window
@@ -147,9 +168,7 @@ final class BrowserWindowController: NSObject, ObservableObject {
 
     // Phase 11c: use the shared resolver so browser_ipc_token goes to
     // <repo>/data/ rather than ~/Library/Application Support/NativeAgent/.
-    private var appSupportDir: URL {
-        NativeAgentPaths.dataRoot
-    }
+    private var appSupportDir: URL { dataRoot }
 
     private var tokenFileURL: URL {
         appSupportDir.appendingPathComponent("browser_ipc_token")
@@ -284,6 +303,7 @@ final class BrowserWindowController: NSObject, ObservableObject {
                           let finish = self.navDelegate.onFinish else { return }
                     self.webView?.stopLoading()
                     self.navDelegate.onFinish = nil
+                    self.navDelegate.expectedNavigation = nil
                     self.activeNavigationID = nil
                     finish(.failure(BrowserError.timeout))
                 }
@@ -292,7 +312,14 @@ final class BrowserWindowController: NSObject, ObservableObject {
                     self?.activeNavigationID = nil
                     cont.resume(with: result)
                 }
-                webView.load(URLRequest(url: url))
+                guard let navigation = webView.load(URLRequest(url: url)) else {
+                    timeoutTask.cancel()
+                    navDelegate.onFinish = nil
+                    activeNavigationID = nil
+                    cont.resume(throwing: BrowserError.notReady)
+                    return
+                }
+                navDelegate.expectedNavigation = navigation
             }
         } onCancel: { [weak self] in
             Task { @MainActor in
@@ -312,6 +339,7 @@ final class BrowserWindowController: NSObject, ObservableObject {
               let finish = navDelegate.onFinish else { return false }
         webView?.stopLoading()
         navDelegate.onFinish = nil
+        navDelegate.expectedNavigation = nil
         self.activeNavigationID = nil
         finish(.failure(CancellationError()))
         return true
@@ -357,7 +385,11 @@ final class BrowserWindowController: NSObject, ObservableObject {
     // arbitrary JavaScript.  JSONSerialization produces a properly escaped JS
     // string literal including the surrounding double-quotes.
     private func jsStringLiteral(_ s: String) -> String {
-        guard let data = try? JSONSerialization.data(withJSONObject: s),
+        // A JavaScript string literal is a JSON *fragment*, not an object or
+        // array.  Without `.fragmentsAllowed`, Foundation raises an Objective-C
+        // exception for every ordinary selector/text input before the Swift
+        // `try?` can handle it.
+        guard let data = try? JSONSerialization.data(withJSONObject: s, options: [.fragmentsAllowed]),
               let str = String(data: data, encoding: .utf8) else {
             // Fallback: escape the string manually (handles cases where JSON
             // serialisation somehow fails, which shouldn't happen for plain strings).
@@ -464,11 +496,11 @@ final class BrowserWindowController: NSObject, ObservableObject {
     private static func endpointIsLoopback(_ endpoint: NWEndpoint) -> Bool {
         guard case let .hostPort(host, _) = endpoint else { return true }
         let value = "\(host)".lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
         return value == "localhost"
             || value == "127.0.0.1"
             || value == "::1"
-            || value.contains("127.0.0.1")
-            || value.contains("::1")
+            || value.hasPrefix("::1%")
     }
 
     func startIPCServer() {

@@ -147,9 +147,11 @@ private func makePump(
     })
     #expect(await sleepPump.tick() == .postureNotNormal)
 
-    // Organism disabled (nil posture) — inert by construction.
+    // An unavailable organism remains inert, but is no longer reported as an
+    // explicit conservative/disabled body. The loop receipt must tell these
+    // two operationally different reasons apart.
     let offPump = makePump(root: root, store: store, spy: spy, posture: { nil })
-    #expect(await offPump.tick() == .postureNotNormal)
+    #expect(await offPump.tick() == .organismUnavailable)
 
     let explicitlyOffPump = makePump(root: root, store: store, spy: spy, posture: {
         OrganismBehaviorPosture(
@@ -158,6 +160,11 @@ private func makePump(
     #expect(await explicitlyOffPump.tick() == .postureNotNormal)
 
     #expect(await spy.callCount() == 0, "no session may run outside a normal green window")
+
+    let normalPump = makePump(root: root, store: store, spy: spy, posture: { normalPosture() })
+    #expect(await normalPump.tick() == .ran(.completed),
+            "a present normal body must still reach the bounded Workshop session")
+    #expect(await spy.callCount() == 1)
 }
 
 @Test func h4_disabledAutonomyDoesNotRun() async throws {

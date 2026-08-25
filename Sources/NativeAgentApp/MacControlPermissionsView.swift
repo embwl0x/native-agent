@@ -1,6 +1,23 @@
 // PATCH-2026-05-07: mac-control-ui-1 Mac Control Permissions panel — master toggle + category toggles + audit log
 import AppKit
+import MacControl
 import SwiftUI
+
+enum MacControlAdvancedDisclosurePresentation {
+    static let preferenceKey = "macControl.showAdvancedControls"
+
+    static func isExpanded(in defaults: UserDefaults) -> Bool {
+        defaults.bool(forKey: preferenceKey)
+    }
+
+    static func setExpanded(_ isExpanded: Bool, in defaults: UserDefaults) {
+        defaults.set(isExpanded, forKey: preferenceKey)
+    }
+
+    static func savePathIsVisible(isExpanded: Bool) -> Bool {
+        isExpanded
+    }
+}
 
 // MARK: - TrustMacControlPolicy
 
@@ -142,7 +159,7 @@ struct MacControlApprovalCategory: Identifiable, Hashable {
 /// older rows still render. `var id: String` is the SwiftUI `Identifiable`
 /// row id and intentionally distinct from the canonical `id` field (the
 /// receipt UUID), which is exposed as `receiptID`.
-struct MacControlAuditEntry: Identifiable, Decodable {
+struct MacControlAuditEntry: Identifiable, Decodable, Sendable {
     // Identifiable row id: stable per row but built from receiptID when
     // present so rows are deduped reliably in the List.
     var id: String { receiptID ?? "\(ts)-\(method)" }
@@ -260,6 +277,37 @@ struct MacControlAuditEntry: Identifiable, Decodable {
     }
 }
 
+enum MacControlAuditLogRead: Sendable {
+    case entries([MacControlAuditEntry], malformedLineCount: Int)
+    case sourceAbsent
+    case unreadable(String)
+
+    static func read(from url: URL, limit: Int = 100) -> Self {
+        guard FileManager.default.fileExists(atPath: url.path) else { return .sourceAbsent }
+        do {
+            let content = try String(contentsOf: url, encoding: .utf8)
+            var malformed = 0
+            let entries = content
+                .split(separator: "\n", omittingEmptySubsequences: true)
+                .compactMap { line -> MacControlAuditEntry? in
+                    guard let data = line.data(using: .utf8) else {
+                        malformed += 1
+                        return nil
+                    }
+                    do {
+                        return try JSONDecoder().decode(MacControlAuditEntry.self, from: data)
+                    } catch {
+                        malformed += 1
+                        return nil
+                    }
+                }
+            return .entries(Array(entries.suffix(limit).reversed()), malformedLineCount: malformed)
+        } catch {
+            return .unreadable(error.localizedDescription)
+        }
+    }
+}
+
 // MARK: - MacControlPermissionsView
 
 private enum MacIntegrationPreset: String, Identifiable {
@@ -307,23 +355,115 @@ private enum MacIntegrationPreset: String, Identifiable {
     }
 }
 
+/// Setup badges describe only a policy that was successfully read or saved.
+/// The controls can still show an editable draft, but a draft must never make
+/// the setup panel claim that Mac Control is already configured.
+enum MacControlSetupStatusBadges {
+    enum PolicyReadState: Equatable {
+        case loading
+        case available
+        case unavailable
+    }
+
+    struct Badge: Equatable {
+        let text: String
+        let status: String
+    }
+
+    struct State: Equatable {
+        let access: Badge
+        let iOSRemote: Badge
+        let receipts: Badge
+        let detail: String
+    }
+
+    static func resolve(readState: PolicyReadState, savedPolicy: TrustMacControlPolicy?) -> State {
+        switch readState {
+        case .loading:
+            return State(
+                access: Badge(text: "Checking setup", status: "unknown"),
+                iOSRemote: Badge(text: "iOS remote unknown", status: "unknown"),
+                receipts: Badge(text: "receipts unknown", status: "unknown"),
+                detail: "Checking the saved Mac Control policy. Setup status is not known yet."
+            )
+        case .unavailable:
+            return State(
+                access: Badge(text: "Setup unavailable", status: "failed"),
+                iOSRemote: Badge(text: "iOS remote unknown", status: "failed"),
+                receipts: Badge(text: "receipts unknown", status: "failed"),
+                detail: "NativeAgent could not read the saved Mac Control policy. No setup badge is claiming that Mac Control is ready."
+            )
+        case .available:
+            guard let savedPolicy else {
+                return State(
+                    access: Badge(text: "Setup unavailable", status: "failed"),
+                    iOSRemote: Badge(text: "iOS remote unknown", status: "failed"),
+                    receipts: Badge(text: "receipts unknown", status: "failed"),
+                    detail: "The saved Trust policy did not include Mac Control settings."
+                )
+            }
+
+            let access: Badge
+            let detail: String
+            if !savedPolicy.enabled {
+                access = Badge(text: "Mac Control off", status: "disabled")
+                detail = "Mac integration is read-only. The agent can inspect app data but Mac Control actions stay blocked."
+            } else if savedPolicy.shellAllowed && savedPolicy.fileOpsAllowed
+                        && savedPolicy.accessibilityAllowed && savedPolicy.approvalRequiredFor.isEmpty {
+                access = Badge(text: "Full Mac configured", status: "ready")
+                detail = "Full Mac enables broad local file and app control. Destructive shell/system actions still require Developer Mode."
+            } else if savedPolicy.fileOpsAllowed || savedPolicy.shellAllowed || savedPolicy.systemControlAllowed
+                        || savedPolicy.accessibilityAllowed || savedPolicy.applesScriptAllowed || savedPolicy.jxaAllowed {
+                access = Badge(text: "Assistant configured", status: "ready")
+                detail = "Assistant mode enables workspace-safe Mac work, iPhone remote receipts, and approvals for risky categories."
+            } else {
+                access = Badge(text: "Watch configured", status: "ready")
+                detail = "Watch mode turns on the local Mac bridge for receipts, Spotlight, Shortcuts, and watch setup without shell or file writes."
+            }
+
+            return State(
+                access: access,
+                iOSRemote: Badge(
+                    text: savedPolicy.remoteFromIosAllowed ? "iOS remote on" : "iOS remote off",
+                    status: savedPolicy.remoteFromIosAllowed ? "ready" : "disabled"
+                ),
+                receipts: Badge(
+                    text: savedPolicy.notificationsAllowed && savedPolicy.enabled ? "receipts on" : "receipts off",
+                    status: savedPolicy.notificationsAllowed && savedPolicy.enabled ? "ready" : "disabled"
+                ),
+                detail: detail
+            )
+        }
+    }
+}
+
 struct MacControlPermissionsView: View {
     @Environment(AppModel.self) private var appModel
     @State private var policy = TrustMacControlPolicy()
     @State private var savedPolicy = TrustMacControlPolicy()
+    @State private var policyReadState: MacControlSetupStatusBadges.PolicyReadState = .loading
     @State private var isSaving = false
     @State private var saveError: String?
     @State private var showAuditSheet = false
     @State private var auditEntries: [MacControlAuditEntry] = []
+    @State private var auditReadProblem: String?
     @State private var isLoadingAudit = false
     @State private var testNotifStatus: String?
     @State private var isTestingNotif = false
-    @State private var showAdvancedMacControls = false
+    // The advanced group contains unsaved policy controls. Keep its expansion
+    // across ordinary navigation so a return to this surface does not hide the
+    // only Save path behind a collapsed card.
+    @AppStorage(MacControlAdvancedDisclosurePresentation.preferenceKey) private var showAdvancedMacControls = false
     @State private var applyingPreset: MacIntegrationPreset?
     @State private var showFullMacConfirm = false
     @State private var isProbingAppleData = false
     @State private var appleDataProbeStatus: String?
     @State private var assistantWatchRefreshToken = 0
+    private let loadsOnAppear: Bool
+
+    init(loadsOnAppear: Bool = true) {
+        self.loadsOnAppear = loadsOnAppear
+    }
 
     private var hasUnsavedChanges: Bool {
         policy != savedPolicy
@@ -335,8 +475,12 @@ struct MacControlPermissionsView: View {
             MacAssistantWatchSetupView(refreshToken: assistantWatchRefreshToken)
 
             DisclosureGroup(isExpanded: $showAdvancedMacControls) {
-                advancedMacControlControls
-                    .padding(.top, 10)
+                if MacControlAdvancedDisclosurePresentation.savePathIsVisible(
+                    isExpanded: showAdvancedMacControls
+                ) {
+                    advancedMacControlControls
+                        .padding(.top, 10)
+                }
             } label: {
                 HStack(spacing: 8) {
                     Image(systemName: "slider.horizontal.3")
@@ -354,6 +498,7 @@ struct MacControlPermissionsView: View {
                     }
                 }
                 .togglesDisclosure($showAdvancedMacControls)
+                .accessibilityIdentifier("macControl.advanced.disclosure")
             }
             .padding(NativeAgentSpacing.lg)
             .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous))
@@ -362,7 +507,10 @@ struct MacControlPermissionsView: View {
                     .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
             }
         }
-        .task { await loadPolicy() }
+        .task {
+            guard loadsOnAppear else { return }
+            await loadPolicy()
+        }
         .onChange(of: appModel.trustPolicy) { _, newPolicy in
             // Guard mirrors TrainingPermissionsView: a mid-save trustPolicy
             // refresh must not clobber unsaved toggle edits (2026-07-21 audit).
@@ -370,10 +518,17 @@ struct MacControlPermissionsView: View {
             if let mp = newPolicy?.macControlPolicy {
                 policy = mp
                 savedPolicy = mp
+                policyReadState = .available
+            } else {
+                policyReadState = .unavailable
             }
         }
         .sheet(isPresented: $showAuditSheet) {
-            MacControlAuditSheet(entries: $auditEntries, isLoading: $isLoadingAudit)
+            MacControlAuditSheet(
+                entries: $auditEntries,
+                isLoading: $isLoadingAudit,
+                readProblem: $auditReadProblem
+            )
         }
         .alert("Enable Full Mac access?", isPresented: $showFullMacConfirm) {
             Button("Enable Full Mac", role: .destructive) {
@@ -390,16 +545,19 @@ struct MacControlPermissionsView: View {
         NativePanel(title: "Mac Integration Setup", systemImage: "macbook.and.iphone", tint: macIntegrationTint) {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 8) {
-                    StatusBadge(text: macIntegrationLabel, status: macIntegrationStatus)
-                    StatusBadge(text: policy.remoteFromIosAllowed ? "iOS remote on" : "iOS remote off", status: policy.remoteFromIosAllowed ? "ready" : "disabled")
-                    StatusBadge(text: policy.notificationsAllowed && policy.enabled ? "receipts on" : "receipts off", status: policy.notificationsAllowed && policy.enabled ? "ready" : "disabled")
+                    StatusBadge(text: setupBadges.access.text, status: setupBadges.access.status)
+                        .accessibilityIdentifier("mac-control.setup.access")
+                    StatusBadge(text: setupBadges.iOSRemote.text, status: setupBadges.iOSRemote.status)
+                        .accessibilityIdentifier("mac-control.setup.ios-remote")
+                    StatusBadge(text: setupBadges.receipts.text, status: setupBadges.receipts.status)
+                        .accessibilityIdentifier("mac-control.setup.receipts")
                     Spacer()
                     if hasUnsavedChanges {
                         StatusBadge(text: "Unsaved details", status: "warn")
                     }
                 }
 
-                Text(macIntegrationDetail)
+                Text(setupBadges.detail)
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -444,17 +602,17 @@ struct MacControlPermissionsView: View {
 
                 HStack(spacing: 8) {
                     Button("Open Accessibility", systemImage: "cursorarrow.motionlines") {
-                        openSystemSettings("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+                        openSystemSettings(.accessibility)
                     }
                     .buttonStyle(.bordered)
 
                     Button("Open Automation", systemImage: "gearshape.2") {
-                        openSystemSettings("x-apple.systempreferences:com.apple.preference.security?Privacy_Automation")
+                        openSystemSettings(.automation)
                     }
                     .buttonStyle(.bordered)
 
                     Button("Open Full Disk Access", systemImage: "externaldrive.badge.checkmark") {
-                        openSystemSettings("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
+                        openSystemSettings(.fullDiskAccess)
                     }
                     .buttonStyle(.bordered)
 
@@ -518,6 +676,7 @@ struct MacControlPermissionsView: View {
                         }
                         .buttonStyle(.borderedProminent)
                         .disabled(isSaving || !hasUnsavedChanges)
+                        .accessibilityIdentifier("macControl.advanced.save")
 
                         if isSaving {
                             ProgressView("Saving...")
@@ -543,19 +702,13 @@ struct MacControlPermissionsView: View {
                         masterEnabled: policy.enabled,
                         isOn: macControlBinding(\.spotlightAllowed)
                     )
-                    MacControlCategoryRow(
+                    MacControlUnavailableCategoryRow(
                         label: "macOS Shortcuts",
-                        detail: "Run named macOS Shortcuts.",
-                        safeDefault: false,
-                        masterEnabled: policy.enabled,
-                        isOn: macControlBinding(\.shortcutsAllowed)
+                        detail: "Unavailable in this Swift build. Shortcut execution is not implemented, so there is no permission switch or workbench action to enable."
                     )
-                    MacControlCategoryRow(
+                    MacControlUnavailableCategoryRow(
                         label: "System Control",
-                        detail: "Volume, brightness, sleep, lock screen, Focus mode.",
-                        safeDefault: false,
-                        masterEnabled: policy.enabled,
-                        isOn: macControlBinding(\.systemControlAllowed)
+                        detail: "Unavailable in this Swift build. System actions such as lock screen and sleep display are not implemented, so there is no permission switch or workbench action to enable."
                     )
                     MacControlCategoryRow(
                         label: "File Operations",
@@ -695,6 +848,10 @@ struct MacControlPermissionsView: View {
     // MARK: - Logic
 
     private var activePreset: MacIntegrationPreset {
+        activePreset(for: policy)
+    }
+
+    private func activePreset(for policy: TrustMacControlPolicy) -> MacIntegrationPreset {
         if policy.enabled == false {
             return .off
         }
@@ -707,41 +864,24 @@ struct MacControlPermissionsView: View {
         return .watch
     }
 
-    private var macIntegrationLabel: String {
-        switch activePreset {
-        case .off: return "Off"
-        case .watch: return "Watch ready"
-        case .assistant: return "Assistant ready"
-        case .full: return "Full Mac"
-        }
-    }
-
-    private var macIntegrationStatus: String {
-        switch activePreset {
-        case .off: return "disabled"
-        case .watch, .assistant, .full: return "ready"
-        }
+    private var setupBadges: MacControlSetupStatusBadges.State {
+        MacControlSetupStatusBadges.resolve(
+            readState: policyReadState,
+            savedPolicy: policyReadState == .available ? savedPolicy : nil
+        )
     }
 
     private var macIntegrationTint: Color {
-        switch activePreset {
+        switch policyReadState {
+        case .loading: return .orange
+        case .unavailable: return .red
+        case .available: break
+        }
+        switch activePreset(for: savedPolicy) {
         case .off: return .secondary
         case .watch: return .teal
         case .assistant: return .blue
         case .full: return .red
-        }
-    }
-
-    private var macIntegrationDetail: String {
-        switch activePreset {
-        case .off:
-            return "Mac integration is read-only. The agent can inspect app data but Mac Control actions stay blocked."
-        case .watch:
-            return "Watch mode turns on the local Mac bridge for receipts, Spotlight, Shortcuts, and watch setup without shell or file writes."
-        case .assistant:
-            return "Assistant mode enables workspace-safe Mac work, iPhone remote receipts, and approvals for risky categories."
-        case .full:
-            return "Full Mac enables broad local file and app control. Destructive shell/system actions still require Developer Mode."
         }
     }
 
@@ -761,11 +901,13 @@ struct MacControlPermissionsView: View {
             if let mp = result.macControlPolicy {
                 policy = mp
                 savedPolicy = mp
+                policyReadState = .available
+                testNotifStatus = "Applied \(preset.title)."
+                assistantWatchRefreshToken += 1
             } else {
-                savedPolicy = policy
+                policyReadState = .unavailable
+                saveError = "Couldn't apply \(preset.title): saved Trust policy did not include Mac Control settings."
             }
-            testNotifStatus = "Applied \(preset.title)."
-            assistantWatchRefreshToken += 1
         } catch {
             saveError = "Couldn't apply \(preset.title): \(error.localizedDescription)"
         }
@@ -807,9 +949,9 @@ struct MacControlPermissionsView: View {
         }
     }
 
-    private func openSystemSettings(_ rawURL: String) {
-        guard let url = URL(string: rawURL) else { return }
-        NSWorkspace.shared.open(url)
+    private func openSystemSettings(_ capability: SystemPermissionCapability) {
+        guard let url = SystemPermissionPreflight.settingsURL(for: capability) else { return }
+        _ = NSWorkspace.shared.open(url)
     }
 
     private func macControlBinding(_ keyPath: WritableKeyPath<TrustMacControlPolicy, Bool>) -> Binding<Bool> {
@@ -833,6 +975,7 @@ struct MacControlPermissionsView: View {
         if let mp = appModel.trustPolicy?.macControlPolicy {
             policy = mp
             savedPolicy = mp
+            policyReadState = .available
             return
         }
         // Fetch fresh from daemon
@@ -842,10 +985,15 @@ struct MacControlPermissionsView: View {
             if let mp = tp.macControlPolicy {
                 policy = mp
                 savedPolicy = mp
+                policyReadState = .available
+            } else {
+                policyReadState = .unavailable
+                saveError = "Couldn't load Mac Control settings: saved Trust policy did not include Mac Control settings."
             }
         } catch {
             // Fall through with default-zeroed policy + show inline error
             saveError = "Couldn't load Mac Control settings: \(error.localizedDescription)"
+            policyReadState = .unavailable
         }
     }
 
@@ -860,8 +1008,10 @@ struct MacControlPermissionsView: View {
                 if let mp = result.macControlPolicy {
                     policy = mp
                     savedPolicy = mp
+                    policyReadState = .available
                 } else {
-                    savedPolicy = policy
+                    policyReadState = .unavailable
+                    saveError = "Mac Control policy saved without a readable Mac Control settings block."
                 }
             }
         } catch {
@@ -885,27 +1035,27 @@ struct MacControlPermissionsView: View {
 
     private func loadAudit() async {
         isLoadingAudit = true
+        auditReadProblem = nil
         let dataDir = appModel.health?.dataDir ?? ""
-        let path = "\(dataDir)/mac_control_audit.jsonl"
+        let path = URL(fileURLWithPath: dataDir).appendingPathComponent("mac_control_audit.jsonl")
         // Read + parse the (potentially large, unbounded) audit file off the
         // MainActor; awaited so ordering vs. isLoadingAudit is preserved.
-        let parsed = await Task.detached(priority: .utility) { () -> [MacControlAuditEntry] in
-            let content = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
-            return Array(
-                content
-                    .components(separatedBy: "\n")
-                    .compactMap { line -> MacControlAuditEntry? in
-                        guard !line.isEmpty,
-                              let data = line.data(using: .utf8),
-                              let entry = try? JSONDecoder().decode(MacControlAuditEntry.self, from: data)
-                        else { return nil }
-                        return entry
-                    }
-                    .suffix(100)
-                    .reversed()
-            )
+        let read = await Task.detached(priority: .utility) {
+            MacControlAuditLogRead.read(from: path)
         }.value
-        auditEntries = parsed
+        switch read {
+        case .entries(let entries, let malformedLineCount):
+            auditEntries = entries
+            if malformedLineCount > 0 {
+                auditReadProblem = "\(malformedLineCount) malformed audit \(malformedLineCount == 1 ? "line was" : "lines were") not shown."
+            }
+        case .sourceAbsent:
+            auditEntries = []
+            auditReadProblem = "Audit source is absent at \(path.path)."
+        case .unreadable(let reason):
+            auditEntries = []
+            auditReadProblem = "Audit source could not be read: \(reason)"
+        }
         isLoadingAudit = false
     }
 }
@@ -942,6 +1092,32 @@ private struct MacControlCategoryRow: View {
                     .foregroundStyle(.green)
             }
         }
+    }
+}
+
+/// A capability the Swift Mac Control runtime deliberately does not offer yet.
+/// It is a status row rather than a disabled Toggle: a toggle suggests a user
+/// can make the action available, while these actions would only return 501.
+private struct MacControlUnavailableCategoryRow: View {
+    let label: String
+    let detail: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack {
+                Label(label, systemImage: "exclamationmark.triangle.fill")
+                    .font(.body.weight(.medium))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("Unavailable")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.orange)
+            }
+            Text(detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -989,6 +1165,7 @@ private struct MacIntegrationPresetButton: View {
 private struct MacControlAuditSheet: View {
     @Binding var entries: [MacControlAuditEntry]
     @Binding var isLoading: Bool
+    @Binding var readProblem: String?
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -1004,32 +1181,49 @@ private struct MacControlAuditSheet: View {
             if isLoading {
                 ProgressView("Loading audit log…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if entries.isEmpty {
-                ContentUnavailableView("No Entries", systemImage: "doc.text", description: Text("No mac_control_audit.jsonl entries found."))
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                List(entries) { entry in
-                    VStack(alignment: .leading, spacing: 3) {
-                        HStack {
-                            Text(entry.action)
-                                .font(.caption.weight(.semibold))
-                            Spacer()
-                            if let ok = entry.allowed {
-                                Image(systemName: ok ? "checkmark.circle.fill" : "xmark.circle.fill")
-                                    .foregroundStyle(ok ? .green : .red)
-                                    .font(.caption)
+                VStack(spacing: 0) {
+                    if let readProblem {
+                        Label(readProblem, systemImage: "exclamationmark.triangle")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(10)
+                    }
+                    if entries.isEmpty {
+                        ContentUnavailableView(
+                            readProblem == nil ? "No Entries" : "Audit Log Needs Attention",
+                            systemImage: readProblem == nil ? "doc.text" : "exclamationmark.triangle",
+                            description: Text(readProblem == nil
+                                ? "No mac_control_audit.jsonl entries found."
+                                : "The audit source could not provide readable entries.")
+                        )
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
+                        List(entries) { entry in
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack {
+                                    Text(entry.action)
+                                        .font(.caption.weight(.semibold))
+                                    Spacer()
+                                    if let ok = entry.allowed {
+                                        Image(systemName: ok ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                            .foregroundStyle(ok ? .green : .red)
+                                            .font(.caption)
+                                    }
+                                }
+                                Text(entry.ts)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                if let detail = entry.detail {
+                                    Text(detail)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
                             }
-                        }
-                        Text(entry.ts)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                        if let detail = entry.detail {
-                            Text(detail)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            .padding(.vertical, 2)
                         }
                     }
-                    .padding(.vertical, 2)
                 }
             }
         }
@@ -1039,16 +1233,109 @@ private struct MacControlAuditSheet: View {
 
 // MARK: - Live Workbench
 
+enum MacControlWorkbenchAvailability: Equatable {
+    case ready
+    case disabled(String)
+    case unavailable(String)
+
+    var isEnabled: Bool {
+        if case .ready = self { return true }
+        return false
+    }
+
+    var message: String? {
+        switch self {
+        case .ready:
+            nil
+        case .disabled(let message), .unavailable(let message):
+            message
+        }
+    }
+
+    var isUnavailable: Bool {
+        if case .unavailable = self { return true }
+        return false
+    }
+}
+
+/// The only action routes the mounted workbench can invoke. Keeping route,
+/// native action name, policy gate, and user-facing label together prevents a
+/// button from quietly drifting onto an unsupported 501 action.
+enum MacControlWorkbenchAction: String, CaseIterable {
+    case shell
+    case fileRead = "file/read"
+    case fileWrite = "file/write"
+    case notify
+
+    var title: String {
+        switch self {
+        case .shell: "Run Shell"
+        case .fileRead: "Read File"
+        case .fileWrite: "Write File"
+        case .notify: "Notify"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .shell: "terminal"
+        case .fileRead: "doc.text.magnifyingglass"
+        case .fileWrite: "square.and.pencil"
+        case .notify: "bell"
+        }
+    }
+
+    var path: String { "/v1/mac_control/\(rawValue)" }
+
+    func availability(
+        policy: TrustMacControlPolicy,
+        policySaved: Bool,
+        hasRequiredInput: Bool = true
+    ) -> MacControlWorkbenchAvailability {
+        guard !macControlUnsupportedActions.contains(rawValue) else {
+            return .unavailable("This action is unavailable because the Swift Mac Control runtime does not implement it.")
+        }
+        guard policySaved else {
+            return .disabled("Save the Mac Control policy before using the workbench.")
+        }
+        guard policy.enabled else {
+            return .disabled("Turn on Mac Control before using this action.")
+        }
+        guard categoryAllowed(by: policy) else {
+            return .disabled("Enable \(categoryName) in Mac Control categories first.")
+        }
+        guard hasRequiredInput else {
+            return .disabled("Enter the required input before running this action.")
+        }
+        return .ready
+    }
+
+    private var categoryName: String {
+        switch self {
+        case .shell: "Terminal commands"
+        case .fileRead, .fileWrite: "File Operations"
+        case .notify: "Notifications"
+        }
+    }
+
+    private func categoryAllowed(by policy: TrustMacControlPolicy) -> Bool {
+        switch self {
+        case .shell: policy.shellAllowed
+        case .fileRead, .fileWrite: policy.fileOpsAllowed
+        case .notify: policy.notificationsAllowed
+        }
+    }
+}
+
 private enum MacControlWorkbenchMode: String, CaseIterable, Identifiable {
     case shell = "Shell"
     case files = "Files"
-    case shortcut = "Shortcut"
-    case screen = "Screen"
+    case notification = "Notify"
 
     var id: String { rawValue }
 }
 
-private struct MacControlWorkbenchView: View {
+struct MacControlWorkbenchView: View {
     @Environment(AppModel.self) private var appModel
     var policy: TrustMacControlPolicy
     var policySaved: Bool = true
@@ -1059,8 +1346,6 @@ private struct MacControlWorkbenchView: View {
     @State private var filePath = NSHomeDirectory()
     @State private var fileContent = ""
     @State private var fileAppend = false
-    @State private var shortcutName = ""
-    @State private var screenAction = "lock_screen"
     @State private var notificationTitle = "NativeAgent"
     @State private var notificationMessage = "Mac Control workbench test"
     @State private var isRunning = false
@@ -1075,6 +1360,9 @@ private struct MacControlWorkbenchView: View {
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
+                Label("Shortcuts and system actions are unavailable in this Swift build, so this workbench does not expose controls that would fail with an unsupported-action error.", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Picker("Action", selection: $mode) {
                     ForEach(MacControlWorkbenchMode.allCases) { mode in
                         Text(mode.rawValue).tag(mode)
@@ -1084,20 +1372,36 @@ private struct MacControlWorkbenchView: View {
 
                 switch mode {
                 case .shell:
+                    let availability = MacControlWorkbenchAction.shell.availability(
+                        policy: policy,
+                        policySaved: policySaved,
+                        hasRequiredInput: !shellCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    )
                     TextField("Working directory", text: $shellCWD)
                         .textFieldStyle(.roundedBorder)
                     TextField("Command", text: $shellCommand, axis: .vertical)
                         .lineLimit(2...5)
                         .textFieldStyle(.roundedBorder)
-                    workbenchButton("Run Shell", systemImage: "terminal", enabled: policySaved && policy.enabled && policy.shellAllowed) {
-                        await run(path: "/v1/mac_control/shell", body: [
+                    workbenchButton(.shell, availability: availability) {
+                        await run(path: MacControlWorkbenchAction.shell.path, body: [
                             "command": shellCommand,
                             "cwd": shellCWD,
                             "timeout": 60,
                             "trigger": "user"
                         ])
                     }
+                    availabilityHint(availability)
                 case .files:
+                    let readAvailability = MacControlWorkbenchAction.fileRead.availability(
+                        policy: policy,
+                        policySaved: policySaved,
+                        hasRequiredInput: !filePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    )
+                    let writeAvailability = MacControlWorkbenchAction.fileWrite.availability(
+                        policy: policy,
+                        policySaved: policySaved,
+                        hasRequiredInput: !filePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !fileContent.isEmpty
+                    )
                     TextField("Path", text: $filePath)
                         .textFieldStyle(.roundedBorder)
                     TextField("Write content", text: $fileContent, axis: .vertical)
@@ -1105,15 +1409,15 @@ private struct MacControlWorkbenchView: View {
                         .textFieldStyle(.roundedBorder)
                     Toggle("Append instead of replace", isOn: $fileAppend)
                     HStack {
-                        workbenchButton("Read File", systemImage: "doc.text.magnifyingglass", enabled: policySaved && policy.enabled && policy.fileOpsAllowed) {
-                            await run(path: "/v1/mac_control/file/read", body: [
+                        workbenchButton(.fileRead, availability: readAvailability) {
+                            await run(path: MacControlWorkbenchAction.fileRead.path, body: [
                                 "path": filePath,
                                 "max_bytes": 200_000,
                                 "trigger": "user"
                             ])
                         }
-                        workbenchButton("Write File", systemImage: "square.and.pencil", enabled: policySaved && policy.enabled && policy.fileOpsAllowed && !fileContent.isEmpty) {
-                            await run(path: "/v1/mac_control/file/write", body: [
+                        workbenchButton(.fileWrite, availability: writeAvailability) {
+                            await run(path: MacControlWorkbenchAction.fileWrite.path, body: [
                                 "path": filePath,
                                 "content": fileContent,
                                 "append": fileAppend,
@@ -1121,40 +1425,28 @@ private struct MacControlWorkbenchView: View {
                             ])
                         }
                     }
-                case .shortcut:
-                    TextField("Shortcut name", text: $shortcutName)
-                        .textFieldStyle(.roundedBorder)
-                    workbenchButton("Run Shortcut", systemImage: "square.stack.3d.up", enabled: policySaved && policy.enabled && policy.shortcutsAllowed && !shortcutName.isEmpty) {
-                        await run(path: "/v1/mac_control/shortcut/run", body: [
-                            "name": shortcutName,
-                            "trigger": "user"
-                        ])
+                    availabilityHint(readAvailability)
+                    if writeAvailability.message != readAvailability.message {
+                        availabilityHint(writeAvailability)
                     }
-                case .screen:
-                    Picker("System action", selection: $screenAction) {
-                        Text("Lock Screen").tag("lock_screen")
-                        Text("Sleep Display").tag("sleep_display")
-                    }
-                    .pickerStyle(.segmented)
+                case .notification:
+                    let availability = MacControlWorkbenchAction.notify.availability(
+                        policy: policy,
+                        policySaved: policySaved,
+                        hasRequiredInput: !notificationMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    )
                     TextField("Notification title", text: $notificationTitle)
                         .textFieldStyle(.roundedBorder)
                     TextField("Notification message", text: $notificationMessage)
                         .textFieldStyle(.roundedBorder)
-                    HStack {
-                        workbenchButton("Run System Action", systemImage: "display", enabled: policySaved && policy.enabled && policy.systemControlAllowed) {
-                            await run(path: "/v1/mac_control/system", body: [
-                                "action": screenAction,
-                                "trigger": "user"
-                            ])
-                        }
-                        workbenchButton("Notify", systemImage: "bell", enabled: policySaved && policy.enabled && policy.notificationsAllowed && !notificationMessage.isEmpty) {
-                            await run(path: "/v1/mac_control/notify", body: [
-                                "title": notificationTitle,
-                                "message": notificationMessage,
-                                "trigger": "user"
-                            ])
-                        }
+                    workbenchButton(.notify, availability: availability) {
+                        await run(path: MacControlWorkbenchAction.notify.path, body: [
+                            "title": notificationTitle,
+                            "message": notificationMessage,
+                            "trigger": "user"
+                        ])
                     }
+                    availabilityHint(availability)
                 }
 
                 Divider()
@@ -1182,12 +1474,21 @@ private struct MacControlWorkbenchView: View {
         }
     }
 
-    private func workbenchButton(_ title: String, systemImage: String, enabled: Bool, action: @escaping () async -> Void) -> some View {
-        Button(title, systemImage: systemImage) {
+    private func workbenchButton(_ actionTarget: MacControlWorkbenchAction, availability: MacControlWorkbenchAvailability, action: @escaping () async -> Void) -> some View {
+        Button(actionTarget.title, systemImage: actionTarget.systemImage) {
             Task { await action() }
         }
         .buttonStyle(.bordered)
-        .disabled(!enabled || isRunning)
+        .disabled(!availability.isEnabled || isRunning)
+    }
+
+    @ViewBuilder
+    private func availabilityHint(_ availability: MacControlWorkbenchAvailability) -> some View {
+        if let message = availability.message {
+            Label(message, systemImage: availability.isUnavailable ? "exclamationmark.triangle.fill" : "lock.fill")
+                .font(.caption)
+                .foregroundStyle(availability.isUnavailable ? .orange : .secondary)
+        }
     }
 
     private func run(path: String, body: [String: Any]) async {

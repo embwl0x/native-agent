@@ -89,19 +89,43 @@ extension NativeClient {
         // DAEMON-DEAD PORT P4: read tools/registry.json under flock, merge
         // {autoRun} into the matching tool by id, write back, return the
         // merged record. Mirrors the daemon's POST /v1/tools/update row patch.
-        let root = PersistenceCore.defaultDataRoot()
+        return try await Self.updateTool(
+            id: id,
+            autoRun: autoRun,
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        )
+    }
+
+    /// Root-injectable form of the canonical Tools-page auto-run mutation.
+    /// An absent registry is empty, but existing malformed or wrongly-shaped
+    /// bytes are authority state and must not be silently replaced by a UI
+    /// toggle. Keeping this next to the production entry point makes the
+    /// temp-root evaluation exercise the same flocked read-modify-write path.
+    static func updateTool(id: String, autoRun: Bool, dataRoot root: URL) async throws -> ToolRecord {
         let regPath = root.appendingPathComponent("tools/registry.json")
         let core = SwiftNativePersistenceCore()
         return try await core.withFileLock(regPath) {
             let fm = FileManager.default
-            try? fm.createDirectory(at: regPath.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try fm.createDirectory(at: regPath.deletingLastPathComponent(), withIntermediateDirectories: true)
             var rows: [[String: Any]] = []
-            if let data = try? Data(contentsOf: regPath),
-               let raw = try? JSONSerialization.jsonObject(with: data, options: []) {
+            if fm.fileExists(atPath: regPath.path) {
+                let data = try Data(contentsOf: regPath)
+                let raw: Any
+                do {
+                    raw = try JSONSerialization.jsonObject(with: data, options: [])
+                } catch {
+                    throw NSError(domain: "NativeAgentSwiftOnly", code: -422, userInfo: [
+                        NSLocalizedDescriptionKey: "updateTool: tools registry is malformed"
+                    ])
+                }
                 if let arr = raw as? [[String: Any]] {
                     rows = arr
                 } else if let dict = raw as? [String: Any], let arr = dict["tools"] as? [[String: Any]] {
                     rows = arr
+                } else {
+                    throw NSError(domain: "NativeAgentSwiftOnly", code: -422, userInfo: [
+                        NSLocalizedDescriptionKey: "updateTool: tools registry must contain an array of records"
+                    ])
                 }
             }
             guard let idx = rows.firstIndex(where: { ($0["id"] as? String) == id }) else {
@@ -216,7 +240,7 @@ extension NativeClient {
         try await updateConnector(
             id: id,
             enabled: enabled,
-            root: PersistenceCore.defaultDataRoot()
+            root: dataRootOverride ?? PersistenceCore.defaultDataRoot()
         )
     }
 
@@ -288,17 +312,42 @@ extension NativeClient {
     }
 
     func addWorkspace(name: String, path: String, permissions: [String]) async throws -> WorkspaceRecord {
+        try await addWorkspace(
+            name: name,
+            path: path,
+            permissions: permissions,
+            root: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        )
+    }
+
+    /// The app action's canonical workspace writer. `root` stays injectable so
+    /// isolated callers exercise the same flocked store rather than a copy of
+    /// the mutation rules.
+    func addWorkspace(name: String, path: String, permissions: [String], root: URL) async throws -> WorkspaceRecord {
         // DAEMON-DEAD PORT P4: append a new row to <dataRoot>/connectors/
         // workspaces.json under flock. Matches the reader path in
         // Connectors.swift L132.
-        let root = PersistenceCore.defaultDataRoot()
+        let cleanedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanedName.isEmpty else {
+            throw workspaceValidationError("Enter a workspace name.")
+        }
+        let requestedURL = URL(fileURLWithPath: path).standardizedFileURL
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: requestedURL.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw workspaceValidationError("Workspace path must be an existing folder.")
+        }
+        let resolvedURL = requestedURL.resolvingSymlinksInPath().standardizedFileURL
+        guard resolvedURL.path == requestedURL.path else {
+            throw workspaceValidationError("Workspace paths cannot use symlinks.")
+        }
+
         let wsPath = root.appendingPathComponent("connectors/workspaces.json")
         let core = SwiftNativePersistenceCore()
         let now = ISO8601DateFormatter().string(from: Date())
         let record = WorkspaceRecord(
             id: UUID().uuidString,
-            name: name,
-            path: path,
+            name: cleanedName,
+            path: requestedURL.path,
             permissions: permissions,
             createdAt: now,
             lastUsedAt: nil
@@ -311,6 +360,18 @@ extension NativeClient {
                let arr = try? JSONSerialization.jsonObject(with: data, options: []) as? [[String: Any]] {
                 rows = arr
             }
+            for existing in rows {
+                guard let existingPath = existing["path"] as? String, !existingPath.isEmpty else { continue }
+                let existingURL = URL(fileURLWithPath: existingPath).standardizedFileURL
+                let candidate = requestedURL.path
+                let prior = existingURL.path
+                if candidate == prior {
+                    throw workspaceValidationError("That workspace is already registered.")
+                }
+                if candidate.hasPrefix(prior + "/") || prior.hasPrefix(candidate + "/") {
+                    throw workspaceValidationError("Workspace folders cannot overlap.")
+                }
+            }
             let rowData = try JSONEncoder().encode(record)
             let row = try JSONSerialization.jsonObject(with: rowData, options: []) as? [String: Any] ?? [:]
             rows.append(row)
@@ -320,7 +381,20 @@ extension NativeClient {
         }
     }
 
+    private func workspaceValidationError(_ message: String) -> NSError {
+        NSError(domain: "NativeAgentWorkspace", code: 422, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+
     func searchWorkspace(query: String) async throws -> WorkspaceSearchResponse {
+        try await searchWorkspace(
+            query: query,
+            root: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        )
+    }
+
+    /// Uses the same in-process workspace search and activity receipt as the
+    /// Settings action; the injected root is solely for hermetic callers.
+    func searchWorkspace(query: String, root: URL) async throws -> WorkspaceSearchResponse {
         // Subsystem #24 wave 31 (W14): when .connectors is on, run the workspace
         // file search in-process (workspaces.json read + local directory walk +
         // content match), matching Runtime.search_workspaces. The SwiftNative
@@ -332,7 +406,7 @@ extension NativeClient {
         // envelope + secret redaction that are byte-identical modulo the
         // createdAt precision divergence (millis vs micros; see Connectors.swift).
         // .connectors is now a flip CANDIDATE (still default-OFF until cutover).
-        let impl = makeConnectorsClient(root: PersistenceCore.defaultDataRoot())
+        let impl = makeConnectorsClient(root: root)
         if let envelope = try await impl.searchWorkspaces(query: query) {
             let data = try envelope.serializedData(pretty: false)
             return try JSONDecoder().decode(WorkspaceSearchResponse.self, from: data)
@@ -391,6 +465,17 @@ extension NativeClient {
         let engine = makePersonaEngineWriter()
         let jvBody = try Self.jsonValueBody(body)
         let saved = try await engine.savePersonality(body: jvBody)
+        return Self.adaptCompiledProfile(saved)
+    }
+
+    /// Save only the live display-name field.  The identity editor must not
+    /// re-submit an older full profile draft and overwrite concurrent edits to
+    /// the rest of profile.json just to rename the agent.
+    func savePersonalityName(_ name: String) async throws -> PersonalityProfile {
+        let engine: any PersonaEngineWriting = dataRootOverride.map(
+            SwiftNativePersonaEngine.isolated(dataRoot:)
+        ) ?? makePersonaEngineWriter()
+        let saved = try await engine.savePersonality(body: ["name": .string(name)])
         return Self.adaptCompiledProfile(saved)
     }
 

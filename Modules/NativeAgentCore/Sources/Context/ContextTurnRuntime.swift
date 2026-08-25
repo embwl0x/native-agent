@@ -207,6 +207,34 @@ public struct ContextTurnRequest: Sendable, Equatable {
     }
 }
 
+/// Exact outcome of the one permitted mandatory-context budget retry.
+///
+/// A present value proves the coordinator retried only after mandatory atoms
+/// exceeded the ordinary packet budget. The granted reserve is the ACTUAL room
+/// left after mandatory context at the configured ceiling; it may be smaller
+/// than the request when the ceiling itself is the limiting factor.
+public struct ContextFlowBudgetExpansion: Sendable, Equatable {
+    public let requestedCharacterBudget: Int
+    public let effectiveCharacterBudget: Int
+    public let maximumCharacterBudget: Int
+    public let mandatoryCharacterBudget: Int
+    public let grantedPostMandatoryReserve: Int
+
+    public init(
+        requestedCharacterBudget: Int,
+        effectiveCharacterBudget: Int,
+        maximumCharacterBudget: Int,
+        mandatoryCharacterBudget: Int,
+        grantedPostMandatoryReserve: Int
+    ) {
+        self.requestedCharacterBudget = requestedCharacterBudget
+        self.effectiveCharacterBudget = effectiveCharacterBudget
+        self.maximumCharacterBudget = maximumCharacterBudget
+        self.mandatoryCharacterBudget = mandatoryCharacterBudget
+        self.grantedPostMandatoryReserve = grantedPostMandatoryReserve
+    }
+}
+
 /// Owns the immutable generation lease for the complete provider/tool loop.
 /// Copying this reference into derived TurnContext values preserves the pin.
 public final class ContextPreparedTurn: @unchecked Sendable {
@@ -217,6 +245,9 @@ public final class ContextPreparedTurn: @unchecked Sendable {
     public let lease: ContextGenerationLease
     public let generation: ContextStoredGeneration
     public let need: NeedSignal
+    /// Non-nil only when the coordinator consumed the bounded mandatory-context
+    /// expansion setting for this prepared turn.
+    public let budgetExpansion: ContextFlowBudgetExpansion?
     private let feedbackHandler: (@Sendable (
         ContextFeedbackSignal,
         [ContextAtomID],
@@ -234,6 +265,7 @@ public final class ContextPreparedTurn: @unchecked Sendable {
         lease: ContextGenerationLease,
         generation: ContextStoredGeneration,
         need: NeedSignal,
+        budgetExpansion: ContextFlowBudgetExpansion? = nil,
         feedbackHandler: (@Sendable (
             ContextFeedbackSignal,
             [ContextAtomID],
@@ -247,6 +279,7 @@ public final class ContextPreparedTurn: @unchecked Sendable {
         self.lease = lease
         self.generation = generation
         self.need = need
+        self.budgetExpansion = budgetExpansion
         self.feedbackHandler = feedbackHandler
     }
 

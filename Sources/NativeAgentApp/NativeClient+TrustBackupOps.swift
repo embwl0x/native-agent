@@ -129,7 +129,10 @@ extension NativeClient {
     /// belongs to SwiftNativeTrustCenter, which validates and deep-merges one
     /// locked generation and consumes Full Mac duration intent under that lock.
     func postTrustWrite(body: [String: Any]) async throws -> TrustPolicy {
-        try await Self.applyTrustPolicyPatch(body: body, dataRoot: PersistenceCore.defaultDataRoot())
+        try await Self.applyTrustPolicyPatch(
+            body: body,
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        )
     }
 
     /// Root-injectable form of the single trust-write chokepoint —
@@ -155,7 +158,23 @@ extension NativeClient {
     // the same string the caller asked about. Autonomy is enforced (the same
     // way a real call would be) so the preview reflects the real gate.
     func simulatePolicy(action: String, path: String) async throws -> PolicySimulation {
-        let securityCenter = SwiftNativeSecurityCenter()
+        return try await Self.simulatePolicy(
+            action: action,
+            path: path,
+            dataRoot: PersistenceCore.defaultDataRoot()
+        )
+    }
+
+    /// Root-injectable form of the Trust Center's policy preview. This is not
+    /// a second evaluator: it builds the same SecurityCenter envelope the
+    /// installed UI uses, while letting hermetic tests write/reopen authority
+    /// state without ever consulting the developer's live policy.
+    static func simulatePolicy(
+        action: String,
+        path: String,
+        dataRoot: URL
+    ) async throws -> PolicySimulation {
+        let securityCenter = SwiftNativeSecurityCenter(dataRoot: dataRoot)
         // Map the policy-preview action vocabulary to SecurityCenter's
         // builtin tool names. The UI uses verb-noun ("file_write");
         // SecurityCenter's catalog uses Swift function names

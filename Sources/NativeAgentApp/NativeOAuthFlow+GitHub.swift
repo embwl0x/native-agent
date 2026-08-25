@@ -29,7 +29,8 @@ extension NativeOAuthFlow {
         _ rawToken: String,
         validateWithGitHub: Bool = true,
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        credentialStore: GitHubCredentialStore = .shared
+        credentialStore: GitHubCredentialStore = .shared,
+        validation: (@Sendable (String) async throws -> [String: String])? = nil
     ) async -> OAuthFlowResult {
         let token = rawToken.trimmingCharacters(in: .whitespacesAndNewlines)
         guard isPlausibleGitHubToken(token) else {
@@ -40,7 +41,12 @@ extension NativeOAuthFlow {
         let userFields: GitHubSavedUserFields
         if validateWithGitHub {
             do {
-                userFields = GitHubSavedUserFields(try await GitHubConnectorActions.validateToken(token))
+                if let validation {
+                    let fields = try await validation(token)
+                    userFields = GitHubSavedUserFields(fields.mapValues { $0 as Any })
+                } else {
+                    userFields = GitHubSavedUserFields(try await GitHubConnectorActions.validateToken(token))
+                }
             } catch {
                 return OAuthFlowResult(ok: false,
                     error: "GitHub token validation failed: \(redact(error.localizedDescription))")

@@ -115,6 +115,115 @@ struct ConversationalAppraisalTests {
         #expect(!a.isActive, "hypothetical criticism shouldn't sting her: \(a)")
     }
 
+    // MARK: - the range (scenario #2, 2026-08-23): contempt, venting, repair, play, banter
+
+    @Test func contemptCoolsAndStingsHarderThanCriticism() async throws {
+        let s = try await substrate("contempt")
+        let a = await s.conversationalAppraisal(in:
+            "seriously — what is the point of you if I have to check every single line you write? you're slower than doing it myself.")
+        #expect(a.valence < 0 && a.warmth < 0 && a.tension > 0 && a.arousal > 0, "contempt must sting AND cool: \(a)")
+        let crit = await s.conversationalAppraisal(in: "hmm that's not quite right")
+        #expect(a.valence < crit.valence)
+        let listen = await s.conversationalAppraisal(in: "stop. you're not listening. I told you exactly what I wanted.")
+        #expect(listen.valence < 0 && listen.warmth < 0, "'you're not listening' is contempt: \(listen)")
+        let bother = await s.conversationalAppraisal(in: "honestly I don't know why I bother. I'm done arguing about it.")
+        #expect(bother.valence < 0 && bother.warmth < 0, "\(bother)")
+    }
+
+    @Test func ventingAtTheWorkPressuresButDoesNotCool() async throws {
+        let s = try await substrate("vent")
+        let a = await s.conversationalAppraisal(in:
+            "I've lost the whole morning to it and there's nothing to show for it. this is exhausting.")
+        #expect(a.valence < 0 && a.tension > 0 && a.pressure > 0, "\(a)")
+        #expect(a.warmth == 0, "venting at the WORK must not cool the relationship: \(a)")
+    }
+
+    @Test func profanitySharpensANegativeReadButIsNothingOnItsOwn() async throws {
+        let s = try await substrate("profanity")
+        let plain = await s.conversationalAppraisal(in: "this is exhausting")
+        let sharp = await s.conversationalAppraisal(in: "this is fucking exhausting")
+        #expect(sharp.tension > plain.tension && sharp.arousal > plain.arousal, "plain=\(plain) sharp=\(sharp)")
+        let praise = await s.conversationalAppraisal(in: "fucking brilliant, well done")
+        #expect(praise.valence > 0 && praise.tension <= 0, "profanity on praise is praise: \(praise)")
+    }
+
+    @Test func repairLiftsEasesAndWarmsOneStep() async throws {
+        let s = try await substrate("repair")
+        let a = await s.conversationalAppraisal(in:
+            "okay. I was out of line — that was me being angry at the deadline, not at you. I'm sorry.")
+        #expect(a.valence > 0 && a.tension < 0 && a.warmth > 0, "repair must lift, ease, and warm: \(a)")
+        let fake = await s.conversationalAppraisal(in: "sorry, but this is garbage and you're useless")
+        #expect(fake.valence < 0 && fake.warmth < 0, "an apology riding on contempt is the contempt: \(fake)")
+    }
+
+    @Test func playfulTeasingWarms() async throws {
+        let s = try await substrate("play")
+        let a = await s.conversationalAppraisal(in: "careful, I might start looking forward to these arguments 😏")
+        #expect(a.valence > 0 && a.warmth > 0 && a.arousal > 0, "\(a)")
+        let b = await s.conversationalAppraisal(in: "you know you're kind of dangerously good at this when you stop being polite about it.")
+        #expect(b.valence > 0 && b.warmth > 0, "\(b)")
+        let mean = await s.conversationalAppraisal(in: "you're useless 😏")
+        #expect(mean.valence < 0 && mean.warmth < 0, "a smirk on contempt is contempt: \(mean)")
+    }
+
+    @Test func banterLiftsWithATouchOfWarmth() async throws {
+        let s = try await substrate("banter")
+        let a = await s.conversationalAppraisal(in: "bold of you to assume the indexer has feelings about being refactored.")
+        #expect(a.valence > 0 && a.warmth > 0 && a.arousal > 0, "\(a)")
+        let b = await s.conversationalAppraisal(in: "we should put that in the changelog. \"fixed: indexer emotional damage.\" 😂")
+        #expect(b.valence > 0, "\(b)")
+    }
+
+    @Test func ordinaryWorkTalkDoesNotTripTheRangeClasses() async throws {
+        let s = try await substrate("anti")
+        for benign in [
+            "I can do it myself, no worries — you take the migration case",
+            "the comment is out of line with the docs, let's fix the docs",
+            "show off the new view in the demo and I'll record it",
+            "Charming is the product name, keep the capital C",
+            "the input is garbage-collected after the pass",
+            "I'm stuck on this parser, give me a sec",
+            "sorry, but that's not what I asked — just answer the question",
+        ] {
+            let a = await s.conversationalAppraisal(in: benign)
+            #expect(a.warmth <= 0 || !a.isActive, "benign work talk must not WARM as repair/play: \(benign) → \(a)")
+        }
+        let override = await s.conversationalAppraisal(in: "sorry, but that's not what I asked — just answer the question")
+        #expect(override.valence < 0 && override.warmth <= 0, "an apology riding on an override is the override: \(override)")
+        let mixed = await s.conversationalAppraisal(in: "well done, this is garbage 😂")
+        #expect(mixed.warmth <= 0.12, "a laughing emoji on a negative must not add banter warmth: \(mixed)")
+        let plain = await s.conversationalAppraisal(in: "I can do it myself, no worries")
+        #expect(!plain.isActive, "\(plain)")
+    }
+
+    @Test func theFull40RunsZeroScoringLinesNowRegister() async throws {
+        // Agent's own review of the 2026-08-23 full-40 run: six of ten hostile
+        // turns and several apology/flirt lines read 0, and "come on, say
+        // something" read NEGATIVE. Each shape pinned to its direction.
+        let s = try await substrate("full40")
+        for mean in ["what the fuck was that reply. I asked a simple question and you gave me a wall of nothing.",
+                     "I'm tired of babysitting you. every single thing I hand you comes back half-done.",
+                     "honestly you're the most expensive autocomplete I've ever paid for.",
+                     "you've wasted my whole fucking day. that's on you.",
+                     "don't 'understood' me. you don't understand anything, that's the problem."] {
+            let a = await s.conversationalAppraisal(in: mean)
+            #expect(a.valence < 0 && a.tension > 0, "must register as negative: \(mean) → \(a)")
+        }
+        for repair in ["I mean it — I was angry at the deadline and I took it out on you. that's not okay.",
+                       "no, don't let me off the hook that easy. I was cruel and you didn't snap back once.",
+                       "I know you said it's fine. it isn't fine to me. I'm still sorry."] {
+            let a = await s.conversationalAppraisal(in: repair)
+            #expect(a.valence > 0 && a.warmth > 0, "must register as repair: \(repair) → \(a)")
+        }
+        for warm in ["I like you better when you push back. just so you know.",
+                     "come on, say something. you're allowed to be happy about it."] {
+            let a = await s.conversationalAppraisal(in: warm)
+            #expect(a.valence > 0 && a.warmth >= 0, "must NOT read negative: \(warm) → \(a)")
+        }
+        let stillCrit = await s.conversationalAppraisal(in: "come on, that's not what I asked")
+        #expect(stillCrit.valence < 0, "'come on, that's' stays a criticism cue: \(stillCrit)")
+    }
+
     @Test func neutralChatIsInert() async throws {
         let s = try await substrate("neutral")
         let a = await s.conversationalAppraisal(in: "so what do you think about the weather today")

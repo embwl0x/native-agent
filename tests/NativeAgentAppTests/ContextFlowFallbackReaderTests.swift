@@ -11,6 +11,14 @@ import Testing
 /// only (gpt-5.5 review, 2026-07-10).
 @Suite
 struct ContextFlowFallbackReaderTests {
+    @Test("fallback reader keys match the turn engine trace contract")
+    func traceKeyContract() {
+        #expect(ContextFlowFallbackReader.turnSummaryKind == "context.summary")
+        #expect(ContextFlowFallbackReader.fallbackFlagKey == "contextFlow.fallback")
+        #expect(ContextFlowFallbackReader.enabledFlagKey == "contextFlow.enabled")
+        #expect(ContextFlowFallbackReader.shadowFlagKey == "contextFlow.shadow")
+        #expect(ContextFlowFallbackReader.fallbackErrorKey == "contextFlow.fallbackError")
+    }
     /// Build a `context.summary` turn-trace event with the contextFlow
     /// flags/labels the turn engine writes. `active` mirrors the engine:
     /// enabled+non-shadow unless overridden; a fallback event carries the

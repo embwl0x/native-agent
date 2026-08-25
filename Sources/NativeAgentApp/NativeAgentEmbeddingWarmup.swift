@@ -127,12 +127,16 @@ func reconcileMemoryEmbeddingEpochAtLaunch() async {
 // "skill-pointer:<name>" rows (see MemoryV2+SkillIndex.swift). Fail-LOUD to
 // stderr — the whole point of the rework is that skills stop being silently
 // invisible, so a broken sync must not be silent either.
-func syncSkillPointerIndex() async {
+@discardableResult
+func syncSkillPointerIndex(
+    memory: SwiftNativeMemoryV2 = .shared,
+    dataRoot: URL = PersistenceCore.defaultDataRoot(),
+    personaRoot: URL = PersonaRootResolver.resolve()
+) async -> SwiftNativeMemoryV2.SkillIndexSyncResult? {
     NSLog("[skill-index] sync starting")
-    let dataRoot = PersistenceCore.defaultDataRoot()
     let bodiesDirs = [
         dataRoot.appendingPathComponent("skills/bodies", isDirectory: true),
-        PersonaRootResolver.resolve()
+        personaRoot
             .appendingPathComponent("skills/bodies", isDirectory: true),
     ]
     let runtimeRegistry = dataRoot.appendingPathComponent("skills/registry.json")
@@ -142,7 +146,7 @@ func syncSkillPointerIndex() async {
     // receipt for launch and mutation-triggered reconciliation.
     let receipt = dataRoot.appendingPathComponent("skills/.pointer_sync_receipt.json")
     do {
-        let result = try await SwiftNativeMemoryV2.shared
+        let result = try await memory
             .syncSkillPointersRecordingReceipt(
                 bodiesDirs: bodiesDirs,
                 runtimeRegistryURL: runtimeRegistry,
@@ -153,7 +157,9 @@ func syncSkillPointerIndex() async {
             "[skill-index] added=%d updated=%d removed=%d unchanged=%d",
             result.added, result.updated, result.removed, result.unchanged
         )
+        return result
     } catch {
         NSLog("[skill-index] SYNC FAILED: %@", String(describing: error))
+        return nil
     }
 }

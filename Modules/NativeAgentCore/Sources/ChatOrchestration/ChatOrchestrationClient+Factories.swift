@@ -88,24 +88,46 @@ public func makeChatOrchestrationClient(
 public func makeChatOrchestrationClient(
     tools: any ToolDispatchClient,
     dataRoot: URL = PersistenceCore.defaultDataRoot(),
+    /// OPTIONAL CREDENTIAL/ROUTING ROOT — token-refresh writes allowed there, nothing else (nil = today's behaviour,
+    /// byte for byte). See `makeDefaultChatOrchestrationClient`.
+    providersRoot: URL? = nil,
+    /// Optional ACTIVE-PROVIDER map path for the router (a bench A/B seam: a
+    /// CLONE-side copy of active.json with one surface repointed). The router
+    /// treats the path as its real map — reads AND any router-side writes/
+    /// transactions target that file and its directory — which is exactly why
+    /// the bench hands it a clone path, never the live file. nil = the provider
+    /// root's own active.json.
+    activeProviderPathOverride: URL? = nil,
+    /// Same seam for the surface→model pin map (surfaces.json). nil = the provider root's own.
+    surfacesPathOverride: URL? = nil,
     approvalFiler: (any ApprovalFiler)? = nil,
     cognitiveObserver: (any CognitiveEventObserving)? = nil,
     cognitiveContextProvider: (any CognitiveContextProviding)? = nil,
     providerLifecycleObserver: (any LLMCallLifecycleObserving)? = nil,
     contextFlow: (any ContextTurnPreparing)? = nil,
     memoryAtomTranslator: (@Sendable (String) -> ContextAtomID?)? = nil,
-    publicSafeMode: Bool = false
+    publicSafeMode: Bool = false,
+    clock: @escaping @Sendable () -> Date = { Date() },
+    // Factory seam for a controlled credential-root probe. Production takes
+    // nil and constructs CodexAdapter directly; tests can observe the exact
+    // child-process environment without launching a real Codex child.
+    codexAdapterFactory: (@Sendable ([String: String]?) -> any LLMAdapter)? = nil
 ) -> SwiftNativeChatOrchestrationClient {
     makeDefaultChatOrchestrationClient(
         tools: tools,
         approvalFiler: approvalFiler,
         dataRoot: dataRoot,
+        providersRoot: providersRoot,
+        activeProviderPathOverride: activeProviderPathOverride,
+        surfacesPathOverride: surfacesPathOverride,
         cognitiveObserver: cognitiveObserver,
         cognitiveContextProvider: cognitiveContextProvider,
         providerLifecycleObserver: providerLifecycleObserver,
         contextFlow: contextFlow,
         memoryAtomTranslator: memoryAtomTranslator,
-        publicSafeMode: publicSafeMode
+        publicSafeMode: publicSafeMode,
+        clock: clock,
+        codexAdapterFactory: codexAdapterFactory
     )
 }
 
@@ -123,7 +145,8 @@ public func makeChatOrchestrationClient(
     makeDefaultChatOrchestrationClient(
         tools: SwiftToolDispatcher(
             dataRoot: dataRoot,
-            allowProcessGlobalTools: dataRoot == PersistenceCore.defaultDataRoot()
+            allowProcessGlobalTools: dataRoot == PersistenceCore.defaultDataRoot(),
+            enforceLazyToolLoading: true
         ),
         approvalFiler: nil,
         dataRoot: dataRoot,
@@ -190,12 +213,45 @@ private func makeDefaultChatOrchestrationClient(
     tools: any ToolDispatchClient,
     approvalFiler: (any ApprovalFiler)?,
     dataRoot: URL = PersistenceCore.defaultDataRoot(),
+    /// OPTIONAL CREDENTIAL/ROUTING ROOT. Reads credentials + routing there; the ONLY
+    /// writes that may land there are the adapters' own token refreshes.
+    ///
+    /// nil (every production and existing test caller) → behaviour is byte
+    /// identical to before this parameter existed.
+    ///
+    /// Non-nil → the provider lane alone is repointed at this root: the
+    /// router reads `providers/surfaces.json` / `providers/active.json` /
+    /// registry / catalog from there, and the REAL adapters resolve their
+    /// credentials there (API keys, OAuth token files, the Codex auth.json).
+    /// Everything else — persona, memory, trust, history, traces, REM pins,
+    /// ActiveToolsStore, telemetry — stays on `dataRoot`, so a disposable
+    /// clone can make a real provider call without the tokens leaving the
+    /// live store; the only writes that land there are token refreshes. This is the
+    /// personality range bench's Layer 2 seam (docs/build_plans/
+    /// personality-range-bench.md, decision (a)).
+    providersRoot: URL? = nil,
+    /// Optional ACTIVE-PROVIDER map path for the router (a bench A/B seam: a
+    /// CLONE-side copy of active.json with one surface repointed). The router
+    /// treats the path as its real map — reads AND any router-side writes/
+    /// transactions target that file and its directory — which is exactly why
+    /// the bench hands it a clone path, never the live file. nil = the provider
+    /// root's own active.json.
+    activeProviderPathOverride: URL? = nil,
+    /// Same seam for the surface→model pin map (surfaces.json). nil = the provider root's own.
+    surfacesPathOverride: URL? = nil,
     cognitiveObserver: (any CognitiveEventObserving)? = nil,
     cognitiveContextProvider: (any CognitiveContextProviding)? = nil,
     providerLifecycleObserver: (any LLMCallLifecycleObserving)? = nil,
     contextFlow: (any ContextTurnPreparing)? = nil,
     memoryAtomTranslator: (@Sendable (String) -> ContextAtomID?)? = nil,
-    publicSafeMode: Bool = false
+    publicSafeMode: Bool = false,
+    // Injectable so replay tooling (turn-replay bench) can pin assembly to a
+    // fixture's capture instant; production callers take the Date() default.
+    clock: @escaping @Sendable () -> Date = { Date() },
+    // Kept at the production assembly boundary: a test observes the exact
+    // environment handed to the real Codex adapter, rather than reconstructing
+    // the expected dictionary beside the factory.
+    codexAdapterFactory: (@Sendable ([String: String]?) -> any LLMAdapter)? = nil
 ) -> SwiftNativeChatOrchestrationClient {
     // W-J hermeticity seam: a single dataRoot threads to every source-bound
     // singleton the factory constructs (persona/router/trust/adapters/engine/
@@ -207,12 +263,16 @@ private func makeDefaultChatOrchestrationClient(
         == PersistenceCore.defaultDataRoot().standardizedFileURL
         ? SwiftNativePersonaEngine(dataRoot: dataRoot)
         : SwiftNativePersonaEngine.isolated(dataRoot: dataRoot)
+    // The provider lane's root: `providersRoot` when injected, otherwise
+    // `dataRoot` exactly as before.
+    let credentialRoot = providersRoot?.standardizedFileURL
+    let routerRoot = credentialRoot ?? dataRoot
     let router = SwiftNativeProviderRouting(
-        dataRoot: dataRoot,
-        surfacesPathOverride: dataRoot
+        dataRoot: routerRoot,
+        surfacesPathOverride: surfacesPathOverride ?? routerRoot
             .appendingPathComponent("providers", isDirectory: true)
             .appendingPathComponent("surfaces.json"),
-        activeProviderPathOverride: dataRoot
+        activeProviderPathOverride: activeProviderPathOverride ?? routerRoot
             .appendingPathComponent("providers", isDirectory: true)
             .appendingPathComponent("active.json")
     )
@@ -234,22 +294,70 @@ private func makeDefaultChatOrchestrationClient(
     // A non-nil telemetry override flips LLMCallTraceRecorder to SYNCHRONOUS
     // test-mode writes — never hand it to production (gpt-5.5 review catch).
     // Only a non-default root (hermetic tests) gets the override.
-    let usesCanonicalBody = dataRoot.standardizedFileURL
-        == PersistenceCore.defaultDataRoot().standardizedFileURL
+    //
+    // An injected `providersRoot` is the SECOND way to be real-adapter
+    // eligible: the caller has named exactly which root the credentials come
+    // from, so the "an alternate root has no credential seam" reason to
+    // install the throwing client no longer holds. Each adapter is then given
+    // that root for credential resolution, while its TELEMETRY root stays on
+    // `dataRoot` — reads from the named credential root, writes into the
+    // caller's own (disposable) body.
+    let usesCanonicalBody = credentialRoot != nil
+        || dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL
     let llm: any LLMClient & StreamingLLMClient
     if usesCanonicalBody {
+        let telemetryRoot: URL? = credentialRoot == nil ? nil : dataRoot
+        let codexEnvironment = credentialRoot.map { root in
+            ProcessInfo.processInfo.environment.merging([
+                "CODEX_HOME": root.appendingPathComponent("codex_home", isDirectory: true).path,
+                "NATIVE_AGENT_DATA_ROOT": root.path,
+            ]) { _, bound in bound }
+        }
         llm = SwiftNativeLLMClient(
             router: router,
-            codex: CodexAdapter(),
-            anthropic: AnthropicAdapter(),
-            openAI: OpenAIAdapter(),
-            openAIOAuthDirect: OpenAIOAuthDirectAdapter(),
-            anthropicOAuthDirect: AnthropicOAuthDirectAdapter(),
-            xaiOAuthDirect: XAIOAuthDirectAdapter(),
-            moonshot: MoonshotAdapter(),
-            kimiCode: AnthropicAdapter.kimiCode(),
-            openRouter: OpenRouterAdapter(),
-            lifecycleObserver: providerLifecycleObserver
+            // Codex child processes read CODEX_HOME / NATIVE_AGENT_DATA_ROOT; bind
+            // both to the credential root so a secondary runtime never reads (or
+            // refreshes) the operator's personal ~/.codex. (gpt-5.5 BLOCKING.)
+            codex: codexAdapterFactory?(codexEnvironment)
+                ?? CodexAdapter(processEnvironmentOverride: codexEnvironment),
+            anthropic: AnthropicAdapter(
+                dataRootOverride: credentialRoot,
+                telemetryDataRootOverride: telemetryRoot
+            ),
+            openAI: OpenAIAdapter(
+                dataRootOverride: credentialRoot,
+                telemetryDataRootOverride: telemetryRoot
+            ),
+            openAIOAuthDirect: OpenAIOAuthDirectAdapter(
+                authPathOverride: credentialRoot.map {
+                    OpenAIOAuthDirectAdapter.preferredAuthPath(dataRoot: $0, allowSharedFallbacks: false, defaultRoot: $0)
+                },
+                telemetryDataRootOverride: telemetryRoot
+            ),
+            anthropicOAuthDirect: AnthropicOAuthDirectAdapter(
+                authPathOverride: credentialRoot.map {
+                    $0.appendingPathComponent("providers", isDirectory: true)
+                        .appendingPathComponent("anthropic_oauth_direct.json")
+                },
+                telemetryDataRootOverride: telemetryRoot
+            ),
+            xaiOAuthDirect: XAIOAuthDirectAdapter(
+                tokenPathOverride: credentialRoot.map {
+                    XAIOAuthDirectAdapter.tokenPath(dataRoot: $0)
+                },
+                telemetryDataRootOverride: telemetryRoot
+            ),
+            moonshot: MoonshotAdapter(
+                dataRootOverride: credentialRoot,
+                telemetryDataRootOverride: telemetryRoot
+            ),
+            kimiCode: AnthropicAdapter.kimiCode(
+                dataRootOverride: credentialRoot,
+                telemetryDataRootOverride: telemetryRoot
+            ),
+            openRouter: OpenRouterAdapter(dataRootOverride: credentialRoot),
+            lifecycleObserver: providerLifecycleObserver,
+            moonshotCatalogDataRoot: credentialRoot ?? PersistenceCore.defaultDataRoot()
         )
     } else {
         // None of the default adapters has a complete credential-root seam.
@@ -287,6 +395,7 @@ private func makeDefaultChatOrchestrationClient(
         trust: trust,
         llm: llm,
         tools: tools,
+        clock: clock,
         remPinsDataRoot: dataRoot,
         memoryPromoter: promoter,
         activeToolsStore: activeToolsStore,
@@ -393,12 +502,25 @@ func makeChatTurnTraceBus(dataRoot: URL) -> TurnTraceBus {
 /// Bridges AdaptiveMemoryPromoter.shared into the chat client's
 /// MemoryPromoting hook. The shared promoter is auto-configured at app
 /// launch with SwiftNativeMemoryV2.shared as its backing store.
-private struct AdaptiveMemoryPromoterAdapter: MemoryPromoting {
+private struct AdaptiveMemoryPromoterAdapter: MemoryPromotionTelemetryReporting {
     func observeTurn(userMessage: String, assistantMessage: String, sessionId: String) async {
-        await AdaptiveMemoryPromoter.shared.observeTurn(
+        _ = await observeTurnWithTelemetry(
             userMessage: userMessage,
             assistantMessage: assistantMessage,
             sessionId: sessionId
         )
+    }
+
+    func observeTurnWithTelemetry(
+        userMessage: String,
+        assistantMessage: String,
+        sessionId: String
+    ) async -> MemoryPromotionTelemetry {
+        let staged = await AdaptiveMemoryPromoter.shared.observeTurn(
+            userMessage: userMessage,
+            assistantMessage: assistantMessage,
+            sessionId: sessionId
+        )
+        return MemoryPromotionTelemetry(stagedProposalCount: staged.count)
     }
 }

@@ -1,14 +1,25 @@
 // PATCH-2026-05-07: proactive-inbox-1 InboxView — proactive inbox card strip
 import SwiftUI
+import Observation
 import NativeAgentShared
 import NativeAgentCore
 
 // MARK: - Models
 
+/// The inbox reader deliberately keeps cards with a bad optional source rather
+/// than dropping the whole record. Preserve why the source is unavailable so
+/// the visible provenance badge does not turn a bad wire value into silence.
+enum InboxSourceReadState: Hashable {
+    case present
+    case missing
+    case malformed
+}
+
 struct InboxItemRecord: Identifiable, Codable, Hashable {
     let id: String
     let created_at: String
     let source: String
+    let sourceReadState: InboxSourceReadState
     let severity: String      // info | important | actionable
     let title: String
     let summary: String
@@ -42,7 +53,16 @@ struct InboxItemRecord: Identifiable, Codable, Hashable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(String.self, forKey: .id)
         created_at = (try? c.decode(String.self, forKey: .created_at)) ?? ""
-        source = (try? c.decode(String.self, forKey: .source)) ?? ""
+        if !c.contains(.source) {
+            source = ""
+            sourceReadState = .missing
+        } else if let decodedSource = try? c.decode(String.self, forKey: .source) {
+            source = decodedSource
+            sourceReadState = .present
+        } else {
+            source = ""
+            sourceReadState = .malformed
+        }
         severity = (try? c.decode(String.self, forKey: .severity)) ?? "info"
         title = (try? c.decode(String.self, forKey: .title)) ?? ""
         summary = (try? c.decode(String.self, forKey: .summary)) ?? ""
@@ -220,34 +240,71 @@ struct InboxItemRecord: Identifiable, Codable, Hashable {
     }
 
     var sourceBadgeLabel: String {
+        InboxSourceBadgePresentation.label(
+            source: source,
+            readState: sourceReadState,
+            hasLinkedApproval: hasLinkedApproval
+        )
+    }
+}
+
+/// Canonical, bounded source-to-badge projection used by every Inbox item.
+/// A category is assigned only for an exact known source/prefix; unknown but
+/// valid source vocabulary is shown as a safe humanized label, while missing
+/// and malformed wire values remain explicit adverse states.
+enum InboxSourceBadgePresentation {
+    static func label(
+        source: String,
+        readState: InboxSourceReadState,
+        hasLinkedApproval: Bool
+    ) -> String {
         if hasLinkedApproval { return "APPROVAL" }
-        if source.hasPrefix("proactive_autonomy") { return "IDEA" }
-        if source.hasPrefix("harness_learning") { return "LEARNING" }
-        if source == "dream_cycle" { return "DREAM" }
-        if source == "rem_cycle" { return "REM" }
-        if source.hasPrefix("trigger:file_watch") { return "FILE-WATCH" }
-        if source.hasPrefix("trigger:morning_brief") { return "MORNING-BRIEF" }
-        if source.hasPrefix("trigger:stuck_pattern") { return "STUCK-PATTERNS" }
-        if source == "idle_checkin" { return "IDLE-CHECKIN" }
-        if ExecutionEventVocabulary.hasKindPrefix(source, WorkshopCompletionTrigger.canonicalKind) {
+        switch readState {
+        case .missing:
+            return "SOURCE MISSING"
+        case .malformed:
+            return "SOURCE INVALID"
+        case .present:
+            break
+        }
+
+        let normalized = source.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return "SOURCE UNKNOWN" }
+        guard isSafeSourceToken(normalized) else { return "SOURCE INVALID" }
+
+        if normalized.hasPrefix("proactive_autonomy:") { return "IDEA" }
+        if normalized.hasPrefix("harness_learning:") { return "LEARNING" }
+        if normalized == "dream_cycle" { return "DREAM" }
+        if normalized == "rem_cycle" { return "REM" }
+        if normalized.hasPrefix("trigger:file_watch") { return "FILE-WATCH" }
+        if normalized.hasPrefix("trigger:morning_brief") { return "MORNING-BRIEF" }
+        if normalized.hasPrefix("trigger:stuck_pattern") { return "STUCK-PATTERNS" }
+        if normalized == "idle_checkin" { return "IDLE-CHECKIN" }
+        if ExecutionEventVocabulary.hasKindPrefix(normalized, WorkshopCompletionTrigger.canonicalKind) {
             return "WORKSHOP"
         }
-        // ui-taste-sweep 2026-06-07: previously fell through to
-        // `String(source.uppercased().prefix(14))` which truncated
-        // "scheduled_proactive_scan" → "SCHEDULED_PROA" (mid-word, leaking
-        // a raw enum). Now: replace underscores with spaces and truncate
-        // on whole-word boundaries so the badge reads as a label.
-        if source == "scheduled_proactive_scan" { return "PROACTIVE SCAN" }
-        let humanized = source.uppercased().replacingOccurrences(of: "_", with: " ")
-        if humanized.count <= 16 { return humanized }
-        // Truncate to last full word that fits in 16 chars.
-        var truncated = ""
-        for word in humanized.split(separator: " ") {
-            let candidate = truncated.isEmpty ? String(word) : truncated + " " + word
+        if normalized == "scheduled_proactive_scan" { return "PROACTIVE SCAN" }
+        return boundedHumanizedLabel(normalized)
+    }
+
+    private static func isSafeSourceToken(_ value: String) -> Bool {
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789_:-")
+        return value.unicodeScalars.allSatisfy { allowed.contains($0) }
+    }
+
+    private static func boundedHumanizedLabel(_ source: String) -> String {
+        let words = source
+            .split(whereSeparator: { $0 == "_" || $0 == ":" || $0 == "-" })
+            .map { $0.uppercased() }
+        guard !words.isEmpty else { return "SOURCE UNKNOWN" }
+
+        var label = ""
+        for word in words {
+            let candidate = label.isEmpty ? word : label + " " + word
             if candidate.count > 16 { break }
-            truncated = candidate
+            label = candidate
         }
-        return truncated.isEmpty ? String(humanized.prefix(16)) : truncated
+        return label.isEmpty ? "SOURCE UNKNOWN" : label
     }
 }
 
@@ -281,6 +338,41 @@ struct InboxActionRecord: Codable, Hashable {
     let id: String
     let label: String
     let description: String?
+}
+
+/// The persisted inbox action list includes control verbs which the Desk owns
+/// itself: opening a card marks it read, and viewing/replying are not direct
+/// button operations. Project once at the presentation boundary so every Desk
+/// surface offers exactly the native action that its button will invoke.
+enum InboxVisibleActionsPresentation {
+    private static let hiddenActionIDs: Set<String> = ["view", "read", "reply"]
+    private static let executableActionIDs: Set<String> = Set([
+        "act", "approve", "reject",
+    ]).union(HeartbeatCardAction.ids)
+
+    static func actions(for item: InboxItemRecord) -> [InboxActionRecord] {
+        var seen: Set<String> = []
+        var visible: [InboxActionRecord] = []
+
+        for action in item.effectiveActions {
+            let normalizedID = action.id
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            let canonicalID = normalizedID == "deny" ? "reject" : normalizedID
+            guard !hiddenActionIDs.contains(canonicalID),
+                  executableActionIDs.contains(canonicalID)
+            else { continue }
+
+            let label = action.label.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !label.isEmpty, seen.insert(canonicalID).inserted else { continue }
+            visible.append(InboxActionRecord(
+                id: canonicalID,
+                label: label,
+                description: action.description
+            ))
+        }
+        return visible
+    }
 }
 
 struct InboxTriggerConfig: Identifiable, Codable, Hashable {
@@ -374,35 +466,52 @@ struct InboxTriggerConfig: Identifiable, Codable, Hashable {
 
 // MARK: - Compact inbox strip (shown above chat messages)
 
+/// The compact strip is deliberately a projection of the unread set, rather
+/// than two independently filtered collections. That makes the visible cards
+/// and the overflow badge account for the same bounded result.
+struct InboxStripDisplay: Equatable {
+    static let visibleLimit = 3
+
+    let visibleItems: [InboxItemRecord]
+    let overflowCount: Int
+    let unreadCount: Int
+
+    init(items: [InboxItemRecord]) {
+        let unreadItems = items.filter(\.isUnread)
+        unreadCount = unreadItems.count
+        visibleItems = Array(unreadItems.prefix(Self.visibleLimit))
+        overflowCount = max(0, unreadCount - visibleItems.count)
+    }
+
+    var isQuiet: Bool { unreadCount == 0 }
+}
+
 struct InboxStripView: View {
     let items: [InboxItemRecord]
-    let onAction: (String, String) async -> Void
+    let onAction: @MainActor (String, String) async throws -> Void
 
     @State private var selectedItem: InboxItemRecord?
     @State private var showSheet = false
+    @State private var actionFlight = InboxRowActionFlight()
 
-    private var visibleItems: [InboxItemRecord] {
-        items.filter { $0.isUnread }.prefix(3).map { $0 }
-    }
-
-    private var overflowCount: Int {
-        max(0, items.filter { $0.isUnread }.count - 3)
+    private var display: InboxStripDisplay {
+        InboxStripDisplay(items: items)
     }
 
     var body: some View {
-        if visibleItems.isEmpty { EmptyView() }
+        if display.isQuiet { EmptyView() }
         else {
             VStack(alignment: .leading, spacing: 0) {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
-                        ForEach(visibleItems) { item in
+                        ForEach(display.visibleItems) { item in
                             InboxCardView(item: item) {
                                 selectedItem = item
                                 showSheet = true
                             }
                         }
-                        if overflowCount > 0 {
-                            Text("+\(overflowCount) more")
+                        if display.overflowCount > 0 {
+                            Text("+\(display.overflowCount) more")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                                 .padding(.horizontal, 8)
@@ -420,8 +529,8 @@ struct InboxStripView: View {
                     item: item,
                     allItems: items,
                     onAction: { actionID in
-                        Task {
-                            await onAction(item.id, actionID)
+                        await actionFlight.perform {
+                            try await onAction(item.id, actionID)
                         }
                     },
                     onClose: { selectedItem = nil }
@@ -481,21 +590,19 @@ struct InboxCardView: View {
 struct InboxItemDetailSheet: View {
     let item: InboxItemRecord
     var allItems: [InboxItemRecord] = []
-    let onAction: (String) -> Void
+    let onAction: @MainActor (String) async -> InboxRowActionFlight.Outcome
     var onOpenGroup: ((InboxRelatedGroup) -> Void)? = nil
     let onClose: () -> Void
 
+    @State private var isActing = false
+    @State private var actionError: String?
+
     private var visibleActions: [InboxActionRecord] {
-        item.effectiveActions.filter { action in
-            !["view", "read", "reply"].contains(action.id)
-        }
+        InboxVisibleActionsPresentation.actions(for: item)
     }
 
     private var relatedGroups: [InboxRelatedGroup] {
-        if let groups = item.related_groups, !groups.isEmpty {
-            return groups
-        }
-        return Self.groupsFromDigestDetail(item: item, allItems: allItems)
+        InboxDetailGroupProjection.groups(item: item, allItems: allItems)
     }
 
     var body: some View {
@@ -594,15 +701,17 @@ struct InboxItemDetailSheet: View {
                                     ForEach(visibleActions, id: \.id) { action in
                                         if isPrimaryAction(action.id) {
                                             Button(action.label) {
-                                                performAndClose(action.id)
+                                                perform(action.id, closesOnSuccess: true)
                                             }
                                             .buttonStyle(.borderedProminent)
                                             .tint(.orange)
+                                            .disabled(isActing)
                                         } else {
                                             Button(action.label) {
-                                                performAndClose(action.id)
+                                                perform(action.id, closesOnSuccess: true)
                                             }
                                             .buttonStyle(.bordered)
+                                            .disabled(isActing)
                                         }
                                     }
                                 }
@@ -623,20 +732,77 @@ struct InboxItemDetailSheet: View {
                 }
             }
         }
-        .onAppear { onAction("read") }
+        .onAppear { perform("read", closesOnSuccess: false) }
+        .alert(
+            "Inbox action failed",
+            isPresented: Binding(
+                get: { actionError != nil },
+                set: { if !$0 { actionError = nil } }
+            ),
+            actions: { Button("OK", role: .cancel) { actionError = nil } },
+            message: { Text(actionError ?? "") }
+        )
     }
 
     private func isPrimaryAction(_ actionID: String) -> Bool {
         actionID == "act" || actionID == "approve" || actionID == "open_approvals" || actionID == "repair"
     }
 
-    private func performAndClose(_ actionID: String) {
-        onAction(actionID)
-        onClose()
+    private func perform(_ actionID: String, closesOnSuccess: Bool) {
+        guard !isActing else { return }
+        isActing = true
+        Task { @MainActor in
+            defer { isActing = false }
+            let outcome = await onAction(actionID)
+            switch InboxDetailActionPresentation.effect(
+                for: outcome,
+                closesOnSuccess: closesOnSuccess
+            ) {
+            case .dismiss:
+                onClose()
+            case .showError(let message):
+                actionError = message
+            case .keepOpen:
+                break
+            }
+        }
     }
 
-    private static func groupsFromDigestDetail(item: InboxItemRecord, allItems: [InboxItemRecord]) -> [InboxRelatedGroup] {
-        guard item.source == "autonomy_maintenance:inbox_digest",
+}
+
+/// A sheet only dismisses after its action's durable write succeeds. Failures
+/// stay mounted with the error so an inbox card cannot falsely disappear.
+enum InboxDetailActionPresentation {
+    enum Effect: Equatable {
+        case keepOpen
+        case dismiss
+        case showError(String)
+    }
+
+    static func effect(
+        for outcome: InboxRowActionFlight.Outcome,
+        closesOnSuccess: Bool
+    ) -> Effect {
+        switch outcome {
+        case .succeeded: return closesOnSuccess ? .dismiss : .keepOpen
+        case .failed(let message): return .showError(message)
+        case .dropped: return .keepOpen
+        }
+    }
+}
+
+/// The only route from a persisted digest card to its Review Groups controls.
+/// New cards use the structured wire; prose remains compatibility for existing
+/// JSONL cards only.
+enum InboxDetailGroupProjection {
+    static func groups(item: InboxItemRecord, allItems: [InboxItemRecord]) -> [InboxRelatedGroup] {
+        if let groups = item.related_groups, !groups.isEmpty { return groups }
+        return legacyGroups(item: item, allItems: allItems)
+    }
+
+    static func legacyGroups(item: InboxItemRecord, allItems: [InboxItemRecord]) -> [InboxRelatedGroup] {
+        guard (item.source == "autonomy_maintenance:inbox_digest"
+                || item.source.hasPrefix("proactive_autonomy:inbox_digest:")),
               let detail = item.detail,
               detail.contains("Top groups:")
         else { return [] }
@@ -650,7 +816,7 @@ struct InboxItemDetailSheet: View {
             if line.isEmpty { continue }
             guard line.hasPrefix("- ") else { break }
             let entry = String(line.dropFirst(2))
-            let parsed = parseDigestGroupLine(entry)
+            let parsed = parseLegacyLine(entry)
             let matchingIDs = allItems
                 .filter { $0.id != item.id && $0.title == parsed.title }
                 .map(\.id)
@@ -665,7 +831,7 @@ struct InboxItemDetailSheet: View {
         return groups
     }
 
-    private static func parseDigestGroupLine(_ entry: String) -> (title: String, count: Int) {
+    private static func parseLegacyLine(_ entry: String) -> (title: String, count: Int) {
         let trimmed = entry.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.hasSuffix(")"), let open = trimmed.lastIndex(of: "(") else {
             return (trimmed, 0)
@@ -701,17 +867,183 @@ enum InboxLane: String, CaseIterable, Identifiable {
     }
 }
 
+/// Production seam for the value emitted by a Review Groups button and the
+/// same list population InboxView renders. Keeping it here prevents a group
+/// selection from becoming a detail-sheet-only presentation effect.
+enum InboxReviewGroupSelection {
+    static func select(_ group: InboxRelatedGroup) -> InboxRelatedGroup {
+        group
+    }
+
+    static func displayItems(
+        items: [InboxItemRecord],
+        lane: InboxLane,
+        showAll: Bool,
+        groupFilter: InboxRelatedGroup?
+    ) -> [InboxItemRecord] {
+        let base = (showAll ? items : items.filter { !$0.isHiddenFromDefaultInbox })
+            .filter { lane.matches($0) }
+        guard let groupFilter else { return base }
+        return base.filter { groupFilter.matches($0) }
+    }
+}
+
+/// One population definition for every Inbox lane count visible at once.  The
+/// segment badge and the empty-state pointer both describe unread, default-
+/// visible cards; using different filters made a quiet lane claim it had work
+/// while its own badge said nothing.
+enum InboxLanePresentation {
+    /// Inbox navigation is view-local, so every fresh presentation must begin
+    /// in the human lane. Keep the default and segment order explicit instead
+    /// of inheriting declaration order from `CaseIterable`.
+    static let initialLane: InboxLane = .forYou
+    static let pickerLanes: [InboxLane] = [.forYou, .system]
+
+    static func unreadVisibleCount(in lane: InboxLane, items: [InboxItemRecord]) -> Int {
+        items.count {
+            lane.matches($0) && $0.isUnread && !$0.isHiddenFromDefaultInbox
+        }
+    }
+}
+
+/// `AppModel.inboxItems` is a shared snapshot for badges and compact surfaces;
+/// the mounted Inbox also owns an action-time copy. A confirmed reload can
+/// remove a card before a stale shared snapshot arrives, so that old snapshot
+/// must not put the resolved card back on screen.
+enum InboxAppModelMirror {
+    struct Snapshot: Equatable {
+        let items: [InboxItemRecord]
+        let locallyResolvedIDs: Set<String>
+    }
+
+    /// A successful Inbox read is authoritative. IDs present before the read
+    /// but absent from its result were resolved durably and become tombstones
+    /// for later stale AppModel mirror copies.
+    static func successfulReload(
+        localItems: [InboxItemRecord],
+        reloadedItems: [InboxItemRecord],
+        locallyResolvedIDs: Set<String>
+    ) -> Snapshot {
+        let localIDs = Set(localItems.map(\.id))
+        let reloadedIDs = Set(reloadedItems.map(\.id))
+        let resolved = locallyResolvedIDs.union(localIDs.subtracting(reloadedIDs))
+        return Snapshot(
+            items: reloadedItems.filter { !resolved.contains($0.id) },
+            locallyResolvedIDs: resolved
+        )
+    }
+
+    /// The shared model is allowed to report a genuine empty inbox. The state
+    /// owner equality-gates repeated empty copies, while resolved IDs cannot
+    /// be resurrected by a stale mirror snapshot.
+    static func modelUpdate(
+        modelItems: [InboxItemRecord],
+        locallyResolvedIDs: Set<String>
+    ) -> Snapshot {
+        Snapshot(
+            items: modelItems.filter { !locallyResolvedIDs.contains($0.id) },
+            locallyResolvedIDs: locallyResolvedIDs
+        )
+    }
+}
+
+/// Visible, bounded wording for a failed inbox read. When a refresh fails over
+/// already rendered cards, say so plainly: those cards are last-known data,
+/// not proof that the current inbox is healthy.
+enum InboxLoadFailurePresentation {
+    static let maxDetailCharacters = 240
+
+    static func banner(error: any Error, retainedItemCount: Int) -> String {
+        let rawDetail = error.localizedDescription
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let detail = rawDetail.isEmpty
+            ? "The inbox reader returned no error details."
+            : String(rawDetail.prefix(maxDetailCharacters))
+        let retained = retainedItemCount == 1
+            ? "Inbox couldn't refresh — showing 1 previously loaded item."
+            : retainedItemCount > 1
+                ? "Inbox couldn't refresh — showing \(retainedItemCount) previously loaded items."
+                : "Inbox couldn't load."
+        return "\(retained) \(detail)"
+    }
+}
+
+/// The InboxView's actual refresh boundary. Keeping records and failure state
+/// together prevents a failed refresh from leaving last-known rows looking
+/// current, and a successful retry clears that adverse state before it
+/// publishes replacement rows.
+@MainActor @Observable
+final class InboxLoadState {
+    private(set) var items: [InboxItemRecord]
+    private(set) var errorText: String?
+    private(set) var locallyResolvedIDs: Set<String> = []
+
+    init(items: [InboxItemRecord] = []) {
+        self.items = items
+    }
+
+    @discardableResult
+    func reload(
+        read: @escaping @MainActor () async throws -> [InboxItemRecord]
+    ) async -> Bool {
+        errorText = nil
+        do {
+            _ = adopt(InboxAppModelMirror.successfulReload(
+                localItems: items,
+                reloadedItems: try await read(),
+                locallyResolvedIDs: locallyResolvedIDs
+            ))
+            return true
+        } catch {
+            errorText = InboxLoadFailurePresentation.banner(
+                error: error,
+                retainedItemCount: items.count)
+            return false
+        }
+    }
+
+    @discardableResult
+    func replaceItems(_ latest: [InboxItemRecord]) -> Bool {
+        adopt(InboxAppModelMirror.modelUpdate(
+            modelItems: latest,
+            locallyResolvedIDs: locallyResolvedIDs
+        ))
+    }
+
+    func markRead(_ id: String) {
+        if let idx = items.firstIndex(where: { $0.id == id }), items[idx].isUnread {
+            items[idx].status = "read"
+        }
+    }
+
+    @discardableResult
+    private func adopt(_ snapshot: InboxAppModelMirror.Snapshot) -> Bool {
+        var changed = false
+        if locallyResolvedIDs != snapshot.locallyResolvedIDs {
+            locallyResolvedIDs = snapshot.locallyResolvedIDs
+            changed = true
+        }
+        if items != snapshot.items {
+            items = snapshot.items
+            changed = true
+        }
+        return changed
+    }
+}
+
+/// The two locations that talk about another inbox lane must use one bounded
+/// population: visible unread cards. This is a rendered truth contract, not a
+/// second inbox state owner.
 struct InboxView: View {
     @Environment(AppModel.self) private var appModel
 
-    @State private var items: [InboxItemRecord] = []
+    @State private var inboxLoadState = InboxLoadState()
     @State private var isLoading = false
-    @State private var errorText: String?
     @State private var showAll = false
     @State private var groupFilter: InboxRelatedGroup?
     // G12: defaults to the human lane. The operations feed is one click away,
     // it is just no longer the thing User's day opens with.
-    @State private var lane: InboxLane = .forYou
+    @State private var lane: InboxLane = InboxLanePresentation.initialLane
 
     // R22: source the client from AppModel's canonical `client`.
     private var client: NativeClient { appModel.client }
@@ -741,7 +1073,7 @@ struct InboxView: View {
             // the System lane is never a silent hiding place — User can see it
             // has three things in it without switching to it.
             Picker("Lane", selection: $lane) {
-                ForEach(InboxLane.allCases) { candidate in
+                ForEach(InboxLanePresentation.pickerLanes) { candidate in
                     Text(laneLabel(candidate)).tag(candidate)
                 }
             }
@@ -750,7 +1082,7 @@ struct InboxView: View {
             .padding(.horizontal, 16)
             .padding(.bottom, 8)
 
-            if let err = errorText {
+            if let err = inboxLoadState.errorText {
                 Text(err).font(NativeAgentFont.label).foregroundStyle(NativeAgentTheme.fail).padding(.horizontal)
             }
 
@@ -790,11 +1122,13 @@ struct InboxView: View {
                 List(displayItems) { item in
                     InboxListRow(
                         item: item,
-                        allItems: items,
+                        allItems: inboxLoadState.items,
                         client: client,
                         onAction: { Task { await loadAndSync() } },
                         onMarkedRead: { markRead(item.id) },
-                        onSelectGroup: { group in groupFilter = group }
+                        onSelectGroup: { group in
+                            groupFilter = InboxReviewGroupSelection.select(group)
+                        }
                     )
                 }
                 .listStyle(.plain)
@@ -802,21 +1136,22 @@ struct InboxView: View {
         }
         .task { await load() }
         .onChange(of: appModel.inboxItems) { _, latest in
-            guard !latest.isEmpty || !items.isEmpty else { return }
-            items = latest
+            inboxLoadState.replaceItems(latest)
         }
     }
 
     private var displayItems: [InboxItemRecord] {
-        let base = (showAll ? items : items.filter { !$0.isHiddenFromDefaultInbox })
-            .filter { lane.matches($0) }
-        guard let groupFilter else { return base }
-        return base.filter { groupFilter.matches($0) }
+        InboxReviewGroupSelection.displayItems(
+            items: inboxLoadState.items,
+            lane: lane,
+            showAll: showAll,
+            groupFilter: groupFilter
+        )
     }
 
     private var emptyStateDetail: String {
         let other: InboxLane = lane == .forYou ? .system : .forYou
-        let otherCount = items.filter { other.matches($0) && !$0.isHiddenFromDefaultInbox }.count
+        let otherCount = InboxLanePresentation.unreadVisibleCount(in: other, items: inboxLoadState.items)
         if otherCount > 0 {
             return "\(otherCount) item(s) are waiting in \(other.title)."
         }
@@ -826,24 +1161,18 @@ struct InboxView: View {
     /// Unread count per lane, over the same visibility rules the list uses —
     /// a dismissed card must not inflate the segment it sits behind.
     private func laneLabel(_ candidate: InboxLane) -> String {
-        let unread = items.filter {
-            candidate.matches($0) && $0.isUnread && !$0.isHiddenFromDefaultInbox
-        }.count
+        let unread = InboxLanePresentation.unreadVisibleCount(in: candidate, items: inboxLoadState.items)
         return unread > 0 ? "\(candidate.title) (\(unread))" : candidate.title
     }
 
     func load() async {
         isLoading = true
         defer { isLoading = false }
-        // ui-honesty 2026-06-10: clear the previous error at the start of
-        // every load — a stale failure banner used to persist over a
-        // subsequent successful refresh.
-        errorText = nil
-        do {
-            items = try await client.getInboxItems(unreadOnly: false)
-            appModel.inboxItems = items
-        } catch {
-            errorText = error.localizedDescription
+        let loaded = await inboxLoadState.reload {
+            try await client.getInboxItems(unreadOnly: false)
+        }
+        if loaded && appModel.inboxItems != inboxLoadState.items {
+            appModel.inboxItems = inboxLoadState.items
         }
     }
 
@@ -856,13 +1185,62 @@ struct InboxView: View {
     // patch the local copy (and the appModel mirror so badges elsewhere agree)
     // — the unread dot/bold clear immediately without a full reload.
     private func markRead(_ id: String) {
-        if let idx = items.firstIndex(where: { $0.id == id }), items[idx].isUnread {
-            items[idx].status = "read"
-        }
+        inboxLoadState.markRead(id)
         if let idx = appModel.inboxItems.firstIndex(where: { $0.id == id }),
            appModel.inboxItems[idx].isUnread {
             appModel.inboxItems[idx].status = "read"
         }
+    }
+}
+
+/// Serializes the direct action buttons on an inbox row.  Keeping the complete
+/// success/failure branch here means the visible row can neither double-submit
+/// a slow action nor present a failed write as a resolved card.
+@MainActor @Observable
+final class InboxRowActionFlight {
+    enum Outcome: Equatable {
+        case dropped
+        case succeeded
+        case failed(message: String)
+    }
+
+    private(set) var isInFlight = false
+
+    func perform(operation: @escaping @MainActor () async throws -> Void) async -> Outcome {
+        guard !isInFlight else { return .dropped }
+        isInFlight = true
+        defer { isInFlight = false }
+
+        do {
+            try await operation()
+            return .succeeded
+        } catch {
+            let message = "Inbox action failed: \(error.localizedDescription)"
+            return .failed(message: message)
+        }
+    }
+}
+
+/// Applies the one visible success consequence after an inbox write settles.
+/// The inline buttons and detail sheet both call `performAction(_:)`, which
+/// uses this owner; a failed/dropped write has no route to a local read patch
+/// or a resolved-row reload.
+@MainActor
+enum InboxRowActionCompletion {
+    @discardableResult
+    static func apply(
+        _ outcome: InboxRowActionFlight.Outcome,
+        actionID: String,
+        onResolved: () -> Void,
+        onMarkedRead: () -> Void
+    ) -> InboxRowActionFlight.Outcome {
+        guard case .succeeded = outcome else { return outcome }
+        if actionID == "read" {
+            onMarkedRead()
+        } else {
+            onResolved()
+        }
+        return outcome
     }
 }
 
@@ -878,9 +1256,9 @@ struct InboxListRow: View {
     let onSelectGroup: (InboxRelatedGroup) -> Void
 
     @State private var showDetail = false
-    // ui-honesty 2026-06-10: in-flight guard — disables the row's action
-    // buttons while a request runs so a double-click can't double-fire.
-    @State private var isActing = false
+    // The shared action flight owns the row's visible busy state and terminal
+    // outcome, rather than relying on a button-local best-effort guard.
+    @State private var actionFlight = InboxRowActionFlight()
     // gpt-5.5 review-2 R2-#1 follow-up: ContentView's InboxStripView already
     // surfaces inbox-action errors (e.g. the new -410 "primary-action resolver
     // not wired" from inboxAction(act:)). The main InboxView used `try?` and
@@ -889,9 +1267,7 @@ struct InboxListRow: View {
     @State private var actionError: String? = nil
 
     private var visibleActions: [InboxActionRecord] {
-        item.effectiveActions.filter { action in
-            !["view", "read", "reply"].contains(action.id)
-        }
+        InboxVisibleActionsPresentation.actions(for: item)
     }
 
     var body: some View {
@@ -938,14 +1314,14 @@ struct InboxListRow: View {
                                     .buttonStyle(.borderedProminent)
                                     .tint(.orange)
                                     .controlSize(.small)
-                                    .disabled(isActing)
+                                    .disabled(actionFlight.isInFlight)
                                 } else {
                                     Button(action.label) {
                                         runAction(action.id)
                                     }
                                     .buttonStyle(.bordered)
                                     .controlSize(.small)
-                                    .disabled(isActing)
+                                    .disabled(actionFlight.isInFlight)
                                 }
                             }
                         }
@@ -962,28 +1338,7 @@ struct InboxListRow: View {
                 item: item,
                 allItems: allItems,
                 onAction: { actionID in
-                    Task {
-                        do {
-                            try await client.inboxAction(item.id, action: actionID)
-                        } catch {
-                            // gpt-5.5 review-2 R2-#1 follow-up: surface the
-                            // failure instead of swallowing — same pattern
-                            // as InboxStripView in ContentView.swift. Do NOT
-                            // call onAction() on failure (would mark the row
-                            // resolved when it isn't).
-                            actionError = "Inbox action failed: \(error.localizedDescription)"
-                            return
-                        }
-                        if actionID == "read" {
-                            // ui-honesty 2026-06-10: patch the local copy so
-                            // the unread dot/bold clear immediately — the
-                            // server write succeeded but no reload runs for
-                            // the read action.
-                            onMarkedRead()
-                        } else {
-                            onAction()
-                        }
-                    }
+                    await performAction(actionID)
                 },
                 onOpenGroup: onSelectGroup,
                 onClose: { showDetail = false }
@@ -1006,20 +1361,24 @@ struct InboxListRow: View {
     }
 
     private func runAction(_ actionID: String) {
-        // ui-honesty 2026-06-10: in-flight guard — a second click while the
-        // request is running double-fired the action.
-        guard !isActing else { return }
-        isActing = true
-        Task {
-            defer { isActing = false }
-            do {
-                try await client.inboxAction(item.id, action: actionID)
-            } catch {
-                // gpt-5.5 review-2 R2-#1 follow-up: surface, don't swallow.
-                actionError = "Inbox action failed: \(error.localizedDescription)"
-                return
-            }
-            onAction()
+        Task { @MainActor in
+            let outcome = await performAction(actionID)
+            if case .failed(let message) = outcome { actionError = message }
         }
+    }
+
+    /// The only native-client action path for both inline row buttons and the
+    /// detail sheet. Success callbacks are deliberately chosen here, after the
+    /// durable write, so the two surfaces cannot drift on read vs. resolution.
+    private func performAction(_ actionID: String) async -> InboxRowActionFlight.Outcome {
+        let outcome = await actionFlight.perform {
+            try await client.inboxAction(item.id, action: actionID)
+        }
+        return InboxRowActionCompletion.apply(
+            outcome,
+            actionID: actionID,
+            onResolved: onAction,
+            onMarkedRead: onMarkedRead
+        )
     }
 }

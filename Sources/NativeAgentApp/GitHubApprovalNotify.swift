@@ -46,6 +46,12 @@ actor GitHubApprovalEdgeNotifier {
                   let number = (entity["number"] as? Int) ?? (entity["number"] as? String).flatMap(Int.init) else { continue }
             let itemId = "\(repo.lowercased())#\(number)"
             if (entity["state"] as? String) == "open", let reviewState = entity["reviewState"] as? String {
+                // "not_expanded" is basicPREntity's sentinel for a PR the
+                // refresh could not detail-fetch (GitHubProjectTracking's
+                // per-pass PR budget). That is UNKNOWN, not a review state:
+                // skip it entirely so the prior baseline survives — writing it
+                // would re-fire "PR approved" when the PR re-enters budget.
+                guard reviewState.lowercased() != "not_expanded" else { continue }
                 open[itemId] = (reviewState, (entity["title"] as? String) ?? "PR #\(number)")
             } else {
                 closed.insert(itemId)

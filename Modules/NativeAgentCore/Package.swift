@@ -26,6 +26,12 @@ let subsystems: [String] = [
     "Dispatcher",
     "MacControl",
     "ScreenVision",
+    // MacVisionPerception v0 (2026-08-22) — the general screen's second half:
+    // an AX-BLIND window perceived from PIXELS ONLY, emitting the same
+    // MacLookPercept contract the AX lane emits. Pure CGImage → percept; no
+    // capture and no mac_look wiring yet, which is what keeps it fully
+    // testable headless.
+    "VisionPerception",
     "Onboarding",
     "MacAssistantStatus",
     "WorkshopExecution",
@@ -97,7 +103,7 @@ let extraDeps: [String: [String]] = [
     // recall, or memory promotion can. The arrow only points this way;
     // ActivityWatch imports nothing from ChatOrchestration, which is what
     // keeps the module unable to reach a turn on its own.
-    "ChatOrchestration": ["PersistenceCore", "PersonaEngine", "MemoryV2", "ProviderRouting", "TrustCenter", "DreamREMCycle", "ApprovalInbox", "MCPDispatcher", "KnowledgeGraph", "Dispatcher", "MacControl", "Context", "SwarmRuns", "XConnector", "GitHubConnector", "SlackConnector", "MacIntegration", "WorkshopExecution", "SystemOps", "CognitiveSubstrate", "ToolExecution", "Skills", "ActivityWatch"],
+    "ChatOrchestration": ["PersistenceCore", "PersonaEngine", "MemoryV2", "ProviderRouting", "TrustCenter", "DreamREMCycle", "ApprovalInbox", "MCPDispatcher", "KnowledgeGraph", "Dispatcher", "MacControl", "VisionPerception", "Context", "SwarmRuns", "XConnector", "GitHubConnector", "SlackConnector", "MacIntegration", "WorkshopExecution", "SystemOps", "CognitiveSubstrate", "ToolExecution", "Skills", "ActivityWatch"],
     "CognitiveSubstrate": ["PersistenceCore"],
     "XConnector": ["PersistenceCore"],
     "GitHubConnector": ["PersistenceCore"],
@@ -169,6 +175,14 @@ let extraDeps: [String: [String]] = [
     // only on PersistenceCore. ChatOrchestration reaches ActivityWatch through
     // one pinned query adapter, and the Mac app owns the capture lifecycle.
     "ActivityWatch": ["PersistenceCore", "MacControl"],
+    // VisionPerception — MacControl for the SHARED contract it emits
+    // (MacLookPercept / MacLookAffordance / MacLookHandle) and for
+    // MacScreenViewTextRedaction, the one secret redactor every text channel
+    // passes through. Reused, never re-implemented: two redactors drift, and
+    // the copy that drifts is the one nobody re-reviews (same reasoning as
+    // ActivityWatch above). No cycle — MacControl depends only on
+    // PersistenceCore and imports nothing from here.
+    "VisionPerception": ["MacControl", "PersistenceCore"],
 ]
 
 // Per-subsystem external (Swift Package) product dependencies.
@@ -240,7 +254,12 @@ let package = Package(
         ),
         .testTarget(
             name: "NativeAgentCoreTests",
-            dependencies: ["NativeAgentCore", "NativeAgentTestSupport"],
+            dependencies: [
+                "NativeAgentCore",
+                "NativeAgentTestSupport",
+                "PersistenceCore",
+                "ProviderRouting",
+            ],
             path: "Tests/NativeAgentCoreTests"
         ),
         .target(

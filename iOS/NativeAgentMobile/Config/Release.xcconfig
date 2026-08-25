@@ -3,3 +3,8 @@
 // profile cannot silently stamp a Release archive with legacy IDs.
 #include? "Local.xcconfig"
 #include "CanonicalIdentifiers.xcconfig"
+
+// App Store builds must always contain the two public About links, even when
+// no maintainer-local configuration file is present.
+NATIVEAGENT_PRIVACY_POLICY_URL = https://nativeagent.app/privacy
+NATIVEAGENT_SUPPORT_URL = https://nativeagent.app/support

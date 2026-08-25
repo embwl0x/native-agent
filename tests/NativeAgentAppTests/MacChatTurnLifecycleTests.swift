@@ -1321,7 +1321,14 @@ struct MacChatTurnLifecycleTests {
                     "responsePersistence": persistence,
                     "tools": [],
                     "motorActions": [],
-                    "dimensionStates": [:],
+                    "dimensionStates": [
+                        "responsePersistence": "observed",
+                        "context": "censored",
+                        "provider": "censored",
+                        "tools": "censored",
+                        "motor": "censored",
+                        "reaction": "unknown",
+                    ],
                 ],
             ],
         ]

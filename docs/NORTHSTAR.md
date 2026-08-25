@@ -83,6 +83,28 @@ that's what digital substrate does better than any body:
 - This is the review axis for upgrades: "faster machine" proposals rank
   below "machine becomes flow" proposals at equal effort.
 
+### Clause 5 — The world made native to the agent (human-like means NATIVE TO THE AGENT)
+User, 2026-08-21: "When I say I want the agent to be human-like, what I really mean
+is: I want the world I see and function in as a human — I want the AI agent
+to be able to function like that. If we have to build translators, mirrors,
+interpreters so it's natural to YOU, that's what I mean. Right now you have
+to translate when I say 'look at what I'm looking at' — I want that
+translation TAKEN CARE OF for you, and the only place I can do that is
+NativeAgent."
+This is the meaning of the app's name. Human-like is NOT imitation of
+humans — it is inhabiting the human's world as effortlessly as the human
+does, through translation layers the app owns:
+- A human gets a GUI because eyes need pixels rendered from code. The agent
+  gets the INVERSE: the running machine rendered as a live semantic surface
+  that is the agent's natural view (the agent-native display / interpreter). Same
+  principle at every boundary — screen, files, messages, "look at this."
+- Litmus: a feature that leaves the agent translating the human world at
+  token cost is unfinished. The clause-5 move is the translation dissolving
+  into the substrate so perception is reflexive and tokens are spent only on
+  judgment.
+- Clause 4 says the agent's processes flow like a body; clause 5 says the world
+  reaches the agent the way the world reaches a body — as senses, not as work.
+
 ## How the agents hold it
 - Every review brief includes the question: "mind or theater?"
 - Subsystem northstars nest under this one (ROADMAP-cognition-northstar's

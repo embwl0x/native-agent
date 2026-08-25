@@ -21,6 +21,13 @@ public actor SwiftNativeTelegramBot: TelegramBotProtocol {
         self.completenessDeps = completenessDeps
     }
 
+    deinit {
+        let identifier = ObjectIdentifier(self)
+        Task {
+            await TelegramBotCompletenessRegistry.shared.unregister(identifier)
+        }
+    }
+
     public func getStatus() async throws -> TelegramStatus {
         let cfg = TelegramConfig.loadFromDisk(dataRoot: dataRoot)
         let pollerRunning = await backgroundLoopsManager.isRunning(loopId: "telegram_poll")
@@ -120,40 +127,46 @@ public actor SwiftNativeTelegramBot: TelegramBotProtocol {
         guard !target.isEmpty else {
             throw TelegramBotError.notConfigured
         }
-        guard let url = _tgBuildBotURL(token: cfg.botToken, method: "sendMessage") else {
-            throw TelegramBotError.invalidRequest
-        }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.timeoutInterval = 20
         let text = message?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let payload: [String: Any] = [
-            "chat_id": target,
-            "text": text?.isEmpty == false ? text! : "NativeAgent Telegram test reply: online.",
-        ]
-        req.httpBody = try JSONSerialization.data(withJSONObject: payload)
-        let data: Data
-        let response: URLResponse
         do {
-            (data, response) = try await URLSession.shared.data(for: req)
+            return try await _tgRetryAfterFloodControl {
+                guard let url = _tgBuildBotURL(token: cfg.botToken, method: "sendMessage") else {
+                    throw TelegramBotError.invalidRequest
+                }
+                var req = URLRequest(url: url)
+                req.httpMethod = "POST"
+                req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                req.timeoutInterval = 20
+                let payload: [String: Any] = [
+                    "chat_id": target,
+                    "text": text?.isEmpty == false ? text! : "NativeAgent Telegram test reply: online.",
+                ]
+                req.httpBody = try JSONSerialization.data(withJSONObject: payload)
+                let (data, response) = try await URLSession.shared.data(for: req)
+                _ = try TelegramPollLoop._tgValidateResponse(
+                    data,
+                    response: response,
+                    operation: "sendMessage",
+                    resultType: TelegramAPIMessageResult.self
+                )
+                let parsed = data.isEmpty ? JSONValue.null : (try? JSONValue.parse(data)) ?? .null
+                return TelegramTestResult(rawResponse: parsed)
+            }
+        } catch let failure as TelegramAPIFailure {
+            // Preserve the settings surface's existing distinction while
+            // making flood-control a typed, retryable Bot API response.
+            if failure.httpStatus == 400 || failure.httpStatus == 401 {
+                throw TelegramBotError.notConfigured
+            }
+            if failure.kind == .rejected {
+                throw TelegramBotError.underlying(failure.localizedDescription)
+            }
+            throw TelegramBotError.invalidResponse(status: failure.httpStatus ?? failure.errorCode ?? 0)
+        } catch let error as TelegramBotError {
+            throw error
         } catch {
             throw TelegramBotError.underlying(error.localizedDescription)
         }
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        let parsed = data.isEmpty ? JSONValue.null : (try? JSONValue.parse(data)) ?? .null
-        if (200..<300).contains(status) {
-            if case .object(let obj) = parsed,
-               case .bool(false)? = obj["ok"],
-               case .string(let description)? = obj["description"] {
-                throw TelegramBotError.underlying(description)
-            }
-            return TelegramTestResult(rawResponse: parsed)
-        }
-        if status == 400 || status == 401 {
-            throw TelegramBotError.notConfigured
-        }
-        throw TelegramBotError.invalidResponse(status: status)
     }
 
     public func clearLogs() async throws {
@@ -329,12 +342,14 @@ extension SwiftNativeTelegramBot {
             ]
             if let routing = completenessDeps?.routing,
                let info = await routing.modelForSurface("telegram") {
-                lines.append("Model: \(info.model) @ \(info.provider)")
+                lines.append(TelegramPollLoop._tgRedactToken("Model: \(info.model) @ \(info.provider)"))
             } else {
                 lines.append("Model: not configured")
             }
             if let session {
-                lines.append("Session: \(session.sessionId) (\(session.messageCount) message(s), persona \(session.persona))")
+                lines.append(TelegramPollLoop._tgRedactToken(
+                    "Session: \(session.sessionId) (\(session.messageCount) message(s), persona \(session.persona))"
+                ))
             } else {
                 lines.append("Session: unavailable")
             }

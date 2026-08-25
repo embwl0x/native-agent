@@ -132,6 +132,14 @@ case "$cmd" in
       usage
       exit 2
     fi
+    case "$scenario" in
+      provider_brittle|stale_phone|resource_tight|memory_brittle|approval_closed) ;;
+      *)
+        echo "unknown organism scenario: $scenario" >&2
+        usage
+        exit 2
+        ;;
+    esac
 
     echo "== before =="
     state_json | jq "$organism_summary"

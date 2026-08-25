@@ -11,9 +11,12 @@
 //     escape hatch that brings the main window forward
 //   - Recent prompts persisted in UserDefaults for ↑/↓ recall
 
+import Foundation
 import SwiftUI
 import AppKit
 import NativeAgentCore
+import PersistenceCore
+import ProviderRouting
 
 // PATCH-2026-05-07: spotlight-overlay-keywindow Subclass NSPanel so we can
 // override canBecomeKey/Main. .nonactivatingPanel style normally refuses key
@@ -30,10 +33,16 @@ final class SpotlightPanel: NSPanel {
 /// panel's current frame. Lives outside the @MainActor class so the
 /// non-MainActor MacControlBridge can read it without actor-isolation
 /// errors. Hops to the main thread internally.
+enum SpotlightOverlayProbeResult: Equatable {
+    case frame(Int, Int, Int, Int)
+    case absent
+    case timedOut
+}
+
 enum SpotlightOverlayProbe {
     /// Returns (x, y, width, height) of the panel's current frame, or nil
     /// when the panel hasn't been instantiated.
-    static func currentFrame() -> (Int, Int, Int, Int)? {
+    static func currentFrame() -> SpotlightOverlayProbeResult {
         let semaphore = DispatchSemaphore(value: 0)
         nonisolated(unsafe) var captured: (Int, Int, Int, Int)? = nil
         DispatchQueue.main.async {
@@ -43,8 +52,155 @@ enum SpotlightOverlayProbe {
             }
             semaphore.signal()
         }
-        _ = semaphore.wait(timeout: .now() + .milliseconds(500))
-        return captured
+        let completed = semaphore.wait(timeout: .now() + .milliseconds(500)) == .success
+        return resolve(completed: completed, frame: captured)
+    }
+
+    /// Keep a visible overlay distinct from a main-thread probe that could not
+    /// complete. The bridge must never describe a timeout as "not open".
+    static func resolve(
+        completed: Bool,
+        frame: (Int, Int, Int, Int)?
+    ) -> SpotlightOverlayProbeResult {
+        guard completed else { return .timedOut }
+        guard let frame else { return .absent }
+        return .frame(frame.0, frame.1, frame.2, frame.3)
+    }
+}
+
+enum SpotlightRecentPrompts {
+    static let defaultsKey = "spotlight.recentPrompts"
+    static let maximumCount = 30
+
+    static func load(from defaults: UserDefaults) -> [String] {
+        defaults.stringArray(forKey: defaultsKey) ?? []
+    }
+
+    @discardableResult
+    static func record(_ prompt: String, in defaults: UserDefaults) -> [String] {
+        let updated = recording(prompt, into: load(from: defaults))
+        defaults.set(updated, forKey: defaultsKey)
+        return updated
+    }
+
+    static func recording(_ prompt: String, into existing: [String]) -> [String] {
+        var prompts = existing.filter { $0 != prompt }
+        prompts.insert(prompt, at: 0)
+        return Array(prompts.prefix(maximumCount))
+    }
+}
+
+enum SpotlightCommandPalettePresentation {
+    static let maximumEntries = 6
+
+    enum State: Equatable {
+        case loading
+        case unavailable(String)
+        case entries([CoordinationCommandEntry])
+        case noMatches
+        case idle
+    }
+
+    static func visibleEntries(_ entries: [CoordinationCommandEntry]) -> [CoordinationCommandEntry] {
+        Array(entries.prefix(maximumEntries))
+    }
+
+    static func resolved(
+        _ result: Result<[CoordinationCommandEntry], Error>
+    ) -> (entries: [CoordinationCommandEntry], error: String?) {
+        switch result {
+        case .success(let entries):
+            return (visibleEntries(entries), nil)
+        case .failure(let error):
+            return ([], "Command shortcuts unavailable: \(error.localizedDescription)")
+        }
+    }
+
+    /// The exact precedence the overlay renders below its input: an in-flight
+    /// search and a failed reader must never be disguised as an empty result.
+    static func state(
+        input: String,
+        isPending: Bool,
+        entries: [CoordinationCommandEntry],
+        error: String?
+    ) -> State {
+        if isPending { return .loading }
+        if let error { return .unavailable(error) }
+        let visible = visibleEntries(entries)
+        if !visible.isEmpty { return .entries(visible) }
+        return input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? .idle
+            : .noMatches
+    }
+}
+
+/// The palette command click has one atomic observable effect: resolve a
+/// command into a canonical app destination, deliver that destination, then
+/// dismiss the temporary overlay. Unknown command entries remain inert and do
+/// not dismiss the overlay.
+enum SpotlightCommandPaletteAction {
+    @discardableResult
+    static func select(
+        _ entry: CoordinationCommandEntry,
+        route: (NativeAgentNavigationDestination) -> Void,
+        dismiss: () -> Void
+    ) -> Bool {
+        guard let destination = NativeAgentNavigationDestination.commandEntry(entry) else {
+            return false
+        }
+        route(destination)
+        dismiss()
+        return true
+    }
+}
+
+/// A previous chat reply must not hide shortcut search. The overlay keeps its
+/// last answer across pops, but entering a new query is an explicit request to
+/// search commands and should take precedence over that retained answer.
+enum SpotlightOverlayPresentation {
+    static func showsCommandPalette(input: String, hasReply: Bool) -> Bool {
+        !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !hasReply
+    }
+}
+
+/// The overlay is a focused entrance to the main conversation, not a separate
+/// model surface. Keep its stable transcript identity together with the exact
+/// route ingredients that are admitted for the main chat surface, so a stale
+/// UI cache cannot silently send this conversation to a different model.
+struct SpotlightTurnIngredient: Sendable, Equatable {
+    static let spotlightSessionId = "spotlight"
+
+    let sessionId: String
+    let model: String
+    let reasoningEffort: String
+    let fileAccess: String
+
+    static func resolved(
+        routing: SurfacePreference,
+        fileAccess: String
+    ) -> SpotlightTurnIngredient {
+        SpotlightTurnIngredient(
+            sessionId: spotlightSessionId,
+            model: routing.model,
+            reasoningEffort: routing.reasoningEffort,
+            fileAccess: AppModel.normalizedAgentAccessMode(fileAccess)
+        )
+    }
+
+    /// Read the same persisted `chat` picker that the main chat turn admits.
+    /// Missing configuration has a provider-routing default; malformed routing
+    /// state remains an error instead of falling back to unrelated defaults.
+    @MainActor
+    static func current(
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        defaults: UserDefaults = .standard
+    ) async throws -> SpotlightTurnIngredient {
+        let routing = SwiftNativeProviderRouting(dataRoot: dataRoot)
+        let preference = try await routing.modelForSurface("chat")
+        return resolved(
+            routing: preference,
+            fileAccess: defaults.string(forKey: "chatFileAccess") ?? "auto"
+        )
     }
 }
 
@@ -177,36 +333,72 @@ final class SpotlightViewModel: ObservableObject {
     @Published var error: String? = nil
     @Published var focusInput: Bool = false   // toggling this re-focuses the field
     @Published var commandEntries: [CoordinationCommandEntry] = []
+    @Published var commandPaletteError: String?
+    @Published var commandSearchPending = false
     private var commandPaletteGate = LatestAsyncRequestGate()
+    private let ingredientResolver: @MainActor () async throws -> SpotlightTurnIngredient
+    private let turnSender: @MainActor (String, SpotlightTurnIngredient) async throws -> String
 
-    // Stable session id so memory persists across pops
-    private let sessionId: String = "spotlight"
-    private var nativeBase: String {
-        NativeBaseURLDefaults.read()
+    init() {
+        ingredientResolver = { try await SpotlightTurnIngredient.current() }
+        turnSender = { text, ingredient in
+            let response = try await NativeClient(baseURL: NativeBaseURLDefaults.read()).chat(
+                message: text,
+                sessionId: ingredient.sessionId,
+                model: ingredient.model,
+                reasoningEffort: ingredient.reasoningEffort,
+                fileAccess: ingredient.fileAccess,
+                surface: "chat"
+            )
+            return response.output
+        }
+    }
+
+    init(
+        ingredientResolver: @escaping @MainActor () async throws -> SpotlightTurnIngredient,
+        turnSender: @escaping @MainActor (String, SpotlightTurnIngredient) async throws -> String
+    ) {
+        self.ingredientResolver = ingredientResolver
+        self.turnSender = turnSender
     }
 
     // Up-arrow recall
-    private let recentKey = "spotlight.recentPrompts"
     var recentPrompts: [String] {
-        UserDefaults.standard.stringArray(forKey: recentKey) ?? []
+        SpotlightRecentPrompts.load(from: .standard)
     }
     private func saveRecent(_ prompt: String) {
-        var list = recentPrompts
-        list.removeAll(where: { $0 == prompt })
-        list.insert(prompt, at: 0)
-        if list.count > 30 { list = Array(list.prefix(30)) }
-        UserDefaults.standard.set(list, forKey: recentKey)
+        SpotlightRecentPrompts.record(prompt, in: .standard)
+    }
+
+    func prepareCommandPaletteSearch() {
+        commandSearchPending = true
+        commandEntries = []
+        commandPaletteError = nil
     }
 
     func refreshCommandPalette(query: String = "") async {
         let requestToken = commandPaletteGate.begin()
-        let api = NativeClient(baseURL: nativeBase)
+        prepareCommandPaletteSearch()
+        let api = NativeClient(baseURL: NativeBaseURLDefaults.read())
         do {
-            let entries = try await api.searchCommandPalette(query: query, limit: 8)
+            // The rendered panel intentionally has room for six entries. Keep
+            // the request aligned so a returned entry is never silently
+            // fetched and then made unreachable.
+            let entries = try await api.searchCommandPalette(
+                query: query,
+                limit: SpotlightCommandPalettePresentation.maximumEntries
+            )
             guard !Task.isCancelled, commandPaletteGate.accepts(requestToken) else { return }
-            self.commandEntries = entries
+            let presentation = SpotlightCommandPalettePresentation.resolved(.success(entries))
+            self.commandEntries = presentation.entries
+            self.commandPaletteError = presentation.error
+            self.commandSearchPending = false
         } catch {
-            // The command palette is opportunistic; Spotlight chat remains usable if it is unavailable.
+            guard !Task.isCancelled, commandPaletteGate.accepts(requestToken) else { return }
+            let presentation = SpotlightCommandPalettePresentation.resolved(.failure(error))
+            self.commandEntries = presentation.entries
+            self.commandPaletteError = presentation.error
+            self.commandSearchPending = false
         }
     }
 
@@ -225,25 +417,13 @@ final class SpotlightViewModel: ObservableObject {
     }
 
     private func send(_ text: String) async {
-        defer { Task { @MainActor in self.isThinking = false } }
-        let api = NativeClient(baseURL: nativeBase)
-        let model = UserDefaults.standard.string(forKey: "chatModel") ?? nativeAgentPrimaryModel
-        let effort = UserDefaults.standard.string(forKey: "chatReasoningEffort") ?? "high"
-        let fileAccess = UserDefaults.standard.string(forKey: "chatFileAccess") ?? "auto"
+        defer { isThinking = false }
         do {
-            let response = try await api.chat(
-                message: text,
-                sessionId: sessionId,
-                model: model,
-                reasoningEffort: effort,
-                fileAccess: fileAccess
-            )
-            let reply = response.output
-            await MainActor.run {
-                self.lastReply = reply.isEmpty ? "(no reply)" : reply
-            }
+            let ingredient = try await ingredientResolver()
+            let reply = try await turnSender(text, ingredient)
+            lastReply = reply.isEmpty ? "(no reply)" : reply
         } catch {
-            await MainActor.run { self.error = error.localizedDescription }
+            self.error = error.localizedDescription
         }
     }
 }
@@ -282,6 +462,7 @@ struct SpotlightView: View {
                     .onAppear { isInputFocused = true }
                     .onChange(of: viewModel.input) { _, newValue in
                         commandSearchTask?.cancel()
+                        viewModel.prepareCommandPaletteSearch()
                         commandSearchTask = Task {
                             try? await Task.sleep(nanoseconds: 100_000_000)
                             guard !Task.isCancelled else { return }
@@ -291,6 +472,7 @@ struct SpotlightView: View {
                     .onChange(of: viewModel.focusInput) { _, _ in
                         DispatchQueue.main.async { isInputFocused = true }
                     }
+                    .accessibilityIdentifier("spotlight.input")
                 if viewModel.isThinking {
                     ProgressView().controlSize(.small)
                 }
@@ -314,7 +496,11 @@ struct SpotlightView: View {
                             .textSelection(.enabled)
                     }
                     .padding(20)
-                } else if !viewModel.lastReply.isEmpty {
+                } else if !viewModel.lastReply.isEmpty,
+                          !SpotlightOverlayPresentation.showsCommandPalette(
+                            input: viewModel.input,
+                            hasReply: true
+                          ) {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 10) {
                             if !viewModel.lastPrompt.isEmpty {
@@ -343,16 +529,37 @@ struct SpotlightView: View {
                         }
                         .foregroundStyle(.secondary)
 
-                        if !viewModel.commandEntries.isEmpty {
+                        switch SpotlightCommandPalettePresentation.state(
+                            input: viewModel.input,
+                            isPending: viewModel.commandSearchPending,
+                            entries: viewModel.commandEntries,
+                            error: viewModel.commandPaletteError
+                        ) {
+                        case .loading:
+                            Label("Searching shortcuts…", systemImage: "magnifyingglass")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                                .padding(.top, 4)
+                                .accessibilityIdentifier("spotlight.commandPalette.loading")
+                        case .unavailable(let error):
+                            Label(error, systemImage: "exclamationmark.triangle")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.orange)
+                                .padding(.top, 4)
+                                .accessibilityIdentifier("spotlight.commandPalette.error")
+                        case .entries(let entries):
                             Text("FIND")
                                 .font(.system(size: 10, weight: .bold))
                                 .tracking(0.8)
                                 .foregroundStyle(.tertiary)
                                 .padding(.top, 4)
-                            ForEach(viewModel.commandEntries.prefix(6)) { entry in
+                            ForEach(entries) { entry in
                                 Button {
-                                    NativeAgentAppCoordinator.shared.request(commandEntry: entry)
-                                    onDismiss()
+                                    _ = SpotlightCommandPaletteAction.select(
+                                        entry,
+                                        route: { NativeAgentAppCoordinator.shared.request($0) },
+                                        dismiss: onDismiss
+                                    )
                                 } label: {
                                     HStack(spacing: 8) {
                                         Image(systemName: entry.systemImage ?? "magnifyingglass")
@@ -376,7 +583,16 @@ struct SpotlightView: View {
                                     .padding(.vertical, 4)
                                 }
                                 .buttonStyle(.plain)
+                                .accessibilityIdentifier("spotlight.commandPalette.\(entry.id)")
                             }
+                        case .noMatches:
+                            Label("No shortcuts match this search. Press Return to ask the assistant instead.", systemImage: "magnifyingglass")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                                .padding(.top, 4)
+                                .accessibilityIdentifier("spotlight.commandPalette.empty")
+                        case .idle:
+                            EmptyView()
                         }
 
                         if !viewModel.recentPrompts.isEmpty {

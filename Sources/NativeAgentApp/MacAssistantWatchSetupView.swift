@@ -1,20 +1,35 @@
 import SwiftUI
 
 struct MacAssistantWatchSetupView: View {
-    var refreshToken: Int = 0
+    typealias StatusReader = @MainActor () async throws -> MacAssistantStatusResponse
+
+    var refreshToken: Int
+    private let statusReader: StatusReader?
+    private let loadsOnAppear: Bool
 
     @Environment(AppModel.self) private var appModel
-    @State private var status: MacAssistantStatusResponse?
+    @State private var loadState: MacAssistantWatchSetupLoadState = .loading
     @State private var isLoading = false
-    @State private var errorText: String?
+
+    init(
+        refreshToken: Int = 0,
+        statusReader: StatusReader? = nil,
+        loadsOnAppear: Bool = true
+    ) {
+        self.refreshToken = refreshToken
+        self.statusReader = statusReader
+        self.loadsOnAppear = loadsOnAppear
+    }
 
     var body: some View {
         NativePanel(title: "Assistant Watch Setup", systemImage: "eye", tint: .teal) {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 8) {
-                    StatusBadge(text: status?.status.capitalized ?? "Loading", status: normalizedStatus(status?.status))
-                    if let attention = status?.templateAttentionCount, attention > 0 {
+                    StatusBadge(text: loadState.badgeText, status: normalizedStatus(loadState.badgeStatus))
+                        .accessibilityIdentifier("mac-assistant-watch.load-status")
+                    if let attention = loadState.response?.templateAttentionCount, attention > 0 {
                         StatusBadge(text: "\(attention) needs setup", status: "warn")
+                            .accessibilityIdentifier("mac-assistant-watch.template-attention")
                     }
                     Spacer()
                     Button("Refresh", systemImage: "arrow.clockwise") {
@@ -22,28 +37,55 @@ struct MacAssistantWatchSetupView: View {
                     }
                     .buttonStyle(.bordered)
                     .disabled(isLoading)
+                    .accessibilityIdentifier("mac-assistant-watch.refresh")
                 }
 
-                if let summary = status?.summary {
+                if let summary = loadState.response?.summary {
                     Text(summary)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                if let createsJobs = loadState.response?.createsJobs {
+                    Label(
+                        createsJobs
+                            ? "Watch jobs are active; their receipts will appear as they run."
+                            : "These are setup templates only. No watch job or receipt exists until you schedule one.",
+                        systemImage: createsJobs ? "checkmark.circle" : "clock.badge.exclamationmark"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(createsJobs ? NativeAgentTheme.ok : Color.secondary)
+                }
 
-                if isLoading && status == nil {
+                if isLoading && loadState.response == nil {
                     ProgressView("Checking access...")
-                } else if let errorText {
-                    Label(errorText, systemImage: "exclamationmark.triangle")
+                } else if let diagnostic = loadState.diagnosticText {
+                    Label(diagnostic, systemImage: "exclamationmark.triangle")
                         .font(.caption)
                         .foregroundStyle(.orange)
-                } else if let status {
+                        .accessibilityIdentifier("mac-assistant-watch.load-error")
+                    if let status = loadState.response {
+                        Text("Showing the last known inventory; refresh did not complete.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        accessSection(status.access)
+                        Divider()
+                        templatesSection(status.watchTemplates)
+                    } else {
+                        Text("No watch setup inventory is available. Check Mac Control and try Refresh again.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } else if let status = loadState.response {
                     accessSection(status.access)
                     Divider()
                     templatesSection(status.watchTemplates)
                 }
             }
         }
-        .task { await load() }
+        .task {
+            guard loadsOnAppear else { return }
+            await load()
+        }
         .onChange(of: refreshToken) { _, _ in
             Task { await load() }
         }
@@ -122,12 +164,19 @@ struct MacAssistantWatchSetupView: View {
 
     private func load() async {
         isLoading = true
-        errorText = nil
         defer { isLoading = false }
         do {
-            status = try await appModel.getMacAssistantStatus()
+            let status: MacAssistantStatusResponse
+            if let statusReader {
+                status = try await statusReader()
+            } else {
+                status = try await appModel.getMacAssistantStatus()
+            }
+            loadState = .current(status)
         } catch {
-            errorText = error.localizedDescription
+            loadState = loadState.afterFailure(
+                "Couldn’t refresh Assistant Watch setup: \(error.localizedDescription)"
+            )
         }
     }
 
@@ -137,7 +186,7 @@ struct MacAssistantWatchSetupView: View {
             return "ready"
         case "attention", "needs_setup", "needs_proof", "needs_policy", "needs_permission", "probe_needed":
             return "warn"
-        case "failed", "error":
+        case "failed", "error", "unavailable":
             return "failed"
         default:
             return status ?? "unknown"

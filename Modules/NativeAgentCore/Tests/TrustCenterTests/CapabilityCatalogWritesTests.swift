@@ -230,7 +230,9 @@ struct CapabilityPackValidateTests {
         #expect(jstr(report, "status") == "valid")
         #expect(jbool(report, "valid") == true)
         #expect(jarr(report, "errors").isEmpty)
-        #expect(jstr(report, "trustTier") == "local")
+        // A local pack validates its integrity, but carries no independent
+        // attestation: the bootstrap root is derived from the same local key.
+        #expect(jstr(report, "trustTier") == "self_issued")
         #expect(jstr(report, "signingIdentity") == "local-trusted")
     }
 
@@ -575,8 +577,13 @@ struct CatalogWritesTests {
         try FileManager.default.createDirectory(
             at: installsPath.deletingLastPathComponent(), withIntermediateDirectories: true
         )
+        // Every production writer since the Swift install port (b4cb6311,
+        // 2026-06-03 — the entire 0.4.x line) writes a non-empty status on
+        // each receipt, and the strict reader
+        // (loadCapabilityPackInstallsChecked) rejects rows without one.
         let install: [Any] = [[
             "id": "install-1", "packId": "demo-pack", "version": "2.0.0",
+            "status": "installed",
             "installedAt": "2026-06-01T01:00:00+00:00",
         ]]
         try JSONSerialization.data(withJSONObject: install).write(to: installsPath)
@@ -619,16 +626,24 @@ struct CatalogWritesTests {
         try FileManager.default.createDirectory(
             at: installsPath.deletingLastPathComponent(), withIntermediateDirectories: true
         )
-        // install with NO packId key → Python f"update:{None}" == "update:None".
-        let installs: [Any] = [["id": "x", "version": "1.0"]]
+        // Historically Python tolerated a receipt with no packId and emitted
+        // f"update:{None}" == "update:None". The strict receipt authority
+        // (loadCapabilityPackInstallsChecked) now rejects such a row as a
+        // damaged store: a receipt that cannot name its pack is unaddressable
+        // for reinstall/rollback decisions. No production writer in the 0.4.x
+        // line has ever omitted packId, so this only fires on damage.
+        let installs: [Any] = [["id": "x", "version": "1.0", "status": "installed"]]
         try JSONSerialization.data(withJSONObject: installs).write(to: installsPath)
         let writes = SwiftNativeCatalogWrites(dataRoot: root, persistence: SwiftNativePersistenceCore())
-        let result = try await writes.checkCapabilityUpdates()
-        let updates = jarr(result, "updates")
-        if case .object(let u)? = updates.first {
-            #expect(jstr(u, "id") == "update:None")
-        } else {
-            #expect(Bool(false))
+        do {
+            _ = try await writes.checkCapabilityUpdates()
+            #expect(Bool(false), "a packId-less install row must read as a damaged store, not update:None")
+        } catch let error as CapabilityCatalogPersistenceError {
+            guard case .malformed(_, let detail) = error else {
+                #expect(Bool(false), "expected .malformed, got \(error)")
+                return
+            }
+            #expect(detail.contains("no non-empty string packId"))
         }
     }
 
@@ -641,10 +656,10 @@ struct CatalogWritesTests {
         )
         // Two share a timestamp (stable order preserved), one is newer, one older.
         let installs: [Any] = [
-            ["id": "a", "installedAt": "2026-06-01T00:00:00+00:00"],
-            ["id": "b", "installedAt": "2026-06-03T00:00:00+00:00"],
-            ["id": "c", "installedAt": "2026-06-02T00:00:00+00:00"],
-            ["id": "d", "installedAt": "2026-06-02T00:00:00+00:00"],
+            ["id": "a", "packId": "pack-a", "status": "installed", "installedAt": "2026-06-01T00:00:00+00:00"],
+            ["id": "b", "packId": "pack-b", "status": "installed", "installedAt": "2026-06-03T00:00:00+00:00"],
+            ["id": "c", "packId": "pack-c", "status": "installed", "installedAt": "2026-06-02T00:00:00+00:00"],
+            ["id": "d", "packId": "pack-d", "status": "installed", "installedAt": "2026-06-02T00:00:00+00:00"],
         ]
         try JSONSerialization.data(withJSONObject: installs).write(to: installsPath)
         let writes = SwiftNativeCatalogWrites(

@@ -1,0 +1,17 @@
+{
+  "surfaces": [
+    { "fence": "core.chat.tools", "id": "chat.tools.sys10" },
+    { "fence": "core.context", "id": "app.personaContextFlowProvider" },
+    { "fence": "core.maccontrol", "id": "ui.remoteNodesPage" },
+    { "fence": "core.misc", "id": "cli.chatDrive.env.embeddingMock" },
+    { "fence": "core.misc", "id": "cli.chatDrive.env.publicSafeMode" },
+    { "fence": "core.substrate.affect", "id": "instrument.SUB.affectMatrixRows" },
+    { "fence": "core.substrate.affect", "id": "instrument.capsuleAnatomy.metricMismatch" },
+    { "fence": "core.substrate.affect", "id": "ui.control.capsuleInjectionEnabled" },
+    { "fence": "core.substrate.affect", "id": "ui.control.cognitiveSubstrateEnabled" },
+    { "fence": "core.substrate.organism", "id": "ui.observatory.organismToggle" },
+    { "fence": "core.telegram", "id": "telegram.chat.busyNotice" },
+    { "fence": "turn.contract", "id": "turn.ingredient.quietHoursWindow" },
+    { "fence": "turn.contract", "id": "turn.ingredient.recallQuerySignalLines" }
+  ]
+}

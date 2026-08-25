@@ -73,9 +73,15 @@ public actor MockDeviceCloud {
     }
     func status(role: String, key: String) -> String? { status["\(role)/\(key)"] }
 
-    /// Register an observer for a peer (role, key)'s status writes.
-    func registerStatusObserver(watching role: String, key: String, handler: @escaping @Sendable (String) async -> Void) {
+    /// Register an observer for a peer (role, key)'s status writes and return
+    /// the current value in the SAME actor-isolated call. Register-then-read
+    /// as two calls left an interleave window where a publish between them was
+    /// delivered twice (once by the publish, once by the drain).
+    func registerStatusObserver(
+        watching role: String, key: String, handler: @escaping @Sendable (String) async -> Void
+    ) -> String? {
         statusObservers["\(role)/\(key)", default: []].append(handler)
+        return status["\(role)/\(key)"]
     }
 
     public func accountStatus() -> String { simulateAccountStatus }
@@ -193,10 +199,13 @@ public actor MockDeviceSyncTransport: DeviceSyncTransport {
     public func observeStatus(key: String, onChange: @escaping @Sendable (String) async -> Void) async {
         statusHandlers[key] = onChange
         let peerRole: NADeviceRole = role == .mac ? .ios : .mac
-        // Ongoing: register so a LATER peer status write fires the handler...
-        await cloud.registerStatusObserver(watching: peerRole.rawValue, key: key, handler: onChange)
-        // ...and drain the current value if one was already set.
-        if let value = await cloud.status(role: peerRole.rawValue, key: key) {
+        // Ongoing: register so a LATER peer status write fires the handler, and
+        // drain the current value (if already set) from the SAME atomic call so
+        // a write racing the registration is delivered exactly once.
+        let current = await cloud.registerStatusObserver(
+            watching: peerRole.rawValue, key: key, handler: onChange
+        )
+        if let value = current {
             await onChange(value)
         }
     }

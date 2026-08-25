@@ -530,6 +530,72 @@ struct CognitionEventDrivenAcceleratedProofTests {
         }
     }
 
+    // EVAL FENCE: core.substrate.organism
+    // Ledger row: telemetry.residualDeadlineArmedFired
+    //
+    // The runtime is the only production owner that discovers organism
+    // opportunities and submits their deadline evidence. A same-instant wake
+    // re-anchor must not inflate arms, and the exact generated deadline must
+    // still yield one persisted fire after the real runtime revalidates it.
+    @Test("runtime residual deadline emits one deduplicated arm/fire evidence pair")
+    func runtimeResidualDeadlineTelemetryIsObservableAndDeduplicated() async throws {
+        let root = try temporaryRoot("runtime-residual-deadline-telemetry")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let clock = AcceleratedCognitionClock(Date(timeIntervalSince1970: 5_500_000))
+        let runtimeID = "runtime-residual-deadline"
+        let recorder = acceleratedRecorder(root: root, runtime: runtimeID, clock: clock)
+        let runtime = makeRuntime(
+            root: root,
+            clock: clock,
+            organismConfiguration: OrganismConfiguration(enabled: true),
+            recorder: recorder
+        )
+
+        await runtime.bootstrap()
+        await runtime.flushPendingMicrocycleForProof()
+        await runtime.ingestOrganismSignal(
+            kind: .providerStarted,
+            sourceOrgan: "deadline-proof",
+            intensity: 0.9,
+            metadata: ["predictionCorrelationId": .string("deadline-proof-turn")],
+            prewarmContext: false
+        )
+        await runtime.ingestOrganismSignal(
+            kind: .providerFailed,
+            sourceOrgan: "deadline-proof",
+            intensity: 0.9,
+            metadata: ["predictionCorrelationId": .string("deadline-proof-turn")],
+            prewarmContext: false
+        )
+        let deadline = try #require(await runtime.residualRepairDeadlineForProof())
+        // The re-anchor reschedules the exact same opportunity. The runtime
+        // submits it again, but the recorder must preserve one arm row.
+        await runtime.reanchorDeadlinesAfterWake()
+        #expect(await runtime.residualRepairDeadlineForProof() == deadline)
+
+        clock.advance(deadline.timeIntervalSince(clock.now()))
+        await runtime.flushResidualRepairDeadlineForProof()
+        _ = try #require(await runtime.installedPhysiologySoakReport())
+        let records = try loadPhysiologyRecords(root: root, runtimeID: runtimeID)
+        // Bootstrap can legitimately have completed an earlier residual-repair
+        // lifecycle. This proof owns the exact opportunity re-anchored above,
+        // so scope its dedupe contract to that deadline rather than treating
+        // a prior arm as a duplicate of this lifecycle.
+        let arms = records.filter {
+            $0.kind == .residualDeadlineArmed && $0.scheduledDeadlineAt == deadline
+        }
+        let fires = records.filter {
+            $0.kind == .residualDeadlineFired && $0.scheduledDeadlineAt == deadline
+        }
+        #expect(arms.count == 1)
+        #expect(fires.count == 1)
+        #expect(arms[0].scheduledDeadlineAt == deadline)
+        #expect(fires[0].scheduledDeadlineAt == deadline)
+        #expect(fires[0].deadlineErrorMilliseconds == 0)
+        let diagnostics = await recorder.diagnostics()
+        #expect(!diagnostics.hasMeasurementGap)
+    }
+
     @Test("a wedged physiology submission cannot hold the drain barrier forever")
     func wedgedPhysiologySubmissionBailsOutAtDeadline() async throws {
         let root = try temporaryRoot("wedged-physiology-submission")

@@ -297,7 +297,10 @@ extension BackgroundLoopsAssembly {
     /// detail. See the report note about the one-click Act button.
     static func fileSystemPermissionNotice(
         capability: String,
-        dataRoot: URL
+        dataRoot: URL,
+        permissionStatus: @escaping @Sendable () -> SystemPermissionStatus = {
+            SystemPermissionPreflight.status(.speechRecognition)
+        }
     ) async {
         guard capability == SystemPermissionCapability.speechRecognition.rawValue else {
             // Only the speech capability has a card today. An unrecognised
@@ -310,12 +313,15 @@ extension BackgroundLoopsAssembly {
         let cap = SystemPermissionCapability.speechRecognition
         // Read the LIVE status (non-prompting) so the card states what is
         // actually true now, not what the failing turn assumed.
-        let liveStatus = SystemPermissionPreflight.status(cap)
+        let liveStatus = permissionStatus()
         guard liveStatus != .granted else {
             // The grant landed between the failed turn and this write (e.g. the
             // launch preflight resolved it). Do not file a card that is already
             // false — and clear any card a previous denial left behind.
-            await retireSystemPermissionCardIfGranted(dataRoot: dataRoot)
+            await retireSystemPermissionCardIfGranted(
+                dataRoot: dataRoot,
+                permissionStatus: permissionStatus
+            )
             return
         }
         let snapshot = SystemPermissionSnapshot(capability: cap, status: liveStatus)
@@ -438,8 +444,13 @@ extension BackgroundLoopsAssembly {
     /// that outlives its own condition. Safe to call on every launch; it is a
     /// no-op when the grant is missing, when there is no card, or when the user
     /// already archived/dismissed it.
-    static func retireSystemPermissionCardIfGranted(dataRoot: URL) async {
-        guard SystemPermissionPreflight.status(.speechRecognition) == .granted else { return }
+    static func retireSystemPermissionCardIfGranted(
+        dataRoot: URL,
+        permissionStatus: @escaping @Sendable () -> SystemPermissionStatus = {
+            SystemPermissionPreflight.status(.speechRecognition)
+        }
+    ) async {
+        guard permissionStatus() == .granted else { return }
         let inboxPath = dataRoot
             .appendingPathComponent("notifications", isDirectory: true)
             .appendingPathComponent("inbox.jsonl")
@@ -486,7 +497,11 @@ extension BackgroundLoopsAssembly {
         }
     }
 
-    private static func makeTelegramVoiceTranscriber(
+    /// The Telegram surface's one transcriber factory. Keeping this at the
+    /// assembly boundary means the config chooses a backend once, while each
+    /// inbound voice note still executes through the shared poll-loop error and
+    /// permission-card path.
+    static func makeTelegramVoiceTranscriber(
         cfg: TelegramBot.TelegramConfig,
         dataRoot: URL
     ) -> (any TelegramVoiceTranscribing)? {
@@ -836,8 +851,35 @@ struct TelegramMemoryWriterBridge: TelegramMemoryWriteRef, Sendable {
 // stamp, audit trail, relauncher, and grace-period terminate exist exactly
 // once. The TelegramBot module can't see AppKit; this bridge is the
 // injection point, mirroring TelegramMemoryWriterBridge.
-private struct TelegramRestartBridge: TelegramRestartRef, Sendable {
+/// App-owned adapter for the Telegram restart capability.  A successful
+/// coordinator envelope is not enough to acknowledge a restart: Telegram
+/// also needs the deferred termination handoff so the committed relaunch can
+/// actually make progress after the reply is delivered.
+struct TelegramRestartBridge: TelegramRestartRef, Sendable {
+    typealias DeferredRestart = @Sendable (
+        _ reason: String
+    ) async -> (envelope: JSONValue, armTerminate: (@Sendable () -> Void)?)
+
     let dataRoot: URL
+    private let deferredRestart: DeferredRestart
+
+    init(dataRoot: URL) {
+        self.init(dataRoot: dataRoot, deferredRestart: Self.requestSharedRestart)
+    }
+
+    init(dataRoot: URL, deferredRestart: @escaping DeferredRestart) {
+        self.dataRoot = dataRoot
+        self.deferredRestart = deferredRestart
+    }
+
+    private static func requestSharedRestart(
+        reason: String
+    ) async -> (envelope: JSONValue, armTerminate: (@Sendable () -> Void)?) {
+        await AppRestartCoordinator.shared.requestRestartDeferringTerminate(
+            reason: reason,
+            source: "telegram:/restart"
+        )
+    }
 
     func ownerChatIds() async -> Set<Int64> {
         // Owner = the on-disk Telegram allowlist. Re-read per call (not
@@ -853,25 +895,28 @@ private struct TelegramRestartBridge: TelegramRestartRef, Sendable {
         // closure rides back to the poll loop, which invokes it AFTER the
         // reply send attempt instead of racing sendMessage against the app
         // termination timer.
-        let (envelope, armTerminate) = await AppRestartCoordinator.shared
-            .requestRestartDeferringTerminate(
-                reason: reason,
-                source: "telegram:/restart"
-            )
+        let (envelope, armTerminate) = await deferredRestart(reason)
         guard case .object(let obj) = envelope else {
             return TelegramRestartOutcome(
-                reply: "Restart failed: unexpected coordinator response.",
-                armTerminate: armTerminate
+                reply: "Restart failed: unexpected coordinator response."
             )
         }
         func str(_ key: String) -> String? {
             if case .string(let s)? = obj[key] { return s }
             return nil
         }
-        if str("status") == "restarting" {
+        if str("status") == "restarting", let armTerminate {
             return TelegramRestartOutcome(
                 reply: "Restarting NativeAgent — back in under a minute. \(str("note") ?? "")",
                 armTerminate: armTerminate
+            )
+        }
+        if str("status") == "restarting" {
+            // A relauncher stamp without the post-reply exit handoff leaves
+            // the old process running and makes the Telegram acknowledgement
+            // a lie. Treat this malformed primitive outcome as a refusal.
+            return TelegramRestartOutcome(
+                reply: "Restart failed: restart handoff was incomplete; NativeAgent is still running."
             )
         }
         if str("reason") == "cooldown" {
@@ -880,13 +925,11 @@ private struct TelegramRestartBridge: TelegramRestartRef, Sendable {
                 return "?"
             }()
             return TelegramRestartOutcome(
-                reply: "Restart refused: a tool-initiated restart fired within the last 10 minutes. Retry in \(retry)s.",
-                armTerminate: armTerminate
+                reply: "Restart refused: a tool-initiated restart fired within the last 10 minutes. Retry in \(retry)s."
             )
         }
         return TelegramRestartOutcome(
-            reply: "Restart failed: \(str("reason") ?? "unknown"). \(str("detail") ?? "")",
-            armTerminate: armTerminate
+            reply: "Restart failed: \(str("reason") ?? "unknown"). \(str("detail") ?? "")"
         )
     }
 }

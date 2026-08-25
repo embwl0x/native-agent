@@ -568,3 +568,90 @@ private func isNull(_ v: JSONValue, _ key: String) -> Bool {
     }
     #expect(fix.readRunsRaw().count == 12)
 }
+
+// MARK: - operation deadline validation (eval ledger: browser.operationStore.deadline)
+
+// Browser+OperationStore.swift:181 is the ONLY guard on the caller-supplied
+// deadline (production passes 30 from NativeClient+BrowserRoutes.swift:124),
+// and :218 is the only writer of `deadlineAt`. Two distinct enums declare an
+// `invalidDeadline` case — BrowserOperationStoreError (the store) and
+// BrowserMotorReadModelError (the read model) — so these assertions name the
+// STORE's error explicitly; a test that accepted "some error" would pass
+// against the wrong subsystem.
+@Test func browserOperation_startRejectsOutOfRangeDeadlineWithoutAppendingARow() async throws {
+    let fix = try WriteFixture()
+    defer { fix.cleanup() }
+    let client = fix.client()
+
+    for seconds in [0, -1, 86_401, Int.max] {
+        do {
+            _ = try await client.executeBrowserOperation(.start(BrowserOperationStart(
+                id: "deadline-\(seconds)",
+                url: "https://example.com/deadline",
+                domain: "example.com",
+                initialState: .running,
+                visible: false,
+                deadlineSeconds: seconds
+            )))
+            Issue.record("deadlineSeconds \(seconds) must be refused")
+        } catch let error as BrowserOperationStoreError {
+            #expect(error == .invalidDeadline)
+        }
+    }
+    // A refused start must leave the canonical store untouched — no half-written
+    // `running` row for the stranded-run recovery to adopt later.
+    #expect(fix.readRunsRaw().isEmpty)
+}
+
+@Test func browserOperation_runningStartStampsDeadlineAtFromTheAcceptedBound() async throws {
+    let fix = try WriteFixture()
+    defer { fix.cleanup() }
+    let frozen = Date(timeIntervalSince1970: 2_100_000_000)
+    let client = fix.client(now: { frozen })
+
+    _ = try await client.executeBrowserOperation(.start(BrowserOperationStart(
+        id: "deadline-ok",
+        url: "https://example.com/ok",
+        domain: "example.com",
+        initialState: .running,
+        visible: false,
+        deadlineSeconds: 30
+    )))
+    // Upper bound is INCLUSIVE — 86_400 is accepted where 86_401 is not.
+    _ = try await client.executeBrowserOperation(.start(BrowserOperationStart(
+        id: "deadline-max",
+        url: "https://example.com/max",
+        domain: "example.com",
+        initialState: .running,
+        visible: false,
+        deadlineSeconds: 86_400
+    )))
+
+    let rows = fix.readRunsRaw()
+    #expect(rows.count == 2)
+    let ok = try #require(rows.first { str($0, "id") == "deadline-ok" })
+    #expect(str(ok, "createdAt") == SwiftNativeBrowserClient.nowISO(frozen))
+    #expect(str(ok, "deadlineAt") == SwiftNativeBrowserClient.nowISO(frozen.addingTimeInterval(30)))
+    let max = try #require(rows.first { str($0, "id") == "deadline-max" })
+    #expect(str(max, "deadlineAt") == SwiftNativeBrowserClient.nowISO(frozen.addingTimeInterval(86_400)))
+}
+
+// `deadlineAt` is written ONLY for rows that start `running` (:218). A dry run
+// carrying a deadline must not grow a deadline field, or a future expiry sweep
+// would start expiring rows that were never live.
+@Test func browserOperation_dryRunStartCarriesNoDeadlineField() async throws {
+    let fix = try WriteFixture()
+    defer { fix.cleanup() }
+    let client = fix.client()
+    _ = try await client.executeBrowserOperation(.start(BrowserOperationStart(
+        id: "dry-deadline",
+        url: "https://example.com/dry",
+        domain: "example.com",
+        initialState: .dryRun,
+        visible: false,
+        deadlineSeconds: 30
+    )))
+    let row = try #require(fix.readRunsRaw().first)
+    #expect(str(row, "status") == "dry_run")
+    #expect(str(row, "deadlineAt") == nil)
+}

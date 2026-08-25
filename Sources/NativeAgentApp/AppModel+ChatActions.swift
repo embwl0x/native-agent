@@ -191,13 +191,25 @@ extension AppModel {
 
     // PATCH-2026-05-08: wave2-chat-ux slash /clear support
     @MainActor
-    func clearActiveChatMessages() async {
-        guard !activeChatSessionId.isEmpty else { return }
+    @discardableResult
+    func clearActiveChatMessages() async -> AppMutationResult {
+        let clearingSessionID = activeChatSessionId
+        guard !clearingSessionID.isEmpty else {
+            statusText = "Clear failed: no active chat session"
+            return .failure(statusText)
+        }
         do {
-            _ = try await client.clearChatMessages(sessionId: activeChatSessionId)
-            chatMessages = []
+            _ = try await client.clearChatMessages(sessionId: clearingSessionID)
+            // The durable writer completed for this exact id. A user can select
+            // another chat while this await is suspended; never clear that
+            // newer transcript optimistically.
+            setChatMessages([], for: clearingSessionID)
+            statusText = "Chat messages cleared"
+            publishChatSnapshot()
+            return .success(statusText)
         } catch {
             statusText = "Clear failed: \(error.localizedDescription)"
+            return .failure(statusText)
         }
     }
 
@@ -444,12 +456,7 @@ extension AppModel {
         chatTasks[sessionId] = task
         streamingSessions.insert(sessionId)
         await task.value
-        if chatTaskGenerations[sessionId] == generation {
-            chatTasks[sessionId] = nil
-            chatTaskGenerations[sessionId] = nil
-            streamingSessions.remove(sessionId)
-            busySessions.remove(sessionId)
-        }
+        _ = finishChatTurnRuntime(sessionId: sessionId, generation: generation)
         if regeneratedTurnCompleted {
             NotificationCenter.default.post(
                 name: .chatTurnCompleted,
@@ -511,11 +518,18 @@ extension AppModel {
     }
 
     @MainActor
-    func archiveActiveChat() async {
-        guard !activeChatSessionId.isEmpty else { return }
+    @discardableResult
+    func archiveActiveChat() async -> AppMutationResult {
+        guard !activeChatSessionId.isEmpty else {
+            statusText = "Archive failed: no active chat session"
+            return .failure(statusText)
+        }
         let archivingId = activeChatSessionId
         do {
-            _ = try await client.updateChatSession(id: archivingId, title: nil, archived: true)
+            guard try await client.archiveChatSession(id: archivingId) != nil else {
+                statusText = "Archive failed: that chat session is no longer available"
+                return .failure(statusText)
+            }
             // PATCH-2026-05-13: parallel-sessions — cancel any in-flight task
             // for the archived session and clean up per-session state so we
             // don't leak entries in the generation/text dicts.
@@ -538,12 +552,23 @@ extension AppModel {
             // messages/receipt/detached-refresh state — pruneSessionChatState
             // covers the queue entries the two inline lines used to clear.
             pruneSessionChatState(archivingId)
-            activeChatSessionId = ""
-            UserDefaults.standard.removeObject(forKey: "activeChatSessionId")
-            await loadChatState()
-            MacSyncEngine.shared.requestChatSnapshotPublication(includeTranscripts: false)
+            chatSessions.removeAll { $0.id == archivingId }
+            // Do not redirect or erase a chat the user selected while the
+            // archival write was in flight. Only the originally active chat
+            // chooses a replacement and clears its active projection.
+            if activeChatSessionId == archivingId {
+                let replacement = chatSessions.first(where: { $0.archived != true })
+                activeChatSessionId = replacement?.id ?? ""
+                persistActiveChatSessionID(activeChatSessionId.isEmpty ? nil : activeChatSessionId)
+                chatMessages = []
+                latestContextReceipt = nil
+            }
+            statusText = "Chat archived"
+            publishChatSnapshot()
+            return .success(statusText)
         } catch {
             statusText = "Archive failed: \(error.localizedDescription)"
+            return .failure(statusText)
         }
     }
 
@@ -797,12 +822,7 @@ extension AppModel {
             ) {
                 await persistChatTurnLifecycleUpdate(identity: closed.identity)
             }
-            if chatTaskGenerations[cleanupId] == generation {
-                streamingSessions.remove(cleanupId)
-                busySessions.remove(cleanupId)
-                chatTasks[cleanupId] = nil
-                chatTaskGenerations[cleanupId] = nil
-            }
+            _ = finishChatTurnRuntime(sessionId: cleanupId, generation: generation)
             await drainNextQueuedChatTurnIfPossible(sessionId: cleanupId)
         }
         chatTasks[targetSessionId] = task

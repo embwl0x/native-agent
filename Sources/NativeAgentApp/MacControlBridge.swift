@@ -63,6 +63,400 @@ struct MacControlBridgeStartupState: Sendable {
     }
 }
 
+/// The complete response contract for `/macctl/info`. A zero port during
+/// startup/teardown is unavailable, not a successful discovery receipt.
+/// Keeping the whole response typed makes the mounted HTTP route and its
+/// executable boundary proof share one policy and one wire meaning.
+struct MacControlBridgeInfoRouteResponse: Equatable, Sendable {
+    enum State: String, Equatable, Sendable {
+        case ready
+        case methodNotAllowed = "method_not_allowed"
+        case unavailable = "bridge_unavailable"
+    }
+
+    let state: State
+    let port: UInt16?
+
+    var statusCode: Int {
+        switch state {
+        case .ready: return 200
+        case .methodNotAllowed: return 405
+        case .unavailable: return 503
+        }
+    }
+
+    var ok: Bool { state == .ready }
+
+    func responseObject(bundleId: String) -> [String: Any] {
+        var body: [String: Any] = ["ok": ok]
+        switch state {
+        case .ready:
+            body["port"] = Int(port ?? 0)
+            body["bundleId"] = bundleId
+        case .methodNotAllowed, .unavailable:
+            body["error"] = state.rawValue
+        }
+        return body
+    }
+}
+
+/// The exact HTTP contract for the read-only Spotlight frame route. Keeping
+/// this separate from the NWConnection writer makes an absent panel, a
+/// main-thread timeout, and a bad request method independently observable.
+enum MacControlSpotlightFrameRoute {
+    struct Frame: Equatable {
+        let x: Int
+        let y: Int
+        let width: Int
+        let height: Int
+    }
+
+    struct Response: Equatable {
+        let status: Int
+        let frame: Frame?
+        let error: String?
+
+        var object: [String: Any] {
+            if let frame {
+                return [
+                    "ok": true,
+                    "x": frame.x,
+                    "y": frame.y,
+                    "width": frame.width,
+                    "height": frame.height,
+                ]
+            }
+            return ["ok": false, "error": error ?? "spotlight_probe_unavailable"]
+        }
+    }
+
+    static func response(
+        method: String,
+        readProbe: () -> SpotlightOverlayProbeResult
+    ) -> Response {
+        guard method == "GET" else {
+            return Response(status: 405, frame: nil, error: "method_not_allowed")
+        }
+        switch readProbe() {
+        case let .frame(x, y, width, height):
+            return Response(
+                status: 200,
+                frame: Frame(x: x, y: y, width: width, height: height),
+                error: nil
+            )
+        case .absent:
+            return Response(status: 404, frame: nil, error: "panel_not_open")
+        case .timedOut:
+            return Response(status: 503, frame: nil, error: "spotlight_probe_timed_out")
+        }
+    }
+}
+
+/// The truthful readiness surface for `GET /macctl/health`. A bound listener
+/// is not enough to call the bridge healthy: Trust policy must still allow the
+/// capability and at least one execution slot must remain available.
+struct MacControlBridgeHealthRouteResponse: Equatable, Sendable {
+    enum State: String, Equatable, Sendable {
+        case ready
+        case methodNotAllowed = "method_not_allowed"
+        case policyDisabled = "policy_disabled"
+        case execSaturated = "exec_saturated"
+    }
+
+    let state: State
+    let startGateAllowed: Bool
+    let execSlotLimit: Int
+    let activeExecSlots: Int
+    let freeExecSlots: Int
+
+    var statusCode: Int {
+        switch state {
+        case .ready: return 200
+        case .methodNotAllowed: return 405
+        case .policyDisabled, .execSaturated: return 503
+        }
+    }
+    var ok: Bool { state == .ready }
+
+    func responseObject(bundleId: String) -> [String: Any] {
+        var body: [String: Any] = [
+            "ok": ok,
+            "bundleId": bundleId,
+            "state": state.rawValue,
+            "startGateAllowed": startGateAllowed,
+            "execSlots": [
+                "limit": execSlotLimit,
+                "active": activeExecSlots,
+                "free": freeExecSlots,
+            ],
+        ]
+        if !ok {
+            body["error"] = state.rawValue
+        }
+        return body
+    }
+}
+
+/// Outcome of one bridge-audit append. An audit append is advisory evidence,
+/// never proof that the underlying subprocess effect happened, but failure to
+/// retain that evidence must remain visible to the route that produced it.
+enum MacControlBridgeAuditAppendState: String, Sendable, Equatable {
+    case appended
+    case appendFailed = "append_failed"
+    case retentionFailed = "retention_failed"
+}
+
+struct MacControlBridgeAuditAppendReceipt: Sendable, Equatable {
+    let state: MacControlBridgeAuditAppendState
+    let path: String
+    /// True once the new JSONL bytes were successfully appended and synced.
+    /// This does not imply that the subsequent bounded-retention step ran.
+    let lineStored: Bool
+    /// True only when the post-append retention validation and cap completed.
+    let retentionEnforced: Bool
+    let retainedRowsDropped: Int
+    let error: String?
+
+    /// Compatibility shorthand for the physical append fact. A retention
+    /// failure after append remains stored evidence with unenforced retention.
+    var isStored: Bool { lineStored }
+
+    func responseObject() -> [String: Any] {
+        [
+            "state": state.rawValue,
+            "path": path,
+            "lineStored": lineStored,
+            "retentionEnforced": retentionEnforced,
+            "retainedRowsDropped": retainedRowsDropped,
+            "error": error ?? NSNull(),
+        ]
+    }
+}
+
+enum MacControlBridgeAuditEvidenceState: String, Sendable, Equatable {
+    case missing
+    case ready
+    case incompleteEvidence = "incomplete_evidence"
+    case unavailable
+}
+
+/// Read-only observation of the live bridge audit file. `physicalRowCount`
+/// includes damaged rows, so a malformed file cannot masquerade as an empty
+/// healthy feed merely because its parser skipped evidence.
+struct MacControlBridgeAuditReport: Sendable, Equatable {
+    let state: MacControlBridgeAuditEvidenceState
+    let dataRoot: String
+    let path: String
+    let byteCount: Int?
+    let physicalRowCount: Int?
+    let validRowCount: Int?
+    let malformedRowCount: Int
+    let trailingPartialRow: Bool
+    let argv0Counts: [String: Int]
+    let statusCounts: [String: Int]
+    let repeatedZeroEffectReasons: [String: Int]
+    let leads: [String]
+    let error: String?
+}
+
+/// One bounded owner for the bridge's terminal-exec audit evidence. The bridge
+/// remains the producer; this store only makes write outcome, retention, and
+/// read evidence explicit and testable.
+enum MacControlBridgeAuditStore {
+    static let filename = "mac_control_bridge_audit.jsonl"
+    static let retentionLimit = 500
+    static let dominantArgv0ShareLead = 0.80
+
+    static func path(dataRoot: URL) -> URL {
+        dataRoot.appendingPathComponent(filename)
+    }
+
+    static func append(
+        argv: [String],
+        status: String,
+        reason: String?,
+        operationId: String?,
+        dataRoot: URL
+    ) -> MacControlBridgeAuditAppendReceipt {
+        let auditPath = path(dataRoot: dataRoot)
+        let event: [String: Any] = [
+            "at": ISO8601DateFormatter().string(from: Date()),
+            "argv0": argv.first ?? "",
+            "argc": argv.count,
+            "operationId": operationId ?? "",
+            "status": status,
+            "reason": reason ?? "",
+        ]
+        do {
+            try FileManager.default.createDirectory(
+                at: auditPath.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let line = try JSONSerialization.data(withJSONObject: event)
+            if FileManager.default.fileExists(atPath: auditPath.path) {
+                let handle = try FileHandle(forWritingTo: auditPath)
+                defer { try? handle.close() }
+                try handle.seekToEnd()
+                try handle.write(contentsOf: line)
+                try handle.write(contentsOf: Data([0x0A]))
+                try handle.synchronize()
+            } else {
+                var firstLine = line
+                firstLine.append(0x0A)
+                try firstLine.write(to: auditPath, options: .atomic)
+            }
+        } catch {
+            return MacControlBridgeAuditAppendReceipt(
+                state: .appendFailed,
+                path: auditPath.path,
+                lineStored: false,
+                retentionEnforced: false,
+                retainedRowsDropped: 0,
+                error: error.localizedDescription
+            )
+        }
+        do {
+            // `enforceJSONLLineCap` correctly refuses to guess at malformed
+            // bytes. Surface that condition here before calling it: otherwise
+            // a successfully appended line could receive an ordinary receipt
+            // even though the requested bounded-retention step was skipped.
+            let raw = try Data(contentsOf: auditPath)
+            guard let text = String(data: raw, encoding: .utf8) else {
+                return MacControlBridgeAuditAppendReceipt(
+                    state: .retentionFailed,
+                    path: auditPath.path,
+                    lineStored: true,
+                    retentionEnforced: false,
+                    retainedRowsDropped: 0,
+                    error: "bridge audit is not valid UTF-8; retention was not enforced"
+                )
+            }
+            var lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+            if lines.last?.isEmpty == true { lines.removeLast() }
+            for line in lines where (try? JSONValue.parse(Data(line.utf8))) == nil {
+                return MacControlBridgeAuditAppendReceipt(
+                    state: .retentionFailed,
+                    path: auditPath.path,
+                    lineStored: true,
+                    retentionEnforced: false,
+                    retainedRowsDropped: 0,
+                    error: "bridge audit contains malformed JSON; retention was not enforced"
+                )
+            }
+            let dropped = try enforceJSONLLineCap(at: auditPath, maxLines: retentionLimit)
+            return MacControlBridgeAuditAppendReceipt(
+                state: .appended,
+                path: auditPath.path,
+                lineStored: true,
+                retentionEnforced: true,
+                retainedRowsDropped: dropped,
+                error: nil
+            )
+        } catch {
+            // The line reached the file, but its retention outcome is unknown;
+            // never flatten that into an ordinary successful audit receipt.
+            return MacControlBridgeAuditAppendReceipt(
+                state: .retentionFailed,
+                path: auditPath.path,
+                lineStored: true,
+                retentionEnforced: false,
+                retainedRowsDropped: 0,
+                error: error.localizedDescription
+            )
+        }
+    }
+
+    static func readReport(dataRoot: URL) async -> MacControlBridgeAuditReport {
+        let auditPath = path(dataRoot: dataRoot)
+        guard FileManager.default.fileExists(atPath: auditPath.path) else {
+            return MacControlBridgeAuditReport(
+                state: .missing,
+                dataRoot: dataRoot.path,
+                path: auditPath.path,
+                byteCount: 0,
+                physicalRowCount: 0,
+                validRowCount: 0,
+                malformedRowCount: 0,
+                trailingPartialRow: false,
+                argv0Counts: [:],
+                statusCounts: [:],
+                repeatedZeroEffectReasons: [:],
+                leads: [],
+                error: nil
+            )
+        }
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: auditPath.path)
+            if (attributes[.type] as? FileAttributeType) == .typeDirectory {
+                throw PersistenceCoreError.ioFailure("bridge audit path is a directory")
+            }
+            guard let byteCount = (attributes[.size] as? NSNumber)?.intValue else {
+                throw PersistenceCoreError.ioFailure("bridge audit size is unavailable")
+            }
+            let scan = try await SwiftNativePersistenceCore().readJSONLReporting(auditPath)
+            var argv0Counts: [String: Int] = [:]
+            var statusCounts: [String: Int] = [:]
+            var zeroEffectReasons: [String: Int] = [:]
+            for row in scan.rows {
+                guard case .object(let object) = row else { continue }
+                let argv0 = string(object["argv0"]) ?? "<missing>"
+                let status = string(object["status"]) ?? "<missing>"
+                argv0Counts[argv0, default: 0] += 1
+                statusCounts[status, default: 0] += 1
+                if let reason = string(object["reason"]), reason.hasSuffix(": 0") {
+                    zeroEffectReasons["\(argv0) / \(status) / \(reason)", default: 0] += 1
+                }
+            }
+            let repeats = zeroEffectReasons.filter { $0.value > 1 }
+            var leads: [String] = repeats.keys.sorted().map { "repeated_zero_effect: \($0)" }
+            if let dominant = argv0Counts.max(by: { $0.value < $1.value }),
+               !scan.rows.isEmpty,
+               Double(dominant.value) / Double(scan.rows.count) >= dominantArgv0ShareLead {
+                leads.append("argv0_dominates: \(dominant.key) \(dominant.value)/\(scan.rows.count)")
+            }
+            let evidenceState: MacControlBridgeAuditEvidenceState = scan.report.isClean
+                ? .ready
+                : .incompleteEvidence
+            return MacControlBridgeAuditReport(
+                state: evidenceState,
+                dataRoot: dataRoot.path,
+                path: auditPath.path,
+                byteCount: byteCount,
+                physicalRowCount: scan.report.physicalLineCount,
+                validRowCount: scan.rows.count,
+                malformedRowCount: scan.report.malformedLineCount,
+                trailingPartialRow: scan.report.trailingPartialLine,
+                argv0Counts: argv0Counts,
+                statusCounts: statusCounts,
+                repeatedZeroEffectReasons: repeats,
+                leads: leads.sorted(),
+                error: nil
+            )
+        } catch {
+            return MacControlBridgeAuditReport(
+                state: .unavailable,
+                dataRoot: dataRoot.path,
+                path: auditPath.path,
+                byteCount: nil,
+                physicalRowCount: nil,
+                validRowCount: nil,
+                malformedRowCount: 0,
+                trailingPartialRow: false,
+                argv0Counts: [:],
+                statusCounts: [:],
+                repeatedZeroEffectReasons: [:],
+                leads: [],
+                error: error.localizedDescription
+            )
+        }
+    }
+
+    private static func string(_ value: JSONValue?) -> String? {
+        guard case .string(let value)? = value, !value.isEmpty else { return nil }
+        return value
+    }
+}
+
 // PATCH-2026-05-07: bridge-off-main Bridge runs OFF the main actor. MainActor
 // is contended at app launch (iCloud `forUbiquityContainerIdentifier` does a
 // synchronous query that can block for seconds), and tasks dispatched onto
@@ -104,6 +498,19 @@ final class MacControlBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
     static let port: UInt16 = 8770
     private static let maxRequestBodyBytes = 2 * 1024 * 1024
     private static let execLimit = 2
+
+    /// Resolves the info endpoint from the listener state that the route reads
+    /// at response time. A request that races bridge teardown must fail closed
+    /// instead of publishing `ok: true` with the sentinel port zero.
+    static func infoRouteResponse(method: String, activePort: UInt16) -> MacControlBridgeInfoRouteResponse {
+        guard method == "GET" else {
+            return MacControlBridgeInfoRouteResponse(state: .methodNotAllowed, port: nil)
+        }
+        guard activePort != 0 else {
+            return MacControlBridgeInfoRouteResponse(state: .unavailable, port: nil)
+        }
+        return MacControlBridgeInfoRouteResponse(state: .ready, port: activePort)
+    }
     private static let execOutputLimitBytes = 1_048_576
     private static let operationStore = MacControlOperationStore(dataRoot: NativeAgentPaths.dataRoot)
     private final class ExecResultBox: @unchecked Sendable {
@@ -144,6 +551,51 @@ final class MacControlBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
     static let execSlots = ScopedSlotCounter(name: "macctl-exec", limit: execLimit)
 
     private static func currentExecCount() -> Int { execSlots.activeCount }
+
+    /// Production health route owner. The caller supplies the live policy
+    /// decision while this method reads the actual bounded exec counter, so the
+    /// reported capacity cannot drift from admission control.
+    nonisolated static func healthRouteResponse(
+        method: String,
+        startGateAllowed: Bool
+    ) -> MacControlBridgeHealthRouteResponse {
+        healthRouteResponse(
+            method: method,
+            startGateAllowed: startGateAllowed,
+            execSlotLimit: execSlots.limit,
+            activeExecSlots: execSlots.activeCount
+        )
+    }
+
+    /// Pure response builder for route-level evaluation. It remains behind the
+    /// production method above, which supplies the real `execSlots` values.
+    nonisolated static func healthRouteResponse(
+        method: String,
+        startGateAllowed: Bool,
+        execSlotLimit: Int,
+        activeExecSlots: Int
+    ) -> MacControlBridgeHealthRouteResponse {
+        let limit = max(0, execSlotLimit)
+        let active = max(0, activeExecSlots)
+        let free = max(0, limit - active)
+        let state: MacControlBridgeHealthRouteResponse.State
+        if method != "GET" {
+            state = .methodNotAllowed
+        } else if !startGateAllowed {
+            state = .policyDisabled
+        } else if free == 0 {
+            state = .execSaturated
+        } else {
+            state = .ready
+        }
+        return MacControlBridgeHealthRouteResponse(
+            state: state,
+            startGateAllowed: startGateAllowed,
+            execSlotLimit: limit,
+            activeExecSlots: active,
+            freeExecSlots: free
+        )
+    }
 
     private static func registerProcess(_ proc: Process, operationId: String) {
         execState.lock.lock()
@@ -207,7 +659,9 @@ final class MacControlBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         return exit == 0 ? .completed : .failed
     }
 
-    private static func stopAllProcesses(reason: String) -> Int {
+    private static func stopAllProcesses(
+        reason: String
+    ) -> (stopped: Int, audit: MacControlBridgeAuditAppendReceipt) {
         execState.lock.lock()
         let processes = execState.activeProcesses
         execState.cancelRequested.formUnion(processes.keys)
@@ -244,8 +698,12 @@ final class MacControlBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                 }
             }
         }
-        appendExecAudit(argv: ["emergency_stop"], status: "cancel_requested", reason: "\(reason): \(processes.count)")
-        return processes.count
+        let audit = appendExecAudit(
+            argv: ["emergency_stop"],
+            status: "cancel_requested",
+            reason: "\(reason): \(processes.count)"
+        )
+        return (processes.count, audit)
     }
 
     // MARK: - App support dir + bridge descriptor
@@ -574,32 +1032,29 @@ final class MacControlBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
 
         switch path {
         case "/macctl/health":
-            var payload: [String: Any] = [
-                "ok": true,
-                "bundleId": Bundle.main.bundleIdentifier ?? "",
-            ]
+            let health = Self.healthRouteResponse(method: method, startGateAllowed: Self.startGateAllows())
+            var payload = health.responseObject(bundleId: Bundle.main.bundleIdentifier ?? "")
             payload.merge(NativeAgentBuildIdentity.current.bridgePayload) { _, new in new }
-            writeJSON(conn, status: 200, obj: payload)
+            writeJSON(conn, status: health.statusCode, obj: payload)
         case "/macctl/info":
-            let port = activePort
-            var payload: [String: Any] = [
-                "ok": true,
-                "port": Int(port),
-                "bundleId": Bundle.main.bundleIdentifier ?? "",
-            ]
-            payload.merge(NativeAgentBuildIdentity.current.bridgePayload) { _, new in new }
-            writeJSON(conn, status: 200, obj: payload)
+            let info = Self.infoRouteResponse(method: method, activePort: activePort)
+            var payload = info.responseObject(bundleId: Bundle.main.bundleIdentifier ?? "")
+            if info.ok {
+                payload.merge(NativeAgentBuildIdentity.current.bridgePayload) { _, new in new }
+            }
+            writeJSON(conn, status: info.statusCode, obj: payload)
         case "/macctl/emergency_stop":
             guard method == "POST" || method == "GET" else {
                 writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
                 return
             }
-            let stopped = Self.stopAllProcesses(reason: "operator requested emergency stop")
+            let stop = Self.stopAllProcesses(reason: "operator requested emergency stop")
             writeJSON(conn, status: 200, obj: [
                 "ok": true,
-                "stopped": stopped,
+                "stopped": stop.stopped,
                 "active": Self.currentExecCount(),
                 "via": "macctl-bridge",
+                "audit": stop.audit.responseObject(),
             ])
         case "/macctl/exec":
             guard method == "POST" else {
@@ -614,19 +1069,10 @@ final class MacControlBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
             }
             cancelHandler(conn: conn, body: body)
         case "/macctl/spotlight_frame":
-            // PATCH-2026-05-07: spotlight-frame Report the overlay panel's
-            // current frame so external probes can read the preferred size.
-            if let f = SpotlightOverlayProbe.currentFrame() {
-                writeJSON(conn, status: 200, obj: [
-                    "ok": true,
-                    "x": f.0,
-                    "y": f.1,
-                    "width": f.2,
-                    "height": f.3,
-                ])
-            } else {
-                writeJSON(conn, status: 404, obj: ["ok": false, "error": "panel_not_open"])
+            let response = MacControlSpotlightFrameRoute.response(method: method) {
+                SpotlightOverlayProbe.currentFrame()
             }
+            writeJSON(conn, status: response.status, obj: response.object)
         default:
             writeJSON(conn, status: 404, obj: ["error": "unknown_path", "path": path])
         }
@@ -670,7 +1116,7 @@ final class MacControlBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                     )
                 }
                 _ = Self.requestCancellation(operationId: operationId)
-                Self.appendExecAudit(
+                let audit = Self.appendExecAudit(
                     argv: ["cancel"],
                     status: "cancel_requested",
                     reason: nil,
@@ -681,6 +1127,7 @@ final class MacControlBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                     "operationId": operationId,
                     "operationState": MacControlOperationState.cancelRequested.rawValue,
                     "cancelAcknowledged": false,
+                    "audit": audit.responseObject(),
                 ])
             } catch {
                 self.writeJSON(conn, status: 409, obj: [
@@ -1004,43 +1451,67 @@ final class MacControlBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         return json
     }
 
-    nonisolated private static func appendExecAudit(argv: [String], status: String, reason: String? = nil, operationId: String? = nil) {
-        let url = NativeAgentPaths.dataRoot.appendingPathComponent("mac_control_bridge_audit.jsonl")
-        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let event: [String: Any] = [
-            "at": ISO8601DateFormatter().string(from: Date()),
-            "argv0": argv.first ?? "",
-            "argc": argv.count,
-            "operationId": operationId ?? "",
-            "status": status,
-            "reason": reason ?? "",
-        ]
-        guard let data = try? JSONSerialization.data(withJSONObject: event),
-              var line = String(data: data, encoding: .utf8) else { return }
-        line.append("\n")
+    /// Appends the audit evidence for every terminal Mac-control outcome. The
+    /// optional root is an evaluation seam; production always uses the canonical
+    /// data root and retains the existing serialized append behavior.
+    @discardableResult
+    nonisolated static func appendExecAudit(
+        argv: [String],
+        status: String,
+        reason: String? = nil,
+        operationId: String? = nil,
+        dataRoot: URL? = nil
+    ) -> MacControlBridgeAuditAppendReceipt {
         // fix-audit-append-race: serialize the open→seek→write so concurrent
-        // writers can't seek to the same end offset and clobber each other.
+        // writers can't seek to the same end offset and clobber/interleave a
+        // JSONL line. The store returns retention/write failure explicitly;
+        // callers with an HTTP response can expose it rather than making a
+        // missing audit row look like a successful receipt.
         auditAppendLock.lock()
         defer { auditAppendLock.unlock() }
-        if !FileManager.default.fileExists(atPath: url.path) {
-            try? line.write(to: url, atomically: true, encoding: .utf8)
-            return
-        }
-        if let fh = try? FileHandle(forWritingTo: url) {
-            defer { try? fh.close() }
-            _ = try? fh.seekToEnd()
-            try? fh.write(contentsOf: Data(line.utf8))
-        }
+        return MacControlBridgeAuditStore.append(
+            argv: argv,
+            status: status,
+            reason: reason,
+            operationId: operationId,
+            dataRoot: dataRoot ?? NativeAgentPaths.dataRoot
+        )
+    }
+
+    /// The route's preflight exits are terminal outcomes too. Keep their audit
+    /// construction at the production owner so malformed requests cannot evade
+    /// the same evidence feed used by policy refusals and completed processes.
+    @discardableResult
+    nonisolated static func auditExecValidationRejection(
+        argv: [String],
+        reason: String,
+        operationId: String? = nil,
+        dataRoot: URL? = nil
+    ) -> MacControlBridgeAuditAppendReceipt {
+        appendExecAudit(
+            argv: argv,
+            status: "validation_rejected",
+            reason: reason,
+            operationId: operationId,
+            dataRoot: dataRoot
+        )
     }
 
     private func execHandler(conn: NWConnection, body: Data) {
         let json = body.isEmpty ? [:] : ((try? JSONSerialization.jsonObject(with: body)) as? [String: Any] ?? [:])
         guard let argv = json["argv"] as? [String], !argv.isEmpty else {
+            let suppliedOperationID = json["operationId"] as? String
+            _ = Self.auditExecValidationRejection(
+                argv: [], reason: "missing_argv", operationId: suppliedOperationID
+            )
             writeJSON(conn, status: 400, obj: ["error": "missing_argv"])
             return
         }
         let operationId = (json["operationId"] as? String) ?? UUID().uuidString
         guard MacControlOperationStore.validOperationId(operationId) else {
+            _ = Self.auditExecValidationRejection(
+                argv: argv, reason: "invalid_operation_id", operationId: operationId
+            )
             writeJSON(conn, status: 400, obj: ["error": "invalid_operation_id"])
             return
         }
@@ -1095,7 +1566,12 @@ final class MacControlBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                         expectedNextEvidence: nil,
                         outcomeCode: "bridge_policy_blocked"
                     )
-                    Self.appendExecAudit(argv: argv, status: "blocked", reason: reason, operationId: operationId)
+                    let audit = Self.appendExecAudit(
+                        argv: argv,
+                        status: "blocked",
+                        reason: reason,
+                        operationId: operationId
+                    )
                     self.writeJSON(conn, status: 403, obj: [
                         "error": "exec_blocked",
                         "detail": reason,
@@ -1103,6 +1579,7 @@ final class MacControlBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                         "protocolVersion": protocolVersion,
                         "operationId": operationId,
                         "operationState": MacControlOperationState.blocked.rawValue,
+                        "audit": audit.responseObject(),
                     ])
                     return
                 }
@@ -1125,7 +1602,12 @@ final class MacControlBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                         expectedNextEvidence: nil,
                         outcomeCode: "exec_queue_saturated"
                     )
-                    Self.appendExecAudit(argv: argv, status: "blocked", reason: "exec_queue_saturated", operationId: operationId)
+                    let audit = Self.appendExecAudit(
+                        argv: argv,
+                        status: "blocked",
+                        reason: "exec_queue_saturated",
+                        operationId: operationId
+                    )
                     self.writeJSON(conn, status: 429, obj: [
                         "error": "exec_queue_saturated",
                         "detail": "Too many Mac Control exec jobs are already running.",
@@ -1134,6 +1616,7 @@ final class MacControlBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                         "protocolVersion": protocolVersion,
                         "operationId": operationId,
                         "operationState": MacControlOperationState.blocked.rawValue,
+                        "audit": audit.responseObject(),
                     ])
                     return
                 }
@@ -1194,12 +1677,13 @@ final class MacControlBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                                 resultBox.value["operationState"] = record.state.rawValue
                                 resultBox.value["verification"] = record.verification.rawValue
                                 resultBox.value["cancelAcknowledged"] = record.state == .cancelAcknowledged
-                                Self.appendExecAudit(
+                                let audit = Self.appendExecAudit(
                                     argv: argv,
                                     status: record.state.rawValue,
                                     reason: "exit_\(exit)",
                                     operationId: operationId
                                 )
+                                resultBox.value["audit"] = audit.responseObject()
                                 self.writeJSON(conn, status: 200, obj: resultBox.value)
                             } catch {
                                 self.writeJSON(conn, status: 500, obj: [

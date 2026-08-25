@@ -316,6 +316,13 @@ extension SwiftNativeMemoryV2 {
             object["updated"] = String(result.updated)
             object["removed"] = String(result.removed)
             object["unchanged"] = String(result.unchanged)
+            // This is the exact number of on-disk bodies that converged to a
+            // recall pointer on this pass. Unlike a bare success bit, it makes
+            // an accidentally empty launch sync distinguishable from a healthy
+            // no-op against an already-empty skill library.
+            object["reconciledPointerCount"] = String(
+                result.added + result.updated + result.unchanged
+            )
         } else {
             object["status"] = "failed"
             object["error"] = error.map(String.init(describing:)) ?? "unknown"

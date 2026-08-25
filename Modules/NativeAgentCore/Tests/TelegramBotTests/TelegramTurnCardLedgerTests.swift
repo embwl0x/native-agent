@@ -141,7 +141,7 @@ struct TelegramTurnCardLedgerTests {
         #expect(result.repaired == 0)
         #expect(result.failures.count == 1)
         #expect(!result.failures[0].contains(secret))
-        #expect(result.failures[0].contains("bot<redacted>"))
+        #expect(result.failures[0].contains("[REDACTED_TELEGRAM_TOKEN]"))
         #expect(try await ledger.records() == [record])
     }
 

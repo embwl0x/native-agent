@@ -217,4 +217,111 @@ func reasoningOptions(from catalog: ModelCatalogResponse?, model: String) -> [Re
     return fallback.filter { supported.contains($0.id) }
 }
 
+struct TelegramNumericIDParseResult: Equatable {
+    let canonicalIDs: [String]
+    let invalidTokens: [String]
+
+    var isConfigured: Bool { !canonicalIDs.isEmpty }
+}
+
+struct TelegramAllowlistPresentation: Equatable {
+    let acceptedCount: Int
+    let invalidTokens: [String]
+
+    var isValidAndConfigured: Bool { acceptedCount > 0 && invalidTokens.isEmpty }
+    var statusLabel: String {
+        isValidAndConfigured ? "Allowlist configured" : "Add valid Telegram IDs before using this bot"
+    }
+}
+
+func telegramAllowlistPresentation(chats: String, users: String) -> TelegramAllowlistPresentation {
+    let chat = parseTelegramNumericIDs(chats)
+    let user = parseTelegramNumericIDs(users)
+    return TelegramAllowlistPresentation(
+        acceptedCount: Set(chat.canonicalIDs + user.canonicalIDs).count,
+        invalidTokens: chat.invalidTokens + user.invalidTokens
+    )
+}
+
+func telegramAuthorizationHasUnsavedChanges(
+    enabled: Bool,
+    requireMention: Bool,
+    allowlist: TelegramAllowlistPresentation,
+    savedEnabled: Bool?,
+    savedRequireMention: Bool?,
+    savedAcceptedCount: Int?
+) -> Bool {
+    guard let savedEnabled, let savedRequireMention, let savedAcceptedCount else { return true }
+    return enabled != savedEnabled
+        || requireMention != savedRequireMention
+        || allowlist.acceptedCount != savedAcceptedCount
+        || !allowlist.invalidTokens.isEmpty
+}
+
+func telegramReasoningEffortMismatch(
+    from catalog: ModelCatalogResponse?,
+    model: String,
+    selected: String
+) -> String? {
+    let normalized = normalizedReasoningEffort(from: catalog, model: model, selected: selected)
+    guard normalized != selected else { return nil }
+    return "Saved think level '\(selected)' is unsupported for \(model). Save to use \(normalized)."
+}
+
+/// The Telegram config used to carry its own model tuple.  The routing store is
+/// now the single runtime authority, so a stale legacy tuple can never win a
+/// status read simply because it happened to be written more recently.
+struct TelegramBrainResolution: Equatable {
+    let model: String?
+    let reasoningEffort: String?
+    let ignoresLegacyTuple: Bool
+}
+
+func resolveTelegramBrain(
+    routing: SurfacePreference?,
+    legacyModel: String?,
+    legacyReasoningEffort: String?
+) -> TelegramBrainResolution {
+    TelegramBrainResolution(
+        model: routing?.model,
+        reasoningEffort: routing?.reasoningEffort,
+        ignoresLegacyTuple: legacyModel != nil || legacyReasoningEffort != nil
+    )
+}
+
+func parseTelegramNumericIDs(_ value: String) -> TelegramNumericIDParseResult {
+    let tokens = value
+        .split { $0 == "," || $0 == " " || $0 == "\n" || $0 == "\t" }
+        .map(String.init)
+        .filter { !$0.isEmpty }
+    var valid: [String] = []
+    var invalid: [String] = []
+    for token in tokens {
+        if let id = Int64(token) {
+            valid.append(String(id))
+        } else {
+            invalid.append(token)
+        }
+    }
+    return TelegramNumericIDParseResult(
+        canonicalIDs: Array(Set(valid)).sorted(),
+        invalidTokens: invalid
+    )
+}
+
+func normalizedReasoningEffort(
+    from catalog: ModelCatalogResponse?,
+    model: String,
+    selected: String
+) -> String {
+    let options = reasoningOptions(from: catalog, model: model)
+    if options.contains(where: { $0.id == selected }) { return selected }
+    if let record = catalog?.models.first(where: { $0.id == model }),
+       let preferred = record.defaultReasoningEffort,
+       options.contains(where: { $0.id == preferred }) {
+        return preferred
+    }
+    return options.first?.id ?? "high"
+}
+
 // PATCH-2026-05-07: proactive-inbox-1 InboxStripContainer — loads and renders unread inbox items

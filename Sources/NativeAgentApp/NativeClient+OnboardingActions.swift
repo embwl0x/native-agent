@@ -42,9 +42,24 @@ import Browser
 
 
 extension NativeClient {
+    /// The onboarding writer must use the same explicit store root as the
+    /// caller's personality reader. This is especially important for an
+    /// injected app body: falling back to the process default here could make
+    /// the starter panel create a persona somewhere other than the panel then
+    /// reloads.
+    private func onboardingClient() -> any OnboardingClient {
+        guard let dataRootOverride else {
+            return makeOnboardingClient()
+        }
+        return SwiftNativeOnboardingClient(
+            personaRoot: PersonaRootResolver.resolveIsolated(dataRoot: dataRootOverride),
+            dataRoot: dataRootOverride
+        )
+    }
+
     func startOnboarding() async throws -> OnboardingStartResponse {
         // WAVE 15 (2026-06-01): Swift-only — daemon route retired.
-        let impl = makeOnboardingClient()
+        let impl = onboardingClient()
         let r = try await impl.startOnboarding()
         let options = r.personaTypeOptions.map {
             PersonaTypeOption(
@@ -75,7 +90,7 @@ extension NativeClient {
     }
 
     func resumePendingOnboarding() async throws -> OnboardingCompleteResponse {
-        let r = try await makeOnboardingClient().resumePendingOnboarding()
+        let r = try await onboardingClient().resumePendingOnboarding()
         if r.ok {
             await refreshResidentMindAfterOnboardingTransition()
         }
@@ -92,7 +107,7 @@ extension NativeClient {
 
     /// Wave 20 (2026-06-01): SwiftNative-only.
     func completeOnboarding(agentName: String, personaType: String, userName: String) async throws -> OnboardingCompleteResponse {
-        let impl = makeOnboardingClient()
+        let impl = onboardingClient()
         let r = try await impl.completeOnboarding(payload: OnboardingCompletePayload(
             agentName: agentName, personaType: personaType, userName: userName
         ))
@@ -112,7 +127,7 @@ extension NativeClient {
 
     /// Wave 20 (2026-06-01): SwiftNative-only.
     func resetOnboarding(confirm: Bool = true) async throws -> OnboardingResetResponse {
-        let impl = makeOnboardingClient()
+        let impl = onboardingClient()
         let r = try await impl.resetOnboarding(confirm: confirm)
         if r.ok {
             await refreshResidentMindAfterOnboardingTransition()

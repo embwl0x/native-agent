@@ -33,16 +33,32 @@ struct DreamEntry: Codable, Hashable, Identifiable {
 struct DreamDiaryResponse: Codable, Hashable {
     var entries: [DreamEntry]
     var enabled: Bool
+    /// Number of diary `.md` files before applying the caller's bounded window.
+    /// Unreadable files in that window are described separately.
+    /// `nil` preserves old wire responses that did not expose a total.
+    var totalEntries: Int?
+    /// `.md` files in the bounded diary window that could not be decoded.
+    /// `nil` preserves older response payloads that did not expose this fact.
+    var unreadableEntries: Int?
 
-    init(entries: [DreamEntry] = [], enabled: Bool = false) {
+    init(
+        entries: [DreamEntry] = [],
+        enabled: Bool = false,
+        totalEntries: Int? = nil,
+        unreadableEntries: Int? = nil
+    ) {
         self.entries = entries
         self.enabled = enabled
+        self.totalEntries = totalEntries
+        self.unreadableEntries = unreadableEntries
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         entries = try c.decodeIfPresent([DreamEntry].self, forKey: .entries) ?? []
         enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        totalEntries = try c.decodeIfPresent(Int.self, forKey: .totalEntries)
+        unreadableEntries = try c.decodeIfPresent(Int.self, forKey: .unreadableEntries)
     }
 }
 
@@ -52,6 +68,52 @@ struct PolicySimulation: Codable, Hashable {
     var risk: String
     var action: String
     var reasons: [String]
+
+    /// The SecurityCenter returns a fail-closed envelope when its saved policy
+    /// cannot be read. That is not a policy denial: the simulator has no
+    /// authority generation to evaluate, so the UI must say it is unavailable.
+    var authorityUnavailable: Bool {
+        reasons.contains {
+            $0.localizedCaseInsensitiveContains("saved trust policy is unavailable")
+        }
+    }
+}
+
+enum PolicySimulationVerdict: Equatable {
+    case allowed
+    case approvalRequired
+    case denied
+    case unavailable
+
+    init(simulation: PolicySimulation) {
+        if simulation.authorityUnavailable {
+            self = .unavailable
+        } else if simulation.requiresApproval {
+            self = .approvalRequired
+        } else if simulation.allowed {
+            self = .allowed
+        } else {
+            self = .denied
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .allowed: "Allowed"
+        case .approvalRequired: "Requires Approval"
+        case .denied: "Denied"
+        case .unavailable: "Policy Unavailable"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .allowed: "checkmark.circle"
+        case .approvalRequired: "hand.raised.circle"
+        case .denied: "xmark.octagon"
+        case .unavailable: "exclamationmark.triangle"
+        }
+    }
 }
 
 struct BackupRecord: Identifiable, Codable, Hashable {
@@ -85,6 +147,12 @@ struct ConnectorRecord: Identifiable, Codable, Hashable {
     var actions: [String]?
     var lastCheckedAt: String?
     var updatedAt: String?
+    /// Socket Mode's separately persisted runtime evidence. This is not the
+    /// connector credential state: an unobserved/stale feed must remain visible
+    /// without disabling otherwise valid outbound Slack credentials.
+    var runtimeStatus: String?
+    var runtimeDetail: String?
+    var runtimeUpdatedAt: String?
 
     // FIX-2026-05-28: synthesized Decodable throws keyNotFound on a missing
     // non-optional key even with a Swift default, so the defaults above were
@@ -103,6 +171,9 @@ struct ConnectorRecord: Identifiable, Codable, Hashable {
         self.actions = try c.decodeIfPresent([String].self, forKey: .actions)
         self.lastCheckedAt = try c.decodeIfPresent(String.self, forKey: .lastCheckedAt)
         self.updatedAt = try c.decodeIfPresent(String.self, forKey: .updatedAt)
+        self.runtimeStatus = try c.decodeIfPresent(String.self, forKey: .runtimeStatus)
+        self.runtimeDetail = try c.decodeIfPresent(String.self, forKey: .runtimeDetail)
+        self.runtimeUpdatedAt = try c.decodeIfPresent(String.self, forKey: .runtimeUpdatedAt)
     }
 }
 
@@ -226,7 +297,7 @@ struct WatchdogStatus: Codable, Hashable {
     var runtimeBadgeStatus: String {
         switch runtimeLifecycleStatus.lowercased() {
         case "ok", "running", "active": return "ok"
-        case "stopped", "warn", "warning": return "warn"
+        case "stopped", "warn", "warning", "degraded": return "warn"
         case "fail", "failed", "error": return "error"
         default:
             return daemon.lowercased() == "swift" ? "ok" : (daemon.isEmpty ? "unknown" : daemon)
@@ -267,3 +338,5 @@ struct WatchdogStatus: Codable, Hashable {
         self.repairAvailable = try c.decodeIfPresent(Bool.self, forKey: .repairAvailable) ?? false
     }
 }
+
+typealias NativeAppWatchdogStatus = WatchdogStatus

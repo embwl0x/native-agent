@@ -294,12 +294,17 @@ public actor ProcedureArtifactStore {
         }
 
         let invocationPath = root.appendingPathComponent("invocations.jsonl")
-        let rows = (try? await persistence.tailJSONL(
+        // The operator status receipt must distinguish a genuinely empty
+        // invocation ledger from a bounded read that skipped malformed JSONL.
+        // `tailJSONL` intentionally hides malformed physical rows for normal
+        // consumers, but status is the explicit integrity-facing surface.
+        let invocationRead = try? await persistence.tailJSONLReadReceipt(
             invocationPath,
             limit: 10_000,
             maxBytes: 8 * 1_024 * 1_024
-        )) ?? []
-        var corruptInvocations = 0
+        )
+        let rows = invocationRead?.rows ?? []
+        var corruptInvocations = invocationRead?.malformedJSONRowCount ?? 0
         let receipts = rows.compactMap { value -> ProcedureInvocationReceipt? in
             guard let data = try? value.serialize(pretty: false).data(using: .utf8),
                   let receipt = try? JSONDecoder().decode(

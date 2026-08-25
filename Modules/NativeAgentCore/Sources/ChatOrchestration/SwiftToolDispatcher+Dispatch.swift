@@ -26,7 +26,27 @@ extension SwiftToolDispatcher {
     /// parallel test execution can't race it; always nil in production.
     @TaskLocal static var lazyGateCatalogOverrideForTests: (@Sendable () async throws -> [String])?
 
-    public func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+    /// The chat catalog names tools `mac_look`; the Trust Center registry and
+    /// the autonomy gate also speak `mac.look` (the connector-action id). A
+    /// model that has just read a registry row will call the dotted form —
+    /// Agent did on 2026-08-22 (mac.look / mac.act / mac.view, every call
+    /// "not in the dispatch table", whole acceptance run void). The two
+    /// spellings name ONE tool; resolve the dotted one to its catalog name
+    /// when, and only when, that catalog name exists. Unknown names stay
+    /// unknown — this is an alias, not a fuzzy match.
+    static func canonicalToolName(_ name: String, catalog: (String) -> Bool) -> String {
+        guard name.contains("."), !name.hasPrefix("mcp__"), !catalog(name) else { return name }
+        let underscored = name.replacingOccurrences(of: ".", with: "_")
+        return catalog(underscored) ? underscored : name
+    }
+
+    public func dispatch(tool requestedTool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        let tool = Self.canonicalToolName(requestedTool) { candidate in
+            Self.builtInToolNames.contains(candidate)
+                || Self.fullMacAppToolNames.contains(candidate)
+                || Self.fullMacAccessibilityReadToolNames.contains(candidate)
+                || Self.fullMacAccessibilityInjectionToolNames.contains(candidate)
+        }
         if ToolCallParser.isIgnorableToolName(tool) {
             return .object([
                 "status": .string("ignored"),
@@ -39,6 +59,18 @@ extension SwiftToolDispatcher {
                 "status": .string("failed"),
                 "reason": .string("canonical_body_unavailable"),
                 "tool": .string(tool),
+            ])
+        }
+        // Four-verb cutover: a conversational call always carries session_id.
+        // Keep the mac_* organs callable by direct diagnostics (which do not)
+        // while refusing stale model calls from an old persisted loadout.
+        if Self.legacyMacModelToolNames.contains(tool),
+           !Self.extractSessionId(from: input).isEmpty {
+            return .object([
+                "status": .string("failed"),
+                "reason": .string("legacy_mac_tool_internal_only"),
+                "tool": .string(tool),
+                "replacement": .array(Self.fourVerbToolNames.map { .string($0) }),
             ])
         }
         // Lazy-load gate (gpt-5.5 review-2 NEEDS_FIX 1): a tool requires
@@ -54,58 +86,63 @@ extension SwiftToolDispatcher {
         // bypassed the gate entirely once Full Mac was on — defeating the
         // whole token-saving + safety-deferring point of lazy load.
         //
-        // The gate fires when the call carries a session_id (the chat
-        // surface always passes one). Surfaces that don't pass a session
-        // (claude-bridge, headless tests, programmatic calls) have their
-        // own gates upstream — they bypass here.
-        if !Self.alwaysOnCoreNames.contains(tool), !tool.hasPrefix("mcp__") {
+        // A lazy tool always needs a concrete session. Without one there is
+        // no active-tool set to check, and treating that absence as a
+        // non-chat exception would silently turn the whole catalog on for
+        // whichever caller forgot to carry its session through dispatch.
+        // The always-on core and external MCP namespace retain their explicit
+        // exceptions above; every catalogued native lazy tool fails closed.
+        if enforcesLazyToolLoading,
+           !Self.alwaysOnCoreNames.contains(tool),
+           !tool.hasPrefix("mcp__") {
             let sessionId = Self.extractSessionId(from: input)
-            if !sessionId.isEmpty {
-                // Build the "exists in catalog" set from listAvailableTools()
-                // (the FULL accessible catalog, including Full-Mac additions).
-                // 2026-07-31 fail-closed fix: this used to be
-                // `if let names = try? await listAvailableTools() { ... } else
-                // { allAvailable = [] }`. Because gate enforcement lives
-                // INSIDE `allAvailable.contains(tool)`, an empty substitute set
-                // made every catalogued tool skip the not_loaded gate — a
-                // thrown enumeration silently opened the whole lazy-load gate.
-                // Enumeration failure now fails the CALL, not the gate.
-                let allAvailable: Set<String>
-                do {
-                    if let override = Self.lazyGateCatalogOverrideForTests {
-                        allAvailable = Set(try await override())
-                    } else {
-                        allAvailable = Set(try await listAvailableTools())
-                    }
-                } catch {
+            guard !sessionId.isEmpty else {
+                return .object([
+                    "status": .string("failed"),
+                    "reason": .string("missing_session_id"),
+                    "tool": .string(tool),
+                    "fix": .string("Lazy tools require the current chat session id so the dispatcher can verify they are loaded. Pass session_id (or __session_id) and call tool_load first if needed."),
+                ])
+            }
+            // Build the "exists in catalog" set from listAvailableTools()
+            // (the FULL accessible catalog, including Full-Mac additions).
+            // 2026-07-31 fail-closed fix: this used to be
+            // `if let names = try? await listAvailableTools() { ... } else
+            // { allAvailable = [] }`. Because gate enforcement lives
+            // INSIDE `allAvailable.contains(tool)`, an empty substitute set
+            // made every catalogued tool skip the not_loaded gate — a
+            // thrown enumeration silently opened the whole lazy-load gate.
+            // Enumeration failure now fails the CALL, not the gate.
+            let allAvailable: Set<String>
+            do {
+                if let override = Self.lazyGateCatalogOverrideForTests {
+                    allAvailable = Set(try await override())
+                } else {
+                    allAvailable = Set(try await listAvailableTools())
+                }
+            } catch {
+                return .object([
+                    "status": .string("failed"),
+                    "reason": .string("catalog_unavailable"),
+                    "tool": .string(tool),
+                    "session_id": .string(sessionId),
+                    "detail": .string(String(describing: error)),
+                    "fix": .string("The tool catalog could not be enumerated, so the lazy-load gate cannot verify '\(tool)'. Retry; if it persists, check data/tools/registry.json and the MCP server config."),
+                ])
+            }
+            if allAvailable.contains(tool) {
+                let persisted = await activeToolsStore.load(sessionId: sessionId).activeTools
+                let active = persisted.union(LLMCallContext.turnActiveTools ?? [])
+                if !active.contains(tool) {
                     return .object([
                         "status": .string("failed"),
-                        "reason": .string("catalog_unavailable"),
+                        "reason": .string("not_loaded"),
                         "tool": .string(tool),
                         "session_id": .string(sessionId),
-                        "detail": .string(String(describing: error)),
-                        "fix": .string("The tool catalog could not be enumerated, so the lazy-load gate cannot verify '\(tool)'. Retry; if it persists, check data/tools/registry.json and the MCP server config."),
+                        "fix": .string("Tool exists in catalog but is not loaded in this session. Call tool_load(session_id:\"\(sessionId)\", names:[\"\(tool)\"]) first, then retry."),
                     ])
                 }
-                if allAvailable.contains(tool) {
-                    let persisted = await activeToolsStore.load(sessionId: sessionId).activeTools
-                    let active = persisted.union(LLMCallContext.turnActiveTools ?? [])
-                    if !active.contains(tool) {
-                        return .object([
-                            "status": .string("failed"),
-                            "reason": .string("not_loaded"),
-                            "tool": .string(tool),
-                            "session_id": .string(sessionId),
-                            "fix": .string("Tool exists in catalog but is not loaded in this session. Call tool_load(session_id:\"\(sessionId)\", names:[\"\(tool)\"]) first, then retry."),
-                        ])
-                    }
-                }
             }
-            // No sessionId: this is a non-chat surface (claude-bridge,
-            // headless, programmatic). Skip the lazy gate — those surfaces
-            // are gated elsewhere (Trust Center / yolo window, read_only
-            // fileAccess on the RPC path, the external-MCP bridge guard,
-            // test fixtures).
         }
         switch tool {
         case "read_file":
@@ -683,6 +720,11 @@ extension SwiftToolDispatcher {
             return try await impl_mac_app_control_tool(tool: name, input: input, surface: surface)
         // W1b — READ-ONLY accessibility perception. Separate route from the
         // app-control case above: same gate CATEGORY, read TIER, no approval.
+        case let name where Self.fourVerbToolNames.contains(name):
+            // Must precede the read/injection list cases: `screen`/`wait` sit
+            // in the read list and `act`/`go` in the injection list for
+            // loading/visibility, but they ROUTE here.
+            return try await impl_mac_four_verbs_tool(tool: name, input: input, surface: surface)
         case let name where Self.fullMacAccessibilityReadToolNames.contains(name):
             return try await impl_mac_accessibility_read_tool(tool: name, input: input, surface: surface)
         // W7 — the NUDGE. Its own case, gated on the same read-tier signal:

@@ -56,6 +56,16 @@ TURNS=(
   "Thanks — say goodbye in exactly four words."
 )
 
+# The benchmark only compares like-for-like turn prefixes.  Bind the complete
+# prompt sequence (with unambiguous NUL separators) into the run output so two
+# summaries can prove that they measured the same workload.
+TURN_SCRIPT_SHA256="$(printf '%s\0' "${TURNS[@]}" | shasum -a 256 | awk '{print $1}')"
+if [[ ! "$TURN_SCRIPT_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+  echo "[u1] unable to calculate fixed turn-script SHA-256" >&2
+  exit 1
+fi
+echo "[u1] turnScriptSHA256=$TURN_SCRIPT_SHA256"
+
 i=0
 for turn in "${TURNS[@]}"; do
   i=$((i+1))

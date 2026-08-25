@@ -877,3 +877,110 @@ private actor PushSpy {
     #expect(st?.lastError == "boom")
     #expect(st?.lastResult == "failed")
 }
+
+// MARK: - core.loops eval wave — loops.manager.uptimeSeconds
+//
+// `uptimeSeconds(now:)` is rendered as "Uptime" by Sources/NativeAgentApp/
+// StatusView.swift and iOS/NativeAgentMobile/Sources/SettingsViewFull.swift,
+// and had no direct test: the `uptimeSeconds` hits elsewhere in this file are
+// on WatchdogStatus's DECODED field, which is a DIFFERENT number computed from
+// SwiftNativeBackgroundLoops' own `startedAt`.
+//
+// Two silent modes pinned here:
+//   1. SILENT ZERO — a manager that never started (or whose start() bailed on
+//      the generation guard) reports 0s, which is exactly what a healthy,
+//      just-launched app shows. Only the isRunning() pair disambiguates.
+//   2. LIFECYCLE RESIDUE — stop() clears `started` but NOT `startedAt`, so the
+//      number keeps climbing after the loops are gone. Asserted, so the
+//      meaning of the rendered figure is a decision rather than an accident.
+
+private final class SteppableClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current: Date
+    init(_ start: Date) { self.current = start }
+    var now: Date { lock.lock(); defer { lock.unlock() }; return current }
+    func advance(_ seconds: TimeInterval) {
+        lock.lock(); current = current.addingTimeInterval(seconds); lock.unlock()
+    }
+}
+
+@Test func managerUptime_isZeroBeforeStart_andOnlyIsRunningDisambiguatesIt() async {
+    let clock = SteppableClock(Date(timeIntervalSince1970: 1_000))
+    let manager = BackgroundLoopsManager(clock: { clock.now })
+
+    // Never started: the displayed number is 0 — indistinguishable from a
+    // healthy app one instant after launch.
+    #expect(await manager.uptimeSeconds(now: clock.now) == 0)
+    #expect(await manager.isRunning() == false)
+
+    _ = await manager.start(loops: [])
+    #expect(await manager.isRunning() == true)
+    // Freshly started: ALSO 0. The pair (uptime, isRunning) is the only honest
+    // read; uptime alone can never report "not started".
+    #expect(await manager.uptimeSeconds(now: clock.now) == 0)
+
+    clock.advance(45)
+    #expect(await manager.uptimeSeconds(now: clock.now) == 45)
+
+    // A `now` behind startedAt must clamp at 0, never go negative.
+    #expect(await manager.uptimeSeconds(now: Date(timeIntervalSince1970: 0)) == 0)
+
+    await manager.stop()
+}
+
+@Test func managerUptime_keepsClimbingAfterStop_soIsRunningIsTheLivenessSignal() async {
+    let clock = SteppableClock(Date(timeIntervalSince1970: 2_000))
+    let manager = BackgroundLoopsManager(clock: { clock.now })
+    _ = await manager.start(loops: [])
+    clock.advance(30)
+    let beforeStop = await manager.uptimeSeconds(now: clock.now)
+    #expect(beforeStop == 30)
+
+    await manager.stop()
+    clock.advance(60)
+    #expect(await manager.isRunning() == false)
+    #expect(
+        await manager.uptimeSeconds(now: clock.now) == 90,
+        "stop() clears `started` but not `startedAt` — the rendered Uptime keeps climbing for a manager with no running loops; isRunning() is the only liveness signal"
+    )
+
+    // Restart rebases the clock rather than accumulating the stopped gap.
+    _ = await manager.start(loops: [])
+    #expect(await manager.uptimeSeconds(now: clock.now) == 0)
+    clock.advance(5)
+    #expect(await manager.uptimeSeconds(now: clock.now) == 5)
+    await manager.stop()
+}
+
+@Test func watchdogUptimeAndManagerUptimeAreTwoIndependentNumbers() async throws {
+    // SwiftNativeBackgroundLoops stamps its OWN startedAt at CONSTRUCTION;
+    // BackgroundLoopsManager stamps its own at start(). Nothing reconciles the
+    // two, so the watchdog can report a healthy-looking uptime for a manager
+    // that never started. Pin the divergence AND the field that does track the
+    // manager, so a UI reading the wrong one is a caught mistake.
+    let clock = SteppableClock(Date(timeIntervalSince1970: 5_000))
+    let manager = BackgroundLoopsManager(clock: { clock.now })
+    let sn = SwiftNativeBackgroundLoops(
+        jobWriter: RecordingSchedulerJobWriter(),
+        manager: manager,
+        startedAt: Date(timeIntervalSince1970: 4_000),
+        now: { clock.now }
+    )
+
+    let stopped = try await sn.getWatchdog()
+    #expect(stopped.uptimeSeconds == 1_000, "the watchdog's uptime is its own construction clock")
+    #expect(await manager.uptimeSeconds(now: clock.now) == 0, "the manager never started")
+    #expect(stopped.daemonLifecycleStatus == "stopped",
+            "lifecycle status — not uptimeSeconds — is what tracks the manager")
+
+    _ = await manager.start(loops: [])
+    clock.advance(10)
+    let running = try await sn.getWatchdog()
+    let managerUptime = await manager.uptimeSeconds(now: clock.now)
+    #expect(running.uptimeSeconds == 1_010)
+    #expect(managerUptime == 10)
+    #expect(running.uptimeSeconds != managerUptime,
+            "two independent uptimes; nothing in production compares them")
+    #expect(running.daemonLifecycleStatus == "ok")
+    await manager.stop()
+}

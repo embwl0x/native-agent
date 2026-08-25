@@ -19,6 +19,28 @@ private final class SingleInstanceActivationBox: @unchecked Sendable {
     }
 }
 
+enum LoginItemInstallLocation {
+    /// A login item must name an app in an actual Applications directory.
+    /// Prefix matching alone admits lookalikes such as `/Applications-old`,
+    /// which leaves macOS relaunching a build artifact that disappears on the
+    /// next cleanup.
+    static func allows(bundlePath: String, homeDirectory: String = NSHomeDirectory()) -> Bool {
+        let path = URL(fileURLWithPath: bundlePath).standardizedFileURL.path
+        let userApplications = URL(fileURLWithPath: homeDirectory, isDirectory: true)
+            .appendingPathComponent("Applications", isDirectory: true)
+            .standardizedFileURL.path
+        return isDescendant(path, of: "/Applications")
+            || isDescendant(path, of: userApplications)
+    }
+
+    private static func isDescendant(_ path: String, of directory: String) -> Bool {
+        let normalizedDirectory = directory.hasSuffix("/")
+            ? String(directory.dropLast())
+            : directory
+        return path.hasPrefix(normalizedDirectory + "/")
+    }
+}
+
 
 extension AppDelegate {
     @MainActor
@@ -94,7 +116,7 @@ extension AppDelegate {
     static func registerLoginItemIfNeeded() async {
         guard #available(macOS 13.0, *) else { return }
         let bundlePath = Bundle.main.bundlePath
-        guard bundlePath.hasPrefix("/Applications/") || bundlePath.hasPrefix("\(NSHomeDirectory())/Applications/") else {
+        guard LoginItemInstallLocation.allows(bundlePath: bundlePath) else {
             print("[app] skipped login auto-start registration for non-installed bundle: \(bundlePath)")
             return
         }

@@ -69,7 +69,7 @@ extension NativeClient {
         // DAEMON-KILL P1: read <dataRoot>/runs/runs.json. The on-disk shape may
         // be a bare array or {"runs": [...]}; try both. Sort newest-first by
         // createdAt and slice to a sane default limit.
-        let path = PersistenceCore.defaultDataRoot()
+        let path = (dataRootOverride ?? PersistenceCore.defaultDataRoot())
             .appendingPathComponent("runs", isDirectory: true)
             .appendingPathComponent("runs.json")
         guard FileManager.default.fileExists(atPath: path.path) else { return [] }
@@ -98,16 +98,9 @@ extension NativeClient {
         // the same 200 the UI list expects, then encode → decode into the
         // NativeAgentShared.MemoryRecord shape the UI uses (its memberwise
         // init is internal, so we round-trip through JSON).
-        let dataRoot = PersistenceCore.defaultDataRoot()
-        guard let storage = try? await SwiftNativeMemoryV2.resolvedStorage(
-            dataRoot: dataRoot
-        ) else { return [] }
-        let stored: [StoredMemory]
-        do {
-            stored = try await storage.listMemories(persona: nil, status: "active", limit: 200)
-        } catch {
-            return []
-        }
+        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
+        let stored = try await storage.listMemories(persona: nil, status: "active", limit: 200)
         let rows: [[String: Any]] = stored.map { m in
             var dict: [String: Any] = [
                 "id": m.id,
@@ -140,7 +133,7 @@ extension NativeClient {
     }
 
     func getSkills() async throws -> [SkillRecord] {
-        let impl = makeSkillsClient(root: PersistenceCore.defaultDataRoot())
+        let impl = makeSkillsClient(root: dataRootOverride ?? PersistenceCore.defaultDataRoot())
         let rows = try await impl.listSkills()
         let data = try JSONValue.array(rows).serializedData(pretty: false)
         // Use the SAME lossy per-row decode the HTTP getList path uses, so a
@@ -178,14 +171,14 @@ extension NativeClient {
         // registry directly and overlay only non-secret runtime readiness
         // signals (token/config presence). This restores the Connectors tab and
         // command-summary counts without routing through a daemon fallback.
-        return try await Self.readConnectorRecords(root: PersistenceCore.defaultDataRoot())
+        return try await Self.readConnectorRecords(root: dataRootOverride ?? PersistenceCore.defaultDataRoot())
     }
 
     func getWorkspaces() async throws -> [WorkspaceRecord] {
         // Subsystem #24 wave 31 (W14): when .connectors is on, read the saved
         // workspace rows in-process from <dataRoot>/connectors/workspaces.json
         // (pure read, no write-back, no secrets), matching Runtime.list_workspaces.
-        let impl = makeConnectorsClient(root: PersistenceCore.defaultDataRoot())
+        let impl = makeConnectorsClient(root: dataRootOverride ?? PersistenceCore.defaultDataRoot())
         let rows = try await impl.listWorkspaces()
         let data = try JSONValue.array(rows).serializedData(pretty: false)
         return try JSONDecoder().decode([WorkspaceRecord].self, from: data)
@@ -208,29 +201,49 @@ extension NativeClient {
     }
 
     func getWatchdog() async throws -> WatchdogStatus {
-        await BackgroundLoopsManager.shared.start()
-        let loopStatuses = await BackgroundLoopsManager.shared.status()
-        let running = await BackgroundLoopsManager.shared.isRunning()
-        let uptime = await BackgroundLoopsManager.shared.uptimeSeconds()
+        let loopStatuses = await backgroundLoopsManager.status()
+        let running = await backgroundLoopsManager.isRunning()
+        let uptime = await backgroundLoopsManager.uptimeSeconds()
+        let failedLoops = loopStatuses.filter { $0.lastError != nil }
+        let lifecycleStatus = running ? (failedLoops.isEmpty ? "ok" : "degraded") : "stopped"
+        let newestRun = loopStatuses.compactMap(\.lastRun).max()
+        let lastActivity: JSONValue? = newestRun.map { lastRun in
+            .object([
+                "id": .string("background-loops-watchdog-\(Int64(lastRun.timeIntervalSince1970))"),
+                "kind": .string("background_loops"),
+                "title": .string("Swift background loop tick"),
+                "detail": .string("Latest registered loop tick."),
+                "status": .string(lifecycleStatus),
+                "executionId": .null,
+                "createdAt": .string(SwiftNativeManifestSigner.isoTimestamp(lastRun)),
+            ])
+        }
         let loops: JSONValue = .array(loopStatuses.sorted { $0.loopId < $1.loopId }.map { loop in
             .object([
                 "name": .string(loop.loopId),
+                "lastRunAt": loop.lastRun.map { .string(SwiftNativeManifestSigner.isoTimestamp($0)) } ?? .null,
+                "nextRunAt": loop.nextRun.map { .string(SwiftNativeManifestSigner.isoTimestamp($0)) } ?? .null,
+                "runCount": .int(Int64(loop.runCount)),
+                "lastError": loop.lastError.map { .string($0) } ?? .null,
                 "running": .bool(loop.running),
+                "executing": .bool(loop.executing),
             ])
         })
         let status = BackgroundLoops.WatchdogStatus(
             daemon: "swift",
             uptimeSeconds: uptime,
-            daemonLifecycleStatus: running ? "ok" : "stopped",
+            daemonLifecycleStatus: lifecycleStatus,
             daemonLifecycleDetail: running
-                ? "Swift background loops are running in NativeAgent.app."
+                ? (failedLoops.isEmpty
+                    ? "Swift background loops are running in NativeAgent.app."
+                    : "Swift background loops are running with \(failedLoops.count) loop failure(s): \(failedLoops.map(\.loopId).sorted().joined(separator: ", ")).")
                 : "Swift background loops are not running.",
             launchAgentStatus: "not_applicable",
             launchAgentDetail: "NativeAgent.app owns background loops; legacy daemon launch agents are retired.",
-            runningImprovements: 0,
-            runningExecutions: 0,
-            lastActivity: nil,
-            repairAvailable: false,
+            runningImprovements: loopStatuses.filter { $0.executing && $0.loopId == "self_improvement_sweep" }.count,
+            runningExecutions: loopStatuses.filter { $0.executing && ["mission_executor", "workshop_pump"].contains($0.loopId) }.count,
+            lastActivity: lastActivity,
+            repairAvailable: !failedLoops.isEmpty,
             extras: .object([
                 "backend": .string("swift"),
                 "source": .string("app_background_loops_manager"),
@@ -254,14 +267,16 @@ extension NativeClient {
     }
 
     func getJobs() async throws -> [SchedulerJob] {
-        // WAVE 38 W15 (2026-06-02): SwiftNative TriggerScheduler list_jobs reads
-        // flock'd jobs.json and decorates nextRunAt epoch values into ISO strings.
-        // Decode those rows into [SchedulerJob] for the app UI. See
-        // CUTOVER_PLAN.md §6.180.
-        let writer = makeSchedulerJobWriter(connectorActionIDs: Self.connectorActionIDSet())
-        let rows = try await writer.listJobs()
-        let data = try JSONValue.array(rows).serializedData(pretty: false)
-        return try JSONDecoder().decode([SchedulerJob].self, from: data)
+        switch await schedulerJobsFeed() {
+        case .current(let jobs):
+            return jobs
+        case .sourceAbsent:
+            throw SchedulerJobsFeedError.sourceAbsent
+        case .partial(_, let rejectedRows):
+            throw SchedulerJobsFeedError.partial(rejectedRows: rejectedRows)
+        case .unavailable(let detail):
+            throw SchedulerJobsFeedError.unavailable(detail)
+        }
     }
 
     func getImprovements() async throws -> [ImprovementRun] {
@@ -312,7 +327,7 @@ extension NativeClient {
     // Swift-native config aggregate. The daemon-era bridge file is retired:
     // each feature is read only from its owned per-feature path.
     func getConfig() async throws -> AppConfig {
-        let dataRoot = PersistenceCore.defaultDataRoot()
+        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         var config = AppConfig()
 
         let researchPath = dataRoot
@@ -329,14 +344,21 @@ extension NativeClient {
         config.autoDoctor = Self.readAutoDoctorConfig(dataRoot: dataRoot)
 
         if let cfg = TelegramBot.TelegramConfig.loadFromDisk(dataRoot: dataRoot) {
+            let telegramBrain = try? await SwiftNativeProviderRouting(dataRoot: dataRoot)
+                .computeModelPreferences()["telegram"]
+            let resolvedTelegramBrain = resolveTelegramBrain(
+                routing: telegramBrain,
+                legacyModel: cfg.model,
+                legacyReasoningEffort: cfg.reasoningEffort
+            )
             var telegram = TelegramConfig()
             telegram.enabled = cfg.enabled
             telegram.tokenConfigured = !cfg.botToken.isEmpty
             telegram.allowedChatIds = cfg.allowedChatIds.sorted().map { String($0) }
             telegram.allowedUserIds = cfg.allowedUserIds.sorted().map { String($0) }
             telegram.requireMention = cfg.requireMention
-            telegram.model = cfg.model
-            telegram.reasoningEffort = cfg.reasoningEffort
+            telegram.model = resolvedTelegramBrain.model
+            telegram.reasoningEffort = resolvedTelegramBrain.reasoningEffort
             config.telegram = telegram
         }
 

@@ -1,6 +1,44 @@
 import SwiftUI
 import NativeAgentShared
 
+/// The only Desk kinds the mobile creation sheet may send across the iCloud
+/// action boundary. Keeping the picker state typed prevents a UI edit from
+/// emitting an arbitrary wire value the canonical Desk store would reject.
+enum MobileDeskItemKind: String, CaseIterable, Hashable {
+    case plan
+    case project
+    case watch
+    case gh
+    case standing
+}
+
+/// iOS may submit only the statuses accepted by the Mac action router. A
+/// blocked item keeps its current label visible so it can be moved elsewhere,
+/// but the phone never offers a reasonless transition into `blocked`.
+enum MobileDeskStatusPickerPresentation {
+    private static let routerAcceptedStatuses = [
+        "watch", "flag", "now", "next", "todo", "done", "canceled",
+    ]
+
+    static func allowedStatuses(for current: String) -> [String] {
+        current == "blocked" ? ["blocked"] + routerAcceptedStatuses : routerAcceptedStatuses
+    }
+}
+
+enum MobileDeskEmptyStatePresentation: Equatable {
+    case loading
+    case unavailable(String)
+    case empty
+
+    static func state(isRefreshing: Bool, syncError: String?) -> MobileDeskEmptyStatePresentation {
+        if isRefreshing { return .loading }
+        if let syncError = syncError?.trimmingCharacters(in: .whitespacesAndNewlines), !syncError.isEmpty {
+            return .unavailable(syncError)
+        }
+        return .empty
+    }
+}
+
 /// iPhone projection of the Mac-owned, event-sourced Desk. All writes travel
 /// through the existing signed action channel; iOS never owns a second Desk.
 struct MobileDeskView: View {
@@ -8,17 +46,18 @@ struct MobileDeskView: View {
     @State private var selectedItem: MobileDeskItem?
     @State private var showingNewItem = false
     @State private var errorMessage: String?
+    @State private var isRefreshingDesk = true
 
     private var waitingOnYou: [MobileDeskItem] {
-        sync.deskItems.filter { $0.requiresOwnerInput && !Self.isTerminal($0.status) }
+        sync.deskItems.filter { MobileDeskSectionPresentation.section(for: $0) == .waitingOnYou }
     }
 
     private var active: [MobileDeskItem] {
-        sync.deskItems.filter { !Self.isTerminal($0.status) && !$0.requiresOwnerInput }
+        sync.deskItems.filter { MobileDeskSectionPresentation.section(for: $0) == .active }
     }
 
     private var history: [MobileDeskItem] {
-        sync.deskItems.filter { Self.isTerminal($0.status) }
+        sync.deskItems.filter { MobileDeskSectionPresentation.section(for: $0) == .history }
     }
 
     var body: some View {
@@ -39,18 +78,43 @@ struct MobileDeskView: View {
                 }
             }
             if sync.deskItems.isEmpty {
-                AppEmptyState(
-                    title: "Your Desk is clear",
-                    systemImage: "rectangle.3.group",
-                    description: "Items tracked on the Mac will appear here. You can also add one from your iPhone."
-                )
-                .listRowBackground(Color.clear)
-                .listRowSeparator(.hidden)
+                switch MobileDeskEmptyStatePresentation.state(
+                    isRefreshing: isRefreshingDesk,
+                    syncError: sync.syncError
+                ) {
+                case .loading:
+                    ProgressView("Loading Desk…")
+                        .frame(maxWidth: .infinity)
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
+                case .unavailable(let error):
+                    AppEmptyState(
+                        title: "Desk is unavailable",
+                        systemImage: "icloud.slash",
+                        kind: .unavailable,
+                        description: error
+                    )
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+                case .empty:
+                    AppEmptyState(
+                        title: "Your Desk is clear",
+                        systemImage: "rectangle.3.group",
+                        kind: .empty,
+                        description: "Items tracked on the Mac will appear here. You can also add one from your iPhone."
+                    )
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+                }
             }
         }
         .listStyle(.insetGrouped)
         .navigationTitle("Desk")
+        .macSyncErrorBanner()
         .toolbar {
+            ToolbarItem(placement: .navigationBarLeading) {
+                MacStatusChip()
+            }
             ToolbarItem(placement: .primaryAction) {
                 Button { showingNewItem = true } label: { Image(systemName: "plus") }
                     .accessibilityLabel("Add Desk item")
@@ -59,8 +123,8 @@ struct MobileDeskView: View {
                 if let syncAt = sync.lastSyncAt { SyncBadge(date: syncAt) }
             }
         }
-        .refreshable { await sync.refreshDeskSnapshot() }
-        .task { await sync.refreshDeskSnapshot() }
+        .refreshable { await refreshDesk() }
+        .task { await refreshDesk() }
         .sheet(item: $selectedItem) { item in
             MobileDeskItemDetail(item: item, errorMessage: $errorMessage)
         }
@@ -75,6 +139,12 @@ struct MobileDeskView: View {
         } message: {
             Text(errorMessage ?? "")
         }
+    }
+
+    private func refreshDesk() async {
+        isRefreshingDesk = true
+        await sync.refreshDeskSnapshot()
+        isRefreshingDesk = false
     }
 
     @ViewBuilder
@@ -104,10 +174,6 @@ struct MobileDeskView: View {
         .buttonStyle(.plain)
     }
 
-    fileprivate static func isTerminal(_ status: String) -> Bool {
-        status == "done" || status == "canceled"
-    }
-
     fileprivate static func icon(for status: String) -> String {
         switch status {
         case "done": "checkmark.circle.fill"
@@ -130,6 +196,52 @@ struct MobileDeskView: View {
         case "flag": .orange
         default: .secondary
         }
+    }
+}
+
+/// The Mac stamps `closedAt` for every terminal Desk transition and includes
+/// that stamp in the mobile snapshot. It is therefore the cross-version
+/// terminal proof; matching raw status names here would leave a newly added
+/// terminal Mac status in Active until the iOS app shipped again.
+enum MobileDeskSectionPresentation {
+    enum Section: Equatable {
+        case waitingOnYou
+        case active
+        case history
+    }
+
+    static func section(for item: MobileDeskItem) -> Section {
+        section(requiresOwnerInput: item.requiresOwnerInput, closedAt: item.closedAt)
+    }
+
+    static func section(requiresOwnerInput: Bool, closedAt: String?) -> Section {
+        if let closedAt, !closedAt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return .history
+        }
+        return requiresOwnerInput ? .waitingOnYou : .active
+    }
+}
+
+/// The mobile form validates the same note shape that the Mac action accepts,
+/// so an iPhone user learns about a local input issue before an iCloud round
+/// trip can return the router's otherwise generic rejection.
+enum MobileDeskNotePresentation {
+    static let maximumCharacterCount = 2_000
+    static let maximumCharacterCountLabel = "2,000"
+
+    static func submissionText(for draft: String) -> String? {
+        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, text.count <= maximumCharacterCount else { return nil }
+        return text
+    }
+
+    static func validationMessage(for draft: String) -> String? {
+        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.isEmpty { return "Enter a note before adding it." }
+        if text.count > maximumCharacterCount {
+            return "Desk notes can be at most \(maximumCharacterCountLabel) characters."
+        }
+        return nil
     }
 }
 
@@ -160,7 +272,7 @@ private struct MobileDeskItemDetail: View {
                         get: { item.status },
                         set: { status in Task { await changeStatus(status) } }
                     )) {
-                        ForEach(Self.allowedStatuses(for: item.status), id: \.self) {
+                        ForEach(MobileDeskStatusPickerPresentation.allowedStatuses(for: item.status), id: \.self) {
                             Text($0.capitalized).tag($0)
                         }
                     }
@@ -179,8 +291,11 @@ private struct MobileDeskItemDetail: View {
                 Section("Add Note") {
                     TextField("What changed?", text: $note, axis: .vertical)
                         .lineLimit(2...6)
+                    Text("\(note.trimmingCharacters(in: .whitespacesAndNewlines).count)/\(MobileDeskNotePresentation.maximumCharacterCountLabel)")
+                        .font(.caption)
+                        .foregroundStyle(note.trimmingCharacters(in: .whitespacesAndNewlines).count > MobileDeskNotePresentation.maximumCharacterCount ? .red : .secondary)
                     Button("Add Note") { Task { await addNote() } }
-                        .disabled(isWorking || note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .disabled(isWorking || MobileDeskNotePresentation.submissionText(for: note) == nil)
                 }
             }
             .navigationTitle(item.title)
@@ -200,18 +315,11 @@ private struct MobileDeskItemDetail: View {
         } catch { errorMessage = error.localizedDescription }
     }
 
-    private static func allowedStatuses(for current: String) -> [String] {
-        var statuses = ["watch", "flag", "now", "next", "todo", "done", "canceled"]
-        // Blocking carries reason/ownership semantics and is deliberately set
-        // on the Mac. Preserve an existing blocked selection without offering
-        // a reasonless transition from the phone.
-        if current == "blocked" { statuses.insert("blocked", at: 0) }
-        return statuses
-    }
-
     private func addNote() async {
-        let clean = note.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clean.isEmpty else { return }
+        guard let clean = MobileDeskNotePresentation.submissionText(for: note) else {
+            errorMessage = MobileDeskNotePresentation.validationMessage(for: note)
+            return
+        }
         isWorking = true
         defer { isWorking = false }
         do {
@@ -229,7 +337,7 @@ private struct NewMobileDeskItemSheet: View {
     @State private var title = ""
     @State private var project = "General"
     @State private var summary = ""
-    @State private var kind = "plan"
+    @State private var kind: MobileDeskItemKind = .plan
     @State private var isSaving = false
 
     var body: some View {
@@ -238,8 +346,8 @@ private struct NewMobileDeskItemSheet: View {
                 TextField("Title", text: $title)
                 TextField("Project", text: $project)
                 Picker("Kind", selection: $kind) {
-                    ForEach(["plan", "project", "watch", "gh", "standing"], id: \.self) {
-                        Text($0.capitalized).tag($0)
+                    ForEach(MobileDeskItemKind.allCases, id: \.self) {
+                        Text($0.rawValue.capitalized).tag($0)
                     }
                 }
                 TextField("Summary (optional)", text: $summary, axis: .vertical).lineLimit(2...6)
@@ -261,7 +369,7 @@ private struct NewMobileDeskItemSheet: View {
         defer { isSaving = false }
         do {
             _ = try await iCloudSyncEngine.shared.createDeskItem(
-                kind: kind,
+                kind: kind.rawValue,
                 project: project.trimmingCharacters(in: .whitespacesAndNewlines),
                 title: title.trimmingCharacters(in: .whitespacesAndNewlines),
                 summary: summary.trimmingCharacters(in: .whitespacesAndNewlines)

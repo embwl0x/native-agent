@@ -266,7 +266,12 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
         usage: LLMUsage?,
         ttftMs: Int?,
         durationMs: Int,
-        status: String = "ok"
+        status: String = "ok",
+        /// Set ONLY when an enumerated model remap actually rewrote the
+        /// caller's requested id (e.g. the OAuth-direct adapters' Claude→GPT
+        /// table or an `openai/` namespace strip). Additive and optional:
+        /// rows without it decode exactly as before.
+        substitutedFrom: String? = nil
     ) async {
         let surface = LLMCallContext.surface ?? "unknown"
         // Turn Inspector W1: tag with the per-turn trace id so the Inspector
@@ -285,6 +290,9 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
             "turnId": .string(turnId),
         ]
         if let ttftMs { payload["ttftMs"] = .int(Int64(ttftMs)) }
+        if let substitutedFrom, !substitutedFrom.isEmpty, substitutedFrom != model {
+            payload["substitutedFrom"] = .string(substitutedFrom)
+        }
         if let usage {
             if let v = usage.inputTokens { payload["inputTokens"] = .int(Int64(v)) }
             if let v = usage.outputTokens { payload["outputTokens"] = .int(Int64(v)) }

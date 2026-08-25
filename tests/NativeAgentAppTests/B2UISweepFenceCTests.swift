@@ -114,12 +114,33 @@ struct B2UISweepFenceCTests {
         #expect(NativeClient.supportSnapshotRollup([]) == "ok")
     }
 
-    @Test func loadSupportDiagnosticsReusesOnlyAFreshDoctorRun() throws {
-        let source = try AppSourceScraping.appSource("AppModel+PersonalitySelfImprovement.swift")
+    @Test @MainActor
+    func loadSupportDiagnosticsReusesOnlyAFreshDoctorRun() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("support-diagnostics-reuse-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
 
-        #expect(source.contains("supportSnapshotDoctorReuseTTL"))
-        #expect(source.contains("getSupportDiagnostics(reusing: reuse)"))
-        // Reuse is gated on a completed run within the TTL.
-        #expect(source.contains("Date().timeIntervalSince(completedAt) < Self.supportSnapshotDoctorReuseTTL"))
+        let app = AppModel(dataRootOverride: root, startBackgroundTasks: false)
+        app.doctorReport = DoctorReport(status: "fail", repaired: false, checks: [
+            DoctorCheck(id: "storage", title: "Storage", status: "ok", detail: "ready", repair: nil),
+            DoctorCheck(id: "backups", title: "Backups", status: "warn", detail: "stale", repair: nil),
+            DoctorCheck(id: "live.telegram", title: "Telegram", status: "fail", detail: "offline", repair: nil),
+        ])
+        app.doctorReportCompletedAt = Date()
+
+        let fresh = await app.loadSupportDiagnostics()
+        guard case let .loaded(diagnostics, reusedDoctorReport: true) = fresh else {
+            Issue.record("a completed Doctor report inside the reuse window was not reused: \(fresh)")
+            return
+        }
+        #expect(diagnostics.doctorStatus == "warn")
+
+        app.doctorReportCompletedAt = Date().addingTimeInterval(-AppModel.supportSnapshotDoctorReuseTTL - 1)
+        let stale = await app.loadSupportDiagnostics()
+        guard case .loaded(_, reusedDoctorReport: false) = stale else {
+            Issue.record("a Doctor report outside the reuse window was incorrectly reused: \(stale)")
+            return
+        }
     }
 }

@@ -8,6 +8,7 @@ import NativeAgentCore
 // MARK: - Diagnostics (Advanced tab)
 
 struct DiagnosticsView: View {
+    @Environment(AppModel.self) private var appModel
     @State private var mode: DiagnosticsMode
 
     /// Landing segment. The retired Cognition and Inspector tabs alias into
@@ -45,7 +46,8 @@ struct DiagnosticsView: View {
                 case .doctor: DoctorView()
                 case .status: StatusView()
                 case .runs: RunsView()
-                case .cognition: CognitionObservatoryView()
+                case .cognition:
+                    CognitionObservatoryView(dependencies: .live(appModel: appModel))
                 case .inspector: InspectorView()
                 }
             }

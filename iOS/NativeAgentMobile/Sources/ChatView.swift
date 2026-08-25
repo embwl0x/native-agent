@@ -3,6 +3,12 @@
 // PATCH-2026-05-30: streaming wired via text_delta BridgeMessage path
 //                   (see ChatStore text_delta handling lines ~434-525).
 import SwiftUI
+
+enum ChatSessionTabPresentation {
+    static func isSelectionDisabled(isSwitchingSession: Bool, isClosingSession: Bool) -> Bool {
+        isSwitchingSession || isClosingSession
+    }
+}
 import UIKit
 import Speech
 import PhotosUI
@@ -30,12 +36,16 @@ struct ChatView: View {
     // generation; a failed round-trip only reverts if ITS generation is still
     // current. A value-equality check alone can't tell "still my pick" from
     // "user moved away and back while I was in flight."
-    @State private var surfaceSelectionGeneration = 0
+    @AppStorage("chatSurfaceSelectionGeneration") private var surfaceSelectionGeneration = 0
+    // A snapshot is eventually consistent with the configure request. Keep a
+    // freshly chosen set of runtime controls on screen until that snapshot
+    // acknowledges the same selection instead of letting an older Mac value
+    // immediately overwrite it.
+    @AppStorage("chatSurfaceSelectionAwaitingSync") private var surfaceSelectionAwaitingSync = false
     @AppStorage("chatFileAccess") private var selectedFileAccess = "auto"
     @AppStorage("chatProviderId") private var selectedProviderId = ""
     @State private var inputText = ""
-    @State private var scrollSerial = 0
-    @State private var scrollScheduled = false
+    @State private var scrollScheduler = ChatScrollScheduler()
     @State private var lastScrollAt = Date.distantPast
     @State private var autoFollowChat = true
     @State private var showLatestButton = false
@@ -102,7 +112,7 @@ struct ChatView: View {
             model: selectedModel,
             reasoningEffort: selectedReasoningEffort,
             serviceTier: selectedFastMode ? "priority" : "default",
-            fileAccess: selectedFileAccess,
+            fileAccess: ChatRuntimeControlPresentation.normalizedFileAccessID(selectedFileAccess),
             providerId: providerId(for: selectedModel)
         )
     }
@@ -136,9 +146,10 @@ struct ChatView: View {
                         Image(systemName: "exclamationmark.triangle.fill")
                         Text(error).font(.callout)
                         Spacer()
-                        Button { store.errorBanner = nil } label: {
+                        Button { store.dismissErrorBanner() } label: {
                             Image(systemName: "xmark")
                         }
+                        .accessibilityLabel("Dismiss chat error")
                     }
                     .padding(10)
                     .background(.red.opacity(0.12))
@@ -164,6 +175,19 @@ struct ChatView: View {
                     .transition(.move(edge: .top).combined(with: .opacity))
                 }
 
+                if let speechErr = voiceOutput.error {
+                    HStack {
+                        Image(systemName: "speaker.slash.fill")
+                        Text(speechErr).font(.callout)
+                        Spacer()
+                        Button { voiceOutput.error = nil } label: {
+                            Image(systemName: "xmark")
+                        }
+                    }
+                    .padding(10)
+                    .background(.orange.opacity(0.14))
+                }
+
                 runtimeControlsBar
                 if showsChatSessionTabs {
                     chatSessionTabsBar
@@ -175,6 +199,7 @@ struct ChatView: View {
                             AppEmptyState(
                                 title: "No messages yet",
                                 systemImage: "bubble.left.and.bubble.right",
+                                kind: .empty,
                                 description: "Say something to get started."
                             )
                         } else {
@@ -186,7 +211,7 @@ struct ChatView: View {
 	                                        isTimedOut: store.isTimedOut(msg),
 	                                        onRetry: { store.retry(messageId: msg.id, client: bridgeClient) }
 	                                    )
-	                                    .id(msg.id)
+	                                    .id(msg.id.uuidString)
 	                                    // phase 6: entrance animates ONLY when the
 	                                    // append seam (ChatStore.send) supplies a
 	                                    // transaction; removals and wholesale
@@ -221,16 +246,18 @@ struct ChatView: View {
                     .simultaneousGesture(
                         DragGesture(minimumDistance: 8).onChanged { _ in
                             if store.isLoading || !store.messages.isEmpty {
-                                autoFollowChat = false
-                                showLatestButton = true
+                                let follow = ChatFollowPresentation.userScrolledAway()
+                                autoFollowChat = follow.autoFollow
+                                showLatestButton = follow.showsLatest
                             }
                         }
                     )
                     .overlay(alignment: .bottomTrailing) {
                         if showLatestButton {
                             Button {
-                                autoFollowChat = true
-                                showLatestButton = false
+                                let follow = ChatFollowPresentation.followLatest()
+                                autoFollowChat = follow.autoFollow
+                                showLatestButton = follow.showsLatest
                                 scheduleScrollToBottom(proxy, animated: true, delayMilliseconds: 0, force: true)
                             } label: {
                                 Label("Latest", systemImage: "arrow.down")
@@ -242,7 +269,9 @@ struct ChatView: View {
                         }
                     }
                     .onAppear {
-                        autoFollowChat = true
+                        let follow = ChatFollowPresentation.followLatest()
+                        autoFollowChat = follow.autoFollow
+                        showLatestButton = follow.showsLatest
                         scheduleScrollToBottom(proxy, animated: false, delayMilliseconds: 120, force: true)
                     }
                     .onChange(of: store.messages.count) {
@@ -271,8 +300,9 @@ struct ChatView: View {
                     // session's messages load async and arrive below the
                     // visible area; user has to manually scroll.
                     .onChange(of: store.selectedSessionID) {
-                        autoFollowChat = true
-                        showLatestButton = false
+                        let follow = ChatFollowPresentation.followLatest()
+                        autoFollowChat = follow.autoFollow
+                        showLatestButton = follow.showsLatest
                         scheduleScrollToBottom(proxy, animated: false, delayMilliseconds: 80, force: true)
                     }
                     // Belt-and-suspenders: when the first message id changes
@@ -373,6 +403,11 @@ struct ChatView: View {
                         }
                     }
                 }
+                _ = NativeAgentDeepLinkSendHook.deliverPending(
+                    to: store,
+                    client: bridgeClient,
+                    controls: runtimeControls
+                )
                 Task {
                     await bridgeClient.pollICloudRepliesNow()
                     await sync.refreshProviderControlsSnapshot()
@@ -411,9 +446,12 @@ struct ChatView: View {
             }
             // Simulator/process-argument test hook. The release target exposes
             // no URL scheme that can inject a real agent turn.
-            .onReceive(NotificationCenter.default.publisher(for: .nativeagentDeepLinkSend)) { note in
-                guard let text = note.userInfo?["text"] as? String, !text.isEmpty else { return }
-                store.send(text: text, client: bridgeClient, controls: runtimeControls)
+            .onReceive(NotificationCenter.default.publisher(for: .nativeagentDeepLinkSend)) { _ in
+                _ = NativeAgentDeepLinkSendHook.deliverPending(
+                    to: store,
+                    client: bridgeClient,
+                    controls: runtimeControls
+                )
             }
             // Append transcript to input field when user releases mic button
             .onChange(of: voiceInput.lastFinalTranscript) { _, newValue in
@@ -525,6 +563,10 @@ struct ChatView: View {
     private var queuedSendStrip: some View {
         let turns = store.queuedSendsForSelectedSession
         let next = turns[0]
+        let primaryAction = QueuedSendStripAction.resolve(
+            id: next.id,
+            isLoading: store.isLoading
+        )
         return HStack(spacing: 7) {
             Image(systemName: store.isSelectedQueuePaused
                   ? "pause.fill"
@@ -543,14 +585,17 @@ struct ChatView: View {
 
             Menu {
                 ForEach(Array(turns.enumerated()), id: \.element.id) { index, queued in
+                    let action = QueuedSendStripAction.resolve(
+                        id: queued.id,
+                        isLoading: store.isLoading
+                    )
                     Button {
-                        if store.isLoading {
-                            store.sendQueuedNow(queued.id, client: bridgeClient)
-                        } else {
-                            store.resumeQueuedSends(startingWith: queued.id)
-                        }
+                        action.apply(
+                            onSteer: { store.sendQueuedNow($0, client: bridgeClient) },
+                            onSend: { store.resumeQueuedSends(startingWith: $0) }
+                        )
                     } label: {
-                        Label("Send \(index + 1) now: \(queued.preview)", systemImage: "arrow.up")
+                        Label(action.menuTitle(position: index + 1, preview: queued.preview), systemImage: "arrow.up")
                     }
                     Button(role: .destructive) {
                         store.removeQueuedSend(queued.id)
@@ -567,12 +612,11 @@ struct ChatView: View {
             .fixedSize()
             .accessibilityLabel("Show all \(turns.count) queued messages")
 
-            Button(store.isLoading ? "Steer" : "Send") {
-                if store.isLoading {
-                    store.sendQueuedNow(next.id, client: bridgeClient)
-                } else {
-                    store.resumeQueuedSends(startingWith: next.id)
-                }
+            Button(primaryAction.primaryTitle) {
+                primaryAction.apply(
+                    onSteer: { store.sendQueuedNow($0, client: bridgeClient) },
+                    onSend: { store.resumeQueuedSends(startingWith: $0) }
+                )
             }
             .buttonStyle(.borderless)
 
@@ -615,13 +659,12 @@ struct ChatView: View {
                                     .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
                             }
                         Button {
-                            pendingPhotos.removeAll { $0.id == photo.id }
-                            if pendingPhotos.isEmpty {
-                                selectedPhotoItems = []
-                            } else {
-                                suppressNextEmptyPhotoSelection = true
+                            let removal = PendingPhotoPresentation.removing(photo.id, from: pendingPhotos)
+                            pendingPhotos = removal.photos
+                            if removal.clearsPicker {
                                 selectedPhotoItems = []
                             }
+                            suppressNextEmptyPhotoSelection = removal.suppressesNextEmptySelection
                         } label: {
                             Image(systemName: "xmark.circle.fill")
                                 .font(.system(size: 18, weight: .semibold))
@@ -685,10 +728,12 @@ struct ChatView: View {
                         }
                         .buttonStyle(.plain)
                         .disabled(
-                            store.isLoading || store.isSwitchingSession
-                                || (tab.sessionID.map { closingPinnedSessionIDs.contains($0) } ?? false)
+                            ChatSessionTabPresentation.isSelectionDisabled(
+                                isSwitchingSession: store.isSwitchingSession,
+                                isClosingSession: tab.sessionID.map { closingPinnedSessionIDs.contains($0) } ?? false
+                            )
                         )
-                        .opacity((store.isLoading || store.isSwitchingSession) && !selected ? 0.55 : 1)
+                        .opacity(store.isSwitchingSession && !selected ? 0.55 : 1)
                         .accessibilityLabel(tab.title)
 
                         if case .pinned(let sessionID) = tab.kind {
@@ -782,28 +827,33 @@ struct ChatView: View {
                             reconcileExecutionControlsForSelectedModel()
                             let requestedProvider = selectedProviderId
                             let requestedEffort = selectedReasoningEffort
-                            let requestedServiceTier = selectedFastMode ? "priority" : "default"
-                            surfaceSelectionGeneration += 1
-                            let myGeneration = surfaceSelectionGeneration
+                            let myGeneration = beginSurfaceSelectionUpdate()
                             Task {
-                                do {
+                                let result = await ChatRuntimeControlPresentation.execute(
+                                    defaults: .standard,
+                                    previous: .init(providerID: previousProvider, model: previous, reasoningEffort: previousEffort, fastMode: previousFastMode),
+                                    requested: .init(providerID: requestedProvider, model: model, reasoningEffort: requestedEffort, fastMode: selectedFastMode),
+                                    requestGeneration: myGeneration
+                                ) { requested in
                                     _ = try await sync.configureSurfaceSelection(
                                         surface: "ios",
-                                        providerId: requestedProvider,
-                                        model: model,
-                                        reasoningEffort: requestedEffort,
-                                        serviceTier: requestedServiceTier
+                                        providerId: requested.providerID,
+                                        model: requested.model,
+                                        reasoningEffort: requested.reasoningEffort,
+                                        serviceTier: requested.fastMode ? "priority" : "default"
                                     )
-                                } catch {
+                                }
+                                if let restored = result.restored {
                                     // Only undo if no NEWER pick happened while this
                                     // round-trip was in flight — generation, not value:
                                     // the user may have moved away and back (ABA).
-                                    if surfaceSelectionGeneration == myGeneration {
-                                        selectedModel = previous
-                                        selectedReasoningEffort = previousEffort
-                                        selectedFastMode = previousFastMode
-                                        selectedProviderId = previousProvider
-                                    }
+                                    selectedModel = restored.model
+                                    selectedReasoningEffort = restored.reasoningEffort
+                                    selectedFastMode = restored.fastMode
+                                    selectedProviderId = restored.providerID
+                                }
+                                if let error = result.error {
+                                    finishSurfaceSelectionFailure(requestGeneration: myGeneration)
                                     iOSSystemToastCenter.shared.push(
                                         error: "Couldn't switch to \(modelLabel(model)): \(error.localizedDescription)"
                                     )
@@ -815,7 +865,12 @@ struct ChatView: View {
                     }
                     Divider()
                     Button {
-                        Task { await sync.refreshProviderControlsSnapshot() }
+                        Task {
+                            await ChatRuntimeControlPresentation.refreshModels(
+                                refresh: { await sync.refreshProviderControlsSnapshot() },
+                                presentError: { iOSSystemToastCenter.shared.push(error: $0) }
+                            )
+                        }
                     } label: {
                         Label("Refresh Models", systemImage: "arrow.clockwise")
                     }
@@ -834,8 +889,7 @@ struct ChatView: View {
                             let requestedModel = selectedModel
                             let requestedProvider = selectedProviderId
                             let requestedServiceTier = selectedFastMode ? "priority" : "default"
-                            surfaceSelectionGeneration += 1
-                            let myGeneration = surfaceSelectionGeneration
+                            let myGeneration = beginSurfaceSelectionUpdate()
                             Task {
                                 do {
                                     _ = try await sync.configureSurfaceSelection(
@@ -846,12 +900,17 @@ struct ChatView: View {
                                         serviceTier: requestedServiceTier
                                     )
                                 } catch {
+                                    finishSurfaceSelectionFailure(requestGeneration: myGeneration)
                                     // Generation, not value (ABA) — see model menu above.
-                                    if surfaceSelectionGeneration == myGeneration {
-                                        selectedModel = previousModel
-                                        selectedReasoningEffort = previous
-                                        selectedFastMode = previousFastMode
-                                        selectedProviderId = previousProvider
+                                    if let restored = ChatRuntimeControlPresentation.rollback(
+                                        currentGeneration: surfaceSelectionGeneration,
+                                        requestGeneration: myGeneration,
+                                        previous: .init(providerID: previousProvider, model: previousModel, reasoningEffort: previous, fastMode: previousFastMode)
+                                    ) {
+                                        selectedModel = restored.model
+                                        selectedReasoningEffort = restored.reasoningEffort
+                                        selectedFastMode = restored.fastMode
+                                        selectedProviderId = restored.providerID
                                     }
                                     iOSSystemToastCenter.shared.push(
                                         error: "Couldn't set reasoning to \(option.label): \(error.localizedDescription)"
@@ -878,8 +937,7 @@ struct ChatView: View {
                             let requestedModel = selectedModel
                             let requestedEffort = selectedReasoningEffort
                             let requestedProvider = selectedProviderId
-                            surfaceSelectionGeneration += 1
-                            let myGeneration = surfaceSelectionGeneration
+                            let myGeneration = beginSurfaceSelectionUpdate()
                             Task {
                                 do {
                                     _ = try await sync.configureSurfaceSelection(
@@ -890,11 +948,16 @@ struct ChatView: View {
                                         serviceTier: enabled ? "priority" : "default"
                                     )
                                 } catch {
-                                    if surfaceSelectionGeneration == myGeneration {
-                                        selectedModel = previousModel
-                                        selectedReasoningEffort = previousEffort
-                                        selectedFastMode = previous
-                                        selectedProviderId = previousProvider
+                                    finishSurfaceSelectionFailure(requestGeneration: myGeneration)
+                                    if let restored = ChatRuntimeControlPresentation.rollback(
+                                        currentGeneration: surfaceSelectionGeneration,
+                                        requestGeneration: myGeneration,
+                                        previous: .init(providerID: previousProvider, model: previousModel, reasoningEffort: previousEffort, fastMode: previous)
+                                    ) {
+                                        selectedModel = restored.model
+                                        selectedReasoningEffort = restored.reasoningEffort
+                                        selectedFastMode = restored.fastMode
+                                        selectedProviderId = restored.providerID
                                     }
                                     iOSSystemToastCenter.shared.push(
                                         error: "Couldn't change Fast mode: \(error.localizedDescription)"
@@ -990,29 +1053,47 @@ struct ChatView: View {
         let previousModel = selectedModel
         let previousEffort = selectedReasoningEffort
         let previousFastMode = selectedFastMode
-        selectedProviderId = id
-        reconcileSelectedModel(forProviderId: id)
+        let preferred = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4", "gpt-5.4-mini", "claude-opus-4-8", "claude-fable-5", "claude-sonnet-5", "grok-4.5"]
+        guard let selected = ChatRuntimeControlPresentation.selectionForProvider(
+            providerID: id,
+            current: .init(providerID: previousProvider, model: previousModel, reasoningEffort: previousEffort, fastMode: previousFastMode),
+            providers: sync.providers,
+            preferredModels: preferred
+        ) else {
+            iOSSystemToastCenter.shared.push(error: "That provider is not ready on the Mac.")
+            return
+        }
+        selectedProviderId = selected.providerID
+        selectedModel = selected.model
+        selectedReasoningEffort = selected.reasoningEffort
+        selectedFastMode = selected.fastMode
         let requestedModel = selectedModel
         let requestedEffort = selectedReasoningEffort
         let requestedFastMode = selectedFastMode
-        surfaceSelectionGeneration += 1
-        let myGeneration = surfaceSelectionGeneration
+        let myGeneration = beginSurfaceSelectionUpdate()
         Task {
-            do {
+            let result = await ChatRuntimeControlPresentation.execute(
+                defaults: .standard,
+                previous: .init(providerID: previousProvider, model: previousModel, reasoningEffort: previousEffort, fastMode: previousFastMode),
+                requested: .init(providerID: id, model: requestedModel, reasoningEffort: requestedEffort, fastMode: requestedFastMode),
+                requestGeneration: myGeneration
+            ) { requested in
                 _ = try await sync.configureSurfaceSelection(
                     surface: "ios",
-                    providerId: id,
-                    model: requestedModel,
-                    reasoningEffort: requestedEffort,
-                    serviceTier: requestedFastMode ? "priority" : "default"
+                    providerId: requested.providerID,
+                    model: requested.model,
+                    reasoningEffort: requested.reasoningEffort,
+                    serviceTier: requested.fastMode ? "priority" : "default"
                 )
-            } catch {
-                if surfaceSelectionGeneration == myGeneration {
-                    selectedProviderId = previousProvider
-                    selectedModel = previousModel
-                    selectedReasoningEffort = previousEffort
-                    selectedFastMode = previousFastMode
-                }
+            }
+            if let restored = result.restored {
+                    selectedProviderId = restored.providerID
+                    selectedModel = restored.model
+                    selectedReasoningEffort = restored.reasoningEffort
+                    selectedFastMode = restored.fastMode
+            }
+            if let error = result.error {
+                finishSurfaceSelectionFailure(requestGeneration: myGeneration)
                 iOSSystemToastCenter.shared.push(
                     error: "Couldn't switch provider: \(error.localizedDescription)"
                 )
@@ -1027,16 +1108,23 @@ struct ChatView: View {
     /// already in-provider (so a deliberate pick is preserved).
     private func reconcileSelectedModel(forProviderId id: String) {
         guard let provider = sync.providers.first(where: { $0.provider_id == id }) else { return }
-        let modelIDs = provider.models.map(\.id).filter { !$0.isEmpty }
-        guard !modelIDs.isEmpty, !modelIDs.contains(selectedModel) else { return }
         let preferred = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4", "gpt-5.4-mini", "claude-opus-4-8", "claude-fable-5", "claude-sonnet-5", "grok-4.5"]
-        selectedModel = preferred.first(where: { modelIDs.contains($0) }) ?? modelIDs[0]
+        let reconciledModel = ChatRuntimeControlPresentation.modelForProvider(
+            currentModel: selectedModel,
+            provider: provider,
+            preferredModels: preferred
+        )
+        guard reconciledModel != selectedModel else { return }
+        selectedModel = reconciledModel
         reconcileExecutionControlsForSelectedModel()
     }
 
     private func seedProviderIfNeeded() {
         let ready = selectableProviders
-        guard !ready.isEmpty else { return }
+        guard !ready.isEmpty else {
+            selectedProviderId = ""
+            return
+        }
         // Already on a valid, still-selectable provider: keep it, but make sure
         // the model belongs to it (a refresh may have dropped the model from the
         // catalog), so the sent (model, providerId) pair is never inconsistent.
@@ -1049,33 +1137,69 @@ struct ChatView: View {
         // else the provider that owns the current model, else first ready provider.
         let activeChatProvider = sync.trustPolicy?.providerPolicy?.activePerSurface?["ios"]
             ?? sync.trustPolicy?.providerPolicy?.activePerSurface?["chat"]
-        if let active = activeChatProvider, ready.contains(where: { $0.provider_id == active }) {
-            selectedProviderId = active
-        } else if let owner = ready.first(where: { $0.models.contains(where: { $0.id == selectedModel }) }) {
-            selectedProviderId = owner.provider_id
-        } else {
-            selectedProviderId = ready[0].provider_id
+        let seededProviderID = ChatRuntimeControlPresentation.seededProviderID(
+            selectedProviderID: selectedProviderId,
+            activeProviderID: activeChatProvider,
+            model: selectedModel,
+            readyProviders: ready
+        )
+        let preferred = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4", "gpt-5.4-mini", "claude-opus-4-8", "claude-fable-5", "claude-sonnet-5", "grok-4.5"]
+        guard let seededProviderID,
+              let selection = ChatRuntimeControlPresentation.selectionForProvider(
+                providerID: seededProviderID,
+                current: .init(providerID: selectedProviderId, model: selectedModel, reasoningEffort: selectedReasoningEffort, fastMode: selectedFastMode),
+                providers: ready,
+                preferredModels: preferred
+              ) else {
+            selectedProviderId = ""
+            return
         }
+        selectedProviderId = selection.providerID
+        selectedModel = selection.model
+        selectedReasoningEffort = selection.reasoningEffort
+        selectedFastMode = selection.fastMode
         // Keep the (provider, model) pair consistent so a send never carries a
         // model the chosen provider doesn't offer.
-        reconcileSelectedModel(forProviderId: selectedProviderId)
+        reconcileExecutionControlsForSelectedModel()
     }
 
     private func adoptSurfaceModelPreferenceFromSync() {
         guard let preference = sync.surfaceModels["ios"] else { return }
-        if let providerId = preference.providerId,
-           selectableProviders.contains(where: { $0.provider_id == providerId }) {
-            selectedProviderId = providerId
-        }
-        if preference.model != selectedModel {
-            selectedModel = preference.model
-        }
-        if let reasoningEffort = preference.reasoningEffort,
-           reasoningEffort != selectedReasoningEffort {
-            selectedReasoningEffort = reasoningEffort
-        }
-        selectedFastMode = preference.serviceTier == "priority"
+        let resolution = ChatSurfaceModelPreferenceAdoption.resolve(
+            current: .init(
+                providerID: selectedProviderId,
+                model: selectedModel,
+                reasoningEffort: selectedReasoningEffort,
+                fastMode: selectedFastMode
+            ),
+            preference: preference,
+            awaitingAcknowledgement: surfaceSelectionAwaitingSync,
+            selectableProviderIDs: Set(selectableProviders.map(\.provider_id))
+        )
+        surfaceSelectionAwaitingSync = resolution.awaitingAcknowledgement
+        guard resolution.selection != .init(
+            providerID: selectedProviderId,
+            model: selectedModel,
+            reasoningEffort: selectedReasoningEffort,
+            fastMode: selectedFastMode
+        ) else { return }
+        selectedProviderId = resolution.selection.providerID
+        selectedModel = resolution.selection.model
+        selectedReasoningEffort = resolution.selection.reasoningEffort
+        selectedFastMode = resolution.selection.fastMode
+        reconcileSelectedModel(forProviderId: selectedProviderId)
         reconcileExecutionControlsForSelectedModel()
+    }
+
+    private func beginSurfaceSelectionUpdate() -> Int {
+        surfaceSelectionGeneration += 1
+        surfaceSelectionAwaitingSync = true
+        return surfaceSelectionGeneration
+    }
+
+    private func finishSurfaceSelectionFailure(requestGeneration: Int) {
+        guard surfaceSelectionGeneration == requestGeneration else { return }
+        surfaceSelectionAwaitingSync = false
     }
 
     private var reasoningOptions: [(id: String, label: String)] {
@@ -1105,12 +1229,14 @@ struct ChatView: View {
     }
 
     private func reconcileExecutionControlsForSelectedModel() {
-        let supported = reasoningOptions.map(\.id)
-        if !supported.contains(selectedReasoningEffort) {
-            let preferred = selectedModelInfo?.default_reasoning_effort ?? "high"
-            selectedReasoningEffort = supported.contains(preferred) ? preferred : (supported.first ?? "high")
-        }
-        if !selectedModelSupportsFast { selectedFastMode = false }
+        let reconciled = ChatRuntimeControlPresentation.reconciled(
+            model: selectedModel,
+            provider: sync.providers.first(where: { $0.provider_id == selectedProviderId }),
+            selectedEffort: selectedReasoningEffort,
+            selectedFastMode: selectedFastMode
+        )
+        selectedReasoningEffort = reconciled.effort
+        selectedFastMode = reconciled.fastMode
     }
 
     private var fileAccessOptions: [(id: String, label: String, icon: String)] {
@@ -1174,8 +1300,9 @@ struct ChatView: View {
     }
 
     private func selectChatSessionTab(_ tab: ChatSessionTab) {
-        autoFollowChat = true
-        showLatestButton = false
+        let follow = ChatFollowPresentation.followLatest()
+        autoFollowChat = follow.autoFollow
+        showLatestButton = follow.showsLatest
         switch tab.kind {
         case .main:
             adoptMainSessionFromSnapshots()
@@ -1210,15 +1337,14 @@ struct ChatView: View {
     }
 
     private func providerId(for modelId: String) -> String {
-        if !selectedProviderId.isEmpty { return selectedProviderId }
         let activeChatProvider = sync.trustPolicy?.providerPolicy?.activePerSurface?["ios"]
             ?? sync.trustPolicy?.providerPolicy?.activePerSurface?["chat"]
-        if let activeChatProvider, !activeChatProvider.isEmpty {
-            return activeChatProvider
-        }
-        return sync.providers.first(where: { provider in
-            provider.models.contains(where: { $0.id == modelId })
-        })?.provider_id ?? ""
+        return ChatRuntimeControlPresentation.providerID(
+            selectedProviderID: selectedProviderId,
+            activeProviderID: activeChatProvider,
+            model: modelId,
+            providers: sync.providers
+        )
     }
 
     private func reasoningLabel(_ id: String) -> String {
@@ -1226,11 +1352,13 @@ struct ChatView: View {
     }
 
     private func fileAccessLabel(_ id: String) -> String {
-        fileAccessOptions.first(where: { $0.id == id })?.label ?? "Auto Access"
+        let normalized = ChatRuntimeControlPresentation.normalizedFileAccessID(id)
+        return fileAccessOptions.first(where: { $0.id == normalized })?.label ?? "Auto Access"
     }
 
     private func fileAccessIcon(_ id: String) -> String {
-        fileAccessOptions.first(where: { $0.id == id })?.icon ?? "wand.and.stars"
+        let normalized = ChatRuntimeControlPresentation.normalizedFileAccessID(id)
+        return fileAccessOptions.first(where: { $0.id == normalized })?.icon ?? "wand.and.stars"
     }
 
     // MARK: - Mic button
@@ -1302,8 +1430,9 @@ struct ChatView: View {
             }
         }
         guard disposition != .rejected else { return }
-        autoFollowChat = true
-        showLatestButton = false
+        let follow = ChatFollowPresentation.followLatest()
+        autoFollowChat = follow.autoFollow
+        showLatestButton = follow.showsLatest
         inputText = ""
         pendingPhotos = []
         selectedPhotoItems = []
@@ -1367,10 +1496,11 @@ struct ChatView: View {
                 guard generation == photoLoadGeneration, !Task.isCancelled else { return }
                 pendingPhotos = Self.mergedPendingPhotos(existing: pendingPhotos, loaded: loaded, limit: maxPendingPhotos)
                 isLoadingPhotos = false
-                if skippedCount > 0 {
-                    store.errorBanner = skippedCount == 1
-                        ? "One photo was too large or unsupported."
-                        : "\(skippedCount) photos were too large or unsupported."
+                if let message = PhotosPickerLoadPresentation.message(
+                    loadedCount: loaded.count,
+                    skippedCount: skippedCount
+                ) {
+                    store.errorBanner = message
                 }
                 if loaded.isEmpty {
                     selectedPhotoItems = []
@@ -1439,32 +1569,348 @@ struct ChatView: View {
     ) {
         guard !store.messages.isEmpty else { return }
         guard force || autoFollowChat else { return }
-        if scrollScheduled && !animated && !force {
-            return
-        }
         guard let targetID = store.messages.last?.id else { return }
+        guard let serial = scrollScheduler.schedule(
+            targetID: targetID.uuidString,
+            animated: animated,
+            force: force
+        ) else { return }
         let elapsed = Date().timeIntervalSince(lastScrollAt)
         let minimumInterval = animated ? 0.12 : 0.09
         let effectiveDelayMs = max(delayMilliseconds, Int(max(0, minimumInterval - elapsed) * 1000))
-        scrollScheduled = true
-        scrollSerial += 1
-        let serial = scrollSerial
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(effectiveDelayMs)) {
-            guard serial == scrollSerial, !store.messages.isEmpty else {
-                if serial == scrollSerial {
-                    scrollScheduled = false
-                }
-                return
-            }
-            scrollScheduled = false
+            guard let currentTargetID = scrollScheduler.complete(
+                serial: serial,
+                messagesAreAvailable: !store.messages.isEmpty
+            ) else { return }
             lastScrollAt = Date()
             if animated {
                 withAnimation(.easeOut(duration: 0.18)) {
-                    proxy.scrollTo(targetID, anchor: .bottom)
+                    proxy.scrollTo(currentTargetID, anchor: .bottom)
                 }
             } else {
-                proxy.scrollTo(targetID, anchor: .bottom)
+                proxy.scrollTo(currentTargetID, anchor: .bottom)
             }
         }
+    }
+}
+
+/// Pure decisions shared by ChatView's controls. Keeping these outside the
+/// view makes an iPhone selection an explicit, testable value before it is
+/// sent to the signed Mac route.
+enum ChatRuntimeControlPresentation {
+    static let fileAccessIDs = ICloudChatFileAccessPolicy.acceptedIDs
+
+    /// Runs the model-menu refresh and surfaces every unsuccessful outcome to
+    /// the person who explicitly asked for it. Background refresh callers can
+    /// still ignore the returned outcome without producing unsolicited toast.
+    @MainActor
+    static func refreshModels(
+        refresh: () async -> ProviderControlsRefreshOutcome,
+        presentError: (String) -> Void
+    ) async {
+        if let message = (await refresh()).feedbackMessage {
+            presentError(message)
+        }
+    }
+
+    static func normalizedFileAccessID(_ id: String) -> String {
+        ICloudChatFileAccessPolicy.normalized(id)
+    }
+
+    static func providerID(
+        selectedProviderID: String,
+        activeProviderID: String?,
+        model: String,
+        providers: [ProviderInfo]
+    ) -> String {
+        let ready = providers.filter { $0.auth_status.state == "ready" }
+        if ready.contains(where: { $0.provider_id == selectedProviderID }) { return selectedProviderID }
+        if let activeProviderID, ready.contains(where: { $0.provider_id == activeProviderID }) { return activeProviderID }
+        return ready.first(where: { provider in
+            provider.models.contains(where: { $0.id == model })
+        })?.provider_id ?? ""
+    }
+
+    static func reconciled(
+        model: String,
+        provider: ProviderInfo?,
+        selectedEffort: String,
+        selectedFastMode: Bool
+    ) -> (model: String, effort: String, fastMode: Bool) {
+        let modelInfo = provider?.models.first(where: { $0.id == model })
+        let allowed = modelInfo?.supported_reasoning_efforts?.filter { !$0.isEmpty }
+            ?? ["none", "low", "medium", "high"]
+        let preferred = modelInfo?.default_reasoning_effort ?? "high"
+        let effort = allowed.contains(selectedEffort)
+            ? selectedEffort
+            : (allowed.contains(preferred) ? preferred : (allowed.first ?? "high"))
+        return (model, effort, modelInfo?.supports_fast == true ? selectedFastMode : false)
+    }
+
+    static func modelForProvider(
+        currentModel: String,
+        provider: ProviderInfo?,
+        preferredModels: [String]
+    ) -> String {
+        guard let provider else { return currentModel }
+        let modelIDs = provider.models.map(\.id).filter { !$0.isEmpty }
+        guard !modelIDs.isEmpty, !modelIDs.contains(currentModel) else { return currentModel }
+        return preferredModels.first(where: modelIDs.contains) ?? modelIDs[0]
+    }
+
+    static func selectionForProvider(
+        providerID: String,
+        current: Selection,
+        providers: [ProviderInfo],
+        preferredModels: [String]
+    ) -> Selection? {
+        guard let provider = providers.first(where: {
+            $0.provider_id == providerID && $0.auth_status.state == "ready"
+        }) else { return nil }
+        let model = modelForProvider(
+            currentModel: current.model,
+            provider: provider,
+            preferredModels: preferredModels
+        )
+        let controls = reconciled(
+            model: model,
+            provider: provider,
+            selectedEffort: current.reasoningEffort,
+            selectedFastMode: current.fastMode
+        )
+        return Selection(
+            providerID: providerID,
+            model: controls.model,
+            reasoningEffort: controls.effort,
+            fastMode: controls.fastMode
+        )
+    }
+
+    static func seededProviderID(
+        selectedProviderID: String,
+        activeProviderID: String?,
+        model: String,
+        readyProviders: [ProviderInfo]
+    ) -> String? {
+        guard !readyProviders.isEmpty else { return nil }
+        if readyProviders.contains(where: { $0.provider_id == selectedProviderID }) { return selectedProviderID }
+        if let activeProviderID, readyProviders.contains(where: { $0.provider_id == activeProviderID }) {
+            return activeProviderID
+        }
+        return readyProviders.first(where: { $0.models.contains(where: { $0.id == model }) })?.provider_id
+            ?? readyProviders[0].provider_id
+    }
+
+    static func shouldRollback(selectionGeneration: Int, requestGeneration: Int) -> Bool {
+        selectionGeneration == requestGeneration
+    }
+
+    struct Selection: Equatable {
+        var providerID: String
+        var model: String
+        var reasoningEffort: String
+        var fastMode: Bool
+    }
+
+    static func rollback(
+        currentGeneration: Int,
+        requestGeneration: Int,
+        previous: Selection
+    ) -> Selection? {
+        shouldRollback(selectionGeneration: currentGeneration, requestGeneration: requestGeneration)
+            ? previous
+            : nil
+    }
+
+    static let modelDefaultsKey = "chatModel"
+    static let effortDefaultsKey = "chatReasoningEffort"
+    static let fastDefaultsKey = "chatFastMode"
+    static let providerDefaultsKey = "chatProviderId"
+    static let generationDefaultsKey = "chatSurfaceSelectionGeneration"
+
+    static func persist(_ selection: Selection, in defaults: UserDefaults) {
+        defaults.set(selection.model, forKey: modelDefaultsKey)
+        defaults.set(selection.reasoningEffort, forKey: effortDefaultsKey)
+        defaults.set(selection.fastMode, forKey: fastDefaultsKey)
+        defaults.set(selection.providerID, forKey: providerDefaultsKey)
+    }
+
+    /// The shared action seam behind every optimistic runtime-control menu.
+    /// It intentionally observes the persisted generation after the transport
+    /// result, so an older failed request cannot restore over a newer iPhone
+    /// pick—even if all four values happen to match again (ABA).
+    @MainActor
+    static func execute(
+        defaults: UserDefaults,
+        previous: Selection,
+        requested: Selection,
+        requestGeneration: Int,
+        configure: (Selection) async throws -> Void
+    ) async -> (restored: Selection?, error: Error?) {
+        persist(requested, in: defaults)
+        do {
+            try await configure(requested)
+            return (nil, nil)
+        } catch {
+            guard defaults.integer(forKey: generationDefaultsKey) == requestGeneration else { return (nil, error) }
+            persist(previous, in: defaults)
+            return (previous, error)
+        }
+    }
+}
+
+/// Resolves an eventually-consistent surface-model snapshot without allowing a
+/// stale snapshot to undo a selection the user has just sent to the Mac.
+enum ChatSurfaceModelPreferenceAdoption {
+    struct Selection: Equatable {
+        var providerID: String
+        var model: String
+        var reasoningEffort: String
+        var fastMode: Bool
+    }
+
+    struct Resolution: Equatable {
+        var selection: Selection
+        var awaitingAcknowledgement: Bool
+    }
+
+    static func resolve(
+        current: Selection,
+        preference: SurfaceModelPref,
+        awaitingAcknowledgement: Bool,
+        selectableProviderIDs: Set<String>
+    ) -> Resolution {
+        if awaitingAcknowledgement {
+            return Resolution(
+                selection: current,
+                awaitingAcknowledgement: !acknowledges(current, preference: preference)
+            )
+        }
+
+        var selection = current
+        if let providerID = preference.providerId,
+           selectableProviderIDs.contains(providerID) {
+            selection.providerID = providerID
+        }
+        selection.model = preference.model
+        if let reasoningEffort = preference.reasoningEffort {
+            selection.reasoningEffort = reasoningEffort
+        }
+        if let serviceTier = preference.serviceTier {
+            selection.fastMode = serviceTier == "priority"
+        }
+        return Resolution(selection: selection, awaitingAcknowledgement: false)
+    }
+
+    private static func acknowledges(_ selection: Selection, preference: SurfaceModelPref) -> Bool {
+        guard preference.model == selection.model else { return false }
+        if let providerID = preference.providerId, providerID != selection.providerID { return false }
+        if let reasoningEffort = preference.reasoningEffort,
+           reasoningEffort != selection.reasoningEffort { return false }
+        if let serviceTier = preference.serviceTier,
+           (serviceTier == "priority") != selection.fastMode { return false }
+        return true
+    }
+}
+
+enum ChatFollowPresentation {
+    static func userScrolledAway() -> (autoFollow: Bool, showsLatest: Bool) { (false, true) }
+    static func followLatest() -> (autoFollow: Bool, showsLatest: Bool) { (true, false) }
+}
+
+/// One pending callback is enough for a streaming burst. Each later ordinary
+/// mutation replaces its target rather than scheduling another scroll, while a
+/// forced/animated request supersedes the prior callback through a new serial.
+struct ChatScrollScheduler: Equatable {
+    private(set) var serial = 0
+    private(set) var isScheduled = false
+    private var pendingTargetID: String?
+
+    mutating func schedule(targetID: String, animated: Bool, force: Bool) -> Int? {
+        if isScheduled && !animated && !force {
+            pendingTargetID = targetID
+            return nil
+        }
+        serial &+= 1
+        isScheduled = true
+        pendingTargetID = targetID
+        return serial
+    }
+
+    mutating func complete(serial: Int, messagesAreAvailable: Bool) -> String? {
+        guard serial == self.serial else { return nil }
+        defer {
+            isScheduled = false
+            pendingTargetID = nil
+        }
+        guard messagesAreAvailable else { return nil }
+        return pendingTargetID
+    }
+}
+
+enum ChatAttachmentPresentation {
+    static func hasRenderableImage(_ attachment: ChatAttachmentSummary) -> Bool {
+        guard attachment.type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "image",
+              let raw = attachment.base64?.trimmingCharacters(in: .whitespacesAndNewlines),
+              let data = Data(base64Encoded: raw), !data.isEmpty else { return false }
+        return UIImage(data: data) != nil
+    }
+
+    static func previewableImages(in attachments: [ChatAttachmentSummary]) -> [ChatAttachmentSummary] {
+        attachments.filter(hasRenderableImage)
+    }
+
+    static func fallbackCount(in attachments: [ChatAttachmentSummary]) -> Int {
+        max(0, attachments.count - previewableImages(in: attachments).count)
+    }
+}
+
+enum PendingPhotoPresentation {
+    struct Removal {
+        var photos: [PendingPhotoAttachment]
+        var clearsPicker: Bool
+        var suppressesNextEmptySelection: Bool
+    }
+
+    static func removing(_ id: String, from photos: [PendingPhotoAttachment]) -> Removal {
+        let remaining = photos.filter { $0.id != id }
+        return Removal(
+            photos: remaining,
+            clearsPicker: true,
+            suppressesNextEmptySelection: !remaining.isEmpty
+        )
+    }
+}
+
+enum PhotosPickerLoadPresentation {
+    /// The Photos picker can successfully return selections that cannot fit the
+    /// signed CloudKit turn. If every selection is rejected, the composer has
+    /// no thumbnail strip, so the message must say that no attachment was
+    /// added rather than merely naming the rejected source files.
+    static func message(loadedCount: Int, skippedCount: Int) -> String? {
+        guard skippedCount > 0 else { return nil }
+        if loadedCount == 0 {
+            return skippedCount == 1
+                ? "No photo was added because it was too large or unsupported. Try a smaller image."
+                : "No photos were added because all \(skippedCount) were too large or unsupported. Try smaller images."
+        }
+        return skippedCount == 1
+            ? "One photo was too large or unsupported; \(loadedCount) photo\(loadedCount == 1 ? "" : "s") is ready to send."
+            : "\(skippedCount) photos were too large or unsupported; \(loadedCount) photo\(loadedCount == 1 ? "" : "s") \(loadedCount == 1 ? "is" : "are") ready to send."
+    }
+}
+
+enum VoicePresentation {
+    static func deniedSpeechMessage() -> String {
+        "Speech recognition permission denied. Enable it in Settings."
+    }
+
+    static func deniedMicrophoneMessage() -> String {
+        "Microphone permission denied. Enable it in Settings."
+    }
+
+    static func canReportSpeaking(audioSessionActivated: Bool, enqueued: Bool) -> Bool {
+        audioSessionActivated && enqueued
     }
 }

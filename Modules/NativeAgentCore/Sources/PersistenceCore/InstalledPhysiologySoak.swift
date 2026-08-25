@@ -742,6 +742,41 @@ public enum InstalledPhysiologySoakAnalyzer {
 /// Bounded JSONL persistence for installed soak evidence. The store never owns
 /// a scheduler. Callers append only when a runtime event or exact deadline
 /// already caused work.
+/// Availability of the durable installed-physiology evidence boundary. This
+/// belongs beside a loaded report because an absent directory and a readable
+/// empty directory both analyze to zero records, but mean different things.
+public enum InstalledPhysiologySoakEvidenceSourceState: String, Codable, Sendable, Equatable {
+    /// The recorder has never created its evidence directory on this root.
+    case absent
+    /// Every retained day file was opened successfully (including a readable empty directory).
+    case readable
+    /// At least one retained day file could not be opened, but others were read.
+    case partial
+    /// The evidence directory itself, or every retained day file, was unreadable.
+    case unreadable
+}
+
+/// The report and the truthfulness boundary that produced it. Consumers must
+/// not turn `.absent` into a zero-record soak claim.
+public struct InstalledPhysiologySoakLoadedReport: Sendable, Equatable {
+    public let report: InstalledPhysiologySoakReport
+    public let evidenceSourceState: InstalledPhysiologySoakEvidenceSourceState
+    public let retainedDayFileCount: Int
+    public let unreadableDayFileCount: Int
+
+    public init(
+        report: InstalledPhysiologySoakReport,
+        evidenceSourceState: InstalledPhysiologySoakEvidenceSourceState,
+        retainedDayFileCount: Int,
+        unreadableDayFileCount: Int
+    ) {
+        self.report = report
+        self.evidenceSourceState = evidenceSourceState
+        self.retainedDayFileCount = retainedDayFileCount
+        self.unreadableDayFileCount = unreadableDayFileCount
+    }
+}
+
 public actor InstalledPhysiologySoakStore {
     public static let maximumRowsPerDay = 4_096
     public static let maximumReadRows = 32_768
@@ -808,25 +843,59 @@ public actor InstalledPhysiologySoakStore {
     }
 
     public func loadReport(now: Date = Date()) async -> InstalledPhysiologySoakReport {
+        await loadReportWithEvidenceSource(now: now).report
+    }
+
+    /// Opens the exact same bounded durable evidence reader as `loadReport`,
+    /// while retaining the source fact that a bare report cannot express.
+    public func loadReportWithEvidenceSource(now: Date = Date()) async -> InstalledPhysiologySoakLoadedReport {
         let fm = FileManager.default
-        guard let files = try? fm.contentsOfDirectory(
-            at: root,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            return InstalledPhysiologySoakAnalyzer.analyze(records: [], generatedAt: now)
+        var isDirectory: ObjCBool = false
+        guard fm.fileExists(atPath: root.path, isDirectory: &isDirectory) else {
+            return InstalledPhysiologySoakLoadedReport(
+                report: InstalledPhysiologySoakAnalyzer.analyze(records: [], generatedAt: now),
+                evidenceSourceState: .absent,
+                retainedDayFileCount: 0,
+                unreadableDayFileCount: 0
+            )
+        }
+        guard isDirectory.boolValue else {
+            return InstalledPhysiologySoakLoadedReport(
+                report: InstalledPhysiologySoakAnalyzer.analyze(records: [], generatedAt: now),
+                evidenceSourceState: .unreadable,
+                retainedDayFileCount: 0,
+                unreadableDayFileCount: 0
+            )
+        }
+        let files: [URL]
+        do {
+            files = try fm.contentsOfDirectory(
+                at: root,
+                includingPropertiesForKeys: [.isRegularFileKey],
+                options: [.skipsHiddenFiles]
+            )
+        } catch {
+            return InstalledPhysiologySoakLoadedReport(
+                report: InstalledPhysiologySoakAnalyzer.analyze(records: [], generatedAt: now),
+                evidenceSourceState: .unreadable,
+                retainedDayFileCount: 0,
+                unreadableDayFileCount: 0
+            )
         }
         var records: [InstalledPhysiologySoakRecord] = []
         var invalid = 0
         var retentionSaturatedFiles = 0
+        var unreadableDayFiles = 0
         let decoder = JSONDecoder()
+        let dayFiles = files.filter { $0.pathExtension == "jsonl" }
         // Read newest retained evidence first. If the global read cap is hit,
         // the report describes current installed behavior rather than an old
         // prefix that happened to sort first.
-        for file in files.filter({ $0.pathExtension == "jsonl" }).sorted(by: { $0.lastPathComponent > $1.lastPathComponent }) {
+        for file in dayFiles.sorted(by: { $0.lastPathComponent > $1.lastPathComponent }) {
             guard let data = try? Data(contentsOf: file),
                   let text = String(data: data, encoding: .utf8) else {
                 invalid += 1
+                unreadableDayFiles += 1
                 continue
             }
             let lines = text.split(separator: "\n")
@@ -850,11 +919,24 @@ public actor InstalledPhysiologySoakStore {
         if records.count >= Self.maximumReadRows {
             retentionSaturatedFiles += 1
         }
-        return InstalledPhysiologySoakAnalyzer.analyze(
-            records: records,
-            malformedOrInvalidRecordCount: invalid,
-            retentionSaturatedFileCount: retentionSaturatedFiles,
-            generatedAt: now
+        let sourceState: InstalledPhysiologySoakEvidenceSourceState
+        if unreadableDayFiles == 0 {
+            sourceState = .readable
+        } else if unreadableDayFiles == dayFiles.count {
+            sourceState = .unreadable
+        } else {
+            sourceState = .partial
+        }
+        return InstalledPhysiologySoakLoadedReport(
+            report: InstalledPhysiologySoakAnalyzer.analyze(
+                records: records,
+                malformedOrInvalidRecordCount: invalid,
+                retentionSaturatedFileCount: retentionSaturatedFiles,
+                generatedAt: now
+            ),
+            evidenceSourceState: sourceState,
+            retainedDayFileCount: dayFiles.count,
+            unreadableDayFileCount: unreadableDayFiles
         )
     }
 

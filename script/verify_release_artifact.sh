@@ -122,8 +122,12 @@ verify_no_derived_context_state() {
   # checks also catch SQLite sidecars and state copied outside that subtree by
   # a future export or staging step. Context source and test filenames remain
   # valid because only artifact-shaped names are rejected.
+  local scan_paths
+  scan_paths="$(release_find_checked "$context derived-context" "$scan_root" -mindepth 1 -print)" \
+    || fail "$context derived-context walk of $scan_root did not run correctly"
   hit="$(
-    find "$scan_root" -mindepth 1 -print 2>/dev/null \
+    printf '%s\n' "$scan_paths" \
+    | awk 'NF' \
     | LC_ALL=C awk -v root="$scan_root/" '
         !found {
           path = $0
@@ -183,7 +187,9 @@ verify_minilm_resource_tree() {
   [[ -d "$resource_root" && ! -L "$resource_root" ]] \
     || fail "$context missing required MiniLM resource directory: $resource_root"
 
-  symlink_path="$(find "$resource_root" -type l -print -quit 2>/dev/null || true)"
+  symlink_path="$(release_find_checked "$context MiniLM symlink" "$resource_root" -type l -print)" \
+    || fail "$context MiniLM symlink scan of $resource_root did not run correctly"
+  symlink_path="$(printf '%s\n' "$symlink_path" | sed '/^$/d' | head -1)"
   [[ -z "$symlink_path" ]] \
     || fail "$context contains unexpected MiniLM resource symlink: $symlink_path"
 
@@ -247,11 +253,15 @@ verify_minilm_swiftpm_resources() {
 
   expected_package="$expected_bundle/minilm.mlpackage"
   expected_vocab="$expected_bundle/minilm_vocab.txt"
+  local minilm_candidates
+  minilm_candidates="$(release_find_checked "staged MiniLM" "$contents_resources" \
+    \( -name 'minilm.mlpackage' -o -name 'minilm_vocab.txt' \) -print)" \
+    || fail "staged MiniLM scan of $contents_resources did not run correctly"
   while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
     [[ "$candidate" == "$expected_package" || "$candidate" == "$expected_vocab" ]] \
       || fail "MiniLM resource staged outside expected SwiftPM resource bundle: $candidate"
-  done < <(find "$contents_resources" \
-    \( -name 'minilm.mlpackage' -o -name 'minilm_vocab.txt' \) -print 2>/dev/null)
+  done <<< "$minilm_candidates"
 
   echo "[resources] verified staged MiniLM SwiftPM bundle: $expected_bundle"
 }
@@ -283,11 +293,14 @@ verify_bridge_helper_source_resources() {
 
 verify_bridge_helper_bundle_resources() {
   local contents_resources="$1" codex_hits claude_hits omp_hits codex_count claude_count omp_count
-  codex_hits="$(find "$contents_resources" -type f -name 'codex_thread_wakeup.js' -print 2>/dev/null || true)"
-  claude_hits="$(find "$contents_resources" -type f \
+  codex_hits="$(release_find_checked "Codex bridge helper" "$contents_resources" -type f -name 'codex_thread_wakeup.js' -print)" \
+    || fail "Codex bridge helper scan of $contents_resources did not run correctly"
+  claude_hits="$(release_find_checked "Claude bridge helper" "$contents_resources" -type f \
     \( -name 'claude_thread_wakeup.js' -o -name 'claude_thread_wakeup.js' \) \
-    -print 2>/dev/null || true)"
-  omp_hits="$(find "$contents_resources" -type f -name 'omp_thread_wakeup.js' -print 2>/dev/null || true)"
+    -print)" \
+    || fail "Claude bridge helper scan of $contents_resources did not run correctly"
+  omp_hits="$(release_find_checked "OMP bridge helper" "$contents_resources" -type f -name 'omp_thread_wakeup.js' -print)" \
+    || fail "OMP bridge helper scan of $contents_resources did not run correctly"
   codex_count="$(printf '%s\n' "$codex_hits" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
   claude_count="$(printf '%s\n' "$claude_hits" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
   omp_count="$(printf '%s\n' "$omp_hits" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
@@ -304,6 +317,18 @@ verify_bridge_helper_bundle_resources() {
   [[ "$(wc -c < "$omp_hits" | tr -d '[:space:]')" -gt 10000 ]] \
     || fail "bundled OMP bridge helper is unexpectedly small: $omp_hits"
   echo "[resources] verified staged Codex, Claude Code, and OMP bridge helpers"
+}
+
+verify_data_bounds_bundle_resource() {
+  local contents_resources="$1" data_bounds
+  [[ -d "$contents_resources" && ! -L "$contents_resources" ]] \
+    || fail "missing app Contents/Resources directory: $contents_resources"
+  data_bounds="$contents_resources/docs/data-bounds.md"
+  [[ -f "$data_bounds" && ! -L "$data_bounds" ]] \
+    || fail "release resources missing data-limits reference: $data_bounds"
+  [[ -s "$data_bounds" ]] \
+    || fail "release data-limits reference is empty: $data_bounds"
+  echo "[resources] verified bundled data-limits reference: $data_bounds"
 }
 
 SPECIAL_MODE_COUNT=0
@@ -433,7 +458,12 @@ fi
 
 require_plist_value "$INFO" "CFBundleIdentifier" "$EXPECTED_MAC_BUNDLE_ID"
 require_plist_value "$INFO" "CFBundleExecutable" "$PRODUCT"
-require_plist_value "$INFO" "CFBundleShortVersionString" "$VERSION"
+# Internal (non-publish) lanes stamp CFBundleShortVersionString with a
+# -dev.<sha8>[.dirty] marker so an internal build can never impersonate the
+# published release (seat-hygiene, 2026-08-21). release.sh exports the
+# expected marked value; a bare invocation still requires the plain VERSION.
+require_plist_value "$INFO" "CFBundleShortVersionString" \
+  "${NATIVEAGENT_EXPECTED_SHORT_VERSION:-$VERSION}"
 require_plist_value "$INFO" "CFBundleVersion" "$VERSION"
 require_plist_value "$INFO" "CFBundlePackageType" "APPL"
 require_plist_value "$INFO" "LSMinimumSystemVersion" "26.0"
@@ -500,6 +530,7 @@ if [[ "$REQUIRE_CLEAN_SOURCE" == "true" && "$SOURCE_DIRTY" != "false" ]]; then
 fi
 verify_minilm_swiftpm_resources "$RESOURCES"
 verify_bridge_helper_bundle_resources "$RESOURCES"
+verify_data_bounds_bundle_resource "$RESOURCES"
 verify_no_derived_context_state "$RESOURCES" "release resources"
 require_absent "$RESOURCES/daemon"
 require_absent "$RESOURCES/native_agentd.py"
@@ -514,32 +545,47 @@ do
 done
 
 LOCAL_STATE_DIR_RE='/(activity|approvals|browser|catalog|chat_sessions|cognition|connectors|context|credentials|dreams|evolution|inbox|keychain|knowledge_graph|memory|memory_proposals|missions|nextgen|oauth|pairings|providers|scheduler|self_worktrees|tokens|traces|trust|workflow|workflows)(/|$)'
+# SCANNER-INTEGRITY CONTRACT (2026-08-21, round 2): every walk below goes
+# through release_find_checked, which keeps find's exit status. The old
+# `find ... 2>/dev/null || true` form made a partially-failed walk (unreadable
+# subdirectory) look exactly like a clean bundle, and `-print -quit` threw the
+# status away a second time by exiting 0 after the error.
+local_state_dirs="$(release_find_checked "artifact state-directory" "$RESOURCES" -type d -print)" \
+  || fail "state-directory scan of $RESOURCES did not run correctly"
 local_state_dir_hit="$(
-  find "$RESOURCES" -type d -print 2>/dev/null \
+  printf '%s\n' "$local_state_dirs" \
+  | awk 'NF' \
   | awk '{ low=tolower($0); print low "\t" $0 }' \
   | awk -F '\t' -v root="$(printf '%s' "$RESOURCES" | tr '[:upper:]' '[:lower:]')" -v re="$LOCAL_STATE_DIR_RE" '
       index($1, root "/") == 1 {
         rel = substr($1, length(root) + 1)
         if (rel ~ re) { print $2; exit }
-      }' \
-  || true
+      }'
 )"
 [[ -z "$local_state_dir_hit" ]] || fail "live NativeAgent state directory shipped in release resources: $local_state_dir_hit"
 
-bad_world_writable="$(find "$BUNDLE" -perm -002 -print -quit 2>/dev/null || true)"
-[[ -z "$bad_world_writable" ]] || fail "world-writable path inside app bundle: $bad_world_writable"
+first_line() { printf '%s\n' "$1" | sed '/^$/d' | head -1; }
 
-bad_readable="$(find "$BUNDLE" \( -type f ! -perm -004 -o -type d ! -perm -005 \) -print -quit 2>/dev/null || true)"
-[[ -z "$bad_readable" ]] || fail "path is not readable/traversable by normal users: $bad_readable"
+bad_world_writable="$(release_find_checked "world-writable" "$BUNDLE" -perm -002 -print)" \
+  || fail "world-writable scan of $BUNDLE did not run correctly"
+[[ -z "$bad_world_writable" ]] || fail "world-writable path inside app bundle: $(first_line "$bad_world_writable")"
 
-pycache_hits="$(find "$RESOURCES" -type d -name '__pycache__' -print -quit 2>/dev/null || true)"
-[[ -z "$pycache_hits" ]] || fail "Python cache directory shipped in release bundle: $pycache_hits"
-bytecode_hits="$(find "$RESOURCES" -type f \( -name '*.pyc' -o -name '*.pyo' \) -print -quit 2>/dev/null || true)"
-[[ -z "$bytecode_hits" ]] || fail "Python bytecode shipped in release bundle: $bytecode_hits"
-backup_hits="$(find "$RESOURCES" -type f -name '*.bak*' -print -quit 2>/dev/null || true)"
-[[ -z "$backup_hits" ]] || fail "backup file shipped in release bundle: $backup_hits"
-test_artifact_hits="$(find "$RESOURCES" -type f \( -name '*_tests.py' -o -name 'test_*.py' \) -print -quit 2>/dev/null || true)"
-[[ -z "$test_artifact_hits" ]] || fail "test artifact shipped in release bundle: $test_artifact_hits"
+bad_readable="$(release_find_checked "readability" "$BUNDLE" \( -type f ! -perm -004 -o -type d ! -perm -005 \) -print)" \
+  || fail "readability scan of $BUNDLE did not run correctly"
+[[ -z "$bad_readable" ]] || fail "path is not readable/traversable by normal users: $(first_line "$bad_readable")"
+
+pycache_hits="$(release_find_checked "__pycache__" "$RESOURCES" -type d -name '__pycache__' -print)" \
+  || fail "__pycache__ scan of $RESOURCES did not run correctly"
+[[ -z "$pycache_hits" ]] || fail "Python cache directory shipped in release bundle: $(first_line "$pycache_hits")"
+bytecode_hits="$(release_find_checked "bytecode" "$RESOURCES" -type f \( -name '*.pyc' -o -name '*.pyo' \) -print)" \
+  || fail "bytecode scan of $RESOURCES did not run correctly"
+[[ -z "$bytecode_hits" ]] || fail "Python bytecode shipped in release bundle: $(first_line "$bytecode_hits")"
+backup_hits="$(release_find_checked "backup-file" "$RESOURCES" -type f -name '*.bak*' -print)" \
+  || fail "backup-file scan of $RESOURCES did not run correctly"
+[[ -z "$backup_hits" ]] || fail "backup file shipped in release bundle: $(first_line "$backup_hits")"
+test_artifact_hits="$(release_find_checked "test-artifact" "$RESOURCES" -type f \( -name '*_tests.py' -o -name 'test_*.py' \) -print)" \
+  || fail "test-artifact scan of $RESOURCES did not run correctly"
+[[ -z "$test_artifact_hits" ]] || fail "test artifact shipped in release bundle: $(first_line "$test_artifact_hits")"
 
 # ONBOARDING-2026-05-26: a public release bundle MUST NOT contain a persona
 # directory. Earlier revisions shipped *.template.md placeholders here, but
@@ -551,20 +597,31 @@ test_artifact_hits="$(find "$RESOURCES" -type f \( -name '*_tests.py' -o -name '
 # regression that must fail the artifact verifier.
 [[ ! -e "$RESOURCES/persona" ]] || fail "Contents/Resources/persona must not ship — see release.sh ONBOARDING-2026-05-26"
 
-SECRET_FILE_RE='(^|/)(\.env($|[._-])|.*\.env$|\.npmrc$|\.pypirc$|\.netrc$|id_rsa$|id_dsa$|id_ecdsa$|id_ed25519$|credentials?\.(json|ya?ml|toml|ini)$|.*credentials?\.(json|ya?ml|toml|ini)$|token(s)?\.(json|ya?ml|toml|ini)$|.*token(s)?\.(json|ya?ml|toml|ini)$|oauth.*token.*\.(json|ya?ml|toml|ini)$|client_secret(s)?\.(json|ya?ml|toml|ini)$|.*client_secret.*\.(json|ya?ml|toml|ini)$|service[-_]?account.*\.(json|ya?ml|toml|ini)$|firebase-adminsdk.*\.json$|.*\.(pem|p12|pfx|jks|keystore|key|gpg|asc)$)'
-secret_file_hits="$(
-  find "$RESOURCES" \
-    -type f -print 2>/dev/null \
-  | awk '{ low=tolower($0); print low "\t" $0 }' \
-  | awk -F '\t' -v re="$SECRET_FILE_RE" '$1 ~ re { print $2; exit }' \
-  || true
-)"
-[[ -z "$secret_file_hits" ]] || fail "secret-bearing filename shipped in release bundle: $secret_file_hits"
+# SCANNER-INTEGRITY CONTRACT (2026-08-21): these scans go through the
+# release_scan_* helpers, which validate the pattern, assert the scan had a
+# subject, and never swallow the scanner's exit code. See the long note at the
+# top of script/lib/release_bundle_gates.sh.
+# The secret VALUE pattern is no longer copied here: release_scan_dir_for_
+# secret_values owns it, so the verifier and the release leak guard cannot drift
+# apart on either the pattern or the binary-pass flag.
+SECRET_FILE_RE="$RELEASE_SECRET_FILE_RE"
+
+release_assert_scanner_canary "artifact verifier" \
+  || fail "artifact-verifier scanner self-test failed; its clean verdicts cannot be trusted"
+
+secret_file_hits="$(release_scan_dir_for_filename_re "$RESOURCES" "artifact secret filename" "$SECRET_FILE_RE")" \
+  || fail "secret-filename scan of $RESOURCES did not run correctly"
+[[ -z "$secret_file_hits" ]] || fail "secret-bearing filename shipped in release bundle: $(printf '%s' "$secret_file_hits" | head -1)"
 
 PRIVACY_DENYLIST_FILE="${NATIVEAGENT_PRIVACY_DENYLIST_FILE:-$ROOT/local/privacy_denylist.regex}"
 PERSONAL_RE="${NATIVEAGENT_PRIVACY_RE:-}"
+if [[ -n "$PERSONAL_RE" ]]; then
+  release_require_valid_regex "$PERSONAL_RE" "NATIVEAGENT_PRIVACY_RE" \
+    || fail "NATIVEAGENT_PRIVACY_RE is not a usable pattern"
+fi
 if [[ -f "$PRIVACY_DENYLIST_FILE" ]]; then
-  FILE_PRIVACY_RE="$(grep -Ev '^[[:space:]]*(#|$)' "$PRIVACY_DENYLIST_FILE" | paste -sd'|' - || true)"
+  FILE_PRIVACY_RE="$(release_denylist_regex_from_file "$PRIVACY_DENYLIST_FILE")" \
+    || fail "privacy denylist $PRIVACY_DENYLIST_FILE is unusable; a broken pattern scans nothing"
   if [[ -n "$FILE_PRIVACY_RE" ]]; then
     if [[ -n "$PERSONAL_RE" ]]; then
       PERSONAL_RE="($PERSONAL_RE)|($FILE_PRIVACY_RE)"
@@ -575,37 +632,43 @@ if [[ -f "$PRIVACY_DENYLIST_FILE" ]]; then
 fi
 raw_personal_hits=""
 if [[ -n "$PERSONAL_RE" ]]; then
-  raw_personal_hits="$(release_personal_identity_hit_files "$BUNDLE" "$PERSONAL_RE")"
+  raw_personal_hits="$(release_personal_identity_hit_files "$BUNDLE" "$PERSONAL_RE")" \
+    || fail "personal-identity scan of $BUNDLE did not run correctly"
+else
+  echo "  WARNING: no NATIVEAGENT_PRIVACY_RE and no usable privacy denylist — personal-identifier scan SKIPPED." >&2
 fi
-for hit in $raw_personal_hits; do
+# Read line-wise: word-splitting shredded any hit path containing a space, so
+# the verifier reported a fragment of the file it was rejecting.
+while IFS= read -r hit; do
+  [[ -n "$hit" ]] || continue
   fail "configured personal identifier found in release artifact: $hit"
-done
+done <<< "$raw_personal_hits"
 
-SECRET_VALUE_RE='(sk-(proj-)?[A-Za-z0-9_-]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|xox[abprs]-[A-Za-z0-9-]{20,}|[0-9]{7,12}:[A-Za-z0-9_-]{30,}|AIza[0-9A-Za-z_-]{30,}|ya29\.[0-9A-Za-z_-]{20,}|AKIA[0-9A-Z]{16}|(sk|rk)_live_[0-9A-Za-z]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|eyJ[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{15,})'
-secret_value_hits="$(
-  find "$RESOURCES" \
-    -type f -print0 2>/dev/null \
-  | xargs -0 grep -IlE "$SECRET_VALUE_RE" 2>/dev/null | head -1 || true
-)"
-[[ -z "$secret_value_hits" ]] || fail "credential-looking value shipped in release resources: $secret_value_hits"
+# Binary pass included — see release_scan_binary_files_for_regex. `grep -I`
+# alone reports rc 1 "no match" for every binary resource, so a token inside a
+# binary plist or compiled asset used to pass the verifier untouched.
+secret_value_hits="$(release_scan_dir_for_secret_values "$RESOURCES" "artifact secret value")" \
+  || fail "secret-value scan of $RESOURCES did not run correctly"
+[[ -z "$secret_value_hits" ]] || fail "credential-looking value shipped in release resources: $(printf '%s' "$secret_value_hits" | head -1)"
 
 PUBLIC_IDENTITY_RE="${NATIVEAGENT_LOCAL_IDENTITY_RE:-}"
 identity_text_hits=""
-if [[ -n "$PUBLIC_IDENTITY_RE" ]]; then
-  identity_text_hits="$(
-    find "$RESOURCES" \
-      \( -path '*/minilm_vocab.txt' -o -path '*/minilm.mlpackage/*' \) -prune -o \
-      -type f -print0 2>/dev/null \
-    | xargs -0 grep -IlEi "$PUBLIC_IDENTITY_RE" 2>/dev/null | head -1 || true
-  )"
-fi
-[[ -z "$identity_text_hits" ]] || fail "local identity name found in release resources: $identity_text_hits"
-
 identity_binary_hit=""
 if [[ -n "$PUBLIC_IDENTITY_RE" ]]; then
-  identity_binary_hit="$(strings "$EXECUTABLE" 2>/dev/null | grep -Ei "$PUBLIC_IDENTITY_RE" | head -1 || true)"
+  identity_text_hits="$(
+    release_scan_dir_for_regex "$RESOURCES" "artifact resource identity" ci "$PUBLIC_IDENTITY_RE" \
+      '*/minilm_vocab.txt' '*/minilm.mlpackage/*'
+  )" || fail "identity resource scan of $RESOURCES did not run correctly"
+  identity_binary_hit="$(release_scan_binary_for_regex "$EXECUTABLE" "artifact executable identity" ci "$PUBLIC_IDENTITY_RE")" \
+    || fail "identity executable scan of $EXECUTABLE did not run correctly"
+else
+  # release_github.sh REQUIRES this input; a direct verifier run must at least
+  # say out loud that the identity check did not happen.
+  echo "  WARNING: NATIVEAGENT_LOCAL_IDENTITY_RE is unset — local-identity scans of" >&2
+  echo "           release resources AND of the executable were SKIPPED." >&2
 fi
-[[ -z "$identity_binary_hit" ]] || fail "local identity name found in release executable strings: $identity_binary_hit"
+[[ -z "$identity_text_hits" ]] || fail "local identity name found in release resources: $(printf '%s' "$identity_text_hits" | head -1)"
+[[ -z "$identity_binary_hit" ]] || fail "local identity name found in release executable strings: $(printf '%s' "$identity_binary_hit" | head -1)"
 
 echo "  app codesign verify..."
 codesign --verify --deep --strict --verbose=2 "$BUNDLE" >/dev/null
@@ -680,12 +743,13 @@ if [[ "$DEVICE_SYNC" == "cloudkit" ]]; then
   echo "  signed entitlements and embedded profile match team, app, container, and production environments..."
 fi
 
-python_artifact_hits="$(find "$RESOURCES" \
+python_artifact_hits="$(release_find_checked "python-artifact" "$RESOURCES" \
   \( -type d \( -name python -o -name __pycache__ -o -name daemon \) \
      -o -type f \( -name '*.py' -o -name '*.pyc' -o -name '*.pyo' -o -name '*python*' -o -name 'native_agentd.py' \) \
      -o -type l \( -name '*python*' -o -name 'native_agentd.py' \) \) \
-  -print -quit 2>/dev/null || true)"
-[[ -z "$python_artifact_hits" ]] || fail "Python artifact shipped in release bundle: $python_artifact_hits"
+  -print)" \
+  || fail "python-artifact scan of $RESOURCES did not run correctly"
+[[ -z "$python_artifact_hits" ]] || fail "Python artifact shipped in release bundle: $(first_line "$python_artifact_hits")"
 
 echo "  public first-run guard marker strings..."
 MARKER_STRINGS="$MOUNT_BASE/nativeagent-executable.strings"

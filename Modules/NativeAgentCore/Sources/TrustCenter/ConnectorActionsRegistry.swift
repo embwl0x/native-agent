@@ -1018,10 +1018,32 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
                 ("attention_user_sequence", prop("integer")),
             ])
         ),
+        // native-look item 3 (2026-08-22) — the CLOSED-LOOP verb. Same
+        // category, same high risk, same approval tier as its neighbours: it
+        // presses and types through the same actuator. The percept it returns
+        // afterwards is evidence of the effect, never a reason for a lower
+        // tier.
+        ConnectorActionDescriptor(
+            id: "mac.act", connectorId: "mac", connector: "mac",
+            name: "Mac Act",
+            description: "Act on one control from the latest Mac Look — press it, open it, type into it, select it, toggle it, dismiss the sheet it belongs to, or scroll it into view — and get back what changed: the accessibility notifications the app fired, the control before and after, which affordances appeared, disappeared or changed, focus and modal and window-title moves, plus a fresh look frame. Refuses when the handle no longer names the same control, when the app it was captured from is gone, or when the effect cannot be observed. Gated by Trust Center Full Mac with the Accessibility category on, plus the macOS Accessibility grant; no per-call approval.",
+            risk: "high", dryRunAvailable: false, requiresApproval: true,
+            category: "accessibility",
+            inputSchema: schema([
+                ("handle", prop("string")),
+                ("frame_id", prop("string")),
+                ("verb", prop("string")),
+                ("text", prop("string")),
+                ("direction", prop("string")),
+                ("wait_ms", prop("integer")),
+                ("attention_session", prop("string")),
+                ("attention_user_sequence", prop("integer")),
+            ])
+        ),
         ConnectorActionDescriptor(
             id: "mac.ax_act", connectorId: "mac", connector: "mac",
             name: "Mac Accessibility Act",
-            description: "Act on one UI element of the frontmost window, addressed by the path from mac.ax_tree or mac.ax_find: press it, or set its value. Runs the app's own accessibility handler; falls back to a synthesized click at the element's centre when the element exposes no usable action. Requires approval.",
+            description: "Act on one UI element of the frontmost window, addressed by the path from mac.ax_tree or mac.ax_find: press it, or set its value. Runs the app's own accessibility handler; falls back to a synthesized click at the element's centre when the element exposes no usable action. Gated by Trust Center Full Mac with the Accessibility category on, plus the macOS Accessibility grant; no per-call approval.",
             risk: "high", dryRunAvailable: false, requiresApproval: true,
             category: "accessibility",
             inputSchema: schema([
@@ -1085,6 +1107,63 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
                 ("max_marks", prop("integer")),
                 ("max_text_items", prop("integer")),
                 ("max_image_bytes", prop("integer")),
+                ("max_nodes", prop("integer")),
+                ("max_depth", prop("integer")),
+            ])
+        ),
+        // native-look item 2 (2026-08-22) — the compiled LOOK: the AX tree
+        // distilled by the app into a glance line / a structured percept with
+        // stable handles / the raw tree, so she pays tokens for the answer,
+        // not the parsing. Read tier like mac.ax_tree; no picture, so no
+        // Screen Recording dependency.
+        ConnectorActionDescriptor(
+            id: "mac.screen", connectorId: "mac", connector: "mac",
+            name: "Screen",
+            description: "The live screen in words: app, position, content as numbered rows, actionable controls, status text. Read-only; nothing held, nothing expires. `part` zooms to a named section.",
+            risk: "low", dryRunAvailable: true, requiresApproval: false,
+            category: "accessibility",
+            inputSchema: schema([("part", prop("string"))])
+        ),
+        ConnectorActionDescriptor(
+            id: "mac.act_by_name", connectorId: "mac", connector: "mac",
+            name: "Act",
+            description: "Do one thing to something on the live screen by NAME (click/open/type/select/toggle/scroll/dismiss). Resolves against a fresh look at act time; ambiguity is returned as a question and nothing is touched. Drives the same gated closed loop as mac.act.",
+            risk: "medium", dryRunAvailable: false, requiresApproval: false,
+            category: "accessibility",
+            inputSchema: schema([
+                ("verb", prop("string")),
+                ("target", prop("string")),
+                ("text", prop("string")),
+            ])
+        ),
+        ConnectorActionDescriptor(
+            id: "mac.go", connectorId: "mac", connector: "mac",
+            name: "Go",
+            description: "Move to an app (switch or launch), a file/folder path, or an http/https URL, then read the fresh screen. App activation is verified; a path or URL is only reported as an accepted open request unless the screen proves where it landed.",
+            risk: "medium", dryRunAvailable: false, requiresApproval: false,
+            category: "accessibility",
+            inputSchema: schema([("name", prop("string"))])
+        ),
+        ConnectorActionDescriptor(
+            id: "mac.wait", connectorId: "mac", connector: "mac",
+            name: "Wait",
+            description: "Watch the screen (bounded, max 60s) until it settles or named text appears; honest timeout. Read-only.",
+            risk: "low", dryRunAvailable: true, requiresApproval: false,
+            category: "accessibility",
+            inputSchema: schema([
+                ("until", prop("string")),
+                ("seconds", prop("integer")),
+            ])
+        ),
+        ConnectorActionDescriptor(
+            id: "mac.look", connectorId: "mac", connector: "mac",
+            name: "Mac Look",
+            description: "Look at the frontmost window at one of three grades: glance (one distilled line), look (the structured percept: focus, modal, landmarks, every labeled control with a stable handle and its element path), or stare (the raw accessibility tree, same as mac.ax_tree). Read-only; unlabeled controls are counted by role, never hidden.",
+            risk: "low", dryRunAvailable: true, requiresApproval: false,
+            category: "accessibility",
+            inputSchema: schema([
+                ("grade", prop("string")),
+                ("max_affordances", prop("integer")),
                 ("max_nodes", prop("integer")),
                 ("max_depth", prop("integer")),
             ])

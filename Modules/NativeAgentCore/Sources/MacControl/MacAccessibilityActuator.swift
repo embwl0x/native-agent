@@ -574,6 +574,39 @@ public enum MacAXActOutcome: String, Sendable, Equatable {
     case invalidTarget
 }
 
+/// The outcome of a PID-ANCHORED resolve (gpt-5.5 round-2 B2).
+///
+/// Three answers, never two: "the app she looked at is gone" is a different
+/// fact from "that path is not in its window", and collapsing them into `nil`
+/// is what let `mac_act` act in whatever app happened to be frontmost.
+public enum MacAXPidResolution: Sendable, Equatable {
+    case resolved(MacAXActTarget)
+    /// No such process, or its AX application element publishes no window —
+    /// the frame she acts from describes an app that is not there any more.
+    case appGone
+    /// The app is alive; that child-index chain is not.
+    case pathNotFound
+    /// gpt-5.5 round-3 B1. The app is alive and still has windows, but none of
+    /// them is the window the look was taken of.
+    case windowGone
+    /// The app is alive and two or more of its windows are equally plausible
+    /// matches for the frame's window. A coin flip between two windows of the
+    /// same app is exactly the wrong-element act this organ refuses.
+    case windowDrifted(String)
+}
+
+/// One of an app's windows, as the ACT seam sees it: the source's own element
+/// handle plus the identity that outlives it.
+public struct MacAXWindowRef: Sendable, Equatable {
+    public let handle: Int
+    public let identity: MacAXWindowIdentity
+
+    public init(handle: Int, identity: MacAXWindowIdentity) {
+        self.handle = handle
+        self.identity = identity
+    }
+}
+
 /// Semantic action on a live element. Separate protocol from
 /// `MacAXElementSource` on purpose: the read seam has no member that can
 /// mutate anything, and this one is the only place that can.
@@ -581,11 +614,131 @@ public protocol MacAXActSource: Sendable {
     func isTrusted() -> Bool
     /// Resolve a child-index chain from the frontmost window root. `[]` is the
     /// window itself. Returns nil when any index is out of range.
+    ///
+    /// FRONTMOST-ANCHORED, and therefore NOT what `mac_act` uses: see
+    /// `resolve(path:inAppPid:)`. Kept for `mac_ax_act` and the actuator's own
+    /// internal fallback, which are explicitly "act on what is in front".
     func resolve(path: [Int]) -> MacAXActTarget?
+    /// Resolve the SAME chain inside a NAMED process — the app the look frame
+    /// was captured from and the app the effect observer is installed on.
+    ///
+    /// gpt-5.5 round-2 B2: the closed loop resolved against
+    /// `NSWorkspace.frontmostApplication` while its AXObserver sat on the
+    /// FRAME's pid. If anything stole front between the look and the act (a
+    /// notification, a build finishing, User cmd-tabbing), the same
+    /// path/role/label could name a plausible control in the WRONG app and the
+    /// verb fired there. Required rather than defaulted: a source that cannot
+    /// anchor to a pid must say so in its own words, because a default that
+    /// silently forwarded to `resolve(path:)` would reintroduce exactly the bug.
+    func resolve(path: [Int], inAppPid pid: Int32) -> MacAXPidResolution
+    /// EVERY window of a named process, in `AXWindows` order, with the
+    /// composite identity (`MacAXWindowIdentity`) that survives this source's
+    /// element handles.
+    ///
+    /// gpt-5.5 round-3 B1: pid anchoring is not window anchoring. Inside the
+    /// right app, `resolve(path:inAppPid:)` still takes "focused, else main,
+    /// else first" — so two windows of one app and a focus change between the
+    /// look and the act resolve the same path in the WRONG window while the pid
+    /// claim still passes.
+    ///
+    /// Default: the single window `resolve(path: [], inAppPid:)` answers with —
+    /// truthful for a one-window source (which every synthetic source is), and
+    /// what makes the identity match a no-op there rather than a fabrication.
+    func windows(pid: Int32) -> [MacAXWindowRef]
+    /// Resolve a child-index chain from THAT window, not from whichever window
+    /// of the app is focused now. `[]` is the window itself.
+    func resolve(path: [Int], inWindow window: MacAXWindowRef) -> MacAXPidResolution
     func perform(_ target: MacAXActTarget, action: String) -> MacAXActOutcome
     func setValue(_ target: MacAXActTarget, value: String) -> MacAXActOutcome
+    /// Give the element the keyboard focus WITHOUT invoking its handler.
+    /// `type`'s keystroke fallback needs a focused field; it used to get one by
+    /// pressing the element, which on a button is activation, not focus.
+    /// Default `.unsupported` so a source that cannot do it says so instead of
+    /// pretending — the caller then refuses rather than typing into the void.
+    func setFocused(_ target: MacAXActTarget) -> MacAXActOutcome
+    /// Select the element (set `AXSelected`) WITHOUT invoking it.
+    ///
+    /// Round 6 live: Finder's `open` has no working AX path at all — the
+    /// filename field ADVERTISES `AXOpen` and returns kAXErrorActionUnsupported
+    /// (-25205) for it, `AXConfirm` reports success and does nothing, and
+    /// synthesized double-clicks at BOTH the row centre and the filename are
+    /// inert. The one mechanism that navigates is select-then-Open-command, and
+    /// this is its first half. Default `.unsupported` so a source that cannot do
+    /// it says so rather than pretending.
+    func setSelected(_ target: MacAXActTarget) -> MacAXActOutcome
+    /// The app's FOCUSED window right now, or nil when this source cannot tell.
+    ///
+    /// Agent round-7 NON-KEY CRITICAL FAIL: `open` on a Finder row was accepted
+    /// while Chrome was frontmost, and the select-then-Open chord — a CGEvent
+    /// key post, which the window server delivers to whatever is KEY, not to
+    /// whatever the frame names — went to Chrome. Every AX anchor in the act
+    /// path was correct and none of them constrains a synthesized event.
+    ///
+    /// nil means CANNOT TELL, which the caller treats as "no window-level
+    /// evidence", never as a match: the app-level frontmost check still stands.
+    func focusedWindow(pid: Int32) -> MacAXWindowRef?
+    /// Bring THIS window to the front — `AXRaise` on the window element plus
+    /// app activation, because either alone is insufficient: activating the app
+    /// raises whichever of its windows it last had in front, and raising
+    /// without activating leaves another app key.
+    ///
+    /// User, 2026-08-22 ("a live screen with hands she can use"): a refusal that
+    /// ends in "bring that window forward and look again" is homework handed to
+    /// the caller. A person does not decline to click because another app is in
+    /// front — they raise the window and click. This is that. It also answers
+    /// the friction Agent reported directly: "cannot raise the exact captured
+    /// window; app focus is insufficient with multiple Finder windows."
+    func raise(_ window: MacAXWindowRef) -> MacAXActOutcome
+    /// Why the last `raise` did not take, when there is more to say than "it
+    /// did not" — read only after a raise that failed, and folded into the
+    /// refusal so she is told the thing a person can actually act on. The one
+    /// case today is a missing Automation (Apple Events) grant, which is
+    /// invisible in every other signal this path produces.
+    var raiseDiagnostic: String? { get }
     /// Re-read the element's attributes so the caller can see the POST-state.
     func reread(_ target: MacAXActTarget) -> MacAXActTarget?
+}
+
+public extension MacAXActSource {
+    func setFocused(_ target: MacAXActTarget) -> MacAXActOutcome { .unsupported }
+
+    /// A source with ONE tree per app has exactly one window, and that window
+    /// IS the one the frame was captured from — there is no second window for
+    /// the resolve to land in by mistake. Reporting it at index 0 with the
+    /// window element's own attributes is the truthful answer, not a stub;
+    /// a multi-window source (the live one) implements this for real.
+    func windows(pid: Int32) -> [MacAXWindowRef] {
+        guard case .resolved(let root) = resolve(path: [], inAppPid: pid) else { return [] }
+        return [MacAXWindowRef(
+            handle: root.handle,
+            identity: MacAXWindowIdentity(
+                pid: pid,
+                index: 0,
+                role: root.role,
+                subrole: nil,
+                title: root.title,
+                frame: root.frame
+            )
+        )]
+    }
+
+    func resolve(path: [Int], inWindow window: MacAXWindowRef) -> MacAXPidResolution {
+        resolve(path: path, inAppPid: window.identity.pid)
+    }
+    func setSelected(_ target: MacAXActTarget) -> MacAXActOutcome { .unsupported }
+
+    /// A synthetic source publishes one tree and no window server, so it has no
+    /// notion of key. nil ⇒ "cannot tell"; the live source answers for real.
+    func focusedWindow(pid: Int32) -> MacAXWindowRef? { nil }
+
+    /// No window server ⇒ nothing to raise. `.unsupported`, never a fabricated
+    /// success: a test that believes it raised a window it cannot raise is how
+    /// a gate becomes vacuous.
+    func raise(_ window: MacAXWindowRef) -> MacAXActOutcome { .unsupported }
+
+    /// Nothing to add. A source that cannot raise has already said everything
+    /// it knows with `.unsupported`.
+    var raiseDiagnostic: String? { nil }
 }
 
 /// AX mutations can synchronously invoke action handlers inside the target
@@ -613,12 +766,31 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     private let lock = NSLock()
     private var table: [Int: AXUIElement] = [:]
     private var nextID = 0
+    /// Guarded by `lock`, like the handle table.
+    private var lastRaiseDiagnostic: String?
 
     public init() {}
 
+    /// ONE HANDLE PER ELEMENT. Round 9, third finding: `windows(pid:)` and
+    /// `focusedWindow(pid:)` each minted a FRESH integer for the very same
+    /// `AXUIElement`, and `MacActClosedLoop.keyWindowRefusal` decides "is the
+    /// frame's window the key window?" by comparing those two integers. With
+    /// per-call minting that comparison is `n != m` for two freshly incremented
+    /// counters — never equal — so the second guard reported `window_not_key`
+    /// for a window that WAS key, every time, and the refusal text named the
+    /// same window on both sides of "key: X; the frame names X".
+    ///
+    /// `CFEqual` on two separately-copied `AXUIElement`s for one window is TRUE
+    /// (measured live, 2026-08-22, on Finder's `AXWindows` re-read), so element
+    /// identity is the stable thing and the integer is just its name here.
+    /// Deduping also bounds the table, which previously grew by six entries per
+    /// `windows(pid:)` call for the lifetime of the source.
     private func mint(_ element: AXUIElement) -> Int {
         lock.lock()
         defer { lock.unlock() }
+        if let existing = table.first(where: { CFEqual($0.value, element) })?.key {
+            return existing
+        }
         nextID += 1
         table[nextID] = element
         return nextID
@@ -641,19 +813,319 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     private func resolveOnExecutionLane(path: [Int]) -> MacAXActTarget? {
         #if canImport(AppKit)
         guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
-        let appElement = AXUIElementCreateApplication(app.processIdentifier)
+        guard case .resolved(let target) = resolveOnExecutionLane(
+            path: path,
+            pid: app.processIdentifier
+        ) else { return nil }
+        return target
+        #else
+        return nil
+        #endif
+    }
+
+    public func resolve(path: [Int], inAppPid pid: Int32) -> MacAXPidResolution {
+        MacAXExecutionLane.sync { resolveOnExecutionLane(path: path, pid: pid) }
+    }
+
+    private func resolveOnExecutionLane(path: [Int], pid: Int32) -> MacAXPidResolution {
+        #if canImport(AppKit)
+        // The process itself first: an AXUIElement for a dead pid is a perfectly
+        // constructible object whose every read fails, so "the app is gone" has
+        // to be asked directly rather than inferred from an empty window list.
+        guard NSRunningApplication(processIdentifier: pid) != nil else { return .appGone }
+        let appElement = AXUIElementCreateApplication(pid)
         guard var current = copyElement(appElement, kAXFocusedWindowAttribute)
             ?? copyElement(appElement, kAXMainWindowAttribute)
             ?? copyElementArray(appElement, kAXWindowsAttribute).first
-        else { return nil }
+        else { return .appGone }
         for index in path {
             let children = copyElementArray(current, kAXChildrenAttribute)
-            guard index >= 0, index < children.count else { return nil }
+            guard index >= 0, index < children.count else { return .pathNotFound }
             current = children[index]
         }
-        return describe(current)
+        guard let described = describe(current) else { return .pathNotFound }
+        return .resolved(described)
+        #else
+        return .appGone
+        #endif
+    }
+
+    /// Round-3 B1 — every window of the process, so the caller can pick the one
+    /// the LOOK was taken of instead of whichever is focused now.
+    public func windows(pid: Int32) -> [MacAXWindowRef] {
+        MacAXExecutionLane.sync { windowsOnExecutionLane(pid: pid) }
+    }
+
+    private func windowsOnExecutionLane(pid: Int32) -> [MacAXWindowRef] {
+        #if canImport(AppKit)
+        guard NSRunningApplication(processIdentifier: pid) != nil else { return [] }
+        let appElement = AXUIElementCreateApplication(pid)
+        let windows = MacAXWindowInventory.union(
+            listed: copyElementArray(appElement, kAXWindowsAttribute),
+            focused: copyElement(appElement, kAXFocusedWindowAttribute),
+            main: copyElement(appElement, kAXMainWindowAttribute),
+            equal: { CFEqual($0, $1) }
+        )
+        return windows.enumerated().map { index, window in
+            MacAXWindowRef(
+                handle: mint(window),
+                identity: MacAXWindowIdentity(
+                    pid: pid,
+                    index: index,
+                    role: copyString(window, kAXRoleAttribute) ?? "AXWindow",
+                    subrole: copyString(window, kAXSubroleAttribute),
+                    title: copyString(window, kAXTitleAttribute),
+                    frame: copyFrame(window)
+                )
+            )
+        }
+        #else
+        return []
+        #endif
+    }
+
+    public func focusedWindow(pid: Int32) -> MacAXWindowRef? {
+        MacAXExecutionLane.sync { focusedWindowOnExecutionLane(pid: pid) }
+    }
+
+    /// `AXFocusedWindow` of that app, carrying the SAME composite identity
+    /// `windows(pid:)` mints, so the caller can compare it against the frame's
+    /// recorded window with the ordinary matcher rather than by title alone.
+    private func focusedWindowOnExecutionLane(pid: Int32) -> MacAXWindowRef? {
+        #if canImport(AppKit)
+        guard NSRunningApplication(processIdentifier: pid) != nil else { return nil }
+        let appElement = AXUIElementCreateApplication(pid)
+        guard let focused = copyElement(appElement, kAXFocusedWindowAttribute) else { return nil }
+        // The INDEX must be the one this window carries in the same canonical
+        // inventory as `windows(pid:)`. Finder can omit a focused AXSheet from
+        // AXWindows; using the raw array would fabricate index 0 and can make
+        // the sheet's identity drift into its document-window parent.
+        let windows = MacAXWindowInventory.union(
+            listed: copyElementArray(appElement, kAXWindowsAttribute),
+            focused: focused,
+            main: copyElement(appElement, kAXMainWindowAttribute),
+            equal: { CFEqual($0, $1) }
+        )
+        let index = windows.firstIndex(where: { CFEqual($0, focused) }) ?? 0
+        return MacAXWindowRef(
+            handle: mint(focused),
+            identity: MacAXWindowIdentity(
+                pid: pid,
+                index: index,
+                role: copyString(focused, kAXRoleAttribute) ?? "AXWindow",
+                subrole: copyString(focused, kAXSubroleAttribute),
+                title: copyString(focused, kAXTitleAttribute),
+                frame: copyFrame(focused)
+            )
+        )
         #else
         return nil
+        #endif
+    }
+
+    /// NOT one `MacAXExecutionLane.sync` around the whole thing (gpt-5.5
+    /// round-9b BLOCKING). Raising now WAITS, and the lane is the app's MAIN
+    /// QUEUE: a 600 ms poll plus an Apple Event round-trip inside it would hold
+    /// the main thread for the whole activation, and an Automation consent
+    /// prompt on the far side of that event can hold it longer still. Only the
+    /// individual AX calls hop onto the lane; the waiting and the Apple Event
+    /// happen on the caller's own thread (`SwiftNativeMacControl`'s actor
+    /// executor, never main).
+    public func raise(_ window: MacAXWindowRef) -> MacAXActOutcome {
+        #if canImport(AppKit)
+        // Cleared at the TRUE top, before any early return (gpt-5.5 round-9c):
+        // a stale Automation note surviving an `.invalidTarget` would be
+        // attached to the next refusal, which is a diagnosis of the wrong call.
+        setRaiseDiagnostic(nil)
+        guard let app = NSRunningApplication(processIdentifier: window.identity.pid) else {
+            return .invalidTarget
+        }
+        // Half one — window ordering INSIDE the app. This half works from a
+        // background process: measured live 2026-08-22 with Chrome frontmost,
+        // `AXRaise` on Finder's `window-a` made it Finder's `AXFocusedWindow`
+        // while Chrome kept the front.
+        let raiseStatus: AXError? = MacAXExecutionLane.sync {
+            guard let element = element(window.handle) else { return nil }
+            NativeAgentMotorEpoch.noteAgentMotorEvent()
+            return AXUIElementPerformAction(element, kAXRaiseAction as CFString)
+        }
+        guard let raiseStatus else { return .invalidTarget }
+
+        // Half two — app ordering. THE OUTCOME IS MEASURED, NEVER ASSUMED.
+        //
+        // Round 9 CROSS-APP FAIL (Agent, envelope 7FCDC92E): this returned
+        // `.performed` for a raise that did not happen. Three mechanisms were
+        // probed live from a background process with Chrome frontmost, and two
+        // of the three RETURN SUCCESS AND DO NOTHING:
+        //
+        //   NSRunningApplication.activate()          → true,        no effect
+        //   AXFrontmost = true on the app element    → kAXErrorSuccess (0),
+        //                                              no effect
+        //   Apple Event `activate` to the bundle id  → Finder came to front
+        //
+        // macOS will not let a background process reorder the front app on its
+        // own say-so; the only sanctioned path is asking the TARGET to activate
+        // ITSELF, which is what the Apple Event does. So: try the cheap call,
+        // then the one that works, and in both cases believe only the window
+        // server's own answer.
+        if isFrontAndFocused(app: app, window: window) { return .performed }
+        _ = MacAXExecutionLane.sync { app.activate() }
+        if awaitFrontAndFocused(app: app, window: window) { return .performed }
+        activateViaAppleEvent(app)
+        if awaitFrontAndFocused(app: app, window: window) { return .performed }
+
+        // Not raised. Which half failed is worth distinguishing for the
+        // receipt, but neither is a success and neither may be reported as one
+        // — the caller's next move is a synthesized event that would land in
+        // whatever IS key.
+        switch raiseStatus {
+        case .actionUnsupported, .attributeUnsupported:
+            return .unsupported
+        default:
+            return .failed
+        }
+        #else
+        return .unsupported
+        #endif
+    }
+
+    /// Why the last `raise` did not take, when there is something to say beyond
+    /// "it did not" — an Automation (Apple Events) consent denial, which is the
+    /// one failure a person can actually fix and the one a bare `failed` hides
+    /// completely, or any other Apple Event error by number. Cleared at the top
+    /// of every `raise`, so it always describes the most recent one.
+    public var raiseDiagnostic: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return lastRaiseDiagnostic
+    }
+
+    private func setRaiseDiagnostic(_ value: String?) {
+        lock.lock()
+        defer { lock.unlock() }
+        lastRaiseDiagnostic = value
+    }
+
+    #if canImport(AppKit)
+    /// The window server's own answer to "is this exact window key right now?"
+    /// — the app is frontmost AND the app's focused window is THIS element.
+    /// `CFEqual`, not handle equality: this is the identity comparison, and it
+    /// is measured against a freshly copied `AXFocusedWindow` every call.
+    private func isFrontAndFocused(app: NSRunningApplication, window: MacAXWindowRef) -> Bool {
+        MacAXExecutionLane.sync {
+            guard let element = element(window.handle) else { return false }
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier
+            else { return false }
+            let appElement = AXUIElementCreateApplication(app.processIdentifier)
+            guard let focused = copyElement(appElement, kAXFocusedWindowAttribute) else { return false }
+            return CFEqual(focused, element)
+        }
+    }
+
+    /// Activation is ASYNCHRONOUS — the call returns before the window server
+    /// has moved anything — so a single immediate read is a race, not a check.
+    /// Bounded poll, deliberately short: a raise the window server has not made
+    /// in 300 ms per mechanism is not being made.
+    ///
+    /// The SLEEP IS OFF THE AX LANE. Only `isFrontAndFocused` hops onto it, one
+    /// short read at a time; holding the main queue for the whole wait is the
+    /// round-9b BLOCKING this shape exists to avoid.
+    private func awaitFrontAndFocused(app: NSRunningApplication, window: MacAXWindowRef) -> Bool {
+        for _ in 0..<12 {
+            if isFrontAndFocused(app: app, window: window) { return true }
+            Thread.sleep(forTimeInterval: 0.025)
+        }
+        return isFrontAndFocused(app: app, window: window)
+    }
+
+    /// `tell application id "…" to activate`, the one mechanism that actually
+    /// fronts another app from the background. Runs OFF the AX lane: an Apple
+    /// Event is a synchronous round-trip into another process and the far side
+    /// can raise an Automation consent prompt, neither of which may happen with
+    /// the app's main queue held.
+    ///
+    /// Needs Automation (Apple Events) consent for THAT target. A denial
+    /// (`errAEEventNotPermitted`, -1743) is not an error here — the front/focus
+    /// check is what decides — but it is RECORDED, because "NativeAgent is not
+    /// allowed to control Finder" is the one raise failure a person can fix and
+    /// a bare `failed` hides it completely.
+    private func activateViaAppleEvent(_ app: NSRunningApplication) {
+        guard let bundleID = app.bundleIdentifier, !bundleID.isEmpty else { return }
+
+        // ASK THE STATUS BEFORE SENDING ANYTHING. `AEDeterminePermissionTo-
+        // AutomateTarget` with `askUserIfNeeded: false` is the non-prompting
+        // read, and it separates the two cases a bare send collapses:
+        //
+        //   * already DENIED (-1743) — sending would fail silently and the
+        //     receipt would blame the window server for a permissions problem.
+        //     Say so instead, and send nothing.
+        //   * never ASKED (-1744) — send anyway. Skipping here is how a
+        //     capability orphans its own consent: the grant is only ever
+        //     created by an event that raises the prompt, and if the one code
+        //     path that could raise it refuses to, the permission stays
+        //     un-askable forever.
+        let permission = bundleID.withCString { cString -> OSStatus in
+            var target = AEAddressDesc()
+            let built = AECreateDesc(
+                AEKeyword(typeApplicationBundleID),
+                cString,
+                strlen(cString),
+                &target
+            )
+            guard built == noErr else { return OSStatus(built) }
+            defer { AEDisposeDesc(&target) }
+            return AEDeterminePermissionToAutomateTarget(&target, typeWildCard, typeWildCard, false)
+        }
+        if permission == OSStatus(errAEEventNotPermitted) {
+            setRaiseDiagnostic(automationDeniedNote(app, bundleID: bundleID))
+            return
+        }
+        // Escaped defensively even though a bundle id cannot legally contain a
+        // quote or a backslash: this string is compiled as source.
+        let escaped = bundleID
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        guard let script = NSAppleScript(source: "tell application id \"\(escaped)\" to activate") else { return }
+        var error: NSDictionary?
+        script.executeAndReturnError(&error)
+        guard let error else { return }
+        let code = (error[NSAppleScript.errorNumber] as? Int) ?? 0
+        if code == Int(errAEEventNotPermitted) {
+            setRaiseDiagnostic(automationDeniedNote(app, bundleID: bundleID))
+        } else if code != 0 {
+            setRaiseDiagnostic("activating \(bundleID) by Apple Event failed with error \(code)")
+        }
+    }
+
+    private func automationDeniedNote(_ app: NSRunningApplication, bundleID: String) -> String {
+        "macOS has not granted NativeAgent permission to control \(app.localizedName ?? bundleID) "
+        + "(Automation / Apple Events). Without it this app cannot bring \(bundleID) to the front at "
+        + "all, because a background process may only ask the target to activate ITSELF — every "
+        + "other mechanism (NSRunningApplication.activate, AXFrontmost) reports success and moves "
+        + "nothing. Grant it in System Settings → Privacy & Security → Automation."
+    }
+    #endif
+
+    public func resolve(path: [Int], inWindow window: MacAXWindowRef) -> MacAXPidResolution {
+        MacAXExecutionLane.sync { resolveOnExecutionLane(path: path, inWindow: window) }
+    }
+
+    private func resolveOnExecutionLane(path: [Int], inWindow window: MacAXWindowRef) -> MacAXPidResolution {
+        #if canImport(AppKit)
+        guard NSRunningApplication(processIdentifier: window.identity.pid) != nil else { return .appGone }
+        // The window element handle the identity match already picked. No
+        // focused/main/first fallback here on purpose: falling back would put
+        // the act back in whichever window is focused now, which is the bug.
+        guard var current = element(window.handle) else { return .windowGone }
+        for index in path {
+            let children = copyElementArray(current, kAXChildrenAttribute)
+            guard index >= 0, index < children.count else { return .pathNotFound }
+            current = children[index]
+        }
+        guard let described = describe(current) else { return .pathNotFound }
+        return .resolved(described)
+        #else
+        return .appGone
         #endif
     }
 
@@ -684,6 +1156,42 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         guard probe == .success, settable.boolValue else { return .unsupported }
         NativeAgentMotorEpoch.noteAgentMotorEvent()
         let status = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, value as CFTypeRef)
+        switch status {
+        case .success: return .performed
+        case .attributeUnsupported, .actionUnsupported: return .unsupported
+        default: return .failed
+        }
+    }
+
+    public func setFocused(_ target: MacAXActTarget) -> MacAXActOutcome {
+        MacAXExecutionLane.sync { setFocusedOnExecutionLane(target) }
+    }
+
+    public func setSelected(_ target: MacAXActTarget) -> MacAXActOutcome {
+        MacAXExecutionLane.sync { setSelectedOnExecutionLane(target) }
+    }
+
+    private func setSelectedOnExecutionLane(_ target: MacAXActTarget) -> MacAXActOutcome {
+        guard let element = element(target.handle) else { return .invalidTarget }
+        var settable: DarwinBoolean = false
+        let probe = AXUIElementIsAttributeSettable(element, "AXSelected" as CFString, &settable)
+        guard probe == .success, settable.boolValue else { return .unsupported }
+        NativeAgentMotorEpoch.noteAgentMotorEvent()
+        let status = AXUIElementSetAttributeValue(element, "AXSelected" as CFString, true as CFTypeRef)
+        return status == .success ? .performed : .failed
+    }
+
+    private func setFocusedOnExecutionLane(_ target: MacAXActTarget) -> MacAXActOutcome {
+        guard let element = element(target.handle) else { return .invalidTarget }
+        var settable: DarwinBoolean = false
+        let probe = AXUIElementIsAttributeSettable(element, kAXFocusedAttribute as CFString, &settable)
+        guard probe == .success, settable.boolValue else { return .unsupported }
+        NativeAgentMotorEpoch.noteAgentMotorEvent()
+        let status = AXUIElementSetAttributeValue(
+            element,
+            kAXFocusedAttribute as CFString,
+            kCFBooleanTrue
+        )
         switch status {
         case .success: return .performed
         case .attributeUnsupported, .actionUnsupported: return .unsupported
@@ -775,6 +1283,7 @@ public struct UnavailableMacAXActSource: MacAXActSource {
     public init() {}
     public func isTrusted() -> Bool { false }
     public func resolve(path: [Int]) -> MacAXActTarget? { nil }
+    public func resolve(path: [Int], inAppPid pid: Int32) -> MacAXPidResolution { .pathNotFound }
     public func perform(_ target: MacAXActTarget, action: String) -> MacAXActOutcome { .invalidTarget }
     public func setValue(_ target: MacAXActTarget, value: String) -> MacAXActOutcome { .invalidTarget }
     public func reread(_ target: MacAXActTarget) -> MacAXActTarget? { nil }
@@ -785,6 +1294,7 @@ public struct UnavailableMacAXActSource: MacAXActSource {
 struct InertAvailableMacAXActSource: MacAXActSource {
     func isTrusted() -> Bool { true }
     func resolve(path: [Int]) -> MacAXActTarget? { nil }
+    func resolve(path: [Int], inAppPid pid: Int32) -> MacAXPidResolution { .pathNotFound }
     func perform(_ target: MacAXActTarget, action: String) -> MacAXActOutcome { .invalidTarget }
     func setValue(_ target: MacAXActTarget, value: String) -> MacAXActOutcome { .invalidTarget }
     func reread(_ target: MacAXActTarget) -> MacAXActTarget? { nil }
@@ -930,17 +1440,38 @@ public enum MacAccessibilityActuator {
         public let error: String?
     }
 
+    /// - Parameter resolved: an element THIS source already resolved, when the
+    ///   caller had to inspect it before deciding to act — `mac_act`'s drift
+    ///   guard compares the live element's role and label against the frame's
+    ///   record, and re-resolving here would (a) pay a second AX walk and
+    ///   (b) open a window in which the second resolve lands on a DIFFERENT
+    ///   element than the one that passed the guard. Passing the checked target
+    ///   through is what makes the guard load-bearing. `path` is then unused.
+    ///   Every other caller leaves it nil and the behaviour is byte-identical.
     public static func act(
         source: any MacAXActSource,
         sink: any MacEventSink,
         path: [Int],
         action requestedAction: String?,
-        value: String?
+        value: String?,
+        resolved: MacAXActTarget? = nil,
+        /// Agent round 9 — THE SYNTHESIZED-CLICK FALLBACK IS WINDOW-SERVER
+        /// INPUT. Every other CGEvent emitter in `mac_act` passes the
+        /// key-window gate; this one is reached from inside the actuator, so
+        /// the gate could not see it and a `click` on a background window whose
+        /// element refused AXPress posted a click at those screen coordinates
+        /// into whatever WAS key. The closure is consulted immediately before
+        /// the first mouse event, receives the fallback `reason` (an
+        /// `ax_action_*` prefix means an AX action was already DELIVERED, which
+        /// the caller's actuation ledger has to know), and `false` aborts with
+        /// nothing posted. Default `nil` = no gate, which is the standing
+        /// behaviour of `mac_ax_act` ("act on what is in front").
+        syntheticFallbackGate: ((String) -> Bool)? = nil
     ) -> Result<ActResult, Failure> {
         let action = (requestedAction?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap {
             $0.isEmpty ? nil : $0
         } ?? defaultAction
-        guard let target = source.resolve(path: path) else {
+        guard let target = resolved ?? source.resolve(path: path) else {
             return .failure(.pathNotFound)
         }
 
@@ -994,7 +1525,8 @@ public enum MacAccessibilityActuator {
                 sink: sink,
                 target: target,
                 action: action,
-                reason: "ax_action_\(outcome.rawValue)"
+                reason: "ax_action_\(outcome.rawValue)",
+                gate: syntheticFallbackGate
             )
         }
 
@@ -1003,7 +1535,8 @@ public enum MacAccessibilityActuator {
             sink: sink,
             target: target,
             action: action,
-            reason: "element_does_not_advertise_\(action)"
+            reason: "element_does_not_advertise_\(action)",
+            gate: syntheticFallbackGate
         )
     }
 
@@ -1012,7 +1545,8 @@ public enum MacAccessibilityActuator {
         sink: any MacEventSink,
         target: MacAXActTarget,
         action: String,
-        reason: String
+        reason: String,
+        gate: ((String) -> Bool)? = nil
     ) -> Result<ActResult, Failure> {
         guard sink.isAvailable else {
             return .success(ActResult(
@@ -1036,6 +1570,21 @@ public enum MacAccessibilityActuator {
                 target: target,
                 postState: source.reread(target),
                 error: "no_ax_action_and_no_frame"
+            ))
+        }
+        // LAST THING BEFORE THE FIRST EVENT. After the availability and frame
+        // checks (a gate that fires for a call which was never going to post
+        // anything would refuse for the wrong reason) and before the post.
+        if let gate, !gate(reason) {
+            return .success(ActResult(
+                ok: false,
+                method: "none",
+                requestedAction: action,
+                outcome: .unsupported,
+                fallbackReason: reason,
+                target: target,
+                postState: source.reread(target),
+                error: "synthetic_fallback_refused"
             ))
         }
         for event in MacEventPlanner.click(x: centre.x, y: centre.y, button: .left, count: 1) {
@@ -1068,6 +1617,11 @@ public enum MacInjectionToolNames {
         "mac_click": "click",
         "mac_scroll": "scroll",
         "mac_ax_act": "ax_act",
+        // native-look item 3 — the closed-loop verb. In this vocabulary
+        // because it IS injection: one entry here gives it the Full-Mac-YOLO
+        // exclusion hook, the redaction sinks and the capability mint, with no
+        // act-shaped special case anywhere in the gate.
+        "mac_act": "act",
         // W6 — mac_wake posts a HID nudge, so it belongs to the SAME
         // vocabulary: one entry here is what gives it the approval floor, the
         // Full-Mac-YOLO exclusion, the replay verification and the capability
@@ -1077,6 +1631,7 @@ public enum MacInjectionToolNames {
         "mac.click": "click",
         "mac.scroll": "scroll",
         "mac.ax_act": "ax_act",
+        "mac.act": "act",
         "mac.wake": "wake",
     ]
 
@@ -1358,6 +1913,12 @@ public enum MacInjectionArgRedaction {
         "mac_ax_act": ["value"],
         "mac.ax_act": ["value"],
         "ax_act": ["value"],
+        // native-look item 3 — `mac_act {verb:"type", text:"…"}` carries the
+        // literal characters, exactly like mac_keystroke.text. Same class of
+        // secret, same redaction at every request boundary.
+        "mac_act": ["text"],
+        "mac.act": ["text"],
+        "act": ["text"],
     ]
 
     public static func carriesSecretArgs(tool: String) -> Bool {

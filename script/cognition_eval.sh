@@ -46,6 +46,11 @@ RUN_ID="${!_runid_var:-$(date -u +%Y%m%dT%H%M%SZ)}"
 DAY_INDEX="${!_dayidx_var:-0}"
 NOTE="${!_note_var:-}"
 
+if [[ ! "$DAY_INDEX" =~ ^[0-9]+$ ]]; then
+  echo "${_dayidx_var} must be a non-negative integer (got '$DAY_INDEX')" >&2
+  exit 2
+fi
+
 require_cmds() {
   for command in "$@"; do
     if ! command -v "$command" >/dev/null 2>&1; then
@@ -56,26 +61,53 @@ require_cmds() {
 }
 
 state_json() {
-  curl -sS --max-time 30 \
+  local response
+  response="$(curl -fsS --max-time 30 \
     -H "Authorization: Bearer $TOKEN" \
     -H "Accept: application/json" \
-    "$BASE_URL/codex/state"
+    "$BASE_URL/codex/state")"
+  if ! jq -ce '
+      [
+        (type == "object"),
+        (.organism | type == "object"),
+        (.cognition | type == "object"),
+        (.cognition.microcycle | type == "object"),
+        (.contextFlow | type == "object"),
+        (.contextFlow.mode | type == "string")
+      ] | all
+    ' <<<"$response"; then
+    echo "bridge state is incomplete or malformed" >&2
+    return 1
+  fi
+  printf '%s\n' "$response"
 }
 
 run_organism() {
-  require_cmds jq
+  require_cmds jq curl
   nativeagent_bridge_resolve
   mkdir -p "$(dirname "$OUT")"
 
   debug_json() {
     local body="$1"
-    curl -sS --max-time 30 \
+    local expected_status="$2"
+    local response
+    response="$(curl -fsS --max-time 30 \
       -H "Authorization: Bearer $TOKEN" \
       -H "Content-Type: application/json" \
       -H "Accept: application/json" \
       -X POST \
       --data "$body" \
-      "$BASE_URL/codex/organism/debug"
+      "$BASE_URL/codex/organism/debug")"
+    if ! jq -e --arg expectedStatus "$expected_status" '
+        [
+          (type == "object"),
+          (.status == $expectedStatus),
+          (.error | not)
+        ] | all
+      ' <<<"$response" >/dev/null; then
+      echo "organism debug response did not confirm status '$expected_status'" >&2
+      return 1
+    fi
   }
 
   record() {
@@ -94,7 +126,7 @@ run_organism() {
       {
         at: $at,
         runId: $runId,
-        dayIndex: ($dayIndex | tonumber? // 0),
+        dayIndex: ($dayIndex | tonumber),
         label: $label,
         sampleKind: $sampleKind,
         note: (if $note == "" then null else $note end),
@@ -113,11 +145,11 @@ run_organism() {
 
   for scenario in provider_brittle stale_phone resource_tight approval_closed; do
     body="$(jq -n --arg scenario "$scenario" '{scenario:$scenario, ttlSeconds:45}')"
-    debug_json "$body" >/dev/null
+    debug_json "$body" "active"
     state_json | record "scenario:$scenario"
   done
 
-  debug_json '{"action":"clear"}' >/dev/null
+  debug_json '{"action":"clear"}' "cleared"
   state_json | record "cleared"
 
   echo "wrote $OUT"
@@ -157,7 +189,7 @@ run_cognition() {
       schema: "cognition.event-driven.eval.v1",
       at: $at,
       runId: $runId,
-      dayIndex: ($dayIndex | tonumber? // 0),
+      dayIndex: ($dayIndex | tonumber),
       note: (if $note == "" then null else $note end),
       processCpuPercent: ($cpu | tonumber?),
       appUptimeSeconds: $state.uptimeSeconds,

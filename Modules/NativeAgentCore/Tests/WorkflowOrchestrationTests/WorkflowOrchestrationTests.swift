@@ -626,6 +626,123 @@ private func firstTrace(_ root: URL) throws -> JSONValue {
     #expect(arrayField(run, "rollbackReceipts")?.isEmpty == true)
 }
 
+@Test func mountedRunControlsPersistReloadTruthAndRefuseStaleTransitions() async throws {
+    let root = tempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    // The mounted UI and the owner use this exact projection. A waiting run
+    // cannot advertise Resume until its authoritative ApprovalInbox decision
+    // exists, while a running run can be canceled and a terminal run cannot.
+    let pending = WorkflowRunControlPreflight.evaluate(status: "waiting_approval")
+    #expect(!pending.resume.isEligible)
+    #expect(pending.resume.detail.contains("approval decision"))
+    #expect(pending.cancel.isEligible)
+    #expect(!pending.rollback.isEligible)
+    let approved = WorkflowRunControlPreflight.evaluate(
+        status: "waiting_approval", approvalDecision: "approved"
+    )
+    #expect(approved.resume.isEligible)
+    let unsupported = WorkflowExecutionPreflight.evaluate(status: "active", stepKinds: ["llm"])
+    #expect(!unsupported.isRunnable)
+    #expect(unsupported.detail.contains("unsupported step kinds: llm"))
+
+    // Resume refusal does not mutate a pending state; once the real inbox is
+    // approved, resume executes the real trace step and survives a new client
+    // reading its run ledger.
+    try writeRegistry(root, [
+        .object([
+            "id": .string("resume-flow"),
+            "name": .string("Resume Flow"),
+            "status": .string("active"),
+            "engineVersion": .string("2"),
+            "steps": .array([
+                .object(["id": .string("trace"), "kind": .string("trace"), "requiresApproval": .bool(true)]),
+            ]),
+        ]),
+        .object([
+            "id": .string("unsupported-flow"),
+            "name": .string("Unsupported Flow"),
+            "status": .string("active"),
+            "engineVersion": .string("2"),
+            "steps": .array([.object(["id": .string("draft"), "kind": .string("llm")])]),
+        ]),
+    ])
+    let client = SwiftNativeWorkflowOrchestrationClient(
+        root: root,
+        now: { "2026-08-24T12:00:00Z" },
+        uuid: makeIDFactory(["resume-run"]),
+        useFileLock: true
+    )
+    await #expect(throws: WorkflowOrchestrationError.self) {
+        _ = try await client.runWorkflow(
+            id: "unsupported-flow", objective: "must refuse before run state", execute: true, engineVersion: nil, variables: nil
+        )
+    }
+    let rejectedRunRows = try await client.listWorkflowRuns()
+    #expect(rejectedRunRows.isEmpty)
+    let waiting = try await client.runWorkflow(
+        id: "resume-flow", objective: "resume after approval", execute: true, engineVersion: nil, variables: nil
+    )
+    #expect(stringField(waiting, "status") == "waiting_approval")
+    await #expect(throws: WorkflowOrchestrationError.self) {
+        _ = try await client.resumeWorkflowRun(id: "resume-run")
+    }
+    let waitingState = try JSONValue.parse(Data(contentsOf: root.appendingPathComponent("workflows/run_state/resume-run.json")))
+    #expect(stringField(waitingState, "status") == "waiting_approval")
+    let approvalID = try #require(stringField(waiting, "approvalId"))
+    _ = try await SwiftNativeApprovalInbox(root: root).resolve(approvalID, decision: .approved, decidedBy: "eval")
+    let resumed = try await client.resumeWorkflowRun(id: "resume-run")
+    #expect(stringField(resumed, "status") == "succeeded")
+    let reloadedAfterResume = SwiftNativeWorkflowOrchestrationClient(root: root, useFileLock: true)
+    let resumeRows = try await reloadedAfterResume.listWorkflowRuns()
+    #expect(resumeRows.first(where: { stringField($0, "id") == "resume-run" }).flatMap { stringField($0, "status") } == "succeeded")
+
+    // Cancel writes both canonical state and the list's durable JSONL outcome.
+    // A stale second control call is refused under the same run-state lock and
+    // cannot overwrite the terminal status or append a phantom outcome.
+    try writeRunState(root, runId: "cancel-run", .object([
+        "id": .string("cancel-run"), "workflowId": .string("resume-flow"),
+        "status": .string("running"), "steps": .array([]),
+    ]))
+    let canceled = try await client.cancelWorkflowRun(id: "cancel-run")
+    #expect(stringField(canceled, "status") == "canceled")
+    let reloadedAfterCancel = SwiftNativeWorkflowOrchestrationClient(root: root, useFileLock: true)
+    let cancelRows = (try await reloadedAfterCancel.listWorkflowRuns())
+        .filter { stringField($0, "id") == "cancel-run" }
+    #expect(cancelRows.count == 1)
+    #expect(stringField(cancelRows[0], "status") == "canceled")
+    await #expect(throws: WorkflowOrchestrationError.self) {
+        _ = try await client.cancelWorkflowRun(id: "cancel-run")
+    }
+    #expect(stringField(try JSONValue.parse(Data(contentsOf: root.appendingPathComponent("workflows/run_state/cancel-run.json"))), "status") == "canceled")
+    let cancelRowsAfterRefusal = (try await reloadedAfterCancel.listWorkflowRuns())
+        .filter { stringField($0, "id") == "cancel-run" }
+    #expect(cancelRowsAfterRefusal.count == 1)
+
+    // Rollback records actual compensation receipts and is likewise visible to
+    // a fresh list reader. A second rollback is a conflict/refusal, never a
+    // fresh set of duplicate compensation receipts.
+    try writeRunState(root, runId: "rollback-run", .object([
+        "id": .string("rollback-run"), "workflowId": .string("resume-flow"),
+        "status": .string("succeeded"),
+        "steps": .array([.object(["id": .string("written"), "status": .string("succeeded")])]),
+    ]))
+    let rolledBack = try await client.rollbackWorkflowRun(id: "rollback-run")
+    #expect(stringField(rolledBack, "status") == "rolled_back")
+    #expect(arrayField(rolledBack, "rollbackReceipts")?.count == 1)
+    let reloadedAfterRollback = SwiftNativeWorkflowOrchestrationClient(root: root, useFileLock: true)
+    let rollbackRows = (try await reloadedAfterRollback.listWorkflowRuns())
+        .filter { stringField($0, "id") == "rollback-run" }
+    #expect(rollbackRows.count == 1)
+    #expect(stringField(rollbackRows[0], "status") == "rolled_back")
+    await #expect(throws: WorkflowOrchestrationError.self) {
+        _ = try await client.rollbackWorkflowRun(id: "rollback-run")
+    }
+    let rollbackRowsAfterRefusal = (try await reloadedAfterRollback.listWorkflowRuns())
+        .filter { stringField($0, "id") == "rollback-run" }
+    #expect(rollbackRowsAfterRefusal.count == 1)
+}
+
 // MARK: - publicRun engineVersion fallback
 
 @Test func publicRunEngineVersionFallsBackToTwo() {
@@ -1183,14 +1300,23 @@ private func makeIDFactory(_ ids: [String]) -> @Sendable () -> String {
     let sameProcessRuns = try await sameProcessReader.listWorkflowRuns()
     #expect(sameProcessRuns.isEmpty)
 
+    // Recovery is intentionally age-gated so a second process cannot seize a
+    // merely slow in-flight dispatch. Model an actual stale crash artifact.
+    let runState = root.appendingPathComponent("workflows/run_state/crash-run.json")
+    try FileManager.default.setAttributes(
+        [.modificationDate: Date(timeIntervalSinceNow: -2 * 60 * 60)],
+        ofItemAtPath: runState.path
+    )
+
     let restarted = SwiftNativeWorkflowOrchestrationClient(
         root: root, now: { "2026-08-16T00:01:00Z" }, useFileLock: false,
         processIdentity: "restarted-process"
     )
     let firstList = try await restarted.listWorkflowRuns()
     #expect(firstList.count == 1)
-    #expect(stringField(firstList[0], "status") == "blocked")
-    #expect(stringField(firstList[0], "blockedReason") == "interrupted_after_step_dispatch")
+    let recovered = try #require(firstList.first)
+    #expect(stringField(recovered, "status") == "blocked")
+    #expect(stringField(recovered, "blockedReason") == "interrupted_after_step_dispatch")
     let secondList = try await restarted.listWorkflowRuns()
     #expect(secondList.count == 1)
     let resumed = try await restarted.resumeWorkflowRun(id: "crash-run")

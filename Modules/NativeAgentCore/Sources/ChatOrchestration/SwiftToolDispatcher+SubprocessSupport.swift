@@ -38,22 +38,26 @@ extension SwiftToolDispatcher {
         onTimeout: (@Sendable () -> Void)? = nil
     ) {
         let childPid = process.processIdentifier
-        _ = setpgid(childPid, childPid)
+        ProcessTreeReaper.ensureChildLeadsOwnProcessGroup(childPid)
+        let launchedTree = ProcessTreeReaper.snapshot(rootPID: childPid)
 
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .seconds(timeoutSeconds)) {
-            if process.isRunning {
+            let timeoutTree = ProcessTreeReaper.snapshot(rootPID: childPid, retaining: launchedTree)
+            if process.isRunning || ProcessTreeReaper.hasLiveDescendant(in: timeoutTree) {
                 // Mark BEFORE killing so the terminationHandler can tell a
                 // watchdog timeout (exit 143/SIGTERM) apart from a crash or an
                 // external kill — Agent hit exactly this ambiguity (2026-06-09).
                 onTimeout?()
-                if killpg(childPid, SIGTERM) != 0 {
-                    process.terminate()
-                }
+                ProcessTreeReaper.signal(timeoutTree, signal: SIGTERM)
                 DispatchQueue.global().asyncAfter(deadline: .now() + .seconds(2)) {
-                    if process.isRunning {
-                        if killpg(childPid, SIGKILL) != 0 {
-                            kill(childPid, SIGKILL)
-                        }
+                    // Re-scan even if the direct child already exited: a
+                    // background descendant may have escaped the group and
+                    // inherited its pipe descriptors.
+                    let survivorTree = ProcessTreeReaper.snapshot(
+                        rootPID: childPid, retaining: timeoutTree
+                    )
+                    if process.isRunning || ProcessTreeReaper.hasLiveDescendant(in: survivorTree) {
+                        ProcessTreeReaper.quiesceAndKill(survivorTree)
                     }
                 }
             }

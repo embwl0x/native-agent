@@ -70,6 +70,8 @@ public enum MemoryCandidateQuality {
             "feeling:",
             "voice:",
             "- body:",
+            "settling:",
+            "- settling:",
             "conversation focus:",
             "conversationfocus:",
             "current focus:",

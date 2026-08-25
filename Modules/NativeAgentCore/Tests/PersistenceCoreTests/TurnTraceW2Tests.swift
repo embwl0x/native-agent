@@ -133,6 +133,25 @@ struct TurnTraceW2Tests {
         #expect(r == env)
     }
 
+    @Test("turn-trace env override honors the exact name, empty-as-unset, and literal tilde")
+    func envRootOverrideIsAnExactHermeticEscapeHatch() throws {
+        let path = "/tmp/nativeagent-trace-env-root"
+        let resolved = try #require(TurnTracePersistLane.envRootOverride([
+            "NATIVE_AGENT_TURN_TRACE_ROOT": path,
+        ]))
+        #expect(resolved.path == path)
+        #expect(TurnTracePersistLane.envRootOverride([
+            "NATIVE_AGENT_TRACE_ROOT": path,
+        ]) == nil, "a near-miss name must not silently redirect traces")
+        #expect(TurnTracePersistLane.envRootOverride([
+            "NATIVE_AGENT_TURN_TRACE_ROOT": "",
+        ]) == nil)
+        let literalTilde = try #require(TurnTracePersistLane.envRootOverride([
+            "NATIVE_AGENT_TURN_TRACE_ROOT": "~/never-expand-this",
+        ]))
+        #expect(literalTilde.path == "~/never-expand-this")
+    }
+
     @Test func resolveRoot_instance_outranks_static_and_default() {
         // A directly-constructed hermetic lane with an explicit instance
         // override must keep ITS root even if the process static is set — so a

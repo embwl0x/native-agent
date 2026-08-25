@@ -253,6 +253,8 @@ public actor SwiftNativeContextClient: ContextClient {
     /// Injectable for the test that mints `<uuid>` so it is deterministic; the
     /// production envelope `id` is a fresh UUID per call (Python `uuid.uuid4()`).
     private let makeEventID: @Sendable () -> String
+    private var lastLegacyReceiptPruneAt: Date?
+    private let legacyReceiptPruneInterval: TimeInterval = 24 * 3_600
 
     public init(
         now: @escaping @Sendable () -> Date = { Date() },
@@ -267,13 +269,6 @@ public actor SwiftNativeContextClient: ContextClient {
     }
 
     // MARK: - Path helpers
-
-    /// `<root>/context/<runId>.json`.
-    private func contextReceiptPath(_ runID: String) -> URL {
-        dataRoot
-            .appendingPathComponent("context", isDirectory: true)
-            .appendingPathComponent("\(runID).json")
-    }
 
     /// `<root>/chat/messages/<safeSessionId>.jsonl`.
     private func chatMessagesPath(_ sessionID: String) -> URL {
@@ -374,6 +369,7 @@ public actor SwiftNativeContextClient: ContextClient {
     // MARK: - GET /v1/context/latest
 
     public func latestContextReceipt(sessionId: String) async -> JSONValue? {
+        await pruneLegacyReceiptFeedIfDue()
         // get_chat_messages(session_id, limit=80): returns [] if the session is
         // unknown, else tail_jsonl(path, 80, max_bytes=1MB). We approximate the
         // session-existence guard by checking sessions.json; an unknown session
@@ -396,8 +392,7 @@ public actor SwiftNativeContextClient: ContextClient {
             // run_id = str(message.get("runId") or "")  — Python-truthy coerce.
             let runID = Self.coercedString(m["runId"]) ?? ""
             if runID.isEmpty { continue }
-            let path = contextReceiptPath(runID)
-            if let receipt = await readReceiptObject(path) {
+            if let receipt = await readReceiptObject(expectedRunID: runID) {
                 return receipt  // .object(...) byte-equal to Python's read_json
             }
         }
@@ -412,8 +407,7 @@ public actor SwiftNativeContextClient: ContextClient {
             .flatMap { Self.coercedString($0["startupContextRunId"]) } ?? ""
         let hadStartupRunID = !startupRunID.isEmpty
         if hadStartupRunID {
-            let path = contextReceiptPath(startupRunID)
-            if var receipt = await readReceiptObjectDict(path) {
+            if var receipt = await readReceiptObjectDict(expectedRunID: startupRunID) {
                 receipt["startupContext"] = .bool(true)  // receipt["startupContext"] = True
                 return .object(receipt)
             }
@@ -484,18 +478,87 @@ public actor SwiftNativeContextClient: ContextClient {
     ///     2. passing `defaultValue: .object([:])` so a present-but-malformed
     ///        file yields `{}` exactly as `read_json(path, {})` does → byte-equal
     ///        to Python's `return {}` / `{"startupContext": true}`.
-    private func readReceiptObject(_ path: URL) async -> JSONValue? {
-        guard FileManager.default.fileExists(atPath: path.path) else { return nil }
-        let value = await store.readJSON(path, defaultValue: .object([:]))
-        if case .object = value { return value }
-        return nil
+    private func readReceiptObject(expectedRunID: String) async -> JSONValue? {
+        switch LegacyContextReceiptFeed.read(dataRoot: dataRoot, runID: expectedRunID) {
+        case .missing, .nonObject:
+            return nil
+        case .invalidRunID, .malformed, .runIDMismatch:
+            // A present corrupted/mismatched file is an adverse terminal state
+            // for this run ID. Do not walk backward and relabel an older receipt
+            // as the latest context.
+            return .object([:])
+        case .receipt(let value):
+            return value
+        }
     }
 
-    private func readReceiptObjectDict(_ path: URL) async -> [String: JSONValue]? {
-        guard FileManager.default.fileExists(atPath: path.path) else { return nil }
-        let value = await store.readJSON(path, defaultValue: .object([:]))
-        if case .object(let o) = value { return o }
-        return nil
+    private func readReceiptObjectDict(expectedRunID: String) async -> [String: JSONValue]? {
+        switch LegacyContextReceiptFeed.read(dataRoot: dataRoot, runID: expectedRunID) {
+        case .missing, .nonObject:
+            return nil
+        case .malformed:
+            // Preserve the daemon's present-but-malformed compatibility result:
+            // the caller adds startupContext=true to an empty object.
+            return [:]
+        case .invalidRunID, .runIDMismatch:
+            // This is not a valid startup receipt for the requested run. In
+            // particular, do not manufacture a startupContext=true claim.
+            return nil
+        case .receipt(.object(let value)):
+            return value
+        case .receipt:
+            return nil
+        }
+    }
+
+    /// Bounded maintenance for daemon-written compatibility files. The reader
+    /// discovers every session-referenced run before pruning, so old fossils
+    /// disappear without deleting a receipt that this route could still return.
+    private func pruneLegacyReceiptFeedIfDue() async {
+        let current = now()
+        if let lastLegacyReceiptPruneAt,
+           current.timeIntervalSince(lastLegacyReceiptPruneAt) < legacyReceiptPruneInterval {
+            return
+        }
+        let protected = await protectedLegacyReceiptRunIDs()
+        let report = await LegacyContextReceiptFeed.prune(
+            dataRoot: dataRoot,
+            protectedRunIDs: protected,
+            now: current,
+            persistence: store
+        )
+        if report.unavailable {
+            NSLog("[Context] legacy receipt retention unavailable; leaving compatibility files untouched")
+            return
+        }
+        lastLegacyReceiptPruneAt = current
+    }
+
+    private func protectedLegacyReceiptRunIDs() async -> Set<String> {
+        let sessions = await store.readJSON(chatSessionsPath(), defaultValue: .array([]))
+        guard case .array(let rows) = sessions else { return [] }
+        var protected: Set<String> = []
+        for row in rows {
+            guard case .object(let session) = row else { continue }
+            if let startup = Self.coercedString(session["startupContextRunId"]), !startup.isEmpty {
+                if LegacyContextReceiptFeed.receiptPath(dataRoot: dataRoot, runID: startup) != nil {
+                    protected.insert(startup)
+                }
+            }
+            guard case .string(let sessionID)? = session["id"] else { continue }
+            let messages = (try? await store.tailJSONL(
+                chatMessagesPath(sessionID), limit: 80, maxBytes: 1_048_576
+            )) ?? []
+            for message in messages {
+                guard case .object(let values) = message,
+                      let runID = Self.coercedString(values["runId"]), !runID.isEmpty
+                else { continue }
+                if LegacyContextReceiptFeed.receiptPath(dataRoot: dataRoot, runID: runID) != nil {
+                    protected.insert(runID)
+                }
+            }
+        }
+        return protected
     }
 
     /// Mirror `chat_session_by_id`: scan sessions.json

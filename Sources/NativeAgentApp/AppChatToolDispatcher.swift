@@ -21,6 +21,9 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
     private let securityCenter: SwiftNativeSecurityCenter
     private let mobileNotificationSender: @Sendable (String, String, [String: String]) async throws -> MobileNotificationDeliveryReceipt
     private let macNotificationSender: @Sendable (String, String) async throws -> NativeAgentNotificationPostResult
+    /// Production uses the shared persisted authority; injected dispatchers
+    /// may carry a hermetic real store without replacing the gate itself.
+    private let macIntegrationPermissionStore: MacIntegrationPermissionStore
     private let browserActionRunner: @Sendable (String, Bool, [String: JSONValue]) async throws -> JSONValue
     private let doctorStatusProvider: @Sendable () async throws -> JSONValue
     private let telegramStatusProvider: @Sendable () async throws -> JSONValue
@@ -61,6 +64,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         macNotificationSender: @escaping @Sendable (String, String) async throws -> NativeAgentNotificationPostResult = { title, body in
             await NativeAgentNotifications.postAndReport(title: title, body: body)
         },
+        macIntegrationPermissionStore: MacIntegrationPermissionStore = .shared,
         browserActionRunner: (@Sendable (String, Bool, [String: JSONValue]) async throws -> JSONValue)? = nil,
         doctorStatusProvider: (@Sendable () async throws -> JSONValue)? = nil,
         telegramStatusProvider: (@Sendable () async throws -> JSONValue)? = nil,
@@ -95,6 +99,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         self.includeAppOwnedTools = includeAppOwnedTools
         self.mobileNotificationSender = mobileNotificationSender
         self.macNotificationSender = macNotificationSender
+        self.macIntegrationPermissionStore = macIntegrationPermissionStore
         self.browserActionRunner = browserActionRunner ?? Self.defaultBrowserActionRunner
         self.doctorStatusProvider = doctorStatusProvider ?? Self.defaultDoctorStatusProvider
         self.telegramStatusProvider = telegramStatusProvider ?? Self.defaultTelegramStatusProvider
@@ -288,13 +293,13 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             // gpt-5.5 review BLOCKING: this path bypasses the Core dispatcher's
             // MacIntegration gate. Check the gate here so the user's "iPhone
             // Notifications" Write toggle actually denies the call.
-            let allowed = await MacIntegrationPermissionStore.shared.allows(MacIntegrationID.notifyMobile, mode: .write)
+            let allowed = await macIntegrationPermissionStore.allows(MacIntegrationID.notifyMobile, mode: .write)
             guard allowed else {
                 return Self.macIntegrationDeniedEnvelope(integration: MacIntegrationID.notifyMobile, mode: "write")
             }
             return try await runMobileNotify(input: input, surface: surface)
         case "mac.notify":
-            let allowed = await MacIntegrationPermissionStore.shared.allows(MacIntegrationID.notifyMac, mode: .write)
+            let allowed = await macIntegrationPermissionStore.allows(MacIntegrationID.notifyMac, mode: .write)
             guard allowed else {
                 return Self.macIntegrationDeniedEnvelope(integration: MacIntegrationID.notifyMac, mode: "write")
             }
@@ -836,6 +841,23 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
     private static let organismToolNames = ["reflex_review"]
     private static var appToolNames: [String] {
         notificationToolNames + browserToolNames + healthToolNames + organismToolNames
+    }
+
+    /// App-owned dispatch cases participate in the same typed catalog
+    /// contract as the core dispatcher. Keep this adjacent to the actual
+    /// dispatch registration lists so a newly registered app tool has to pick
+    /// a visible category before the catalog coverage eval can pass.
+    static var catalogRegisteredToolNames: Set<String> {
+        Set(appToolNames)
+    }
+
+    static func catalogBucket(forRegisteredToolNamed name: String) -> ChatToolCatalogBucket? {
+        guard catalogRegisteredToolNames.contains(name) else { return nil }
+        if notificationToolNames.contains(name) { return .macIntegration }
+        if browserToolNames.contains(name) { return .browser }
+        if healthToolNames.contains(name) { return .system }
+        if organismToolNames.contains(name) { return .core }
+        return nil
     }
 
     /// Same envelope shape the Core dispatcher's MacIntegration permission
@@ -1507,6 +1529,10 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             "description": .string(schema.description),
             "dispatchable_via": .string("nativeagent_app_tool_dispatcher"),
             "category": .string(category),
+            "catalog_bucket": .string(
+                catalogBucket(forRegisteredToolNamed: schema.name)?.rawValue
+                    ?? ChatToolCatalogBucket.unclassified.rawValue
+            ),
             "provider_alias": .string(providerAlias(for: schema.name)),
         ]
         if let params = try? JSONValue.parse(schema.parametersJSON) {

@@ -20,13 +20,20 @@ import OSLog
 import BackgroundTasks
 #endif
 
-private final class WakeResetThrottle: @unchecked Sendable {
+final class WakeResetThrottle: @unchecked Sendable {
     private let lock = NSLock()
     private var lastFire: Date = .distantPast
 
     func shouldFire(now: Date = Date(), minimumInterval: TimeInterval = 30) -> Bool {
         lock.lock()
         defer { lock.unlock() }
+        // Wall-clock corrections can move backwards. Treat that as a new
+        // epoch instead of permanently throttling sleep recovery until the
+        // clock catches up with a timestamp that no longer exists.
+        if now < lastFire {
+            lastFire = now
+            return true
+        }
         guard now.timeIntervalSince(lastFire) >= minimumInterval else { return false }
         lastFire = now
         return true
@@ -38,11 +45,42 @@ private final class NativeAgentHotkeyBootstrap {
     static let shared = NativeAgentHotkeyBootstrap()
 
     private let voice = VoiceInputController()
+    private var voiceTurn: GlobalHotkeyVoiceTurn?
     private var wakeObserverToken: NSObjectProtocol?
 
     func start(appModel: AppModel) {
         let hotkeyManager = GlobalHotkeyManager.shared
         let voice = self.voice
+        let voiceTurn: GlobalHotkeyVoiceTurn
+        if let existing = self.voiceTurn {
+            voiceTurn = existing
+        } else {
+            voiceTurn = GlobalHotkeyVoiceTurn(
+                requestPermission: { await voice.requestPermission() },
+                permissionFailureMessage: { voice.errorMessage },
+                isVoiceHoldCurrent: { hotkeyManager.isVoiceHoldCurrent() },
+                beginCapture: {
+                    voice.startListening()
+                    return voice.isListening
+                        ? nil
+                        : (voice.errorMessage ?? "Voice capture could not start.")
+                },
+                stopCapture: { await voice.stopListening() },
+                captureFailureMessage: { voice.errorMessage },
+                submitTurn: { transcript in
+                    await appModel.sendChat(transcript)
+                },
+                reportUnavailable: { message in
+                    appModel.statusText = "Voice input unavailable: \(message)"
+                    NativeAgentNotifications.post(title: "Voice input unavailable", body: message)
+                },
+                reportRejectedTurn: { message in
+                    appModel.statusText = "Voice message was not sent: \(message)"
+                    NativeAgentNotifications.post(title: "Voice message was not sent", body: message)
+                }
+            )
+            self.voiceTurn = voiceTurn
+        }
         hotkeyManager.onOpenWindow = {
             Task { @MainActor in
                 SpotlightOverlay.shared.toggle()
@@ -50,24 +88,12 @@ private final class NativeAgentHotkeyBootstrap {
         }
         hotkeyManager.onVoiceStart = {
             Task { @MainActor in
-                let granted = await voice.requestPermission()
-                guard granted else {
-                    NativeAgentNotifications.post(
-                        title: "Voice input unavailable",
-                        body: voice.errorMessage ?? "Microphone or speech recognition permission was denied."
-                    )
-                    return
-                }
-                guard hotkeyManager.isVoiceHoldCurrent() else { return }
-                voice.startListening()
+                _ = await voiceTurn.beginVoiceTurn()
             }
         }
         hotkeyManager.onVoiceEnd = {
             Task { @MainActor in
-                let transcript = await voice.stopListening()
-                let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmed.isEmpty else { return }
-                await appModel.sendChat(trimmed)
+                _ = await voiceTurn.endVoiceTurn()
             }
         }
 

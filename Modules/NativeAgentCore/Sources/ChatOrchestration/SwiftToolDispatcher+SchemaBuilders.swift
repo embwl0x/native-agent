@@ -2067,6 +2067,7 @@ extension SwiftToolDispatcher {
                         ("handle", strSchema("The item's stable handle.")),
                         ("outcome_summary", strSchema("What the outcome was.")),
                         ("canceled", boolSchema("Close as canceled instead of done. Default false.")),
+                        ("expected_updated_at", strSchema("Optional row version from a just-read Desk projection. When supplied, refuses if the item changed before this close.")),
                     ],
                     required: ["handle", "outcome_summary"]
                 )
@@ -2468,7 +2469,7 @@ extension SwiftToolDispatcher {
                 // approval on mac_click / mac_keystroke.
                 requestedSchema(
                     name: "mac_nudge",
-                    description: "Post a single bare mouse MOVE (one point) to wake a sleeping display or dismiss a screensaver — the software equivalent of bumping the mouse. It moves the cursor and does nothing else: it cannot click, type, scroll, drag or unlock, and on a locked Mac it only brings up the login field. Takes no arguments. Available only when Trust Center Full Mac is active with the Accessibility category enabled; to actually click or type, use mac_click / mac_keystroke.",
+                    description: "Post a single bare mouse MOVE (one point) to wake a sleeping display or dismiss a screensaver — the software equivalent of bumping the mouse. It moves the cursor and does nothing else: it cannot click, type, scroll, drag, or authenticate. Takes no arguments. Available only when Trust Center Full Mac is active with the Accessibility category enabled; to actually click or type, use mac_click / mac_keystroke.",
                     parametersJSON: params(properties: [], required: [])
                 ),
                 requestedSchema(
@@ -2516,6 +2517,49 @@ extension SwiftToolDispatcher {
                             ("max_image_bytes", intSchema("Maximum encoded PNG size. The image is downscaled to fit; clamped to the view's own cap. Omit for the default.")),
                             ("max_nodes", intSchema("Maximum number of AX nodes to consider when choosing marks. Clamped to the reader's own cap.")),
                             ("max_depth", intSchema("Maximum AX tree depth to descend. Clamped to the reader's own cap.")),
+                        ],
+                        required: []
+                    )
+                ),
+                // native-look item 2 — THE PERCEPTION COMPILER. The description
+                // teaches the GRADE, because the whole saving is in her picking
+                // the cheapest one that answers the question: a glance is one
+                // line, a look is the addressable controls, a stare is the tree
+                // she almost never needs.
+                requestedSchema(
+                    name: "screen",
+                    description: "Look at the live screen, right now, in words. One structured page: SCREEN (which app and window, whether it is front), WHERE (your position in the app's own navigation), the dominant content as a numbered LIST/GRID (the numbers are addresses — say 'row 3' to point at one) or CANVAS when part of the screen is not controls, DO (everything you can act on, with its state inline), SAYS (status text worth knowing). Nothing to hold and nothing expires: look again by calling again. Pass `part` to lean in — the same shape scoped to the section or thing you name ('the list', 'the toolbar', 'the Send button').",
+                    parametersJSON: params(
+                        properties: [
+                            ("part", strSchema("Optional: a section or thing to zoom into, by name.")),
+                        ],
+                        required: []
+                    )
+                ),
+                requestedSchema(
+                    name: "wait",
+                    description: "Watch the screen until it settles or until something you name appears — like watching a page load. Bounded (default 10s, max 60s); returns early when the screen stops changing or when `until` text shows up, and says honestly when it timed out with the screen still moving. Answers with what happened and the final screen.",
+                    parametersJSON: params(
+                        properties: [
+                            ("until", strSchema("Optional: return as soon as this text appears on screen (case-insensitive).")),
+                            ("seconds", intSchema("Optional: how long to watch. Default 10, max 60.")),
+                        ],
+                        required: []
+                    )
+                ),
+                requestedSchema(
+                    name: "mac_look",
+                    description: "LOOK at the frontmost window — the app reads the on-screen accessibility structure and hands you the distilled answer instead of a tree you have to parse. Three grades: `glance` is ONE line (app, window title, how many controls, where the focus is, whether a sheet or dialog is up, the first few buttons); `look` is the structured percept — the window, the focused element, any modal, the landmarks (toolbar, sidebar, table, list, web area) and every LABELED interactive control with a stable `handle`, its role, value and real element path; `stare` is the full raw AX tree, the same payload mac_ax_tree returns, and you should rarely need it. Prefer `glance` to orient and `look` to act: a look costs roughly a tenth to a seventieth of a stare. Controls the app publishes no name for are never hidden — they are counted by role under `unlabeled`. Handles are valid only for the returned `frame_id`; if the screen may have changed, look again. Read-only perception: it clicks nothing, types nothing and changes nothing. Requires the macOS Accessibility system grant; available only when Trust Center Full Mac is active with the Accessibility category enabled.",
+                    parametersJSON: params(
+                        properties: [
+                            ("grade", enumStringSchema(["glance", "look", "stare"], "How hard to look. Defaults to look.")),
+                            ("max_affordances", intSchema("Maximum labeled interactive controls to return. Clamped to the compiler's own cap (60); omit for the default.")),
+                            ("max_nodes", intSchema("Maximum number of AX nodes to walk. Clamped to the reader's own cap.")),
+                            ("max_depth", intSchema("Maximum AX tree depth to descend. Clamped to the reader's own cap.")),
+                            ("scope", enumStringSchema(
+                                ["page", "chrome", "both"],
+                                "For a browser or Electron window: `page` (the default) spends the whole walk on the web page and collapses the browser's own toolbar and bookmarks bar to one summary line; `chrome` looks at the browser's controls instead; `both` walks the whole window in one pass, where the page competes with the chrome for the node budget. Ignored for a window with no web area — the result always says which scope it used."
+                            )),
                         ],
                         required: []
                     )
@@ -2589,6 +2633,34 @@ extension SwiftToolDispatcher {
             }
             schemas.append(contentsOf: [
                 requestedSchema(
+                    name: "act",
+                    description: "Do something naturally, by NAME or visible ordinal, against a fresh fused screen. Semantic actions: click/open/type/select/toggle/scroll/dismiss. Physical actions: hover, move, drag (give `to`), hold, or key (target may be a bounded key/chord sequence such as `w`, `cmd+s`, or `1 2 3`; `hold` can target `key w`). Prominent unlabeled pixel objects appear in the same screen as numbered visual regions; they accept literal physical actions without being misrepresented as semantic controls. Use `repeat` for a short continuous burst: the target is freshly seen and re-resolved before every attempt, so moving visual targets are followed instead of reusing an old point. Use `holding` to keep one or more keys/modifiers down around a physical move, drag, click, scroll, or key action (for example hold `w d` while dragging a world view). Accessibility targets use the app's own action; coordinated or pixel-only actions use the bounded physical hand. Every result includes the fresh screen and counts which attempts had visible proof. Ambiguity or a vanished target stops the burst and touches nothing further. Needs active Full Mac Accessibility app control; there is no per-call approval.",
+                    parametersJSON: params(
+                        properties: [
+                            ("verb", enumStringSchema(["click", "open", "type", "select", "toggle", "scroll", "dismiss", "hover", "move", "drag", "hold", "key"], "What to do.")),
+                            ("target", strSchema("The thing, by name as the screen shows it — a label, a partial label, an ordinal like 'row 3', or a numbered unlabeled target like 'visual region 2'.")),
+                            ("text", strSchema("For `type`: the text to put in the target.")),
+                            ("direction", enumStringSchema(["up", "down"], "For `scroll`: which way to move.")),
+                            ("to", strSchema("For `drag`: the named/numbered destination.")),
+                            ("seconds", numSchema("For `hover` or `hold`: bounded duration, at most 10 seconds.")),
+                            ("repeat", intSchema("Optional bounded burst count, 1-12. The target is freshly re-resolved before every attempt; total requested hold/dwell time is capped at 30 seconds.")),
+                            ("interval", numSchema("Optional pause between repeated attempts, 0-2 seconds.")),
+                            ("holding", strSchema("Optional keys/modifiers to keep physically down around a physical action, space-separated, such as `w d`, `shift`, or `cmd+w`. Not valid with `hold` or literal `type`.")),
+                        ],
+                        required: ["verb", "target"]
+                    )
+                ),
+                requestedSchema(
+                    name: "go",
+                    description: "Get to an app, file, folder, or http/https URL through the canonical Mac-control owner, then read the fresh screen. App activation is independently verified; file/URL opening is reported only as an accepted request unless the screen proves where it landed. Needs active Full Mac Accessibility app control; there is no per-call approval.",
+                    parametersJSON: params(
+                        properties: [
+                            ("name", strSchema("An app name, a file/folder path (~ allowed), or an http/https URL.")),
+                        ],
+                        required: ["name"]
+                    )
+                ),
+                requestedSchema(
                     name: "mac_keystroke",
                     description: "Type text and/or press key combinations on this Mac, exactly as if typed on the physical keyboard. The input goes to WHATEVER APP IS FRONTMOST — focus the intended app first. `text` is typed literally (any Unicode, any layout); `keys` is a space-separated sequence of chords using cmd/shift/opt/ctrl/fn plus a key, for example \"cmd+s\", \"cmd+shift+4\", \"return\", \"cmd+a cmd+c\". At least one of text/keys is required; text is typed before keys. This requires approval and an active Full Mac window with the Accessibility category on.",
                     parametersJSON: params(
@@ -2640,7 +2712,7 @@ extension SwiftToolDispatcher {
                 ),
                 requestedSchema(
                     name: "mac_ax_act",
-                    description: "Act on ONE UI element of the frontmost window, addressed either by a `mark` number from the latest mac_view (pass `view` too) or by the `path` that mac_ax_tree or mac_ax_find returned for it. By default it presses the element (AXPress), which runs the app's own handler — more reliable than clicking a coordinate, and it works even when the element is partly covered. Pass `value` instead to set a text field's contents directly. If the element exposes no usable accessibility action, this falls back to a synthesized click at the element's centre and says so in the result's `method` field. The result carries a re-read `post_state` so you can check whether the UI actually changed. This requires approval and an active Full Mac window with the Accessibility category on.",
+                    description: "Act on ONE UI element of the frontmost window, addressed either by a `mark` number from the latest mac_view (pass `view` too) or by the `path` that mac_ax_tree or mac_ax_find returned for it. By default it presses the element (AXPress), which runs the app's own handler — more reliable than clicking a coordinate, and it works even when the element is partly covered. Pass `value` instead to set a text field's contents directly. If the element exposes no usable accessibility action, this falls back to a synthesized click at the element's centre and says so in the result's `method` field. The result carries a re-read `post_state` so you can check whether the UI actually changed. Needs Trust Center Full Mac with the Accessibility category on and the macOS Accessibility grant; there is no per-call approval.",
                     parametersJSON: params(
                         properties: [
                             ("path", intArraySchema("Child-index path from mac_ax_tree / mac_ax_find. [] is the window itself.")),
@@ -2654,9 +2726,32 @@ extension SwiftToolDispatcher {
                         required: []
                     )
                 ),
+                // native-look item 3 — THE CLOSED LOOP. One call replaces the
+                // look→click→look triple: it acts on a handle and returns what
+                // changed, so the model never spends a turn finding out.
+                requestedSchema(
+                    name: "mac_act",
+                    description: "ACT on one control you saw in a mac_look, and get back WHAT CHANGED in the same call — you never need to look again to find out whether it landed. Pass the `handle` of a control from the latest look plus that look's `frame_id`, and a `verb`: `click` presses it the app's own way (falling back to a real click at its centre when it advertises no action), `open` opens it — a Finder row, a file, a folder — via AXOpen or a synthesized double-click, `type` puts `text` into it (setting the value directly when the control allows it, otherwise focusing it and typing), `select` picks a row/cell/menu item, `toggle` flips a checkbox/radio/switch, `dismiss` closes the sheet or dialog that is up by pressing its own Cancel/Close/Dismiss/Done/OK button, and `scroll` brings the control into view (`direction` up or down). Before acting it watches the app for accessibility change notifications, then re-reads the window and diffs it: the result's `effect` names the notifications that fired, the acted control's before/after label and value, which affordances appeared, disappeared or changed, whether focus moved, whether a modal opened or closed, and whether the window title changed — with `observed:false` when the app published no change at all, which is itself an answer. It also returns a FRESH `frame_id` and a one-line `glance` of the new state, so the next act continues from there; handles from the previous frame are dead. If the control the handle named is no longer what it was, this refuses with `handle_drifted` rather than acting on a different control; it also refuses with `frame_app_gone` when the app you looked at is no longer there, and with `observer_unavailable` when it cannot watch that app for the effect — in every one of those cases NOTHING is acted on. Needs Trust Center Full Mac with the Accessibility category on and the macOS Accessibility grant; there is no per-call approval.",
+                    parametersJSON: params(
+                        properties: [
+                            ("handle", strSchema("Handle of the control, from the latest mac_look's affordances.")),
+                            ("frame_id", strSchema("The frame_id that mac_look returned with that handle. A handle from any earlier frame is refused — take a fresh mac_look instead.")),
+                            ("verb", enumStringSchema(
+                                ["click", "open", "type", "select", "toggle", "dismiss", "scroll"],
+                                "What to do to the control."
+                            )),
+                            ("text", strSchema("For verb=type: the characters to put into the control.")),
+                            ("direction", enumStringSchema(["up", "down"], "For verb=scroll: which way. Defaults to down.")),
+                            ("wait_ms", intSchema("How long to wait for the app to react before reporting no observed effect, 0-2000ms. Defaults to 300, which is ten times the measured latency.")),
+                            ("attention_session", strSchema("Required while mac_attention is active: its current session id.")),
+                            ("attention_user_sequence", intSchema("Required while mac_attention is active: the user_sequence from its latest observed fused view.")),
+                        ],
+                        required: ["handle", "frame_id", "verb"]
+                    )
+                ),
                 requestedSchema(
                     name: "mac_wake",
-                    description: "Wake the screen: if this Mac is showing a screensaver or the display has gone to sleep, nudge it away and hand back a fresh view of the real desktop underneath, in one call. Use it when mac_view shows only the screensaver or the login window and you need to see or act on what is actually there. It posts the smallest possible input — a one-point mouse move that presses nothing and leaves the pointer where it was — and then returns exactly what mac_view returns (`marks`, `text`, the annotated image, and a `view` id you can act on), plus a `wake` block saying whether the screen really came back. If the Mac is PASSWORD-LOCKED it refuses and posts nothing: only the owner can unlock it, and no amount of retrying will change that. Requires approval and an active Full Mac window with the Accessibility category on.",
+                    description: "Wake the screen: if this Mac is showing a screensaver or the display has gone to sleep, nudge it away and hand back a fresh view of the real desktop underneath, in one call. Use it when mac_view shows only the screensaver or the login window and you need to see or act on what is actually there. It posts the smallest possible input — a one-point mouse move plus a bare Shift tap, neither of which can click, type text, or authenticate — and then returns exactly what mac_view returns (`marks`, `text`, the annotated image, and a `view` id you can act on), plus a `wake` block saying whether the screen really came back. If the saver/login layer remains, it reports that observed obstruction without guessing why. Requires approval and an active Full Mac window with the Accessibility category on.",
                     parametersJSON: params(
                         properties: [
                             ("key_tap", boolSchema("Also tap the left shift key, which types nothing but wakes some sleeping displays a mouse move alone does not. Off by default; try it if a first wake reports dismissed:false.")),

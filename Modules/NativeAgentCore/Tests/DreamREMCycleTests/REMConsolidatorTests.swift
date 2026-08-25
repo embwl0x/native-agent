@@ -23,6 +23,16 @@ private let remTestNow: Date = {
     return f.date(from: "2026-05-31")!
 }()
 
+/// The real shared run ledger is a general cross-surface contract, so this
+/// narrow decode intentionally verifies the bytes REM leaves for a reload
+/// rather than inspecting REMConsolidator's in-memory return value.
+private struct REMPersistedRunRow: Decodable {
+    let kind: String
+    let status: String
+    let output: String?
+    let error: String?
+}
+
 /// Write <data>/dream_diary/<date>.md AND backdate its mtime so the
 /// 7-day mtime filter in REMConsolidator picks it up.
 private func writeDreamEntryWithMtime(
@@ -611,6 +621,89 @@ func REMConsolidator_trust_gate_off_refuses_run() async throws {
     } catch DreamREMCycleError.cycleDisabled {
         // expected
     }
+}
+
+@Test
+func REMConsolidator_persists_completed_skipped_and_disabled_run_reports_for_reload() async throws {
+    let (dataRoot, personaRoot) = tempREMRoot()
+    defer { try? FileManager.default.removeItem(at: dataRoot.deletingLastPathComponent()) }
+    try seedREMInputs(dataRoot: dataRoot, personaRoot: personaRoot)
+
+    let llm = MockLLMClient(scriptedResponses: [proposalsJSON(target: "GROWTH.md", proposals: [
+        (
+            text: "Carry steadiness across the week.",
+            dates: ["2026-05-28", "2026-05-29"],
+            conf: 0.8
+        ),
+    ])])
+    let enabled = REMConsolidator(
+        dataRoot: dataRoot,
+        personaRoot: personaRoot,
+        llm: llm,
+        gate: DreamREMGatePolicy(remCycleEnabled: true),
+        clock: { remTestNow }
+    )
+
+    let completedReport = try await enabled.runWeeklyREM()
+    let skippedReport = try await enabled.runWeeklyREM()
+    #expect(completedReport.proposalsGenerated == 1)
+    #expect(skippedReport.proposalsGenerated == 0)
+
+    // A corrupt durable reservation is an execution failure, not an empty
+    // successful week. The failed call must leave an observable row after its
+    // caller has handled the throw.
+    let markerURL = dataRoot
+        .appendingPathComponent("harness", isDirectory: true)
+        .appendingPathComponent("last_weekly_rem_run")
+    try Data("not-a-weekly-timestamp".utf8).write(to: markerURL)
+    do {
+        _ = try await enabled.runWeeklyREM()
+        Issue.record("expected malformed weekly reservation to throw")
+    } catch {
+        // asserted from the durable run ledger below
+    }
+
+    let disabled = REMConsolidator(
+        dataRoot: dataRoot,
+        personaRoot: personaRoot,
+        llm: MockLLMClient(scriptedResponses: []),
+        gate: DreamREMGatePolicy(remCycleEnabled: false),
+        clock: { remTestNow }
+    )
+    do {
+        _ = try await disabled.runWeeklyREM()
+        Issue.record("expected disabled REM run to throw")
+    } catch DreamREMCycleError.cycleDisabled {
+        // The adverse result is deliberately persisted below instead of being
+        // lost with the throwing scheduler/debug caller.
+    }
+
+    let ledgerURL = dataRoot
+        .appendingPathComponent("runs", isDirectory: true)
+        .appendingPathComponent("runs.json")
+    let rows = try JSONDecoder().decode(
+        [REMPersistedRunRow].self,
+        from: Data(contentsOf: ledgerURL)
+    ).filter { $0.kind == "rem_weekly_consolidation" }
+    #expect(rows.map(\.status) == ["disabled", "failed", "skipped", "completed"])
+
+    let payloads = try rows.map { row -> REMRunReportPayload in
+        try JSONDecoder().decode(
+            REMRunReportPayload.self,
+            from: try #require(row.output?.data(using: .utf8))
+        )
+    }
+    #expect(payloads.map(\.schemaVersion) == Array(repeating: REMRunReportPayload.schema, count: 4))
+    #expect(payloads.map(\.outcome) == [.disabled, .failed, .skipped, .completed])
+    #expect(payloads[0].reason == "rem_cycle_disabled")
+    #expect(payloads[0].report == nil)
+    #expect(rows[0].error?.contains("rem_cycle_disabled") == true)
+    #expect(payloads[1].reason == "execution_failed")
+    #expect(payloads[1].report == nil)
+    #expect(rows[1].error?.contains("weekly REM marker is malformed") == true)
+    #expect(payloads[2].reason == "already_ran_within_weekly_window")
+    #expect(payloads[2].report == skippedReport)
+    #expect(payloads[3].report == completedReport)
 }
 
 @Test

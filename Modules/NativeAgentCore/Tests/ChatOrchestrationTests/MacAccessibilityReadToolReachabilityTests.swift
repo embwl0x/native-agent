@@ -62,7 +62,13 @@ private func axFullMacPolicy(accessibilityAllowed: Bool) -> JSONValue {
 // no-approval contract, so every reachability property asserted here must hold
 // for it too. Its own W3.5-specific surface (schema shape, action mapping,
 // mark plumbing) is pinned in MacFusedViewToolReachabilityTests.
-private let axToolNames = ["mac_ax_status", "mac_ax_tree", "mac_ax_find", "mac_view", "mac_attention"]
+// native-look item 2 — mac_look joins for the same reason mac_view did: same
+// category, same read tier, same route, same no-approval contract. Its own
+// grade/handle/frame surface is pinned in MacControlTests/MacPerceptionCompilerTests.
+// four-verbs (2026-08-22): screen and wait join the read tier — perception
+// only, nothing held. They ROUTE to impl_mac_four_verbs_tool (its case
+// precedes the list cases); membership here is loading/visibility.
+private let axToolNames = ["mac_ax_status", "mac_ax_tree", "mac_ax_find", "mac_view", "mac_attention", "mac_look", "screen", "wait"]
 
 // MARK: - Catalog reachability
 
@@ -170,6 +176,8 @@ func macAXReadTools_schemasDeclareTheDocumentedParameters() async throws {
     #expect(Set(tree.keys) == ["max_nodes", "max_depth"])
     let find = try properties("mac_ax_find")
     #expect(Set(find.keys) == ["role", "title", "value", "limit"])
+    let look = try properties("mac_look")
+    #expect(Set(look.keys) == ["grade", "max_affordances", "max_nodes", "max_depth", "scope"])
     let attention = try properties("mac_attention")
     #expect(Set(attention.keys) == [
         "mode", "session", "after_sequence", "wait_ms", "duration_seconds",
@@ -193,6 +201,7 @@ func macAXReadTools_dispatchToTheMatchingMacControlAction() async throws {
         ("mac_ax_status", "ax_status"),
         ("mac_ax_tree", "ax_tree"),
         ("mac_ax_find", "ax_find"),
+        ("mac_look", "look"),
     ] {
         let result = try await tools.dispatch(
             tool: tool,
@@ -249,7 +258,7 @@ func macAXReadTools_resolveToAutoWithNoApprovalTier() async throws {
         Issue.record("expected toolAutonomy object in the default trust policy")
         return
     }
-    for actionId in ["mac.ax_status", "mac.ax_tree", "mac.ax_find", "mac.view", "mac.attention"] {
+    for actionId in ["mac.ax_status", "mac.ax_tree", "mac.ax_find", "mac.view", "mac.attention", "mac.look"] {
         #expect(autonomy[actionId] == .string("auto"),
                 "\(actionId) must carry an explicit auto tier in the Trust Center defaults")
     }
@@ -319,7 +328,7 @@ func macAXReadActions_areInTheBridgeDispatchableSet() {
     // NativeClient+CutoverSeams' HTTP/iOS-remote route 404s any action outside
     // this set. Gating it on macControlAllActions (daemon parity only) is what
     // made ax_* unreachable on the bridge path.
-    for action in ["ax_status", "ax_tree", "ax_find", "view", "attention"] {
+    for action in ["ax_status", "ax_tree", "ax_find", "view", "attention", "look"] {
         #expect(macControlDispatchableActions.contains(action),
                 "\(action) must be in macControlDispatchableActions or the bridge route 404s it")
         #expect(!macControlAllActions.contains(action),
@@ -337,5 +346,25 @@ func macAXReadTools_areRegisteredAsTheirOwnCatalogClass() {
                 "\(tool) must not ride the app-control list")
         #expect(SwiftToolDispatcher.reservedBuiltInNames.contains(tool),
                 "\(tool) must be a reserved built-in so a registry custom tool cannot shadow it")
+    }
+}
+
+// MARK: - Trust Center registry (7-point chain, point 1)
+
+@Test
+func macAXReadActions_haveAConnectorRegistryDescriptor() {
+    // A tool absent from ConnectorActionsRegistry has no Trust Center row, no
+    // risk tier and no schema for the connector surfaces — the first point of
+    // the reachability chain. mac.look shipped without one on 2026-08-22
+    // (caught in Claude's sweep) because nothing pinned it; now something does.
+    let byId = Dictionary(uniqueKeysWithValues: connectorActionDescriptors().map { ($0.id, $0) })
+    for actionId in ["mac.ax_status", "mac.ax_tree", "mac.ax_find", "mac.view", "mac.attention", "mac.look"] {
+        guard let descriptor = byId[actionId] else {
+            Issue.record("\(actionId) must have a ConnectorActionsRegistry descriptor")
+            continue
+        }
+        #expect(descriptor.category == "accessibility", "\(actionId) must sit in the accessibility category")
+        #expect(descriptor.requiresApproval == false, "\(actionId) is read tier and must not require approval")
+        #expect(descriptor.connectorId == "mac")
     }
 }

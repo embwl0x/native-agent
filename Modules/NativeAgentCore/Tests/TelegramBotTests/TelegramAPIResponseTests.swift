@@ -1,6 +1,14 @@
 import Foundation
 import Testing
 @testable import TelegramBot
+import NativeAgentTestSupport
+
+// ConfigurableURLProtocolStub stores its handler per concrete protocol type.
+// These separate types keep the adversarial cases independent when Swift
+// Testing runs this suite concurrently.
+private final class FloodRetryURLProtocol: ConfigurableURLProtocolStub {}
+private final class FloodNon429URLProtocol: ConfigurableURLProtocolStub {}
+private final class FloodSecondFailureURLProtocol: ConfigurableURLProtocolStub {}
 
 @Suite("Telegram API response validation")
 struct TelegramAPIResponseTests {
@@ -121,7 +129,91 @@ struct TelegramAPIResponseTests {
             #expect(failure.errorCode == 429)
             #expect(failure.parameters?.retryAfter == 17)
             #expect(failure.parameters?.migrateToChatId == -1_001_234_567_890)
+            // Both hints must survive the typed transport boundary into the
+            // durable error/state owner; otherwise a generic failure hides a
+            // rate window or required chat migration from the operator.
+            #expect(failure.localizedDescription.contains("retry_after=17s"))
+            #expect(failure.localizedDescription.contains("migrate_to_chat_id=-1001234567890"))
         }
+    }
+
+    @Test func floodControlRetriesTheConcreteSendPathOnceAfterTheAdvertisedWindow() async throws {
+        actor Waits {
+            var values: [UInt64] = []
+            func record(_ value: UInt64) { values.append(value) }
+            func snapshot() -> [UInt64] { values }
+        }
+        final class Attempts: @unchecked Sendable {
+            private let lock = NSLock()
+            private var count = 0
+            func next() -> Int { lock.withLock { count += 1; return count } }
+            func snapshot() -> Int { lock.withLock { count } }
+        }
+        let attempts = Attempts()
+        let waits = Waits()
+        let session = FloodRetryURLProtocol.makeSession { request in
+            let call = attempts.next()
+            if call == 1 {
+                return (
+                    HTTPURLResponse(url: try #require(request.url), statusCode: 429, httpVersion: nil, headerFields: nil)!,
+                    Data(#"{"ok":false,"error_code":429,"parameters":{"retry_after":301}}"#.utf8)
+                )
+            }
+            return (
+                HTTPURLResponse(url: try #require(request.url), statusCode: 200, httpVersion: nil, headerFields: nil)!,
+                Data(#"{"ok":true,"result":{"message_id":9}}"#.utf8)
+            )
+        }
+
+        try await TelegramPollLoop.sendMessage(
+            token: "123:abc", chatId: 77, text: "one message", session: session,
+            sleep: { nanos in await waits.record(nanos) }
+        )
+        #expect(attempts.snapshot() == 2, "the concrete request path must deliver once after one retry")
+        #expect(await waits.snapshot() == [301_000_000_000], "must not shorten Telegram's advertised retry_after")
+    }
+
+    @Test func floodControlDoesNotReplayNon429OrASecondFloodFailure() async throws {
+        final class Attempts: @unchecked Sendable {
+            private let lock = NSLock()
+            private var count = 0
+            func next() -> Int { lock.withLock { count += 1; return count } }
+            func snapshot() -> Int { lock.withLock { count } }
+        }
+        actor Waits { var count = 0; func record(_: UInt64) { count += 1 } }
+
+        let non429Attempts = Attempts()
+        let non429 = FloodNon429URLProtocol.makeSession { request in
+            _ = non429Attempts.next()
+            return (
+                HTTPURLResponse(url: try #require(request.url), statusCode: 400, httpVersion: nil, headerFields: nil)!,
+                Data(#"{"ok":false,"error_code":400,"parameters":{"retry_after":2}}"#.utf8)
+            )
+        }
+        do {
+            try await TelegramPollLoop.sendMessage(token: "123:abc", chatId: 77, text: "no replay", session: non429)
+            Issue.record("expected non-429 rejection")
+        } catch {}
+        #expect(non429Attempts.snapshot() == 1)
+
+        let secondAttempts = Attempts()
+        let waits = Waits()
+        let alwaysFlooded = FloodSecondFailureURLProtocol.makeSession { request in
+            _ = secondAttempts.next()
+            return (
+                HTTPURLResponse(url: try #require(request.url), statusCode: 429, httpVersion: nil, headerFields: nil)!,
+                Data(#"{"ok":false,"error_code":429,"parameters":{"retry_after":2}}"#.utf8)
+            )
+        }
+        do {
+            try await TelegramPollLoop.sendMessage(
+                token: "123:abc", chatId: 77, text: "one retry only", session: alwaysFlooded,
+                sleep: { nanos in await waits.record(nanos) }
+            )
+            Issue.record("expected second flood-control rejection")
+        } catch {}
+        #expect(secondAttempts.snapshot() == 2)
+        #expect(await waits.count == 1)
     }
 
     @Test func serverDescriptionCannotLeakBotToken() throws {
@@ -143,7 +235,7 @@ struct TelegramAPIResponseTests {
         } catch let failure as TelegramAPIFailure {
             #expect(!(failure.telegramDescription ?? "").contains(secret))
             #expect(!(failure.localizedDescription).contains(secret))
-            #expect((failure.telegramDescription ?? "").contains("bot<redacted>"))
+            #expect((failure.telegramDescription ?? "").contains("[REDACTED_TELEGRAM_TOKEN]"))
         }
     }
 

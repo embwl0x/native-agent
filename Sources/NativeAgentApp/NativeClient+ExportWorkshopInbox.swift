@@ -47,9 +47,106 @@ private struct SessionProviderUsageReceipt: Decodable {
     let turnInputDeltaTokens: Int?
 }
 
+/// A manual trigger test is successful only when its card is independently
+/// observable in the live notifications inbox. The scheduler's `fired` result
+/// acknowledges execution; it is not evidence that the Desk-facing card exists.
+struct InboxTriggerTestFireReceipt: Equatable, Sendable {
+    enum CardState: Equatable, Sendable {
+        case created
+        case alreadyVisible
+    }
+
+    let itemID: String
+    let cardState: CardState
+    let wasPlaceholder: Bool
+
+    /// Keep the Desk Test control aligned with the release smoke gate. A
+    /// scheduler acknowledgement is never a successful manual test when the
+    /// observable card has the exact legacy proactive-scan placeholder shape.
+    ///
+    /// This intentionally mirrors `user_mode_eval.swift::checkInbox`: missing
+    /// status is active for compatibility with old physical rows, while
+    /// archived and dismissed cards cannot trip the gate.
+    static func isReleaseGatePlaceholder(_ row: JSONValue) -> Bool {
+        guard case .object(let object) = row else { return false }
+
+        func string(_ key: String) -> String {
+            guard case .string(let value)? = object[key] else { return "" }
+            return value
+        }
+
+        let activeStatuses: Set<String> = ["", "unread", "read"]
+        return string("source") == "scheduled_proactive_scan"
+            && activeStatuses.contains(string("status").lowercased())
+            && string("title") == "Scheduled proactive scan"
+            && string("summary").hasPrefix("Reason: scheduled_proactive_scan")
+    }
+
+    static func confirm(
+        _ result: TriggerFireResult,
+        in inbox: LiveNotificationInbox
+    ) async throws -> InboxTriggerTestFireReceipt {
+        guard result.status == "fired" else {
+            let reason = result.error?.trimmingCharacters(in: .whitespacesAndNewlines)
+            throw NSError(
+                domain: "NativeAgent",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey:
+                    reason?.isEmpty == false ? reason! : "The trigger test did not fire."
+                ]
+            )
+        }
+        guard let itemID = result.itemId?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !itemID.isEmpty else {
+            throw NSError(
+                domain: "NativeAgent",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "The trigger reported success without an inbox item receipt."
+                ]
+            )
+        }
+        let rows = try await inbox.rows()
+        guard let observed = rows.first(where: { row in
+            guard case .object(let object) = row,
+                  case .string(let id)? = object["id"] else { return false }
+            return id == itemID
+        }) else {
+            throw NSError(
+                domain: "NativeAgent",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "The trigger fired but its inbox card is not observable."
+                ]
+            )
+        }
+        guard !isReleaseGatePlaceholder(observed) else {
+            throw NSError(
+                domain: "NativeAgent",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "The trigger test wrote a scheduled proactive scan placeholder, not a real inbox card."
+                ]
+            )
+        }
+        return InboxTriggerTestFireReceipt(
+            itemID: itemID,
+            cardState: result.item == nil ? .alreadyVisible : .created,
+            wasPlaceholder: result.stub ?? false
+        )
+    }
+}
+
 extension NativeClient {
+    /// Closed executor vocabulary for persisted inbox controls. Heartbeat
+    /// controls are imported from their producer contract so a new heartbeat
+    /// button cannot be accepted or omitted independently here.
+    static let explicitlyHandledInboxActionIDs: Set<String> = Set([
+        "read", "act", "approve", "reject",
+    ]).union(HeartbeatCardAction.ids)
+
     func createProductionExport() async throws -> ProductionExport {
-        let root = PersistenceCore.defaultDataRoot()
+        let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let now = Self.nativeArtifactTimestamp()
         let id = UUID().uuidString.lowercased()
         let exportRoot = root
@@ -103,7 +200,7 @@ extension NativeClient {
     }
 
     func createSupportBundle() async throws -> ProductionExport {
-        let root = PersistenceCore.defaultDataRoot()
+        let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let now = Self.nativeArtifactTimestamp()
         let id = UUID().uuidString.lowercased()
         let supportRoot = root
@@ -210,6 +307,12 @@ extension NativeClient {
 
     // PATCH-2026-05-07: proactive-inbox-1 Inbox action helper (avoids Sendable Any issue at call site)
     func inboxAction(_ id: String, action: String) async throws {
+        // Keep the action writer on the same resolved root as getInboxItems.
+        // Isolated/recovered app surfaces inject `dataRootOverride`; falling
+        // back to the process default here made a visible card's button write
+        // a different inbox (or fail) even though its reader was correct.
+        let visibleInboxPath = Self.visibleNotificationInboxPath(
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot())
         // "reply" needs text input the act handler doesn't have. If a caller
         // hits this entry point with `reply`, surface the gap honestly
         // instead of silently mapping to `act`. (gpt-5.5 review HIGH: act
@@ -222,7 +325,7 @@ extension NativeClient {
                 userInfo: [NSLocalizedDescriptionKey: "Reply requires text input; use inboxReply(id:text:) instead of inboxAction(id:\"reply\")."]
             )
         }
-        let nativeActions: Set<String> = ["read", "archive", "dismiss", "act", "approve", "reject", "open_approvals", "repair"]
+        let nativeActions = Self.explicitlyHandledInboxActionIDs
         let endpointAction = nativeActions.contains(normalizedAction) ? normalizedAction : "act"
 
         // Wave 32 W16 (2026-06-01): consume the SwiftNative NotificationInbox for
@@ -230,7 +333,8 @@ extension NativeClient {
         // the proactive-outcome ledger before the index.json overlay write under
         // the inbox file lock. Other actions are handled below or fail closed.
         if endpointAction == "read" || endpointAction == "archive" || endpointAction == "dismiss" {
-            if await Self.updateVisibleNotificationInboxStatus(id: id, action: endpointAction) {
+            if await Self.updateVisibleNotificationInboxStatus(
+                id: id, action: endpointAction, inboxPath: visibleInboxPath) {
                 return
             }
             // A5.2 (2026-07-24): the legacy silo fallback (makeNotificationInbox
@@ -269,11 +373,11 @@ extension NativeClient {
             }
             return
         }
-        if endpointAction == "open_approvals" {
+        if endpointAction == HeartbeatCardAction.openApprovals.rawValue {
             await Self.openApprovalsFromInboxAction(id: id)
             return
         }
-        if endpointAction == "repair" {
+        if endpointAction == HeartbeatCardAction.repair.rawValue {
             let message = try await BackgroundLoopsAssembly.repairHeartbeatInboxItem(id: id)
             _ = await Self.updateVisibleNotificationInboxStatus(id: id, action: "archive")
             NSLog("[NativeClient] inboxAction(repair) id=\(id): \(message)")
@@ -310,7 +414,8 @@ extension NativeClient {
                 // "succeed" while the row stays unread. Nothing else has
                 // happened yet, so failing loud with the same retryable -423
                 // the read/archive path uses keeps a retry clean.
-                guard await Self.updateVisibleNotificationInboxStatus(id: id, action: statusAction) else {
+                guard await Self.updateVisibleNotificationInboxStatus(
+                    id: id, action: statusAction, inboxPath: visibleInboxPath) else {
                     throw NSError(
                         domain: "NativeAgentSwiftOnly",
                         code: -423,
@@ -781,7 +886,11 @@ extension NativeClient {
         // bytes-but-no-rows; per-row decode stays lossy (one malformed
         // record doesn't nuke the list) but ALL rows failing to decode
         // throws too (decodeLossyArray's all-fail rule).
-        let rows = try await LiveNotificationInbox.shared.rows()
+        let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let inboxPath = root
+            .appendingPathComponent("notifications", isDirectory: true)
+            .appendingPathComponent("inbox.jsonl")
+        let rows = try await LiveNotificationInbox(path: inboxPath).rows()
         let decoder = JSONDecoder()
         var items: [InboxItemRecord] = []
         var decodeFailures = 0
@@ -837,7 +946,7 @@ extension NativeClient {
         return
     }
 
-    func inboxTriggerFireNow(_ name: String, stub: Bool) async throws -> (itemId: String?, wasStub: Bool) {
+    func inboxTriggerFireNow(_ name: String, stub: Bool) async throws -> InboxTriggerTestFireReceipt {
         // Wave 12 (2026-05-31): SwiftNative path covers the stub=true canonical
         // kinds (file_watch/idle/time/execution_complete/session_pattern). The
         // non-stub action path now fails closed if the Swift scheduler cannot
@@ -845,7 +954,8 @@ extension NativeClient {
         // FIRE site: carries the paired-device push sender (see
         // TriggerNotifierBinding) so a manual fire pushes exactly like the
         // periodic tick does.
-        let client = TriggerNotifierBinding.makeNotifyingTriggerScheduler()
+        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let client = TriggerNotifierBinding.makeNotifyingTriggerScheduler(dataRoot: dataRoot)
         let result = try await client.fireInboxTrigger(name: name, isStub: stub)
         if let err = result.error, !err.isEmpty {
             throw NSError(domain: "NativeAgent", code: -1,
@@ -863,7 +973,7 @@ extension NativeClient {
         // and the user's inbox stays empty (board M18). And if that mirror
         // FAILS, say so: a manual fire whose card never landed is an error,
         // not a success with an invisible item (gpt-5.5 review, 2026-07-09).
-        if !(await TriggerNotifierBinding.mirrorNonNotifiedFire(result)) {
+        if !(await TriggerNotifierBinding.mirrorNonNotifiedFire(result, dataRoot: dataRoot)) {
             throw NSError(domain: "NativeAgent", code: -1, userInfo: [
                 NSLocalizedDescriptionKey:
                     "Trigger fired but its card could not be written to the notifications inbox — check disk/logs (trigger_mirror)."
@@ -874,7 +984,10 @@ extension NativeClient {
         // requested with isStub: true. Surface the truth to the UI instead of
         // dropping it (gpt-5.5 review MED: the settings panel said "Fired (stub)"
         // for genuinely real briefs).
-        return (result.itemId, result.stub ?? true)
+        return try await InboxTriggerTestFireReceipt.confirm(
+            result,
+            in: LiveNotificationInbox(path: LiveNotificationInbox.livePath(dataRoot: dataRoot))
+        )
     }
 
     // SUBSYSTEM #17 (2026-05-31): retired diagnostic UI + /v1/inbox/self_test

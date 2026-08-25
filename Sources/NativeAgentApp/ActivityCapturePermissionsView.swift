@@ -1,6 +1,14 @@
 import SwiftUI
 import ActivityWatch
 
+/// Kept beside the mounted Trust Center control so its disabled state follows
+/// exactly the same persisted consent rule as the dispatcher-facing policy.
+enum ActivityCapturePresentation {
+    static func isAgentAccessControlEnabled(policy: ActivityPolicy) -> Bool {
+        policy.captureEnabled
+    }
+}
+
 /// W8 — the Trust Center surface for the ambient activity watcher.
 ///
 /// The copy here is the feature's actual privacy contract, so it is written to
@@ -21,10 +29,14 @@ import ActivityWatch
 ///     and it is destructive, so it is stated in a confirmation, with the
 ///     count reported afterwards.
 struct ActivityCapturePermissionsView: View {
-    @State private var controller = ActivityWatchController.shared
+    @State private var controller: ActivityWatchController
     @State private var newExclusion = ""
     @State private var pendingExclusion: String?
     @State private var showWipeConfirm = false
+
+    init(controller: ActivityWatchController = .shared) {
+        _controller = State(initialValue: controller)
+    }
 
     var body: some View {
         NativePanel(
@@ -42,11 +54,32 @@ struct ActivityCapturePermissionsView: View {
                 exclusionList
                 Divider()
                 retentionAndWipe
-                if let error = controller.lastError {
-                    Label(error, systemImage: "exclamationmark.triangle")
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                        .fixedSize(horizontal: false, vertical: true)
+                if !controller.issues.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Label("Activity Capture notices", systemImage: "exclamationmark.triangle.fill")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(issueColor(controller.primaryIssue?.severity ?? .notice))
+                        ForEach(controller.presentationIssues) { issue in
+                            HStack(alignment: .top, spacing: 6) {
+                                Label(issue.severity.title, systemImage: issue.severity.systemImage)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(issueColor(issue.severity))
+                                Text(issue.occurredAt, style: .time)
+                                    .font(.caption2.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                                Text(issue.message)
+                                    .font(.caption)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            .accessibilityIdentifier(
+                                issue.id == controller.primaryIssue?.id
+                                    ? "activity.capture.last-error"
+                                    : "activity.capture.issue"
+                            )
+                        }
+                    }
+                    .padding(10)
+                    .background(issueColor(controller.primaryIssue?.severity ?? .notice).opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
                 }
             }
         }
@@ -82,6 +115,14 @@ struct ActivityCapturePermissionsView: View {
             so capture stays on if it is on — turn the switch above off first if you want it \
             to stop as well.
             """)
+        }
+    }
+
+    private func issueColor(_ severity: ActivityCaptureIssue.Severity) -> Color {
+        switch severity {
+        case .notice: .secondary
+        case .warning: .orange
+        case .critical: .red
         }
     }
 
@@ -164,7 +205,7 @@ struct ActivityCapturePermissionsView: View {
                     set: { controller.setModelAccessEnabled($0) }
                 )
             )
-            .disabled(!controller.policy.captureEnabled)
+            .disabled(!ActivityCapturePresentation.isAgentAccessControlEnabled(policy: controller.policy))
             Text("Off by default. When on, an activity answer requested in chat is sent to the AI provider selected for that chat so the agent can discuss it. The database and full history remain local; only the bounded answer leaves the Mac. Turn this off to keep every activity answer on-device.")
                 .font(.caption)
                 .foregroundStyle(.secondary)

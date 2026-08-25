@@ -16,6 +16,12 @@ struct ICloudPairingPayload: Codable {
     let version: String
 }
 
+enum PairingKVSRefreshResult {
+    static func installedNewMaterial(applied: Bool, previousSecret: Data?, currentSecret: Data?) -> Bool {
+        applied && currentSecret != previousSecret
+    }
+}
+
 @MainActor
 final class PairingStore: ObservableObject {
     private enum Keys {
@@ -287,15 +293,14 @@ final class PairingStore: ObservableObject {
     @discardableResult
     func applyKVSPairingMaterialIfNeeded() -> Bool {
         let kvs = NSUbiquitousKeyValueStore.default
-        guard let secretB64 = kvs.string(forKey: KVSPairingKey.hmacSecret),
-              let secretData = Data(base64Encoded: secretB64),
-              secretData.count == 32 else {
+        let publishedAt = kvs.string(forKey: KVSPairingKey.publishedAt)
+        let ignoredPublishedAt = UserDefaults.standard.string(forKey: Keys.ignoredKVSPublishedAt)
+        guard let secretData = Self.validatedKVSPairingSecret(
+            base64: kvs.string(forKey: KVSPairingKey.hmacSecret),
+            publishedAt: publishedAt,
+            ignoredPublishedAt: ignoredPublishedAt
+        ) else {
             // KVS has no pairing material yet — nothing to do.
-            return false
-        }
-        let publishedAt = kvs.string(forKey: KVSPairingKey.publishedAt) ?? ""
-        let ignoredPublishedAt = UserDefaults.standard.string(forKey: Keys.ignoredKVSPublishedAt) ?? ""
-        if !publishedAt.isEmpty && publishedAt <= ignoredPublishedAt {
             return false
         }
 
@@ -317,6 +322,32 @@ final class PairingStore: ObservableObject {
 
         // Write the new secret to Keychain via the existing save path.
         return installPairingSecret(secretData, source: "KVS")
+    }
+
+    static func validatedKVSPairingSecret(
+        base64: String?,
+        publishedAt: String?,
+        ignoredPublishedAt: String?
+    ) -> Data? {
+        guard let base64, let data = Data(base64Encoded: base64), data.count == 32 else { return nil }
+        let published = publishedAt ?? ""
+        let ignored = ignoredPublishedAt ?? ""
+        guard published.isEmpty || published > ignored else { return nil }
+        return data
+    }
+
+    /// The Mac's current pairing material, used only to verify an explicitly
+    /// pasted fallback key before it can become active on this phone. Unlike
+    /// auto-bootstrap, an explicit re-pair may compare material that was
+    /// deliberately ignored during a prior unpair; the comparison itself does
+    /// not mutate pairing state.
+    func publishedICloudPairingSecretForVerification() -> Data? {
+        guard let base64 = NSUbiquitousKeyValueStore.default.string(forKey: KVSPairingKey.hmacSecret),
+              let data = Data(base64Encoded: base64),
+              data.count == 32 else {
+            return nil
+        }
+        return data
     }
 
     /// Receives pairing material from the CloudKit transport. Exact length is
@@ -386,7 +417,11 @@ final class PairingStore: ObservableObject {
         // pass writes the new Keychain entry rather than no-op'ing on equality.
         let previousSecret = iCloudPairingSecret
         let applied = applyKVSPairingMaterialIfNeeded()
-        if applied && iCloudPairingSecret != previousSecret {
+        if PairingKVSRefreshResult.installedNewMaterial(
+            applied: applied,
+            previousSecret: previousSecret,
+            currentSecret: iCloudPairingSecret
+        ) {
             NSLog("[PairingStore] refreshFromKVS: new HMAC secret installed")
             return true
         }
@@ -411,12 +446,23 @@ final class PairingStore: ObservableObject {
         isICloudPaired = true
     }
 
+    /// A manually supplied secret is eligible only when it exactly matches
+    /// pairing material the Mac has already published. Shape alone cannot
+    /// prove that two devices share the same HMAC authority.
+    static func isVerifiedManualICloudSecret(_ candidate: Data, publishedMacSecret: Data?) -> Bool {
+        candidate.count == 32 && candidate == publishedMacSecret
+    }
+
     /// Apply an iCloud HMAC pairing secret decoded from a QR code or pasted key.
-    /// Returns false if the decoded data is not exactly 32 bytes OR if the Keychain
-    /// write fails (R11-C8: propagate saveSecretToKeychain failure).
+    /// Returns false if the key is malformed, cannot be verified against the
+    /// Mac's published material, or the Keychain write fails.
     @discardableResult
     func applyICloudSecret(base64 string: String) -> Bool {
         guard let data = Data(base64Encoded: string), data.count == 32 else { return false }
+        guard Self.isVerifiedManualICloudSecret(
+            data,
+            publishedMacSecret: publishedICloudPairingSecretForVerification()
+        ) else { return false }
         UserDefaults.standard.removeObject(forKey: Keys.ignoredCloudKitSecretHash)
         return installPairingSecret(data, source: "manual")
     }

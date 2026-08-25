@@ -65,12 +65,22 @@ struct ChromeControlPermissionsView: View {
 struct MultimodalPermissionsView: View {
     @Environment(AppModel.self) private var appModel
     @AppStorage("voiceAutoRead") private var voiceAutoRead = false
-    @AppStorage("voiceUseOpenAI") private var voiceUseOpenAI = false
     @State private var draftPolicy = TrustMultimodalPolicy()
     @State private var isSaving = false
+    @State private var voiceOutputReadAttempted = false
+    @State private var voiceOutputSaveFailure: String?
 
     private var currentPolicy: TrustMultimodalPolicy {
         draftPolicy
+    }
+
+    private var voiceOutputState: VoiceOutputSettingsPresentation.State {
+        VoiceOutputSettingsPresentation.resolve(
+            trustPolicy: appModel.trustPolicy,
+            hasReadAttempted: voiceOutputReadAttempted,
+            isSaving: isSaving,
+            saveFailure: voiceOutputSaveFailure
+        )
     }
 
     var body: some View {
@@ -106,20 +116,40 @@ struct MultimodalPermissionsView: View {
                 Spacer()
             }
             Divider()
+            VStack(alignment: .leading, spacing: 4) {
+                Label(voiceOutputState.title, systemImage: voiceOutputState.systemImage)
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(voiceOutputState.status == "warn" ? Color.orange : Color.secondary)
+                Text(voiceOutputState.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if voiceOutputState.canRetry {
+                    Button("Reload voice output policy", systemImage: "arrow.clockwise") {
+                        Task { await reloadVoiceOutputPolicy() }
+                    }
+                    .controlSize(.small)
+                    .disabled(isSaving)
+                    .accessibilityIdentifier("trust.multimodal.voice-output.reload")
+                }
+            }
+            .accessibilityIdentifier("trust.multimodal.voice-output.status")
             HStack {
                 Toggle("Read replies aloud automatically", isOn: $voiceAutoRead)
-                    .help("New assistant messages are spoken aloud using the selected voice mode.")
+                    .help("New assistant messages are spoken aloud using the saved output route. This preference does not grant OpenAI voice access.")
+                    .accessibilityIdentifier("trust.multimodal.voice-output.auto-read")
                 EffectTimingTag(timing: .now)
                 Spacer()
             }
             HStack {
                 Toggle("Use higher-quality OpenAI voice", isOn: Binding(
-                    get: { currentPolicy.tts_openai },
+                    get: { voiceOutputState.remoteVoiceEnabled ?? false },
                     set: { newValue in
-                        voiceUseOpenAI = newValue
-                        savePolicy(\.tts_openai, value: newValue)
+                        saveVoiceOutputPolicy(remoteVoiceEnabled: newValue)
                     }
                 ))
+                .disabled(!voiceOutputState.canChangeRemoteVoice || isSaving)
+                .accessibilityIdentifier("trust.multimodal.voice-output.openai")
                 EffectTimingTag(timing: .now)
                 Spacer()
             }
@@ -127,8 +157,10 @@ struct MultimodalPermissionsView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
-        .task { syncDraftPolicy() }
-        .onChange(of: draftPolicy.tts_openai) { _, newValue in voiceUseOpenAI = newValue }
+        .task {
+            syncDraftPolicy()
+            await reloadVoiceOutputPolicy()
+        }
         .onChange(of: appModel.trustPolicy) { _, _ in
             if !isSaving { syncDraftPolicy() }
         }
@@ -147,15 +179,46 @@ struct MultimodalPermissionsView: View {
         draftPolicy = next
         Task {
             isSaving = true
-            await appModel.saveMultimodalPolicy(next)
+            _ = await appModel.saveMultimodalPolicy(next)
             isSaving = false
             syncDraftPolicy()
         }
     }
 
+    private func saveVoiceOutputPolicy(remoteVoiceEnabled: Bool) {
+        guard var next = appModel.trustPolicy?.multimodalPolicy else {
+            voiceOutputSaveFailure = "Reload the Trust policy before changing the OpenAI voice setting."
+            return
+        }
+        next.tts_openai = remoteVoiceEnabled
+        draftPolicy = next
+        voiceOutputSaveFailure = nil
+        Task {
+            isSaving = true
+            let saved = await appModel.saveMultimodalPolicy(next)
+            isSaving = false
+            if saved {
+                voiceOutputSaveFailure = nil
+            } else {
+                voiceOutputSaveFailure = appModel.statusText
+            }
+            syncDraftPolicy()
+        }
+    }
+
+    private func reloadVoiceOutputPolicy() async {
+        voiceOutputReadAttempted = true
+        let loaded = await appModel.refreshVoiceOutputPolicy()
+        if loaded {
+            voiceOutputSaveFailure = nil
+            syncDraftPolicy()
+        }
+    }
+
     private func syncDraftPolicy() {
-        draftPolicy = appModel.trustPolicy?.multimodalPolicy ?? TrustMultimodalPolicy()
-        voiceUseOpenAI = draftPolicy.tts_openai
+        if let policy = appModel.trustPolicy?.multimodalPolicy {
+            draftPolicy = policy
+        }
     }
 }
 
@@ -623,11 +686,12 @@ struct TrustBoundaryRow: View {
     var title: String
     var detail: String
     var systemImage: String
+    var tone: TrustSafetyBoundaryTone = .neutral
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: systemImage)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(tint)
                 .frame(width: 22)
             VStack(alignment: .leading, spacing: 3) {
                 Text(title)
@@ -638,6 +702,19 @@ struct TrustBoundaryRow: View {
             }
         }
         .textSelection(.enabled)
+    }
+
+    private var tint: Color {
+        switch tone {
+        case .neutral:
+            .secondary
+        case .caution:
+            .orange
+        case .danger:
+            .red
+        case .unavailable:
+            .orange
+        }
     }
 }
 

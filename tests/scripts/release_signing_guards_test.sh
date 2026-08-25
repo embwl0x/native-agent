@@ -354,6 +354,27 @@ grep -Fq 'NATIVEAGENT_BACKGROUND_TASK_PREFIX="${NATIVEAGENT_BACKGROUND_TASK_PREF
 grep -Fq -- '--require-notarized' "$ROOT/script/release.sh" \
   || fail "release lane no longer proves the mounted app is notarized"
 
+# The signed-DMG publication branch is the complete final-artifact gate. Keep
+# its exact required flag set pinned together: a deleted guard otherwise leaves
+# a plausible-looking release run with a materially weaker artifact proof.
+SIGNED_VERIFY_BLOCK="$(
+  awk '
+    /==> Verifying final notarized release artifact/ { capture = 1 }
+    capture { print }
+    capture && /--require-sparkle-key/ { exit }
+  ' "$ROOT/script/release.sh"
+)"
+[[ -n "$SIGNED_VERIFY_BLOCK" ]] \
+  || fail "could not locate signed-DMG final artifact verification block"
+for required_flag in \
+  --require-clean-source \
+  --require-dmg-signature \
+  --require-notarized \
+  --require-sparkle-key; do
+  grep -Fq -- "$required_flag" <<<"$SIGNED_VERIFY_BLOCK" \
+    || fail "release lane no longer requires $required_flag on final artifact verification"
+done
+
 # A release must be backed by one exact clean source revision, the complete
 # canonical gate, and a real iOS simulator result. Ordinary development tests
 # may still skip iOS when CoreSimulator is unavailable.

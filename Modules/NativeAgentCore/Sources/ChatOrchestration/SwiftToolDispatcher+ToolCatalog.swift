@@ -15,7 +15,60 @@ import MacControl
 import SwarmRuns
 import MacIntegration
 
+/// Stable, runtime-owned categories for the Tools catalog. The catalog is the
+/// authority for the mounted tool set; this registry is the authority for the
+/// names implemented by the Swift dispatcher. Keeping both facts together
+/// means a new dispatcher case cannot quietly fall into a presentation
+/// catch-all without its category being reviewed.
+public enum ChatToolCatalogBucket: String, CaseIterable, Sendable {
+    case mcp
+    case shell
+    case system
+    case macControl = "mac-control"
+    case macIntegration = "mac-integration"
+    case fileOps = "file-ops"
+    case alwaysOn = "always-on"
+    case browser
+    case core
+    case unclassified
+
+    public var title: String {
+        switch self {
+        case .mcp: return "MCP (External Servers)"
+        case .shell: return "Shell / Build"
+        case .system: return "System"
+        case .macControl: return "Mac Control"
+        case .macIntegration: return "Mac Integration"
+        case .fileOps: return "File Ops"
+        case .alwaysOn: return "Always-on"
+        case .browser: return "Browser"
+        case .core: return "Core & Connectors"
+        case .unclassified: return "Unclassified Runtime Tools"
+        }
+    }
+
+    public var systemImage: String {
+        switch self {
+        case .mcp: return "link"
+        case .shell: return "terminal"
+        case .system: return "cpu"
+        case .macControl: return "macwindow"
+        case .macIntegration: return "app.badge"
+        case .fileOps: return "doc.text"
+        case .alwaysOn: return "bolt.circle"
+        case .browser: return "safari"
+        case .core: return "bolt.circle"
+        case .unclassified: return "exclamationmark.triangle"
+        }
+    }
+}
+
 extension SwiftToolDispatcher {
+    /// Read-only skill-manifest/body tools. This is the canonical taxonomy
+    /// exported by `tool_catalog`; transcript summaries must not carry a
+    /// second hand-maintained spelling of these names.
+    public static let skillReaderToolNames: Set<String> = ["list_skills", "read_skill"]
+
     public static let alwaysOnCoreNames: Set<String> = [
         "tool_catalog", "tool_load", "tool_unload", "tool_result_page",
         "list_skills", "read_skill", "save_skill",
@@ -39,6 +92,11 @@ extension SwiftToolDispatcher {
         // its runtime/model. An agent should always be able to ask "what am I
         // running on" without a load dance. (2026-06-09, found via live test.)
         "agent_introspect",
+        // Native computer use is four small verbs. They stay hot whenever the
+        // matching Trust Center gates make them available; the old mac_* organ
+        // tools remain callable by diagnostics but never enter Agent's normal
+        // model prompt.
+        "screen", "act", "go", "wait",
         "claude_message",
         "codex_message",
         "omp_message",
@@ -188,6 +246,14 @@ extension SwiftToolDispatcher {
     /// as the AX reads report the Accessibility grant.
     static let fullMacAccessibilityReadToolNames: [String] = [
         "mac_ax_status", "mac_ax_tree", "mac_ax_find", "mac_view", "mac_attention",
+        // native-look item 2 — `mac_look`. Same category, same read tier, same
+        // route, same no-approval contract as the reads beside it, and it needs
+        // no system grant beyond the Accessibility one they all need.
+        "mac_look",
+        // four-verbs (User, 2026-08-22: "a live screen she looks at and hands
+        // she can use, native to an LLM"): `screen` and `wait` are pure
+        // perception — they hold nothing, they expire nothing.
+        "screen", "wait",
     ]
 
     /// W7 — `mac_nudge`, the one-mouse-move tool. Its own list because it is
@@ -229,9 +295,41 @@ extension SwiftToolDispatcher {
     /// move first, and the tier is decided by what a tool does, not by what it
     /// hands back. Read tier for it would have been a bypass with a view-shaped
     /// result stapled to it.
+    /// `mac_act` (native-look item 3) is in this list and NOT in the read list
+    /// even though it returns a percept: it presses, types and scrolls through
+    /// the same actuator `mac_ax_act` uses. The tier is decided by what a tool
+    /// DOES, never by what it hands back — read tier for it would have been a
+    /// bypass with a look-shaped result stapled to it, the same trap `mac_wake`
+    /// was kept out of.
     static let fullMacAccessibilityInjectionToolNames: [String] = [
-        "mac_keystroke", "mac_click", "mac_scroll", "mac_ax_act", "mac_wake",
+        "mac_keystroke", "mac_click", "mac_scroll", "mac_ax_act", "mac_wake", "mac_act",
+        // four-verbs: `act` drives the same closed loop as mac_act (raise,
+        // gates, actuator, observer) addressed by NAME instead of handle;
+        // `go` activates/launches/opens — hands, so injection tier.
+        "act", "go",
     ]
+
+    /// The four-verb surface routes to its OWN impl (see the dispatch switch:
+    /// its case precedes the read/injection list cases, so membership above
+    /// buys loading/visibility while routing lands here).
+    static let fourVerbToolNames: [String] = ["screen", "act", "go", "wait"]
+
+    /// The implementation organs retained for direct diagnostics and the Tools
+    /// UI, but removed from the conversational model surface. This one set is
+    /// the cutover boundary; prompt filters, same-turn loading, and stale-call
+    /// rejection all consult it instead of maintaining parallel exclusion
+    /// lists.
+    static var legacyMacModelToolNames: Set<String> {
+        Set(fullMacAppToolNames
+            + fullMacAccessibilityReadToolNames
+            + fullMacNudgeToolNames
+            + fullMacAccessibilityInjectionToolNames)
+            .subtracting(fourVerbToolNames)
+    }
+
+    static func normalModelToolNames(activeTools: Set<String>) -> Set<String> {
+        alwaysOnCoreNames.union(activeTools.subtracting(legacyMacModelToolNames))
+    }
 
     // Builder tools (agent-builder-tools, 2026-06-08). Gated on Full Mac
     // file_ops_allowed at dispatch time; surfaced in listAvailableTools()
@@ -262,6 +360,106 @@ extension SwiftToolDispatcher {
     // mislabeling them "implemented_swift_builder_tools".
     static let fullMacEvolutionToolNames: [String] = [
         "evolution_propose", "evolution_status", "self_install",
+    ]
+
+    /// Names implemented by this dispatcher, including capability-gated
+    /// surfaces. Dynamic registry and MCP tools are catalog rows too, but are
+    /// intentionally not claimed here because this static dispatcher cannot
+    /// vouch for their registration lifecycle.
+    public static var catalogRegisteredToolNames: Set<String> {
+        Set(
+            builtInToolNames
+            + fullMacFileToolNames
+            + fullMacSystemToolNames
+            + fullMacAppToolNames
+            + fullMacAccessibilityReadToolNames
+            + fullMacNudgeToolNames
+            + activityQueryToolNames
+            + fullMacAccessibilityInjectionToolNames
+            + fullMacBuilderToolNames
+            + fullMacRestartToolNames
+            + fullMacEvolutionToolNames
+        )
+    }
+
+    /// Returns nil deliberately for a name without an explicit reviewed
+    /// category. Callers must present that condition visibly instead of
+    /// treating an arbitrary runtime name as a reviewed category.
+    public static func catalogBucket(forRegisteredToolNamed name: String) -> ChatToolCatalogBucket? {
+        guard catalogRegisteredToolNames.contains(name) else { return nil }
+        if Self.fullMacBuilderToolNames.contains(name)
+            || Self.fullMacRestartToolNames.contains(name)
+            || Self.fullMacEvolutionToolNames.contains(name) {
+            return .shell
+        }
+        if Self.standardFileToolNames.contains(name) || Self.fullMacFileToolNames.contains(name) {
+            return .fileOps
+        }
+        if Self.fullMacSystemToolNames.contains(name) {
+            return .system
+        }
+        if Self.fullMacAppToolNames.contains(name)
+            || Self.fullMacAccessibilityReadToolNames.contains(name)
+            || Self.fullMacNudgeToolNames.contains(name)
+            || Self.fullMacAccessibilityInjectionToolNames.contains(name) {
+            return .macControl
+        }
+        if Self.macIntegrationToolNames.contains(name) {
+            return .macIntegration
+        }
+        return Self.coreCatalogToolNames.contains(name) ? .core : nil
+    }
+
+    private static let standardFileToolNames: Set<String> = [
+        "read_file", "list_dir", "write_file",
+    ]
+
+    private static let macIntegrationToolNames: Set<String> = [
+        "mac_calendar_list_upcoming", "mac_reminders_list_due_today",
+        "mac_notify", "mobile_notify", "mac_spotlight_search",
+        "contacts_search", "contacts_create_or_update", "mail_list_recent",
+        "mail_search", "mail_send", "messages_recent_threads", "messages_send",
+        "notes_search", "notes_create", "music_now_playing", "music_control",
+        "mac_calendar_create_event", "mac_calendar_modify_event",
+        "mac_reminders_create", "mac_reminders_complete", "mail_mark_read",
+        "mail_archive", "mail_delete", "mail_reply", "notes_update",
+        "music_search_library", "music_list_library", "music_list_playlists",
+        "contacts_delete", "scheduler_list_jobs", "scheduler_create_job",
+    ]
+
+    /// The intentionally broad core category is still an explicit registry,
+    /// not a fallback. `catalogRegisteredToolNames` is derived from the real
+    /// dispatch lists, so adding a case there without adding it here (or to a
+    /// specialised set above) is observable to the coverage eval.
+    private static let coreCatalogToolNames: Set<String> = [
+        "tool_catalog", "tool_load", "tool_unload", "tool_result_page",
+        "list_skills", "read_skill", "save_skill", "recall_memory",
+        "recall_search", "commit_memory", "search_kg", "search_chat_history",
+        "session_search", "get_persona_doc", "persona_read", "persona_write",
+        "persona_append_section", "agent_introspect", "daemon_introspect",
+        "list_tools", "context_lookup", "context_expand", "scratchpad_read",
+        "recent_trace_summary", "time_now", "claude_message", "invoke_claude",
+        "codex_message", "invoke_codex", "omp_message", "agent_swarm",
+        "market_status", "market_watchlists", "tradingview_watchlist", "market_quote",
+        "x_status", "x_me", "x_search", "x_timeline", "x_user_tweets",
+        "gmail_status", "gmail_search", "gmail_read", "google_calendar_status",
+        "google_calendar_list", "notion_status", "notion_search", "notion_read_page",
+        "github_status", "github_list_repos", "github_list_notifications",
+        "github_get_repository", "github_read_repository_content", "github_list_commits",
+        "github_list_issues", "github_search", "github_list_pull_requests",
+        "github_get_issue", "github_get_pull_request", "github_pull_request_files",
+        "github_pull_request_activity", "github_discover_tracking", "github_project_digest",
+        "github_mutate", "github_set_repo_visibility", "slack_status",
+        "slack_list_channels", "slack_search_messages", "slack_post_message",
+        "agentmail_list", "agentmail_read", "agentmail_send", "image_generate",
+        "workshop_submit", "workshop_status", "task_ledger_post", "task_ledger_list",
+        // Activity history is a Trust Center-gated local query; it belongs in
+        // the reviewed core/runtime bucket, never an implicit catalog fallback.
+        "delegation_status", "activity_query", "desk_read", "desk_add_item", "desk_set_status",
+        "desk_update_item", "desk_note", "desk_add_ref", "desk_set_cadence",
+        "desk_set_notify", "desk_close", "desk_archive", "desk_blocked_on",
+        "desk_defer", "desk_breakdown", "desk_nag_control", "desk_open_pursuit",
+        "desk_work_log",
     ]
 
 }

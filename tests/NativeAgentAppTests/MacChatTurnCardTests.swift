@@ -612,11 +612,24 @@ struct MacChatTurnCardTests {
         #expect(title.lowerBound < meta.lowerBound, "The title must precede the meta readout")
         guard title.lowerBound < meta.lowerBound else { return }
         let titleRow = String(source[title.lowerBound..<meta.lowerBound])
-        // Title outranks both the meta readout and the Stop control, so a
-        // narrow detached window truncates those first.
+        // Compression contract (sweep 2026-08-21): controls (3) > title (2)
+        // > settled badge (1) > meta (0, no priority). At the 380pt detached
+        // floor the meta readout collapses FIRST and the Approve/Deny/Stop
+        // controls can never be squeezed off the right edge; fixedSize keeps
+        // their labels from clipping mid-glyph.
         #expect(titleRow.contains(".layoutPriority(2)"))
+        #expect(occurrences(of: ".layoutPriority(3)", in: source) == 3)
         #expect(occurrences(of: ".layoutPriority(2)", in: source) == 1)
         #expect(occurrences(of: ".layoutPriority(1)", in: source) == 1)
+        #expect(occurrences(of: ".fixedSize()", in: source) == 3)
+        // The meta readout must stay priority-less so it is the first to give:
+        // no .layoutPriority within its own modifier chain (the ~8 lines
+        // following Text(meta) before the next view begins).
+        let metaChain = String(source[meta.lowerBound...])
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .prefix(8)
+            .joined(separator: "\n")
+        #expect(!metaChain.contains(".layoutPriority"))
     }
 
     @Test func theTranscriptReservesMoreRoomThanTheCardCanOccupy() throws {
@@ -625,11 +638,19 @@ struct MacChatTurnCardTests {
         // start covering the last transcript line.
         #expect(MacChatTurnCardMetrics.floatingClearance >= 68)
 
-        // ...and the constant must be what the transcript actually reserves.
-        // Asserting the constant alone false-greens: someone could hardcode
-        // the old 56 back at both sites and this test would never notice.
+        // ...and the reservation must be what the transcript actually uses.
+        // Since 7f86a29f the two layout sites (spacer frame + Latest-pill
+        // inset) read the computed `turnCardClearance`, whose floor is the
+        // constant. Pin both layers: the layout sites read the computed
+        // property, and the shared presentation helper floors at the constant —
+        // asserting the constant alone false-greens (someone could hardcode
+        // the old 56 back at the layout sites and this test would never
+        // notice; sweep 2026-08-21 caught the previous pin counting
+        // occurrences inside the computed property instead of the sites).
         let chatView = try AppSourceScraping.appSource("ChatView.swift")
-        #expect(occurrences(of: "MacChatTurnCardMetrics.floatingClearance", in: chatView) == 2)
+        #expect(occurrences(of: ".frame(height: turnCardClearance)", in: chatView) == 1)
+        #expect(occurrences(of: ".padding(.bottom, showThinkingRow ? turnCardClearance : 18)", in: chatView) == 1)
+        #expect(chatView.contains("ChatViewportPresentation.turnCardClearance("))
         #expect(!chatView.contains(".frame(height: 56)"))
         #expect(!chatView.contains("showThinkingRow ? 56"))
     }

@@ -7,6 +7,48 @@ import Testing
 
 @Suite("Outcome Tissue V2")
 struct OutcomeTissueV2Tests {
+    // EVAL FENCE: core.chat.persistence
+    // Ledger row: chat.persistence.outcomeDimensionStates
+    //
+    // The canonical assistant-row observation receives the checked turn
+    // context. Its provider state must therefore be an observed fact when an
+    // admitted provider route exists; a model id by itself remains insufficient.
+    @Test("outcome observation retains an admitted provider as observed evidence")
+    func admittedProviderIsObservedRatherThanHistoricalUnknown() throws {
+        let context = TurnContext(
+            surface: "chat",
+            personaDocs: [:],
+            recalled: [],
+            modelId: "gpt-5.6",
+            reasoningEffort: "high",
+            providerId: "openai_oauth_direct",
+            toolsAvailable: [],
+            systemPrompt: nil,
+            userMessage: "hello",
+            toolSchemas: []
+        )
+        let result = TurnEngineResult(
+            reply: "done", modelUsed: "gpt-5.6", recalledIds: [],
+            toolDispatches: [], elapsedMs: 1, rawLLMResponse: "done"
+        )
+
+        let observation = try #require(ResponseOutcomeObservationV2.make(
+            turnID: "turn-provider-observed",
+            messageID: "message-provider-observed",
+            sessionID: "session-provider-observed",
+            surface: "chat",
+            observedAt: Date(timeIntervalSince1970: 1_800_000_000),
+            responsePersistence: "persisted",
+            result: result,
+            context: context
+        ))
+
+        #expect(observation.providerID == "openai_oauth_direct")
+        #expect(observation.providerModel == "gpt-5.6")
+        #expect(observation.dimensionStates["provider"] == .observed)
+        #expect(ResponseOutcomeObservationV2(jsonValue: observation.jsonValue) == observation)
+    }
+
     @Test("response observations preserve the canonical chat session identity contract")
     func responseObservationSessionIdentityContract() throws {
         let maximumLengthSession = String(repeating: "s", count: 160)

@@ -39,6 +39,10 @@ struct ProductionHardeningSummary: Codable, Hashable {
     var release: ReleaseChecklist?
     var doctorStatus: String?
     var createdAt: String?
+    /// Missing is distinct from a report that could not be read. The latter
+    /// remains visible to the hardening panel instead of becoming a neutral
+    /// synthetic state.
+    var detail: String? = nil
 }
 
 struct ProductionExport: Identifiable, Codable, Hashable {

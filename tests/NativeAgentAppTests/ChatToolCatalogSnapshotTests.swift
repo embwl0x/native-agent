@@ -12,6 +12,7 @@ func chatToolCatalogSnapshotPreservesLiveAvailabilityAndAutonomyFields() throws 
                 "load_state": .string("discovery_only"),
                 "effective_autonomy": .string("confirm"),
                 "available_now": .bool(true),
+                "catalog_bucket": .string("core"),
                 "parameters": .object([
                     "type": .string("object"),
                     "properties": .object(["prompt": .object(["type": .string("string")])]),
@@ -26,5 +27,6 @@ func chatToolCatalogSnapshotPreservesLiveAvailabilityAndAutonomyFields() throws 
     #expect(tool.loadState == "discovery_only")
     #expect(tool.effectiveAutonomy == "confirm")
     #expect(tool.availableNow == true)
+    #expect(tool.catalogBucket == "core")
     #expect(tool.parametersPreview == "prompt")
 }

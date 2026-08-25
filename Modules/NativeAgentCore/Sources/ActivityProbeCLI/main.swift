@@ -59,6 +59,28 @@ func resolveDataRoot(_ explicit: String?) -> URL {
     return PersistenceCore.defaultDataRoot()
 }
 
+func strictDays(_ raw: String?) throws -> Double {
+    guard let raw, let days = Double(raw), days.isFinite, days > 0 else {
+        throw CLIError.usage("--days needs a positive finite number")
+    }
+    return days
+}
+
+func strictSwitch(_ raw: String, option: String) throws -> Bool {
+    switch raw.lowercased() {
+    case "on": return true
+    case "off": return false
+    default: throw CLIError.usage("\(option) must be 'on' or 'off', not '\(raw)'")
+    }
+}
+
+enum CLIError: Error, LocalizedError {
+    case usage(String)
+    var errorDescription: String? {
+        switch self { case .usage(let message): return message }
+    }
+}
+
 func formatTimestamp(_ value: Double) -> String {
     let formatter = DateFormatter()
     formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
@@ -70,6 +92,12 @@ func formatDuration(_ seconds: Double) -> String {
     return String(format: "%02dh%02dm%02ds", total / 3600, (total % 3600) / 60, total % 60)
 }
 
+func formatCount(_ value: Int) -> String {
+    let formatter = NumberFormatter()
+    formatter.numberStyle = .decimal
+    return formatter.string(from: NSNumber(value: value)) ?? "\(value)"
+}
+
 func usage() {
     print("""
     activity-probe — DEV-ONLY ambient activity watcher (metadata only, zero inference)
@@ -77,10 +105,10 @@ func usage() {
     usage: activity-probe <command> [--data-root PATH]
 
     commands:
-      run [--enable-capture]
+      run
                           capture until SIGINT; prints a status line every 30s.
-                          Capture is OFF by default; --enable-capture writes
-                          captureEnabled=true into the policy file first.
+                          Capture must already be enabled by an explicit
+                          Trust Center or `policy --enable` decision.
       stats [--days N]    events/hour report over the last N days (default 1)
       dump  [--days N]    print spans over the last N days (default 1)
       rollup [--days N] [--grain hourly|daily] [--tz ID]
@@ -109,7 +137,7 @@ func usage() {
 
 func commandStats(_ args: [String], dataRoot: URL) throws -> Int32 {
     var args = args
-    let days = Double(extractOption("--days", from: &args) ?? "1") ?? 1
+    let days = try strictDays(extractOption("--days", from: &args) ?? "1")
     let now = Date().timeIntervalSince1970
     let from = now - days * 86_400
     let store = try ActivitySpanStore(dataRoot: dataRoot)
@@ -129,16 +157,24 @@ func commandStats(_ args: [String], dataRoot: URL) throws -> Int32 {
 
 func commandDump(_ args: [String], dataRoot: URL) throws -> Int32 {
     var args = args
-    let days = Double(extractOption("--days", from: &args) ?? "1") ?? 1
+    let days = try strictDays(extractOption("--days", from: &args) ?? "1")
     let now = Date().timeIntervalSince1970
     let from = now - days * 86_400
     let store = try ActivitySpanStore(dataRoot: dataRoot)
     let policy = ActivityPolicyStore(dataRoot: dataRoot).load()
-    let spans = try blockingAwait {
-        try await store.querySpans(from: from, to: now, policy: policy)
+    let total = try blockingAwait {
+        try await store.countSpansOverlapping(from: from, to: now, policy: policy)
     }
-    print("activity-probe dump  (\(spans.count) spans, \(dataRoot.path))")
-    for span in spans {
+    let spans = try blockingAwait {
+        try await store.spansOverlapping(from: from, to: now, limit: 20_000, policy: policy)
+    }
+    let truncated = total > spans.count
+    let visible = spans
+    print("activity-probe dump  (\(formatCount(visible.count)) spans, \(dataRoot.path))")
+    if truncated {
+        print("  TRUNCATED: \(formatCount(visible.count)) shown; \(formatCount(total - visible.count)) omitted; use a narrower --days window")
+    }
+    for span in visible {
         let ended = span.endedAt.map(formatTimestamp) ?? "OPEN"
         print(
             "  \(formatTimestamp(span.startedAt)) → \(ended)  "
@@ -194,7 +230,7 @@ func commandSimulate(_ args: [String], dataRoot: URL) throws -> Int32 {
 
 func commandRollup(_ args: [String], dataRoot: URL) throws -> Int32 {
     var args = args
-    let days = Double(extractOption("--days", from: &args) ?? "1") ?? 1
+    let days = try strictDays(extractOption("--days", from: &args) ?? "1")
     let grainName = extractOption("--grain", from: &args)
     let tzName = extractOption("--tz", from: &args)
     let timezone = tzName.flatMap(TimeZone.init(identifier:)) ?? TimeZone.current
@@ -241,32 +277,46 @@ func commandPolicy(_ args: [String], dataRoot: URL) throws -> Int32 {
     var args = args
     let policyStore = ActivityPolicyStore(dataRoot: dataRoot)
     var policy = policyStore.load()
+    let originalPolicy = policy
     var changed = false
     var purgeTargets: Set<String> = []
+    var requestedExclusions: Set<String> = []
 
     if extractFlag("--enable", from: &args) { policy.captureEnabled = true; changed = true }
     if extractFlag("--disable", from: &args) { policy.captureEnabled = false; changed = true }
     if let value = extractOption("--titles", from: &args) {
-        policy.captureTitles = (value == "on"); changed = true
+        policy.captureTitles = try strictSwitch(value, option: "--titles"); changed = true
     }
     if let value = extractOption("--browser-titles", from: &args) {
-        policy.browserTitlesEnabled = (value == "on"); changed = true
+        policy.browserTitlesEnabled = try strictSwitch(value, option: "--browser-titles"); changed = true
     }
     if let value = extractOption("--app-name-only", from: &args) {
-        policy.appNameOnlyMode = (value == "on"); changed = true
+        policy.appNameOnlyMode = try strictSwitch(value, option: "--app-name-only"); changed = true
     }
-    if let value = extractOption("--retention-days", from: &args), let days = Int(value) {
-        policy.retentionDays = max(1, days); changed = true
+    if let value = extractOption("--retention-days", from: &args) {
+        guard let days = Int(value), days > 0 else {
+            throw CLIError.usage("--retention-days needs a positive whole number")
+        }
+        policy.retentionDays = days; changed = true
     }
     while let bundle = extractOption("--exclude", from: &args) {
         policy.excludedBundleIDs.insert(bundle)
-        purgeTargets.insert(bundle)
+        requestedExclusions.insert(bundle)
         changed = true
     }
     while let bundle = extractOption("--include", from: &args) {
         policy.excludedBundleIDs.remove(bundle)
         changed = true
     }
+
+    guard args.isEmpty || args == ["--show"] else {
+        throw CLIError.usage("unrecognized policy option(s): \(args.joined(separator: " "))")
+    }
+
+    // Exclude and include are evaluated as one final policy transaction. A
+    // bundle that ends this invocation included must never be purged merely
+    // because an earlier argument mentioned --exclude.
+    purgeTargets = policy.excludedBundleIDs.subtracting(originalPolicy.excludedBundleIDs)
 
     if changed {
         try policyStore.save(policy)
@@ -290,6 +340,14 @@ func commandPolicy(_ args: [String], dataRoot: URL) throws -> Int32 {
     for bundle in policy.effectiveExcludedBundleIDs.sorted() {
         let locked = ActivityPolicy.alwaysExcludedBundleIDs.contains(bundle) ? "  [always]" : ""
         print("    \(bundle)\(locked)")
+    }
+    let restored = originalPolicy.excludedBundleIDs.subtracting(policy.excludedBundleIDs)
+    if !restored.isEmpty {
+        print("  NOTE: including an app permits future capture; already deleted history is not restored.")
+    }
+    let canceledExclusions = requestedExclusions.subtracting(policy.excludedBundleIDs)
+    if !canceledExclusions.isEmpty {
+        print("  NOTE: no rows were deleted for \(canceledExclusions.sorted().joined(separator: ", ")); the final policy includes it.")
     }
     return 0
 }
@@ -336,22 +394,23 @@ func commandRun(_ args: [String], dataRoot: URL) throws -> Int32 {
     var args = args
     let store = try ActivitySpanStore(dataRoot: dataRoot)
     let policyStore = ActivityPolicyStore(dataRoot: dataRoot)
-    var policy = policyStore.load()
+    let policy = policyStore.load()
 
-    // Capture is OFF by default and stays off unless someone says otherwise IN
-    // WRITING — an explicit flag that persists, so the enabled state is visible
-    // on disk rather than being a property of how the process was launched.
-    if extractFlag("--enable-capture", from: &args), !policy.captureEnabled {
-        policy.captureEnabled = true
-        try policyStore.save(policy)
-        print("  capture ENABLED in \(policyStore.fileURL.path)")
+    // A probe run cannot grant persistent capture consent. That authority is
+    // the explicit policy command / Trust Center transaction, never an
+    // incidental diagnostic flag.
+    if extractFlag("--enable-capture", from: &args) {
+        throw CLIError.usage("run cannot enable capture; use 'policy --enable' first")
     }
     guard policy.captureEnabled else {
         print("activity-probe run  (data root: \(dataRoot.path))")
         print("  capture is DISABLED (captureEnabled=false) — nothing will be recorded.")
         print("  enable it with:  activity-probe policy --enable")
-        print("               or:  activity-probe run --enable-capture")
         return 0
+    }
+
+    guard AXIsProcessTrusted() else {
+        throw CLIError.usage("run requires Accessibility permission; refusing app-change-only capture")
     }
 
     // Startup reconciliation: spans left open by a prior process are closed at
@@ -368,11 +427,6 @@ func commandRun(_ args: [String], dataRoot: URL) throws -> Int32 {
     print("  titles: captureTitles=\(policy.captureTitles) "
         + "browserTitles=\(policy.browserTitlesEnabled) "
         + "appNameOnly=\(policy.appNameOnlyMode)")
-
-    if !AXIsProcessTrusted() {
-        print("  WARNING: this process is not Accessibility-trusted — AX focus events")
-        print("           will not arrive. App-change spans still record.")
-    }
 
     // The policy FILE is watched too, so `activity-probe policy --disable` in
     // another terminal pauses this run within one tick instead of being ignored
@@ -425,14 +479,21 @@ func commandRun(_ args: [String], dataRoot: URL) throws -> Int32 {
 
 var arguments = Array(CommandLine.arguments.dropFirst())
 let probeDataRootOption = extractOption("--data-root", from: &arguments)
-/// Whether the caller explicitly pinned a data root. `simulate` requires it —
-/// it must never write synthetic spans into the real store.
+/// Whether the caller explicitly pinned a data root. `simulate` creates a
+/// scratch store when this is false; every real-store command refuses to guess.
 let isExplicitDataRoot = probeDataRootOption != nil
 let probeDataRoot = resolveDataRoot(probeDataRootOption)
 let command = arguments.first ?? "help"
 let rest = Array(arguments.dropFirst())
 
 do {
+    // The probe can print or mutate a private activity history. Make the target
+    // explicit for every real-store command; only `simulate` is scratch by
+    // default and cannot ever touch the installed history.
+    if command != "help", command != "--help", command != "-h", command != "simulate",
+       !isExplicitDataRoot {
+        throw CLIError.usage("\(command) requires --data-root PATH; refusing the implicit live activity store")
+    }
     switch command {
     case "run":
         #if canImport(AppKit)
@@ -465,6 +526,9 @@ do {
         usage()
         exit(64)
     }
+} catch let error as CLIError {
+    FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
+    exit(64)
 } catch {
     FileHandle.standardError.write(Data("error: \(error)\n".utf8))
     exit(1)

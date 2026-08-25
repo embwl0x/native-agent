@@ -212,7 +212,8 @@ extension NativeClient {
         let callID = UUID().uuidString.lowercased()
         let createdAt = ISO8601DateFormatter().string(from: Date())
         let started = Date()
-        let dispatcher = SwiftNativeMCPDispatcher(root: PersistenceCore.defaultDataRoot())
+        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let dispatcher = SwiftNativeMCPDispatcher(root: dataRoot)
         let servers = try await dispatcher.listServers()
         guard let server = servers.first(where: { $0.id == serverId }) else {
             throw NSError(domain: "NativeAgentMCP", code: 404, userInfo: [
@@ -224,7 +225,7 @@ extension NativeClient {
             serverId: serverId,
             toolName: toolName,
             serverRiskClass: server.riskClass,
-            dataRoot: PersistenceCore.defaultDataRoot()
+            dataRoot: dataRoot
         )
         let hasConsent = consents.contains {
             $0.serverId == serverId
@@ -274,7 +275,7 @@ extension NativeClient {
             createdAt: createdAt,
             projection: projection
         )
-        let activityPath = PersistenceCore.defaultDataRoot()
+        let activityPath = dataRoot
             .appendingPathComponent("activity", isDirectory: true)
             .appendingPathComponent("events.jsonl")
         // The external/local MCP call may already have produced effects.
@@ -306,20 +307,20 @@ extension NativeClient {
     }
 
     func warmMCPServer(serverId: String) async throws -> MCPSessionStatus {
-        let dispatcher = SwiftNativeMCPDispatcher(root: SwiftNativeMCPDispatcher.defaultDataRoot())
+        let dispatcher = mcpDispatcherForClientRoot()
         _ = try await dispatcher.listToolsLive(forServer: serverId, cached: false)
         return try await swiftMCPSessionStatus(serverId: serverId)
     }
 
     func restartMCPServer(serverId: String) async throws -> MCPSessionStatus {
         await SwiftNativeMCPDispatcher.sharedPool.stop(serverId: serverId)
-        let dispatcher = SwiftNativeMCPDispatcher(root: SwiftNativeMCPDispatcher.defaultDataRoot())
+        let dispatcher = mcpDispatcherForClientRoot()
         _ = try await dispatcher.listToolsLive(forServer: serverId, cached: false)
         return try await swiftMCPSessionStatus(serverId: serverId)
     }
 
     func refreshMCPCache(serverId: String) async throws -> MCPSessionStatus {
-        let dispatcher = SwiftNativeMCPDispatcher(root: SwiftNativeMCPDispatcher.defaultDataRoot())
+        let dispatcher = mcpDispatcherForClientRoot()
         _ = try await dispatcher.listToolsLive(forServer: serverId, cached: false)
         _ = try? await dispatcher.listResourcesLive(forServer: serverId, cached: false)
         return try await swiftMCPSessionStatus(serverId: serverId)
@@ -387,7 +388,7 @@ extension NativeClient {
         // Swift-native cutover sweep s3: id-only form — list consents and resolve the
         // row by id (matching the daemon's body.id-first fallback). The ledger
         // R-M-W is already flock-guarded inside swiftRevokeMCPConsent.
-        let disp = makeMCPDispatcher()
+        let disp = mcpDispatcherForClientRoot()
         let consents = try await disp.listConsents()
         guard let match = consents.first(where: { $0.id == id }),
               !match.serverId.isEmpty,

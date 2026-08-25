@@ -33,7 +33,7 @@ extension SwiftToolDispatcher {
         input: [String: JSONValue],
         run: (any MacIntegrationToolBridge, [String: JSONValue]) async throws -> JSONValue
     ) async throws -> JSONValue {
-        let allowed = await MacIntegrationPermissionStore.shared.allows(integration, mode: mode)
+        let allowed = await macIntegrationPermissionStore.allows(integration, mode: mode)
         guard allowed else {
             return .object([
                 "status": .string("denied"),

@@ -33,6 +33,25 @@ func stateLabel(_ state: GitHubCommandItemState) -> String {
     }
 }
 
+/// Test-only deterministic seam for the CAS race contract.  It is inert unless
+/// BOTH paths are supplied in the subprocess environment; production callers
+/// have no pause or extra write.  The bounded wait lets the evaluator mutate a
+/// planned item through the canonical store before this process attempts its
+/// guarded close.
+private func waitForPlanRaceTestBarrierIfRequested() async {
+    let environment = ProcessInfo.processInfo.environment
+    guard let readyPath = environment["NATIVE_AGENT_DESK_SWEEP_TEST_PLAN_READY_FILE"],
+          let continuePath = environment["NATIVE_AGENT_DESK_SWEEP_TEST_PLAN_CONTINUE_FILE"],
+          !readyPath.isEmpty, !continuePath.isEmpty else {
+        return
+    }
+    FileManager.default.createFile(atPath: readyPath, contents: Data())
+    let deadline = Date().addingTimeInterval(10)
+    while !FileManager.default.fileExists(atPath: continuePath), Date() < deadline {
+        try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+}
+
 @main
 struct DeskSweep {
     static func main() async {
@@ -155,6 +174,8 @@ struct DeskSweep {
         }
         guard !dryRun else { return }
 
+        await waitForPlanRaceTestBarrierIfRequested()
+
         // Children before parents: the store (correctly) refuses terminal
         // status on a parent with non-terminal children.
         planned.sort { $0.alias.filter { $0 == "." }.count > $1.alias.filter { $0 == "." }.count }
@@ -186,6 +207,10 @@ struct DeskSweep {
             }
         }
         print("closed \(closed), failed \(failed), skipped \(skipped)")
-        if failed > 0 { exit(1) }
+        // A sweep whose complete plan went stale did no requested work.  Its
+        // nonzero exit is the shell receipt that tells an automation/operator
+        // to re-plan rather than treating a green process as a completed bulk
+        // close.
+        if failed > 0 || (closed == 0 && skipped > 0) { exit(1) }
     }
 }

@@ -40,11 +40,16 @@ import Skills
 import Connectors
 import Browser
 
+private struct TelegramDiagnosticFeedRead<Row> {
+    let rows: [Row]
+    let issue: String?
+}
+
 extension NativeClient {
     func getModelCatalog(refresh: Bool) async throws -> ModelCatalogResponse {
         try await getModelCatalog(
             refresh: refresh,
-            dataRoot: PersistenceCore.defaultDataRoot()
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
         )
     }
 
@@ -300,10 +305,15 @@ extension NativeClient {
         // DAEMON KILLED 2026-06-02. Native Telegram status: read the saved
         // config and surface every field the UI binds to (chat ids, user
         // ids, require_mention). Token itself is NOT echoed back for safety.
-        let cfg = TelegramBot.TelegramConfig.loadFromDisk()
-        let dataRoot = PersistenceCore.defaultDataRoot()
-        let telegramBrain = try? await SwiftNativeProviderRouting()
+        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let cfg = TelegramBot.TelegramConfig.loadFromDisk(dataRoot: dataRoot)
+        let telegramBrain = try? await SwiftNativeProviderRouting(dataRoot: dataRoot)
             .computeModelPreferences()["telegram"]
+        let resolvedTelegramBrain = resolveTelegramBrain(
+            routing: telegramBrain,
+            legacyModel: cfg?.model,
+            legacyReasoningEffort: cfg?.reasoningEffort
+        )
         let telegramDir = dataRoot.appendingPathComponent("telegram", isDirectory: true)
         let stateURL = telegramDir.appendingPathComponent("state.json")
         var lastSeenUpdateId: Int?
@@ -312,6 +322,7 @@ extension NativeClient {
         var lastError: String?
         var pollBackoffFailures: Int?
         var lastPollAt: String?
+        var lastDiagnosticsClearedAt: String?
         if let data = try? Data(contentsOf: stateURL),
            let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             if let i = raw["lastSeenUpdateId"] as? Int {
@@ -332,16 +343,17 @@ extension NativeClient {
                 pollBackoffFailures = Int(d)
             }
             lastPollAt = raw["lastPollAt"] as? String
+            lastDiagnosticsClearedAt = raw["lastDiagnosticsClearedAt"] as? String
         }
-        let receipts: [TelegramReceipt] = tailJSONL(
+        let receiptsRead: TelegramDiagnosticFeedRead<TelegramReceipt> = await telegramDiagnosticFeed(
             path: telegramDir.appendingPathComponent("receipts.jsonl"),
             limit: 50
         )
-        let blocked: [TelegramBlockedEvent] = tailJSONL(
+        let blockedRead: TelegramDiagnosticFeedRead<TelegramBlockedEvent> = await telegramDiagnosticFeed(
             path: telegramDir.appendingPathComponent("blocked.jsonl"),
             limit: 50
         )
-        let errors: [TelegramErrorEvent] = tailJSONL(
+        let errorsRead: TelegramDiagnosticFeedRead<TelegramErrorEvent> = await telegramDiagnosticFeed(
             path: telegramDir.appendingPathComponent("errors.jsonl"),
             limit: 50
         )
@@ -372,7 +384,7 @@ extension NativeClient {
         // not just config.enabled. Config-says-on / loop-not-running is the
         // exact regression the UI used to hide (status panel looked healthy
         // while the poller was dead).
-        let loopStatuses = await BackgroundLoopsManager.shared.status()
+        let loopStatuses = await backgroundLoopsManager.status()
         let pollerRunning = loopStatuses.contains(where: { $0.loopId == "telegram_poll" && $0.running })
         return TelegramStatus(
             enabled: cfg?.enabled ?? false,
@@ -380,8 +392,8 @@ extension NativeClient {
             allowedChatIds: chatIds,
             allowedUserIds: userIds,
             requireMention: cfg?.requireMention ?? false,
-            model: telegramBrain?.model,
-            reasoningEffort: telegramBrain?.reasoningEffort,
+            model: resolvedTelegramBrain.model,
+            reasoningEffort: resolvedTelegramBrain.reasoningEffort,
             pollerEnabled: pollerRunning,
             lastSeenUpdateId: lastSeenUpdateId,
             lastSeenAt: lastSeenAt,
@@ -389,15 +401,60 @@ extension NativeClient {
             lastError: lastError ?? (cfg == nil ? "No bot token saved — paste one to enable." : nil),
             pollBackoffFailures: pollBackoffFailures,
             lastPollAt: lastPollAt,
+            lastDiagnosticsClearedAt: lastDiagnosticsClearedAt,
             voiceTranscription: voiceStatus,
-            receipts: receipts,
-            blocked: blocked,
-            errors: errors
+            receipts: receiptsRead.rows,
+            blocked: blockedRead.rows,
+            errors: errorsRead.rows,
+            receiptsIssue: receiptsRead.issue,
+            blockedIssue: blockedRead.issue,
+            errorsIssue: errorsRead.issue
         )
     }
 
+    private func telegramDiagnosticFeed<Row: Decodable>(
+        path: URL,
+        limit: Int
+    ) async -> TelegramDiagnosticFeedRead<Row> {
+        do {
+            let receipt = try await SwiftNativePersistenceCore().tailJSONLReadReceipt(
+                path,
+                limit: limit,
+                maxBytes: 1_048_576
+            )
+            let decoder = JSONDecoder.nativeAgent
+            var rows: [Row] = []
+            var undecodableSchemaRows = 0
+            for raw in receipt.rows {
+                guard let data = try? raw.serializedData(pretty: false),
+                      let row = try? decoder.decode(Row.self, from: data) else {
+                    undecodableSchemaRows += 1
+                    continue
+                }
+                rows.append(row)
+            }
+
+            var warnings: [String] = []
+            let unreadableCount = receipt.malformedJSONRowCount + undecodableSchemaRows
+            if unreadableCount > 0 {
+                warnings.append("\(unreadableCount) unreadable diagnostic \(unreadableCount == 1 ? "row was" : "rows were") omitted from this panel.")
+            }
+            if receipt.truncatedToByteWindow {
+                warnings.append("Only the newest bounded portion of this diagnostic feed was read; older entries are not shown.")
+            }
+            return TelegramDiagnosticFeedRead(rows: rows, issue: warnings.isEmpty ? nil : warnings.joined(separator: " "))
+        } catch {
+            return TelegramDiagnosticFeedRead(
+                rows: [],
+                issue: "This diagnostic feed is unavailable and was not treated as empty."
+            )
+        }
+    }
+
     func getChatSessions() async throws -> [ChatSession] {
-        try await Self.getChatSessions(dataRoot: PersistenceCore.defaultDataRoot())
+        try await Self.getChatSessions(
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        )
     }
 
     static func getChatSessions(dataRoot: URL) async throws -> [ChatSession] {
@@ -424,7 +481,7 @@ extension NativeClient {
     func getChatMessages(sessionId: String) async throws -> [ChatMessage] {
         try await Self.getChatMessages(
             sessionId: sessionId,
-            dataRoot: PersistenceCore.defaultDataRoot()
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
         )
     }
 
@@ -468,7 +525,7 @@ extension NativeClient {
     func getLatestContextReceipt(sessionId: String) async throws -> ContextReceipt {
         try await Self.getLatestContextReceipt(
             sessionId: sessionId,
-            dataRoot: PersistenceCore.defaultDataRoot()
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
         )
     }
 
@@ -514,7 +571,7 @@ extension NativeClient {
         try await Self.createChatSession(
             title: title,
             sourceKey: sourceKey,
-            dataRoot: PersistenceCore.defaultDataRoot()
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
         )
     }
 
@@ -560,7 +617,7 @@ extension NativeClient {
             id: id,
             title: title,
             archived: archived,
-            dataRoot: PersistenceCore.defaultDataRoot()
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
         )
     }
 
@@ -602,6 +659,89 @@ extension NativeClient {
                           userInfo: [NSLocalizedDescriptionKey: "chat session \(id) not found"])
         }
         return try JSONDecoder.nativeAgent.decode(ChatSession.self, from: updatedData)
+    }
+
+    /// A user-initiated archive leaves the hot index immediately. Retention
+    /// later bounds the archive tier, but it must not be responsible for the
+    /// visible archive action: an archived chat may never linger in
+    /// `sessions.json` or be appended twice to the archive tail.
+    func archiveChatSession(id: String) async throws -> ChatSession? {
+        try await Self.archiveChatSession(
+            id: id,
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        )
+    }
+
+    static func archiveChatSession(
+        id: String,
+        dataRoot: URL,
+        afterArchiveTailWrite: (@Sendable () throws -> Void)? = nil
+    ) async throws -> ChatSession? {
+        guard NativeAgentChatSessionID.normalizedPathComponent(id) != nil else { return nil }
+        let sessionsPath = dataRoot
+            .appendingPathComponent("chat", isDirectory: true)
+            .appendingPathComponent("sessions.json")
+        let archivePath = dataRoot
+            .appendingPathComponent("chat", isDirectory: true)
+            .appendingPathComponent("archive", isDirectory: true)
+            .appendingPathComponent("sessions.jsonl")
+        let persistence = SwiftNativePersistenceCore()
+        return try await persistence.withFileLock(sessionsPath) {
+            var rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
+            guard let index = rows.firstIndex(where: {
+                if case .string(let rowID)? = $0["id"] { return rowID == id }
+                return false
+            }) else { return nil }
+
+            var archived = rows[index]
+            archived["archived"] = .bool(true)
+            archived["archivedBy"] = .string("mac_chat")
+            archived["archivedAt"] = .string(ISO8601DateFormatter().string(from: Date()))
+            let archivedData = try JSONValue.object(archived).serializedData(pretty: false)
+
+            try FileManager.default.createDirectory(
+                at: archivePath.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let existingTail: Data
+            if FileManager.default.fileExists(atPath: archivePath.path) {
+                existingTail = try Data(contentsOf: archivePath)
+            } else {
+                existingTail = Data()
+            }
+            var archivedIDs = Set<String>()
+            for line in existingTail.split(separator: 10) {
+                guard let value = try? JSONValue.parse(Data(line)),
+                      case .object(let row) = value,
+                      case .string(let archivedID)? = row["id"] else {
+                    throw NSError(domain: "NativeAgent", code: -422, userInfo: [
+                        NSLocalizedDescriptionKey: "chat archive tail is unreadable; refusing to overwrite it"
+                    ])
+                }
+                archivedIDs.insert(archivedID)
+            }
+            let alreadyArchived = archivedIDs.contains(id)
+            if !alreadyArchived {
+                var nextTail = existingTail
+                if !nextTail.isEmpty, nextTail.last != 10 { nextTail.append(10) }
+                nextTail.append(archivedData)
+                try nextTail.write(to: archivePath, options: .atomic)
+            }
+
+            // The tail is the durable claim. If the index commit faults after
+            // it lands, a retry sees this same id in the tail and only removes
+            // the live row; it never appends another archival record.
+            try afterArchiveTailWrite?()
+            rows.remove(at: index)
+
+            if rows.isEmpty {
+                try FileManager.default.removeItem(at: sessionsPath)
+            } else {
+                try ChatSessionIndexFile.serializedData(for: rows)
+                    .write(to: sessionsPath, options: .atomic)
+            }
+            return try JSONDecoder.nativeAgent.decode(ChatSession.self, from: archivedData)
+        }
     }
 
     func verifyCodex() async throws -> CodexCheckResponse {
@@ -689,7 +829,7 @@ extension NativeClient {
         // the write flag is OFF the scaffold never runs and the compiled
         // read stays pure (production read-flag-only path unchanged).
         do {
-            let writer = makePersonaEngineWriter()
+            let writer: any PersonaEngineWriting = dataRootOverride.map(SwiftNativePersonaEngine.isolated(dataRoot:)) ?? makePersonaEngineWriter()
             try await writer.scaffoldMissingDocs()
         }
         return try await swiftCompiledPersonality(surface: surface)
@@ -724,7 +864,7 @@ extension NativeClient {
         // this closes). When the write flag is OFF, the scaffold never runs
         // and the read is pure (production read-flag-only path unchanged).
         do {
-            let writer = makePersonaEngineWriter()
+            let writer: any PersonaEngineWriting = dataRootOverride.map(SwiftNativePersonaEngine.isolated(dataRoot:)) ?? makePersonaEngineWriter()
             try await writer.scaffoldMissingDocs()
         }
         return try await swiftPersonalityDocs()
@@ -758,7 +898,7 @@ extension NativeClient {
     // Persona writes now route through the Swift writer directly; unsupported
     // inputs fail closed inside PersonaEngine.
     func savePersonalityDoc(id: String, content: String) async throws -> PersonalityDoc {
-        let engine = makePersonaEngineWriter()
+        let engine: any PersonaEngineWriting = dataRootOverride.map(SwiftNativePersonaEngine.isolated(dataRoot:)) ?? makePersonaEngineWriter()
         let spec = try await engine.savePersonalityDoc(id: id, content: content)
         return PersonalityDoc(
             id: spec.id,
@@ -771,7 +911,7 @@ extension NativeClient {
     }
 
     func getPrivacyMap(includeInventory: Bool = true) async throws -> PrivacyMap {
-        let dataRoot = PersistenceCore.defaultDataRoot()
+        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         return PrivacyMap(
             dataRoot: dataRoot.path,
             categories: Self.privacyCategories(

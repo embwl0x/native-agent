@@ -21,6 +21,33 @@ import UniformTypeIdentifiers
 import NativeAgentCore
 import PersistenceCore
 
+/// The resize lifecycle's decision boundary. The view owns geometry and the
+/// scroll proxy; this compact policy owns the user-position invariant so the
+/// debounced task cannot accidentally re-pin a history reader or a closed
+/// panel.
+enum DetachedChatResizeRepin {
+    static let settleDelayNanoseconds: UInt64 = 150_000_000
+
+    /// A resize burst snapshots the bottom sentinel only once. Later geometry
+    /// ticks may occur after reflow has displaced that sentinel, which must
+    /// not rewrite what the user was reading when the drag began.
+    static func shouldSnapshotBottom(hasPendingSettle: Bool) -> Bool {
+        !hasPendingSettle
+    }
+
+    /// Only the latest, live resize task for a bottom-pinned transcript may
+    /// scroll. In particular, cancellation is not a harmless early wake-up:
+    /// it means the panel disappeared or a newer geometry tick superseded it.
+    static func shouldRepin(
+        settledToken: Int,
+        currentToken: Int,
+        wasAtBottom: Bool,
+        isCancelled: Bool
+    ) -> Bool {
+        !isCancelled && settledToken == currentToken && wasAtBottom
+    }
+}
+
 struct DetachedChatPanelView: View {
     let sessionId: String
     @Environment(AppModel.self) private var appModel
@@ -117,8 +144,15 @@ struct DetachedChatPanelView: View {
         appModel.trustPolicy?.multimodalPolicy?.screen_capture == true
     }
 
-    private var sessionTitle: String {
-        appModel.chatSessions.first(where: { $0.id == sessionId })?.displayTitle ?? "Chat"
+    private var sessionPresentation: DetachedChatSessionPresentation {
+        DetachedChatSessionPresentation.resolve(
+            sessionId: sessionId,
+            sessions: appModel.chatSessions
+        )
+    }
+
+    private var sessionIsAvailable: Bool {
+        sessionPresentation.isAvailable
     }
 
     private var personaName: String {
@@ -172,6 +206,7 @@ struct DetachedChatPanelView: View {
             messageScrollback
             Divider()
             inputBar
+                .disabled(!sessionIsAvailable)
         }
         .frame(minWidth: 380, minHeight: 280)
         .background(Color(nsColor: .windowBackgroundColor))
@@ -221,6 +256,12 @@ struct DetachedChatPanelView: View {
             // F1: invalidate any scroll scheduled against the now-dead proxy
             // (same contract as `ChatView.swift:1032`).
             scrollCoordinator.markViewDisappeared()
+            // Task.sleep wakes early on cancel, so invalidate before
+            // cancellation: a late resize settle must not target a panel that
+            // has already left the hierarchy.
+            resizeBurstToken += 1
+            resizeSettleTask?.cancel()
+            resizeSettleTask = nil
             // H5: hand the uncommitted draft back so closing the panel never
             // eats typed text (the main window adopts it on session switch).
             appModel.commitChatDraft(panelDraft, sessionId: sessionId)
@@ -255,7 +296,10 @@ struct DetachedChatPanelView: View {
                             .font(NativeAgentFont.tag)
                             .foregroundStyle(.yellow)
                     }
-                    if messages.isEmpty {
+                    if !sessionIsAvailable {
+                        detachedSessionUnavailableState
+                            .frame(maxWidth: .infinity, minHeight: 220)
+                    } else if messages.isEmpty {
                         detachedEmptyState
                             .frame(maxWidth: .infinity, minHeight: 220)
                     } else {
@@ -305,7 +349,7 @@ struct DetachedChatPanelView: View {
             // Empty/placeholder states anchor to the TOP: the anchor also
             // aligns content SHORTER than the viewport, and a lone empty-state
             // card shoved to the bottom of a 600pt panel reads as broken.
-            .modifier(DetachedScrollAnchorModifier(isEmpty: messages.isEmpty))
+            .modifier(DetachedScrollAnchorModifier(isEmpty: messages.isEmpty || !sessionIsAvailable))
             .safeAreaInset(edge: .top, spacing: 0) {
                 if showTranscriptSearch {
                     MacChatTranscriptSearchBar(
@@ -331,17 +375,27 @@ struct DetachedChatPanelView: View {
             .background(
                 GeometryReader { geo in
                     Color.clear.onChange(of: geo.size) {
-                        if resizeSettleTask == nil {
+                        if DetachedChatResizeRepin.shouldSnapshotBottom(
+                            hasPendingSettle: resizeSettleTask != nil
+                        ) {
                             resizeWasAtBottom = bottomAnchorVisible
                         }
                         resizeBurstToken += 1
                         let token = resizeBurstToken
                         resizeSettleTask?.cancel()
                         resizeSettleTask = Task { @MainActor in
-                            try? await Task.sleep(nanoseconds: 150_000_000)
+                            try? await Task.sleep(
+                                nanoseconds: DetachedChatResizeRepin.settleDelayNanoseconds
+                            )
                             // A newer tick superseded this one (its own task
-                            // owns the settle) — bail without touching state.
-                            guard token == resizeBurstToken else { return }
+                            // owns the settle), and a cancelled panel must
+                            // never get a late scroll after it has closed.
+                            guard DetachedChatResizeRepin.shouldRepin(
+                                settledToken: token,
+                                currentToken: resizeBurstToken,
+                                wasAtBottom: resizeWasAtBottom,
+                                isCancelled: Task.isCancelled
+                            ) else { return }
                             if resizeWasAtBottom {
                                 proxy.scrollTo(detachedBottomAnchor, anchor: .bottom)
                             }
@@ -443,19 +497,42 @@ struct DetachedChatPanelView: View {
         }
     }
 
+    @ViewBuilder
     private var emptyState: some View {
+        if case let .available(title) = sessionPresentation {
+            VStack(spacing: 8) {
+                Image(systemName: "bubble.left.and.bubble.right")
+                    .font(.system(size: 30))
+                    .foregroundStyle(.secondary)
+                Text("Detached session")
+                    .font(NativeAgentFont.section)
+                Text("Messages you send here go to “\(title)”. This window stays open and pinned until you close it.")
+                    .font(NativeAgentFont.tag)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 24)
+            }
+        }
+    }
+
+    private var detachedSessionUnavailableState: some View {
         VStack(spacing: 8) {
-            Image(systemName: "bubble.left.and.bubble.right")
+            Image(systemName: "exclamationmark.triangle.fill")
                 .font(.system(size: 30))
-                .foregroundStyle(.secondary)
-            Text("Detached session")
+                .foregroundStyle(.yellow)
+            Text(DetachedChatSessionPresentation.unavailableTitle)
                 .font(NativeAgentFont.section)
-            Text("Messages you send here go to “\(sessionTitle)”. This window stays open and pinned until you close it.")
+            Text(DetachedChatSessionPresentation.unavailableDetail)
                 .font(NativeAgentFont.tag)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 24)
         }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            DetachedChatSessionPresentation.unavailableTitle
+                + ". " + DetachedChatSessionPresentation.unavailableDetail
+        )
     }
 
     // MARK: - Input
@@ -502,7 +579,7 @@ struct DetachedChatPanelView: View {
             MacChatComposerControlStrip(
                 isListening: voiceInput.isListening,
                 screenCaptureAllowed: screenCaptureAllowed,
-                screenCaptureDisabled: isBusy || isCapturing || !screenCaptureAllowed,
+                screenCaptureDisabled: !sessionIsAvailable || isBusy || isCapturing || !screenCaptureAllowed,
                 pendingAttachmentCount: pendingAttachments.count,
                 isRunning: isBusy,
                 canSend: canSend,
@@ -546,11 +623,13 @@ struct DetachedChatPanelView: View {
     }
 
     private var canSend: Bool {
-        !isCapturing
+        sessionIsAvailable
+            && !isCapturing
             && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !pendingAttachments.isEmpty)
     }
 
     private func send() {
+        guard ensureSessionIsAvailable() else { return }
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         let attachments = pendingAttachments
         guard !isCapturing, (!text.isEmpty || !attachments.isEmpty) else { return }
@@ -577,16 +656,18 @@ struct DetachedChatPanelView: View {
     private func toggleVoice() {
         if voiceInput.isListening {
             Task { @MainActor in
-                let final = await voiceInput.stopListening()
+                let result = await voiceInput.stopListeningResult()
+                let final = result.transcriptForSubmission
                 if final.isEmpty {
                     draft = voiceDraftBeforeListening
-                    showToast("No speech detected")
+                    showToast(result.userFacingFailureMessage ?? "No speech detected")
                 } else {
                     draft = composeVoiceDraft(final)
                 }
                 voiceDraftBeforeListening = ""
             }
         } else {
+            guard ensureSessionIsAvailable() else { return }
             voiceInput.errorMessage = nil
             showToast("Checking microphone...")
             Task {
@@ -595,6 +676,7 @@ struct DetachedChatPanelView: View {
                     showToast(voiceInput.errorMessage ?? "Microphone or speech permission denied.")
                     return
                 }
+                guard ensureSessionIsAvailable() else { return }
                 voiceDraftBeforeListening = draft
                 voiceInput.startListening()
                 if let msg = voiceInput.errorMessage, !voiceInput.isListening {
@@ -607,6 +689,7 @@ struct DetachedChatPanelView: View {
     }
 
     private func captureScreen() {
+        guard ensureSessionIsAvailable() else { return }
         guard !isCapturing else { return }
         guard screenCaptureAllowed else {
             showToast("Enable screen capture in Trust -> Multimodal Capabilities")
@@ -639,6 +722,7 @@ struct DetachedChatPanelView: View {
                     name: capture.name,
                     byteSize: capture.byteSize
                 )
+                guard ensureSessionIsAvailable() else { return }
                 let acceptance = await appModel.startChatTurnForSession(
                     prompt,
                     attachments: capturedAttachments + [attachment],
@@ -671,6 +755,7 @@ struct DetachedChatPanelView: View {
     }
 
     private func attachFromClipboardOrPickFile() {
+        guard ensureSessionIsAvailable() else { return }
         if clipboardHasImage() {
             if let att = pasteImageFromClipboard() {
                 pendingAttachments.append(att)
@@ -712,6 +797,7 @@ struct DetachedChatPanelView: View {
                 showToast("Couldn't read file: \(url.lastPathComponent)")
                 return
             }
+            guard ensureSessionIsAvailable() else { return }
             let att = MultimodalAttachment(
                 type: attachmentInfo.type,
                 base64: data.base64EncodedString(),
@@ -733,9 +819,41 @@ struct DetachedChatPanelView: View {
             }
         }
     }
+
+    private func ensureSessionIsAvailable() -> Bool {
+        guard sessionIsAvailable else {
+            showToast(DetachedChatSessionPresentation.unavailableActionMessage)
+            return false
+        }
+        return true
+    }
 }
 
 private let detachedBottomAnchor = "detached-chat-bottom-anchor"
+
+/// Resolves the fixed destination of a mounted detached panel. The window can
+/// outlive a session deletion, so a missing row is an unavailable destination,
+/// never a generic chat named "Chat".
+enum DetachedChatSessionPresentation: Equatable {
+    case available(title: String)
+    case unavailable
+
+    static let unavailableTitle = "This chat session is no longer available"
+    static let unavailableDetail = "Messages cannot be sent from this window. Close it and choose another conversation in the main app."
+    static let unavailableActionMessage = "This chat session is no longer available. Your message was not sent."
+
+    static func resolve(sessionId: String, sessions: [ChatSession]) -> Self {
+        guard let session = sessions.first(where: { $0.id == sessionId }) else {
+            return .unavailable
+        }
+        return .available(title: session.displayTitle)
+    }
+
+    var isAvailable: Bool {
+        if case .available = self { return true }
+        return false
+    }
+}
 
 // Plain-English copy for the detached panel's load-failure state. Pure strings
 // so the wording is unit-testable; the view only decides where to put them.

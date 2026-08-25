@@ -26,5 +26,5 @@ Keep the agent brain lightweight. Let macOS provide native reach through narrowl
    - Use receipts so the user can inspect what happened without bloating chat context.
 
 5. Re-check bloat constraints after adding capability.
-   - Run the consolidation guard before and after capability changes when working in NativeAgent.
+   - After the complete capability is integrated and built, run the consolidation guard once at the final validation checkpoint.
    - Ensure capability bodies are not autoloaded and context routes remain within budget.

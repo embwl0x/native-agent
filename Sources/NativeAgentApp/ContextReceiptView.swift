@@ -16,19 +16,56 @@ import CoreSpotlight
 import CloudKit
 #endif
 
+/// Value-only receipt rendering rules. Context receipts are diagnostic truth:
+/// absent data is unknown, not a confident zero or an omitted field.
+enum ContextReceiptPresentation {
+    static func metricValue(_ value: Int?) -> String {
+        guard let value else { return "unknown" }
+        return "\(value)"
+    }
+
+    static func hasReceiptIdentity(fingerprint: String?, runID: String?) -> Bool {
+        fingerprint != nil || runID != nil
+    }
+
+    static func cacheDisplayText(status: String?, hit: Bool?, budgetStatus: String?) -> String? {
+        if let status, !status.isEmpty { return status }
+        if let hit { return hit ? "cache hit" : "cache miss" }
+        if let budgetStatus, !budgetStatus.isEmpty { return budgetStatus }
+        return nil
+    }
+
+    static func optionalValue(_ value: Int?) -> String {
+        value.map(String.init) ?? "unknown"
+    }
+
+    static func optionalText(_ value: String?) -> String {
+        guard let value, !value.isEmpty else { return "unknown" }
+        return value
+    }
+
+    static func remainingCount(total: Int, displayed: Int) -> Int? {
+        let remainder = total - displayed
+        return remainder > 0 ? remainder : nil
+    }
+}
+
 struct ContextReceiptView: View {
     var context: ContextReceipt?
 
     var body: some View {
         NativePanel(title: "Context Receipt", systemImage: "shippingbox") {
-            if let context, context.fingerprint != nil || context.runId != nil {
+            if let context, ContextReceiptPresentation.hasReceiptIdentity(
+                fingerprint: context.fingerprint,
+                runID: context.runId
+            ) {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 130), spacing: 10)], spacing: 10) {
-                    MetricTile(title: "History", value: "\(context.budgets?.historyChars ?? 0)", systemImage: "text.bubble")
-                    MetricTile(title: "Memory", value: "\(context.budgets?.memoryChars ?? 0)", systemImage: "brain")
-                    MetricTile(title: "System Map", value: "\(context.budgets?.agentMapChars ?? 0)", systemImage: "map")
-                    MetricTile(title: "Budget", value: "\(context.budgetTotals?.displayTotal ?? context.budgets?.displayTotal ?? 0)", systemImage: "speedometer")
+                    MetricTile(title: "History", value: ContextReceiptPresentation.metricValue(context.budgets?.historyChars), systemImage: "text.bubble")
+                    MetricTile(title: "Memory", value: ContextReceiptPresentation.metricValue(context.budgets?.memoryChars), systemImage: "brain")
+                    MetricTile(title: "System Map", value: ContextReceiptPresentation.metricValue(context.budgets?.agentMapChars), systemImage: "map")
+                    MetricTile(title: "Budget", value: ContextReceiptPresentation.metricValue(context.budgetTotals?.displayTotal ?? context.budgets?.displayTotal), systemImage: "speedometer")
                     MetricTile(title: "Skills", value: "\(context.selectedSkillsForDisplay.count)", systemImage: "list.bullet.rectangle")
-                    MetricTile(title: "Tools", value: "\(context.budgets?.toolResultChars ?? 0)", systemImage: "hammer")
+                    MetricTile(title: "Tools", value: ContextReceiptPresentation.metricValue(context.budgets?.toolResultChars), systemImage: "hammer")
                 }
                 HStack {
                     if let surface = context.surface {
@@ -49,8 +86,7 @@ struct ContextReceiptView: View {
                 }
                 .lineLimit(1)
 
-                if let budget = context.budgetTotals ?? context.budgets,
-                   budget.maxChars != nil || budget.remainingChars != nil || budget.cacheStatus != nil || budget.cacheKey != nil {
+                if let budget = context.budgetTotals ?? context.budgets {
                     ContextBudgetDetailView(budget: budget)
                 }
 
@@ -66,6 +102,10 @@ struct ContextReceiptView: View {
                 ContextSelectionSection(title: "Memories", systemImage: "brain", items: context.selectedMemories ?? [])
                 ContextSelectionSection(title: "Tools", systemImage: "hammer", items: context.selectedTools ?? [])
                 ContextSelectionSection(title: "Skills", systemImage: "list.bullet.rectangle", items: context.selectedSkillsForDisplay)
+            } else if context != nil {
+                Text("Context receipt is incomplete and cannot be identified.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
             } else {
                 Text("Send a message to generate a context receipt.")
                     .font(.caption)
@@ -86,16 +126,11 @@ private extension ContextReceipt {
     }
 
     var cacheDisplayText: String? {
-        if let status = cacheState?.status, !status.isEmpty {
-            return status
-        }
-        if let hit = cacheState?.hit ?? budgetTotals?.cached ?? budgets?.cached {
-            return hit ? "cache hit" : "cache miss"
-        }
-        if let status = budgetTotals?.cacheStatus ?? budgets?.cacheStatus, !status.isEmpty {
-            return status
-        }
-        return nil
+        ContextReceiptPresentation.cacheDisplayText(
+            status: cacheState?.status,
+            hit: cacheState?.hit ?? budgetTotals?.cached ?? budgets?.cached,
+            budgetStatus: budgetTotals?.cacheStatus ?? budgets?.cacheStatus
+        )
     }
 }
 
@@ -105,18 +140,10 @@ struct ContextBudgetDetailView: View {
     var body: some View {
         HStack(spacing: 8) {
             InfoPill(text: "total \(budget.displayTotal)", systemImage: "sum")
-            if let maxChars = budget.maxChars {
-                InfoPill(text: "max \(maxChars)", systemImage: "gauge.with.dots.needle.bottom.50percent")
-            }
-            if let remainingChars = budget.remainingChars {
-                InfoPill(text: "remaining \(remainingChars)", systemImage: "minus.forwardslash.plus")
-            }
-            if let cacheStatus = budget.cacheStatus {
-                InfoPill(text: cacheStatus, systemImage: "externaldrive.badge.icloud")
-            }
-            if let cacheKey = budget.cacheKey {
-                InfoPill(text: cacheKey, systemImage: "number")
-            }
+            InfoPill(text: "max \(ContextReceiptPresentation.optionalValue(budget.maxChars))", systemImage: "gauge.with.dots.needle.bottom.50percent")
+            InfoPill(text: "remaining \(ContextReceiptPresentation.optionalValue(budget.remainingChars))", systemImage: "minus.forwardslash.plus")
+            InfoPill(text: ContextReceiptPresentation.optionalText(budget.cacheStatus), systemImage: "externaldrive.badge.icloud")
+            InfoPill(text: ContextReceiptPresentation.optionalText(budget.cacheKey), systemImage: "number")
         }
     }
 }
@@ -137,6 +164,12 @@ struct ContextStringListView: View {
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .textSelection(.enabled)
+            }
+            if let remaining = ContextReceiptPresentation.remainingCount(total: values.count, displayed: 6) {
+                Text("+\(remaining) more")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("\(remaining) additional \(title.lowercased()) entries")
             }
         }
     }
@@ -168,6 +201,11 @@ struct ContextInjectedSectionsView: View {
                     .padding(8)
                     .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
                 }
+            }
+            if let remaining = ContextReceiptPresentation.remainingCount(total: sections.count, displayed: 8) {
+                Text("+\(remaining) more")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -212,7 +250,122 @@ struct ContextSelectionSection: View {
                         }
                     }
                 }
+                if let remaining = ContextReceiptPresentation.remainingCount(total: items.count, displayed: 6) {
+                    Text("+\(remaining) more")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
             }
+        }
+    }
+}
+
+/// Shared state transitions for the sidebar and pinned-tab rename editors.
+/// A structural disappearance is always a cancel, and only one terminal event
+/// may escape even when Escape is immediately followed by focus loss.
+struct ChatRenameStateMachine: Equatable {
+    enum EndResult: Equatable {
+        case ignored
+        case cancelled
+        case committed(String)
+    }
+
+    var draftTitle = ""
+    private(set) var isRenaming = false
+    private var ended = false
+
+    mutating func begin(title: String) {
+        draftTitle = title
+        isRenaming = true
+        ended = false
+    }
+
+    mutating func syncExternalTitle(_ title: String) {
+        guard !isRenaming else { return }
+        draftTitle = title
+    }
+
+    mutating func submit(currentTitle: String) -> EndResult {
+        let cleaned = draftTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty, cleaned != currentTitle else { return finish(.cancelled) }
+        return finish(.committed(cleaned))
+    }
+
+    mutating func cancel() -> EndResult {
+        finish(.cancelled)
+    }
+
+    mutating func focusChanged(isFocused: Bool, currentTitle: String) -> EndResult {
+        guard !isFocused, isRenaming else { return .ignored }
+        return submit(currentTitle: currentTitle)
+    }
+
+    private mutating func finish(_ result: EndResult) -> EndResult {
+        guard !ended else { return .ignored }
+        ended = true
+        isRenaming = false
+        return result
+    }
+}
+
+/// One source of truth for the sidebar row's two rename entry points. The
+/// pencil is intentionally hover-only, while the context-menu action remains
+/// available whenever a caller supplies a rename handler so keyboard and
+/// assistive-technology users never depend on pointer hover.
+struct SessionRowRenamePencilPresentation: Equatable {
+    let opacity: Double
+    let allowsHitTesting: Bool
+    let accessibilityHidden: Bool
+    let contextMenuRenameAvailable: Bool
+
+    static func make(
+        renameAvailable: Bool,
+        hovering: Bool,
+        renaming: Bool
+    ) -> Self {
+        let pencilVisible = renameAvailable && hovering && !renaming
+        return Self(
+            opacity: pencilVisible ? 1 : 0,
+            allowsHitTesting: pencilVisible,
+            accessibilityHidden: !pencilVisible,
+            contextMenuRenameAvailable: renameAvailable
+        )
+    }
+}
+
+/// Session-level origin is a trust boundary. Unlike a message's origin, this
+/// follows the whole conversation in the sidebar, so never interpolate a raw
+/// stored value or silently hide a missing one.
+struct ChatSidebarSessionSourceBadge: Equatable {
+    enum Tone: Equatable {
+        case remote
+        case unknown
+    }
+
+    let label: String
+    let symbol: String
+    let tone: Tone
+
+    static func make(source: String?) -> Self? {
+        guard let raw = source?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty
+        else {
+            return Self(label: "Unknown origin", symbol: "questionmark.circle", tone: .unknown)
+        }
+
+        switch raw.lowercased() {
+        case "app":
+            return nil
+        case "telegram":
+            return Self(label: "Telegram", symbol: "paperplane.fill", tone: .remote)
+        case "ios", "iphone", "ipad":
+            return Self(label: "iPhone / iPad", symbol: "iphone", tone: .remote)
+        case "slack":
+            return Self(label: "Slack", symbol: "bubble.left.and.bubble.right.fill", tone: .remote)
+        case "bridge", "agent_bridge":
+            return Self(label: "Bridge", symbol: "arrow.left.arrow.right", tone: .remote)
+        default:
+            return Self(label: "External source", symbol: "exclamationmark.triangle", tone: .unknown)
         }
     }
 }
@@ -224,11 +377,25 @@ struct ContextSelectionSection: View {
 // commits, Esc cancels, focus-loss commits, empty reverts) so the two
 // surfaces never teach conflicting muscle memory.
 struct SessionRow: View {
+    enum PinState {
+        case unpinned
+        case pinned(onUnpin: () -> Void)
+
+        var isPinned: Bool {
+            if case .pinned = self { return true }
+            return false
+        }
+
+        func performUnpin() {
+            guard case let .pinned(onUnpin) = self else { return }
+            onUnpin()
+        }
+    }
+
     var session: ChatSession
     var selected: Bool
-    var pinned: Bool = false
+    var pinState: PinState
     var renaming: Bool = false
-    var onUnpin: (() -> Void)? = nil
     var onRenameBegin: (() -> Void)? = nil
     /// nil = rename canceled/no-op; non-nil = commit this cleaned title.
     var onRenameEnd: ((String?) -> Void)? = nil
@@ -236,21 +403,26 @@ struct SessionRow: View {
     @State private var hovering = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    @State private var draftTitle = ""
+    @State private var renameState = ChatRenameStateMachine()
     @FocusState private var titleFocused: Bool
     // One rename ends exactly once. Esc fires onExitCommand AND the resulting
     // focus loss fires the onChange commit before the parent's renaming=false
     // re-render lands — without this guard a canceled edit could still
     // commit. (PinnedSessionTab gets this for free from its local isRenaming;
     // this row's rename state lives in the parent, so the sync guard is local.)
-    @State private var renameEnded = false
+
+    private var renamePencil: SessionRowRenamePencilPresentation {
+        SessionRowRenamePencilPresentation.make(
+            renameAvailable: onRenameBegin != nil,
+            hovering: hovering,
+            renaming: renaming
+        )
+    }
 
     var body: some View {
         HStack(spacing: 6) {
-            if pinned {
-                Button {
-                    onUnpin?()
-                } label: {
+            if pinState.isPinned {
+                Button(action: pinState.performUnpin) {
                     Image(systemName: "pin.fill")
                         .font(.caption2)
                         .foregroundStyle(Color.accentColor)
@@ -278,17 +450,19 @@ struct SessionRow: View {
                 }
                 .buttonStyle(.plain)
                 .frame(width: 14)
-                .opacity(hovering && !renaming ? 1 : 0)
-                .allowsHitTesting(hovering && !renaming)
+                .opacity(renamePencil.opacity)
+                .allowsHitTesting(renamePencil.allowsHitTesting)
                 .help("Rename session")
                 .accessibilityLabel("Rename session")
-                .accessibilityHidden(!(hovering && !renaming))
+                .accessibilityIdentifier("chat.sidebar.session.rename-pencil.\(session.id)")
+                .accessibilityHidden(renamePencil.accessibilityHidden)
             }
-            if let source = session.source, source != "app" {
-                Text(source)
+            if let sourceBadge = ChatSidebarSessionSourceBadge.make(source: session.source) {
+                Label(sourceBadge.label, systemImage: sourceBadge.symbol)
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(sourceBadge.tone == .remote ? Color.orange : Color.red)
                     .lineLimit(1)
+                    .accessibilityLabel("Session origin: \(sourceBadge.label)")
             }
             if selected {
                 Image(systemName: "checkmark.circle.fill")
@@ -319,12 +493,12 @@ struct SessionRow: View {
     @ViewBuilder
     private var titleView: some View {
         if renaming {
-            TextField("Session", text: $draftTitle)
+            TextField("Session", text: $renameState.draftTitle)
                 .textFieldStyle(.plain)
                 .font(.subheadline.weight(.semibold))
                 .lineLimit(1)
                 .focused($titleFocused)
-                .onSubmit { commitRename() }
+                .onSubmit { endRename(renameState.submit(currentTitle: session.title)) }
                 // COMMIT only on deliberate signals: Enter, or genuine focus
                 // loss (clicking the search field / composer — real focus
                 // targets). Everything structural CANCELS: Esc, clicking
@@ -333,21 +507,23 @@ struct SessionRow: View {
                 // removing it — a disappearance can't tell click-away from
                 // recycling, and committing a half-typed title on a scroll
                 // is worse than dropping an edit (review round 3).
-                // renameEnded keeps every end path single-fire.
+                // The shared state machine keeps every end path single-fire.
                 .onKeyPress(.escape) {
-                    endRename(nil)
+                    endRename(renameState.cancel())
                     return .handled
                 }
-                .onExitCommand { endRename(nil) }
+                .onExitCommand { endRename(renameState.cancel()) }
                 .onChange(of: titleFocused) { _, focused in
-                    if !focused && renaming { commitRename() }
+                    endRename(renameState.focusChanged(
+                        isFocused: focused,
+                        currentTitle: session.title
+                    ))
                 }
                 .onAppear {
-                    draftTitle = session.title
-                    renameEnded = false
+                    renameState.begin(title: session.title)
                     DispatchQueue.main.async { titleFocused = true }
                 }
-                .onDisappear { endRename(nil) }
+                .onDisappear { endRename(renameState.cancel()) }
         } else {
             Text(session.displayTitle)
                 .font(.subheadline.weight(selected ? .semibold : .regular))
@@ -356,19 +532,35 @@ struct SessionRow: View {
         }
     }
 
-    private func commitRename() {
-        let clean = draftTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clean.isEmpty, clean != session.title else {
-            endRename(nil)
+    private func endRename(_ result: ChatRenameStateMachine.EndResult) {
+        switch result {
+        case .ignored:
             return
+        case .cancelled:
+            onRenameEnd?(nil)
+        case .committed(let title):
+            onRenameEnd?(title)
         }
-        endRename(clean)
+    }
+}
+
+enum PinnedSessionTabPresentation {
+    static func tabAccessibilityLabel(for session: ChatSession) -> String {
+        session.displayTitle
     }
 
-    private func endRename(_ result: String?) {
-        guard !renameEnded else { return }
-        renameEnded = true
-        onRenameEnd?(result)
+    static func closeAccessibilityLabel(for session: ChatSession) -> String {
+        "Close pinned tab \(session.displayTitle)"
+    }
+
+    static func showsRunningIndicator(
+        sessionID: String,
+        streamingSessionIDs: Set<String>
+    ) -> Bool {
+        guard !sessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+        return streamingSessionIDs.contains(sessionID)
     }
 }
 
@@ -410,7 +602,10 @@ struct PinnedSessionTabStrip: View {
                             PinnedSessionTab(
                                 session: session,
                                 selected: session.id == activeSessionId,
-                                running: runningSessionIds.contains(session.id),
+                                running: PinnedSessionTabPresentation.showsRunningIndicator(
+                                    sessionID: session.id,
+                                    streamingSessionIDs: runningSessionIds
+                                ),
                                 onSelect: { onSelect(session) },
                                 onClose: { onClose(session) },
                                 onRename: { title in onRename(session, title) }
@@ -450,8 +645,7 @@ private struct PinnedSessionTab: View {
     var onSelect: () -> Void
     var onClose: () -> Void
     var onRename: (String) -> Void
-    @State private var isRenaming = false
-    @State private var draftTitle = ""
+    @State private var renameState = ChatRenameStateMachine()
     @State private var hovering = false
     @FocusState private var titleFocused: Bool
 
@@ -468,6 +662,7 @@ private struct PinnedSessionTab: View {
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
             .help("Unpin tab")
+            .accessibilityLabel(PinnedSessionTabPresentation.closeAccessibilityLabel(for: session))
         }
         .padding(.leading, 10)
         .padding(.trailing, 6)
@@ -481,12 +676,10 @@ private struct PinnedSessionTab: View {
             }
         }
         .onAppear {
-            draftTitle = session.title
+            renameState.syncExternalTitle(session.title)
         }
         .onChange(of: session.title) { _, newTitle in
-            if !isRenaming {
-                draftTitle = newTitle
-            }
+            renameState.syncExternalTitle(newTitle)
         }
         // ui-polish 2026-05-22 — replace flat 7-radius fill+stroke with the
         // design-system material vocabulary (cf. NativePanel/GlassCard):
@@ -519,31 +712,32 @@ private struct PinnedSessionTab: View {
 
     @ViewBuilder
     private var tabTitle: some View {
-        if isRenaming {
-            TextField("Session", text: $draftTitle)
+        if renameState.isRenaming {
+            TextField("Session", text: $renameState.draftTitle)
                 .textFieldStyle(.plain)
                 .font(NativeAgentFont.tag.weight(.semibold))
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .focused($titleFocused)
                 .onSubmit {
-                    commitRename()
+                    finishRename(renameState.submit(currentTitle: session.title))
                 }
                 // Esc gets both SwiftUI cancel paths, matching SessionRow.
                 .onKeyPress(.escape) {
-                    cancelRename()
+                    finishRename(renameState.cancel())
                     return .handled
                 }
                 .onExitCommand {
-                    cancelRename()
+                    finishRename(renameState.cancel())
                 }
                 .onChange(of: titleFocused) { _, focused in
-                    if !focused && isRenaming {
-                        commitRename()
-                    }
+                    finishRename(renameState.focusChanged(
+                        isFocused: focused,
+                        currentTitle: session.title
+                    ))
                 }
                 .onAppear {
-                    draftTitle = session.title
+                    renameState.begin(title: session.title)
                     DispatchQueue.main.async {
                         titleFocused = true
                     }
@@ -565,6 +759,7 @@ private struct PinnedSessionTab: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .accessibilityLabel(PinnedSessionTabPresentation.tabAccessibilityLabel(for: session))
             .simultaneousGesture(
                 TapGesture(count: 2).onEnded {
                     beginRename()
@@ -575,24 +770,12 @@ private struct PinnedSessionTab: View {
     }
 
     private func beginRename() {
-        draftTitle = session.title
-        isRenaming = true
+        renameState.begin(title: session.title)
     }
 
-    private func cancelRename() {
-        draftTitle = session.title
-        isRenaming = false
-    }
-
-    private func commitRename() {
-        let cleanTitle = draftTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanTitle.isEmpty else {
-            cancelRename()
-            return
-        }
-        isRenaming = false
-        if cleanTitle != session.title {
-            onRename(cleanTitle)
+    private func finishRename(_ result: ChatRenameStateMachine.EndResult) {
+        if case .committed(let title) = result {
+            onRename(title)
         }
     }
 }

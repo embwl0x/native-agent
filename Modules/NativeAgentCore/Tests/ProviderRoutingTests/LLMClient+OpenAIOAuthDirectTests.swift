@@ -191,27 +191,75 @@ private func stubSession() -> URLSession {
     // ---------- Model coercion (Python parity) ----------
 
     @Test func model_coercion_passes_gpt_through() throws {
-        #expect(OpenAIOAuthDirectAdapter.coerceToGPTModel("gpt-5.5") == nativeAgentPrimaryModel)
-        #expect(OpenAIOAuthDirectAdapter.coerceToGPTModel("gpt-4o") == "gpt-4o")
+        #expect(try OpenAIOAuthDirectAdapter.coerceToGPTModel("gpt-5.5") == nativeAgentPrimaryModel)
+        #expect(try OpenAIOAuthDirectAdapter.coerceToGPTModel("gpt-4o") == "gpt-4o")
     }
 
     @Test func model_coercion_strips_openai_namespace() throws {
-        #expect(OpenAIOAuthDirectAdapter.coerceToGPTModel("openai/gpt-5.5") == nativeAgentPrimaryModel)
-        #expect(OpenAIOAuthDirectAdapter.coerceToGPTModel("openai/gpt-4o") == "gpt-4o")
+        #expect(try OpenAIOAuthDirectAdapter.coerceToGPTModel("openai/gpt-5.5") == nativeAgentPrimaryModel)
+        #expect(try OpenAIOAuthDirectAdapter.coerceToGPTModel("openai/gpt-4o") == "gpt-4o")
     }
 
     @Test func model_coercion_remaps_claude_to_gpt_default() throws {
         // Defensive remap preserves retired L136-L143 behavior — Anthropic ids that
         // accidentally land on this adapter must not 404 the chatgpt.com
         // backend.
-        #expect(OpenAIOAuthDirectAdapter.coerceToGPTModel("claude-opus-4-7") == nativeAgentPrimaryModel)
-        #expect(OpenAIOAuthDirectAdapter.coerceToGPTModel("claude-haiku-4-6") == "gpt-5.4-mini")
+        #expect(try OpenAIOAuthDirectAdapter.coerceToGPTModel("claude-opus-4-7") == nativeAgentPrimaryModel)
+        #expect(try OpenAIOAuthDirectAdapter.coerceToGPTModel("claude-haiku-4-6") == "gpt-5.4-mini")
     }
 
-    @Test func model_coercion_default_for_empty_or_unknown() throws {
-        #expect(OpenAIOAuthDirectAdapter.coerceToGPTModel(nil) == nativeAgentPrimaryModel)
-        #expect(OpenAIOAuthDirectAdapter.coerceToGPTModel("") == nativeAgentPrimaryModel)
-        #expect(OpenAIOAuthDirectAdapter.coerceToGPTModel("llama-3") == nativeAgentPrimaryModel)
+    @Test func model_coercion_default_for_empty_request() throws {
+        // An ABSENT request is not a substituted pick — the adapter default
+        // still applies. Only an id the caller actually chose and this
+        // adapter cannot serve is an error.
+        #expect(try OpenAIOAuthDirectAdapter.coerceToGPTModel(nil) == nativeAgentPrimaryModel)
+        #expect(try OpenAIOAuthDirectAdapter.coerceToGPTModel("") == nativeAgentPrimaryModel)
+    }
+
+    /// NORTHSTAR clause 2: an unrecognized id used to come back as the
+    /// primary GPT model — User's pick silently replaced and billed. It now
+    /// throws `modelUnavailable` naming the offending id.
+    @Test func model_coercion_throws_on_unrecognized_id() throws {
+        for unknown in ["llama-3", "deepseek-chat", "o3", "mistral-large"] {
+            var thrown: (any Error)?
+            do {
+                _ = try OpenAIOAuthDirectAdapter.coerceToGPTModel(unknown)
+            } catch {
+                thrown = error
+            }
+            guard case .modelUnavailable(let provider, let model)? = thrown as? LLMError else {
+                Issue.record("expected modelUnavailable for \(unknown), got \(String(describing: thrown))")
+                continue
+            }
+            #expect(provider == "openai_oauth_direct")
+            #expect(model == unknown)
+        }
+    }
+
+    /// An id normalizeModelIdStatic REJECTS (illegal characters, >100 chars)
+    /// used to come back as its fallback — which was the default GPT id, so
+    /// the rejection sailed through the `gpt-` prefix check as a second
+    /// silent substitution hiding behind the first.
+    @Test func model_coercion_throws_on_malformed_id() throws {
+        #expect(throws: LLMError.self) {
+            _ = try OpenAIOAuthDirectAdapter.coerceToGPTModel("gpt-5 turbo!!")
+        }
+        #expect(throws: LLMError.self) {
+            _ = try OpenAIOAuthDirectAdapter.coerceToGPTModel(String(repeating: "g", count: 120))
+        }
+    }
+
+    /// The surviving enumerated remaps must leave a trace on the telemetry
+    /// row; a pass-through must not claim a substitution.
+    @Test func model_coercion_substitution_trace() throws {
+        let remapped = try OpenAIOAuthDirectAdapter.coerceToGPTModel("claude-haiku-4-6")
+        #expect(OpenAIOAuthDirectAdapter.substitutionTrace(
+            requested: "claude-haiku-4-6", coerced: remapped) == "claude-haiku-4-6")
+        let passthrough = try OpenAIOAuthDirectAdapter.coerceToGPTModel("gpt-4o")
+        #expect(OpenAIOAuthDirectAdapter.substitutionTrace(
+            requested: "gpt-4o", coerced: passthrough) == nil)
+        #expect(OpenAIOAuthDirectAdapter.substitutionTrace(
+            requested: nil, coerced: nativeAgentPrimaryModel) == nil)
     }
 
     @Test func jwt_exp_claim_detection() throws {

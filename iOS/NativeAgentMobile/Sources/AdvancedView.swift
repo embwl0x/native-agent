@@ -2,7 +2,7 @@
 // PATCH-2026-05-07: mac-control-ui-1 Added Mac Tools section to AdvancedView
 // PATCH-2026-05-10: sidebar-flatten — More menu rebuilt as a flat list of
 // single-purpose destinations.  Memory + Skills came out (now primary bottom
-// tabs). Added Workshop / Personality / Connectors / Trust / Providers /
+// tabs). Added Personality / Connectors / Trust / Providers /
 // Connection to the "Manage" section so core Mac surfaces stay reachable on
 // iOS through one consistent overflow without nesting duplicate hubs.
 // PATCH-2026-06-07: mac-integration-tab-ios — Mac Integration row added to
@@ -11,13 +11,73 @@
 import SwiftUI
 import NativeAgentShared
 
+enum MoreAboutPresentation {
+    static let text = "Some advanced controls require a live Mac connection. Skill installs, eval runs, and Workshop policy editing are Mac-only today. Desk changes sync with the paired Mac."
+}
+
+@MainActor
+enum AdvancedHostViewStoreFactory {
+    static func makeSettingsStore() -> SettingsStore {
+        SettingsStore()
+    }
+}
+
+private enum MorePowerUserDestination: CaseIterable, Identifiable {
+    case knowledgeGraph
+    case turnInspector
+    case macTools
+
+    var id: String { title }
+
+    var title: String {
+        switch self {
+        case .knowledgeGraph: "Knowledge Graph"
+        case .turnInspector: "Turn Inspector"
+        case .macTools: "Mac Tools"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .knowledgeGraph: "circle.hexagongrid"
+        case .turnInspector: "waveform.path.ecg"
+        case .macTools: "macbook.and.iphone"
+        }
+    }
+
+    var sourceDescription: String {
+        switch self {
+        case .knowledgeGraph: "Mac-published iCloud snapshot"
+        case .turnInspector: "Synced turn summaries"
+        case .macTools: "Paired-Mac policy and actions"
+        }
+    }
+}
+
 // MARK: - AdvancedView (hidden behind "More" tab)
 
 struct AdvancedView: View {
+    @EnvironmentObject private var pairingStore: PairingStore
     @StateObject private var store = AdvancedStore()
+    @State private var showPairingRecovery = false
+
     var body: some View {
         NavigationStack {
             List {
+                if PairingSkipPresentation.showsRecoveryAffordance(isPaired: pairingStore.isPaired) {
+                    Section {
+                        Button {
+                            showPairingRecovery = true
+                        } label: {
+                            Label("Pair with Mac", systemImage: "link.badge.plus")
+                        }
+                        .accessibilityHint("Opens pairing so this iPhone can reconnect to the Mac.")
+                    } header: {
+                        Label("Connection required", systemImage: "icloud.slash")
+                            .font(AppFont.section)
+                    }
+                }
+
                 // ── Manage — everything the Mac sidebar promotes to primary ──
                 Section {
                     NavigationLink {
@@ -62,20 +122,17 @@ struct AdvancedView: View {
 
                 // ── Power user — opt-in deep surfaces ──
                 Section {
-                    NavigationLink {
-                        KnowledgeGraphView()
-                    } label: {
-                        Label("Knowledge Graph", systemImage: "circle.hexagongrid")
-                    }
-                    NavigationLink {
-                        TurnInspectorView()
-                    } label: {
-                        Label("Turn Inspector", systemImage: "waveform.path.ecg")
-                    }
-                    NavigationLink {
-                        MacToolsView()
-                    } label: {
-                        Label("Mac Tools", systemImage: "macbook.and.iphone")
+                    ForEach(MorePowerUserDestination.allCases) { destination in
+                        NavigationLink {
+                            powerUserDestination(destination)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Label(destination.title, systemImage: destination.systemImage)
+                                Text(destination.sourceDescription)
+                                    .font(AppFont.label)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
                     }
                 } header: {
                     Label("Power user", systemImage: "bolt.circle")
@@ -100,7 +157,7 @@ struct AdvancedView: View {
                         HStack(spacing: 10) {
                             Image(systemName: "info.circle")
                                 .foregroundStyle(NativeAgentPalette.agentAccent)
-                            Text("Some advanced controls require a live Mac connection. Skill installs, eval runs, and Workshop policy editing are Mac-only today. Desk changes sync with the paired Mac.")
+                            Text(MoreAboutPresentation.text)
                                 .font(AppFont.label)
                                 .foregroundStyle(.secondary)
                         }
@@ -113,6 +170,32 @@ struct AdvancedView: View {
                 }
             }
             .navigationTitle("More")
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    MacStatusChip()
+                }
+            }
+            .sheet(isPresented: $showPairingRecovery) {
+                PairingView(onSkip: {
+                    showPairingRecovery = false
+                }, onPaired: {
+                    showPairingRecovery = false
+                })
+                .environmentObject(pairingStore)
+            }
+        }
+        .macSyncErrorBanner()
+    }
+
+    @ViewBuilder
+    private func powerUserDestination(_ destination: MorePowerUserDestination) -> some View {
+        switch destination {
+        case .knowledgeGraph:
+            KnowledgeGraphView()
+        case .turnInspector:
+            TurnInspectorView()
+        case .macTools:
+            MacToolsView()
         }
     }
 }
@@ -122,36 +205,263 @@ struct AdvancedView: View {
 // sub-rows inside SettingsViewFull's NavigationLink list.  Each
 // re-uses the same underlying detail view SettingsViewFull pushes to.
 private struct PersonalityDetailHostView: View {
-    @StateObject private var store = SettingsStore()
+    @State private var store: SettingsStore?
+
     var body: some View {
-        PersonalityDetailView(store: store)
-            .onAppear { Task { await store.refresh() } }
+        Group {
+            if let store {
+                PersonalityDetailView(store: store)
+            } else {
+                ProgressView("Loading Personality…")
+            }
+        }
+        .onAppear { beginFreshPush() }
+    }
+
+    private func beginFreshPush() {
+        let freshStore = AdvancedHostViewStoreFactory.makeSettingsStore()
+        store = freshStore
+        Task { await freshStore.refresh() }
     }
 }
 
 private struct ConnectorsHostView: View {
-    @StateObject private var store = SettingsStore()
+    @State private var store: SettingsStore?
+
     var body: some View {
-        ConnectorsView(store: store)
-            .onAppear { Task { await store.refresh() } }
+        Group {
+            if let store {
+                ConnectorsView(store: store)
+            } else {
+                ProgressView("Loading Connectors…")
+            }
+        }
+        .onAppear { beginFreshPush() }
+    }
+
+    private func beginFreshPush() {
+        let freshStore = AdvancedHostViewStoreFactory.makeSettingsStore()
+        store = freshStore
+        Task { await freshStore.refresh() }
     }
 }
 
 private struct TrustHostView: View {
-    @StateObject private var store = SettingsStore()
+    @State private var store: SettingsStore?
+
     var body: some View {
-        TrustPolicyView(store: store)
-            .onAppear { Task { await store.refresh() } }
+        Group {
+            if let store {
+                TrustPolicyView(store: store)
+            } else {
+                ProgressView("Loading Trust Policy…")
+            }
+        }
+        .onAppear { beginFreshPush() }
+    }
+
+    private func beginFreshPush() {
+        let freshStore = AdvancedHostViewStoreFactory.makeSettingsStore()
+        store = freshStore
+        Task { await freshStore.refresh() }
     }
 }
 
 // MARK: - Store
+
+enum RunsLogPresentation: Equatable {
+    case content
+    case empty
+    case unavailable(String)
+
+    static func state(runs: [RunRecord], error: String?) -> RunsLogPresentation {
+        guard runs.isEmpty else { return .content }
+        if let error, !error.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return .unavailable(error)
+        }
+        return .empty
+    }
+}
+
+enum RunKindPresentation {
+    static func displayName(_ kind: String) -> String {
+        RunKindVocabulary.displayName(kind, on: .iOS)
+    }
+
+    static func icon(_ kind: String) -> String {
+        switch kind.lowercased() {
+        case "codex": return "terminal"
+        case "claude": return "sparkles"
+        case "swarm": return "circle.hexagongrid.fill"
+        case "mission": return "target"
+        default: return "questionmark.circle"
+        }
+    }
+
+    static func tint(_ kind: String) -> Color {
+        switch kind.lowercased() {
+        case "codex": return .teal
+        case "claude": return NativeAgentPalette.agentAccent
+        case "swarm": return .orange
+        case "mission": return .blue
+        default: return .secondary
+        }
+    }
+}
+
+struct RunDetailModelFact: Identifiable, Equatable {
+    let label: String
+    let value: String
+    var id: String { label }
+}
+
+enum RunDetailPresentation {
+    static func modelFacts(for run: RunRecord) -> [RunDetailModelFact] {
+        func nonEmpty(_ value: String?) -> String? {
+            guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+                return nil
+            }
+            return value
+        }
+
+        var facts: [RunDetailModelFact] = []
+        let model = nonEmpty(run.model)
+        if let model { facts.append(.init(label: "Model", value: model)) }
+        if let requested = nonEmpty(run.requestedModel), requested != model {
+            facts.append(.init(label: "Requested (substituted)", value: requested))
+        }
+        if let effort = nonEmpty(run.reasoningEffort) {
+            facts.append(.init(label: "Reasoning effort", value: effort.capitalized))
+        }
+        if let sandbox = nonEmpty(run.codexSandbox) {
+            facts.append(.init(label: "Sandbox", value: sandbox))
+        }
+        if let fileAccess = nonEmpty(run.fileAccessMode) {
+            facts.append(.init(label: "File access", value: fileAccess))
+        }
+        return facts
+    }
+}
+
+enum RunDetailCopyPresentation {
+    static func successMessage(for section: String) -> String {
+        let label = section.trimmingCharacters(in: .whitespacesAndNewlines)
+        return label.isEmpty
+            ? "Copied run detail to clipboard."
+            : "Copied \(label) to clipboard."
+    }
+}
+
+enum RunDetailPromptPresentation {
+    static let unavailableDescription = "The prompt was not captured for this run."
+
+    /// Keep the captured prompt verbatim for copy fidelity, but do not render a
+    /// prompt section (or a Copy action) for a blank payload.
+    static func copyablePrompt(_ prompt: String?) -> String? {
+        guard let prompt,
+              !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        return prompt
+    }
+}
+
+enum OrganismStatusPresentation {
+    enum SnapshotState: Equatable {
+        case available
+        case disabled
+        case unavailable(reason: String?)
+        case invalidTimestamp(futureBy: TimeInterval)
+        case stale(age: TimeInterval)
+        case absent
+
+        var displaysDetails: Bool {
+            switch self {
+            case .available, .stale: true
+            case .disabled, .unavailable, .invalidTimestamp, .absent: false
+            }
+        }
+    }
+
+    struct DreamProposalSlice: Equatable {
+        let visible: [OrganismLivingStandingViewProposalFile]
+        let hiddenCount: Int
+    }
+
+    static func approvedBiasesText(_ value: Int?) -> String {
+        value.map(String.init) ?? "Not reported"
+    }
+
+    static func canApprove(_ candidate: OrganismLivingReflexCandidateFile) -> Bool {
+        candidate.trustClass == "lowRisk" && candidate.reviewRequired
+    }
+
+    static func isStale(generatedAt: Date, now: Date = Date(), maximumAge: TimeInterval = 300) -> Bool {
+        now.timeIntervalSince(generatedAt) > maximumAge
+    }
+
+    static func snapshotState(
+        for organism: OrganismLivingStatusFile?,
+        now: Date = Date(),
+        maximumAge: TimeInterval = 300,
+        maximumFutureClockSkew: TimeInterval = 60
+    ) -> SnapshotState {
+        guard let organism else { return .absent }
+        switch organism.availabilityState {
+        case .unavailable:
+            return .unavailable(reason: organism.unavailableReason)
+        case .disabled:
+            return .disabled
+        case .live:
+            let age = now.timeIntervalSince(organism.generatedAt)
+            let allowedFutureSkew = max(0, maximumFutureClockSkew)
+            if age < -allowedFutureSkew {
+                return .invalidTimestamp(futureBy: -age)
+            }
+            return age > maximumAge ? .stale(age: age) : .available
+        }
+    }
+
+    static func staleAgeText(_ age: TimeInterval) -> String {
+        let seconds = max(0, Int(age.rounded(.down)))
+        if seconds < 60 { return "\(seconds)s" }
+        if seconds < 3_600 { return "\(seconds / 60)m" }
+        return "\(seconds / 3_600)h"
+    }
+
+    struct ReflexCandidateSlice: Equatable {
+        let visible: [OrganismLivingReflexCandidateFile]
+        let hiddenCount: Int
+    }
+
+    static func reflexCandidateSlice(
+        _ candidates: [OrganismLivingReflexCandidateFile],
+        visibleLimit: Int = 6
+    ) -> ReflexCandidateSlice {
+        .init(visible: Array(candidates.prefix(visibleLimit)), hiddenCount: max(0, candidates.count - visibleLimit))
+    }
+
+    static func removingLocallyFinalizedCandidate(
+        id: String,
+        from candidates: [OrganismLivingReflexCandidateFile]
+    ) -> [OrganismLivingReflexCandidateFile] {
+        candidates.filter { $0.id != id }
+    }
+
+    static func dreamProposalSlice(
+        _ proposals: [OrganismLivingStandingViewProposalFile],
+        visibleLimit: Int = 4
+    ) -> DreamProposalSlice {
+        .init(visible: Array(proposals.prefix(visibleLimit)), hiddenCount: max(0, proposals.count - visibleLimit))
+    }
+}
 
 @MainActor
 final class AdvancedStore: ObservableObject {
     @Published var health: RuntimeHealth?
     @Published var runs: [RunRecord] = []
     @Published var isLoading = false
+    @Published private(set) var runsLoadError: String?
 
     func refreshHealth() async {
         isLoading = true
@@ -164,15 +474,104 @@ final class AdvancedStore: ObservableObject {
         isLoading = true
         await iCloudSyncEngine.shared.refreshRunsSnapshot()
         runs = iCloudSyncEngine.shared.runs
+        runsLoadError = runs.isEmpty ? iCloudSyncEngine.shared.syncError : nil
         isLoading = false
     }
 
     func applySyncedRuns(_ next: [RunRecord]) {
         if next != runs { runs = next }
+        if !next.isEmpty { runsLoadError = nil }
     }
 }
 
 // MARK: - Status detail
+
+enum MacHealthPresentation {
+    enum Snapshot {
+        case available(RuntimeHealth)
+        case unavailable
+    }
+
+    static let unavailableTitle = "Mac health is unavailable"
+    static let unavailableDetail = "Waiting for a health snapshot from the Mac."
+
+    static func snapshot(for health: RuntimeHealth?) -> Snapshot {
+        guard let health else { return .unavailable }
+        return .available(health)
+    }
+}
+
+/// One freshness contract for Mac-owned iCloud snapshots on the phone. Every
+/// screen that reports a snapshot age must use this threshold rather than
+/// deciding independently when a snapshot becomes stale.
+enum MobileSnapshotFreshnessPresentation {
+    static let staleAfter: TimeInterval = 30
+
+    static func isStale(lastSyncedAt: Date, now: Date = Date()) -> Bool {
+        now.timeIntervalSince(lastSyncedAt) > staleAfter
+    }
+}
+
+enum StatusConnectionPresentation {
+    enum SyncState: Equatable {
+        case current(age: TimeInterval)
+        case stale(age: TimeInterval, limit: TimeInterval)
+        case neverSynced
+        case clockMismatch(futureBy: TimeInterval)
+    }
+
+    static func syncState(
+        lastSyncedAt: Date?,
+        now: Date = Date(),
+        staleAfter: TimeInterval = MobileSnapshotFreshnessPresentation.staleAfter,
+        maximumFutureClockSkew: TimeInterval = 60
+    ) -> SyncState {
+        guard let lastSyncedAt else { return .neverSynced }
+
+        let age = now.timeIntervalSince(lastSyncedAt)
+        if age < -max(0, maximumFutureClockSkew) {
+            return .clockMismatch(futureBy: -age)
+        }
+        let limit = max(0, staleAfter)
+        return age > limit ? .stale(age: age, limit: limit) : .current(age: max(0, age))
+    }
+
+    static func ageText(_ interval: TimeInterval) -> String {
+        let seconds = max(0, Int(interval.rounded(.down)))
+        if seconds < 60 { return "\(seconds)s" }
+        if seconds < 3_600 { return "\(seconds / 60)m" }
+        return "\(seconds / 3_600)h"
+    }
+
+    static func cardValue(for state: SyncState) -> String {
+        switch state {
+        case .current(let age): return "Fresh · \(ageText(age)) ago"
+        case .stale(let age, _): return "STALE · \(ageText(age)) old"
+        case .neverSynced: return "Never synced"
+        case .clockMismatch: return "Clock mismatch"
+        }
+    }
+
+    static func detail(for state: SyncState) -> String? {
+        switch state {
+        case .current:
+            return nil
+        case .stale(_, let limit):
+            return "Expected a newer iCloud snapshot within \(ageText(limit))."
+        case .neverSynced:
+            return "No iCloud snapshot has reached this phone yet."
+        case .clockMismatch(let futureBy):
+            return "The Mac snapshot is \(ageText(futureBy)) ahead of this phone."
+        }
+    }
+
+    static func needsAttention(_ state: SyncState) -> Bool {
+        switch state {
+        case .current: false
+        case .stale, .neverSynced, .clockMismatch: true
+        }
+    }
+}
 
 struct StatusDetailView: View {
     @ObservedObject var store: AdvancedStore
@@ -180,7 +579,8 @@ struct StatusDetailView: View {
     @EnvironmentObject private var bridgeClient: MacBridgeClient
     @EnvironmentObject private var pairingStore: PairingStore
     @State private var decidingReflexID: String?
-    @State private var reflexDecisionError: String?
+    @State private var locallyFinalizedReflexIDs = Set<String>()
+    @State private var reflexDecisionErrors: [String: String] = [:]
 
     var body: some View {
         List {
@@ -208,15 +608,28 @@ struct StatusDetailView: View {
                         Text(lastSeen, style: .relative).foregroundStyle(.secondary)
                     }
                 }
-                if let syncAt = iCloudSyncEngine.shared.lastSyncAt {
-                    LabeledContent("Last synced") {
-                        Text(syncAt, style: .relative)
-                            .foregroundStyle(Date().timeIntervalSince(syncAt) > 30 ? .orange : .secondary)
-                    }
+                let syncState = StatusConnectionPresentation.syncState(
+                    lastSyncedAt: iCloudSyncEngine.shared.lastSyncAt
+                )
+                StatCard(
+                    label: "Last synced",
+                    value: StatusConnectionPresentation.cardValue(for: syncState),
+                    systemImage: "arrow.triangle.2.circlepath",
+                    tint: StatusConnectionPresentation.needsAttention(syncState)
+                        ? .orange
+                        : NativeAgentPalette.agentAccent
+                )
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
+                if let detail = StatusConnectionPresentation.detail(for: syncState) {
+                    Text(detail)
+                        .font(AppFont.label)
+                        .foregroundStyle(.secondary)
                 }
             }
-            if let health = store.health {
-                Section("Mac") {
+            Section("Mac") {
+                switch MacHealthPresentation.snapshot(for: store.health) {
+                case .available(let health):
                     StatCard(
                         label: "App",
                         value: health.app,
@@ -239,12 +652,20 @@ struct StatusDetailView: View {
                         Image(systemName: health.ok ? "checkmark.circle.fill" : "xmark.circle.fill")
                             .foregroundStyle(health.ok ? .green : .red)
                     }
+                case .unavailable:
+                    Label(MacHealthPresentation.unavailableTitle, systemImage: "questionmark.circle")
+                        .foregroundStyle(.secondary)
+                    Text(MacHealthPresentation.unavailableDetail)
+                        .font(AppFont.label)
+                        .foregroundStyle(.secondary)
                 }
             }
             if let organism = sync.organismLivingStatus {
+                let organismState = OrganismStatusPresentation.snapshotState(for: organism)
                 Section(sync.agentDisplayName) {
-                    let needsAttention = organism.needsAttention == true
-                    StatCard(
+                    if organismState.displaysDetails {
+                        let needsAttention = organism.needsAttention == true
+                        StatCard(
                         label: "Posture",
                         value: organism.posture.capitalized,
                         systemImage: organism.needsUser
@@ -282,7 +703,7 @@ struct StatusDetailView: View {
                             .foregroundStyle(organism.counters.reflexesNeedReview > 0 ? Color.orange : Color.secondary)
                     }
                     LabeledContent("Approved biases") {
-                        Text("\(organism.counters.approvedReflexBiases ?? 0)")
+                        Text(OrganismStatusPresentation.approvedBiasesText(organism.counters.approvedReflexBiases))
                             .foregroundStyle((organism.counters.approvedReflexBiases ?? 0) > 0 ? Color.green : Color.secondary)
                     }
                     LabeledContent("iPhone") {
@@ -297,11 +718,41 @@ struct StatusDetailView: View {
                         Text(organism.generatedAt, style: .relative)
                             .foregroundStyle(.secondary)
                     }
+                    if case .stale(let age) = organismState {
+                        Label("STALE · \(OrganismStatusPresentation.staleAgeText(age)) old — waiting for a newer Mac snapshot", systemImage: "clock.badge.exclamationmark")
+                            .font(AppFont.label)
+                            .foregroundStyle(.orange)
+                    }
+                    } else {
+                        switch organismState {
+                        case .disabled:
+                            Label("Organism body is disabled — no live body readout is available.", systemImage: "power")
+                                .foregroundStyle(.secondary)
+                        case .unavailable(let reason):
+                            Label("Organism status is unavailable", systemImage: "exclamationmark.triangle")
+                                .foregroundStyle(.orange)
+                            Text(reason ?? "The Mac could not complete this status snapshot.")
+                                .font(AppFont.label)
+                                .foregroundStyle(.secondary)
+                        case .invalidTimestamp(let futureBy):
+                            Label("Organism status timestamp is invalid", systemImage: "clock.badge.exclamationmark")
+                                .foregroundStyle(.orange)
+                            Text("The Mac timestamp is \(OrganismStatusPresentation.staleAgeText(futureBy)) ahead of this phone.")
+                                .font(AppFont.label)
+                                .foregroundStyle(.secondary)
+                        case .available, .stale, .absent:
+                            EmptyView()
+                        }
+                    }
                 }
-                let candidates = organism.reflexCandidates ?? []
-                if !candidates.isEmpty {
+                let candidateSlice: OrganismStatusPresentation.ReflexCandidateSlice = organismState.displaysDetails
+                    ? OrganismStatusPresentation.reflexCandidateSlice(
+                        (organism.reflexCandidates ?? []).filter { !locallyFinalizedReflexIDs.contains($0.id) }
+                    )
+                    : .init(visible: [], hiddenCount: 0)
+                if !candidateSlice.visible.isEmpty {
                     Section("Reflex review") {
-                        ForEach(candidates.prefix(6)) { candidate in
+                        ForEach(candidateSlice.visible) { candidate in
                             VStack(alignment: .leading, spacing: 8) {
                                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                                     Text(candidate.trustClass)
@@ -327,7 +778,7 @@ struct StatusDetailView: View {
                                         Label("Approve", systemImage: "checkmark")
                                     }
                                     .buttonStyle(.bordered)
-                                    .disabled(candidate.trustClass != "lowRisk" || decidingReflexID == candidate.id)
+                                    .disabled(!OrganismStatusPresentation.canApprove(candidate) || decidingReflexID == candidate.id)
 
                                     Button(role: .destructive) {
                                         decideReflex(candidate, approve: false)
@@ -339,13 +790,25 @@ struct StatusDetailView: View {
                                 }
                             }
                             .padding(.vertical, 4)
+                            if let error = reflexDecisionErrors[candidate.id] {
+                                Text(error)
+                                    .font(.caption)
+                                    .foregroundStyle(.red)
+                            }
+                        }
+                        if candidateSlice.hiddenCount > 0 {
+                            Text("\(candidateSlice.hiddenCount) more reflex candidate\(candidateSlice.hiddenCount == 1 ? "" : "s") need review on the Mac.")
+                                .font(AppFont.label)
+                                .foregroundStyle(.secondary)
                         }
                     }
                 }
-                let proposals = organism.standingViewProposals ?? []
-                if !proposals.isEmpty {
+                let proposalSlice: OrganismStatusPresentation.DreamProposalSlice = organismState.displaysDetails
+                    ? OrganismStatusPresentation.dreamProposalSlice(organism.standingViewProposals ?? [])
+                    : .init(visible: [], hiddenCount: 0)
+                if !proposalSlice.visible.isEmpty {
                     Section("Dream proposals") {
-                        ForEach(proposals.prefix(4)) { proposal in
+                        ForEach(proposalSlice.visible) { proposal in
                             VStack(alignment: .leading, spacing: 6) {
                                 Text(proposal.title)
                                     .font(AppFont.label)
@@ -360,14 +823,20 @@ struct StatusDetailView: View {
                                 }
                             }
                         }
+                        if proposalSlice.hiddenCount > 0 {
+                            Text("\(proposalSlice.hiddenCount) more proposal\(proposalSlice.hiddenCount == 1 ? "" : "s") can be reviewed on the Mac.")
+                                .font(AppFont.label)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
-                if let reflexDecisionError {
-                    Section {
-                        Text(reflexDecisionError)
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                    }
+            } else {
+                Section(sync.agentDisplayName) {
+                    Label("ABSENT — living status is not reporting yet", systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
+                    Text("The phone has not received an organism status snapshot. This is different from a healthy zero.")
+                        .font(AppFont.label)
+                        .foregroundStyle(.secondary)
                 }
             }
         }
@@ -379,7 +848,7 @@ struct StatusDetailView: View {
 
     private func decideReflex(_ candidate: OrganismLivingReflexCandidateFile, approve: Bool) {
         decidingReflexID = candidate.id
-        reflexDecisionError = nil
+        reflexDecisionErrors.removeValue(forKey: candidate.id)
         Task {
             do {
                 if approve {
@@ -387,8 +856,9 @@ struct StatusDetailView: View {
                 } else {
                     _ = try await iCloudSyncEngine.shared.retireOrganismReflex(candidateId: candidate.id)
                 }
+                locallyFinalizedReflexIDs.insert(candidate.id)
             } catch {
-                reflexDecisionError = error.localizedDescription
+                reflexDecisionErrors[candidate.id] = error.localizedDescription
             }
             decidingReflexID = nil
         }
@@ -397,57 +867,32 @@ struct StatusDetailView: View {
 
 // MARK: - Runs log
 
-/// Presentation facts for a run kind — icon + tint + display name in one
-/// place so the row and detail view can't drift apart.
-private enum RunKindStyle {
-    static func displayName(_ kind: String) -> String {
-        switch kind.lowercased() {
-        case "codex": return "Codex"
-        // `claude` remains a compatibility identifier on the wire. The public
-        // UI names the actual integration instead of a maintainer nickname.
-        case "claude": return "Claude Code"
-        case "swarm": return "Swarm"
-        case "mission": return "Workshop"
-        default: return kind.capitalized
-        }
-    }
-
-    static func icon(_ kind: String) -> String {
-        switch kind.lowercased() {
-        case "codex": return "terminal"
-        case "claude": return "sparkles"
-        case "swarm": return "circle.hexagongrid.fill"
-        case "mission": return "target"
-        default: return "gearshape.2"
-        }
-    }
-
-    static func tint(_ kind: String) -> Color {
-        switch kind.lowercased() {
-        case "codex": return .teal
-        case "claude": return NativeAgentPalette.agentAccent
-        case "swarm": return .orange
-        case "mission": return .blue
-        default: return .secondary
-        }
-    }
-}
-
 struct RunsLogView: View {
     @ObservedObject var store: AdvancedStore
     @ObservedObject private var sync = iCloudSyncEngine.shared
 
     var body: some View {
         List {
-            if store.runs.isEmpty {
+            switch RunsLogPresentation.state(runs: store.runs, error: store.runsLoadError) {
+            case .unavailable(let error):
                 AppEmptyState(
-                    title: "No Runs Yet",
-                    systemImage: "list.bullet.clipboard",
-                    description: "Codex, swarm, and Workshop runs on the Mac land here — or the snapshot is still syncing. Pull to refresh."
+                    title: "Runs are not available",
+                    systemImage: "exclamationmark.triangle",
+                    kind: .unavailable,
+                    description: error
                 )
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
-            } else {
+            case .empty:
+                AppEmptyState(
+                    title: "No Runs Yet",
+                    systemImage: "list.bullet.clipboard",
+                    kind: .empty,
+                    description: "The latest Mac run snapshot contains no runs."
+                )
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
+            case .content:
                 ForEach(store.runs) { run in
                     NavigationLink {
                         RunDetailView(run: run)
@@ -472,15 +917,15 @@ private struct RunRowView: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            Image(systemName: RunKindStyle.icon(run.kind))
+            Image(systemName: RunKindPresentation.icon(run.kind))
                 .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(RunKindStyle.tint(run.kind))
+                .foregroundStyle(RunKindPresentation.tint(run.kind))
                 .frame(width: 32, height: 32)
-                .background(RunKindStyle.tint(run.kind).opacity(0.12),
+                .background(RunKindPresentation.tint(run.kind).opacity(0.12),
                             in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
-                    Text(RunKindStyle.displayName(run.kind))
+                    Text(RunKindPresentation.displayName(run.kind))
                         .font(AppFont.section)
                     Spacer()
                     StatusBadge(status: run.status)
@@ -523,14 +968,14 @@ struct RunDetailView: View {
         List {
             Section {
                 HStack(spacing: 12) {
-                    Image(systemName: RunKindStyle.icon(run.kind))
+                    Image(systemName: RunKindPresentation.icon(run.kind))
                         .font(.system(size: 20, weight: .semibold))
-                        .foregroundStyle(RunKindStyle.tint(run.kind))
+                        .foregroundStyle(RunKindPresentation.tint(run.kind))
                         .frame(width: 44, height: 44)
-                        .background(RunKindStyle.tint(run.kind).opacity(0.12),
+                        .background(RunKindPresentation.tint(run.kind).opacity(0.12),
                                     in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                     VStack(alignment: .leading, spacing: 3) {
-                        Text(RunKindStyle.displayName(run.kind))
+                        Text(RunKindPresentation.displayName(run.kind))
                             .font(AppFont.title)
                         Text(UserDisplayFormatters.humanizeISOTimestamp(run.createdAt))
                             .font(AppFont.label)
@@ -559,31 +1004,26 @@ struct RunDetailView: View {
                 }
             }
 
-            let nonEmpty: (String?) -> Bool = { !($0 ?? "").trimmingCharacters(in: .whitespaces).isEmpty }
-            let hasModelFacts = nonEmpty(run.model) || nonEmpty(run.requestedModel)
-                || nonEmpty(run.reasoningEffort) || nonEmpty(run.codexSandbox) || nonEmpty(run.fileAccessMode)
-            if hasModelFacts {
+            let modelFacts = RunDetailPresentation.modelFacts(for: run)
+            if !modelFacts.isEmpty {
                 Section("Model") {
-                    if let model = run.model, !model.isEmpty {
-                        LabeledContent("Model", value: model)
-                    }
-                    if let requested = run.requestedModel, !requested.isEmpty, requested != run.model {
-                        LabeledContent("Requested", value: requested)
-                    }
-                    if let effort = run.reasoningEffort, !effort.isEmpty {
-                        LabeledContent("Reasoning effort", value: effort.capitalized)
-                    }
-                    if let sandbox = run.codexSandbox, !sandbox.isEmpty {
-                        LabeledContent("Sandbox", value: sandbox)
-                    }
-                    if let fileAccess = run.fileAccessMode, !fileAccess.isEmpty {
-                        LabeledContent("File access", value: fileAccess)
+                    ForEach(modelFacts) { fact in
+                        LabeledContent(fact.label, value: fact.value)
                     }
                 }
             }
 
-            if let prompt = run.prompt, !prompt.isEmpty {
+            if let prompt = RunDetailPromptPresentation.copyablePrompt(run.prompt) {
                 runTextSection("Prompt", systemImage: "text.bubble", text: prompt)
+            } else {
+                Section {
+                    Text(RunDetailPromptPresentation.unavailableDescription)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                } header: {
+                    Label("Prompt", systemImage: "text.bubble")
+                        .font(AppFont.section)
+                }
             }
             if let error = run.error, !error.isEmpty {
                 Section {
@@ -614,6 +1054,9 @@ struct RunDetailView: View {
                 .contextMenu {
                     Button("Copy \(title)", systemImage: "doc.on.doc") {
                         UIPasteboard.general.string = text
+                        iOSSystemToastCenter.shared.push(
+                            success: RunDetailCopyPresentation.successMessage(for: title)
+                        )
                     }
                 }
         } header: {

@@ -31,7 +31,14 @@ public enum GitHubConnectorActions {
     public static func status(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> JSONValue {
         _ = input
         let user = try await validateStoredToken(dataRoot: dataRoot)
-        return GitHubConnectorSecretRedactor.redactValue(.object([
+        return statusEnvelope(user: user)
+    }
+
+    /// The deterministic, local half of `github.status`. Keeping the wire
+    /// response projection here lets callers and tests share the same
+    /// fail-safe/redaction envelope without requiring a live GitHub request.
+    static func statusEnvelope(user: [String: Any]) -> JSONValue {
+        GitHubConnectorSecretRedactor.redactValue(.object([
             "actionId": .string("github.status"),
             "connectorId": .string("github"),
             "ok": .bool(true),

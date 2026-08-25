@@ -1786,3 +1786,72 @@ test("release script fails LOUD on unknown job, bad releaser, and path-shaped id
   assert.equal(traversal.status, 1);
   assert.equal(traversal.out.reason, "invalid_job_id");
 });
+
+// ------------------------------------------- stall watchdog progress (2026-08-22)
+// Wake 7FAB386B was killed as "stalled_after_600s" while its dispatched worker
+// was provably busy every minute: the live-tree CPU SUM dropped when a heavy
+// `swift test` grandchild exited, and a high-water-mark ratchet then read the
+// survivors' light work as "no advance" for the whole window. Progress must be
+// monotonic over a tree whose members come and go.
+test("tree CPU progress does not regress when a heavy grandchild exits", () => {
+  const p = new wakeup.TreeCpuProgress();
+  const claude = 100, server = 200, worker = 300, swiftTest = 400;
+  let s = p.observe(new Map([[claude, 1000], [server, 50], [worker, 200], [swiftTest, 180_000]]));
+  assert.equal(s.advanced, true); // first sample establishes the baseline
+  // The test run finishes: 180 CPU-seconds leave the live tree; the worker did
+  // a little more work. The OLD ratchet saw 181_250 → 1_300 and called it idle.
+  s = p.observe(new Map([[claude, 1000], [server, 50], [worker, 250]]));
+  assert.equal(s.advanced, true, "exited work is retired, not forgotten; +50 ms on the worker is progress");
+  assert.deepEqual(s.retiredPids, [swiftTest]);
+  assert.equal(s.total, 180_000 + 1000 + 50 + 250);
+  // Genuinely idle: identical sample → not advanced.
+  s = p.observe(new Map([[claude, 1000], [server, 50], [worker, 250]]));
+  assert.equal(s.advanced, false);
+  // A brand-new pid (a fresh `swift build`) with 0 ms so far is work STARTING.
+  s = p.observe(new Map([[claude, 1000], [server, 50], [worker, 250], [500, 0]]));
+  assert.equal(s.advanced, true);
+  assert.deepEqual(s.newPids, [500]);
+  // pid reuse: 500 comes back with LESS CPU than before → old one retired, new one counted.
+  p.observe(new Map([[claude, 1000], [server, 50], [worker, 250], [500, 9000]]));
+  s = p.observe(new Map([[claude, 1000], [server, 50], [worker, 250], [500, 10]]));
+  assert.equal(s.advanced, true);
+  assert.equal(s.total, 180_000 + 9000 + 1000 + 50 + 250 + 10);
+});
+
+test("tree CPU progress: total is monotonic across any sequence of samples", () => {
+  const p = new wakeup.TreeCpuProgress();
+  let last = -1;
+  const samples = [
+    new Map([[1, 10], [2, 500]]),
+    new Map([[1, 12]]),
+    new Map([[1, 12], [3, 0]]),
+    new Map([[1, 12], [3, 700]]),
+    new Map([[1, 13]]),
+    new Map([[1, 13]]),
+  ];
+  for (const m of samples) {
+    const s = p.observe(m);
+    assert.ok(s.total >= last, `total regressed: ${s.total} < ${last}`);
+    last = s.total;
+  }
+  assert.equal(p.observe("not a map"), null);
+});
+
+test("processTreeCpuByPid reads this process's own tree and finds itself", () => {
+  const per = wakeup.processTreeCpuByPid(process.pid);
+  assert.ok(per instanceof Map);
+  assert.ok(per.has(process.pid));
+});
+
+test("tree CPU progress: a member exiting with no other change still counts as activity", () => {
+  // gpt-5.5 review (2026-08-22): the incident test also had CPU advance, so a
+  // mutation dropping the retired-pids term could pass. Pin the policy on its own.
+  const p = new wakeup.TreeCpuProgress();
+  p.observe(new Map([[1, 100], [2, 50]]));
+  const s = p.observe(new Map([[1, 100]]));
+  assert.equal(s.advanced, true, "a process exiting is tree activity (the lifecycle event that broke the live-sum ratchet)");
+  assert.equal(s.total, 150, "the exited member's work is retired, not lost");
+  assert.deepEqual(s.retiredPids, [2]);
+  // And genuinely static afterwards: no churn, no CPU → not advanced.
+  assert.equal(p.observe(new Map([[1, 100]])).advanced, false);
+});

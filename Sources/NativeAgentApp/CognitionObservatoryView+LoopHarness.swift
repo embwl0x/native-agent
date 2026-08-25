@@ -5,33 +5,105 @@ import CognitiveSubstrate
 import Context
 import PersistenceCore
 
+/// The Association Graph is only meaningful when at least one of its edge
+/// endpoints can be resolved from the same cognitive snapshot. A single
+/// evicted node is ordinary decay and stays visible on its row; every endpoint
+/// missing at once is a broken/partial snapshot, not a graph of forgotten
+/// memories.
+enum CognitiveAssociationGraphPresentation {
+    static let visibleEdgeLimit = 8
+
+    struct Row: Identifiable, Equatable {
+        let id: String
+        let fromLabel: String
+        let toLabel: String
+        let weight: Double
+        let reasons: [String]
+    }
+
+    enum State: Equatable {
+        case empty
+        case endpointResolutionFailure(edgeCount: Int)
+        case rows([Row])
+    }
+
+    static func state(
+        edges: [CognitiveAssociationEdge],
+        nodes: [CognitiveNode]
+    ) -> State {
+        guard !edges.isEmpty else { return .empty }
+        let labelsByID = Dictionary(
+            nodes.compactMap { node in
+                normalizedSummary(node.summary).map { (node.id, $0) }
+            },
+            uniquingKeysWith: { first, _ in first })
+        let hasResolvableEndpoint = edges.contains { edge in
+            labelsByID[edge.fromNodeId] != nil || labelsByID[edge.toNodeId] != nil
+        }
+        guard hasResolvableEndpoint else {
+            return .endpointResolutionFailure(edgeCount: edges.count)
+        }
+
+        return .rows(edges.prefix(visibleEdgeLimit).map { edge in
+            Row(
+                id: edge.id,
+                fromLabel: nodeSnippet(labelsByID[edge.fromNodeId]),
+                toLabel: nodeSnippet(labelsByID[edge.toNodeId]),
+                weight: edge.weight,
+                reasons: edge.reasons)
+        })
+    }
+
+    private static func normalizedSummary(_ summary: String) -> String? {
+        let oneLine = summary
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return oneLine.isEmpty ? nil : oneLine
+    }
+
+    private static func nodeSnippet(_ summary: String?) -> String {
+        guard let summary else { return "(forgotten)" }
+        return summary.count > 44 ? String(summary.prefix(44)) + "…" : summary
+    }
+}
+
 extension CognitionObservatoryView {
 
     @ViewBuilder
-    func loopActivity(_ receipts: [CognitiveReceiptRecord]) -> some View {
-        if receipts.isEmpty {
+    func loopActivity(_ read: CognitiveReceiptRead) -> some View {
+        switch CognitionLoopActivityPresentation.state(for: read) {
+        case .unavailable(let detail):
+            Label(detail, systemImage: "exclamationmark.triangle.fill")
+                .font(NativeAgentFont.label)
+                .foregroundStyle(.orange)
+        case .empty:
             Text("No cognition loop receipts.")
                 .font(NativeAgentFont.label)
                 .foregroundStyle(.secondary)
-        } else {
-            VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                ForEach(Array(receipts.prefix(10)), id: \.id) { receipt in
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
-                            Text(receipt.kind)
-                                .font(.caption.weight(.semibold))
-                            Spacer()
-                            Text(receipt.createdAt, style: .time)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                        Text(payloadSummary(receipt.payload))
+        case .receipts(let receipts):
+            loopReceiptRows(receipts)
+        }
+    }
+
+    @ViewBuilder
+    private func loopReceiptRows(_ receipts: [CognitiveReceiptRecord]) -> some View {
+        VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
+            ForEach(Array(receipts.prefix(10)), id: \.id) { receipt in
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text(receipt.kind)
+                            .font(.caption.weight(.semibold))
+                        Spacer()
+                        Text(receipt.createdAt, style: .time)
                             .font(.caption2)
                             .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
                     }
-                    Divider()
+                    Text(payloadSummary(receipt.payload))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
                 }
+                Divider()
             }
         }
     }
@@ -114,46 +186,40 @@ extension CognitionObservatoryView {
     }
 
     func associationGraph(_ edges: [CognitiveAssociationEdge], nodes: [CognitiveNode]) -> some View {
-        // An edge row without its endpoints ("sessionId · 0.94") is unreadable —
-        // resolve both node ids to summary snippets so the row says WHAT is
-        // associated, with the reasons as the why-line underneath.
-        let labelsById = Dictionary(nodes.map { ($0.id, $0.summary) }, uniquingKeysWith: { first, _ in first })
+        let presentation = CognitiveAssociationGraphPresentation.state(edges: edges, nodes: nodes)
         return VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-            if edges.isEmpty {
+            switch presentation {
+            case .empty:
                 Text("No association edges.")
                     .font(NativeAgentFont.label)
                     .foregroundStyle(.secondary)
-            } else {
-                ForEach(Array(edges.prefix(8)), id: \.id) { edge in
+            case .endpointResolutionFailure(let edgeCount):
+                Label("Association endpoints unavailable", systemImage: "exclamationmark.triangle")
+                    .font(NativeAgentFont.label.weight(.semibold))
+                    .foregroundStyle(.orange)
+                Text("Couldn't resolve either endpoint for \(edgeCount) association \(edgeCount == 1 ? "edge" : "edges") from the current node snapshot.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            case .rows(let rows):
+                ForEach(rows) { row in
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(alignment: .firstTextBaseline) {
-                            Text("\(nodeSnippet(labelsById[edge.fromNodeId])) ↔ \(nodeSnippet(labelsById[edge.toNodeId]))")
+                            Text("\(row.fromLabel) ↔ \(row.toLabel)")
                                 .font(.caption)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
                             Spacer()
-                            Text(String(format: "%.2f", edge.weight))
+                            Text(String(format: "%.2f", row.weight))
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
-                        Text("why: \(edge.reasons.joined(separator: ", "))")
+                        Text("why: \(row.reasons.joined(separator: ", "))")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
                 }
             }
         }
-    }
-
-    /// One-line label for an association endpoint; a node evicted since the edge
-    /// formed has no summary — say so instead of rendering an empty gap.
-    private func nodeSnippet(_ summary: String?) -> String {
-        guard let summary else { return "(forgotten)" }
-        let oneLine = summary
-            .replacingOccurrences(of: "\n", with: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !oneLine.isEmpty else { return "(forgotten)" }
-        return oneLine.count > 44 ? String(oneLine.prefix(44)) + "…" : oneLine
     }
 
     private func payloadSummary(_ value: JSONValue) -> String {
@@ -200,6 +266,55 @@ extension CognitionObservatoryView {
             return "\(values.count) items"
         case .object(let object):
             return "\(object.count) fields"
+        }
+    }
+}
+
+/// Presentation policy for the mounted Loop Activity panel.  An empty array
+/// is a real, observable quiet loop only when its receipt read succeeded.
+enum CognitionLoopActivityPresentation {
+    enum State: Equatable, Sendable {
+        case receipts([CognitiveReceiptRecord])
+        case empty
+        case unavailable(String)
+    }
+
+    static func state(for read: CognitiveReceiptRead) -> State {
+        switch read {
+        case .available(let receipts):
+            return receipts.isEmpty ? .empty : .receipts(receipts)
+        case .unavailable(let reason):
+            return .unavailable(unavailabilityText(reason))
+        }
+    }
+
+    static func receiptCount(for read: CognitiveReceiptRead) -> Int? {
+        guard case .available(let receipts) = read else { return nil }
+        return receipts.count
+    }
+
+    static func collapsedHint(for read: CognitiveReceiptRead) -> String? {
+        switch state(for: read) {
+        case .receipts(let receipts):
+            guard let latest = receipts.first else { return nil }
+            return "\(latest.kind) · \(latest.createdAt.formatted(date: .omitted, time: .shortened))"
+        case .empty:
+            return "quiet"
+        case .unavailable(let detail):
+            return detail
+        }
+    }
+
+    private static func unavailabilityText(_ reason: CognitiveReceiptReadUnavailability) -> String {
+        switch reason {
+        case .cognitionDisabled:
+            return "Loop activity is unavailable while cognition is off."
+        case .persistenceDisabled:
+            return "Loop activity is unavailable because receipt persistence is off."
+        case .storeUnavailable:
+            return "Loop activity is unavailable because the receipt store is unavailable."
+        case .readFailed:
+            return "Loop activity could not be read from the receipt store."
         }
     }
 }

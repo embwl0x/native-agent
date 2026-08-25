@@ -16,6 +16,107 @@ extension Notification.Name {
     static let nativeagentOpenActivity = Notification.Name("nativeagent.open.activity")
 }
 
+/// Skipping initial pairing admits the user to the main app, but it must never
+/// remove the path back to pairing. The More tab owns that recovery action.
+enum PairingSkipPresentation {
+    enum MainAppState: Equatable {
+        case pairingRequired
+        case skipped
+        case paired
+    }
+
+    static func mainAppState(isPaired: Bool, pairingSkipped: Bool) -> MainAppState {
+        if isPaired { return .paired }
+        return pairingSkipped ? .skipped : .pairingRequired
+    }
+
+    static func showsRecoveryAffordance(isPaired: Bool) -> Bool {
+        !isPaired
+    }
+}
+
+/// Process-local simulator hook for a single launch-injected chat turn. The
+/// pending value closes the observer-registration race: if the notification
+/// posts before ChatView mounts, the mounted chat still consumes the exact
+/// launch text once. This is not persisted and has no public URL route.
+@MainActor
+enum NativeAgentDeepLinkSendHook {
+    private static var pendingText: String?
+    private static var acceptedLaunchArgument = false
+
+    static func stageLaunchArguments(
+        _ arguments: [String],
+        notificationCenter: NotificationCenter = .default
+    ) {
+        guard !acceptedLaunchArgument,
+              let index = arguments.firstIndex(of: "-sendTestMessage"),
+              index + 1 < arguments.count
+        else { return }
+        let text = arguments[index + 1]
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        acceptedLaunchArgument = true
+        stage(text, notificationCenter: notificationCenter)
+    }
+
+    static func stage(
+        _ text: String,
+        notificationCenter: NotificationCenter = .default
+    ) {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        pendingText = text
+        notificationCenter.post(name: .nativeagentDeepLinkSend, object: nil)
+    }
+
+    @discardableResult
+    static func deliverPending(
+        to store: ChatStore,
+        client: MacBridgeClient,
+        controls: ChatRuntimeControls,
+        emitHaptic: Bool = true
+    ) -> ChatSendDisposition? {
+        guard let text = pendingText else { return nil }
+        pendingText = nil
+        return store.send(
+            text: text,
+            client: client,
+            controls: controls,
+            emitHaptic: emitHaptic
+        )
+    }
+}
+
+/// Parses explicit simulator/device test switches without exposing a URL or
+/// notification route to production callers. Application lifecycle code owns
+/// the one-shot execution of the returned values.
+enum NativeAgentLaunchArgumentPresentation {
+    struct TestNotification: Equatable {
+        let title: String
+        let body: String
+    }
+
+    static func pairingSecret(from arguments: [String]) -> Data? {
+        guard let encoded = value(after: "-pairingSecretBase64", in: arguments),
+              let secret = Data(base64Encoded: encoded),
+              secret.count == 32
+        else { return nil }
+        return secret
+    }
+
+    static func testNotification(from arguments: [String]) -> TestNotification? {
+        guard arguments.contains("-sendTestNotification") else { return nil }
+        return TestNotification(
+            title: value(after: "-notificationTitle", in: arguments) ?? "NativeAgent test notification",
+            body: value(after: "-notificationBody", in: arguments) ?? "Local notifications are working on this iPhone."
+        )
+    }
+
+    static func value(after flag: String, in arguments: [String]) -> String? {
+        guard let index = arguments.firstIndex(of: flag), index + 1 < arguments.count else { return nil }
+        let value = arguments[index + 1].trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+}
+
 enum NativeAgentNotificationLaunchIntent {
     private static let openActivityKey = "NativeAgentMobile.pendingOpenActivityFromNotification"
     private static let pendingScreenKey = "NativeAgentMobile.pendingNotificationScreen"
@@ -240,6 +341,8 @@ struct NativeAgentMobileApp: App {
     @StateObject private var voiceOutput = VoiceOutputController()
     private let notificationDelegate = NativeAgentNotificationDelegate()
     @State private var bridgeNotificationObserverID: UUID?
+    @State private var didApplyPairingSecretLaunchArgument = false
+    @State private var didScheduleTestNotificationLaunchArgument = false
     /// Fix-A: persisted flag so users can skip the pairing screen and return later.
     @AppStorage("NativeAgentMobile.pairingSkipped") private var pairingSkipped = false
     @AppStorage(NativeAgentAppearance.storageKey) private var appearanceRawValue = NativeAgentAppearance.system.rawValue
@@ -250,20 +353,22 @@ struct NativeAgentMobileApp: App {
 
     /// True when the user has either paired OR explicitly skipped the pairing screen.
     private var shouldShowMainApp: Bool {
-        pairingStore.isPaired || pairingSkipped
+        PairingSkipPresentation.mainAppState(
+            isPaired: pairingStore.isPaired,
+            pairingSkipped: pairingSkipped
+        ) != .pairingRequired
     }
 
-    // 2026-07-04 foreground-refresh fix: opening the app previously showed
-    // whatever data the last poll tick left behind (new inbox cards written by
-    // the Mac overnight didn't appear until a tab's 30s loop fired — or, with
-    // the stale-replica read bug, until a full relaunch). Kick the shared
-    // snapshot refresh the moment the scene becomes active.
+    // Opening the app must refresh every Mac-published snapshot group, rather
+    // than advancing freshness through Activity alone while other tabs retain
+    // overnight data. The full engine refresh coalesces repeated activations
+    // and performs its reads off the main actor.
     @Environment(\.scenePhase) private var scenePhase
 
     private func refreshOnForeground() {
         guard pairingStore.usesICloudTransport else { return }
         Task { @MainActor in
-            await iCloudSyncEngine.shared.refreshActivitySnapshot()
+            await iCloudSyncEngine.shared.refreshSnapshots()
         }
     }
 
@@ -283,6 +388,10 @@ struct NativeAgentMobileApp: App {
                             checkLaunchArgsForTestSend()
                             checkLaunchArgsForTestNotification()
                             checkLaunchArgsForPairingSecret()
+                            // `scenePhase` can already be active by the time
+                            // this view mounts, so do not rely on its change
+                            // callback to refresh the initial foreground view.
+                            refreshOnForeground()
                         }
                         .onChange(of: pairingStore.isICloudPaired) { _, _ in
                             configureTransport()
@@ -301,9 +410,14 @@ struct NativeAgentMobileApp: App {
                         // Fix-A: user tapped Skip — persist the flag and show the main app.
                         // Does NOT clear any existing pairing credentials.
                         pairingSkipped = true
+                        configureTransport()
                     }, onPaired: {
                         pairingSkipped = false
                         configureTransport()
+                        // Registration may have been deferred while this first
+                        // pairing screen was visible; retry it once signing is
+                        // available so silent CloudKit pushes can arrive.
+                        configureNotifications()
                     })
                     .environmentObject(pairingStore)
                     .onAppear {
@@ -405,19 +519,7 @@ struct NativeAgentMobileApp: App {
     /// `-sendTestMessage "your text"` to `xcrun simctl launch`; production apps
     /// cannot receive this from another app or a web page.
     private func checkLaunchArgsForTestSend() {
-        let args = ProcessInfo.processInfo.arguments
-        guard let idx = args.firstIndex(of: "-sendTestMessage"),
-              idx + 1 < args.count else { return }
-        let text = args[idx + 1]
-        guard !text.isEmpty else { return }
-        // Slight delay so ChatView has installed its NotificationCenter observer.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-            NotificationCenter.default.post(
-                name: .nativeagentDeepLinkSend,
-                object: nil,
-                userInfo: ["text": text]
-            )
-        }
+        NativeAgentDeepLinkSendHook.stageLaunchArguments(ProcessInfo.processInfo.arguments)
     }
 
     /// Launch-args test hook for simulator pairing without iCloud sync.
@@ -427,10 +529,9 @@ struct NativeAgentMobileApp: App {
     /// we can verify the post-pair UI in headless tests.
     private func checkLaunchArgsForPairingSecret() {
         let args = ProcessInfo.processInfo.arguments
-        guard let idx = args.firstIndex(of: "-pairingSecretBase64"),
-              idx + 1 < args.count else { return }
-        let b64 = args[idx + 1]
-        guard let data = Data(base64Encoded: b64), data.count == 32 else {
+        guard args.contains("-pairingSecretBase64"), !didApplyPairingSecretLaunchArgument else { return }
+        didApplyPairingSecretLaunchArgument = true
+        guard let data = NativeAgentLaunchArgumentPresentation.pairingSecret(from: args) else {
             NSLog("[NativeAgentMobile] -pairingSecretBase64: invalid (need 32 bytes base64)")
             return
         }
@@ -445,9 +546,10 @@ struct NativeAgentMobileApp: App {
     /// Pass `-sendTestNotification` to schedule a local notification after 5 seconds.
     private func checkLaunchArgsForTestNotification() {
         let args = ProcessInfo.processInfo.arguments
-        guard args.contains("-sendTestNotification") else { return }
-        let title = value(after: "-notificationTitle", in: args) ?? "NativeAgent test notification"
-        let body = value(after: "-notificationBody", in: args) ?? "Local notifications are working on this iPhone."
+        guard !didScheduleTestNotificationLaunchArgument,
+              let notification = NativeAgentLaunchArgumentPresentation.testNotification(from: args)
+        else { return }
+        didScheduleTestNotificationLaunchArgument = true
         Task.detached {
             let center = UNUserNotificationCenter.current()
             let granted = (try? await center.requestAuthorization(options: [.alert, .badge, .sound])) ?? false
@@ -457,8 +559,8 @@ struct NativeAgentMobileApp: App {
             guard granted || settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional else { return }
 
             let content = UNMutableNotificationContent()
-            content.title = title
-            content.body = body
+            content.title = notification.title
+            content.body = notification.body
             content.sound = .default
             content.userInfo = ["screen": "activity", "source": "launch_test"]
             let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 5, repeats: false)
@@ -476,15 +578,76 @@ struct NativeAgentMobileApp: App {
         }
     }
 
-    private func value(after flag: String, in args: [String]) -> String? {
-        guard let idx = args.firstIndex(of: flag), idx + 1 < args.count else { return nil }
-        let value = args[idx + 1].trimmingCharacters(in: .whitespacesAndNewlines)
-        return value.isEmpty ? nil : value
+}
+
+/// The remote-push fetch contract is deliberately separate from UIKit so the
+/// completion result stays truthful under every transport outcome. Reporting
+/// `.noData` after a successful inbox load or CloudKit drain causes iOS to
+/// throttle later background wakes.
+@MainActor
+enum NativeAgentRemotePushProcessor {
+    enum FetchOutcome: Equatable {
+        case newData
+        case noData
+
+        var backgroundFetchResult: UIBackgroundFetchResult {
+            switch self {
+            case .newData: .newData
+            case .noData: .noData
+            }
+        }
     }
 
+    static func process(
+        userInfo: [AnyHashable: Any],
+        recordReceipt: ([AnyHashable: Any]) -> PushReceiptEntry,
+        sendReceipt: (String) async throws -> Void,
+        drainDeviceSyncPush: ([AnyHashable: Any]) async throws -> Bool,
+        refreshInbox: () async throws -> Bool,
+        refreshActivity: () async throws -> Void
+    ) async -> FetchOutcome {
+        let pushReceipt = recordReceipt(userInfo)
+        if let eventID = pushReceipt.eventId {
+            // Receipt acknowledgement is useful but must never prevent the
+            // device-sync and snapshot refresh work from completing.
+            try? await sendReceipt(eventID)
+        }
+
+        // Each lane is independently best-effort. A failed CloudKit drain
+        // must not suppress the inbox/activity refreshes (and vice versa).
+        let cloudKitDelivered = (try? await drainDeviceSyncPush(userInfo)) ?? false
+        let inboxLoaded = (try? await refreshInbox()) ?? false
+        try? await refreshActivity()
+        return (inboxLoaded || cloudKitDelivered) ? .newData : .noData
+    }
+}
+
+/// UIKit requires the background-fetch completion callback exactly once. The
+/// timeout and the normal async path race, so the gate is synchronized rather
+/// than relying on either task being the first to return.
+final class NativeAgentRemotePushCompletionGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var completed = false
+    private let completionHandler: (UIBackgroundFetchResult) -> Void
+
+    init(_ completionHandler: @escaping (UIBackgroundFetchResult) -> Void) {
+        self.completionHandler = completionHandler
+    }
+
+    func complete(_ result: UIBackgroundFetchResult) {
+        lock.lock()
+        guard !completed else {
+            lock.unlock()
+            return
+        }
+        completed = true
+        lock.unlock()
+        completionHandler(result)
+    }
 }
 
 final class NativeAgentMobilePushDelegate: NSObject, UIApplicationDelegate {
+    private static let backgroundPushDeadlineNanoseconds: UInt64 = 25_000_000_000
     func application(
         _ application: UIApplication,
         didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
@@ -548,25 +711,42 @@ final class NativeAgentMobilePushDelegate: NSObject, UIApplicationDelegate {
         didReceiveRemoteNotification userInfo: [AnyHashable: Any],
         fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
-        // 2026-07-04: ledger every arrival so delivered-but-silenced (Focus,
-        // Scheduled Summary) is distinguishable from never-delivered.
-        let pushReceipt = PushReceiptLedger.record(userInfo: userInfo)
+        let completionGate = NativeAgentRemotePushCompletionGate(completionHandler)
+        let timeoutTask = Task {
+            try? await Task.sleep(nanoseconds: Self.backgroundPushDeadlineNanoseconds)
+            guard !Task.isCancelled else { return }
+            completionGate.complete(.noData)
+        }
         Task { @MainActor in
-            if let eventID = pushReceipt.eventId {
-                await iCloudSyncEngine.shared.sendNotificationReceipt(
-                    eventID: eventID,
-                    channel: "apns"
-                )
-            }
             // CK-3c: if this is a CloudKit silent push for our device-sync
             // subscription AND CloudKit is active, drain the transport. Both
             // guards live inside drainIfDeviceSyncPush; a flag-off build returns
             // immediately without parsing. Every other push — and the legacy
             // snapshot refresh below — is untouched.
-            let ckDelivered = await iCloudBridge.shared.drainIfDeviceSyncPush(userInfo)
-            let inboxLoaded = await iCloudSyncEngine.shared.refreshInboxSnapshot()
-            await iCloudSyncEngine.shared.refreshActivitySnapshot()
-            completionHandler((inboxLoaded || ckDelivered) ? .newData : .noData)
+            let outcome = await NativeAgentRemotePushProcessor.process(
+                userInfo: userInfo,
+                // 2026-07-04: ledger every arrival so delivered-but-silenced
+                // (Focus, Scheduled Summary) is distinguishable from never
+                // delivered.
+                recordReceipt: PushReceiptLedger.record(userInfo:),
+                sendReceipt: { eventID in
+                    await iCloudSyncEngine.shared.sendNotificationReceipt(
+                        eventID: eventID,
+                        channel: "apns"
+                    )
+                },
+                drainDeviceSyncPush: { userInfo in
+                    await iCloudBridge.shared.drainIfDeviceSyncPush(userInfo)
+                },
+                refreshInbox: {
+                    await iCloudSyncEngine.shared.refreshInboxSnapshot()
+                },
+                refreshActivity: {
+                    await iCloudSyncEngine.shared.refreshActivitySnapshot()
+                }
+            )
+            timeoutTask.cancel()
+            completionGate.complete(outcome.backgroundFetchResult)
         }
     }
 }
@@ -576,13 +756,16 @@ final class NativeAgentNotificationDelegate: NSObject, UNUserNotificationCenterD
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification
     ) async -> UNNotificationPresentationOptions {
-        [.banner, .list, .sound, .badge]
+        NativeAgentNotificationDelegatePresentation.foregroundPresentationOptions
     }
 
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         didReceive response: UNNotificationResponse
     ) async {
+        guard NativeAgentNotificationDelegatePresentation.shouldRouteUserResponse(
+            actionIdentifier: response.actionIdentifier
+        ) else { return }
         // F7: route per notification payload's `screen` field instead of always
         // landing on Activity. Allowed values: activity, chat, memories, skills, more.
         let screen = NativeAgentRemoteNotificationPayload.string(
@@ -590,15 +773,29 @@ final class NativeAgentNotificationDelegate: NSObject, UNUserNotificationCenterD
             cloudKitRecordKey: "notificationScreen",
             in: response.notification.request.content.userInfo
         )
-        NativeAgentNotificationLaunchIntent.markOpenActivityPending(screen: screen)
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 350_000_000)
+        await MainActor.run {
+            // Persist before posting. ContentView consumes this intent from
+            // UserDefaults on appearance, so a cold-launch view tree that has
+            // not installed its ephemeral observer yet still receives the tap.
+            NativeAgentNotificationLaunchIntent.markOpenActivityPending(screen: screen)
             NotificationCenter.default.post(
                 name: .nativeagentOpenActivity,
                 object: nil,
                 userInfo: ["screen": screen ?? "activity"]
             )
         }
+    }
+}
+
+enum NativeAgentNotificationDelegatePresentation {
+    static let foregroundPresentationOptions: UNNotificationPresentationOptions = [
+        .banner, .list, .sound, .badge,
+    ]
+
+    /// Only a notification tap is navigation intent. A system dismiss is not a
+    /// request to reopen the app, and an unknown action must not guess a route.
+    static func shouldRouteUserResponse(actionIdentifier: String) -> Bool {
+        actionIdentifier == UNNotificationDefaultActionIdentifier
     }
 }
 
@@ -675,7 +872,9 @@ enum NativeAgentBridgeNotificationScheduler {
         Task {
             let metadata = msg.metadata ?? [:]
             let title = nonEmpty(metadata["title"]) ?? "NativeAgent"
-            let body = nonEmpty(metadata["body"]) ?? msg.text
+            let body = nonEmpty(metadata["body"])
+                ?? nonEmpty(msg.text)
+                ?? "New activity from Mac."
             var userInfo: [String: Any] = [:]
             for (key, value) in metadata where key.hasPrefix("userInfo.") {
                 let cleanKey = String(key.dropFirst("userInfo.".count))

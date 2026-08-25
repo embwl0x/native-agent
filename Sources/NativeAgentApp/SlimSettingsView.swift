@@ -5,6 +5,209 @@ import Context
 import NativeAgentShared
 import NativeAgentCore
 
+/// One canonical owner for each live operational control. Views consume these
+/// labels rather than repeating storage-oriented wording, which keeps a
+/// control from quietly acquiring a second settings home.
+enum OperationalSettingsControlPresentation {
+    enum Control: CaseIterable, Hashable, Sendable {
+        case providerRoute
+        case macIntegrationPermission
+        case subconsciousMaster
+        case fluidContext
+        case softwareUpdate
+        case globalHotkey
+    }
+
+    enum Owner: String, Hashable, Sendable {
+        case providers
+        case macIntegration
+        case settings
+    }
+
+    static func owner(for control: Control) -> Owner {
+        switch control {
+        case .providerRoute: .providers
+        case .macIntegrationPermission: .macIntegration
+        case .subconsciousMaster, .fluidContext, .softwareUpdate, .globalHotkey: .settings
+        }
+    }
+
+    static func title(for control: Control) -> String {
+        switch control {
+        case .providerRoute: "Provider"
+        case .macIntegrationPermission: "Mac Integration"
+        case .subconsciousMaster: "Subconscious"
+        case .fluidContext: "Fluid Context"
+        case .softwareUpdate: "Software Update"
+        case .globalHotkey: "Global Shortcut"
+        }
+    }
+
+    static func fluidContextLabel(_ mode: ContextFlowMode) -> String {
+        switch mode {
+        case .active: "Active"
+        case .shadow: "Observe Only"
+        case .off: "Off"
+        }
+    }
+}
+
+/// The About panel must distinguish a live runtime read from the unrelated
+/// most-recent UI action. `AppModel.statusText` is intentionally a broad
+/// activity feed, so showing it as "Status" could claim an old save result
+/// describes the runtime now.
+enum SlimSettingsStatusLinePresentation {
+    enum Tone: Equatable {
+        case neutral
+        case success
+        case warning
+        case failure
+    }
+
+    struct State: Equatable {
+        let text: String
+        let detail: String?
+        let tone: Tone
+        let systemImage: String
+    }
+
+    static func runtimeState(runtimeOK: Bool?, lastRefreshError: String?) -> State {
+        let error = normalized(lastRefreshError)
+
+        switch runtimeOK {
+        case true:
+            if let error {
+                return State(
+                    text: "Runtime is online; some app data is unavailable",
+                    detail: "Last refresh error: \(bounded(error))",
+                    tone: .warning,
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+            }
+            return State(
+                text: "Runtime is online",
+                detail: nil,
+                tone: .success,
+                systemImage: "checkmark.circle.fill"
+            )
+        case false:
+            return State(
+                text: "Runtime reported a problem",
+                detail: error.map { "Last refresh error: \(bounded($0))" },
+                tone: .failure,
+                systemImage: "xmark.octagon.fill"
+            )
+        case nil:
+            if let error {
+                return State(
+                    text: "Runtime status is unavailable",
+                    detail: "Last refresh error: \(bounded(error))",
+                    tone: .failure,
+                    systemImage: "xmark.octagon.fill"
+                )
+            }
+            return State(
+                text: "Runtime status has not been checked",
+                detail: nil,
+                tone: .neutral,
+                systemImage: "questionmark.circle"
+            )
+        }
+    }
+
+    private static func normalized(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let text = raw.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        return text.isEmpty ? nil : text
+    }
+
+    private static func bounded(_ text: String) -> String {
+        let maximumVisibleCharacters = 240
+        guard text.count > maximumVisibleCharacters else { return text }
+        return String(text.prefix(maximumVisibleCharacters)) + "…"
+    }
+}
+
+/// The updater has two independent facts: whether this build has a published
+/// feed at all, and whether Sparkle can start another manual check right now.
+/// Keep them separate so a release build that is mid-check never looks like a
+/// locally built copy, and a development build never looks checkable.
+enum SoftwareUpdateRowPresentation {
+    struct State: Equatable {
+        let title: String
+        let detail: String
+        let status: String
+        let systemImage: String
+        let actionEnabled: Bool
+    }
+
+    static func resolve(
+        availableVersion: String?,
+        updatesAreAvailable: Bool,
+        canCheckForUpdates: Bool,
+        unavailableDetail: String
+    ) -> State {
+        if let version = availableVersion?.trimmingCharacters(in: .whitespacesAndNewlines), !version.isEmpty {
+            return State(
+                title: "NativeAgent \(version) is available",
+                detail: "Select Update Available to review and install the signed release.",
+                status: "ok",
+                systemImage: "arrow.down.circle.fill",
+                actionEnabled: true
+            )
+        }
+        guard updatesAreAvailable else {
+            return State(
+                title: "Automatic updates aren’t available in this build",
+                detail: unavailableDetail,
+                status: "warn",
+                systemImage: "info.circle",
+                actionEnabled: true
+            )
+        }
+        guard canCheckForUpdates else {
+            return State(
+                title: "An update check is already in progress",
+                detail: "Wait for the current signed-feed check to finish before starting another one.",
+                status: "info",
+                systemImage: "arrow.triangle.2.circlepath",
+                actionEnabled: false
+            )
+        }
+        return State(
+            title: "Automatic updates are ready",
+            detail: "NativeAgent checks the signed release feed automatically. You can also check now.",
+            status: "ok",
+            systemImage: "checkmark.circle",
+            actionEnabled: true
+        )
+    }
+}
+
+struct SoftwareUpdateRow: View {
+    let state: SoftwareUpdateRowPresentation.State
+    let actionTitle: String
+    let onCheck: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label(state.title, systemImage: state.systemImage)
+                .foregroundStyle(NativeAgentTheme.statusColor(state.status))
+                .fontWeight(.semibold)
+            Text(state.detail)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+            Button(action: onCheck) {
+                Label(actionTitle, systemImage: state.systemImage)
+            }
+            .disabled(!state.actionEnabled)
+            .accessibilityIdentifier("settings.softwareUpdate.check")
+        }
+        .accessibilityIdentifier("settings.softwareUpdate.row")
+    }
+}
+
 // MARK: - Slim Settings (the new "Settings" primary tab)
 
 struct SlimSettingsView: View {
@@ -35,6 +238,7 @@ struct SlimSettingsView: View {
     // The app menu and Settings use one Sparkle scheduler/controller.
     @State private var updateController = UpdateController.shared
     @AppStorage("nativeagent.showTour") private var showTour = false
+    @State private var tourReplayCoordinator = OnboardingTourReplayCoordinator.shared
     @AppStorage("nativeagent.darkMode") private var preferDark = false
     // User-selected transcript threshold ceiling. The shared compactor clamps
     // this to 40% of the active model window so smaller-window models compact
@@ -64,26 +268,33 @@ struct SlimSettingsView: View {
     @State private var embeddingsAttention = false
     @State private var subconsciousAttention = false
     @State private var confirmClassicPresentation = false
+    @State private var dataLimitsFailure: String?
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
-                    NavigationLink {
-                        MacPairingView()
-                    } label: {
-                        Label("Pair iPhone / iPad", systemImage: "iphone.and.arrow.right.outward")
+                    NavigationLink(value: SlimSettingsPairDeviceLink.destination) {
+                        Label(
+                            SlimSettingsPairDeviceLink.title,
+                            systemImage: SlimSettingsPairDeviceLink.systemImage
+                        )
                     }
+                    .accessibilityHint(SlimSettingsPairDeviceLink.accessibilityHint)
                 } header: {
                     Text("Devices")
                 }
 
                 Section {
-                    NavigationLink {
-                        TelegramView()
-                    } label: {
-                        Label("Telegram", systemImage: "paperplane")
+                    let telegramLink = SlimSettingsTelegramLink.presentation
+                    NavigationLink(value: telegramLink.destination) {
+                        Label(
+                            telegramLink.title,
+                            systemImage: telegramLink.systemImage
+                        )
                     }
+                    .accessibilityHint(telegramLink.accessibilityHint)
+                    .accessibilityIdentifier("settings.telegram-link")
                 } header: {
                     Text("Integrations")
                 }
@@ -185,15 +396,23 @@ struct SlimSettingsView: View {
                 Section {
                     Button {
                         showTour = true
+                        tourReplayCoordinator.requestReplay()
                     } label: {
                         Label("Replay Onboarding Tour", systemImage: "map")
                     }
                     Button {
-                        // S.2: docs/data-bounds.md ships in Resources/docs/
-                        let bundled = Bundle.main.url(forResource: "data-bounds", withExtension: "md", subdirectory: "docs")
-                            ?? Bundle.main.url(forResource: "data-bounds", withExtension: "md")
-                        if let url = bundled {
-                            NSWorkspace.shared.open(url)
+                        let outcome = SlimSettingsDataLimitsReference.open(
+                            resourceLookup: { name, ext, subdirectory in
+                                Bundle.main.url(
+                                    forResource: name,
+                                    withExtension: ext,
+                                    subdirectory: subdirectory
+                                )
+                            },
+                            opener: { NSWorkspace.shared.open($0) }
+                        )
+                        if let failure = outcome.failureMessage {
+                            dataLimitsFailure = failure
                         }
                     } label: {
                         Label("Show data limits", systemImage: "ruler")
@@ -219,36 +438,43 @@ struct SlimSettingsView: View {
                             ChatClipboard.copy(Self.buildIdentityLine(identity))
                         }
                     }
-                    if let notice = updateController.updateNoticeText {
-                        Label(notice, systemImage: "arrow.down.circle.fill")
-                            .foregroundStyle(Color.accentColor)
-                            .fontWeight(.semibold)
-                    }
-                    Button {
-                        updateController.checkForUpdates()
-                    } label: {
-                        Label(
-                            updateController.menuTitle,
-                            systemImage: updateController.updateNoticeText == nil
-                                ? "arrow.triangle.2.circlepath"
-                                : "arrow.down.circle.fill"
-                        )
-                    }
-                    .accessibilityHint(
-                        updateController.updatesAreAvailable
-                            ? "Checks the signed NativeAgent release feed now."
-                            : "Explains how this build receives software updates."
+                    let updateState = SoftwareUpdateRowPresentation.resolve(
+                        availableVersion: updateController.status.availableVersion,
+                        updatesAreAvailable: updateController.updatesAreAvailable,
+                        canCheckForUpdates: updateController.canCheckForUpdates,
+                        unavailableDetail: updateController.settingsDetail
                     )
-                    LabeledContent("Status", value: appModel.statusText)
+                    SoftwareUpdateRow(
+                        state: updateState,
+                        actionTitle: updateController.menuTitle,
+                        onCheck: { updateController.checkForUpdates() }
+                    )
+                    let runtimeStatus = SlimSettingsStatusLinePresentation.runtimeState(
+                        runtimeOK: appModel.health?.ok,
+                        lastRefreshError: appModel.lastRefreshError
+                    )
+                    LabeledContent("Runtime") {
+                        VStack(alignment: .trailing, spacing: 2) {
+                            Label(runtimeStatus.text, systemImage: runtimeStatus.systemImage)
+                                .foregroundStyle(runtimeStatusColor(runtimeStatus.tone))
+                            if let detail = runtimeStatus.detail {
+                                Text(detail)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .multilineTextAlignment(.trailing)
+                                    .textSelection(.enabled)
+                            }
+                        }
+                        .accessibilityLabel("Runtime status: \(runtimeStatus.text)")
+                    }
                 } header: {
                     Text("About")
-                } footer: {
-                    Text(updateController.settingsDetail)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
                 }
             }
             .formStyle(.grouped)
+            .navigationDestination(for: SlimSettingsNavigationDestination.self) { destination in
+                SlimSettingsDestinationView(destination: destination)
+            }
             .navigationTitle("Settings")
             // Seed the Embeddings attention badge while the Advanced block is
             // collapsed (the child section that normally detects fail-closed /
@@ -272,6 +498,17 @@ struct SlimSettingsView: View {
             } message: {
                 Text("Only the optional presentation is removed. NativeAgent's capabilities and living runtime stay exactly as they are.")
             }
+            .alert(
+                "Can’t open data limits",
+                isPresented: Binding(
+                    get: { dataLimitsFailure != nil },
+                    set: { if !$0 { dataLimitsFailure = nil } }
+                )
+            ) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(dataLimitsFailure ?? "The data-limits reference is unavailable.")
+            }
         }
     }
 
@@ -287,10 +524,35 @@ struct SlimSettingsView: View {
         }
     }
 
+    private func runtimeStatusColor(_ tone: SlimSettingsStatusLinePresentation.Tone) -> Color {
+        switch tone {
+        case .neutral: .secondary
+        case .success: NativeAgentTheme.ok
+        case .warning: NativeAgentTheme.warn
+        case .failure: NativeAgentTheme.fail
+        }
+    }
+
     private func formatThresholdTokens(_ n: Int) -> String {
         if n >= 1_000_000 { return String(format: "%.1fM", Double(n) / 1_000_000) }
         if n >= 1_000     { return String(format: "%dk",  n / 1_000) }
         return "\(n)"
+    }
+}
+
+/// The one mounted destination seam for the macOS Settings scene. Tests mount
+/// this exact view with each typed route so a Settings entry cannot retain a
+/// valid-looking route while its visible destination drifts elsewhere.
+struct SlimSettingsDestinationView: View {
+    let destination: SlimSettingsNavigationDestination
+
+    var body: some View {
+        switch destination.content {
+        case .macPairing:
+            MacPairingView()
+        case .telegramSettings:
+            TelegramView()
+        }
     }
 }
 
@@ -325,6 +587,7 @@ private struct SubconsciousSettingsSection: View {
     @State private var errorMessage: String?
     @State private var contextFlowStatus: NativeContextFlowModeStatus?
     @State private var reflectionRouteStatus: NativeReflectionRouteStatus?
+    @State private var subconsciousRuntimeState: NativeSubconsciousRuntimeState?
     @State private var pendingReflectionChoiceID: String?
 
     var body: some View {
@@ -337,7 +600,7 @@ private struct SubconsciousSettingsSection: View {
             }
             .disabled(savingToggle)
 
-            Picker("Fluid Context", selection: $contextFlowMode) {
+            Picker(OperationalSettingsControlPresentation.title(for: .fluidContext), selection: $contextFlowMode) {
                 ForEach([ContextFlowMode.active, .shadow, .off], id: \.self) { mode in
                     Text(contextFlowModeLabel(mode)).tag(mode.rawValue)
                 }
@@ -378,20 +641,22 @@ private struct SubconsciousSettingsSection: View {
                 .disabled(savingToggle || savingModel)
             }
 
-            if let reflectionRouteStatus, !reflectionRouteStatus.isReady {
-                Text(reflectionRouteStatus.detail)
-                    .font(.caption2)
-                    .foregroundStyle(.orange)
-            }
-
             HStack {
-                Label(statusLabel, systemImage: statusSystemImage)
+                let status = statusPresentation
+                Label(status.text, systemImage: status.systemImage)
                     .font(.caption)
-                    .foregroundStyle(statusColor)
+                    .foregroundStyle(statusColor(status.tone))
                 Spacer()
                 if savingToggle || savingContextFlow || savingModel {
                     ProgressView().controlSize(.small)
                 }
+            }
+
+            if let detail = statusPresentation.detail {
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(statusColor(statusPresentation.tone))
+                    .textSelection(.enabled)
             }
 
             if let errorMessage {
@@ -413,6 +678,7 @@ private struct SubconsciousSettingsSection: View {
             }
             _ = await appModel.loadProvidersForChat()
             contextFlowStatus = await NativeContextFlowRuntime.shared.modeStatus()
+            await refreshSubconsciousRuntimeState()
             await refreshReflectionRouteStatus()
             attention = attentionState
         }
@@ -483,35 +749,30 @@ private struct SubconsciousSettingsSection: View {
         providerID + "\u{1f}" + modelID
     }
 
-    private var fullyRunning: Bool {
-        subconsciousEnabled && capsuleEnabled && backgroundEnabled && reflectionEnabled
-            && reflectionBudget > 0 && organismEnabled
-            && reflectionRouteStatus?.isReady == true
+    private var statusPresentation: SlimSettingsSubconsciousStatusLine.State {
+        SlimSettingsSubconsciousStatusLine.state(
+            runtime: subconsciousRuntimeState,
+            reflectionRoute: reflectionRouteStatus
+        )
     }
 
-    // Attention = enabled-but-not-fully-running (orange) or an error. Surfaced
-    // as a badge on the collapsed Advanced disclosure (B2.6c).
+    // Attention = a real runtime warning/unavailability or an operation error.
+    // Surfaced as a badge on the collapsed Advanced disclosure (B2.6c).
     private var attentionState: Bool {
-        (subconsciousEnabled && !fullyRunning) || errorMessage != nil
+        statusPresentation.requiresAttention || errorMessage != nil
     }
 
-    private var statusLabel: String {
-        if fullyRunning { return "Running with \(effectiveSubconsciousModel)" }
-        if subconsciousEnabled, reflectionRouteStatus?.isReady != true { return "Needs LLM setup" }
-        if subconsciousEnabled { return "Partially enabled" }
-        return "Off"
-    }
-
-    private var statusSystemImage: String {
-        if fullyRunning { return "checkmark.circle.fill" }
-        if subconsciousEnabled { return "exclamationmark.triangle.fill" }
-        return "circle"
-    }
-
-    private var statusColor: Color {
-        if fullyRunning { return .green }
-        if subconsciousEnabled { return .orange }
-        return .secondary
+    private func statusColor(_ tone: SlimSettingsSubconsciousStatusLine.Tone) -> Color {
+        switch tone {
+        case .neutral:
+            .secondary
+        case .progress:
+            .secondary
+        case .healthy:
+            .green
+        case .warning, .unavailable:
+            .orange
+        }
     }
 
     @MainActor
@@ -587,6 +848,7 @@ private struct SubconsciousSettingsSection: View {
     }
 
     private func applySubconsciousRuntimeState(_ state: NativeSubconsciousRuntimeState) {
+        subconsciousRuntimeState = state
         subconsciousEnabled = state.enabled
         capsuleEnabled = state.capsuleEnabled
         backgroundEnabled = state.backgroundEnabled
@@ -596,11 +858,7 @@ private struct SubconsciousSettingsSection: View {
     }
 
     private func contextFlowModeLabel(_ mode: ContextFlowMode) -> String {
-        switch mode {
-        case .active: "Active"
-        case .shadow: "Observe Only"
-        case .off: "Off"
-        }
+        OperationalSettingsControlPresentation.fluidContextLabel(mode)
     }
 
     @MainActor
@@ -638,6 +896,11 @@ private struct SubconsciousSettingsSection: View {
     @MainActor
     private func refreshReflectionRouteStatus() async {
         reflectionRouteStatus = await NativeCognitionRuntime.shared.reflectionRouteStatus()
+    }
+
+    @MainActor
+    private func refreshSubconsciousRuntimeState() async {
+        subconsciousRuntimeState = await NativeCognitionRuntime.shared.subconsciousRuntimeState()
     }
 
     @MainActor
@@ -698,7 +961,107 @@ private struct SubconsciousSettingsSection: View {
 // runtime is fail-closed because the MiniLM bundle is missing / failed to
 // load.
 
-private struct EmbeddingsSettingsSection: View {
+/// Shared state/action mapping for the embeddings controls. The SwiftUI view
+/// owns task lifetime, while this value owner keeps retry/release eligibility
+/// and the post-action truth in one place.
+struct EmbeddingsSettingsActionPresentation {
+    struct Controls: Equatable {
+        let showsRetryMemoryStatus: Bool
+        let showsRetryStatus: Bool
+        let showsReleaseNow: Bool
+    }
+
+    struct Update {
+        let status: EmbeddingsStatus?
+        let errorMessage: String?
+    }
+
+    static func controls(status: EmbeddingsStatus?, errorMessage: String?) -> Controls {
+        Controls(
+            showsRetryMemoryStatus: errorMessage != nil,
+            showsRetryStatus: status?.installState?.state == "failed",
+            showsReleaseNow: status?.modelState?.loaded == true
+        )
+    }
+
+    static func refreshed(_ status: EmbeddingsStatus) -> Update {
+        Update(status: status, errorMessage: nil)
+    }
+
+    static func refreshFailed(_ error: any Error, preserving status: EmbeddingsStatus?) -> Update {
+        Update(
+            status: status,
+            errorMessage: "Status check failed: \(error.localizedDescription)"
+        )
+    }
+
+    static func released(_ result: EmbeddingsToggleResult) -> Update {
+        Update(
+            status: result.status,
+            errorMessage: result.ok == false
+                ? (result.error ?? "Embedding memory release could not be confirmed.")
+                : result.error
+        )
+    }
+
+    static func releaseFailed(_ error: any Error, preserving status: EmbeddingsStatus?) -> Update {
+        Update(
+            status: status,
+            errorMessage: "Release failed: \(error.localizedDescription)"
+        )
+    }
+}
+
+/// Shared read-only mapping for the embeddings status panel. It receives the
+/// root-scoped runtime status and gives the view its selected mode and the
+/// human-facing explanation without reconstructing either from defaults.
+struct EmbeddingsSettingsStatusPresentation: Equatable {
+    let memoryMode: String
+    let memoryModeLabel: String
+    let memoryModeDescription: String
+
+    init(status: EmbeddingsStatus) {
+        let mode = Self.normalizedMemoryMode(status.memoryMode)
+        self.memoryMode = mode
+        switch mode {
+        case "performance":
+            memoryModeLabel = "Fast"
+        case "low_memory":
+            memoryModeLabel = "Low"
+        default:
+            memoryModeLabel = "Balanced"
+        }
+        if let detail = status.memoryModeDetail?.detail, !detail.isEmpty {
+            memoryModeDescription = detail
+        } else {
+            switch mode {
+            case "performance":
+                memoryModeDescription = "Keeps the model hot for fastest recall."
+            case "low_memory":
+                memoryModeDescription = "Allows the model to release sooner when idle."
+            default:
+                memoryModeDescription = "Balances recall speed and memory use."
+            }
+        }
+    }
+
+    static func normalizedMemoryMode(_ raw: String?) -> String {
+        let value = raw ?? "balanced"
+        switch value {
+        case "performance", "balanced", "low_memory":
+            return value
+        default:
+            return "balanced"
+        }
+    }
+}
+
+struct EmbeddingsSettingsSection: View {
+    struct ActionOverrides {
+        var fetchStatus: (@MainActor () async throws -> EmbeddingsStatus)?
+        var releaseMemory: (@MainActor () async throws -> EmbeddingsToggleResult)?
+    }
+
     @Environment(AppModel.self) private var appModel
     // 2026-07-23 B2.6c: reports fail-closed / failed-install / status-error up
     // to the Advanced disclosure so the error state surfaces a warn badge when
@@ -710,6 +1073,15 @@ private struct EmbeddingsSettingsSection: View {
     @State private var releasingMemory = false
     @State private var errorMessage: String?
     @State private var pollTask: Task<Void, Never>?
+    private let actionOverrides: ActionOverrides
+
+    init(
+        attention: Binding<Bool>,
+        actionOverrides: ActionOverrides = .init(fetchStatus: nil, releaseMemory: nil)
+    ) {
+        _attention = attention
+        self.actionOverrides = actionOverrides
+    }
 
     var body: some View {
         Section {
@@ -721,7 +1093,7 @@ private struct EmbeddingsSettingsSection: View {
                 Text("Status unavailable.")
                     .foregroundStyle(.secondary).font(.caption)
             }
-            if let err = errorMessage {
+            if let err = errorMessage, actionControls.showsRetryMemoryStatus {
                 VStack(alignment: .leading, spacing: 6) {
                     Text(err).foregroundStyle(.orange).font(.caption)
                     Button {
@@ -732,6 +1104,7 @@ private struct EmbeddingsSettingsSection: View {
                     .buttonStyle(.naFeel)
                     .font(.caption)
                     .disabled(loading)
+                    .accessibilityIdentifier("settings.embeddings.retry-memory-status")
                 }
             }
         } header: {
@@ -759,6 +1132,10 @@ private struct EmbeddingsSettingsSection: View {
         if s.installState?.state == "failed" { return true }
         if s.reindexState?.state == "failed" { return true }
         return false
+    }
+
+    private var actionControls: EmbeddingsSettingsActionPresentation.Controls {
+        EmbeddingsSettingsActionPresentation.controls(status: status, errorMessage: errorMessage)
     }
 
     @ViewBuilder
@@ -894,11 +1271,14 @@ private struct EmbeddingsSettingsSection: View {
                 Text(detail).font(.caption2).foregroundStyle(.secondary)
                     .lineLimit(3).textSelection(.enabled)
             }
-            HStack {
-                Button {
-                    Task { await refreshStatus() }
-                } label: {
-                    Label("Retry status", systemImage: "arrow.clockwise")
+            if actionControls.showsRetryStatus {
+                HStack {
+                    Button {
+                        Task { await refreshStatus() }
+                    } label: {
+                        Label("Retry status", systemImage: "arrow.clockwise")
+                    }
+                    .accessibilityIdentifier("settings.embeddings.retry-status")
                 }
             }
         }
@@ -946,7 +1326,8 @@ private struct EmbeddingsSettingsSection: View {
 
     @ViewBuilder
     private func memoryModeRow(for s: EmbeddingsStatus) -> some View {
-        let currentMode = normalizedMemoryMode(s.memoryMode)
+        let presentation = EmbeddingsSettingsStatusPresentation(status: s)
+        let currentMode = presentation.memoryMode
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Label("Memory mode", systemImage: "memorychip")
@@ -967,12 +1348,12 @@ private struct EmbeddingsSettingsSection: View {
             .disabled(memoryModeSaving || releasingMemory)
 
             HStack(spacing: 8) {
-                Text(memoryModeDescription(for: s))
+                Text(presentation.memoryModeDescription)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
                 Spacer()
-                if s.modelState?.loaded == true {
+                if actionControls.showsReleaseNow {
                     Button {
                         Task { await releaseMemoryNow() }
                     } label: {
@@ -981,6 +1362,7 @@ private struct EmbeddingsSettingsSection: View {
                     .buttonStyle(.naFeel)
                     .font(.caption)
                     .disabled(releasingMemory)
+                    .accessibilityIdentifier("settings.embeddings.release-now")
                 }
             }
         }
@@ -1038,15 +1420,18 @@ private struct EmbeddingsSettingsSection: View {
         loading = (status == nil)
         defer { loading = false }
         do {
-            let fresh = try await appModel.fetchEmbeddingsStatus()
-            status = fresh
-            errorMessage = nil
+            let update = EmbeddingsSettingsActionPresentation.refreshed(try await fetchStatus())
+            status = update.status
+            errorMessage = update.errorMessage
+            guard let fresh = update.status else { return }
             // If model prep or indexing is running, keep polling for progress.
             if fresh.installState?.state == "installing" || fresh.reindexState?.state == "running" {
                 startPollingIfNeeded()
             }
         } catch {
-            errorMessage = "Status check failed: \(error.localizedDescription)"
+            let update = EmbeddingsSettingsActionPresentation.refreshFailed(error, preserving: status)
+            status = update.status
+            errorMessage = update.errorMessage
             if status == nil {
                 startPollingIfNeeded()
             }
@@ -1062,7 +1447,7 @@ private struct EmbeddingsSettingsSection: View {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 if Task.isCancelled { return }
                 do {
-                    let fresh = try await appModel.fetchEmbeddingsStatus()
+                    let fresh = try await fetchStatus()
                     status = fresh
                     let installState = fresh.installState?.state ?? "idle"
                     let reindexState = fresh.reindexState?.state ?? "idle"
@@ -1079,30 +1464,6 @@ private struct EmbeddingsSettingsSection: View {
             // happened so the user knows and can choose to refresh.
             errorMessage = "Memory status is taking longer than expected. Refresh the status and check app logs if it persists."
             await refreshStatus()
-        }
-    }
-
-    private func normalizedMemoryMode(_ raw: String?) -> String {
-        let value = raw ?? "balanced"
-        switch value {
-        case "performance", "balanced", "low_memory":
-            return value
-        default:
-            return "balanced"
-        }
-    }
-
-    private func memoryModeDescription(for s: EmbeddingsStatus) -> String {
-        if let detail = s.memoryModeDetail?.detail, !detail.isEmpty {
-            return detail
-        }
-        switch normalizedMemoryMode(s.memoryMode) {
-        case "performance":
-            return "Keeps the model hot for fastest recall."
-        case "low_memory":
-            return "Allows the model to release sooner when idle."
-        default:
-            return "Balances recall speed and memory use."
         }
     }
 
@@ -1128,11 +1489,31 @@ private struct EmbeddingsSettingsSection: View {
         releasingMemory = true
         defer { releasingMemory = false }
         do {
-            let result = try await appModel.releaseEmbeddingsMemory()
-            status = result.status
-            errorMessage = result.error
+            let update = EmbeddingsSettingsActionPresentation.released(
+                try await releaseEmbeddingsMemory()
+            )
+            status = update.status
+            errorMessage = update.errorMessage
         } catch {
-            errorMessage = "Release failed: \(error.localizedDescription)"
+            let update = EmbeddingsSettingsActionPresentation.releaseFailed(error, preserving: status)
+            status = update.status
+            errorMessage = update.errorMessage
         }
+    }
+
+    @MainActor
+    private func fetchStatus() async throws -> EmbeddingsStatus {
+        if let fetchStatus = actionOverrides.fetchStatus {
+            return try await fetchStatus()
+        }
+        return try await appModel.fetchEmbeddingsStatus()
+    }
+
+    @MainActor
+    private func releaseEmbeddingsMemory() async throws -> EmbeddingsToggleResult {
+        if let releaseMemory = actionOverrides.releaseMemory {
+            return try await releaseMemory()
+        }
+        return try await appModel.releaseEmbeddingsMemory()
     }
 }

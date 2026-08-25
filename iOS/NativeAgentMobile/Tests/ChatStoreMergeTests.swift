@@ -246,6 +246,48 @@ final class ChatStoreMergeTests: XCTestCase {
         XCTAssertEqual(store.messages.last?.text, "keep this answer")
     }
 
+    // Coverage ledger: ios.screens / ios.chat.composer.textField
+    func test_sessionSwitchAlwaysReleasesTheComposerAfterSuccessFailureOrCancellation() async {
+        enum LoadFailure: Error { case unavailable }
+
+        func waitForSwitchToFinish(_ store: ChatStore) async {
+            for _ in 0..<100 where store.isSwitchingSession {
+                await Task.yield()
+            }
+            XCTAssertFalse(store.isSwitchingSession)
+        }
+
+        let store = ChatStore(defaults: isolatedDefaults(), restoreQueuedSends: false)
+        store.setSelectedSessionID("current")
+
+        store.switchSessionForEvaluation(
+            to: "success",
+            loadHistory: { _ in [] },
+            fallbackMessages: nil
+        )
+        await waitForSwitchToFinish(store)
+
+        store.switchSessionForEvaluation(
+            to: "failure",
+            loadHistory: { _ in throw LoadFailure.unavailable },
+            fallbackMessages: nil
+        )
+        await waitForSwitchToFinish(store)
+        XCTAssertTrue(store.errorBanner?.contains("Could not load this chat") == true)
+
+        store.switchSessionForEvaluation(
+            to: "cancelled",
+            loadHistory: { _ in
+                try await Task.sleep(nanoseconds: 60_000_000_000)
+                return nil
+            },
+            fallbackMessages: nil
+        )
+        XCTAssertTrue(store.isSwitchingSession)
+        store.cancelSessionSwitch()
+        XCTAssertFalse(store.isSwitchingSession)
+    }
+
     func test_unmatchedLateCancellationCannotStopANewerTurn() {
         let store = ChatStore(restoreQueuedSends: false)
         store.isLoading = true
@@ -806,5 +848,364 @@ final class ChatStoreMergeTests: XCTestCase {
         var genericProfile = profile
         genericProfile.name = "AI"
         XCTAssertEqual(NativeAgentIdentity.displayName(genericProfile.name), "NativeAgent")
+    }
+}
+
+// MARK: - ios.sync fence evals (2026-08-23, coverage ledger wave A)
+//
+// Pure/injectable surfaces on the iOS↔Mac sync path whose failure mode is
+// SILENT: a projection that mints a fresh id every refresh (duplicate
+// transcript), a metadata dictionary that stops carrying the routing key
+// (every Mac reply dropped), a formatter that prints "60s" instead of "1m",
+// a timeout race that never fires (a wedged cloudd freezes the caller), an
+// error enum with an empty sentence, and the one guard that keeps provider
+// API keys off the iCloud wire entirely.
+//
+// Ledger rows: ios.macBridgeClient.projectChatRecords,
+// shared.icloudConstants.mobileSourceKey (call site), ios.userDisplayFormatters,
+// ios.ckLandmine.withCKTimeout / ios.diagnostics.withCKTimeout,
+// ios.sync.syncError.userStrings, ios.sync.configureProvider.apiKeyRefusal.
+@MainActor
+final class ICloudSyncFenceLogicTests: XCTestCase {
+    private func isolatedDefaults(_ label: String = #function) -> UserDefaults {
+        let suite = "NativeAgentMobileTests.ICloudSyncFence.\(label).\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        defaults.set(true, forKey: "NativeAgent.unifiedSession.v1")
+        return defaults
+    }
+
+
+    // MARK: ios.macBridgeClient.projectChatRecords
+
+    private func record(
+        id: String,
+        role: String,
+        content: String,
+        attachments: [PersistedAttachmentRecord]? = nil
+    ) -> ChatMessageRecord {
+        ChatMessageRecord(
+            id: id,
+            sessionId: "sid-1",
+            role: role,
+            content: content,
+            createdAt: "2026-08-23T09:00:00Z",
+            metadata: attachments.map { ChatMessageRecordMetadata(attachments: $0) }
+        )
+    }
+
+    /// A Mac-side id that IS a UUID must project to the same ChatMessage.id on
+    /// every refresh — that stability is the only thing keeping a re-read of
+    /// the transcript from appending a second copy of every message.
+    func testUUIDBackedRecordsProjectToAStableIdentityAcrossRefreshes() {
+        let stableID = UUID()
+        let records = [record(id: stableID.uuidString, role: "assistant", content: "hi")]
+
+        let first = MacBridgeClient.projectChatRecords(records)
+        let second = MacBridgeClient.projectChatRecords(records)
+
+        XCTAssertEqual(first.count, 1)
+        XCTAssertEqual(first[0].id, stableID)
+        XCTAssertEqual(first.map(\.id), second.map(\.id),
+                       "re-projecting the same records must not mint new identities")
+        XCTAssertEqual(first[0].role, .assistant)
+        XCTAssertEqual(first[0].text, "hi")
+    }
+
+    /// The `UUID(uuidString:) ?? UUID()` fallback is a live dedup landmine: a
+    /// Mac id that is not a UUID gets a FRESH identity on every projection, so
+    /// the same message can be appended twice. This test documents the hazard
+    /// with teeth — if the fallback is ever made deterministic (a hash of the
+    /// source id), this test fails and the fix gets an eval instead of a
+    /// silent behaviour change.
+    func testNonUUIDRecordIdsCurrentlyMintAFreshIdentityEveryProjection() {
+        let records = [record(id: "msg_20260823_0001", role: "user", content: "hey")]
+
+        let first = MacBridgeClient.projectChatRecords(records)
+        let second = MacBridgeClient.projectChatRecords(records)
+
+        XCTAssertEqual(first.count, 1)
+        XCTAssertEqual(second.count, 1)
+        XCTAssertNotEqual(
+            first[0].id, second[0].id,
+            "non-UUID Mac ids are not stable across projections — if this now passes, "
+            + "the fallback became deterministic and the dedup story changed"
+        )
+    }
+
+    /// Only user/assistant turns are renderable. A `system`/`tool` row must be
+    /// dropped, not coerced into an assistant bubble that puts Mac-internal
+    /// text in front of the user.
+    func testNonRenderableRolesAreDroppedRatherThanCoerced() {
+        let records = [
+            record(id: UUID().uuidString, role: "system", content: "you are…"),
+            record(id: UUID().uuidString, role: "tool", content: "{\"ok\":true}"),
+            record(id: UUID().uuidString, role: "user", content: "hey"),
+            record(id: UUID().uuidString, role: "Assistant", content: "wrong case"),
+        ]
+        let projected = MacBridgeClient.projectChatRecords(records)
+        XCTAssertEqual(projected.count, 1, "only the exact-case user/assistant rows render")
+        XCTAssertEqual(projected[0].role, .user)
+    }
+
+    /// Attachments must survive the refresh round trip; dropping them makes a
+    /// photo the user sent vanish from history with no error.
+    func testAttachmentSummariesSurviveTheRefreshProjection() {
+        let records = [
+            record(
+                id: UUID().uuidString,
+                role: "user",
+                content: "look at this",
+                attachments: [
+                    PersistedAttachmentRecord(
+                        id: "att-1",
+                        type: "image",
+                        mime: "image/jpeg",
+                        name: "shot.jpg",
+                        byteSize: 204_800,
+                        path: nil
+                    ),
+                    // name omitted → must fall back, not collapse to empty.
+                    PersistedAttachmentRecord(
+                        id: "att-2",
+                        type: "image",
+                        mime: nil,
+                        name: nil,
+                        byteSize: nil,
+                        path: nil
+                    ),
+                ]
+            )
+        ]
+        let projected = MacBridgeClient.projectChatRecords(records)
+        XCTAssertEqual(projected.count, 1)
+        XCTAssertEqual(projected[0].attachments.count, 2)
+        XCTAssertEqual(projected[0].attachments[0].id, "att-1")
+        XCTAssertEqual(projected[0].attachments[0].name, "shot.jpg")
+        XCTAssertEqual(projected[0].attachments[0].byteSize, 204_800)
+        XCTAssertEqual(projected[0].attachments[1].name, "attachment")
+        XCTAssertNil(projected[0].attachments[1].byteSize)
+    }
+
+    // MARK: shared.icloudConstants.mobileSourceKey — the emitting call site
+
+    /// Every outbound chat message carries the two keys the Mac addresses its
+    /// reply with. If either stops being emitted the Mac's reply is addressed
+    /// to nobody and the iOS receive filter drops it — chat looks like the Mac
+    /// never answered.
+    func testChatMetadataAlwaysCarriesTheRoutingKeysTheMacRepliesTo() {
+        let metadata = ChatRuntimeControls.defaults.metadata(transport: "icloud")
+        XCTAssertEqual(metadata["sourceKey"], NativeAgentICloudBridgeConstants.mobileSourceKey)
+        XCTAssertEqual(metadata["routeKey"], ChatRuntimeControls.deviceSourceKey)
+        XCTAssertEqual(metadata["transport"], "icloud")
+        XCTAssertEqual(metadata["source"], "ios")
+        XCTAssertEqual(metadata["clientSurface"], "iphone")
+        XCTAssertFalse(metadata["routeKey"]?.isEmpty ?? true)
+        XCTAssertTrue(
+            NativeAgentICloudBridgeConstants.isMobileSourceKey(metadata["sourceKey"]),
+            "the key we emit must be the key our own receive filter accepts"
+        )
+    }
+
+    /// Blank control fields must be OMITTED, not sent as "". An empty `model`
+    /// on the wire overrides the Mac's configured default with nothing and the
+    /// turn silently runs on whatever the Mac falls back to.
+    func testBlankRuntimeControlsAreOmittedRatherThanSentEmpty() {
+        let blank = ChatRuntimeControls(
+            model: "   ",
+            reasoningEffort: "",
+            serviceTier: "",
+            fileAccess: "",
+            providerId: ""
+        )
+        let metadata = blank.metadata(transport: "icloud")
+        for key in ["model", "reasoningEffort", "serviceTier", "fileAccess", "providerId"] {
+            XCTAssertNil(metadata[key], "\(key) must be omitted when blank, not sent empty")
+        }
+        // The routing keys are never optional.
+        XCTAssertNotNil(metadata["sourceKey"])
+        XCTAssertNotNil(metadata["routeKey"])
+
+        let filled = ChatRuntimeControls(
+            model: "  gpt-5.6-sol ",
+            reasoningEffort: "high",
+            serviceTier: "default",
+            fileAccess: "auto",
+            providerId: "openai"
+        ).metadata(transport: "icloud")
+        XCTAssertEqual(filled["model"], "gpt-5.6-sol", "values must be trimmed before the wire")
+    }
+
+    /// The per-device route key is what makes a reply land on THIS phone. An
+    /// unnamed device must still get a usable key, never an empty string.
+    func testDeviceRouteKeyIsNeverEmptyEvenForAnUnnamedDevice() {
+        XCTAssertEqual(ChatRuntimeControls.makeDeviceSourceKey(deviceName: ""), "iphone")
+        XCTAssertEqual(ChatRuntimeControls.makeDeviceSourceKey(deviceName: "   "), "iphone")
+        XCTAssertEqual(ChatRuntimeControls.makeDeviceSourceKey(deviceName: " User's iPhone "), "iphone:User's iPhone")
+        XCTAssertFalse(ChatRuntimeControls.deviceSourceKey.isEmpty)
+    }
+
+    // MARK: ios.userDisplayFormatters
+
+    /// Duration boundaries. The rounding order is load-bearing: rounding after
+    /// the branch prints "60s", which reads as a broken clock.
+    func testDurationFormattingRoundsBeforeItBranches() {
+        XCTAssertEqual(UserDisplayFormatters.humanizeDuration(0.44), "0.4s")
+        XCTAssertEqual(UserDisplayFormatters.humanizeDuration(4.62), "4.6s")
+        XCTAssertEqual(UserDisplayFormatters.humanizeDuration(9.99), "10.0s")
+        XCTAssertEqual(UserDisplayFormatters.humanizeDuration(10), "10s")
+        XCTAssertEqual(UserDisplayFormatters.humanizeDuration(59.5), "1m")
+        XCTAssertEqual(UserDisplayFormatters.humanizeDuration(134), "2m 14s")
+        XCTAssertEqual(UserDisplayFormatters.humanizeDuration(3600), "1h")
+        XCTAssertEqual(UserDisplayFormatters.humanizeDuration(3780), "1h 3m")
+        XCTAssertEqual(UserDisplayFormatters.humanizeDuration(7200), "2h")
+        // Never render a raw seconds count above a minute.
+        XCTAssertFalse(UserDisplayFormatters.humanizeDuration(59.5).hasSuffix("60s"))
+    }
+
+    /// Non-finite / negative durations must render as nothing rather than
+    /// "nans" or "-1.0s" under a live progress row.
+    func testDurationFormattingRefusesNonFiniteAndNegativeInput() {
+        XCTAssertEqual(UserDisplayFormatters.humanizeDuration(.nan), "")
+        XCTAssertEqual(UserDisplayFormatters.humanizeDuration(.infinity), "")
+        XCTAssertEqual(UserDisplayFormatters.humanizeDuration(-1), "")
+    }
+
+    /// Both Mac timestamp spellings must parse. A parser that only accepts one
+    /// makes every relative timestamp on the phone silently fall back to the
+    /// raw ISO string — legible, but wrong-looking, and it never raises.
+    func testBothMacISOTimestampSpellingsParse() {
+        XCTAssertNotNil(UserDisplayFormatters.parseISOTimestamp("2026-08-23T09:00:00Z"))
+        XCTAssertNotNil(UserDisplayFormatters.parseISOTimestamp("2026-08-23T09:00:00.123Z"))
+        XCTAssertNotNil(UserDisplayFormatters.parseISOTimestamp("  2026-08-23T09:00:00.123Z  "))
+        XCTAssertNil(UserDisplayFormatters.parseISOTimestamp(""))
+        XCTAssertNil(UserDisplayFormatters.parseISOTimestamp("not-a-date"))
+
+        // Unparseable input returns the raw value — dropping the field is worse.
+        XCTAssertEqual(UserDisplayFormatters.humanizeISOTimestamp("not-a-date"), "not-a-date")
+        XCTAssertEqual(UserDisplayFormatters.humanizeISOTimestamp("   "), "")
+        let relative = UserDisplayFormatters.humanizeISOTimestamp("2026-08-23T09:00:00.123Z")
+        XCTAssertFalse(relative.isEmpty)
+        XCTAssertFalse(relative.contains("2026-08-23T"), "a parsed timestamp must not render as raw ISO")
+    }
+
+    // MARK: ios.ckLandmine.withCKTimeout / ios.diagnostics.withCKTimeout
+
+    /// The guard returns Optional-nil for THREE different reasons and every
+    /// caller sees the same nil. All three are pinned here so a regression in
+    /// any one of them cannot hide behind the other two.
+    func testCKTimeoutReturnsTheValueOnSuccess() async {
+        let value = await withCKTimeout("eval.success", seconds: 5) { 42 }
+        XCTAssertEqual(value, 42)
+    }
+
+    func testCKTimeoutReturnsNilWhenTheWorkThrows() async {
+        struct Boom: Error {}
+        let value: Int? = await withCKTimeout("eval.throws", seconds: 5) { throw Boom() }
+        XCTAssertNil(value)
+    }
+
+    /// The one that actually matters: a wedged cloudd must NOT hold the caller.
+    /// The work here sleeps far longer than the budget; the race must win.
+    /// The bound is deliberately loose (structural proof, not a perf assertion)
+    /// — the point is "it returned at all", not "it returned in exactly 200ms".
+    func testCKTimeoutAbandonsWedgedWorkInsteadOfBlockingTheCaller() async {
+        let started = Date()
+        let value: Int? = await withCKTimeout("eval.wedged", seconds: 0.2) {
+            try? await Task.sleep(nanoseconds: 30_000_000_000)
+            return 7
+        }
+        let elapsed = Date().timeIntervalSince(started)
+        XCTAssertNil(value, "a wedged call must surface as nil, not the late value")
+        XCTAssertLessThan(elapsed, 10, "the timeout race never fired — the caller was held by the work")
+    }
+
+    // MARK: ios.sync.syncError.userStrings
+
+    /// Every SyncError case must produce a sentence, and the two the user is
+    /// most likely to hit must tell them what to DO. A swallowed case renders
+    /// as an empty toast, which is indistinguishable from success.
+    func testEverySyncErrorCaseRendersAnActionableSentence() {
+        let cases: [SyncError] = [
+            .notSetup,
+            .notSigned,
+            .timeout("Mac did not return a response."),
+            .persistence("could not write responses/1.json"),
+            .busy("another action is still in flight"),
+            .unsupported("API keys cannot be sent through iCloud."),
+        ]
+        var seen = Set<String>()
+        for error in cases {
+            let text = error.errorDescription ?? ""
+            XCTAssertFalse(text.isEmpty, "\(error) has no user-facing description")
+            XCTAssertTrue(seen.insert(text).inserted, "duplicate user string: \(text)")
+        }
+        // The two fixed sentences name the recovery action.
+        XCTAssertTrue(SyncError.notSetup.errorDescription?.contains("iCloud Drive") == true)
+        XCTAssertTrue(SyncError.notSigned.errorDescription?.contains("QR code") == true)
+        // The message-carrying cases pass the message through verbatim.
+        XCTAssertEqual(SyncError.timeout("boom").errorDescription, "boom")
+        XCTAssertEqual(SyncError.busy("wait").errorDescription, "wait")
+        XCTAssertEqual(SyncError.persistence("disk").errorDescription, "disk")
+        XCTAssertEqual(SyncError.unsupported("nope").errorDescription, "nope")
+    }
+
+    // MARK: ios.sync.configureProvider.apiKeyRefusal
+
+    /// The single `if` that keeps provider API keys off the iCloud wire. It
+    /// must refuse BEFORE any envelope is built, so the key never reaches a
+    /// signed message, a Drive file, or a CloudKit record. If the guard is
+    /// removed the call falls through to the transport and fails with a
+    /// DIFFERENT error (`.notSetup`), which is exactly what this asserts
+    /// against.
+    func testConfigureProviderRefusesAnAPIKeyBeforeAnythingIsSent() async {
+        do {
+            _ = try await iCloudSyncEngine.shared.configureProvider(
+                providerId: "openai",
+                apiKey: "sk-live-DO-NOT-SHIP",
+                authMode: "api_key"
+            )
+            XCTFail("configureProvider must refuse to carry an API key over iCloud")
+        } catch let error as SyncError {
+            guard case .unsupported(let message) = error else {
+                return XCTFail("expected .unsupported, got \(error) — the refusal guard did not fire first")
+            }
+            XCTAssertTrue(message.contains("API keys cannot be sent through iCloud"))
+            XCTAssertTrue(message.contains("Mac"), "the refusal must tell the user where keys DO get saved")
+            XCTAssertFalse(message.contains("sk-live-DO-NOT-SHIP"), "the refusal must not echo the key")
+        } catch {
+            XCTFail("expected SyncError.unsupported, got \(error)")
+        }
+    }
+
+    // Coverage ledger: ios.screens / ios.chat.deepLinkSendHook
+    func testLaunchInjectedSendHookAddsTheExactUserMessageAndConsumesItOnce() {
+        let store = ChatStore(defaults: isolatedDefaults(), restoreQueuedSends: false)
+        let client = MacBridgeClient()
+        let notificationCenter = NotificationCenter()
+        let text = "launch-hook message"
+
+        NativeAgentDeepLinkSendHook.stageLaunchArguments(
+            ["NativeAgentMobile", "-sendTestMessage", text],
+            notificationCenter: notificationCenter
+        )
+        let disposition = NativeAgentDeepLinkSendHook.deliverPending(
+            to: store,
+            client: client,
+            controls: .defaults,
+            emitHaptic: false
+        )
+        XCTAssertNotNil(disposition)
+        XCTAssertEqual(store.messages.first(where: { $0.role == .user })?.text, text)
+        XCTAssertNil(
+            NativeAgentDeepLinkSendHook.deliverPending(
+                to: store,
+                client: client,
+                controls: .defaults,
+                emitHaptic: false
+            ),
+            "the process launch hook must not replay the same injected turn"
+        )
+        store.sendTask?.cancel()
     }
 }

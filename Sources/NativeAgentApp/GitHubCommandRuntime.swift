@@ -273,27 +273,35 @@ actor GitHubCommandRuntime {
     }
 
     private func processNotifications() async {
+        let intents: [GitHubCommandNotificationIntent]
         do {
-            for intent in try await store.claimPendingNotifications() {
-                do {
-                    let (status, detail) = try await notificationSender(intent)
-                    _ = try await store.recordNotification(
-                        itemId: intent.itemId,
-                        dedupKey: intent.dedupKey,
-                        status: status,
-                        detail: detail
-                    )
-                } catch {
-                    _ = try await store.recordNotification(
-                        itemId: intent.itemId,
-                        dedupKey: intent.dedupKey,
-                        status: "failed",
-                        detail: GitHubCommandRuntime.readableDetail(error)
-                    )
-                }
-            }
+            intents = try await store.claimPendingNotifications()
         } catch {
             NSLog("github_command: notification cycle failed: \(error.localizedDescription)")
+            return
+        }
+        // Every intent above is already durably claimed and will never be
+        // re-surfaced, so a persistence failure for one intent must not abort
+        // the rest of the batch, and a receipt-write failure after a delivered
+        // send must not be recorded as a send failure.
+        for intent in intents {
+            var status = "failed"
+            var detail = ""
+            do {
+                (status, detail) = try await notificationSender(intent)
+            } catch {
+                detail = GitHubCommandRuntime.readableDetail(error)
+            }
+            do {
+                _ = try await store.recordNotification(
+                    itemId: intent.itemId,
+                    dedupKey: intent.dedupKey,
+                    status: status,
+                    detail: detail
+                )
+            } catch {
+                NSLog("github_command: receipt persist failed for \(intent.dedupKey): \(GitHubCommandRuntime.readableDetail(error))")
+            }
         }
     }
 

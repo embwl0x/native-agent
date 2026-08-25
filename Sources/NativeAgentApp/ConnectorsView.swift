@@ -136,6 +136,89 @@ struct ConnectorWizardPresentationState: Equatable {
     }
 }
 
+struct WorkspaceSearchPresentation: Equatable {
+    let visible: [WorkspaceSearchResult]
+    let remainingCount: Int
+
+    static func make(results: [WorkspaceSearchResult], limit: Int = 8) -> Self {
+        Self(visible: Array(results.prefix(limit)), remainingCount: max(0, results.count - limit))
+    }
+}
+
+/// Status copy belongs to the connector operation that produced it, not to
+/// AppModel's shared status line (which unrelated background work can replace
+/// before this view renders it).
+enum ConnectorsStatusMessagePresentation {
+    enum Tone: Equatable {
+        case progress
+        case success
+        case failure
+    }
+
+    struct Message: Equatable {
+        let text: String
+        let tone: Tone
+    }
+
+    static func connectorUpdate(
+        connectorName: String,
+        enabled: Bool,
+        outcome: ConnectorUpdateOutcome
+    ) -> Message {
+        switch outcome {
+        case .verified(let connector):
+            let name = nonempty(connector.name, fallback: connectorName)
+            return Message(
+                text: "\(name) is \(connector.enabled ? "enabled" : "disabled").",
+                tone: .success
+            )
+        case .failed(let detail):
+            return Message(
+                text: "Could not \(enabled ? "enable" : "disable") \(nonempty(connectorName, fallback: "connector")): \(nonempty(detail, fallback: "the connector registry did not confirm the change"))",
+                tone: .failure
+            )
+        }
+    }
+
+    static func workspaceAdd(name: String, writable: Bool, outcome: WorkspaceAddOutcome) -> Message {
+        switch outcome {
+        case .verified(let workspace):
+            return Message(
+                text: "Added \(nonempty(workspace.name, fallback: name)) with \(writable ? "read and write" : "read-only") access.",
+                tone: .success
+            )
+        case .failed(let detail):
+            return Message(
+                text: "Could not add \(nonempty(name, fallback: "workspace")): \(nonempty(detail, fallback: "the workspace was not saved"))",
+                tone: .failure
+            )
+        }
+    }
+
+    static func browserOpening() -> Message {
+        Message(text: "Opening Visible Browser…", tone: .progress)
+    }
+
+    static func browserOpened() -> Message {
+        Message(text: "Visible Browser opened. The assistant can use browser actions in that window.", tone: .success)
+    }
+
+    private static func nonempty(_ value: String?, fallback: String) -> String {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? fallback : trimmed
+    }
+}
+
+enum ConnectorUpdateOutcome: Equatable {
+    case verified(ConnectorRecord)
+    case failed(String)
+}
+
+enum WorkspaceAddOutcome: Equatable {
+    case verified(WorkspaceRecord)
+    case failed(String)
+}
+
 struct ConnectorsView: View {
     @Environment(AppModel.self) private var appModel
     @State private var workspaceName = ""
@@ -144,17 +227,17 @@ struct ConnectorsView: View {
     @State private var workspaceQuery = ""
     // PATCH-2026-05-07: connector-wizard-b ConnectorWizard sheet per card
     @State private var wizardPresentation = ConnectorWizardPresentationState()
-    @State private var connectorStatusMessage = ""
+    @State private var connectorStatusMessage: ConnectorsStatusMessagePresentation.Message?
     @State private var isAddingWorkspace = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             List {
-                if !connectorStatusMessage.isEmpty {
+                if let connectorStatusMessage {
                     Section {
-                        Text(connectorStatusMessage)
+                        Text(connectorStatusMessage.text)
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(statusColor(for: connectorStatusMessage.tone))
                     }
                 }
 
@@ -162,18 +245,34 @@ struct ConnectorsView: View {
                     ForEach(registryRowsForDisplay) { connector in
                         let uiState = connectorUIState(connector)
                         let actionPolicy = connectorActionPolicy(connector)
+                        let renderedStatusText = statusText(for: connector, uiState: uiState)
                         VStack(alignment: .leading, spacing: 6) {
                             HStack {
                                 Text(connector.name)
                                     .font(.headline)
                                 Spacer()
-                                Text(statusText(for: connector, uiState: uiState))
+                                Text(renderedStatusText)
                                     .font(.caption.weight(.semibold))
                                     .foregroundStyle(uiState.statusColor)
                             }
                             Text(connector.description)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
+                            if let runtimeStatus = connector.runtimeStatus,
+                               !runtimeStatus.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                let runtimeLabel: String = if let detail = connector.runtimeDetail {
+                                    "Socket Mode: \(runtimeStatus) · \(detail)"
+                                } else {
+                                    "Socket Mode: \(runtimeStatus)"
+                                }
+                                let runtimeConnected = runtimeStatus == "connected"
+                                Label(
+                                    runtimeLabel,
+                                    systemImage: runtimeConnected ? "dot.radiowaves.left.and.right" : "exclamationmark.triangle"
+                                )
+                                .font(.caption)
+                                .foregroundStyle(runtimeConnected ? Color.secondary : Color.orange)
+                            }
                             HStack {
                                 Label(connector.kind, systemImage: "tag")
                                 Label(connector.riskClass ?? "standard", systemImage: "exclamationmark.shield")
@@ -190,8 +289,12 @@ struct ConnectorsView: View {
                                 if actionPolicy.showsEnabledMutation {
                                     Button(connector.enabled ? "Disable" : "Enable", systemImage: connector.enabled ? "pause.circle" : "play.circle") {
                                         Task {
-                                            await appModel.updateConnector(connector, enabled: !connector.enabled)
-                                            connectorStatusMessage = appModel.statusText
+                                            let outcome = await appModel.updateConnector(connector, enabled: !connector.enabled)
+                                            connectorStatusMessage = ConnectorsStatusMessagePresentation.connectorUpdate(
+                                                connectorName: connector.name,
+                                                enabled: !connector.enabled,
+                                                outcome: outcome
+                                            )
                                         }
                                     }
                                 }
@@ -242,12 +345,18 @@ struct ConnectorsView: View {
                         }
                         .disabled(workspaceQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
-                    ForEach(appModel.workspaceSearchResults.prefix(8)) { result in
+                    let searchPresentation = WorkspaceSearchPresentation.make(results: appModel.workspaceSearchResults)
+                    ForEach(searchPresentation.visible) { result in
                         Text("\(result.workspaceName ?? "Workspace") · \(result.relativePath)")
                             .font(.caption)
                             .lineLimit(1)
                             .truncationMode(.middle)
                             .textSelection(.enabled)
+                    }
+                    if searchPresentation.remainingCount > 0 {
+                        Text("\(searchPresentation.remainingCount) more matches — refine your search to narrow the list.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
             }
@@ -296,14 +405,17 @@ struct ConnectorsView: View {
         isAddingWorkspace = true
         defer { isAddingWorkspace = false }
 
-        if await appModel.addWorkspace(name: name, path: path, writable: writable) {
+        let outcome = await appModel.addWorkspaceWithReceipt(name: name, path: path, writable: writable)
+        if case .verified = outcome {
             workspaceName = ""
             workspacePath = ""
             workspaceWritable = false
-            connectorStatusMessage = "Workspace added"
-        } else {
-            connectorStatusMessage = appModel.statusText
         }
+        connectorStatusMessage = ConnectorsStatusMessagePresentation.workspaceAdd(
+            name: name,
+            writable: writable,
+            outcome: outcome
+        )
     }
 
     private var registryRowsForDisplay: [ConnectorRecord] {
@@ -361,15 +473,23 @@ struct ConnectorsView: View {
         guard let action else { return }
         switch action {
         case .showBrowser:
-            connectorStatusMessage = "Opening Visible Browser…"
+            connectorStatusMessage = ConnectorsStatusMessagePresentation.browserOpening()
             Task { @MainActor in
                 await appModel.showVisibleBrowser()
-                connectorStatusMessage = "Visible Browser is open. The assistant can navigate, read text, inspect links, and capture screenshots through browser actions."
+                connectorStatusMessage = ConnectorsStatusMessagePresentation.browserOpened()
             }
         case .openTelegramSettings:
             NativeAgentAppCoordinator.shared.request(.sidebar(.telegram))
         case .openWizard(let provider):
             wizardPresentation.present(provider: provider)
+        }
+    }
+
+    private func statusColor(for tone: ConnectorsStatusMessagePresentation.Tone) -> Color {
+        switch tone {
+        case .progress: return .secondary
+        case .success: return NativeAgentTheme.ok
+        case .failure: return NativeAgentTheme.warn
         }
     }
 }

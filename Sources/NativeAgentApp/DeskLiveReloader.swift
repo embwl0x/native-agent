@@ -15,6 +15,18 @@ final class DeskLiveReloader {
     private var windowVisible = true
     private var effectivelyVisible = false
     private var started = false
+    /// Invalidates callbacks from a retired file/bus subscription. Cancellation
+    /// is cooperative, so a callback already queued when the Desk rebinds must
+    /// prove it still belongs to the current root before it can signal reload.
+    private var watchGeneration: UInt64 = 0
+    /// The active Desk view normally keeps one stable root, but a process-wide
+    /// reloader must not silently retain a previous root after the view is
+    /// reconstructed with another configured data root (tests, recovery, and
+    /// alternate runtimes all do this).  Keeping the normalized set lets an
+    /// equal activation stay cheap while a changed root replaces every exact
+    /// watcher and bus subscription.
+    private var watchedPaths: Set<URL> = []
+    private(set) var configurationError: String?
     private var reloadSequence: UInt64 = 0
     private var reload: (@MainActor @Sendable () async -> Void)?
     private let debounceDelay: Duration
@@ -39,14 +51,19 @@ final class DeskLiveReloader {
     /// Bind the currently visible DeskView to the app-lifetime watcher. The
     /// coordinator survives navigation reconstruction, so hidden file events
     /// remain dirty and produce one logged catch-up load for the new view.
+    @discardableResult
     func activate(
         paths: [URL],
         reload: @escaping @MainActor @Sendable () async -> Void
-    ) {
+    ) -> String? {
         self.reload = reload
-        start(paths: paths)
+        guard start(paths: paths) else {
+            setViewVisible(false)
+            return configurationError
+        }
         setViewVisible(true)
         Task { await debouncer.signal() }
+        return nil
     }
 
     func deactivate() {
@@ -54,27 +71,42 @@ final class DeskLiveReloader {
         reload = nil
     }
 
-    func start(paths: [URL]) {
-        guard !started else { return }
-        started = true
+    @discardableResult
+    func start(paths: [URL]) -> Bool {
         let normalized = Set(paths.map(\.standardizedFileURL))
+        if started {
+            guard watchedPaths != normalized else { return true }
+            stop()
+        }
+        for path in normalized {
+            do {
+                try FileManager.default.createDirectory(
+                    at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+            } catch {
+                configurationError = "Desk live updates are unavailable: \(error.localizedDescription)"
+                return false
+            }
+        }
+        started = true
+        watchedPaths = normalized
+        configurationError = nil
+        watchGeneration &+= 1
+        let generation = watchGeneration
         // A vnode source can watch an absent file only through an existing
         // parent. These are generated store directories, not state rows; make
         // the two canonical parents available before arming so a blank-slate
         // install cannot permanently miss its first out-of-process append.
-        for path in normalized {
-            try? FileManager.default.createDirectory(
-                at: path.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-        }
         watcher = FileChangeWatcher(paths: paths) { [weak self] _ in
-            Task { @MainActor in self?.sourceDidChange() }
+            Task { @MainActor in
+                guard let self, self.started, self.watchGeneration == generation else { return }
+                self.sourceDidChange()
+            }
         }
         let changes = StoreChangeBus.shared.changes()
         busTask = Task { [weak self] in
             for await change in changes where normalized.contains(change.path.standardizedFileURL) {
                 guard let self else { return }
+                guard self.started, self.watchGeneration == generation else { return }
                 sourceDidChange()
             }
         }
@@ -89,6 +121,7 @@ final class DeskLiveReloader {
         }
         refreshWindowVisibility()
         updateVisibility()
+        return true
     }
 
     func setViewVisible(_ value: Bool) { viewVisible = value; updateVisibility() }
@@ -105,8 +138,17 @@ final class DeskLiveReloader {
         busTask = nil
         occlusionTask?.cancel()
         occlusionTask = nil
-        Task { await debouncer.cancel() }
         started = false
+        watchedPaths = []
+        watchGeneration &+= 1
+        let stoppedGeneration = watchGeneration
+        // If a new root activates before this actor hop executes, that new
+        // activation owns visibility/dirty state.  Do not let an old stop
+        // cancel its initial refresh.
+        Task { [weak self] in
+            guard let self, !self.started, self.watchGeneration == stoppedGeneration else { return }
+            await self.debouncer.cancel()
+        }
     }
     private func refreshWindowVisibility() {
         windowVisible = visibilityResolver()

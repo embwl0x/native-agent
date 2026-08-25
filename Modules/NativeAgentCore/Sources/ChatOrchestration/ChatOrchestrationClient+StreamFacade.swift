@@ -337,7 +337,8 @@ extension SwiftNativeChatOrchestrationClient {
                 persistToolMessages: true,
                 progress: { event in
                     continuation.yield(event)
-                }
+                },
+                noticeSink: { kind, text in continuation.yield(.notice(kind: kind, text: text)) }
             )
             continuation.yield(.final(execution.turn))
         } catch let e as ChatOrchestrationError {

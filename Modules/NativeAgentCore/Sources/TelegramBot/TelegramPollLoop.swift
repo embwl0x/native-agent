@@ -25,6 +25,44 @@ public struct TelegramPollLoop: LoopRunner {
     let bot: SwiftNativeTelegramBot
     let session: URLSession
     let dataRoot: URL
+
+    /// The fail-closed sender decision shared by the live poll loop and
+    /// Settings coverage. The decision carries the exact receipt reason, so a
+    /// refactor cannot turn an empty or nonmatching allowlist into a silent
+    /// accept-all path.
+    public enum InboundAuthorizationDecision: Equatable, Sendable {
+        case allowed
+        case allowlistEmpty
+        case notAllowlisted
+    }
+
+    public static func inboundAuthorizationDecision(
+        allowedChatIds: Set<Int64>,
+        allowedUserIds: Set<Int64>,
+        chatId: Int,
+        fromUserId: Int?
+    ) -> InboundAuthorizationDecision {
+        guard !allowedChatIds.isEmpty || !allowedUserIds.isEmpty else {
+            return .allowlistEmpty
+        }
+        guard allowedChatIds.contains(Int64(chatId))
+                || fromUserId.map({ allowedUserIds.contains(Int64($0)) }) == true
+        else {
+            return .notAllowlisted
+        }
+        return .allowed
+    }
+
+    /// The authorization decision for ordinary group messages. Kept at the
+    /// runtime boundary so Settings can prove that its saved `requireMention`
+    /// value changes the decision the poll loop actually executes.
+    public static func dropsForMissingMention(
+        requireMention: Bool,
+        chatId: Int,
+        text: String
+    ) -> Bool {
+        requireMention && chatId < 0 && !text.contains("@")
+    }
     let offsetURL: URL
     let sendMessage: @Sendable (_ token: String, _ chatId: Int, _ text: String) async throws -> Void
     let sendPhoto: @Sendable (_ token: String, _ chatId: Int, _ imagePath: String, _ caption: String?) async throws -> Void
@@ -126,7 +164,7 @@ public struct TelegramPollLoop: LoopRunner {
         turnCardClock: @escaping @Sendable () -> Date = Date.init,
         turnCardSleeper: @escaping @Sendable (_ nanoseconds: UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) },
         turnStopConfirmationNanoseconds: UInt64 = 1_500_000_000,
-        syncCommandMenu: TelegramCommandMenuSync? = nil,
+        syncCommandMenu: TelegramCommandMenuSync? = TelegramPollLoop.defaultSyncCommandMenu,
         approvalHandler: (any TelegramApprovalHandling)? = nil,
         chatHandler: TelegramChatHandler? = nil,
         progressChatHandler: TelegramProgressChatHandler? = nil,
@@ -264,12 +302,13 @@ public struct TelegramPollLoop: LoopRunner {
         // never fire and a revoked token / offline Mac was silent forever.
         await syncCommandMenuIfNeeded()
 
-        let store = SwiftNativePersistenceCore()
-        let current = await store.readJSON(offsetURL, defaultValue: .object(["offset": .int(0)]))
-        var offset = 0
-        if case .object(let obj) = current, let v = obj["offset"] {
-            if case .int(let i) = v { offset = Int(i) }
-            else if case .double(let d) = v { offset = Int(d) }
+        let cursor = TelegramOffsetCursor(fileURL: offsetURL)
+        var offset: Int
+        do {
+            offset = try cursor.load()
+        } catch {
+            await recordError(context: "load_offset", error: String(describing: error))
+            return .failed(error: "Telegram offset cursor unavailable: \(error.localizedDescription)")
         }
 
         // Admit every Telegram update durably before acknowledging it upstream.
@@ -280,7 +319,7 @@ public struct TelegramPollLoop: LoopRunner {
         let updateInbox = TelegramUpdateInbox(offsetURL: offsetURL)
         let recoveredClaims: [TelegramUpdateClaim]
         do {
-            let snapshots = try await updateInbox.snapshots()
+            let snapshots = try await updateInbox.recoverableClaims()
             var reconciled: [TelegramUpdateClaim] = []
             reconciled.reserveCapacity(snapshots.count)
             for claim in snapshots {
@@ -310,10 +349,10 @@ public struct TelegramPollLoop: LoopRunner {
             .map({ $0.updateId + 1 })
             .max(),
            acknowledged > offset {
-            guard await persistOffset(acknowledged, store: store) else {
+            guard let advanced = await persistOffset(acknowledged, cursor: cursor) else {
                 return .failed(error: "Telegram could not reconcile durable inbox offset")
             }
-            offset = acknowledged
+            offset = advanced
         }
 
         let result: TelegramPollResult
@@ -396,10 +435,10 @@ public struct TelegramPollLoop: LoopRunner {
             await recordSeen(update: update, message: update.message)
             let updateOffset = update.updateId + 1
             if updateOffset > persistedOffset {
-                guard await persistOffset(updateOffset, store: store) else {
+                guard let advanced = await persistOffset(updateOffset, cursor: cursor) else {
                     return .failed(error: "Telegram update \(update.updateId) was claimed but its offset could not be persisted")
                 }
-                persistedOffset = updateOffset
+                persistedOffset = advanced
             }
             do {
                 let processing = try await updateInbox.transition(
@@ -460,21 +499,22 @@ public struct TelegramPollLoop: LoopRunner {
             // opened the front door — User's call, 2026-08-13: "if they don't
             // put something in there, have it fail closed."
             // Match rule: chat.id ∈ allowedChatIds OR from.id ∈ allowedUserIds.
-            let hasAllowlist = !allowedChatIds.isEmpty || !allowedUserIds.isEmpty
-            if !hasAllowlist {
+            switch Self.inboundAuthorizationDecision(
+                allowedChatIds: allowedChatIds,
+                allowedUserIds: allowedUserIds,
+                chatId: msg.chatId,
+                fromUserId: msg.fromUserId
+            ) {
+            case .allowlistEmpty:
                 FileHandle.standardError.write(Data("TelegramPollLoop: dropping update \(update.updateId) — allowlist is EMPTY (fail-closed); add an approved sender/group in Telegram settings\n".utf8))
                 await recordBlocked(reason: "allowlist_empty_fail_closed", update: update, message: msg, text: textFromMessage)
                 break updateProcessing
-            }
-            let chatOk = allowedChatIds.contains(Int64(msg.chatId))
-            let userOk: Bool = {
-                guard let fid = msg.fromUserId else { return false }
-                return allowedUserIds.contains(Int64(fid))
-            }()
-            if !chatOk && !userOk {
+            case .notAllowlisted:
                 FileHandle.standardError.write(Data("TelegramPollLoop: dropping update \(update.updateId) — chat_id \(msg.chatId) / from \(msg.fromUserId ?? 0) not allowlisted\n".utf8))
                 await recordBlocked(reason: "not_allowlisted", update: update, message: msg, text: textFromMessage)
                 break updateProcessing
+            case .allowed:
+                break
             }
             let text: String
             let receiptKind: String
@@ -599,7 +639,11 @@ public struct TelegramPollLoop: LoopRunner {
             // message is addressed to the bot. Mention proxy: text must
             // contain "@" (full bot-username verification would need a
             // getMe() round-trip we don't cache yet).
-            if requireMention && msg.chatId < 0 && !text.contains("@") {
+            if Self.dropsForMissingMention(
+                requireMention: requireMention,
+                chatId: msg.chatId,
+                text: text
+            ) {
                 FileHandle.standardError.write(Data("TelegramPollLoop: dropping update \(update.updateId) — requireMention=true, no @-mention in group chat \(msg.chatId)\n".utf8))
                 await recordBlocked(reason: "mention_required", update: update, message: msg, text: text)
                 break updateProcessing
@@ -869,7 +913,9 @@ public struct TelegramPollLoop: LoopRunner {
 
         let finalOffset = max(persistedOffset, result.nextOffset)
         if finalOffset != persistedOffset || result.updates.isEmpty {
-            _ = await persistOffset(finalOffset, store: store)
+            guard await persistOffset(finalOffset, cursor: cursor) != nil else {
+                return .failed(error: "Telegram final poll offset could not be persisted")
+            }
         }
         await updateInbox.pruneTerminalClaims()
         return .completed(result: "Telegram poll processed \(updates.count) update(s)")

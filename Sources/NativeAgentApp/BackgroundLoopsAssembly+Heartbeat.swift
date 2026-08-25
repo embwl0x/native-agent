@@ -205,6 +205,11 @@ extension BackgroundLoopsAssembly {
 
     private static let heartbeatExecutionStuckAge: TimeInterval = 6 * 60 * 60
     private static let heartbeatSelfHealStaleAge: TimeInterval = 6 * 60 * 60
+    /// A failed candidate is not terminal: it can return to `proposed` after
+    /// correction, but it is otherwise easy to leave indefinitely in the one
+    /// proposal array. Name that stalled branch before it becomes invisible
+    /// behind later, healthy proposals.
+    private static let heartbeatCandidateFailedAge: TimeInterval = 6 * 60 * 60
     private static let heartbeatInstalledUnverifiedAge: TimeInterval = 60 * 60
     private static let heartbeatErrorLogTailBytes = 256 * 1024
 
@@ -354,7 +359,8 @@ extension BackgroundLoopsAssembly {
     ) async -> (line: String, issues: [HeartbeatIssue]) {
         let store = EvolutionProposalStore(dataRoot: dataRoot)
         guard let active = try? await store.list(statuses: [
-            .needsDiff, .proposed, .building, .candidateGreen, .staged, .approved, .installed,
+            .needsDiff, .proposed, .building, .candidateGreen, .candidateFailed,
+            .staged, .approved, .installed,
         ]) else {
             return ("Pending evolution: unreadable proposal store.", [
                 HeartbeatIssue(
@@ -388,11 +394,7 @@ extension BackgroundLoopsAssembly {
                 detail: "Doctor is currently healthy, but \(resolvedDoctorSelfHeal.count) Doctor-failure self-heal proposal(s) are still in needs_diff.",
                 priority: 15,
                 actions: [
-                    HeartbeatNoticeAction(
-                        id: "repair",
-                        label: "Repair",
-                        description: "Close resolved Doctor self-heal proposals"
-                    )
+                    HeartbeatCardAction.repair.noticeAction
                 ]
             ))
         } else {
@@ -410,6 +412,22 @@ extension BackgroundLoopsAssembly {
                     actions: []
                 ))
             }
+        }
+
+        let failedCandidates = active.filter {
+            $0.status == .candidateFailed
+                && (heartbeatAgeSeconds(updatedAt: $0.updatedAt, createdAt: $0.createdAt, now: now)
+                    .map { $0 >= heartbeatCandidateFailedAge } ?? false)
+        }
+        if !failedCandidates.isEmpty {
+            let titles = failedCandidates.prefix(3).map(\.title).joined(separator: "; ")
+            issues.append(HeartbeatIssue(
+                id: "evolution-candidate-failed",
+                summary: "\(failedCandidates.count) evolution candidate(s) failed and need a new diff.",
+                detail: "Candidate build/test failures have remained unresolved for over \(Int(heartbeatCandidateFailedAge / 3600))h: \(titles).",
+                priority: 18,
+                actions: []
+            ))
         }
 
         let unverifiedInstalls = active.filter {
@@ -473,11 +491,7 @@ extension BackgroundLoopsAssembly {
                 detail: "\(stale.count) Desk execution(s) have been queued/running/blocked longer than \(Int(heartbeatExecutionStuckAge / 3600))h: \(rows).",
                 priority: 35,
                 actions: hasBlocked
-                    ? [HeartbeatNoticeAction(
-                        id: "open_approvals",
-                        label: "Open Approvals",
-                        description: "Review approvals blocking Desk tasks"
-                    )]
+                    ? [HeartbeatCardAction.openApprovals.noticeAction]
                     : []
             )
         )
@@ -664,15 +678,12 @@ extension BackgroundLoopsAssembly {
     /// Upserts a stable heartbeat-alert card to notifications/inbox.jsonl.
     /// Card id is keyed by condition, not day, so a flapping condition updates
     /// one visible card instead of stacking daily duplicates.
-    private static func upsertHeartbeatNoticeCard(dataRoot: URL, notice: HeartbeatNotice) async throws {
+    static func upsertHeartbeatNoticeCard(dataRoot: URL, notice: HeartbeatNotice) async throws {
         let inboxPath = heartbeatInboxPath(dataRoot: dataRoot)
         let body = notice.body.trimmingCharacters(in: .whitespacesAndNewlines)
         let cardId = heartbeatCardID(conditionId: notice.conditionId)
         let now = heartbeatISO(Date())
-        let actions = (notice.actions + [
-            HeartbeatNoticeAction(id: "archive", label: "Archive", description: "Archive this card"),
-            HeartbeatNoticeAction(id: "dismiss", label: "Dismiss", description: "Dismiss this card"),
-        ])
+        let actions = try HeartbeatCardAction.cardActions(authored: notice.actions)
         let card: JSONValue = .object([
             "id": .string(cardId),
             "created_at": .string(now),

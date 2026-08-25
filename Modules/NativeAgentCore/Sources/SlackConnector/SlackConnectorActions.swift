@@ -27,15 +27,14 @@ public enum SlackConnectorActions {
     }
 
     public static func listChannels(input: [String: JSONValue]) async throws -> JSONValue {
-        let limit = clamp(int(input["limit"], default: 100), min: 1, max: 1000)
-        let types = string(input["types"])?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let request = listChannelsRequest(input: input)
         let response = try await call(
             method: "conversations.list",
             httpMethod: "GET",
             params: [
-                "limit": String(limit),
+                "limit": String(request.limit),
                 "exclude_archived": "true",
-                "types": types?.isEmpty == false ? types! : "public_channel,private_channel,mpim,im",
+                "types": request.types,
             ]
         )
         return envelope(
@@ -43,6 +42,14 @@ public enum SlackConnectorActions {
             response: response,
             successStatus: "completed"
         )
+    }
+
+    /// The local, deterministic half of `slack.list_channels`. DMs are part
+    /// of the default inventory; dropping `im` silently makes them disappear.
+    static func listChannelsRequest(input: [String: JSONValue]) -> (limit: Int, types: String) {
+        let limit = clamp(int(input["limit"], default: 100), min: 1, max: 1000)
+        let types = string(input["types"])?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (limit, types?.isEmpty == false ? types! : "public_channel,private_channel,mpim,im")
     }
 
     public static func searchMessages(input: [String: JSONValue]) async throws -> JSONValue {
@@ -160,12 +167,18 @@ public enum SlackConnectorActions {
         )
         guard (uploadURLResponse["ok"] as? Bool) == true,
               let rawUploadURL = uploadURLResponse["upload_url"] as? String,
-              let uploadURL = URL(string: rawUploadURL),
               let fileId = uploadURLResponse["file_id"] as? String,
               !fileId.isEmpty else {
             return envelope(
                 action: "slack.upload_file",
                 response: uploadURLResponse,
+                successStatus: "completed"
+            )
+        }
+        guard let uploadURL = trustedExternalUploadURL(rawUploadURL) else {
+            return envelope(
+                action: "slack.upload_file",
+                response: ["ok": false, "error": "unsafe_upload_url"],
                 successStatus: "completed"
             )
         }
@@ -350,7 +363,7 @@ public enum SlackConnectorActions {
         ])
     }
 
-    private static func envelope(
+    static func envelope(
         action: String,
         response: [String: Any],
         successStatus: String
@@ -366,7 +379,24 @@ public enum SlackConnectorActions {
         if let error = response["error"] as? String, !error.isEmpty {
             obj["error"] = .string(error)
         }
-        return SlackConnectorSecretRedactor.redactValue(.object(obj))
+        return redactReceipt(.object(obj))
+    }
+
+    static func redactReceipt(_ value: JSONValue) -> JSONValue {
+        SlackConnectorSecretRedactor.redactValue(value)
+    }
+
+    /// `files.getUploadURLExternal` may return a short-lived signed URL, but
+    /// the file body must still only leave for Slack's HTTPS upload domain.
+    static func trustedExternalUploadURL(_ raw: String) -> URL? {
+        guard let url = URL(string: raw),
+              url.scheme?.lowercased() == "https",
+              url.user == nil, url.password == nil,
+              let host = url.host?.lowercased(),
+              (host == "files.slack.com" || host.hasSuffix(".files.slack.com")),
+              url.port == nil || url.port == 443
+        else { return nil }
+        return url
     }
 
     private static func string(_ raw: JSONValue?) -> String? {
@@ -416,7 +446,7 @@ private extension String {
 
 private enum SlackConnectorSecretRedactor {
     private static let slackToken = try! NSRegularExpression(
-        pattern: "\\bxox[baprs]-[A-Za-z0-9-]{20,}\\b",
+        pattern: "\\b(?:xox[baprs]-[A-Za-z0-9-]{20,}|xapp-[A-Za-z0-9-]{20,}|xoxe(?:\\.xoxp)?-[A-Za-z0-9-]{20,})\\b",
         options: []
     )
 

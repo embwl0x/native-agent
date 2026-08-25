@@ -9,6 +9,7 @@
 
 import SwiftUI
 import AuthenticationServices
+import PersistenceCore
 
 /// Drop into Settings, onboarding, or anywhere else.
 /// Examples:
@@ -24,13 +25,17 @@ struct OAuthSignInButton: View {
     // S.5: access AppModel so we can propagate revoke state to provider list
     @Environment(AppModel.self) private var appModel
 
-    @State private var status: SignInStatus = .idle
+    @State private var status: OAuthSignInPresentation.State = .idle
     @State private var lastError: String? = nil
     @State private var authStatusText: String? = nil
     @State private var flowTask: Task<Void, Never>? = nil
     @State private var cliSessionOffer: NativeOAuthFlow.CodexCLISessionOffer? = nil
     @State private var showingCLIConsentRepairConfirmation = false
     @State private var cliConsentRepairMessage: String? = nil
+
+    private var oauthDataRoot: URL {
+        appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -44,7 +49,7 @@ struct OAuthSignInButton: View {
                         } else {
                             Image(systemName: provider.iconSystemName)
                         }
-                        Text(buttonLabel)
+                        Text(buttonControl.title)
                             .fontWeight(.medium)
                     }
                     .padding(.horizontal, 14)
@@ -52,7 +57,7 @@ struct OAuthSignInButton: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(provider.tintColor)
-                .disabled(status == .running)
+                .disabled(buttonControl.isDisabled)
 
                 if status == .complete {
                     Button("Sign out") {
@@ -150,12 +155,11 @@ struct OAuthSignInButton: View {
         }
     }
 
-    private var buttonLabel: String {
-        switch status {
-        case .running:  return "Signing in…"
-        case .complete: return "Re-authenticate \(provider.displayShort)"
-        case .idle:     return "Sign in with \(provider.displayShort)"
-        }
+    private var buttonControl: OAuthSignInPresentation.ButtonControl {
+        OAuthSignInPresentation.buttonControl(
+            providerDisplayShort: provider.displayShort,
+            state: status
+        )
     }
 
     // MARK: - Flow
@@ -171,7 +175,10 @@ struct OAuthSignInButton: View {
         lastError = nil
         print("[oauth-signin] starting native flow for \(provider.id)")
 
-        let result = await NativeOAuthFlow.startOAuthFlow(providerId: provider.id)
+        let result = await NativeOAuthFlow.startOAuthFlow(
+            providerId: provider.id,
+            dataRoot: oauthDataRoot
+        )
         if Task.isCancelled {
             status = .idle
             return
@@ -182,7 +189,10 @@ struct OAuthSignInButton: View {
             // cycle would compute, off the just-written auth.json — not a
             // placeholder. If signInStatusDetail can't read expiry (long-lived
             // setup_token), fall through to "Signed in".
-            authStatusText = NativeOAuthFlow.signInStatusDetail(providerId: provider.id)
+            authStatusText = NativeOAuthFlow.signInStatusDetail(
+                providerId: provider.id,
+                dataRoot: oauthDataRoot
+            )
                 ?? "Signed in"
             await appModel.loadProvidersForChat()
             // Fill any blank/stale surfaces with the provider just connected, so
@@ -265,10 +275,10 @@ struct OAuthSignInButton: View {
 
     @MainActor
     private func signOut() async {
-        _ = NativeOAuthFlow.clearTokens(providerId: provider.id)
+        _ = NativeOAuthFlow.clearTokens(providerId: provider.id, dataRoot: oauthDataRoot)
         await refreshStatus()
         if provider.id == "openai_oauth_direct",
-           NativeOAuthFlow.isSignedIn(providerId: provider.id) {
+           NativeOAuthFlow.isSignedIn(providerId: provider.id, dataRoot: oauthDataRoot) {
             lastError = "Shared Codex auth is still signed in. Sign out from Codex to remove it."
         }
         // S.5: propagate revoke to the provider list so ProviderSettingsView
@@ -278,17 +288,13 @@ struct OAuthSignInButton: View {
 
     @MainActor
     private func refreshStatus() async {
-        if NativeOAuthFlow.isSignedIn(providerId: provider.id) {
-            status = .complete
-            // Show "Signed in (expires in Xh Ym)" countdown when expires_at
-            // is persisted. Falls back to "Signed in" for long-lived
-            // setup_tokens that don't carry expiry.
-            authStatusText = NativeOAuthFlow.signInStatusDetail(providerId: provider.id)
-                ?? "Signed in"
-        } else {
-            status = .idle
-            authStatusText = nil
-        }
+        let projection = OAuthSignInPresentation.status(
+            providerID: provider.id,
+            dataRoot: oauthDataRoot
+        )
+        status = projection.state
+        authStatusText = projection.detail
+        lastError = projection.error
         cliSessionOffer = provider.id == "openai_oauth_direct"
             ? NativeOAuthFlow.codexCLISessionOffer()
             : nil
@@ -322,9 +328,6 @@ struct OAuthSignInButton: View {
         }
     }
 
-    private enum SignInStatus: Equatable {
-        case idle, running, complete
-    }
 }
 
 // MARK: - Provider catalog

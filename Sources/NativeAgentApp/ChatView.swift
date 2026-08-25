@@ -20,6 +20,105 @@ let chatSessionDragType = UTType(exportedAs: "com.nativeagent.chat-session")
 let chatSessionDragPlainTextPrefix = "nativeagent-chat-session:"
 let chatSessionDropTypes: [UTType] = [chatSessionDragType, .plainText]
 
+/// Value-only presentation rules used by the chat viewport. The view is their
+/// sole consumer; no state is duplicated here.
+enum ChatViewportPresentation {
+    static func turnCardClearance(showingTurnCard: Bool, measuredHeight: CGFloat) -> CGFloat {
+        guard showingTurnCard else { return MacChatTurnCardMetrics.floatingClearance }
+        return max(MacChatTurnCardMetrics.floatingClearance, measuredHeight)
+    }
+
+    static func shouldShowLatestPill(autoFollow: Bool) -> Bool {
+        !autoFollow
+    }
+
+    enum ScrollFollowAction: Equatable {
+        case none
+        case disarm
+        case rearm
+    }
+
+    static func scrollFollowAction(
+        deltaY: CGFloat,
+        bottomSpacerVisible: Bool,
+        autoFollow: Bool
+    ) -> ScrollFollowAction {
+        if deltaY > 0.5 { return .disarm }
+        if deltaY < -0.5, bottomSpacerVisible, !autoFollow { return .rearm }
+        return .none
+    }
+}
+
+/// Owns the destructive clear action's presentation lifecycle. The view may
+/// dismiss a confirmation dialog more than once (button action plus binding
+/// teardown), so only a currently presented dialog may consume the clear.
+struct ChatClearConfirmationState: Equatable {
+    private(set) var isPresented = false
+
+    mutating func request() {
+        isPresented = true
+    }
+
+    mutating func cancel() {
+        isPresented = false
+    }
+
+    /// Returns true exactly once for a presented destructive confirmation.
+    mutating func consumeConfirmation() -> Bool {
+        guard isPresented else { return false }
+        isPresented = false
+        return true
+    }
+}
+
+struct ChatSidebarSections {
+    let pinned: [ChatSession]
+    let unpinned: [ChatSession]
+
+    static func split(visible: [ChatSession], orderedPinned: [ChatSession]) -> Self {
+        let visibleByID = Dictionary(
+            visible.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        var seenPinned = Set<String>()
+        let pinned: [ChatSession] = orderedPinned.compactMap { candidate -> ChatSession? in
+            guard seenPinned.insert(candidate.id).inserted else { return nil }
+            return visibleByID[candidate.id]
+        }
+        let pinnedIDs = Set(pinned.map(\.id))
+        var seenUnpinned = Set<String>()
+        return Self(
+            pinned: pinned,
+            // A damaged or concurrently refreshed index can contain a
+            // duplicate session ID.  A LazyVStack needs one stable row per
+            // ID; rendering both would let it recycle one row's closures and
+            // appearance for the other.  Keep the first visible receipt,
+            // matching the pinned projection above.
+            unpinned: visible.filter {
+                !pinnedIDs.contains($0.id) && seenUnpinned.insert($0.id).inserted
+            }
+        )
+    }
+}
+
+/// The identity SwiftUI uses for a sidebar row.  Section membership is part
+/// of the identity on purpose: moving a session between Pinned and Recent
+/// must destroy the old lazy row rather than recycle its local view state.
+struct ChatSidebarSessionRowIdentity: Hashable, Sendable {
+    enum Section: Hashable, Sendable {
+        case pinned
+        case recent
+    }
+
+    let sessionID: String
+    let section: Section
+
+    init(sessionID: String, pinned: Bool) {
+        self.sessionID = sessionID
+        self.section = pinned ? .pinned : .recent
+    }
+}
+
 struct ChatView: View {
     @Environment(AppModel.self) var appModel
     // chat-smoothness phase 6: respect the system Reduce Motion setting on the
@@ -78,17 +177,21 @@ struct ChatView: View {
     @State var showConversationControls = false
     let bottomAnchor = "chat-bottom-anchor"
     // User 2026-08-20: the floating turn card can outgrow the fixed 80pt
-    // clearance (approval row, steer affordance) and land on the streaming
-    // reply. Measure the real card height and let the clearance grow with it.
-    // The fixed constant stays as the FLOOR so idle→busy still never shifts
-    // rows; only a taller-than-default card moves the transcript up.
+    // clearance (larger accessibility text sizes scale its two rows) and land
+    // on the streaming reply. Measure the real card height and let the
+    // clearance grow with it. The fixed constant stays as the FLOOR so
+    // idle→busy never shifts rows at default text size (card ≈ 67pt < 80);
+    // only a genuinely taller card moves the transcript up. The measurement
+    // already includes the card's 6pt bottom inset — no additive on top, or
+    // busy clearance exceeds the floor at default size and every turn start
+    // shifts the transcript (sweep 2026-08-21).
     @State var turnCardMeasuredHeight: CGFloat = 0
 
     var turnCardClearance: CGFloat {
-        // While no card shows, hold the floor: the measured height is stale
-        // from the last turn and must not keep the idle transcript inflated.
-        guard showThinkingRow else { return MacChatTurnCardMetrics.floatingClearance }
-        return max(MacChatTurnCardMetrics.floatingClearance, turnCardMeasuredHeight + 18)
+        ChatViewportPresentation.turnCardClearance(
+            showingTurnCard: showThinkingRow,
+            measuredHeight: turnCardMeasuredHeight
+        )
     }
 
     // Sprint 3.1 — voice input
@@ -97,7 +200,6 @@ struct ChatView: View {
     // Sprint 3.2 — voice output
     @State var voiceOutput = VoiceOutputController()
     @AppStorage("voiceAutoRead") var voiceAutoRead = false
-    @AppStorage("voiceUseOpenAI") var voiceUseOpenAI = false
     // Sprint 3.3 — screen capture
     @State var isCapturing = false
     @State var toasts = ChatToastQueue()
@@ -113,21 +215,40 @@ struct ChatView: View {
     @State var transcriptSearch = MacChatTranscriptSearchController()
     @State var showTranscriptSearch = false
     @State var transcriptSearchFocusRequest: UInt = 0
-    // PATCH-2026-05-08: wave2-chat-ux — clear confirmation
-    @State var showClearConfirm = false
+    // The state gate is separate from the SwiftUI binding so dismissal and a
+    // destructive button action cannot race into duplicate clears.
+    @State var clearConfirmation = ChatClearConfirmationState()
     // Capability store supplies dynamic slash-command suggestions and dispatch metadata.
     @State var capabilitiesStore = CapabilitiesStore()
     // PATCH-Phase7b: tool dispatch sheet + in-flight plan
     @State var showToolInputForm = false
     @State var currentDispatchPlan: DispatchArgPlan? = nil
     @State var scrollCoordinator = ChatScrollCoordinator()
-    @State var lastAutoReadMessageId: String?
+    /// Per-session cursor prevents a tab switch from overwriting the marker
+    /// for a response that is still arriving in another conversation.
+    @State var lastAutoReadMessageIds: [String: String] = [:]
+    /// A session is primed from its already-loaded transcript once. Until then
+    /// auto-read must not mistake old history for a newly appended reply.
+    @State var autoReadPrimedSessionIds: Set<String> = []
     @State var pinnedSessionDropTargeted = false
     /// Fences overlapping "Go to" tasks. A route may need to refresh the
     /// session index before selection; an older click must not resume after a
     /// newer click and become the newest AppModel selection request.
     @State var runningSessionNavigationGeneration: UInt = 0
     @AppStorage("NativeAgent.pinnedChatSessionIds") var pinnedChatSessionIdsRaw = ""
+
+    var clearConfirmationBinding: Binding<Bool> {
+        Binding(
+            get: { clearConfirmation.isPresented },
+            set: { isPresented in
+                if isPresented {
+                    clearConfirmation.request()
+                } else {
+                    clearConfirmation.cancel()
+                }
+            }
+        )
+    }
 
     var activeSession: ChatSession? {
         appModel.chatSessions.first { $0.id == appModel.activeChatSessionId }
@@ -177,14 +298,17 @@ struct ChatView: View {
     // own section (pin ORDER, matching the tab strip) with everything else
     // below. Both sections respect the live search filter.
     var filteredPinnedSidebarSessions: [ChatSession] {
-        let visible = Set(filteredSessions.map(\.id))
-        return pinnedSessions.filter { visible.contains($0.id) }
+        ChatSidebarSections.split(
+            visible: filteredSessions,
+            orderedPinned: pinnedSessions
+        ).pinned
     }
 
     var filteredUnpinnedSidebarSessions: [ChatSession] {
-        let pinned = Set(pinnedSessionIds)
-        guard !pinned.isEmpty else { return filteredSessions }
-        return filteredSessions.filter { !pinned.contains($0.id) }
+        ChatSidebarSections.split(
+            visible: filteredSessions,
+            orderedPinned: pinnedSessions
+        ).unpinned
     }
 
     // 658.14: kept off the body so ChatView's already-maximal body expression
@@ -377,15 +501,7 @@ struct ChatView: View {
                 // and their sessions.
                 HealthCardPill()
 
-                Button {
-                    Task { await appModel.archiveActiveChat() }
-                } label: {
-                    Image(systemName: "archivebox")
-                }
-                .buttonStyle(.borderless)
-                .disabled(appModel.activeChatSessionId.isEmpty)
-                .help("Archive active chat")
-                .accessibilityLabel("Archive active chat")
+                ChatSidebarArchiveButton()
 
                 Button {
                     Task {
@@ -445,7 +561,7 @@ struct ChatView: View {
             }
             // M12: dim the list when the session/message fetch itself failed —
             // the rows on screen are a snapshot from an earlier refresh.
-            .opacity(appModel.chatStateLoadFailed || appModel.chatSessionIndexRefreshFailed ? 0.55 : 1)
+            .opacity(appModel.chatSidebarSessionListOpacity)
         }
         .frame(width: 240)
         .padding()
@@ -467,12 +583,19 @@ struct ChatView: View {
     @ViewBuilder
     func sidebarSessionRow(_ session: ChatSession, pinned isPinned: Bool) -> some View {
         let renaming = renamingSessionId == session.id
+        let renamePencil = SessionRowRenamePencilPresentation.make(
+            renameAvailable: true,
+            hovering: false,
+            renaming: renaming
+        )
+        let pinState: SessionRow.PinState = isPinned
+            ? .pinned(onUnpin: { unpinSession(session.id) })
+            : .unpinned
         SessionRow(
             session: session,
             selected: session.id == appModel.activeChatSessionId,
-            pinned: isPinned,
+            pinState: pinState,
             renaming: renaming,
-            onUnpin: { unpinSession(session.id) },
             onRenameBegin: { renamingSessionId = session.id },
             onRenameEnd: { title in
                 renamingSessionId = nil
@@ -518,8 +641,10 @@ struct ChatView: View {
                         pinSession(session.id, selectAfterPin: false)
                     }
                 }
-                Button("Rename Session", systemImage: "pencil") {
-                    renamingSessionId = session.id
+                if renamePencil.contextMenuRenameAvailable {
+                    Button("Rename Session", systemImage: "pencil") {
+                        renamingSessionId = session.id
+                    }
                 }
                 Divider()
                 // detached-chat-windows Phase 1 W1.8: context-menu
@@ -547,45 +672,31 @@ struct ChatView: View {
             // glyph after an unpin) until the whole view rebuilds. Branding
             // the row id with its section makes a pin flip a destroy+create
             // instead of a reuse.
-            .id((isPinned ? "pinned-" : "recent-") + session.id)
+            .id(ChatSidebarSessionRowIdentity(sessionID: session.id, pinned: isPinned))
     }
 
     @ViewBuilder
     var chatColumn: some View {
         VStack(spacing: 0) {
-            // PATCH-2026-05-08: wave2-chat-ux — hidden clear confirmation trigger
+            // The tool-input sheet remains a deliberately inert host. The
+            // clear confirmation is mounted on the real column below so it
+            // is laid out and presented by the visible conversation surface.
             Color.clear
                 .frame(width: 0, height: 0)
-                .confirmationDialog("Clear all messages in this session?", isPresented: $showClearConfirm, titleVisibility: .visible) {
-                    Button("Clear Messages", role: .destructive) {
-                        Task { await appModel.clearActiveChatMessages() }
-                    }
-                    Button("Cancel", role: .cancel) {}
-                }
-                // PATCH-Phase7b: ToolInputForm sheet — opened when dispatch needs multiple/complex fields
-                // Phase 13 (item 8): serialize [String: Any] values to Data BEFORE crossing
-                // the Task actor boundary so Swift 6 strict concurrency does not flag
-                // the capture of a non-Sendable [String: Any] in a Task closure.
+                // The form owns schema validation and emits only a JSON Data
+                // payload; the sheet can close only after a dispatch-safe
+                // body exists, and the Task never captures [String: Any].
                 .sheet(isPresented: $showToolInputForm) {
                     if let plan = currentDispatchPlan {
                         ToolInputForm(
                             plan: plan,
-                            onSubmit: { values in
+                            onSubmit: { inputData in
                                 showToolInputForm = false
-                                // Serialize to Data on the current actor (MainActor) before Task.
-                                let inputData = try? JSONSerialization.data(withJSONObject: values)
                                 let toolName = plan.tool.name
                                 Task {
-                                    if let data = inputData {
-                                        // Use the Data overload to avoid capturing [String: Any].
-                                        await runDispatchAndRenderReceiptData(
-                                            tool: toolName, inputData: data
-                                        )
-                                    } else {
-                                        await runDispatchAndRenderReceipt(
-                                            tool: toolName, input: [:]
-                                        )
-                                    }
+                                    await runDispatchAndRenderReceiptData(
+                                        tool: toolName, inputData: inputData
+                                    )
                                 }
                             },
                             onCancel: { showToolInputForm = false }
@@ -597,6 +708,7 @@ struct ChatView: View {
                     compiled: appModel.compiledPersonality,
                     context: appModel.latestContextReceipt,
                     nextGenSummary: appModel.nextGenSummary,
+                    nextGenPhases: appModel.nextGenPhases,
                     showContext: $showContext,
                     showConversationControls: $showConversationControls,
                     onRename: { title in
@@ -635,7 +747,7 @@ struct ChatView: View {
                     PinnedSessionTabStrip(
                         sessions: pinnedSessions,
                         activeSessionId: appModel.activeChatSessionId,
-                        runningSessionIds: appModel.streamingSessions,
+                        runningSessionIds: appModel.pinnedTabRunningSessionIDs,
                         dropTargeted: pinnedSessionDropTargeted,
                         onSelect: { session in
                             renameTitle = session.title
@@ -674,7 +786,13 @@ struct ChatView: View {
                                 ChatEmptyState(
                                     personaName: appModel.agentDisplayName,
                                     onSuggestion: { suggestion in
-                                        text = suggestion
+                                        ChatEmptyStateSuggestionAction.apply(
+                                            suggestion,
+                                            model: appModel,
+                                            activeSessionID: appModel.activeChatSessionId,
+                                            draftText: &draftText,
+                                            draftSessionID: &draftSessionId
+                                        )
                                     }
                                 )
                                 .frame(minHeight: 360)
@@ -727,9 +845,14 @@ struct ChatView: View {
                     )
                     .background(
                         ScrollWheelCatcher { deltaY in
-                            if deltaY > 0.5 {
+                            switch ChatViewportPresentation.scrollFollowAction(
+                                deltaY: deltaY,
+                                bottomSpacerVisible: scrollCoordinator.bottomSpacerVisible,
+                                autoFollow: scrollCoordinator.autoFollow
+                            ) {
+                            case .disarm:
                                 scrollCoordinator.disarmFollow()
-                            } else if deltaY < -0.5, scrollCoordinator.bottomSpacerVisible, !scrollCoordinator.autoFollow {
+                            case .rearm:
                                 // Scrolling back DOWN to the bottom re-arms
                                 // follow (standard chat UX — the user's catch
                                 // 2026-06-12: once follow disarmed, streaming
@@ -738,6 +861,8 @@ struct ChatView: View {
                                 // so the next delta continues from the bottom.
                                 scrollCoordinator.forceFollow()
                                 scrollToBottom(proxy, animated: true, delay: 0, force: true)
+                            case .none:
+                                break
                             }
                         }
                         .allowsHitTesting(false)
@@ -757,7 +882,9 @@ struct ChatView: View {
                         }
                     }
                     .overlay(alignment: .bottomTrailing) {
-                        if !scrollCoordinator.autoFollow {
+                        if ChatViewportPresentation.shouldShowLatestPill(
+                            autoFollow: scrollCoordinator.autoFollow
+                        ) {
                             Button {
                                 scrollCoordinator.forceFollow()
                                 scrollToBottom(proxy, animated: true, delay: 0, force: true)
@@ -806,8 +933,10 @@ struct ChatView: View {
                         transcriptSearch.reset(for: appModel.activeChatSessionId)
                         turnNoticeToasts.dismissAll()
                         scrollCoordinator.forceFollow()
+                        // A turn can be live in both the old and new session
+                        // with different card heights — don't carry one over.
+                        turnCardMeasuredHeight = 0
                         renameTitle = activeSession?.title ?? ""
-                        lastAutoReadMessageId = appModel.chatMessages.last(where: { $0.role == "assistant" })?.id
                         scrollToBottom(proxy, animated: false, delay: 0.05, force: true)
                     }
                     // session-switch scroll fix 2026-05-23: activeChatSessionId
@@ -818,6 +947,7 @@ struct ChatView: View {
                     // — force a scroll with enough delay for the LazyVStack
                     // to lay out the new messages.
                     .onChange(of: appModel.chatMessages.first?.id) { _, _ in
+                        primeAutoReadForCurrentSessionIfNeeded()
                         if showTranscriptSearch {
                             refreshTranscriptSearchIfPresented()
                         } else {
@@ -920,7 +1050,7 @@ struct ChatView: View {
                             if let session = appModel.chatSessions.first(where: { $0.id == appModel.activeChatSessionId }) {
                                 renameTitle = session.title
                             }
-                            lastAutoReadMessageId = appModel.chatMessages.last(where: { $0.role == "assistant" })?.id
+                            primeAutoReadForCurrentSessionIfNeeded()
                             scrollCoordinator.forceFollow()
                             scrollToBottom(proxy, animated: false, delay: 0, force: true)
                         }
@@ -955,7 +1085,7 @@ struct ChatView: View {
                             .padding(.bottom, 6)
                             // Feed the measured height (card + bottom inset)
                             // into the transcript clearance so a grown card
-                            // (approval / steer rows) never covers the reply.
+                            // (large accessibility text) never covers the reply.
                             .onGeometryChange(for: CGFloat.self) { proxy in
                                 proxy.size.height
                             } action: { height in
@@ -967,6 +1097,12 @@ struct ChatView: View {
                     .animation(
                         NativeAgentMotion.respecting(NativeAgentMotion.snappy, reduceMotion: reduceMotion),
                         value: showThinkingRow)
+                    .onChange(of: showThinkingRow) { _, visible in
+                        // Card gone: drop the stale measurement so the next
+                        // turn's clearance starts at the floor instead of the
+                        // previous card's height (one settle-scroll, not two).
+                        if !visible { turnCardMeasuredHeight = 0 }
+                    }
                 }
                 .safeAreaInset(edge: .bottom, spacing: 0) {
 
@@ -1007,20 +1143,20 @@ struct ChatView: View {
                     // the user can keep typing here while N background sessions
                     // run; this banner is just a friendly nudge.
                     MacChatOtherSessionsBanner(
-                        otherRunning: appModel.streamingSessions
-                            .filter { $0 != appModel.activeChatSessionId },
+                        otherRunning: appModel.otherRunningChatSessionIDs,
                         routes: runningSessionRoutes,
                         onGoTo: goToRunningSession,
                         onStop: { appModel.stopChatStream(sessionId: $0) }
                     )
 
                     // Toast
-                    if let toast = toasts.current {
+                    if let toast = ChatComposerBottomToastPresentation.visibleEntry(from: toasts) {
                         Text(toast)
                             .font(NativeAgentFont.tag)
                             .foregroundStyle(.secondary)
                             .padding(.horizontal)
                             .transition(.opacity)
+                            .accessibilityIdentifier("chat.composer.bottom-toast")
                     }
 
                     // PATCH-2026-05-09: nextgen-surface — suggested action chips above composer
@@ -1136,6 +1272,19 @@ struct ChatView: View {
                 }
                 }
         }
+        .confirmationDialog(
+            "Clear all messages in this session?",
+            isPresented: clearConfirmationBinding,
+            titleVisibility: .visible
+        ) {
+            Button("Clear Messages", role: .destructive) {
+                guard clearConfirmation.consumeConfirmation() else { return }
+                Task { await appModel.clearActiveChatMessages() }
+            }
+            Button("Cancel", role: .cancel) {
+                clearConfirmation.cancel()
+            }
+        }
         .background(.background)
         .contentShape(Rectangle())
         .onDrop(
@@ -1161,6 +1310,24 @@ struct ChatView: View {
         ))
     }
 
+}
+
+/// Kept as its own mounted control so the durable archive route can be hosted
+/// without starting ChatView's unrelated provider, voice, and file-watch work.
+struct ChatSidebarArchiveButton: View {
+    @Environment(AppModel.self) private var appModel
+
+    var body: some View {
+        Button {
+            Task { await appModel.archiveActiveChat() }
+        } label: {
+            Image(systemName: "archivebox")
+        }
+        .buttonStyle(.borderless)
+        .disabled(appModel.activeChatSessionId.isEmpty)
+        .help("Archive active chat")
+        .accessibilityLabel("Archive active chat")
+    }
 }
 
 /// M12: the honest counterpart to `try? await api.getX() ?? existingValue`.

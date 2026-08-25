@@ -1,15 +1,36 @@
 import Foundation
-import KnowledgeGraph
-import MemoryV2
-import PersistenceCore
 
 extension KnowledgeGraphView {
+    /// Policy authority is read separately from graph contents so unreadable
+    /// bytes cannot leave the mounted page indefinitely saying "Checking".
+    /// The enable action remains unavailable until this checked read succeeds.
+    func loadKnowledgeGraphPolicy() async -> Bool {
+        if appModel.trustPolicy != nil {
+            policyReadError = nil
+            return true
+        }
+        do {
+            appModel.trustPolicy = try await appModel.getTrustPolicy()
+            policyReadError = nil
+            return true
+        } catch {
+            policyReadError = error.localizedDescription
+            return false
+        }
+    }
+
+    func reloadKnowledgeGraphPolicyAndGraph() async {
+        guard await loadKnowledgeGraphPolicy() else { return }
+        await loadGraph()
+    }
+
     func loadGraph() async {
         loading = true; defer { loading = false }
         // ui-honesty 2026-06-10: clear the previous error at the start of
         // every load — a stale failure message used to persist over a
         // subsequent successful refresh.
         errorMsg = nil
+        errorOrigin = nil
         do {
             // PATCH-2026-05-15: paginate through ALL pages. Previously only
             // page 0 was fetched, so the sidebar capped at one page (~100)
@@ -44,13 +65,13 @@ extension KnowledgeGraphView {
             edges = allEdges
             totalEntities = total > 0 ? total : all.count
             totalEdges = totEdges
-            lastLoadFailed = false
+            errorOrigin = nil
         } catch {
             // U5 W-C fix-round: keep whatever loaded previously (the banner
             // marks it stale) — but the error is rendered FIRST, never under
             // a fabricated healthy empty state.
             errorMsg = error.localizedDescription
-            lastLoadFailed = true
+            errorOrigin = .graphLoad
         }
     }
 
@@ -58,81 +79,48 @@ extension KnowledgeGraphView {
         guard !isEnablingGraph else { return }
         isEnablingGraph = true
         defer { isEnablingGraph = false }
+        enableActionPresentation = .enabling
         errorMsg = nil
-        await appModel.patchMemoryPolicy(knowledgeGraphEnabled: true)
+        errorOrigin = nil
+        let outcome = await KnowledgeGraphEnableAction.perform(using: appModel)
+        enableActionPresentation = outcome
+        guard outcome == .enabled else { return }
         await loadGraph()
     }
 
     // U5 W-C: GC sweep — dry-run preview, then user-confirmed apply.
 
-    /// Build the live-memory fact list the GC reconciles against, from the
-    /// same memory.sqlite MemoryV2 writes through.
-    func listGCFacts(_ storage: MemoryStorage) async throws -> [KnowledgeGraphMemoryFact] {
-        let mems = try await storage.listMemories(persona: nil, status: nil, limit: nil)
-        return mems.map {
-            KnowledgeGraphMemoryFact(
-                id: $0.id,
-                content: $0.content,
-                source: $0.source,
-                status: $0.status,
-                createdAt: $0.createdAt,
-                updatedAt: $0.updatedAt,
-                metadata: $0.projectionMetadata
-            )
-        }
-    }
-
-    func previewGCSweep() async {
+    func previewGCSweep(actions: KnowledgeGraphMaintenanceActions = .init()) async {
         guard !gcRunning else { return }
         gcRunning = true
         defer { gcRunning = false }
-        gcStatus = nil
-        do {
-            let storage = try await SwiftNativeMemoryV2.resolvedStorage(
-                dataRoot: PersistenceCore.defaultDataRoot()
-            )
-            let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: await storage.path)
-            let facts = try await listGCFacts(storage)
-            let report = try await indexer.collectGarbage(liveFacts: facts, apply: false)
-            if report.candidates.isEmpty {
-                // U5 W-C fix-round (gpt-5.5 NIT): clear residue from any
-                // previous preview — a stale candidate list must not survive
-                // an empty dry-run (the confirmation dialog reads its count).
-                gcCandidates = []
-                gcStatus = "No orphaned entities."
-            } else {
-                gcCandidates = report.candidates
-                showGCConfirm = true
-            }
-        } catch {
-            errorMsg = "Orphan sweep failed: \(error.localizedDescription)"
-        }
+        applyGCSweepPresentation(
+            await KnowledgeGraphMaintenancePresentation.previewState(actions: actions)
+        )
     }
 
-    func applyGCSweep() async {
+    func applyGCSweep(actions: KnowledgeGraphMaintenanceActions = .init()) async {
         guard !gcRunning else { return }
         gcRunning = true
         defer { gcRunning = false }
-        do {
-            // Re-list immediately before applying so the live set is fresh;
-            // the GC re-scans inside its write transaction as well.
-            let storage = try await SwiftNativeMemoryV2.resolvedStorage(
-                dataRoot: PersistenceCore.defaultDataRoot()
-            )
-            let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: await storage.path)
-            let facts = try await listGCFacts(storage)
-            // The confirmation dialog the user just clicked IS the approval —
-            // that is the only path that sets approvedOverThreshold.
-            let report = try await indexer.collectGarbage(
-                liveFacts: facts,
-                apply: true,
-                approvedOverThreshold: true
-            )
-            gcStatus = "Removed \(report.entitiesDeleted) entities · \(report.edgesDeleted) edges."
-            gcCandidates = []
+        let presentation = await KnowledgeGraphMaintenancePresentation.applyState(
+            expectedCandidateIDs: gcPreviewCandidateIDs,
+            actions: actions
+        )
+        applyGCSweepPresentation(presentation)
+        if presentation.requiresGraphReload {
             await loadGraph()
-        } catch {
-            errorMsg = "Orphan sweep failed: \(error.localizedDescription)"
         }
+    }
+
+    private func applyGCSweepPresentation(
+        _ presentation: KnowledgeGraphMaintenancePresentation.State
+    ) {
+        gcStatus = presentation.status
+        gcCandidates = presentation.candidates
+        gcPreviewCandidateIDs = presentation.candidateIDs
+        showGCConfirm = presentation.presentsConfirmation
+        errorMsg = presentation.errorMessage
+        errorOrigin = presentation.errorMessage == nil ? nil : .maintenance
     }
 }

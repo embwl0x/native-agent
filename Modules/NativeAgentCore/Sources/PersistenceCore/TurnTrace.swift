@@ -125,10 +125,15 @@ public actor TurnFirstRenderRegistry {
 public struct TurnTraceEvent: Sendable, Equatable {
     /// Per-string-field cap applied to every string LEAF in the payload.
     public static let maxPayloadStringChars = 2000
-    /// Hard serialized-payload ceiling. A leaf cap alone does not bound arrays
-    /// or objects with many individually small fields; one diagnostic result
-    /// previously produced a 41 KB trace row despite every leaf being legal.
+    /// Hard serialized persisted-row ceiling. The payload is sized together
+    /// with the event envelope; bounding the payload alone can still write a
+    /// line over the promised limit once ids, timestamp, kind and surface are
+    /// added.
     public static let maxPayloadBytes = 12 * 1024
+    // Keep hostile envelope metadata from consuming the space reserved for
+    // the frozen context.snapshot scalar manifest.
+    private static let maxEnvelopeFieldUTF8Bytes = 480
+    private static let maxEnvelopeFieldJSONBytes = 512
     private static let oversizedPreviewBytes = 6 * 1024
 
     public let turnId: String
@@ -148,12 +153,23 @@ public struct TurnTraceEvent: Sendable, Equatable {
         surface: String? = nil,
         payload: JSONValue = .object([:])
     ) {
-        self.turnId = turnId
+        let boundedTurnID = Self.boundEnvelopeString(turnId)
+        let boundedKind = Self.boundEnvelopeString(kind)
+        let boundedSessionID = sessionId.map(Self.boundEnvelopeString)
+        let boundedSurface = surface.map(Self.boundEnvelopeString)
+        self.turnId = boundedTurnID
         self.ts = ts
-        self.kind = kind
-        self.sessionId = sessionId
-        self.surface = surface
-        self.payload = TurnTraceEvent.boundPayload(payload)
+        self.kind = boundedKind
+        self.sessionId = boundedSessionID
+        self.surface = boundedSurface
+        self.payload = TurnTraceEvent.boundPayload(
+            payload,
+            turnId: boundedTurnID,
+            ts: ts,
+            kind: boundedKind,
+            sessionId: boundedSessionID,
+            surface: boundedSurface
+        )
     }
 
     /// Bound every string leaf of a JSONValue tree to `maxPayloadStringChars`,
@@ -161,10 +177,24 @@ public struct TurnTraceEvent: Sendable, Equatable {
     /// Oversized payloads retain stable lifecycle fields plus a bounded JSON
     /// preview, original byte count, and digest so truncation remains explicit
     /// without making the per-day ledger unbounded.
-    static func boundPayload(_ value: JSONValue) -> JSONValue {
+    static func boundPayload(
+        _ value: JSONValue,
+        turnId: String,
+        ts: Date,
+        kind: String,
+        sessionId: String?,
+        surface: String?
+    ) -> JSONValue {
         let leafBound = boundLeaves(value)
         guard let serialized = try? leafBound.serializedData(pretty: false),
-              serialized.count > maxPayloadBytes else {
+              persistedRowBytes(
+                payload: leafBound,
+                turnId: turnId,
+                ts: ts,
+                kind: kind,
+                sessionId: sessionId,
+                surface: surface
+              ).map({ $0 > maxPayloadBytes }) == true else {
             return leafBound
         }
 
@@ -187,6 +217,17 @@ public struct TurnTraceEvent: Sendable, Equatable {
                 "milestone", "provider", "model", "resultClass",
                 "durationMs", "elapsedMs", "inputTokens", "outputTokens",
                 "argKeys",
+                // Context snapshots can include bounded previews that are
+                // intentionally much larger than one trace row. Keep their
+                // scalar integrity facts when that preview is summarized so
+                // the canonical row stays queryable rather than leaving a
+                // JSON fragment whose surviving keys depend on sort order.
+                "containsCognitiveSubstrate", "cognitiveCapsuleBytes",
+                "toolSchemaCount", "toolSchemaParameterBytes",
+                "toolSchemaMaterialBytes", "toolSchemaFingerprintSHA256",
+                "promptFingerprintSHA256", "systemTotalBytes",
+                "stableBytes", "dynamicBytes", "userMessageBytes",
+                "promptTextBytes", "imagePayloadBytes", "segmented",
             ]
             for key in stableKeys {
                 guard let field = object[key],
@@ -195,18 +236,73 @@ public struct TurnTraceEvent: Sendable, Equatable {
                 summary[key] = field
             }
         }
-        let bounded = JSONValue.object(summary)
-        if let data = try? bounded.serializedData(pretty: false),
-           data.count <= maxPayloadBytes {
-            return bounded
+        var previewBytes = min(oversizedPreviewBytes, serialized.count)
+        while true {
+            summary["_preview"] = .string(
+                String(decoding: serialized.prefix(previewBytes), as: UTF8.self)
+                + "…[payload byte limit]"
+            )
+            let bounded = JSONValue.object(summary)
+            let rowBytes = persistedRowBytes(
+                payload: bounded,
+                turnId: turnId,
+                ts: ts,
+                kind: kind,
+                sessionId: sessionId,
+                surface: surface
+            ) ?? Int.max
+            if rowBytes <= maxPayloadBytes { return bounded }
+            guard previewBytes > 0 else { break }
+            previewBytes = max(0, previewBytes - max(256, rowBytes - maxPayloadBytes + 64))
         }
-        // Defensive fallback if future stable fields collectively grow. The
-        // digest and byte count remain; only the preview shrinks.
-        summary["_preview"] = .string(
-            String(decoding: serialized.prefix(2 * 1024), as: UTF8.self)
-            + "…[payload byte limit]"
-        )
+
+        // Defensive fallback removes optional lifecycle fields only. The
+        // context.snapshot scalar manifest is a persisted contract and may
+        // never be traded away to make room for hostile envelope metadata.
+        summary.removeValue(forKey: "_preview")
+        for key in [
+            "argKeys", "outputTokens", "inputTokens",
+            "elapsedMs", "durationMs", "resultClass", "provider", "milestone",
+            "stage", "tool", "name", "status", "phase",
+        ] {
+            let candidate = JSONValue.object(summary)
+            if persistedRowBytes(
+                payload: candidate,
+                turnId: turnId,
+                ts: ts,
+                kind: kind,
+                sessionId: sessionId,
+                surface: surface
+            ).map({ $0 <= maxPayloadBytes }) == true {
+                return candidate
+            }
+            summary.removeValue(forKey: key)
+        }
+        // With four envelope fields capped at 512 serialized bytes, the fixed
+        // scalar manifest plus integrity fields has a reserved budget well
+        // below 12 KiB. Return it intact; never fall back to integrity-only.
         return .object(summary)
+    }
+
+    private static func persistedRowBytes(
+        payload: JSONValue,
+        turnId: String,
+        ts: Date,
+        kind: String,
+        sessionId: String?,
+        surface: String?
+    ) -> Int? {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        var row: [String: JSONValue] = [
+            "turnId": .string(turnId),
+            "ts": .string(formatter.string(from: ts)),
+            "kind": .string(kind),
+            "payload": payload,
+        ]
+        if let sessionId { row["sessionId"] = .string(sessionId) }
+        if let surface { row["surface"] = .string(surface) }
+        return try? (JSONValue.object(row).serializedData(pretty: false).count + 1)
     }
 
     private static func boundLeaves(_ value: JSONValue) -> JSONValue {
@@ -231,6 +327,36 @@ public struct TurnTraceEvent: Sendable, Equatable {
         // Keep the newest-truncation honest: prefix kept, marker appended.
         let prefix = String(s.prefix(cap))
         return prefix + "…[+\(s.count - cap) chars]"
+    }
+
+    /// Envelope fields are bounded by UTF-8 bytes, then checked in their JSON
+    /// string representation. Character-count caps are not byte caps (`🧠` is
+    /// one Character and four bytes), and JSON escaping can add bytes again.
+    private static func boundEnvelopeString(_ value: String) -> String {
+        let source = Data(value.utf8)
+        if source.count <= maxEnvelopeFieldUTF8Bytes,
+           (try? JSONValue.string(value).serializedData(pretty: false).count)
+                .map({ $0 <= maxEnvelopeFieldJSONBytes }) == true {
+            return value
+        }
+
+        var prefixBytes = min(source.count, maxEnvelopeFieldUTF8Bytes)
+        while prefixBytes >= 0 {
+            guard let prefix = String(data: source.prefix(prefixBytes), encoding: .utf8) else {
+                prefixBytes -= 1
+                continue
+            }
+            let marker = "…[+\(source.count - prefixBytes) bytes]"
+            let candidate = prefix + marker
+            let utf8Count = candidate.utf8.count
+            let jsonCount = try? JSONValue.string(candidate).serializedData(pretty: false).count
+            if utf8Count <= maxEnvelopeFieldUTF8Bytes,
+               jsonCount.map({ $0 <= maxEnvelopeFieldJSONBytes }) == true {
+                return candidate
+            }
+            prefixBytes -= max(1, utf8Count - maxEnvelopeFieldUTF8Bytes)
+        }
+        return "…[+\(source.count) bytes]"
     }
 
     /// Decode one persisted JSONL row back into a `TurnTraceEvent` — the inverse
@@ -335,6 +461,14 @@ public actor TurnTraceBus {
         }
     }
 
+    /// A subscription's drop counter is meaningful only while that exact sink
+    /// still exists. Keep retirement distinct from a measured zero so runtime
+    /// diagnostics never present an unavailable live feed as loss-free.
+    public enum DropCountRead: Sendable, Equatable {
+        case available(Int)
+        case unavailable
+    }
+
     private struct Sink {
         let continuation: AsyncStream<TurnTraceEvent>.Continuation
         let capacity: Int
@@ -403,6 +537,15 @@ public actor TurnTraceBus {
         sinks[id]?.drops ?? 0
     }
 
+    /// Availability-preserving variant of `dropCount(_:)` for live runtime
+    /// readers. The legacy integer hook retains its zero fallback for existing
+    /// callers, but Inspector must be able to tell a retired sink from a sink
+    /// that has genuinely observed no drops.
+    public func dropCountRead(_ id: UUID) -> DropCountRead {
+        guard let sink = sinks[id] else { return .unavailable }
+        return .available(sink.drops)
+    }
+
     public var subscriberCount: Int { sinks.count }
 
     // MARK: Emit
@@ -422,6 +565,7 @@ public actor TurnTraceBus {
         private var head = 0
         private var draining = false
         private var dropped = 0
+        private var idleWaiters: [CheckedContinuation<Void, Never>] = []
         let capacity: Int
         init(capacity: Int) { self.capacity = capacity }
         /// Returns true only when the caller must start the sole drain worker.
@@ -437,11 +581,15 @@ public actor TurnTraceBus {
             return true
         }
         func next() -> Pending? {
-            lock.lock(); defer { lock.unlock() }
+            lock.lock()
             guard head < queue.count else {
                 queue.removeAll(keepingCapacity: true)
                 head = 0
                 draining = false
+                let waiters = idleWaiters
+                idleWaiters.removeAll()
+                lock.unlock()
+                for waiter in waiters { waiter.resume() }
                 return nil
             }
             let value = queue[head]
@@ -450,7 +598,25 @@ public actor TurnTraceBus {
                 queue.removeFirst(head)
                 head = 0
             }
+            lock.unlock()
             return value
+        }
+        /// Suspend until the pump is idle (queue empty AND the drain worker,
+        /// which pops each item BEFORE awaiting its delivery, has finished its
+        /// final delivery and observed the empty queue). Resumes immediately
+        /// when already idle. Process-exit drain for short-lived CLI hosts;
+        /// the hot emit path never touches this.
+        func waitUntilIdle() async {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                lock.lock()
+                guard draining || head < queue.count else {
+                    lock.unlock()
+                    continuation.resume()
+                    return
+                }
+                idleWaiters.append(continuation)
+                lock.unlock()
+            }
         }
         var snapshot: (inFlight: Int, dropped: Int) {
             lock.lock(); defer { lock.unlock() }
@@ -498,11 +664,15 @@ public actor TurnTraceBus {
         }
 
         private func takeNext() -> TurnTraceEvent? {
-            lock.lock(); defer { lock.unlock() }
+            lock.lock()
             guard head < queue.count else {
                 queue.removeAll(keepingCapacity: true)
                 head = 0
                 draining = false
+                let waiters = idleWaiters
+                idleWaiters.removeAll()
+                lock.unlock()
+                for waiter in waiters { waiter.resume() }
                 return nil
             }
             let value = queue[head]
@@ -511,13 +681,49 @@ public actor TurnTraceBus {
                 queue.removeFirst(head)
                 head = 0
             }
+            lock.unlock()
             return value
+        }
+
+        private var idleWaiters: [CheckedContinuation<Void, Never>] = []
+
+        /// Suspend until every already-submitted row has been appended to disk
+        /// (the writer pops BEFORE awaiting `lane.append`, and `draining` only
+        /// flips false on the empty-queue pop AFTER the final append returns).
+        /// Immediate resume when idle. Never called on the emit path.
+        func waitUntilIdle() async {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                lock.lock()
+                guard draining || head < queue.count else {
+                    lock.unlock()
+                    continuation.resume()
+                    return
+                }
+                idleWaiters.append(continuation)
+                lock.unlock()
+            }
         }
     }
 
     /// Test/observability seam: current emission backlog + gate drops.
     public nonisolated static var emissionBacklog: (inFlight: Int, dropped: Int) {
         emissionPump.snapshot
+    }
+
+    /// Await full quiescence of the fire→deliver→persist pipeline for this
+    /// bus: first the process-wide emission pump (idle ⇒ every accepted event
+    /// has completed `deliver`, which enqueues onto the persist lane), then
+    /// this bus's persist pump (idle ⇒ every enqueued row is on disk).
+    ///
+    /// For SHORT-LIVED HOSTS ONLY (chat-drive and peers): the app process
+    /// stays alive so the detached persists always land, but a CLI that exits
+    /// right after a turn races its own telemetry to `exit(0)` and loses the
+    /// terminal receipt. Rows dropped at either bounded gate under distress
+    /// stay dropped — this drains what was accepted; it cannot resurrect
+    /// load-shed events. Never call on a turn's hot path.
+    public nonisolated func drainForProcessExit() async {
+        await Self.emissionPump.waitUntilIdle()
+        await persistPump.waitUntilIdle()
     }
 
     /// Fire-and-forget emission entry. NEVER call from the hot path with
@@ -564,7 +770,7 @@ public actor TurnTraceBus {
     /// counted) and enqueue onto the persist lane. Subscribers are served
     /// synchronously within the actor but the per-subscriber yield is itself
     /// non-blocking (AsyncStream.yield never suspends).
-    func deliver(_ event: TurnTraceEvent) async {
+    public func deliver(_ event: TurnTraceEvent) async {
         if let deliveryGate { await deliveryGate() }
         for (id, var sink) in sinks {
             // `.bufferingNewest(cap)` means yield NEVER blocks; on overflow it
@@ -744,7 +950,7 @@ public struct TurnTracePersistLane: Sendable {
 
     /// Resolve the env-var override once (literal path, tilde preserved — same
     /// `URLComponents(scheme:"file")` trick as `defaultDataRoot`).
-    private static func envRootOverride(
+    static func envRootOverride(
         _ environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> URL? {
         guard let raw = environment["NATIVE_AGENT_TURN_TRACE_ROOT"], !raw.isEmpty else {
@@ -760,10 +966,21 @@ public struct TurnTracePersistLane: Sendable {
     /// `defaultDataRoot()` at append time (env-var / stamped-repo / cwd
     /// resolution happens in the live process, not at construction).
     let dataRootOverride: URL?
+    /// A test-only acknowledgement after a row is durably appended. Production
+    /// leaves this nil, preserving fire-and-forget telemetry behavior.
+    private let onPersist: (@Sendable (TurnTraceEvent) async -> Void)?
     private let persistence = SwiftNativePersistenceCore()
 
     public init(dataRootOverride: URL? = nil) {
+        self.init(dataRootOverride: dataRootOverride, onPersist: nil)
+    }
+
+    init(
+        dataRootOverride: URL? = nil,
+        onPersist: (@Sendable (TurnTraceEvent) async -> Void)?
+    ) {
         self.dataRootOverride = dataRootOverride
+        self.onPersist = onPersist
     }
 
     /// Pure resolution of the data root from the four candidate sources, in
@@ -839,6 +1056,7 @@ public struct TurnTracePersistLane: Sendable {
                 maxBytes: Self.maxBytes,
                 trimToBytes: Self.trimToBytes
             )
+            await onPersist?(event)
         } catch {
             FileHandle.standardError.write(
                 Data("TurnTracePersistLane: append failed (turn \(event.turnId)): \(error)\n".utf8)

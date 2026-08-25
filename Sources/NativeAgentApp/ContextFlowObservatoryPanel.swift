@@ -46,6 +46,8 @@ enum ContextFlowFallbackReader {
     static let turnSummaryKind = "context.summary"
     static let fallbackFlagKey = "contextFlow.fallback"
     static let fallbackErrorKey = "contextFlow.fallbackError"
+    static let enabledFlagKey = "contextFlow.enabled"
+    static let shadowFlagKey = "contextFlow.shadow"
 
     /// Most-recent turns to inspect for the chip.
     static let windowLimit = 50
@@ -119,17 +121,17 @@ enum ContextFlowFallbackReader {
     static func isActiveMode(_ event: TurnTraceEvent) -> Bool {
         guard case .object(let payload) = event.payload,
               case .object(let flags)? = payload["flags"],
-              case .bool(true)? = flags["contextFlow.enabled"]
+              case .bool(true)? = flags[enabledFlagKey]
         else { return false }
-        if case .bool(true)? = flags["contextFlow.shadow"] { return false }
+        if case .bool(true)? = flags[shadowFlagKey] { return false }
         return true
     }
 
     static func isShadowMode(_ event: TurnTraceEvent) -> Bool {
         guard case .object(let payload) = event.payload,
               case .object(let flags)? = payload["flags"],
-              case .bool(true)? = flags["contextFlow.enabled"],
-              case .bool(true)? = flags["contextFlow.shadow"]
+              case .bool(true)? = flags[enabledFlagKey],
+              case .bool(true)? = flags[shadowFlagKey]
         else { return false }
         return true
     }
@@ -178,52 +180,154 @@ enum ContextFlowFallbackReader {
     }
 }
 
-struct ContextFlowObservatoryPanel: View {
-    let health: ContextFlowCoordinatorHealth?
-    var fallback: ContextFlowFallbackState?
+/// The live runtime's health read has a distinct configured-off result: no
+/// coordinator is expected in that case, unlike an unavailable read.
+enum ContextFlowObservatoryHealthState: Sendable, Equatable {
+    case unavailable
+    case off
+    case health(ContextFlowCoordinatorHealth)
+}
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-            if let fallback {
-                fallbackChip(fallback)
-            }
-            if let health {
-                healthRows(health)
+/// The Context Flow health projection deliberately keeps "no health was
+/// readable", "configured off", and "reported an error" separate. The
+/// Observatory must not turn any of those into the same reassuring zero-value
+/// table.
+struct ContextFlowHealthRowsPresentation: Equatable {
+    struct Row: Identifiable, Equatable {
+        let label: String
+        let value: String
+
+        var id: String { label }
+    }
+
+    enum State: Equatable {
+        case unavailable
+        case off
+        case stopped
+        case attention
+        case running
+    }
+
+    let state: State
+    let rows: [Row]
+    let errorDetail: String?
+
+    init(healthState: ContextFlowObservatoryHealthState) {
+        switch healthState {
+        case .unavailable:
+            self.init(health: nil)
+        case .off:
+            self.init(
+                state: .off,
+                rows: [Row(label: "Mode", value: ContextFlowMode.off.rawValue)],
+                errorDetail: nil
+            )
+        case .health(let health):
+            self.init(health: health)
+        }
+    }
+
+    private init(state: State, rows: [Row], errorDetail: String?) {
+        self.state = state
+        self.rows = rows
+        self.errorDetail = errorDetail
+    }
+
+    init(health: ContextFlowCoordinatorHealth?) {
+        guard let health else {
+            self.state = .unavailable
+            self.rows = []
+            self.errorDetail = nil
+            return
+        }
+
+        self.rows = Self.rows(for: health)
+        if let error = health.lastError {
+            self.state = .attention
+            let trimmed = error.trimmingCharacters(in: .whitespacesAndNewlines)
+            self.errorDetail = trimmed.isEmpty
+                ? "Context Flow reported an unspecified error."
+                : trimmed
+        } else {
+            self.errorDetail = nil
+            if health.mode == .off {
+                self.state = .off
+            } else if !health.started {
+                self.state = .stopped
             } else {
-                Text("Context Flow is not running.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                self.state = .running
             }
         }
     }
 
-    @ViewBuilder
-    private func healthRows(_ health: ContextFlowCoordinatorHealth) -> some View {
-        row("Mode", health.mode.rawValue)
-        row("Store generation", generationText(health.activeStoreGenerationID))
-        row("RAM generation", generationText(health.activeArenaGenerationID))
-        row("Registered sources", String(health.registeredSourceCount))
-        row("Degraded sources", String(health.degradedSourceCount))
-        row(
-            "Arena",
-            ByteCountFormatter.string(
-                fromByteCount: Int64(health.arenaMetrics.residentLogicalBytes),
-                countStyle: .memory
-            )
-        )
-        row("Pressure", health.arenaMetrics.pressure.rawValue)
-        row("Active leases", String(health.arenaMetrics.activeLeaseCount))
-        row("Prewarm queue", String(health.pendingPrewarmHints))
-        row("Prewarm receipts", String(health.prewarmUsefulnessReceipts))
-        if let reconciled = health.lastReconciledAt {
-            row("Reconciled", reconciled.formatted(date: .omitted, time: .standard))
+    var statusText: String? {
+        return switch state {
+        case .unavailable: "Context Flow health is unavailable."
+        case .off: "Context Flow is off."
+        case .stopped: "Context Flow has not started."
+        case .attention: "Context Flow needs attention."
+        case .running: nil
         }
-        if let error = health.lastError {
-            Divider()
-            Text(error)
-                .font(.caption2)
-                .foregroundStyle(.orange)
-                .textSelection(.enabled)
+    }
+
+    static func generationText(_ generation: Int64?) -> String {
+        generation.map(String.init) ?? "none"
+    }
+
+    private static func rows(for health: ContextFlowCoordinatorHealth) -> [Row] {
+        var rows = [
+            Row(label: "Mode", value: health.mode.rawValue),
+            Row(label: "Store generation", value: generationText(health.activeStoreGenerationID)),
+            Row(label: "RAM generation", value: generationText(health.activeArenaGenerationID)),
+            Row(label: "Registered sources", value: String(health.registeredSourceCount)),
+            Row(label: "Degraded sources", value: String(health.degradedSourceCount)),
+            Row(
+                label: "Arena",
+                value: ByteCountFormatter.string(
+                    fromByteCount: Int64(health.arenaMetrics.residentLogicalBytes),
+                    countStyle: .memory
+                )
+            ),
+            Row(label: "Pressure", value: health.arenaMetrics.pressure.rawValue),
+            Row(label: "Active leases", value: String(health.arenaMetrics.activeLeaseCount)),
+            Row(label: "Prewarm queue", value: String(health.pendingPrewarmHints)),
+            Row(label: "Prewarm receipts", value: String(health.prewarmUsefulnessReceipts)),
+        ]
+        if let reconciled = health.lastReconciledAt {
+            rows.append(Row(
+                label: "Reconciled",
+                value: reconciled.formatted(date: .omitted, time: .standard)
+            ))
+        }
+        return rows
+    }
+}
+
+struct ContextFlowObservatoryPanel: View {
+    let healthState: ContextFlowObservatoryHealthState
+    var fallback: ContextFlowFallbackState?
+
+    var body: some View {
+        let presentation = ContextFlowHealthRowsPresentation(healthState: healthState)
+        VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
+            if let fallback {
+                fallbackChip(fallback)
+            }
+            if let statusText = presentation.statusText {
+                Text(statusText)
+                    .font(.caption)
+                    .foregroundStyle(presentation.state == .attention ? .orange : .secondary)
+            }
+            ForEach(presentation.rows) { healthRow in
+                row(healthRow.label, healthRow.value)
+            }
+            if let error = presentation.errorDetail {
+                Divider()
+                Text(error)
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .textSelection(.enabled)
+            }
         }
     }
 
@@ -298,10 +402,6 @@ struct ContextFlowObservatoryPanel: View {
         detail: String?
     ) -> some View {
         ObservatoryNoticeRow(icon: icon, tint: tint, title: title, detail: detail)
-    }
-
-    private func generationText(_ generation: Int64?) -> String {
-        generation.map(String.init) ?? "none"
     }
 
     private func row(_ label: String, _ value: String) -> some View {

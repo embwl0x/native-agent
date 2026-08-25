@@ -369,6 +369,7 @@ async function acquireTopicLock(slug, waitMs, ownerMeta) {
         return { acquired: false, lockDir, reason: "lock_unavailable", inFlight: null, waitedMs: Date.now() - startedMs, release() {} };
       }
       let owner = null;
+      let inspectedLock = false;
       try {
         const stat = fs.statSync(lockDir);
         // A lock whose owner is between mkdir and the pid write is LIVE, not
@@ -380,7 +381,14 @@ async function acquireTopicLock(slug, waitMs, ownerMeta) {
           continue;
         }
         owner = readLockOwnerInfo(lockDir);
+        inspectedLock = true;
       } catch {}
+      // The owner can remove the directory after our mkdir observed EEXIST
+      // but before the inspection above. That is an unlocked retry, not a
+      // busy lock whose (already elapsed) base deadline should reject the
+      // queued wake. Under load this tiny release/acquire window used to turn
+      // an honestly serialized second wake into rejected_topic_busy.
+      if (!inspectedLock || !fs.existsSync(lockDir)) continue;
       // Queue behind a live owner: wait out its advertised deadline + margin.
       // No advertised deadline (pre-metadata lock) -> the base wait applies.
       let deadline = baseDeadline;
@@ -764,6 +772,7 @@ function formatPrompt(payload, jobPath) {
   lines.push(
     "Do the work in this session. There is no human in this loop, so do not block waiting for input mid-task. If you genuinely need a decision or answer from Agent, END your turn with that question as your final message — it reaches her as the completion event, and her reply RESUMES this same session with full context. Ask-and-end is the supported pattern; idle waiting is not.",
     "You are the FULL Claude (User's directive, 2026-07-25): your standard operating doctrine applies here exactly as in User's own sessions — orchestrate, dispatch swarm workers for build-sized tasks, put every implementation diff through gpt-5.5 review, verify before you assert. The sonnet-swarm and gpt-swarm MCPs are available.",
+    "LIVENESS (2026-08-22): this session is supervised by a stall watchdog that measures your process tree's CPU. Dispatch swarm workers with the *_dispatch_async variants and poll them every 1–3 minutes (each poll is observable activity); never sit in one synchronous tool call for more than a few minutes, and never end a turn idle-waiting. Wake 7FAB386B was killed mid-build for exactly this.",
     "COMMIT HOLD (User's standing order, 2026-07-25): this wake session is under a commit hold. Build, test, deploy locally, and verify all you need — but do NOT `git commit` or `git push` in ANY repository while the hold stands. Your finish-all-the-way doctrine explicitly stops at the commit for wake sessions: report the verified diff (files, test results, live proofs) as your completion instead, and the pipeline's verification step commits it. The hold is released ONLY by the release file" + (jobPath ? ` at ${path.join(path.dirname(path.dirname(jobPath)), "wake-releases", path.basename(jobPath))}` : " (your job record's filename under the sibling wake-releases/ directory)") + " — check that it EXISTS immediately before any commit; if it is absent the hold stands (the job record's own hold fields are informational mirrors, not authority). If your work is verified and you believe it should ship, END your turn saying exactly that — release is User's, Agent's, or the interactive Claude's call, never this session's.",
     "Your FINAL message is what crosses back to Agent as the completion receipt — always end with a real answer, including when the task failed or needed no changes. A completed session with an empty reply is a failure, not evidence."
   );
@@ -825,9 +834,11 @@ function formatCompletionForAgent(result, payload) {
 /// direct child alone would read a busy session as idle.
 ///
 /// Returns null when the tree cannot be sampled at all. null means "no
-/// evidence", which is NOT the same as "no progress" — the caller treats it as
-/// non-advancing but never lets it be the sole basis for a kill decision it
-/// could not observe.
+/// evidence", which is NOT the same as "no progress" — the sampler SKIPS a null
+/// sample (the stall clock neither advances nor resets on it), so an unreadable
+/// `ps` can never be the basis for a kill. Sustained unreadability therefore
+/// defers the stall verdict to the hard deadline — accepted (gpt-5.5 NIT,
+/// 2026-08-22) over the alternative of killing on missing evidence.
 /// Every pid in `rootPid`'s tree, root first. Used to kill the whole tree, not
 /// just the direct child: `claude` spawns descendants that INHERIT its stdout
 /// pipe, and a surviving descendant holds that pipe open so node's `close`
@@ -868,16 +879,89 @@ function walkProcessTree(rootPid) {
   let total = 0;
   const seen = new Set();
   const order = [];
+  const perPid = new Map();
   const stack = [Number(rootPid)];
   while (stack.length) {
     const pid = stack.pop();
     if (seen.has(pid)) continue;
     seen.add(pid);
     order.push(pid);
-    total += cpu.get(pid) || 0;
+    const ms = cpu.get(pid) || 0;
+    total += ms;
+    perPid.set(pid, ms);
     for (const kid of children.get(pid) || []) stack.push(kid);
   }
-  return { cpuMs: total, order };
+  return { cpuMs: total, order, perPid };
+}
+
+/// Per-pid CPU of the live tree, or null when `ps` could not be read.
+function processTreeCpuByPid(rootPid) {
+  const tree = walkProcessTree(rootPid);
+  return tree ? tree.perPid : null;
+}
+
+/// MONOTONIC progress over a process tree whose members come and go.
+///
+/// The sum of CPU over the CURRENTLY LIVE tree is not monotonic: when a heavy
+/// grandchild exits (a `swift test` run worth hundreds of CPU-seconds), the sum
+/// DROPS by everything it burned, and a watchdog that ratchets a high-water
+/// mark then sees "no advance" until the survivors re-accumulate that much —
+/// which light work (edits, greps, short test filters) never does inside the
+/// stall window. That is exactly how wake 7FAB386B (2026-08-22) was killed as
+/// "stalled_after_600s" while its dispatched worker was provably busy every
+/// minute (transcript d2725762: builds and tests until the SIGKILL at 11:13Z).
+///
+/// This accumulator keeps every pid's last-seen CPU and RETIRES it into a
+/// running total when the pid disappears (or is reused with a lower count), so
+/// `total` only ever grows and "advanced" means the tree did new work since the
+/// last sample — including a brand-new pid with 0 ms so far, which is work
+/// starting. Pure and injectable: feed it Map<pid, cpuMs> samples.
+class TreeCpuProgress {
+  constructor() {
+    this.lastSeen = new Map();
+    this.retiredMs = 0;
+    this.lastTotal = null;
+  }
+
+  /// - Returns {total, advanced, newPids, retiredPids}; `advanced` is false
+  ///   only when nothing in the tree changed since the previous sample.
+  observe(perPid) {
+    if (!(perPid instanceof Map)) return null;
+    const newPids = [];
+    const retiredPids = [];
+    for (const [pid, prev] of this.lastSeen) {
+      const now = perPid.get(pid);
+      if (now === undefined) {
+        this.retiredMs += prev;
+        retiredPids.push(pid);
+        this.lastSeen.delete(pid);
+      } else if (now < prev) {
+        // pid reused by a new process: the old one's work is retired, the
+        // new one starts from its own count.
+        this.retiredMs += prev;
+        retiredPids.push(pid);
+        newPids.push(pid);
+        this.lastSeen.set(pid, now);
+      }
+    }
+    for (const [pid, ms] of perPid) {
+      if (!this.lastSeen.has(pid)) {
+        newPids.push(pid);
+        this.lastSeen.set(pid, ms);
+      } else {
+        this.lastSeen.set(pid, ms);
+      }
+    }
+    let live = 0;
+    for (const ms of this.lastSeen.values()) live += ms;
+    const total = this.retiredMs + live;
+    const advanced = this.lastTotal == null
+      || total > this.lastTotal
+      || newPids.length > 0
+      || retiredPids.length > 0;
+    this.lastTotal = total;
+    return { total, advanced, newPids, retiredPids };
+  }
 }
 
 /// Parse `ps -o time=` ("MM:SS.ss", "HH:MM:SS", "D-HH:MM:SS") to milliseconds.
@@ -993,7 +1077,12 @@ function runClaude({ prompt, sessionArgs, cwd, timeoutSeconds, stallSeconds, onP
     // runner's own heartbeat.
     const stallMs = Number(stallSeconds) > 0 ? Number(stallSeconds) * 1000 : 0;
     if (stallMs > 0) {
-      let lastCpuMs = processTreeCpuMs(child.pid);
+      // Progress is MONOTONIC tree CPU (see TreeCpuProgress): exited members
+      // keep the work they burned, new members count as work starting. The
+      // live-sum ratchet this replaced killed a busy wake on 2026-08-22.
+      const progress = new TreeCpuProgress();
+      const first = processTreeCpuByPid(child.pid);
+      if (first) progress.observe(first);
       let lastAdvanceAt = Date.now();
       const sampleMs = Math.max(
         250,
@@ -1001,16 +1090,16 @@ function runClaude({ prompt, sessionArgs, cwd, timeoutSeconds, stallSeconds, onP
       );
       stallTimer = setInterval(() => {
         if (settled) return;
-        const cpuMs = processTreeCpuMs(child.pid);
+        const perPid = processTreeCpuByPid(child.pid);
         // A sample we could not take is not evidence of death. Skip it and let
         // the next one decide, rather than letting an unreadable `ps` kill a
         // healthy job.
-        if (cpuMs == null) return;
-        if (lastCpuMs == null || cpuMs > lastCpuMs) {
-          lastCpuMs = cpuMs;
+        if (perPid == null) return;
+        const sample = progress.observe(perPid);
+        if (sample && sample.advanced) {
           lastAdvanceAt = Date.now();
           if (typeof onProgress === "function") {
-            try { onProgress({ cpuMs, at: new Date(lastAdvanceAt).toISOString() }); } catch {}
+            try { onProgress({ cpuMs: sample.total, at: new Date(lastAdvanceAt).toISOString() }); } catch {}
           }
           return;
         }
@@ -2250,6 +2339,8 @@ module.exports = {
   resolveTimeoutSeconds,
   resolveStallSeconds,
   processTreeCpuMs,
+  processTreeCpuByPid,
+  TreeCpuProgress,
   runWakeJob,
   sanitizePayload,
   resolveCwd,

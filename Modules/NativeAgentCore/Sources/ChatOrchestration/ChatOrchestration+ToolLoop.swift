@@ -519,7 +519,7 @@ private enum SameTurnToolSchemaRefresh {
 
         let persisted = await activeToolsStore.load(sessionId: session).activeTools
         let active = persisted.union(LLMCallContext.turnActiveTools ?? [])
-        let allowed = SwiftToolDispatcher.alwaysOnCoreNames.union(active)
+        let allowed = SwiftToolDispatcher.normalModelToolNames(activeTools: active)
         var known = Set(current.map(\.name))
         var refreshed = current
         for schema in available where !known.contains(schema.name) {
@@ -1458,22 +1458,30 @@ extension SwiftNativeTurnEngine {
         runId: String?,
         preBuiltContext: TurnContext?
     ) async throws -> TurnContext {
-        let ctx: TurnContext
         if let preBuiltContext {
-            ctx = preBuiltContext
-        } else {
-            let rawCtx = try await buildTurnContext(
+            // This is the production structured-chat shape. Its context already
+            // contains the chosen persona, threaded history/session digest, and
+            // cognitive capsule, and has already received its turn-scoped lazy
+            // tool filter. Rebuilding here would silently discard those inputs.
+            Self.fireContextSnapshotEvent(
                 surface: surface,
-                userMessage: userMessage,
-                personaOverride: nil,
-                imageBlocks: [],
-                sessionID: sessionId
+                context: preBuiltContext,
+                sessionId: sessionId,
+                runId: runId
             )
-            // Apply lazy-load filter (C3 shared helper):
-            //   - non-empty sessionId: alwaysOnCore + sessionActive + MCP
-            //   - empty/nil sessionId: alwaysOnCore + MCP only (fail closed)
-            ctx = await lazyFilteredTurnContext(rawCtx, sessionId: sessionId)
+            return preBuiltContext
         }
+        let rawCtx = try await buildTurnContext(
+            surface: surface,
+            userMessage: userMessage,
+            personaOverride: nil,
+            imageBlocks: [],
+            sessionID: sessionId
+        )
+        // Apply lazy-load filter (C3 shared helper):
+        //   - non-empty sessionId: alwaysOnCore + sessionActive + MCP
+        //   - empty/nil sessionId: alwaysOnCore + MCP only (fail closed)
+        let ctx = await lazyFilteredTurnContext(rawCtx, sessionId: sessionId)
         Self.fireContextSnapshotEvent(
             surface: surface,
             context: ctx,
@@ -1803,7 +1811,8 @@ extension SwiftNativeTurnEngine {
             let serviceTier = ctx.serviceTier ?? LLMCallContext.serviceTier
             let raw: String
             do {
-            raw = try await LLMCallContext.$providerId.withValue(providerRoute) {
+            raw = try await LLMCallContext.$admittedModel.withValue(ctx.modelId) {
+            try await LLMCallContext.$providerId.withValue(providerRoute) {
             try await LLMCallContext.$serviceTier.withValue(serviceTier) {
             try await LLMCallContext.$systemSegments.withValue(ctx.systemSegments) {
                 try await LLMCallContext.$sessionId.withValue(sessionId) {
@@ -1816,7 +1825,8 @@ extension SwiftNativeTurnEngine {
                         tools: providerTools.schemas.isEmpty ? nil : providerTools.schemas
                     )
                     }
-                }
+            }
+            }
             }
             }
             }
@@ -2053,6 +2063,7 @@ extension SwiftNativeTurnEngine {
             // so wrapping only construction+consumption needs no re-indent.
             let providerRoute = ctx.providerId ?? LLMCallContext.providerId
             let serviceTier = ctx.serviceTier ?? LLMCallContext.serviceTier
+            try await LLMCallContext.$admittedModel.withValue(ctx.modelId) {
             try await LLMCallContext.$providerId.withValue(providerRoute) {
             try await LLMCallContext.$serviceTier.withValue(serviceTier) {
             try await LLMCallContext.$systemSegments.withValue(ctx.systemSegments) {
@@ -2186,6 +2197,7 @@ extension SwiftNativeTurnEngine {
             } // LLMCallContext.$systemSegments.withValue
             } // LLMCallContext.$serviceTier.withValue
             } // LLMCallContext.$providerId.withValue
+            } // LLMCallContext.$admittedModel.withValue
 
             if let violation = ToolCallParser.formattedToolCallViolation(in: iterAccumulated) {
                 lastProtocolViolation = violation

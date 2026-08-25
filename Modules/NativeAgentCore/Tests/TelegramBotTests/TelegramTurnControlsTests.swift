@@ -249,6 +249,25 @@ struct TelegramTurnControlsTests {
         responses.setUpdate(telegramMessageUpdate(updateId: 3, messageId: 3, text: "race this"))
         _ = await loop.tickOutcome()
 
+        // The refused ordinary message is deliberately not queued, but it must
+        // remain recoverable in the durable receipt trail.  This drives the
+        // actual polling transport while the first turn is still suspended;
+        // a direct coordinator call would miss both the send and receipt
+        // boundaries.
+        #expect(await coordinator.snapshot(chatId: 77).isRunning)
+        #expect(await coordinator.lastUserMessage(chatId: 77)?.text == "do long work",
+                "a refused busy message must not replace the retry source for the running turn")
+        let busyReceipts = await telegramFeedRows(root: root, "receipts").filter { row in
+            row["kind"] == .string("busy_notice")
+        }
+        #expect(busyReceipts.count == 1)
+        #expect(busyReceipts.first?["textPreview"] == .string("race this"))
+        guard case .string(let busyReply)? = busyReceipts.first?["replyPreview"] else {
+            Issue.record("busy notice receipt must retain its reply preview")
+            return
+        }
+        #expect(busyReply.contains("already running"))
+
         responses.setUpdate(telegramCallbackUpdate(
             updateId: 4,
             callbackId: "cb-details",

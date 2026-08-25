@@ -560,6 +560,7 @@ private func telegramNormalizeProviderId(_ raw: String) -> String {
 public actor TelegramBotCompletenessRegistry {
     public static let shared = TelegramBotCompletenessRegistry()
     private var store: [ObjectIdentifier: TelegramBotCompletenessDeps] = [:]
+    private var unregisterWaiters: [ObjectIdentifier: [CheckedContinuation<Void, Never>]] = [:]
 
     private init() {}
 
@@ -569,6 +570,40 @@ public actor TelegramBotCompletenessRegistry {
 
     public func deps(for id: ObjectIdentifier) -> TelegramBotCompletenessDeps? {
         store[id]
+    }
+
+    public func unregister(_ id: ObjectIdentifier) {
+        store.removeValue(forKey: id)
+        if let waiters = unregisterWaiters.removeValue(forKey: id) {
+            for waiter in waiters { waiter.resume() }
+        }
+    }
+
+    public func registeredCount() -> Int {
+        store.count
+    }
+
+    /// Snapshot of currently registered bot ids. Lets callers assert on the
+    /// ids THEY own instead of a process-global count that other concurrent
+    /// registrants perturb.
+    public func registeredIDs() -> Set<ObjectIdentifier> {
+        Set(store.keys)
+    }
+
+    /// Event-driven seam for the deinit's detached-Task unregister (mirrors
+    /// the TurnTraceBus.drainForProcessExit drain pattern): suspend until
+    /// `unregister(id)` has run for this id — resumed by `unregister` itself,
+    /// no polling. Immediate resume when the id is not currently registered.
+    /// Callers own the bound (e.g. a test `.timeLimit`); if the unregister
+    /// never fires, that bound fails the wait loudly.
+    public func waitForUnregister(_ id: ObjectIdentifier) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            guard store[id] != nil else {
+                continuation.resume()
+                return
+            }
+            unregisterWaiters[id, default: []].append(continuation)
+        }
     }
 }
 

@@ -261,7 +261,11 @@ actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHandling 
 
     private static func executionFailed(_ value: JSONValue) -> Bool {
         guard case .object(let object) = value else { return false }
-        if object["error"] != nil { return true }
+        // Present-but-null `error` is success (MacControl envelopes always
+        // carry the key) — same null-blind bug as ChatToolOutcome, 2026-08-21.
+        if let error = object["error"], error != .null { return true }
+        if case .bool(false)? = object["ok"] { return true }
+        if case .bool(false)? = object["success"] { return true }
         guard case .string(let rawStatus)? = object["status"] else { return false }
         return ["failed", "error", "denied", "rejected", "canceled", "cancelled"]
             .contains(rawStatus.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())

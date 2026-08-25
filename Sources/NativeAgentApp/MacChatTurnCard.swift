@@ -432,6 +432,7 @@ struct MacChatTurnCard: View {
                 HStack(alignment: .firstTextBaseline, spacing: NativeAgentSpacing.sm) {
                     leading
                         .frame(width: 12, alignment: .center)
+                        .allowsHitTesting(false)
 
                     Text(model.title)
                         .font(NativeAgentFont.label)
@@ -439,6 +440,9 @@ struct MacChatTurnCard: View {
                         .lineLimit(1)
                         .truncationMode(.tail)
                         .layoutPriority(2)
+                        // Text glyphs have their own hit regions; a drag that
+                        // starts on the title must reach the transcript below.
+                        .allowsHitTesting(false)
 
                     Spacer(minLength: NativeAgentSpacing.sm)
 
@@ -449,18 +453,30 @@ struct MacChatTurnCard: View {
                         .lineLimit(1)
                         .accessibilityLabel(model.spokenMeta)
                         .accessibilityAddTraits(.updatesFrequently)
+                        .allowsHitTesting(false)
 
+                    // Controls outrank ALL text at narrow widths: at the
+                    // detached-window floor (380pt) with a long meta readout,
+                    // the approval decision — the card's only real steering
+                    // affordance — used to be the thing squeezed off the
+                    // right edge (sweep 2026-08-21). Priority order is now
+                    // controls (3) > title (2) > badge (1) > meta (0), and
+                    // fixedSize keeps button labels from clipping mid-glyph.
                     if let approval = model.approval, approval.isActionable, let onDecideApproval {
                         Button("Approve") { onDecideApproval("approved") }
                             .buttonStyle(.borderless)
                             .foregroundStyle(NativeAgentTheme.ok)
                             .help("Approve \(approval.toolName)")
                             .accessibilityLabel("Approve \(approval.toolName)")
+                            .fixedSize()
+                            .layoutPriority(3)
                         Button("Deny") { onDecideApproval("denied") }
                             .buttonStyle(.borderless)
                             .foregroundStyle(NativeAgentTheme.fail)
                             .help("Deny \(approval.toolName)")
                             .accessibilityLabel("Deny \(approval.toolName)")
+                            .fixedSize()
+                            .layoutPriority(3)
                     } else if let approval = model.approval, !approval.isActionable {
                         // A settled approval never gets buttons; it says what
                         // it was, including when that is "we cannot tell".
@@ -468,6 +484,7 @@ struct MacChatTurnCard: View {
                             .font(NativeAgentFont.tag)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
+                            .layoutPriority(1)
                     }
 
                     if !model.isTerminal, let onStop {
@@ -485,7 +502,8 @@ struct MacChatTurnCard: View {
                         .disabled(model.cancellationPending)
                         .help(model.cancellationPending ? "Stop already requested" : "Stop this turn")
                         .accessibilityLabel("Stop this turn")
-                        .layoutPriority(1)
+                        .fixedSize()
+                        .layoutPriority(3)
                     }
                 }
 
@@ -500,9 +518,15 @@ struct MacChatTurnCard: View {
                 }
             }
         }
-        // A card with nothing to click floats over the transcript, so it must
-        // not swallow clicks or text selection in the strip it covers. A
-        // settled turn still holding a pending approval DOES have controls.
+        // The card floats over the transcript, and clear glass keeps the text
+        // beneath legible — so the card must not swallow clicks or drags on
+        // anything that is not an actual control (User, 2026-08-21: covered
+        // text looked selectable but the card ate every hit). An empty content
+        // shape removes the container's own hit region (glass background and
+        // spacing); the Approve/Deny/Stop buttons keep their intrinsic hit
+        // regions as children. The hasControls gate remains for settled cards
+        // so even button remnants mid-fade cannot catch a click.
+        .contentShape(Path())
         .allowsHitTesting(model.hasControls)
         // Children already read the title, detail, and elapsed/movement line;
         // a container label on top of them would announce everything twice.

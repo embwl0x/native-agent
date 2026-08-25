@@ -84,8 +84,26 @@ for suite in "$ROOT"/tests/scripts/*.sh; do
   fi
 done
 
+echo "[test] total script behavior evals"
+"$ROOT/tests/scripts/total_script_behavior_evals_test.sh"
+
+echo "[test] Wave 2 script behavior evals"
+"$ROOT/tests/scripts/wave2_feeds_scripts_behavior_evals_test.sh"
+
+echo "[test] release environment surface"
+bash "$ROOT/tests/scripts/release_env_surface_test.sh"
+
 echo "[test] release derived ContextFlow state guards"
 "$ROOT/tests/scripts/release_derived_context_guards_test.sh"
+
+echo "[test] agent instrument eval suite"
+"$ROOT/tests/scripts/agent_instrument_test.sh"
+
+echo "[test] tool execution inventory states"
+"$ROOT/tests/scripts/tool_execution_inventory_test.sh"
+
+echo "[test] user-mode Accessibility gate"
+"$ROOT/tests/scripts/user_mode_eval_gate_test.sh"
 
 echo "[test] release ad-hoc signing guards"
 "$ROOT/tests/scripts/release_signing_guards_test.sh"
@@ -186,7 +204,7 @@ CORE_SWIFT_TEST_SHARDS=(
   "KnowledgeGraphTests|MCPDispatcherTests|MacAssistantStatusTests|MacControlTests|MemoryV2Tests"
   "WorkshopExecutionTests"
   "MultimodalTTSTests|NativeAgentCoreTests|NotificationInboxTests|PersistenceCoreTests"
-  "PersonaEngineTests|ProviderRoutingTests|ResearchTests|ScreenVisionTests"
+  "PersonaEngineTests|ProviderRoutingTests|ResearchTests|ScreenVisionTests|VisionPerceptionTests"
   "SelfImprovementTests"
   "SkillsTests|SwarmRunsTests|SystemOpsTests|TelegramBotTests"
   "ToolExecutionTests|ToolRegistryTests|TriggerSchedulerTests|TrustCenterTests|WorkflowOrchestrationTests"

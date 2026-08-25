@@ -217,9 +217,32 @@ private struct CompatObservation {
     let finalReply: String?
     let toolUses: [String]
     let toolResults: [String]
+    let notices: [(kind: String, text: String)]
     let errors: [String]
     let persistedRows: [[String]]
     let llm: DualTransportScriptedLLM
+    let finalElapsedMs: Int?
+}
+
+private func boolPayload(_ event: TurnTraceEvent, _ key: String) -> Bool? {
+    guard case .object(let payload) = event.payload,
+          case .bool(let value)? = payload[key] else { return nil }
+    return value
+}
+
+private func stringPayload(_ event: TurnTraceEvent, _ key: String) -> String? {
+    guard case .object(let payload) = event.payload,
+          case .string(let value)? = payload[key] else { return nil }
+    return value
+}
+
+private func stringArrayPayload(_ event: TurnTraceEvent, _ key: String) -> [String]? {
+    guard case .object(let payload) = event.payload,
+          case .array(let values)? = payload[key] else { return nil }
+    return values.compactMap {
+        guard case .string(let value) = $0 else { return nil }
+        return value
+    }
 }
 
 private func runCompatScenario(
@@ -230,16 +253,34 @@ private func runCompatScenario(
     grownPromptCompat: Bool,
     writeAuth: Bool = true,
     promptOnlyClient: Bool = false,
-    reasoningEffort: String = "high"
+    reasoningEffort: String = "high",
+    suppressUserAppend: Bool = false,
+    wedgeToolTranscriptDirectory: Bool = false,
+    turnTraceBus: TurnTraceBus = .shared
 ) async throws -> CompatObservation {
     let root = try makeTempRoot(tag)
     if writeAuth { try writeOAuthFixture(root) }
+    if wedgeToolTranscriptDirectory {
+        let chat = root.appendingPathComponent("chat", isDirectory: true)
+        try FileManager.default.createDirectory(at: chat, withIntermediateDirectories: true)
+        try Data("not a directory".utf8).write(
+            to: chat.appendingPathComponent("messages", isDirectory: false)
+        )
+    }
     let llm = UnusedLLM()
     let dual = DualTransportScriptedLLM(scripts: scripts)
     let streaming: any StreamingLLMClient = promptOnlyClient
         ? MockStreamingLLMClient(chunks: scripts.first ?? [])
         : dual
-    let engine = makeQAEngine(root: root, llm: llm, tools: tools)
+    let engine = SwiftNativeTurnEngine(
+        persona: hermeticPersona(root: root),
+        memory: nil,
+        router: StubRoutingQA(),
+        trust: hermeticTrust(),
+        llm: llm,
+        tools: tools,
+        turnTraceBus: turnTraceBus
+    )
     let client = SwiftNativeChatOrchestrationClient(
         engine: engine,
         tools: tools,
@@ -247,14 +288,17 @@ private func runCompatScenario(
         streamingLLM: streaming,
         history: SessionHistoryReader(dataRoot: root),
         dataRoot: root,
+        turnTraceBus: turnTraceBus,
         trust: SwiftNativeTrustCenter(dataRoot: root)
     )
     let sessionId = "s-\(tag)"
 
     var deltas: [String] = []
     var finalReply: String?
+    var finalElapsedMs: Int?
     var toolUses: [String] = []
     var toolResults: [String] = []
+    var notices: [(kind: String, text: String)] = []
     var errors: [String] = []
     try await AnthropicOAuthDirectAdapter.GrownPromptCompat.$compatOverride
         .withValue(grownPromptCompat) {
@@ -262,15 +306,15 @@ private func runCompatScenario(
                 message: message, sessionId: sessionId,
                 model: "claude-opus-4-8", reasoningEffort: reasoningEffort,
                 fileAccess: "workspace", attachments: [], persona: nil,
-                surface: "chat", suppressUserAppend: false
+                surface: "chat", suppressUserAppend: suppressUserAppend
             ) {
                 switch event {
                 case .delta(let s): deltas.append(s)
-                case .final(let r): finalReply = r.reply
+                case .final(let r): finalReply = r.reply; finalElapsedMs = r.elapsedMs
                 case .toolUse(let name, _): toolUses.append(name)
                 case .toolResult(let name, _): toolResults.append(name)
                 case .error(let m): errors.append(m)
-                case .notice: break
+                case .notice(let kind, let text): notices.append((kind, text))
                 }
             }
         }
@@ -280,10 +324,172 @@ private func runCompatScenario(
         finalReply: finalReply,
         toolUses: toolUses,
         toolResults: toolResults,
+        notices: notices,
         errors: errors,
         persistedRows: readPersistedRoleContent(root, sessionId: sessionId),
-        llm: dual
+        llm: dual,
+        finalElapsedMs: finalElapsedMs
     )
+}
+
+// MARK: - Ledger eval: chat.textCompat.appendOnlyMessagesEligibility
+
+/// The append-only messages transport is the prompt-cache lane. Its three
+/// prerequisites all used to fall back to the grown-prompt wire silently, so a
+/// credential repair, an adapter regression, or an emergency compatibility
+/// flag could only be inferred from cost and time-to-first-token. Drive the
+/// real text-compatible client for every condition and require its per-turn
+/// trace to name the actual carrier and every precondition value.
+@Test
+func textCompatAppendOnlyEligibility_tracesEveryPrerequisiteAndFallbackCarrier() async throws {
+    struct Scenario: Sendable {
+        let tag: String
+        let grownPromptCompat: Bool
+        let writeAuth: Bool
+        let promptOnlyClient: Bool
+        let expectedEligible: Bool
+        let expectedBlockers: [String]
+        let expectsMessagesTransport: Bool
+    }
+
+    let scenarios: [Scenario] = [
+        .init(
+            tag: "eligible",
+            grownPromptCompat: false,
+            writeAuth: true,
+            promptOnlyClient: false,
+            expectedEligible: true,
+            expectedBlockers: [],
+            expectsMessagesTransport: true
+        ),
+        // Damaged/moved OAuth authority must take the known-good prompt path,
+        // then the NEXT fresh turn can re-read a repaired file (no process-wide
+        // negative cache is allowed at this decision seam).
+        .init(
+            tag: "oauth-unavailable",
+            grownPromptCompat: false,
+            writeAuth: false,
+            promptOnlyClient: false,
+            expectedEligible: false,
+            expectedBlockers: ["anthropic_oauth_unavailable"],
+            expectsMessagesTransport: false
+        ),
+        .init(
+            tag: "messages-unsupported",
+            grownPromptCompat: false,
+            writeAuth: true,
+            promptOnlyClient: true,
+            expectedEligible: false,
+            expectedBlockers: ["messages_streaming_unsupported"],
+            expectsMessagesTransport: false
+        ),
+        .init(
+            tag: "rollback-enabled",
+            grownPromptCompat: true,
+            writeAuth: true,
+            promptOnlyClient: false,
+            expectedEligible: false,
+            expectedBlockers: ["grown_prompt_compat"],
+            expectsMessagesTransport: false
+        ),
+    ]
+
+    for scenario in scenarios {
+        let observation = LockedBox<CompatObservation?>(nil)
+        let events = try await withHermeticTraceBus(
+            kinds: ["text_compat.append_only_messages_eligibility"]
+        ) { bus in
+            observation.set(try await runCompatScenario(
+                tag: "eligibility-\(scenario.tag)",
+                scripts: [["done"]],
+                tools: MockToolDispatchClient(),
+                grownPromptCompat: scenario.grownPromptCompat,
+                writeAuth: scenario.writeAuth,
+                promptOnlyClient: scenario.promptOnlyClient,
+                turnTraceBus: bus
+            ))
+        }
+
+        let trace = try #require(events.first, "\(scenario.tag): eligibility trace missing")
+        #expect(events.count == 1, "\(scenario.tag): eligibility must be decided once per turn")
+        #expect(trace.surface == "chat")
+        #expect(stringPayload(trace, "schema") == "text_compat.append_only_messages_eligibility.v1")
+        #expect(boolPayload(trace, "eligible") == scenario.expectedEligible)
+        #expect(
+            stringPayload(trace, "effectiveTransport")
+                == (scenario.expectedEligible ? "append_only_messages" : "grown_prompt")
+        )
+        #expect(boolPayload(trace, "grownPromptCompatibilityEnabled") == scenario.grownPromptCompat)
+        #expect(boolPayload(trace, "messagesStreamingSupported") == !scenario.promptOnlyClient)
+        #expect(boolPayload(trace, "usableAnthropicOAuthCredentials") == scenario.writeAuth)
+        #expect(stringArrayPayload(trace, "blockers") == scenario.expectedBlockers)
+
+        let result = try #require(observation.get())
+        #expect(result.finalReply == "done", "\(scenario.tag): fallback lost live completion")
+        if scenario.expectsMessagesTransport {
+            #expect(result.llm.messagesCalls.count == 1)
+            #expect(result.llm.promptCalls.isEmpty)
+        } else if !scenario.promptOnlyClient {
+            #expect(result.llm.messagesCalls.isEmpty)
+            #expect(result.llm.promptCalls.count == 1)
+        }
+    }
+}
+
+/// Ledger row `chat.persistence.transcriptWriteFailureNotice`. The marker is
+/// parsed and dispatched first; only the receipt append is wedged. The live
+/// turn must surface the durable-loss notice through its stream, not merely
+/// write it to stderr or a task-local that this text-compat path never binds.
+@Test
+func textCompat_toolReceiptWriteFailureSurfacesNoticeToTheLiveTurn() async throws {
+    let marker = #"<tool_use id="receipt-1" name="read_file">{"path":"a"}</tool_use>"#
+    let observation = try await runCompatScenario(
+        tag: "tool-receipt-notice",
+        scripts: [[marker], ["done"]],
+        tools: MockToolDispatchClient(scripted: ["read_file": .string("BODY")]),
+        grownPromptCompat: false,
+        suppressUserAppend: true,
+        wedgeToolTranscriptDirectory: true
+    )
+
+    #expect(observation.toolUses == ["read_file"])
+    #expect(observation.toolResults == ["read_file"])
+    #expect(observation.notices.contains {
+        $0.kind == "transcript_write_failed"
+            && $0.text.contains("receipt for tool 'read_file'")
+    })
+}
+
+/// Tool dispatcher that takes real wall time — sits BETWEEN the two provider
+/// segments of a tool round-trip, so only a whole-turn clock can see it.
+private struct SlowTools: ToolDispatchClient {
+    let inner = MockToolDispatchClient(scripted: ["read_file": .string("BODY-A")])
+    let sleepMs: UInt64
+    func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        try await Task.sleep(nanoseconds: sleepMs * 1_000_000)
+        return try await inner.dispatch(tool: tool, input: input, surface: surface)
+    }
+    func listAvailableTools() async throws -> [String] { try await inner.listAvailableTools() }
+}
+
+// MARK: - turn.terminal clock: the final result's elapsedMs spans the WHOLE turn
+
+/// Each iteration's streamTurn starts its own clock, so the last segment's
+/// elapsedMs was what reached turn.terminal — 9.7 s for a 23-tool turn that
+/// ran 204 s (instrument lead, 2026-08-23). The tool sleep below lives between
+/// segment 1 and segment 2; the final segment alone is ~0 ms, so only a
+/// whole-turn clock satisfies the bound.
+@Test
+func textCompat_finalElapsedMs_spansTheWholeTurn_notTheLastSegment() async throws {
+    let marker = #"<tool_use id="t1" name="read_file">{"path":"a"}</tool_use>"#
+    let obs = try await runCompatScenario(
+        tag: "elapsed-whole-turn", scripts: [[marker], ["done"]],
+        tools: SlowTools(sleepMs: 200), grownPromptCompat: false
+    )
+    #expect(obs.finalReply == "done")
+    #expect(obs.toolResults == ["read_file"])
+    let elapsed = try #require(obs.finalElapsedMs)
+    #expect(elapsed >= 200, "final elapsedMs \(elapsed) ms must include the 200 ms tool dispatch between segments")
 }
 
 private func expectShapeEquivalent(

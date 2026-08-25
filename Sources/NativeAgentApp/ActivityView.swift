@@ -48,8 +48,52 @@ struct ActivityView: View {
     @AppStorage(NativeExperiencePreferences.masterKey) private var experienceEnabled = false
     @State private var path = NavigationPath()
     // B2.4: cognition proposals aren't mirrored into AppModel's badge counts;
-    // this view loads the proposed set directly from the cognition runtime.
-    @State private var cognitionPending = CognitionProposalsFeed.Pending()
+    // this mounted owner reads the real runtime and consumes its change stream.
+    @State private var cognitionSubscription = ActivityCognitionSubscription()
+
+    private var cognitionPending: CognitionProposalsFeed.Pending {
+        cognitionSubscription.pending
+    }
+
+    private var activityRefreshStatus: AppModel.PanelRefreshStatus? {
+        appModel.panelRefreshStatus[.activity]
+    }
+
+    private var approvalsPresentation: ActivityQueuePresentation {
+        .appModel(
+            count: appModel.pendingApprovalsCount,
+            requiredEndpoints: ["approvals"],
+            refresh: activityRefreshStatus
+        )
+    }
+
+    private var inboxPresentation: ActivityQueuePresentation {
+        .appModel(
+            count: appModel.pendingInboxCount,
+            requiredEndpoints: ["inbox"],
+            refresh: activityRefreshStatus
+        )
+    }
+
+    private var memoryProposalsPresentation: ActivityQueuePresentation {
+        .appModel(
+            count: appModel.pendingMemoryProposalsCount,
+            requiredEndpoints: ["memory proposals"],
+            refresh: activityRefreshStatus
+        )
+    }
+
+    private var selfImprovementPresentation: ActivityQueuePresentation {
+        .appModel(
+            count: appModel.pendingSelfImprovementCount,
+            requiredEndpoints: ["training proposals", "promotion candidates"],
+            refresh: activityRefreshStatus
+        )
+    }
+
+    private var cognitionPresentation: ActivityQueuePresentation {
+        .cognition(count: cognitionPending.count, state: cognitionSubscription.state)
+    }
 
     private var pendingApprovals: [ApprovalRequest] {
         appModel.approvals.filter { $0.status.lowercased() == "pending" }
@@ -74,6 +118,12 @@ struct ActivityView: View {
     var body: some View {
         NavigationStack(path: $path) {
             List {
+                // The status card has a real Activity owner. Keeping it out of
+                // Chat preserves the session-first rail while its view-lifetime
+                // watcher remains armed whenever Activity is visible.
+                LivingStatusPanel()
+                    .listRowBackground(Color.clear)
+
                 if experienceEnabled {
                     Section {
                         NavigationLink(value: ActivitySection.journey) {
@@ -108,7 +158,7 @@ struct ActivityView: View {
                             title: "Approvals",
                             systemImage: "checkmark.shield",
                             tint: .orange,
-                            count: appModel.pendingApprovalsCount,
+                            presentation: approvalsPresentation,
                             subtitle: "Tool calls waiting for your go-ahead"
                         )
                     }
@@ -140,7 +190,7 @@ struct ActivityView: View {
                             title: "Inbox",
                             systemImage: "tray",
                             tint: .blue,
-                            count: appModel.pendingInboxCount,
+                            presentation: inboxPresentation,
                             subtitle: "Proactive cards from the agent"
                         )
                     }
@@ -169,7 +219,7 @@ struct ActivityView: View {
                             title: "Memory Proposals",
                             systemImage: "brain.head.profile",
                             tint: .indigo,
-                            count: appModel.pendingMemoryProposalsCount,
+                            presentation: memoryProposalsPresentation,
                             subtitle: "Memories the agent wants to keep"
                         )
                     }
@@ -196,7 +246,7 @@ struct ActivityView: View {
                             title: "Self-Improvement",
                             systemImage: "wand.and.stars",
                             tint: .indigo,
-                            count: appModel.pendingSelfImprovementCount,
+                            presentation: selfImprovementPresentation,
                             subtitle: "Harness changes proposed by the agent"
                         )
                     }
@@ -235,26 +285,35 @@ struct ActivityView: View {
 
                 // ── Cognition Proposals (B2.4: from the retired Observatory) ──
                 Section {
-                    NavigationLink(value: ActivitySection.cognitionProposals) {
+                    if case .unavailable(let detail) = cognitionSubscription.state {
+                        Label(detail, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .accessibilityIdentifier("activity.cognition-subscription.unavailable")
+                    }
+                    NavigationLink(value: CognitionSurfaceDispositionPresentation.activityApprovalSection) {
                         SidebarActivityRow(
                             title: "Cognition Proposals",
                             systemImage: "eye",
                             tint: .purple,
-                            count: cognitionPending.count,
+                            presentation: cognitionPresentation,
                             subtitle: "Standing views from reflection"
                         )
                     }
                     ForEach(Array(cognitionPending.standingViews.prefix(2)), id: \.id) { view in
                         InlineCognitionProposalCard(
+                            proposalID: view.id,
                             title: view.body,
                             subtitle: "standing view — proposed",
-                            onApprove: { resolveStandingView(view.id, approved: true) },
-                            onReject: { resolveStandingView(view.id, approved: false) }
+                            detail: view.body,
+                            onResolve: { approved in
+                                await resolveStandingView(view.id, approved: approved)
+                            }
                         )
                     }
                     if cognitionPending.count > 2 {
                         Button {
-                            path.append(ActivitySection.cognitionProposals)
+                            path.append(CognitionSurfaceDispositionPresentation.activityApprovalSection)
                         } label: {
                             Label("All \(cognitionPending.count) cognition proposals →",
                                   systemImage: "arrow.right")
@@ -280,17 +339,10 @@ struct ActivityView: View {
                 }
             }
         }
-        .task { await loadCognitionPending() }
         .task {
-            // gpt-5.5 review (B2 wave): the root count/previews must track the
-            // same change stream the drilled-in view follows, else "needs your
-            // eyes" goes stale while Activity sits open. Task cancels with the
-            // view, closing the subscription.
-            let changes = await NativeCognitionRuntime.shared.changes()
-            for await _ in changes {
-                await loadCognitionPending()
-            }
+            cognitionSubscription.start()
         }
+        .onDisappear { cognitionSubscription.stop() }
         .task {
             // gpt-5.5 review #1: when Cmd+Shift+A/I fires from another tab,
             // ContentView stashes the target section on AppModel and switches
@@ -322,24 +374,85 @@ struct ActivityView: View {
 
     // MARK: - Cognition proposals (B2.4)
 
-    private func loadCognitionPending() async {
-        cognitionPending = await CognitionProposalsFeed.pending()
-    }
-
-    private func resolveStandingView(_ id: UUID, approved: Bool) {
-        Task {
-            await NativeCognitionRuntime.shared.resolveStandingView(id: id, approved: approved)
-            await loadCognitionPending()
+    private func resolveStandingView(
+        _ id: UUID,
+        approved: Bool
+    ) async -> CognitionProposalActions.ResolveStatus {
+        let result = await CognitionProposalActions.resolveWithOutcome(id: id, approved: approved)
+        if case .unavailable(let message) = result.status {
+            appModel.systemToasts.push(error: "Standing-view review not applied: \(message)")
+        } else {
+            appModel.systemToasts.push(success: approved ? "Standing view approved and saved." : "Standing view rejected and retired.")
         }
+        await cognitionSubscription.refreshNow()
+        return result.status
     }
 
 }
 
-private struct SidebarActivityRow: View {
+enum ActivityQueuePresentation: Equatable {
+    struct SidebarStatus: Equatable {
+        let text: String
+        let systemImage: String?
+    }
+
+    case loading
+    case unavailable
+    case allClear
+    case actionable(Int)
+
+    /// The status vocabulary rendered by `SidebarActivityRow`. Keeping this
+    /// projection beside the queue state prevents unavailable evidence from
+    /// ever borrowing the reassuring all-clear label.
+    var sidebarStatus: SidebarStatus {
+        switch self {
+        case .actionable(let count):
+            return SidebarStatus(text: "\(count)", systemImage: nil)
+        case .allClear:
+            return SidebarStatus(text: "All clear", systemImage: nil)
+        case .loading:
+            return SidebarStatus(text: "Checking…", systemImage: nil)
+        case .unavailable:
+            return SidebarStatus(text: "Unavailable", systemImage: "exclamationmark.triangle.fill")
+        }
+    }
+
+    static func appModel(
+        count: Int,
+        requiredEndpoints: Set<String>,
+        refresh: AppModel.PanelRefreshStatus?
+    ) -> ActivityQueuePresentation {
+        guard let refresh else { return .loading }
+        let failed = Set(refresh.failedEndpoints.map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        })
+        let required = Set(requiredEndpoints.map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        })
+        guard failed.isDisjoint(with: required) else { return .unavailable }
+        return count > 0 ? .actionable(count) : .allClear
+    }
+
+    static func cognition(
+        count: Int,
+        state: ActivityCognitionSubscription.State
+    ) -> ActivityQueuePresentation {
+        switch state {
+        case .active:
+            return count > 0 ? .actionable(count) : .allClear
+        case .idle:
+            return .loading
+        case .unavailable, .stopped:
+            return .unavailable
+        }
+    }
+}
+
+struct SidebarActivityRow: View {
     let title: String
     let systemImage: String
     let tint: Color
-    let count: Int
+    let presentation: ActivityQueuePresentation
     let subtitle: String
 
     var body: some View {
@@ -358,20 +471,32 @@ private struct SidebarActivityRow: View {
 
             Spacer()
 
-            if count > 0 {
-                Text("\(count)")
+            switch presentation {
+            case .actionable:
+                Text(presentation.sidebarStatus.text)
                     .font(NativeAgentFont.label)
                     .foregroundStyle(.white)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 2)
                     .background(tint, in: Capsule())
-            } else {
+            case .allClear:
                 // Taste pass 2026-07-24: "Clear" alone read as a clear-all
                 // BUTTON sitting exactly where one would live; "All clear" is
                 // unambiguously a status.
-                Text("All clear")
+                Text(presentation.sidebarStatus.text)
                     .font(NativeAgentFont.tag)
                     .foregroundStyle(.secondary)
+            case .loading:
+                Text(presentation.sidebarStatus.text)
+                    .font(NativeAgentFont.tag)
+                    .foregroundStyle(.secondary)
+            case .unavailable:
+                Label(
+                    presentation.sidebarStatus.text,
+                    systemImage: presentation.sidebarStatus.systemImage ?? "exclamationmark.triangle.fill"
+                )
+                    .font(NativeAgentFont.tag)
+                    .foregroundStyle(.orange)
             }
         }
         .padding(.vertical, 4)

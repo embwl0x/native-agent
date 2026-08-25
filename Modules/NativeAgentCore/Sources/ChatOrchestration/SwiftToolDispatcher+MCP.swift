@@ -26,6 +26,15 @@ extension SwiftToolDispatcher {
         return (serverId, toolName)
     }
 
+    /// Remove chat-only routing metadata before a strict remote MCP schema sees
+    /// the arguments. Kept as a pure production seam so this boundary can be
+    /// proved without starting a server or touching the user's MCP config.
+    static func forwardedMCPArguments(_ input: [String: JSONValue]) -> [String: JSONValue] {
+        var forwarded = input
+        forwarded["__session_id"] = nil
+        return forwarded
+    }
+
     func impl_mcp_tool(
         serverId: String,
         toolName: String,
@@ -65,8 +74,7 @@ extension SwiftToolDispatcher {
         // injected into EVERY tool input for the lazy-load gate, and remote
         // MCP servers with strict schemas (additionalProperties: false)
         // reject calls carrying unknown keys.
-        var forwarded = input
-        forwarded["__session_id"] = nil
+        let forwarded = Self.forwardedMCPArguments(input)
         return try await dispatcher.callToolLive(
             forServer: serverId,
             toolName: toolName,

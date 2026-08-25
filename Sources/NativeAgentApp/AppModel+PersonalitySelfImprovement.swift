@@ -41,6 +41,23 @@ import Skills
 import Connectors
 import Browser
 
+/// The identity field is one of the few profile fields with immediate live UI
+/// effect.  Its save outcome must be derived from the persisted profile the
+/// writer returned, not from the name the editor attempted to submit.
+enum PersonalityNameSaveOutcome: Equatable {
+    case saved(PersonalityProfile)
+    case refused(String)
+    case failed(String)
+}
+
+/// A personality-document refresh either replaces the in-memory document set
+/// with one canonical reader result, or leaves that last known set intact and
+/// reports exactly why it could not be refreshed.
+enum PersonalityDocumentsReloadOutcome: Equatable {
+    case loaded(documentCount: Int)
+    case failed(detail: String, retainedDocumentCount: Int)
+}
+
 @MainActor
 extension AppModel {
     @MainActor
@@ -58,43 +75,107 @@ extension AppModel {
         }
     }
 
+    @discardableResult
+    func savePersonalityName(_ rawName: String) async -> PersonalityNameSaveOutcome {
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else {
+            let detail = "Enter a name before saving."
+            statusText = "Name save refused: \(detail)"
+            return .refused(detail)
+        }
+        // Generic persona labels are intentionally rendered as the fallback
+        // across the live app. Refuse them here so a claimed saved name cannot
+        // immediately disappear into "NativeAgent" on the next render.
+        guard !NativeAgentIdentity.displayName(name, fallback: "").isEmpty else {
+            let detail = "Choose a specific name instead of a generic persona label."
+            statusText = "Name save refused: \(detail)"
+            return .refused(detail)
+        }
+        do {
+            let saved = try await client.savePersonalityName(name)
+            personality = saved
+            statusText = "Name saved as \(saved.name)"
+            return .saved(saved)
+        } catch {
+            let detail = error.localizedDescription
+            statusText = "Name save failed: \(detail)"
+            return .failed(detail)
+        }
+    }
+
     /// TTL for reusing a completed Doctor run when building the Support
     /// Snapshot instead of re-running the whole offline pass (B2.6d).
-    static let supportSnapshotDoctorReuseTTL: TimeInterval = 90
+    nonisolated static let supportSnapshotDoctorReuseTTL: TimeInterval = 90
+
+    enum SupportDiagnosticsLoadOutcome: Equatable {
+        case unavailable(String)
+        case loaded(SupportDiagnostics, reusedDoctorReport: Bool)
+        case failed(String)
+    }
 
     @MainActor
-    func loadSupportDiagnostics() async {
+    @discardableResult
+    func loadSupportDiagnostics() async -> SupportDiagnosticsLoadOutcome {
+        guard !supportDiagnosticsLoading else {
+            return .unavailable("A Support Snapshot is already being prepared.")
+        }
+        guard !doctorRunning else {
+            return .unavailable("Doctor is currently running. Wait for it to finish before preparing a Support Snapshot.")
+        }
+        supportDiagnosticsLoading = true
+        defer { supportDiagnosticsLoading = false }
         do {
             // B2.6d: if a full Doctor run finished within the TTL, reuse its
             // result (identical offline rollup) rather than re-running the
             // whole pass. Falls back to a fresh run when stale or never run.
             let reuse: DoctorReport? = {
                 guard let report = doctorReport,
-                      let completedAt = doctorReportCompletedAt,
-                      Date().timeIntervalSince(completedAt) < Self.supportSnapshotDoctorReuseTTL
+                      let completedAt = doctorReportCompletedAt else { return nil }
+                let age = Date().timeIntervalSince(completedAt)
+                guard age >= 0, age < Self.supportSnapshotDoctorReuseTTL
                 else { return nil }
                 return report
             }()
-            supportDiagnostics = try await client.getSupportDiagnostics(reusing: reuse)
+            let diagnostics = try await client.getSupportDiagnostics(reusing: reuse)
+            supportDiagnostics = diagnostics
             statusText = reuse != nil
                 ? "Support diagnostics refreshed (reused recent Doctor result)"
                 : "Support diagnostics refreshed"
+            return .loaded(diagnostics, reusedDoctorReport: reuse != nil)
         } catch {
-            statusText = "Support diagnostics failed: \(error.localizedDescription)"
+            let detail = error.localizedDescription
+            statusText = "Support diagnostics failed: \(detail)"
+            return .failed(detail)
         }
     }
 
     @MainActor
-    func loadPersonalityDocs() async {
+    @discardableResult
+    func loadPersonalityDocs() async -> Bool {
+        if case .loaded = await reloadPersonalityDocuments() { return true }
+        return false
+    }
+
+    @MainActor
+    @discardableResult
+    func reloadPersonalityDocuments() async -> PersonalityDocumentsReloadOutcome {
         do {
             personalityDocs = try await client.getPersonalityDocs().docs
+            statusText = "Personality documents reloaded"
+            return .loaded(documentCount: personalityDocs.count)
         } catch {
-            statusText = "Personality docs load failed: \(error.localizedDescription)"
+            let rawDetail = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+            let detail = rawDetail.isEmpty
+                ? "The persona document reader returned no diagnostic details."
+                : rawDetail
+            statusText = "Personality docs load failed: \(detail)"
+            return .failed(detail: detail, retainedDocumentCount: personalityDocs.count)
         }
     }
 
     @MainActor
-    func savePersonalityDoc(id: String, content: String) async {
+    @discardableResult
+    func savePersonalityDoc(id: String, content: String) async -> Bool {
         do {
             let saved = try await client.savePersonalityDoc(id: id, content: content)
             if let index = personalityDocs.firstIndex(where: { $0.id == saved.id }) {
@@ -104,8 +185,10 @@ extension AppModel {
             }
             compiledPersonality = try? await client.getCompiledPersonality(surface: "chat")
             statusText = "\(saved.filename) saved"
+            return true
         } catch {
             statusText = "Personality doc save failed: \(error.localizedDescription)"
+            return false
         }
     }
 
@@ -281,19 +364,26 @@ extension AppModel {
         }
     }
 
-    /// Run a REM consolidation pass now. Returns true on success so the caller
-    /// only reloads (which clears dreamError) when the run actually succeeded.
+    /// Run a REM consolidation pass now. The returned presentation comes from
+    /// the real native completion record, so the Dreams button can distinguish
+    /// a completed zero-proposal week from an incomplete or failed invocation.
     @MainActor
-    func runRemPass() async -> Bool {
+    func runRemPass() async -> DreamsREMActionFeedback {
         dreamError = nil
         do {
-            _ = try await client.runRem()
-            statusText = "REM consolidation started"
-            return true
+            let feedback = DreamsREMActionFeedback.resolve(response: try await client.runRem())
+            if feedback.isSuccess {
+                statusText = feedback.message
+            } else {
+                dreamError = "REM cycle failed: \(feedback.message)"
+                statusText = "REM cycle failed"
+            }
+            return feedback
         } catch {
-            dreamError = "REM cycle failed: \(error.localizedDescription)"
+            let feedback = DreamsREMActionFeedback.failed(error.localizedDescription)
+            dreamError = "REM cycle failed: \(feedback.message)"
             statusText = "REM cycle failed"
-            return false
+            return feedback
         }
     }
 

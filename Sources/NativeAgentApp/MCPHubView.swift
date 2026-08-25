@@ -1,6 +1,133 @@
 import SwiftUI
 import PersistenceCore
 
+enum MCPHubConsentPresentation {
+    enum State: Equatable {
+        case loading
+        case empty
+        case available
+        case stale
+        case unavailable
+    }
+
+    static func resolve(
+        consentCount: Int,
+        refresh: AppModel.PanelRefreshStatus?
+    ) -> State {
+        let failedConsentRead = refresh?.failedEndpoints.contains { endpoint in
+            endpoint.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "mcp consent"
+        } ?? false
+        if failedConsentRead { return consentCount > 0 ? .stale : .unavailable }
+        if consentCount > 0 { return .available }
+        return refresh == nil ? .loading : .empty
+    }
+}
+
+struct MCPHubConsentSection: View {
+    @Environment(AppModel.self) private var appModel
+
+    private var presentation: MCPHubConsentPresentation.State {
+        MCPHubConsentPresentation.resolve(
+            consentCount: appModel.mcpConsent.count,
+            refresh: appModel.panelRefreshStatus[.mcp]
+        )
+    }
+
+    var body: some View {
+        Section("Consent log") {
+            switch presentation {
+            case .loading:
+                Text("Loading MCP consent decisions…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .empty:
+                Text("No MCP consent decisions recorded yet.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .unavailable:
+                Label(
+                    "MCP consent ledger is unavailable. Refresh MCP Hub before relying on tool authority.",
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .accessibilityIdentifier("mcp.consent.unavailable")
+            case .stale:
+                Label(
+                    "Showing last loaded MCP consent decisions.",
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .accessibilityIdentifier("mcp.consent.stale")
+                consentRows
+            case .available:
+                consentRows
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var consentRows: some View {
+        ForEach(appModel.mcpConsent) { consent in
+            MCPHubConsentRow(consent: consent)
+        }
+    }
+}
+
+private struct MCPHubConsentRow: View {
+    @Environment(AppModel.self) private var appModel
+    let consent: MCPConsentRecord
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("\(consent.serverId ?? "?") · \(consent.toolName ?? "?")")
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                Text(consent.status ?? "unknown")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(color(consent.status))
+            }
+            HStack(spacing: 12) {
+                if let granted = consent.grantedAt, !granted.isEmpty {
+                    Label("granted \(granted)", systemImage: "checkmark.seal")
+                }
+                if let revoked = consent.revokedAt, !revoked.isEmpty {
+                    Label("revoked \(revoked)", systemImage: "xmark.seal")
+                }
+                if let risk = consent.risk, !risk.isEmpty {
+                    Label(risk, systemImage: "exclamationmark.shield")
+                }
+                Spacer()
+            }
+            .font(.caption)
+            .foregroundStyle(.tertiary)
+            if (consent.status ?? "") == "granted" {
+                HStack {
+                    Spacer()
+                    Button("Revoke", role: .destructive) {
+                        Task { await appModel.revokeMCPConsent(consent) }
+                    }
+                    .font(.caption)
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("mcp.consent.revoke.\(consent.id)")
+                }
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func color(_ status: String?) -> Color {
+        switch status {
+        case "granted": .green
+        case "revoked": .orange
+        case "denied": .red
+        default: .secondary
+        }
+    }
+}
+
 // MCP server control hub — a sidebar tab that surfaces all connected MCP
 // servers, their tools, the consent log, and the most recent tool call. The
 // backend (AppModel + NativeClient) is fully wired; this view is purely the
@@ -18,6 +145,7 @@ struct MCPHubView: View {
     // button still read perToolValues[tool.name] holding old/wrong-typed args.
     @State private var perToolValues: [String: [String: JSONValue]] = [:]
     @State private var expandedTool: Set<String> = []
+    @State private var inputValidationErrors: [String: String] = [:]
 
     private func valuesKey(for tool: MCPToolRecord) -> String {
         "\(tool.name)|\(schemaFingerprint(tool.inputSchema))"
@@ -27,7 +155,10 @@ struct MCPHubView: View {
         let key = valuesKey(for: tool)
         return Binding(
             get: { perToolValues[key] ?? [:] },
-            set: { perToolValues[key] = $0 }
+            set: {
+                perToolValues[key] = $0
+                inputValidationErrors.removeValue(forKey: key)
+            }
         )
     }
 
@@ -73,6 +204,7 @@ struct MCPHubView: View {
             // every add path needs a remove path.)
             perToolValues.removeAll()
             expandedTool.removeAll()
+            inputValidationErrors.removeAll()
         }
     }
 
@@ -80,15 +212,42 @@ struct MCPHubView: View {
 
     private var serversSection: some View {
         Section("Servers") {
-            if appModel.mcpServers.isEmpty {
+            switch MCPHubCollectionPresentation.resolve(
+                recordCount: appModel.mcpServers.count,
+                endpoint: "mcp servers",
+                refresh: appModel.panelRefreshStatus[.mcp]
+            ) {
+            case .loading:
+                Label("Loading MCP servers…", systemImage: "arrow.triangle.2.circlepath")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("mcp.servers.loading")
+            case .unavailable:
+                Label("MCP servers are unavailable. Refresh MCP Hub to retry.", systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .accessibilityIdentifier("mcp.servers.unavailable")
+            case .empty:
                 Text("No MCP servers configured.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-            } else {
-                ForEach(appModel.mcpServers) { server in
-                    serverRow(server)
-                }
+                    .accessibilityIdentifier("mcp.servers.empty")
+            case .stale:
+                Label("Showing last loaded MCP servers; the latest refresh failed.", systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .accessibilityIdentifier("mcp.servers.stale")
+                serverRows
+            case .available:
+                serverRows
             }
+        }
+    }
+
+    @ViewBuilder
+    private var serverRows: some View {
+        ForEach(appModel.mcpServers) { server in
+            serverRow(server)
         }
     }
 
@@ -134,9 +293,11 @@ struct MCPHubView: View {
                 Button("Warm") {
                     Task { await appModel.warmMCPServer(server) }
                 }
+                .accessibilityIdentifier("mcp.server.warm.\(server.id)")
                 Button("Restart") {
                     Task { await appModel.restartMCPServer(server) }
                 }
+                .accessibilityIdentifier("mcp.server.restart.\(server.id)")
                 Button("Refresh") {
                     // gpt-5.5 review: refreshMCPCache updates the cache on
                     // disk but doesn't reload the in-memory mcpTools /
@@ -189,11 +350,21 @@ struct MCPHubView: View {
 
     private var toolsSection: some View {
         Section("Tools — \(appModel.selectedMCPServer?.name ?? "no server selected")") {
-            if appModel.mcpTools.isEmpty {
-                Text("No tools loaded. Select a server or warm it first.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            } else {
+            let notice = MCPHubInventoryPresentation.notice(
+                state: appModel.mcpToolReadState,
+                selectedServerName: appModel.selectedMCPServer?.name,
+                toolCount: appModel.mcpTools.count
+            )
+            if !notice.text.isEmpty {
+                Label(
+                    notice.text,
+                    systemImage: notice.isFailure ? "exclamationmark.triangle" : "arrow.triangle.2.circlepath"
+                )
+                .font(.caption)
+                .foregroundStyle(notice.isFailure ? .orange : .secondary)
+                .accessibilityIdentifier(notice.isFailure ? "mcp.tools.unavailable" : "mcp.tools.empty-or-loading")
+            }
+            if notice.showsTools {
                 ForEach(appModel.mcpTools) { tool in
                     toolRow(tool)
                 }
@@ -239,6 +410,14 @@ struct MCPHubView: View {
                     Button("Run") {
                         guard let server = appModel.selectedMCPServer else { return }
                         let input = perToolValues[key] ?? [:]
+                        if let validation = MCPInputSchemaForm.validationMessage(
+                            schema: tool.inputSchema,
+                            values: input
+                        ) {
+                            inputValidationErrors[key] = validation
+                            return
+                        }
+                        inputValidationErrors.removeValue(forKey: key)
                         Task { await appModel.callMCPToolWithInput(server: server, tool: tool, input: input) }
                     }
                     .buttonStyle(.borderedProminent)
@@ -246,6 +425,13 @@ struct MCPHubView: View {
                 }
                 .font(.caption)
                 .buttonStyle(.bordered)
+                if let validation = inputValidationErrors[key] {
+                    Label(validation, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .textSelection(.enabled)
+                        .accessibilityIdentifier("mcp.tool.input.invalid.\(tool.name)")
+                }
             }
         }
         .padding(.vertical, 4)
@@ -256,11 +442,29 @@ struct MCPHubView: View {
 
     private var resourcesSection: some View {
         Section("Resources — \(appModel.selectedMCPServer?.name ?? "no server selected")") {
-            if appModel.mcpResources.isEmpty {
-                Text("No resources exposed by this server.")
+            switch appModel.mcpResourceReadState {
+            case .notLoaded, .loading:
+                Label(MCPHubResourcesPresentation.notice(
+                    state: appModel.mcpResourceReadState,
+                    resourceCount: appModel.mcpResources.count
+                )!.text, systemImage: "arrow.triangle.2.circlepath")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-            } else {
+            case .unavailable(let detail):
+                Label(MCPHubResourcesPresentation.notice(
+                    state: .unavailable(detail),
+                    resourceCount: appModel.mcpResources.count
+                )!.text, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            case .current where appModel.mcpResources.isEmpty:
+                Text(MCPHubResourcesPresentation.notice(
+                    state: .current,
+                    resourceCount: appModel.mcpResources.count
+                )!.text)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .current:
                 ForEach(appModel.mcpResources) { resource in
                     VStack(alignment: .leading, spacing: 3) {
                         Text(resource.name ?? resource.uri)
@@ -287,74 +491,66 @@ struct MCPHubView: View {
     // MARK: - Consent log
 
     private var consentSection: some View {
-        Section("Consent log") {
-            if appModel.mcpConsent.isEmpty {
-                Text("No consents granted yet.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            } else {
-                ForEach(appModel.mcpConsent) { consent in
-                    consentRow(consent)
-                }
-            }
-        }
-    }
-
-    private func consentRow(_ consent: MCPConsentRecord) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text("\(consent.serverId ?? "?") · \(consent.toolName ?? "?")")
-                    .font(.subheadline.weight(.semibold))
-                Spacer()
-                Text(consent.status ?? "unknown")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(consentColor(consent.status))
-            }
-            HStack(spacing: 12) {
-                if let granted = consent.grantedAt, !granted.isEmpty {
-                    Label("granted \(granted)", systemImage: "checkmark.seal")
-                }
-                if let revoked = consent.revokedAt, !revoked.isEmpty {
-                    Label("revoked \(revoked)", systemImage: "xmark.seal")
-                }
-                if let risk = consent.risk, !risk.isEmpty {
-                    Label(risk, systemImage: "exclamationmark.shield")
-                }
-                Spacer()
-            }
-            .font(.caption)
-            .foregroundStyle(.tertiary)
-            if (consent.status ?? "") == "granted" {
-                HStack {
-                    Spacer()
-                    Button("Revoke", role: .destructive) {
-                        Task { await appModel.revokeMCPConsent(consent) }
-                    }
-                    .font(.caption)
-                    .buttonStyle(.bordered)
-                }
-            }
-        }
-        .padding(.vertical, 4)
-    }
-
-    private func consentColor(_ status: String?) -> Color {
-        switch status {
-        case "granted": return .green
-        case "revoked": return .orange
-        case "denied": return .red
-        default: return .secondary
-        }
+        MCPHubConsentSection()
     }
 
     // MARK: - Recent call
 
     private var recentCallSection: some View {
         Section("Recent call") {
-            if let call = appModel.latestMCPCall {
+            switch appModel.mcpRecentCallState {
+            case .durable(let call):
+                recentCallRow(call, provenance: "Recorded in Activity; available after relaunch.")
+            case .partial(let call, let rejectedRows):
+                if let call {
+                    recentCallRow(
+                        call,
+                        provenance: "Recorded in Activity; \(rejectedRows) malformed receipt row\(rejectedRows == 1 ? "" : "s") ignored."
+                    )
+                } else {
+                    Label(
+                        "MCP call history is partially unreadable (\(rejectedRows) malformed receipt row\(rejectedRows == 1 ? "" : "s")).",
+                        systemImage: "exclamationmark.triangle"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                }
+            case .sessionOnly(let call):
+                recentCallRow(
+                    call,
+                    provenance: "This app session only — durable Activity evidence was not recorded."
+                )
+            case .latestAttemptFailed(let detail):
+                Label(
+                    "Latest MCP call failed this app session: \(detail). No durable call receipt was recorded.",
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(.caption)
+                .foregroundStyle(.red)
+            case .unavailable(let detail):
+                Label("Recorded MCP call history unavailable: \(detail)", systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            case .notLoaded:
+                Label("Reading recorded MCP call history…", systemImage: "arrow.triangle.2.circlepath")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .absent:
+                Text("No recorded MCP tool call yet.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func recentCallRow(_ call: MCPCallResult, provenance: String) -> some View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("\(call.serverId) · \(call.toolName)")
                         .font(.headline)
+                    Label(provenance, systemImage: "checkmark.seal")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                     Text(call.status)
                         .font(.caption)
                         .foregroundStyle(callStatusColor(call.status))
@@ -394,12 +590,6 @@ struct MCPHubView: View {
                     }
                 }
                 .padding(.vertical, 4)
-            } else {
-                Text("No MCP tool has been called this session yet.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
     }
 
     private func callStatusColor(_ status: String) -> Color {

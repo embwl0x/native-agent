@@ -779,6 +779,107 @@ struct SwiftNativeTelegramBotPhaseBTests {
         #expect(calls.count == 1)
         #expect(calls.first?.0 == 77)
         #expect(calls.first?.1.hasPrefix("Telegram:") == true)
+        let status = calls.first?.1 ?? ""
+        for required in ["Runtime:", "Model:", "Session:", "Task:"] {
+            #expect(status.contains(required), "live /status omitted \(required): \(status)")
+        }
+        #expect(!status.contains(tokenStr))
+    }
+
+    @Test func telegramPollLoop_status_redacts_running_prompt_model_and_error_sources() async throws {
+        let secret = "7123456789:AAH-secret_Token123"
+        let root = try writeTelegramConfigRoot(token: secret, allowedChatIds: [77])
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data(#"{"lastError":"\#(secret)/sendMessage"}"#.utf8)
+            .write(to: root.appendingPathComponent("telegram/state.json"))
+        // /status interpolates these independently into its Session line;
+        // seed the raw Bot API token form without a URL `bot` prefix.
+        try Data(#"{"chats":{"77":{"activeSessionId":"\#(secret)","persona":"\#(secret)"}}}"#.utf8)
+            .write(to: root.appendingPathComponent("telegram/session_map.json"))
+        let offset = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("telegram_status_redaction_\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: offset) }
+
+        actor Routing: ProviderRoutingRef {
+            func modelForSurface(_ surface: String) async -> (model: String, provider: String)? {
+                ("7123456789:AAH-secret_Token123-model", "test")
+            }
+            func modelMenuForSurface(_ surface: String) async -> TelegramModelMenu? { nil }
+            func saveModelConfig(surface: String, key: String, value: String) async throws {}
+            func saveModelSelection(surface: String, provider: String?, model: String) async throws {}
+        }
+        let coordinator = TelegramTurnCoordinator()
+        await coordinator.recordLastUserMessage(chatId: 77, text: "last \(secret) message")
+        let activeTask = Task<Void, Never> { try? await Task.sleep(nanoseconds: 30_000_000_000) }
+        let turnID = try #require(await coordinator.beginTurn(
+            chatId: 77, text: "running \(secret) prompt", task: activeTask
+        ))
+        defer {
+            activeTask.cancel()
+            Task { await coordinator.finishTurn(chatId: 77, turnId: turnID) }
+        }
+
+        let update = #"""
+        {"ok":true,"result":[{"update_id":52,"message":{"message_id":4,"chat":{"id":77},"text":"/status","date":1}}]}
+        """#
+        let session = mockSession { request in
+            (makeResponse(request.url!, 200), Data(update.utf8))
+        }
+        actor Capture {
+            var text = ""
+            func set(_ value: String) { text = value }
+        }
+        let capture = Capture()
+        let bot = SwiftNativeTelegramBot(
+            dataRoot: root, completenessDeps: TelegramBotCompletenessDeps(routing: Routing())
+        )
+        let loop = TelegramPollLoop(
+            interval: 60, token: secret, allowedChatIds: [77], bot: bot, session: session,
+            dataRoot: root, offsetURL: offset,
+            sendMessage: { _, _, text in await capture.set(text) },
+            turnCoordinator: coordinator
+        )
+        await loop.tick()
+        let status = await capture.text
+        for required in ["Runtime:", "Model:", "Session:", "Task:"] {
+            #expect(status.contains(required))
+        }
+        #expect(!status.contains(secret), "live /status leaked a token-shaped value: \(status)")
+        #expect(status.contains("[REDACTED_TELEGRAM_TOKEN]"))
+    }
+
+    @Test func telegramPollLoop_persists_migrateToChatId_on_a_real_command_send_failure() async throws {
+        let offset = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("telegram_migrate_\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: offset) }
+        let root = try writeTelegramConfigRoot(allowedChatIds: [77])
+        defer { try? FileManager.default.removeItem(at: root) }
+        let originalConfig = try Data(contentsOf: root.appendingPathComponent("telegram/config.json"))
+        let update = #"""
+        {"ok":true,"result":[{"update_id":51,"message":{"message_id":3,"chat":{"id":77},"text":"/status","date":1}}]}
+        """#
+        let session = mockSession { request in
+            (makeResponse(request.url!, 200), Data(update.utf8))
+        }
+        let migratedID: Int64 = -1_001_234_567_890
+        let loop = TelegramPollLoop(
+            interval: 60, token: tokenStr, allowedChatIds: [77],
+            bot: SwiftNativeTelegramBot(dataRoot: root), session: session, dataRoot: root, offsetURL: offset,
+            sendMessage: { _, _, _ in
+                throw TelegramAPIFailure(
+                    kind: .rejected, operation: "sendMessage", errorCode: 400,
+                    parameters: TelegramAPIResponseParameters(migrateToChatId: migratedID)
+                )
+            }
+        )
+        await loop.tick()
+
+        let errors = try String(contentsOf: root.appendingPathComponent("telegram/errors.jsonl"), encoding: .utf8)
+        #expect(errors.contains("migrate_to_chat_id=\(migratedID)"))
+        let state = try String(contentsOf: root.appendingPathComponent("telegram/state.json"), encoding: .utf8)
+        #expect(state.contains("migrate_to_chat_id=\(migratedID)"))
+        let configAfter = try Data(contentsOf: root.appendingPathComponent("telegram/config.json"))
+        #expect(configAfter == originalConfig, "migration visibility must not rewrite config bytes")
     }
 
     @Test func telegramPollLoop_routes_approval_slash_to_injected_handler() async throws {
@@ -3001,7 +3102,7 @@ struct TelegramTokenRedactionTests {
         let raw = "Error Domain=NSURLErrorDomain Code=-1009 \"offline\" UserInfo={NSErrorFailingURLStringKey=https://api.telegram.org/bot7123456789:AAH-secret_Token123/sendMessage}"
         let redacted = TelegramPollLoop._tgRedactToken(raw)
         #expect(!redacted.contains("AAH-secret_Token123"))
-        #expect(redacted.contains("bot<redacted>"))
+        #expect(redacted.contains("[REDACTED_TELEGRAM_TOKEN]"))
         #expect(redacted.contains("sendMessage"))
     }
 

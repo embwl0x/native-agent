@@ -53,7 +53,7 @@ public enum DeskProjection {
         let plan = injectedPlan ?? DeskSequencing.compute(state, now: now)
         var lines: [String] = []
         lines.append("desk · owner · rev \(state.generatedTs) · stale ok")
-        lines.append("status: watch · flag · now · next · todo · done · blocked")
+        lines.append("status: " + DeskStatus.allCases.map(\.displayLabel).joined(separator: " · "))
 
         for item in cappedTopLevel(state) {
             lines.append(renderTopLevel(item, in: state, now: now, archiveGrace: archiveGrace, plan: plan))

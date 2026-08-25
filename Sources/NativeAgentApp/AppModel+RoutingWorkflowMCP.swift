@@ -55,6 +55,82 @@ enum ResearchSearchFailure: Error, Equatable {
     }
 }
 
+enum WorkflowBuilderError: LocalizedError, Equatable {
+    case nameRequired
+    case persistenceUnconfirmed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .nameRequired:
+            return "Enter a workflow name before creating it."
+        case .persistenceUnconfirmed(let id):
+            return "Workflow '\(id)' was returned but is not visible after reloading the registry."
+        }
+    }
+}
+
+enum WorkflowLifecycleAction: Equatable {
+    case resume
+    case cancel
+    case rollback
+
+    var title: String {
+        switch self {
+        case .resume: "Resume"
+        case .cancel: "Cancel"
+        case .rollback: "Rollback"
+        }
+    }
+}
+
+enum WorkflowLifecycleActionOutcome: Equatable {
+    case persisted(status: String)
+    case unavailable(detail: String)
+    case unconfirmed(detail: String)
+    case failed(detail: String)
+}
+
+enum WorkflowLifecycleButtonPresentation {
+    struct Notice: Equatable {
+        let detail: String
+        let status: String
+    }
+
+    static func eligibility(
+        action: WorkflowLifecycleAction,
+        run: WorkflowRun,
+        approvalDecision: String?,
+        isPerforming: Bool
+    ) -> WorkflowRunControlEligibility {
+        if isPerforming {
+            return WorkflowRunControlEligibility(
+                isEligible: false,
+                detail: "Workflow lifecycle action is in progress."
+            )
+        }
+        let controls = run.controlAvailability(approvalDecision: approvalDecision)
+        switch action {
+        case .resume: return controls.resume
+        case .cancel: return controls.cancel
+        case .rollback: return controls.rollback
+        }
+    }
+
+    static func notice(
+        for action: WorkflowLifecycleAction,
+        outcome: WorkflowLifecycleActionOutcome
+    ) -> Notice {
+        switch outcome {
+        case .persisted(let status):
+            return Notice(detail: "\(action.title) persisted as \(status).", status: "ok")
+        case .unavailable(let detail), .unconfirmed(let detail):
+            return Notice(detail: detail, status: "warn")
+        case .failed(let detail):
+            return Notice(detail: detail, status: "failed")
+        }
+    }
+}
+
 @MainActor
 extension AppModel {
     @MainActor
@@ -87,29 +163,89 @@ extension AppModel {
 
     @MainActor
     func routeIntent(_ message: String) async {
+        let client = client
+        let didRoute = await routeIntent(message, using: { message in
+            try await client.planRoute(message: message)
+        })
+        guard didRoute else { return }
+        let traceTimeline = client.getCapabilityTraceTimeline()
+        capabilityTraceTimeline = traceTimeline
+        traces = traceTimeline.traces
+    }
+
+    /// The UI owns visible route state while the injected planner remains the
+    /// real router boundary. The overload makes the successful-empty and
+    /// failed paths executable without a source-text proxy.
+    @MainActor
+    @discardableResult
+    func routeIntent(
+        _ message: String,
+        using planner: (String) async throws -> IntentRoutePlan
+    ) async -> Bool {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty else {
+            routePlan = nil
+            routePresentation = .failed("Enter a task before planning a route.")
+            statusText = "Router needs a task to plan."
+            return false
+        }
+        routePlan = nil
+        routePresentation = .planning
         do {
-            routePlan = try await client.planRoute(message: trimmed)
-            traces = (try? await client.getTraces()) ?? traces
-            statusText = "Route planned: \(routePlan?.goalType ?? "unknown")"
+            let plan = try await planner(trimmed)
+            routePlan = plan
+            routePresentation = .plan(plan)
+            statusText = "Route planned: \(plan.goalType)"
+            return true
         } catch {
-            statusText = "Router failed: \(error.localizedDescription)"
+            let failure = IntentRoutePresentation.boundedFailure(error)
+            routePlan = nil
+            routePresentation = .failed(failure)
+            statusText = "Router failed: \(failure)"
+            return false
         }
     }
 
     @MainActor
     func runWorkflow(_ workflow: WorkflowRecord, objective: String) async {
         do {
-            _ = try await client.runWorkflow(id: workflow.id, objective: objective, execute: true)
+            let run = try await client.runWorkflow(id: workflow.id, objective: objective, execute: true)
             disabledFeature = nil
-            statusText = "Workflow execution recorded"
-            await refreshAll()
+            await refreshWorkflowControlOutcome(run, action: "Workflow execution")
         } catch let err as NSError where AppModel.isNotImplemented(err) {
             disabledFeature = AppModel.disabledBadge(for: "Workflow run", error: err)
             statusText = disabledFeature ?? "Workflow run disabled"
         } catch {
+            await refreshAll()
             statusText = "Workflow run failed: \(error.localizedDescription)"
+        }
+    }
+
+    /// Creates the smallest reviewable workflow through the canonical registry
+    /// writer. A create response alone is not presented as success: the
+    /// returned id must appear in a fresh registry read from the same root.
+    @MainActor
+    func createWorkflow(named name: String) async throws -> WorkflowRecord {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            statusText = WorkflowBuilderError.nameRequired.localizedDescription
+            throw WorkflowBuilderError.nameRequired
+        }
+        do {
+            let created = try await client.createWorkflow(.object([
+                "name": .string(trimmed),
+            ]))
+            let reloaded = try await client.getWorkflows()
+            guard let confirmed = reloaded.first(where: { $0.id == created.id }) else {
+                throw WorkflowBuilderError.persistenceUnconfirmed(created.id)
+            }
+            workflows = reloaded
+            disabledFeature = nil
+            statusText = "Workflow created: \(confirmed.name)"
+            return confirmed
+        } catch {
+            statusText = "Workflow creation failed: \(error.localizedDescription)"
+            throw error
         }
     }
 
@@ -132,47 +268,150 @@ extension AppModel {
     }
 
     @MainActor
-    func resumeWorkflowRun(_ run: WorkflowRun) async {
+    @discardableResult
+    func resumeWorkflowRun(_ run: WorkflowRun) async -> WorkflowLifecycleActionOutcome {
+        let approvalDecision = run.approvalId.flatMap { approvalID in
+            approvals.first(where: { $0.id == approvalID })?.decision
+        }
+        let eligibility = run.controlAvailability(approvalDecision: approvalDecision).resume
+        guard eligibility.isEligible else {
+            let detail = "Workflow resume unavailable: \(eligibility.detail)"
+            statusText = detail
+            return .unavailable(detail: detail)
+        }
         do {
-            _ = try await client.resumeWorkflowRun(id: run.id)
-            statusText = "Workflow resumed"
-            await refreshAll()
+            let updated = try await client.resumeWorkflowRun(id: run.id)
+            return await refreshWorkflowControlOutcome(updated, action: "Workflow resume")
         } catch {
-            statusText = "Workflow resume failed: \(error.localizedDescription)"
+            await refreshAll()
+            let detail = "Workflow resume failed: \(error.localizedDescription)"
+            statusText = detail
+            return .failed(detail: detail)
         }
     }
 
     @MainActor
-    func cancelWorkflowRun(_ run: WorkflowRun) async {
+    @discardableResult
+    func cancelWorkflowRun(_ run: WorkflowRun) async -> WorkflowLifecycleActionOutcome {
+        let eligibility = run.controlAvailability().cancel
+        guard eligibility.isEligible else {
+            let detail = "Workflow cancel unavailable: \(eligibility.detail)"
+            statusText = detail
+            return .unavailable(detail: detail)
+        }
         do {
-            _ = try await client.cancelWorkflowRun(id: run.id)
-            statusText = "Workflow canceled"
-            await refreshAll()
+            let updated = try await client.cancelWorkflowRun(id: run.id)
+            return await refreshWorkflowControlOutcome(updated, action: "Workflow cancel")
         } catch {
-            statusText = "Workflow cancel failed: \(error.localizedDescription)"
+            await refreshAll()
+            let detail = "Workflow cancel failed: \(error.localizedDescription)"
+            statusText = detail
+            return .failed(detail: detail)
         }
     }
 
     @MainActor
-    func rollbackWorkflowRun(_ run: WorkflowRun) async {
-        do {
-            _ = try await client.rollbackWorkflowRun(id: run.id)
-            statusText = "Workflow rolled back"
-            await refreshAll()
-        } catch {
-            statusText = "Workflow rollback failed: \(error.localizedDescription)"
+    @discardableResult
+    func rollbackWorkflowRun(_ run: WorkflowRun) async -> WorkflowLifecycleActionOutcome {
+        let eligibility = run.controlAvailability().rollback
+        guard eligibility.isEligible else {
+            let detail = "Workflow rollback unavailable: \(eligibility.detail)"
+            statusText = detail
+            return .unavailable(detail: detail)
         }
+        do {
+            let updated = try await client.rollbackWorkflowRun(id: run.id)
+            return await refreshWorkflowControlOutcome(updated, action: "Workflow rollback")
+        } catch {
+            await refreshAll()
+            let detail = "Workflow rollback failed: \(error.localizedDescription)"
+            statusText = detail
+            return .failed(detail: detail)
+        }
+    }
+
+    /// A client response is not enough to claim a run-control action completed:
+    /// the visible list is deliberately rebuilt from its durable JSONL history.
+    /// Confirm the exact returned run after that rebuild and leave an adverse
+    /// message if a write/ledger conflict made the result unobservable.
+    @MainActor
+    @discardableResult
+    private func refreshWorkflowControlOutcome(
+        _ expected: WorkflowRun,
+        action: String
+    ) async -> WorkflowLifecycleActionOutcome {
+        await refreshAll()
+        guard let reloaded = workflowRuns.first(where: { $0.id == expected.id }) else {
+            let detail = "\(action) outcome is not visible after reload; durable status could not be confirmed."
+            statusText = detail
+            return .unconfirmed(detail: detail)
+        }
+        guard reloaded.status == expected.status else {
+            let detail = "\(action) conflicted with persisted state: returned \(expected.status), reloaded \(reloaded.status)."
+            statusText = detail
+            return .unconfirmed(detail: detail)
+        }
+        statusText = "\(action) persisted as \(reloaded.status)."
+        return .persisted(status: reloaded.status)
     }
 
     @MainActor
     func resolveApproval(_ approval: ApprovalRequest, decision: String) async {
-        do {
-            _ = try await client.resolveApproval(id: approval.id, decision: decision)
-            statusText = "Approval \(decision)"
+        let result = await resolveApprovalOnce(id: approval.id, decision: decision)
+        switch result {
+        case .applied:
+            statusText = result.visibleMessage
             await refreshAll()
-        } catch {
-            statusText = "Approval update failed: \(error.localizedDescription)"
+        case .noOpAlreadyResolved:
+            statusText = result.visibleMessage
+            await refreshAll()
+        case .noOpInFlight, .unavailable:
+            statusText = result.visibleMessage
         }
+    }
+
+    /// The compact Capabilities panel keeps its own visible receipt rather
+    /// than implying an outcome from the list refresh or global status text.
+    @MainActor
+    func resolveCapabilitiesApprovalInbox(_ approval: ApprovalRequest, decision: String) async {
+        capabilitiesApprovalInboxOutcome = nil
+        let result = await resolveApprovalOnce(id: approval.id, decision: decision)
+        capabilitiesApprovalInboxOutcome = result
+        statusText = result.visibleMessage
+        switch result {
+        case .applied, .noOpAlreadyResolved:
+            await refreshAll()
+        case .noOpInFlight, .unavailable:
+            break
+        }
+    }
+
+    /// Coalesce simultaneous decisions from the compact Capabilities card,
+    /// the full Approvals screen, and any mounted inline control. The second
+    /// caller is deliberately typed as a no-op rather than issuing another
+    /// resolve request whose post-resolution effect could run twice.
+    @MainActor
+    func resolveApprovalOnce(id: String, decision: String) async -> CapabilitiesApprovalInboxResolution {
+        let trimmedID = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedID.isEmpty else {
+            return .unavailable("The approval request has no identifier.")
+        }
+        guard approvalResolutionTasks[trimmedID] == nil else {
+            return .noOpInFlight(id: trimmedID)
+        }
+
+        do {
+            return .applied(try await resolveApproval(id: trimmedID, decision: decision))
+        } catch let ApprovalInboxError.alreadyResolved(id: resolvedID, status: status) {
+            return .noOpAlreadyResolved(id: resolvedID, status: status)
+        } catch {
+            return .unavailable(CapabilitiesApprovalInboxResolution.boundedUnavailable(error))
+        }
+    }
+
+    @MainActor
+    func isResolvingApproval(id: String) -> Bool {
+        approvalResolutionInFlightIDs.contains(id)
     }
 
     @MainActor
@@ -185,7 +424,9 @@ extension AppModel {
         // Clear stale inventories immediately so the UI doesn't show the
         // previous server's tools under the new server's name during fetch.
         mcpTools = []
+        mcpToolReadState = .loading
         mcpResources = []
+        mcpResourceReadState = .loading
         let pendingId = server.id
         do {
             let toolsResult = try await client.getMCPTools(serverId: pendingId).tools
@@ -193,9 +434,16 @@ extension AppModel {
             // Late-arrival guard: discard if user has moved on.
             guard selectedMCPServerId == pendingId else { return }
             mcpTools = toolsResult
+            mcpToolReadState = .current
             mcpResources = resourcesResult
+            mcpResourceReadState = .current
             statusText = "Loaded MCP details for \(server.name)"
         } catch {
+            if selectedMCPServerId == pendingId {
+                mcpToolReadState = .unavailable(String(error.localizedDescription.prefix(240)))
+                mcpResources = []
+                mcpResourceReadState = .unavailable(String(error.localizedDescription.prefix(240)))
+            }
             statusText = "MCP details failed: \(error.localizedDescription)"
         }
     }
@@ -212,17 +460,46 @@ extension AppModel {
             selectedMCPServerId = pendingId
             _ = try await client.warmMCPServer(serverId: pendingId)
             let fetchedSessions = (try? await client.getMCPSessions())
-            let fetchedTools = (try? await client.getMCPTools(serverId: pendingId).tools)
-            let fetchedResources = (try? await client.getMCPResources(serverId: pendingId).resources)
+            mcpToolReadState = .loading
+            let fetchedTools: [MCPToolRecord]?
+            do {
+                fetchedTools = try await client.getMCPTools(serverId: pendingId).tools
+            } catch {
+                fetchedTools = nil
+                if selectedMCPServerId == pendingId {
+                    mcpToolReadState = .unavailable(String(error.localizedDescription.prefix(240)))
+                }
+            }
+            mcpResourceReadState = .loading
+            let fetchedResources: [MCPResourceRecord]?
+            do {
+                fetchedResources = try await client.getMCPResources(serverId: pendingId).resources
+            } catch {
+                fetchedResources = nil
+                if selectedMCPServerId == pendingId {
+                    mcpResources = []
+                    mcpResourceReadState = .unavailable(String(error.localizedDescription.prefix(240)))
+                }
+            }
             // Sessions are server-list-wide, safe to apply unconditionally.
             if let s = fetchedSessions { mcpSessions = s }
             // Tools / resources are server-scoped — guard on still-selected.
             if selectedMCPServerId == pendingId {
                 if let t = fetchedTools { mcpTools = t }
-                if let r = fetchedResources { mcpResources = r }
+                if fetchedTools != nil { mcpToolReadState = .current }
+                if let r = fetchedResources {
+                    mcpResources = r
+                    mcpResourceReadState = .current
+                }
             }
             disabledFeature = nil
-            statusText = "MCP warmed: \(server.name)"
+            if selectedMCPServerId == pendingId {
+                if case .current = mcpResourceReadState {
+                    statusText = "MCP warmed and details refreshed: \(server.name)"
+                } else {
+                    statusText = "MCP warmed, but details could not refresh: \(server.name)"
+                }
+            }
         } catch let err as NSError where AppModel.isNotImplemented(err) {
             disabledFeature = AppModel.disabledBadge(for: "MCP warm", error: err)
             statusText = disabledFeature ?? "MCP warm disabled"
@@ -233,11 +510,21 @@ extension AppModel {
 
     @MainActor
     func restartMCPServer(_ server: MCPServerRecord) async {
+        let pendingId = server.id
         do {
-            selectedMCPServerId = server.id
-            _ = try await client.restartMCPServer(serverId: server.id)
+            selectedMCPServerId = pendingId
+            _ = try await client.restartMCPServer(serverId: pendingId)
             mcpSessions = (try? await client.getMCPSessions()) ?? mcpSessions
-            statusText = "MCP restarted: \(server.name)"
+            // Restart replaces the live child. Refresh the selected inventory
+            // through the same owner before declaring completion; otherwise
+            // the Hub can show tools/resources from the pre-restart session.
+            await loadMCPDetails(server)
+            guard selectedMCPServerId == pendingId else { return }
+            if case .current = mcpResourceReadState {
+                statusText = "MCP restarted and details refreshed: \(server.name)"
+            } else {
+                statusText = "MCP restarted, but details could not refresh: \(server.name)"
+            }
         } catch {
             statusText = "MCP restart failed: \(error.localizedDescription)"
         }
@@ -285,15 +572,28 @@ extension AppModel {
     func callMCPTool(server: MCPServerRecord, tool: MCPToolRecord, query: String) async {
         do {
             latestMCPCall = try await client.callMCPTool(serverId: server.id, toolName: tool.name, input: ["query": query])
+            if latestMCPCall?.evidenceStatus == "recorded" {
+                refreshMCPHubRecentCall()
+            } else if let latestMCPCall {
+                mcpRecentCallState = .sessionOnly(latestMCPCall)
+            }
             statusText = "MCP \(tool.name): \(latestMCPCall?.status ?? "done")"
             await refreshAll()
         } catch {
+            mcpRecentCallState = .latestAttemptFailed(String(error.localizedDescription.prefix(240)))
             statusText = "MCP call failed: \(error.localizedDescription)"
         }
     }
 
     @MainActor
     func callMCPToolWithInput(server: MCPServerRecord, tool: MCPToolRecord, input: [String: JSONValue]) async {
+        if let validation = MCPInputSchemaForm.validationMessage(
+            schema: tool.inputSchema,
+            values: input
+        ) {
+            statusText = "MCP input refused: \(validation)"
+            return
+        }
         do {
             // Mirror the shape of the v1 callMCPTool(server:tool:query:) above:
             // convert and await on the main actor. The original v1 path passes
@@ -302,9 +602,15 @@ extension AppModel {
             // first-cut Task.detached wrapper as over-structured.
             let foundationInput = MCPInputSchemaForm.toFoundationDict(input)
             latestMCPCall = try await client.callMCPTool(serverId: server.id, toolName: tool.name, input: foundationInput)
+            if latestMCPCall?.evidenceStatus == "recorded" {
+                refreshMCPHubRecentCall()
+            } else if let latestMCPCall {
+                mcpRecentCallState = .sessionOnly(latestMCPCall)
+            }
             statusText = "MCP \(tool.name): \(latestMCPCall?.status ?? "done")"
             await refreshAll()
         } catch {
+            mcpRecentCallState = .latestAttemptFailed(String(error.localizedDescription.prefix(240)))
             statusText = "MCP call failed: \(error.localizedDescription)"
         }
     }

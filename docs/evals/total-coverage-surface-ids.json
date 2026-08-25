@@ -1,0 +1,2572 @@
+{
+  "baselineInputs": {
+    "coverage-overrides.json": "5d82eaee16d0725a913f1763e27ea47a3ab52ff736bec0ab34f3934c9edcfa16",
+    "phase1-fragments.json": "e0620c6c76d7a1632f4675af70ded2b1c349425f6ed9962de1dc186b7a43fb00"
+  },
+  "surfaces": [
+    {
+      "fence": "core.chat.tools",
+      "id": "chat.tools.dispatch.mcpSessionIdStrip"
+    },
+    {
+      "fence": "core.chat.tools",
+      "id": "chat.tools.builderWriteAudit"
+    },
+    {
+      "fence": "core.chat.tools",
+      "id": "chat.tools.builderSwiftPMShimDirectory"
+    },
+    {
+      "fence": "core.chat.tools",
+      "id": "chat.tools.builder.timeoutClamp"
+    },
+    {
+      "fence": "core.chat.persistence",
+      "id": "chat.trace.contextStage.emitStage"
+    },
+    {
+      "fence": "core.chat.persistence",
+      "id": "chat.factory.credentialRootEnvOverride"
+    },
+    {
+      "fence": "core.chat.persistence",
+      "id": "chat.persistence.outcomeDimensionStates"
+    },
+    {
+      "fence": "core.chat.persistence",
+      "id": "chat.trace.contextSnapshot.payloadBound"
+    },
+    {
+      "fence": "core.chat.persistence",
+      "id": "chat.metacognition.livingFabricEvalRoute"
+    },
+    {
+      "fence": "core.chat.persistence",
+      "id": "chat.persistence.resolveSessionId"
+    },
+    {
+      "fence": "core.substrate.affect",
+      "id": "ui.observatory.affectPanel"
+    },
+    {
+      "fence": "core.substrate.affect",
+      "id": "ui.control.capsuleInjectionEnabled"
+    },
+    {
+      "fence": "core.substrate.field",
+      "id": "substrate.runReplay"
+    },
+    {
+      "fence": "core.substrate.organism",
+      "id": "feed.cognition/organism_watch.jsonl"
+    },
+    {
+      "fence": "core.substrate.organism",
+      "id": "cli.organism_watch.sh"
+    },
+    {
+      "fence": "core.substrate.organism",
+      "id": "cli.organism_longitudinal_eval.sh"
+    },
+    {
+      "fence": "core.substrate.organism",
+      "id": "cli.organism_doctor.sh"
+    },
+    {
+      "fence": "core.substrate.organism",
+      "id": "cli.organism_bridge_probe.sh"
+    },
+    {
+      "fence": "core.substrate.organism",
+      "id": "ui.observatory.organismBodyPanel"
+    },
+    {
+      "fence": "core.substrate.organism",
+      "id": "ui.observatory.settleAndResetBody"
+    },
+    {
+      "fence": "core.substrate.organism",
+      "id": "ui.observatory.organismHint"
+    },
+    {
+      "fence": "core.substrate.organism",
+      "id": "telemetry.residualDeadlineArmedFired"
+    },
+    {
+      "fence": "core.substrate.organism",
+      "id": "gate.workshopRequiresNormalOrganismPosture"
+    },
+    {
+      "fence": "core.substrate.organism",
+      "id": "telemetry.organism_debug/organism_reflex_review"
+    },
+    {
+      "fence": "core.substrate.organism",
+      "id": "speed.rem_pins.read"
+    },
+    {
+      "fence": "core.persistence",
+      "id": "core.persistence.defaultDataRoot.unstampedPublicBundleGuard"
+    },
+    {
+      "fence": "core.context",
+      "id": "cli.ContextSelectionABHarness"
+    },
+    {
+      "fence": "core.context",
+      "id": "context.coordinator.prewarmPlans.residency"
+    },
+    {
+      "fence": "core.context",
+      "id": "context.coordinator.feedbackEvents.cap"
+    },
+    {
+      "fence": "core.context",
+      "id": "context.runtime.modeStatus"
+    },
+    {
+      "fence": "core.context",
+      "id": "context.flow.mode.env"
+    },
+    {
+      "fence": "core.context",
+      "id": "context.runtime.memoryPressureSource"
+    },
+    {
+      "fence": "core.context",
+      "id": "context.runtime.prepareForSleep"
+    },
+    {
+      "fence": "core.context",
+      "id": "feed.legacyContextReceipts"
+    },
+    {
+      "fence": "core.context",
+      "id": "ui.contextFlowObservatoryPanel"
+    },
+    {
+      "fence": "core.context",
+      "id": "runtime.attachMemoryProvenance"
+    },
+    {
+      "fence": "core.context",
+      "id": "store.contextFts.writeOnly"
+    },
+    {
+      "fence": "core.context",
+      "id": "context.monitor.rearmOnDeleteOrRename"
+    },
+    {
+      "fence": "core.context",
+      "id": "context.coordinator.refreshDiscoveredSources"
+    },
+    {
+      "fence": "core.telegram",
+      "id": "telegram.completenessRegistry"
+    },
+    {
+      "fence": "core.telegram",
+      "id": "telegram.voice.audioTranscodeStage"
+    },
+    {
+      "fence": "core.telegram",
+      "id": "telegram.updateInbox.perTickFullScan"
+    },
+    {
+      "fence": "core.maccontrol",
+      "id": "macassistant.commandPaletteBadge"
+    },
+    {
+      "fence": "core.maccontrol",
+      "id": "ui.macAssistantWatchSetup"
+    },
+    {
+      "fence": "core.maccontrol",
+      "id": "ui.deadSystemAndShortcutWorkbench"
+    },
+    {
+      "fence": "core.workshop",
+      "id": "workflow.runsLedger.feedFamily"
+    },
+    {
+      "fence": "core.workshop",
+      "id": "workflow.ui.runResumeCancelRollback"
+    },
+    {
+      "fence": "core.workshop",
+      "id": "scheduler.jobs.feed"
+    },
+    {
+      "fence": "core.activity",
+      "id": "activity.watcher.status"
+    },
+    {
+      "fence": "core.activity",
+      "id": "activity.watcher.lifecycleState"
+    },
+    {
+      "fence": "core.activity",
+      "id": "activity.watcher.tickLoop"
+    },
+    {
+      "fence": "core.activity",
+      "id": "activity.watcher.workspaceObservers"
+    },
+    {
+      "fence": "core.activity",
+      "id": "activity.retention.appWiring"
+    },
+    {
+      "fence": "core.activity",
+      "id": "activity.simulation.groundTruthVerifier"
+    },
+    {
+      "fence": "core.activity",
+      "id": "activity.cli.dataRoot"
+    },
+    {
+      "fence": "core.activity",
+      "id": "activity.cli.run"
+    },
+    {
+      "fence": "core.activity",
+      "id": "activity.cli.policy"
+    },
+    {
+      "fence": "core.activity",
+      "id": "activity.cli.readCommands"
+    },
+    {
+      "fence": "core.activity",
+      "id": "activity.cli.policyIncludeIsNotTheInverseOfExclude"
+    },
+    {
+      "fence": "core.activity",
+      "id": "activity.cli.dumpSilentRowCap"
+    },
+    {
+      "fence": "core.connectors",
+      "id": "github.action.getIssue"
+    },
+    {
+      "fence": "core.connectors",
+      "id": "github.setting.contributorLoginGuard"
+    },
+    {
+      "fence": "core.connectors",
+      "id": "github.setting.staleAfterHours"
+    },
+    {
+      "fence": "core.connectors",
+      "id": "x.action.status"
+    },
+    {
+      "fence": "core.connectors",
+      "id": "x.oauth1.secretsFile"
+    },
+    {
+      "fence": "core.connectors",
+      "id": "x.env.NATIVE_AGENT_X_CLIENT_ID"
+    },
+    {
+      "fence": "core.connectors",
+      "id": "x.oauthApp.file"
+    },
+    {
+      "fence": "core.connectors",
+      "id": "slack.action.status"
+    },
+    {
+      "fence": "core.connectors",
+      "id": "slack.action.listChannels"
+    },
+    {
+      "fence": "core.connectors",
+      "id": "slack.envelope.redaction"
+    },
+    {
+      "fence": "core.connectors",
+      "id": "browser.instrument.blindSpot"
+    },
+    {
+      "fence": "core.connectors",
+      "id": "slack.secretRedactor"
+    },
+    {
+      "fence": "core.connectors",
+      "id": "slack.uploadFile.externalUploadURL"
+    },
+    {
+      "fence": "core.connectors",
+      "id": "x.userIDCache"
+    },
+    {
+      "fence": "core.connectors",
+      "id": "x.status.credentialMasking"
+    },
+    {
+      "fence": "core.misc",
+      "id": "cli.chatDrive.chat"
+    },
+    {
+      "fence": "core.misc",
+      "id": "cli.chatDrive.stream"
+    },
+    {
+      "fence": "core.misc",
+      "id": "cli.chatDrive.providerPrefs"
+    },
+    {
+      "fence": "core.misc",
+      "id": "cli.chatDrive.doctor"
+    },
+    {
+      "fence": "core.misc",
+      "id": "cli.chatDrive.memoryOps"
+    },
+    {
+      "fence": "core.misc",
+      "id": "cli.chatDrive.livingFabricEval"
+    },
+    {
+      "fence": "core.misc",
+      "id": "cli.chatDrive.procedure"
+    },
+    {
+      "fence": "core.misc",
+      "id": "cli.chatDrive.physiologySoakReport"
+    },
+    {
+      "fence": "core.misc",
+      "id": "cli.chatDrive.workshopCancel"
+    },
+    {
+      "fence": "core.misc",
+      "id": "cli.chatDrive.env.publicSafeMode"
+    },
+    {
+      "fence": "core.misc",
+      "id": "cli.chatDrive.env.chatSession"
+    },
+    {
+      "fence": "core.misc",
+      "id": "cli.chatDrive.env.embeddingMock"
+    },
+    {
+      "fence": "core.misc",
+      "id": "cli.deskSweep"
+    },
+    {
+      "fence": "core.misc",
+      "id": "cli.chatDrive.parseOptions.unknownFlagBecomesPositional"
+    },
+    {
+      "fence": "core.misc",
+      "id": "cli.chatDrive.memoryHygiene.approveSwap"
+    },
+    {
+      "fence": "core.misc",
+      "id": "cli.deskSweep.retireTrackerGh"
+    },
+    {
+      "fence": "core.misc",
+      "id": "cli.deskSweep.ghReport"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.sidebar.archiveButton"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.sidebar.listDimming"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.sidebar.sessionRow"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.sidebar.rowRenameEditor"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.sidebar.rowContextMenu"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.sidebar.pinnedSectionSplit"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.pinnedTabStrip"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.pinnedTab.renameEditor"
+    },
+    {
+      "fence": "app.chat",
+      "id": "api.SessionDragSource.desktopDropPredicate"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.header.title"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.header.renameControls"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.header.messageCountLine"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.header.nextGenPill"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.header.conversationSettingsToggle"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.header.contextReceiptToggle"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.contextReceipt.pillRow"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.contextReceipt.sections"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.contextReceipt.emptyState"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.transcript.liveToolFlipBox"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.transcript.toolsUsedSummary"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.transcript.toolPill"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.transcript.toolDiff"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.transcript.approvalNeverCollapsed"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.transcript.nonImageAttachmentChip"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.composer.toolInputForm"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.composer.clearConfirmation"
+    },
+    {
+      "fence": "app.chat",
+      "id": "setting.voiceAutoRead"
+    },
+    {
+      "fence": "app.chat",
+      "id": "setting.voiceUseOpenAI"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.transcript.latestPill"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.transcript.turnCardClearance"
+    },
+    {
+      "fence": "app.chat",
+      "id": "setting.nativeagent.darkMode"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.detached.emptyState"
+    },
+    {
+      "fence": "app.chat",
+      "id": "api.CommandPalette.ranking"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.inspector.liveDropCount"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.conversationSettings.accessPicker"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.conversationSettings.staleModelWarning"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.conversationSettings.refreshCatalogButton"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.contextFillBar.compactButton"
+    },
+    {
+      "fence": "app.chat",
+      "id": "feed.chat.inboxStrip"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.emptyState"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.otherSessionsBanner"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.nextGenActionChips"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.queue.queueMenu"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.sidebar.rowUnpinButton"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.sidebar.rowRenamePencil"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.sidebar.rowSourceBadge"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.contextReceipt.budgetDetail"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.contextReceipt.stringList"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.chat.pinnedTab.runningDot"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.inspector.liveDropCountBadge"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.commandPalette.itemPool"
+    },
+    {
+      "fence": "app.chat",
+      "id": "ui.commandPalette.recentActions"
+    },
+    {
+      "fence": "app.chat",
+      "id": "setting.showDeveloperSurfaces"
+    },
+    {
+      "fence": "app.chat",
+      "id": "api.DetachedChatPanel.framePlacement"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.control.toolbar.refresh"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.palette.view"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.action.surfacePin"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.action.optimisticRollback"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.nag.bellSymbol"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.board.sequencingPills"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.board.freshnessChip"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.board.finishedCap"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.github.buckets"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.execution.benchSlice"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.pursuits.card"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.scheduler.loadError"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.runs.list"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.runs.detailSheet"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.approvals.decisionToastKind"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.inbox.laneLabelCounts"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.inbox.groupFilter"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.inbox.rowActionInFlightGuard"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.inbox.detailSheetAutoRead"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.inbox.strip"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.inbox.sourceBadgeLabel"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.inboxPolicy.triggerToggle"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.inboxPolicy.testFire"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.inboxPolicy.statusLine"
+    },
+    {
+      "fence": "app.desk",
+      "id": "workshop.observatory.vetoButton"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.smoke.coverage"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.runs.emptyStateSilentZero"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.runs.statusBadgeRawStatus"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.runs.previewFallback"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.execution.verificationLabel"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.execution.pillLabel"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.execution.stepProgress"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.github.statePillLabel"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.github.portfolioStripCounts"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.github.waitingRollup"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.board.blockerPillNavigation"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.board.ghProjectSummaryNeedsEyes"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.board.statusPillVocabulary"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.counters.inProgress"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.view.loadErrorBanner"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.action.noticeRow"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.action.inFlightGuard"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.palette.applyCommand"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.reloader.startPathsLatch"
+    },
+    {
+      "fence": "app.desk",
+      "id": "workshop.observatory.veto"
+    },
+    {
+      "fence": "app.desk",
+      "id": "workshop.observatory.receiptStatusTint"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.inbox.emptyStateCrossLanePointer"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.inbox.visibleActionsHideList"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.inbox.detailSheetActionPath"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.inbox.errorBanner"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.inbox.appModelMirror"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.approvals.historyRowIcon"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.approvals.riskBadge"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.approvals.refreshAndError"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.inboxPolicy.viewInboxHistory"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.inboxPolicy.triggersPanelGate"
+    },
+    {
+      "fence": "app.desk",
+      "id": "desk.inboxPolicy.statusSlot"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.cognitionObservatory.button.refresh"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.cognitionObservatory.button.resetBody"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.cognitionObservatory.panel.workshopVeto"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.cognitionObservatory.action.reflexApprove"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.cognitionObservatory.action.reflexRetire"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.cognitionObservatory.panel.associations"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.cognitionObservatory.panel.tensions"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.cognitionObservatory.panel.developmentalTimeline"
+    },
+    {
+      "fence": "app.mind",
+      "id": "api.CognitionProposalsFeed.pending"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.cognitionProposals.action.reject"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.InlineCognitionProposalCard"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.contextFlow.healthRows"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.dreams.button.refresh"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.dreams.errorBanner"
+    },
+    {
+      "fence": "app.mind",
+      "id": "logic.dreams.diaryLoadGeneration"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.personality.identity.saveName"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.personality.docPicker"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.personality.reloadDocuments"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.memory.searchField"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.memory.statusLabels"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.memory.toolbar.refresh"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.kg.viewModePicker"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.kg.searchAndTypeFilter"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.kg.errorBanner"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.kg.emptyStates"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.kg.action.enableKnowledgeGraph"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.kg.graphCanvas"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.kg.entityDetail"
+    },
+    {
+      "fence": "app.mind",
+      "id": "logic.kg.selectionSync"
+    },
+    {
+      "fence": "app.mind",
+      "id": "loop.LivingStatusPanel.fileWatch"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.cognitionObservatory.collapsible.countBadge"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.cognitionObservatory.hint.collapsedRow"
+    },
+    {
+      "fence": "app.mind",
+      "id": "logic.dreams.loadEntry"
+    },
+    {
+      "fence": "app.mind",
+      "id": "logic.personality.loadProfile.docsLoadErrorLatch"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.memory.rowEditor.pin"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.memory.search.semanticRecall"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.memory.reindexSpotlight"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.kg.button.sweepOrphans"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.kg.button.enableKnowledgeGraph"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.kg.staleDataBanner"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.kg.graphSafetyNet"
+    },
+    {
+      "fence": "app.mind",
+      "id": "loop.livingStatus.fileWatcher"
+    },
+    {
+      "fence": "app.mind",
+      "id": "logic.livingStatus.refreshCoalescing"
+    },
+    {
+      "fence": "app.mind",
+      "id": "ui.livingStatus.button.refresh"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.ProviderSettings.surfaceRowSet"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.ProviderSettings.surfaceLabel"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.ProviderSettings.statusText"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.ProviderSettings.refreshButton"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.ProviderSettings.xaiOAuthButton"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.ProviderSettings.openTelegramSettingsButton"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.ProviderSettings.anthropicMCPStatusPanel"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.ProviderSettings.anthropicOAuthDirectPanel"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.SlimSettings.replayOnboardingTour"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.SlimSettings.showDataLimits"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.SlimSettings.statusLine"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.SlimSettings.subconsciousStatusLine"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.SlimSettings.embeddingsRetryAndReleaseButtons"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.TrustCenter.policyMapDisclosure"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.TrustCenter.safetyBoundariesPanel"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.TrustCenter.privacyMapPanel"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.TrustCenter.policySimulator"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.TrustCenter.statusText"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Capabilities.foundryIndexPanel"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Capabilities.mcpBuilderCard"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Capabilities.intentRouter"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Capabilities.traceTimeline"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Capabilities.skillMemoryGraph"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Capabilities.nativeMacPowerPanel"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Capabilities.productionHardeningPanel"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Capabilities.refreshToolbar"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Tools.fullMacBanner"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Tools.statusFlash"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Tools.emptyStateVsLoading"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.SkillLifecycle.searchField"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.SkillLifecycle.buildAndRefreshButtons"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.SkillLifecycle.errorBannerAndToast"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.SkillLifecycle.reviewSheetInstall"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.SkillLifecycle.oauthFlowSheet"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.SkillLifecycle.skillBodySheet"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.MCPHub.consentSection"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.MCPHub.resourcesAndRecentCall"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Connectors.workspaceSearch"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Connectors.statusMessage"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Telegram.botTokenField"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Telegram.actionButtons"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Telegram.receiptPanels"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Status.recentActivity"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Doctor.reportFooter"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Tools.toolStatusBadge"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Tools.approveButton"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Tools.autoRunToggleButton"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Tools.quarantineButton"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Tools.emptyState"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Skills.bodySheetRootGuard"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Skills.reviewSheetInstall"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Skills.buildSkillButton"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Skills.manifestErrorBanner"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Skills.searchField"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.MCPHub.toolInputForm"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.MCPHub.emptyStates"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Connectors.statusMessageSection"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.ConnectorWizard.slackTokenForm"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.ConnectorWizard.githubAndNotionTokenFields"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Telegram.disconnectButton"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Telegram.clearLogsButton"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Telegram.receiptsAndBlockedPanels"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Doctor.repairSafeIssuesButton"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Doctor.openOAuthLoginButton"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Doctor.supportSnapshotButton"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Status.recentActivityPanel"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Capabilities.approvalInboxApproveDeny"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Capabilities.nativeActionRunButton"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Capabilities.addCatalogSource"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Capabilities.workflowLifecycleButtons"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Capabilities.productionExportButtons"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Capabilities.runGauntletAndBrowserDryRun"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.Capabilities.statusTextLine"
+    },
+    {
+      "fence": "app.settings",
+      "id": "ui.SecurityCenterPanel.refreshButton"
+    },
+    {
+      "fence": "app.mac",
+      "id": "loop.refreshForSidebarItem"
+    },
+    {
+      "fence": "app.mac",
+      "id": "ui.onboardingTourOverlay"
+    },
+    {
+      "fence": "app.mac",
+      "id": "route.onOpenURL.oauthCallback"
+    },
+    {
+      "fence": "app.mac",
+      "id": "store.spotlightRecentPrompts"
+    },
+    {
+      "fence": "app.mac",
+      "id": "turn-ingredient.spotlightSessionId"
+    },
+    {
+      "fence": "app.mac",
+      "id": "public-api.SpotlightOverlayProbe.currentFrame"
+    },
+    {
+      "fence": "app.mac",
+      "id": "ui.macIntegration.grantAll"
+    },
+    {
+      "fence": "app.mac",
+      "id": "store.appleEventsStatusCache"
+    },
+    {
+      "fence": "app.mac",
+      "id": "loop.activityCognitionSubscription"
+    },
+    {
+      "fence": "app.mac",
+      "id": "ui.activityCapture.modelAccess"
+    },
+    {
+      "fence": "app.mac",
+      "id": "ui.activityCapture.titleControls"
+    },
+    {
+      "fence": "app.mac",
+      "id": "ui.update.unavailableExplanationAlert"
+    },
+    {
+      "fence": "app.mac",
+      "id": "ui.mainWindow.restartToolbarButton"
+    },
+    {
+      "fence": "app.mac",
+      "id": "loop.wakeURLSessionReset"
+    },
+    {
+      "fence": "app.mac",
+      "id": "turn-ingredient.globalHotkeyVoiceTurn"
+    },
+    {
+      "fence": "app.mac",
+      "id": "public-api.NativeScreenCapture"
+    },
+    {
+      "fence": "app.mac",
+      "id": "route.iCloudInboxDidProcess"
+    },
+    {
+      "fence": "app.mac",
+      "id": "public-api.BrowserWindowController.readRetryLadder"
+    },
+    {
+      "fence": "app.mac",
+      "id": "public-api.BrowserWindowController.runJSInjection"
+    },
+    {
+      "fence": "app.mac",
+      "id": "ui.activityCapture.lastErrorLine"
+    },
+    {
+      "fence": "app.mac",
+      "id": "ui.macControl.advancedDisclosure"
+    },
+    {
+      "fence": "app.runtimes",
+      "id": "cognition.providerVitals.snapshot"
+    },
+    {
+      "fence": "app.runtimes",
+      "id": "cognition.physiology.soakEnableGate"
+    },
+    {
+      "fence": "app.runtimes",
+      "id": "cognition.organism.persistenceGeneration"
+    },
+    {
+      "fence": "app.runtimes",
+      "id": "cognition.organism.setEnabled"
+    },
+    {
+      "fence": "app.runtimes",
+      "id": "cognition.reflection.model"
+    },
+    {
+      "fence": "app.runtimes",
+      "id": "cognition.reflection.manual"
+    },
+    {
+      "fence": "app.runtimes",
+      "id": "cognition.reflection.scheduleEventDriven"
+    },
+    {
+      "fence": "app.runtimes",
+      "id": "cognition.research.export"
+    },
+    {
+      "fence": "app.runtimes",
+      "id": "tools.macIntegrationNotifyGate"
+    },
+    {
+      "fence": "app.runtimes",
+      "id": "appmodel.chat.stopStream"
+    },
+    {
+      "fence": "app.runtimes",
+      "id": "appmodel.chat.archiveClear"
+    },
+    {
+      "fence": "app.runtimes",
+      "id": "appmodel.settings.baseURLs"
+    },
+    {
+      "fence": "app.runtimes",
+      "id": "client.toolDispatch"
+    },
+    {
+      "fence": "app.runtimes",
+      "id": "client.nextGenStatusReads"
+    },
+    {
+      "fence": "app.runtimes",
+      "id": "client.trainingActions"
+    },
+    {
+      "fence": "app.runtimes",
+      "id": "client.telegramOps"
+    },
+    {
+      "fence": "app.runtimes",
+      "id": "client.knowledgeGraphView"
+    },
+    {
+      "fence": "app.runtimes",
+      "id": "client.improvementsCapabilityPacks"
+    },
+    {
+      "fence": "app.runtimes",
+      "id": "client.procedureExactActivation"
+    },
+    {
+      "fence": "app.runtimes",
+      "id": "voice.input.controller"
+    },
+    {
+      "fence": "app.runtimes",
+      "id": "voice.input.pushToTalk"
+    },
+    {
+      "fence": "app.runtimes",
+      "id": "voice.output.controller"
+    },
+    {
+      "fence": "app.runtimes",
+      "id": "voice.output.mode"
+    },
+    {
+      "fence": "app.runtimes",
+      "id": "client.chat.personaOverride"
+    },
+    {
+      "fence": "app.runtimes",
+      "id": "client.dispatchTool"
+    },
+    {
+      "fence": "app.runtimes",
+      "id": "client.clearChatMessages"
+    },
+    {
+      "fence": "app.runtimes",
+      "id": "contextflow.memoryPressureSource"
+    },
+    {
+      "fence": "app.runtimes",
+      "id": "voice.input.listen"
+    },
+    {
+      "fence": "app.runtimes",
+      "id": "voice.output.settings"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "bridge.claude.route.events"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "bridge.macctl.route.health"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "bridge.macctl.route.info"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "bridge.macctl.route.spotlightFrame"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "icloud.deviceTransport.selection"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "icloud.publishProviderCatalogStatus"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "icloud.publishMobileSnapshotStatus"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "icloud.sendKVSChatProgress"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "icloud.sendUnsignedResyncHint"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "icloud.checkIosOutbox"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "icloud.processedMessageIDs"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "macsync.inboxResponseKVSSweep"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "apns.config"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "slack.state"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "slack.receiptsAndErrors"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "slack.state.feed"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "slack.receipts.feed"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "slack.errors.feed"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "telegram.offsetCursor"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "telegram.configureTelegram"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "telegram.testAndClearControls"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "telegram.restartBridge"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "telegram.voiceTranscriber"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "telegram.speechPermissionCard"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "icloud.ckSeenIDs"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "icloud.observeIncomingMessages"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "icloud.handleIncomingFromTransport"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "icloud.observeStatusKey"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "icloud.deliveryNudges"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "icloud.sendCloudKitActionResponse"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "icloud.publishPairingSecret"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "pairing.regenerateControl"
+    },
+    {
+      "fence": "app.bridges",
+      "id": "macsync.chatSnapshotCoalescerGeneration"
+    },
+    {
+      "fence": "app.background",
+      "id": "app.background.loop.desk_notify"
+    },
+    {
+      "fence": "app.background",
+      "id": "app.background.retireSystemPermissionCardIfGranted"
+    },
+    {
+      "fence": "app.background",
+      "id": "app.background.scheduler.dreamReceiptBackfill"
+    },
+    {
+      "fence": "app.background",
+      "id": "app.background.scheduler.activityFeed"
+    },
+    {
+      "fence": "app.background",
+      "id": "app.background.update.settingsDetail"
+    },
+    {
+      "fence": "app.background",
+      "id": "app.background.lifecycle.loginItem"
+    },
+    {
+      "fence": "app.background",
+      "id": "app.background.memorySpotlightBootstrap"
+    },
+    {
+      "fence": "app.background",
+      "id": "app.background.launch.embeddingWarmupAndIndexSync"
+    },
+    {
+      "fence": "app.background",
+      "id": "app.background.triggerNotifierBinding"
+    },
+    {
+      "fence": "app.background",
+      "id": "app.background.manager.statusProjection"
+    },
+    {
+      "fence": "app.background",
+      "id": "app.background.heartbeat.checklistFile"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.chat.composer.textField"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.chat.composer.mic"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.chat.pendingPhotoStrip.remove"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.chat.runtime.providerPill"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.chat.runtime.surfaceSelectionGeneration"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.chat.runtime.reasoningPill"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.chat.runtime.fastToggle"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.chat.runtime.fileAccessPill"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.chat.runtime.refreshModels"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.chat.toolbar.speaker"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.chat.errorBanner"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.chat.voiceErrorBanner"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.chat.latestButton"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.chat.scrollToBottom.scheduler"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.chat.bubble.toolActivity"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.chat.bubble.attachmentPreview"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.chat.deepLinkSendHook"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.chat.adoptSurfaceModelPreferenceFromSync"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.chat.seedProviderIfNeeded"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.content.activityBadge"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.content.initialTabFromLaunchArgs"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.content.notificationPrune"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.content.toastBarInset"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.desk.sections"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.desk.addItem"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.desk.addNote"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.inbox.list"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.inbox.store.applySuccessfulLocalAction"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.inbox.localNotificationBurstCap"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.inbox.detailSheet.reviewGroups"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.activity.sections"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.activity.inlineApproval.decide"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.activity.inlineInbox.runAction"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.activity.inlineMemoryProposal.decide"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.activity.inlineSelfImprovement"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.activity.navigationDestinations"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.activity.skipInitialRefresh"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.approvals.mergeLocalFinalDecisions"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.approvals.card.approveDeny"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.approvals.payloadPreview"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.approvals.banners"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.approvals.newPendingNotification"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.memory.segmentPicker"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.memory.deleteSwipe"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.memory.proposalDecide"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.memory.proposalRow.evidenceSummary"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.autonomy.screen"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.autonomy.macOnlyNotice"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.workshop.screen"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.workshop.store.approveRejectStep"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.workshop.completionNotification"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.tools.catalog.search"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.tools.catalog.row.status"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.skills.row"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.providers.surfaceProviderPicker"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.providers.surfaceModelMenu"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.providers.rollbackOnFailure"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.providers.refreshButton"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.providers.detail.testConnection"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.providers.detail.capabilities"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.mactools.policyGate"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.mactools.runShortcut"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.mactools.sendNotification"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.mactools.lockScreen"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.mactools.sleepDisplay"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.mactools.setVolume"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.mactools.spotlight"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.mactools.remoteActionCards"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.mactools.approvalClassification"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.macintegration.freshness"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.kg.list"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.kg.search"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.kg.dualShapeDecoder"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.kg.detailSheet.neighbors"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.kg.emptyState"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.turninspector.truncationNotice"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.turninspector.rowMetrics"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.more.powerUserSection"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.more.aboutCard"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.status.connectionCards"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.status.macHealth"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.status.organismLiving"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.status.reflexReview"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.status.dreamProposals"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.runs.kindStyle"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.runs.detail.copy"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.settings.forceRefreshFromICloud"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.settings.pushReceipts"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.settings.aboutLinks"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.personality.detail"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.trustpolicy.detail"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.connectors.detail"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.pairing.manualKeyPaste"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.pairing.skip"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.chrome.macStatusChip"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.chrome.macSyncErrorBanner"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.chrome.appEmptyState"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.voice.input"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.voice.output"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.mactools.quickAction.unknownActionSilentSuccess"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.mactools.remoteActionCard.approvalClassification"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.mactools.remoteActionLedger"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.mactools.reviewApprovalButton"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.mactools.retryButton"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.mactools.policyGate.loadPolicy"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.mactools.shortcutRunner"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.mactools.spotlightResults"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.macintegration.externalChange"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.advanced.hostViews.freshStorePerPush"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.advanced.status.reflexApprove"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.advanced.status.reflexRetire"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.advanced.status.organismCounters"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.advanced.status.dreamProposals"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.advanced.runKindStyle"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.advanced.runDetail.copyPrompt"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.advanced.runDetail.modelFacts"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.settings.about.legalLinks"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.settings.macUptime"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.settings.trustPolicy.summary"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.settings.connectors.status"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.settings.personality.traits"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.pairing.manualSecretPaste"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.knowledgegraph.entityCountHeader"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.knowledgegraph.dualShapeDecoder"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.knowledgegraph.searchDebounce"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.knowledgegraph.entityDetail.neighbors"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.knowledgegraph.emptyState.deadInstruction"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.knowledgegraph.entityTypeMeta"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.turninspector.perTurnMetrics"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.turninspector.kindsMix"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.turninspector.emptyState"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.autonomy.promotionDecisionHasNoControl"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.actions.orphanedPrivilegedMacActions"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.skills.filter.quarantinedBucketMissing"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.skills.stateChip"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.skills.pairingGate"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.tools.catalog.autoRunBadge"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.shared.macStatusChip"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.shared.macSyncErrorBanner.mountCoverage"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.shared.toastCenter.dismissTasks"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.chat.errorBanner.dismiss"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.activity.overflowButtons"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.activity.cardRowCounts"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.memory.deleteConfirmation"
+    },
+    {
+      "fence": "ios.screens",
+      "id": "ios.memory.errorLine"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.pairing.applyKVSPairingMaterialIfNeeded"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.pairing.refreshFromKVS"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.bridge.setup"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.bridge.publishedStatus"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.bridge.drainDeviceTransport"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.bridge.observerRegistry"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.bridge.foregroundPairingRedrain"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.bridge.rejectedMessage.userMessage"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.sync.applyCloudKitSnapshotStatus"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.sync.remoteActions.macControl"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.sync.remoteActions.deskAndWorkshop"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.sync.remoteActions.providerControl"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.push.didReceiveRemoteNotification"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.push.bridgeNotificationScheduler"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.push.notificationDelegate"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.app.configureNotifications"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.app.foregroundRefresh"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.app.launchArgHooks"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.app.pairingSkipped"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.bridgeStatus"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.voice.input"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.voice.output"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.app.bridgeNotificationScheduler.schedule"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.app.didReceiveRemoteNotification"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.app.launchArgs"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.app.notificationDelegate"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.macBridgeClient.bridgeStatus"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.macBridgeClient.reconnectLoop"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.chatStore.unifiedSessionPurge"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.chatStore.streamingHint"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.macIntegrationPermissions.defaultTable"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.voiceOutput.enabled"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.voiceInput.authorization"
+    },
+    {
+      "fence": "ios.sync",
+      "id": "ios.app.refreshOnForeground"
+    },
+    {
+      "fence": "feeds",
+      "id": "feeds.desk.cadence_stats"
+    },
+    {
+      "fence": "feeds",
+      "id": "feeds.desk.nag_config"
+    },
+    {
+      "fence": "feeds",
+      "id": "feeds.context.hints"
+    },
+    {
+      "fence": "feeds",
+      "id": "feeds.memory.uncovered_38"
+    },
+    {
+      "fence": "feeds",
+      "id": "feeds.logs.maintenance_sweep"
+    },
+    {
+      "fence": "feeds",
+      "id": "feeds.logs.uncovered"
+    },
+    {
+      "fence": "feeds",
+      "id": "feeds.connectors.uncovered"
+    },
+    {
+      "fence": "feeds",
+      "id": "feeds.providers.openrouter_models_cache"
+    },
+    {
+      "fence": "feeds",
+      "id": "feeds.evals.uncovered_rest"
+    },
+    {
+      "fence": "feeds",
+      "id": "feeds.activity_watch.spans"
+    },
+    {
+      "fence": "feeds",
+      "id": "feeds.triggers.state"
+    },
+    {
+      "fence": "feeds",
+      "id": "feeds.work_journal"
+    },
+    {
+      "fence": "feeds",
+      "id": "feeds.from_claude"
+    },
+    {
+      "fence": "feeds",
+      "id": "feeds.from_codex"
+    },
+    {
+      "fence": "feeds",
+      "id": "feeds.harness"
+    },
+    {
+      "fence": "feeds",
+      "id": "feeds.evolution"
+    },
+    {
+      "fence": "feeds",
+      "id": "feeds.backups"
+    },
+    {
+      "fence": "feeds",
+      "id": "feeds.mcp"
+    },
+    {
+      "fence": "feeds",
+      "id": "feeds.macctl_bridge_and_browser_ipc"
+    },
+    {
+      "fence": "feeds",
+      "id": "feeds.disabled_shadow_tree"
+    },
+    {
+      "fence": "feeds",
+      "id": "feeds.workshop.notes_and_findings"
+    },
+    {
+      "fence": "feeds",
+      "id": "feeds.fossil.dormant_directories"
+    },
+    {
+      "fence": "feeds",
+      "id": "feeds.backups.events_pre_scrub"
+    },
+    {
+      "fence": "feeds",
+      "id": "feeds.context.legacy_generation_json"
+    },
+    {
+      "fence": "feeds",
+      "id": "feeds.turn_traces.busSubscriberDrops"
+    },
+    {
+      "fence": "turn.contract",
+      "id": "turn.ingredient.quietHoursWindow"
+    },
+    {
+      "fence": "turn.contract",
+      "id": "turn.contract.ContextStageTrace.emitStage"
+    },
+    {
+      "fence": "turn.contract",
+      "id": "setting.contextFlow.budgetExpansion"
+    },
+    {
+      "fence": "turn.contract",
+      "id": "turn.ingredient.toolCatalogRowCap"
+    },
+    {
+      "fence": "turn.contract",
+      "id": "route.trustedBridgeEnvelopeProjection"
+    },
+    {
+      "fence": "turn.contract",
+      "id": "turn.ingredient.suppressPursuitIntent"
+    },
+    {
+      "fence": "turn.contract",
+      "id": "turn.contract.surfaceSpellingFold"
+    },
+    {
+      "fence": "turn.contract",
+      "id": "telemetry.context.stage.memoryPromotion"
+    },
+    {
+      "fence": "scripts",
+      "id": "scripts.smoke_all.toolDispatchSteps"
+    },
+    {
+      "fence": "scripts",
+      "id": "scripts.check_timer_inventory.flag.printCandidates"
+    },
+    {
+      "fence": "scripts",
+      "id": "scripts.cognition_eval.organism"
+    },
+    {
+      "fence": "scripts",
+      "id": "scripts.cognition_eval.cognition"
+    },
+    {
+      "fence": "scripts",
+      "id": "scripts.cognition_eval.env"
+    },
+    {
+      "fence": "scripts",
+      "id": "scripts.organism_doctor"
+    },
+    {
+      "fence": "scripts",
+      "id": "scripts.organism_doctor.env"
+    },
+    {
+      "fence": "scripts",
+      "id": "scripts.organism_watch"
+    },
+    {
+      "fence": "scripts",
+      "id": "scripts.organism_bridge_probe"
+    },
+    {
+      "fence": "scripts",
+      "id": "scripts.u1_baseline"
+    },
+    {
+      "fence": "scripts",
+      "id": "scripts.opus5_baseline_report"
+    },
+    {
+      "fence": "scripts",
+      "id": "scripts.voice_tic_census"
+    },
+    {
+      "fence": "scripts",
+      "id": "scripts.release_github"
+    },
+    {
+      "fence": "scripts",
+      "id": "scripts.icons.render"
+    }
+  ]
+}

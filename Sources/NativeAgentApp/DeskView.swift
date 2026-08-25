@@ -32,6 +32,13 @@ enum DeskLaneState<Row: Sendable>: Sendable {
 
     static var maxReasonChars: Int { 240 }
 
+    /// Every failure notice on the Desk uses this cap. Keeping the truncation
+    /// at the state boundary makes an unreadable store visible without letting
+    /// an untrusted error string take over the board.
+    static func boundedReason(_ reason: String) -> String {
+        String(reason.prefix(maxReasonChars))
+    }
+
     var items: [Row] {
         if case .rows(let rows) = self { return rows }
         return []
@@ -44,7 +51,7 @@ enum DeskLaneState<Row: Sendable>: Sendable {
 
     /// A throwing read: the error text IS the reason, bounded.
     static func failed(_ error: any Error) -> DeskLaneState {
-        .unavailable(String("\(error)".prefix(maxReasonChars)))
+        .unavailable(boundedReason("\(error)"))
     }
 
     /// Silent-zero cross-check, for readers that CANNOT throw.
@@ -64,12 +71,129 @@ enum DeskLaneState<Row: Sendable>: Sendable {
             // construction in that case; saying "empty" here is the exact lie
             // this primitive exists to prevent.
             return .unavailable(
-                String("Couldn't read the \(noun) store — \(detail)".prefix(maxReasonChars)))
+                boundedReason("Couldn't read the \(noun) store — \(detail)"))
         case .records(let recordsOnDisk):
             if rows.isEmpty && recordsOnDisk > 0 {
                 return .unavailable("\(recordsOnDisk) \(noun) on disk, none could be read")
             }
             return .rows(rows)
+        }
+    }
+}
+
+/// The GitHub part of Desk's "Needs you" headline. A missing or unreadable
+/// command feed is not evidence that no GitHub decision needs User; preserve
+/// that distinction instead of folding the failed lane into a reassuring zero.
+enum DeskGitHubNeedsUserCount: Equatable, Sendable {
+    case measured(Int)
+    case unavailable(String)
+
+    init(githubLane: DeskLaneState<GitHubCommandItem>) {
+        if let reason = githubLane.unavailableReason {
+            self = .unavailable(reason)
+        } else {
+            self = .measured(githubLane.items.lazy.filter { $0.state == .needsUser }.count)
+        }
+    }
+
+    var value: Int? {
+        if case .measured(let count) = self { return count }
+        return nil
+    }
+
+    var unavailableReason: String? {
+        if case .unavailable(let reason) = self { return reason }
+        return nil
+    }
+}
+
+/// The "In progress" counter must describe the exact rows rendered on the
+/// execution bench. An unreadable execution lane is unknown, not an empty
+/// bench, so it deliberately has no numeric value for the counter to display.
+enum DeskExecutionInProgressCount: Equatable, Sendable {
+    case measured(Int)
+    case unavailable(String)
+
+    init(
+        executionsLane: DeskLaneState<WorkshopExecution.WorkshopExecutionRecord>,
+        renderedBenchCount: Int
+    ) {
+        if let reason = executionsLane.unavailableReason {
+            self = .unavailable(reason)
+        } else {
+            self = .measured(max(0, renderedBenchCount))
+        }
+    }
+
+    var value: Int? {
+        if case .measured(let count) = self { return count }
+        return nil
+    }
+
+    var unavailableReason: String? {
+        if case .unavailable(let reason) = self { return reason }
+        return nil
+    }
+}
+
+/// The GitHub command store owns callback evidence; Desk owns the honest
+/// wording of that evidence. A failed callback with no provider detail
+/// is still a failure, not a reason to render no second line at all.
+enum DeskGitHubCallbackFailurePresentation {
+    struct Detail: Equatable, Sendable {
+        let message: String
+        let noWorkObserved: Bool?
+    }
+
+    private static let failedStatuses: Set<String> = [
+        "failed", "failure", "error", "stalled", "timeout", "timed_out",
+        "canceled", "cancelled", "completed_without_reply",
+    ]
+    private static let successfulStatuses: Set<String> = ["completed", "ok", "success"]
+
+    static func detail(for item: GitHubCommandItem) -> Detail? {
+        let status = (item.lastCallbackStatus ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let error = nonEmpty(item.lastCallbackErrorMessage)
+        let noWorkObserved = item.lastCallbackNoWorkObserved
+
+        if failedStatuses.contains(status) {
+            return Detail(
+                message: error ?? fallbackMessage(for: status),
+                noWorkObserved: noWorkObserved
+            )
+        }
+
+        // A non-success status paired with an error/resend-safety field is
+        // conflicting callback evidence. Surface it rather than silently
+        // treating an unknown producer spelling as a healthy completion.
+        guard !successfulStatuses.contains(status), error != nil || noWorkObserved != nil else {
+            return nil
+        }
+        let statusText = status.isEmpty ? "no usable status" : "status \(status)"
+        return Detail(
+            message: error ?? "Codex callback returned \(statusText) without an error detail.",
+            noWorkObserved: noWorkObserved
+        )
+    }
+
+    private static func nonEmpty(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func fallbackMessage(for status: String) -> String {
+        switch status {
+        case "completed_without_reply":
+            return "Codex callback ended without a final result."
+        case "stalled":
+            return "Codex callback stalled without an error detail."
+        case "timeout", "timed_out":
+            return "Codex callback timed out without an error detail."
+        default:
+            return "Codex callback failed without an error detail."
         }
     }
 }
@@ -114,7 +238,7 @@ struct DeskAttentionLine: Identifiable, Equatable, Sendable {
 /// Builds and BOUNDS the "Waiting on you" strip.
 ///
 /// The strip is fed by four op-log-sourced collections (approval-blocked
-/// executions, needs-you GitHub items, blocked/flagged desk items, GitHub-blocked
+/// executions, needs-you GitHub items, Desk rows that need eyes, GitHub-blocked
 /// desk items). All four grow with the op log, and the enclosing `LazyVStack`
 /// only virtualizes its DIRECT children — a nested `VStack` builds every row
 /// eagerly on every render regardless of viewport. So the four sources flatten
@@ -228,7 +352,8 @@ enum DeskAttentionStrip {
             if out.count >= cap { return out }
             out.append(DeskAttentionLine(
                 id: "item:\(item.handle)",
-                icon: item.status == .blocked ? "stop.circle" : "flag",
+                icon: item.status == .blocked ? "stop.circle"
+                    : item.status == .flag ? "flag" : "clock.badge.exclamationmark",
                 text: item.status == .blocked
                     ? "\(item.title)\(item.blockedReason.map { " — \($0)" } ?? "")"
                     : "\(item.title)\(item.waitingOn.map { " — waiting on \($0)" } ?? "")",
@@ -362,6 +487,84 @@ private struct DeskViewSnapshot: Sendable {
     let aliasByHandle: [String: String]
 }
 
+/// One owner for GitHub command classification and the sections that render
+/// it. Keeping the two lists together prevents a newly-persisted state from
+/// being assigned to a bucket that Desk never shows.
+enum DeskGitHubBucket: String, CaseIterable, Sendable {
+    case actionNeeded = "Action needed"
+    case legacyWork = "Finishing prior work"
+    case needsUser = "Needs you"
+    case waiting = "Waiting upstream"
+    case attention = "Attention"
+    case resolved = "Recently resolved"
+
+    static let inlineBuckets: [Self] = [.actionNeeded, .legacyWork, .needsUser, .attention]
+    static let collapsedBucket: Self = .waiting
+    static let resolvedBucket: Self = .resolved
+    static let resolvedDisplayLimit = 5
+
+    /// This is intentionally derived from the actual three render branches:
+    /// inline sections, the collapsed waiting section, and recent resolution.
+    static let renderedBuckets: Set<Self> = Set(inlineBuckets + [collapsedBucket, resolvedBucket])
+
+    static func bucket(for state: GitHubCommandItemState) -> Self {
+        switch state {
+        case .detected, .needsCodex: return .actionNeeded
+        case .codexWorking, .verifying: return .legacyWork
+        case .needsUser: return .needsUser
+        case .waitingUpstream: return .waiting
+        case .attention: return .attention
+        case .resolved: return .resolved
+        }
+    }
+
+    static func displayedCount(matchingCount: Int, in bucket: Self) -> Int {
+        bucket == .resolved ? min(max(0, matchingCount), resolvedDisplayLimit) : max(0, matchingCount)
+    }
+}
+
+/// One presentation projection for a GitHub Watcher bucket. The portfolio pill
+/// and the rows beneath it consume this same slice, so a capped resolved
+/// history can never claim every historical row is on screen.
+struct DeskGitHubPortfolioStrip {
+    struct BucketPresentation: Equatable, Sendable {
+        let bucket: DeskGitHubBucket
+        let matchingCount: Int
+        let renderedItems: [GitHubCommandItem]
+
+        var renderedCount: Int { renderedItems.count }
+        var isCapped: Bool { renderedCount < matchingCount }
+
+        var label: String {
+            isCapped
+                ? "\(bucket.rawValue) \(renderedCount) shown of \(matchingCount)"
+                : "\(bucket.rawValue) \(renderedCount)"
+        }
+    }
+
+    static func presentation(
+        for bucket: DeskGitHubBucket,
+        items: [GitHubCommandItem]
+    ) -> BucketPresentation {
+        let matching = items.filter { DeskGitHubBucket.bucket(for: $0.state) == bucket }
+        let displayedCount = DeskGitHubBucket.displayedCount(
+            matchingCount: matching.count,
+            in: bucket
+        )
+        let renderedItems: [GitHubCommandItem]
+        if bucket == .resolved {
+            renderedItems = Array(matching.sorted { $0.updatedAt > $1.updatedAt }.prefix(displayedCount))
+        } else {
+            renderedItems = matching
+        }
+        return BucketPresentation(
+            bucket: bucket,
+            matchingCount: matching.count,
+            renderedItems: renderedItems
+        )
+    }
+}
+
 struct DeskView: View {
     @Environment(AppModel.self) private var appModel
     @Environment(\.scenePhase) private var scenePhase
@@ -407,20 +610,13 @@ struct DeskView: View {
     @State private var showingPalette = false
     @State private var showingNagsPanel = false
     @State private var nagConfig = DeskNagConfig()
-    @State private var actionInFlight = false
+    @State private var actionFlight = DeskActionFlight()
     @State private var actionNotice: DeskActionNotice?
     @FocusState private var benchFocused: Bool
     /// Triage-counter navigation (desk-triage-makeover W1): a tapped counter
     /// names its section anchor here; the ScrollViewReader in `body` performs
     /// the scroll — same one-rule pattern as `selectedHandle`.
     @State private var scrollTarget: String?
-
-    /// A one-line receipt for the last action — the tool's OWN confirmation
-    /// string (or its honest refusal), never a UI-invented "Done".
-    private struct DeskActionNotice: Equatable {
-        let text: String
-        let isError: Bool
-    }
 
     /// The mutation seam. Same dispatcher, same `impl_desk_*` functions, same
     /// ledger as the chat tools — see DeskQuickActions.swift.
@@ -436,13 +632,14 @@ struct DeskView: View {
         return items.first { $0.handle == selectedHandle }
     }
 
-    /// The palette's pool is EVERY live item, not `selectionOrder` — search
-    /// exists precisely to reach the rows that are collapsed out of sight, and
-    /// `select(_:)` opens whatever family the match lives in before scrolling.
-    /// Scoping the pool to what is already on screen would make ⌘K useless for
-    /// exactly the items it is most needed for.
+    /// The palette's pool is every live Desk item plus waiting GitHub watcher
+    /// row, not `selectionOrder` — search exists precisely to reach rows that
+    /// are collapsed out of sight, and `select(_:)` opens their family before
+    /// scrolling. Scoping it to what is already on screen would make ⌘K useless
+    /// for exactly the items it is most needed for.
     private var paletteRows: [DeskPaletteRow] {
         activeItems.map(DeskPaletteRow.init(item:))
+            + DeskGitHubWaitingRollup.paletteRows(in: githubItems)
     }
 
     // Lane unwrapping happens in ONE place: every slice below reads rows, and
@@ -450,6 +647,9 @@ struct DeskView: View {
     // renders its own unavailable notice — it never contributes silent emptiness.
     private var allExecutions: [WorkshopExecution.WorkshopExecutionRecord] { executionsLane.items }
     private var githubItems: [GitHubCommandItem] { githubLane.items }
+    private var githubNeedsUserCount: DeskGitHubNeedsUserCount {
+        DeskGitHubNeedsUserCount(githubLane: githubLane)
+    }
     private var laneUnavailable: Bool {
         executionsLane.unavailableReason != nil || githubLane.unavailableReason != nil
     }
@@ -469,7 +669,9 @@ struct DeskView: View {
     private var activeItems: [DeskItem] { DeskBoardLayout.activeItems(items) }
     private var doneItems: [DeskItem] { items.filter { $0.status.isTerminal } }
 
-    private var pursuitItems: [DeskItem] { DeskBoardLayout.pursuits(activeItems) }
+    private var pursuitRows: [DeskPursuitSectionPresentation.Row] {
+        DeskPursuitSectionPresentation.rows(from: activeItems)
+    }
 
     private var watchItems: [DeskItem] { DeskBoardLayout.watches(activeItems) }
     private var boardItems: [DeskItem] { DeskBoardLayout.board(activeItems) }
@@ -478,10 +680,13 @@ struct DeskView: View {
         DeskBoardLayout.ghByProject(boardItems)
     }
 
-    // Blocked/flagged PURSUITS belong in the attention strip too (review
-    // finding: filtering boardItems alone hid a blocked pursuit's reason).
+    // The collapsed GitHub project roll-up and this strip deliberately share
+    // `needsEyes`: a row with an explicit waiting owner must not inflate the
+    // roll-up while vanishing from the attention section on the same screen.
+    // Pursuits are included as well, rather than being hidden by board-only
+    // filtering.
     private var attentionItems: [DeskItem] {
-        activeItems.filter { $0.status == .blocked || $0.status == .flag }
+        activeItems.filter(DeskItemPresentation.needsEyes)
     }
 
     private var githubBlockedAttentionItems: [DeskItem] {
@@ -504,23 +709,32 @@ struct DeskView: View {
             showingAll: showAllAttention)
     }
 
-    private static let terminalExecutionStatuses: Set<String> = ["completed", "failed", "cancelled"]
-
-    /// Bench = queued/running PLUS any unknown non-terminal status, so a
-    /// corrupt or future status stays visible instead of vanishing.
-    private var benchExecutions: [WorkshopExecution.WorkshopExecutionRecord] {
-        allExecutions.filter {
-            $0.status != "blocked_on_approval" && !Self.terminalExecutionStatuses.contains($0.status)
-        }
+    private var executionSlice: DeskExecutionPresentation.Slice {
+        DeskExecutionPresentation.slice(allExecutions)
     }
+
+    private var benchExecutions: [WorkshopExecution.WorkshopExecutionRecord] {
+        let ids = Set(executionSlice.benchIDs)
+        return allExecutions.filter { ids.contains($0.id) }
+    }
+
+    /// Keep the headline tied to the exact collection the bench section
+    /// renders; it cannot silently use a separate status/count calculation.
+    private var inProgressExecutionCount: DeskExecutionInProgressCount {
+        DeskExecutionInProgressCount(
+            executionsLane: executionsLane,
+            renderedBenchCount: benchExecutions.count)
+    }
+
     private var approvalExecutions: [WorkshopExecution.WorkshopExecutionRecord] {
-        allExecutions.filter { $0.status == "blocked_on_approval" }
+        let ids = Set(executionSlice.approvalIDs)
+        return allExecutions.filter { ids.contains($0.id) }
     }
     private var recentDoneExecutions: [WorkshopExecution.WorkshopExecutionRecord] {
-        Array(allExecutions
-            .filter { Self.terminalExecutionStatuses.contains($0.status) }
-            .sorted { $0.updatedAt > $1.updatedAt }
-            .prefix(5))
+        let byID = allExecutions.reduce(into: [String: WorkshopExecution.WorkshopExecutionRecord]()) {
+            $0[$1.id] = $1
+        }
+        return executionSlice.recentDoneIDs.compactMap { byID[$0] }
     }
 
     var body: some View {
@@ -551,7 +765,7 @@ struct DeskView: View {
                     .keyboardShortcut("k", modifiers: .command)
             }
             ToolbarItem(placement: .primaryAction) {
-                Button { Task { await load() } } label: { Image(systemName: "arrow.clockwise") }
+                Button { Task { await refreshFromToolbar() } } label: { Image(systemName: "arrow.clockwise") }
                     .help("Refresh the desk")
             }
         }
@@ -566,9 +780,13 @@ struct DeskView: View {
         .task {
             let reloader = DeskLiveReloader.shared
             reloader.setSceneActive(scenePhase == .active)
-            reloader.activate(
+            if let setupError = reloader.activate(
                 paths: [store.opsPath, GitHubCommandStore(dataRoot: dataRoot).opsPath]
             ) { await load() }
+            {
+                loadError = setupError
+                hasLoadedOnce = true
+            }
         }
         .onDisappear { DeskLiveReloader.shared.deactivate() }
         .onChange(of: scenePhase) { _, phase in
@@ -584,9 +802,10 @@ struct DeskView: View {
                 headerRow
 
                 if let loadError {
-                    Label(loadError, systemImage: "exclamationmark.triangle")
+                    Label(DeskItemPresentation.boundedLoadFailure(loadError), systemImage: "exclamationmark.triangle")
                         .font(.callout)
                         .foregroundStyle(.orange)
+                        .lineLimit(3)
                         .padding(10)
                         .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
                 }
@@ -597,14 +816,19 @@ struct DeskView: View {
                 // first load() round-trips, nothing has reported yet, so the
                 // same clause forbids the claim there too: an 82-item board
                 // must not open on "The desk is clear" for two seconds.
-                if items.isEmpty && allExecutions.isEmpty && githubItems.isEmpty
-                    && loadError == nil && !laneUnavailable {
-                    if hasLoadedOnce {
-                        emptyState
-                    } else {
-                        loadingState
-                    }
-                } else {
+                switch DeskHonestyPresentation.boardBody(
+                    itemCount: items.count,
+                    executionCount: allExecutions.count,
+                    githubItemCount: githubItems.count,
+                    loadError: loadError,
+                    hasLoadedOnce: hasLoadedOnce,
+                    hasUnavailableLane: laneUnavailable
+                ) {
+                case .loading:
+                    loadingState
+                case .clear:
+                    emptyState
+                case .populated:
                     countersStrip
                     attentionSection
                     githubCommandSection
@@ -668,6 +892,18 @@ struct DeskView: View {
             // the caret: `c` would then fire on something User can't see.
             selectedHandle = DeskSelection.reconcile(selectedHandle, order: selectionOrder)
         }
+        .onChange(of: githubItems) { _, latest in
+            // A watcher row can advance while its palette result is open or
+            // selected. Once it is no longer waiting, its scroll anchor no
+            // longer renders, so drop that reveal-only selection promptly.
+            guard let selectedHandle,
+                  DeskGitHubWaitingRollup.isPaletteHandle(selectedHandle),
+                  DeskGitHubWaitingRollup.revealKeys(
+                    forPaletteHandle: selectedHandle, in: latest
+                  ).isEmpty
+            else { return }
+            self.selectedHandle = nil
+        }
         // NOTE: the live-reloader activation stays on `body` (with its paired
         // onDisappear/scenePhase handlers). Attaching a second `.task` here
         // would activate the reloader TWICE per appearance — one watcher per
@@ -723,6 +959,23 @@ struct DeskView: View {
     /// in first, so `scrollTo` has something to scroll to — a selection that
     /// can't be seen is worse than no selection.
     private func select(_ handle: String) {
+        // GitHub waiting rows are watch-only palette targets. They share the
+        // actual expansion vocabulary with this rollup, but deliberately do
+        // not become a selected DeskItem or gain close/defer/note actions.
+        let githubRevealKeys = DeskGitHubWaitingRollup.revealKeys(
+            forPaletteHandle: handle, in: githubItems)
+        if !githubRevealKeys.isEmpty {
+            withAnimation(.easeInOut(duration: 0.15)) {
+                for key in githubRevealKeys { expandedRoots.insert(key) }
+            }
+            showingNoteField = false
+            showingDeferOptions = false
+            noteDraft = ""
+            // The GitHub row carries the matching scroll anchor. It has no
+            // DeskItem backing it, so the mutation inspector remains absent.
+            selectedHandle = handle
+            return
+        }
         // Terminal rows are NOT selectable — close/defer/note on something
         // already closed is meaningless, and `finishedSection` shares
         // `groupView` with the board. Glance mode for history stays glance-only.
@@ -779,7 +1032,7 @@ struct DeskView: View {
                     Text(item.alias)
                         .font(.caption2.monospaced()).foregroundStyle(.tertiary)
                     Spacer(minLength: 8)
-                    if actionInFlight {
+                    if actionFlight.isInFlight {
                         ProgressView().controlSize(.small)
                     }
                     Button { closeSelected() } label: { Label("Close", systemImage: "checkmark.circle") }
@@ -791,7 +1044,7 @@ struct DeskView: View {
                     Button { clearInteraction() } label: { Image(systemName: "xmark") }
                         .help("Clear the selection (esc)")
                 }
-                .disabled(actionInFlight)
+                .disabled(actionFlight.isInFlight)
                 if showingDeferOptions { deferOptionsRow(item) }
                 if showingNoteField { noteFieldRow(item) }
                 // Refs are an affordance, not glance chrome: they appear on the
@@ -868,10 +1121,11 @@ struct DeskView: View {
     @ViewBuilder
     private var actionNoticeRow: some View {
         if let notice = actionNotice {
+            let presentation = DeskActionPresentation.notice(isError: notice.isError)
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Image(systemName: notice.isError ? "exclamationmark.triangle" : "checkmark.circle")
+                Image(systemName: presentation.symbol)
                     .font(.caption)
-                    .foregroundStyle(notice.isError ? Color.orange : Color.green)
+                    .foregroundStyle(presentation.tone == .warning ? Color.orange : Color.green)
                 // The TOOL's own words — a confirmation or an honest refusal.
                 // The desk never invents a success line the ledger can't back.
                 Text(notice.text).font(.caption).lineLimit(3)
@@ -922,14 +1176,29 @@ struct DeskView: View {
     }
 
     private func applyPaletteCommand(_ verb: DeskPaletteQuery.Verb, handle: String) {
-        select(handle)
-        switch verb {
-        case .close:
-            perform(.close(handle: handle, outcome: DeskQuickAction.deskCloseOutcome))
-        case .deferItem:
+        guard !actionFlight.isInFlight else {
+            actionNotice = DeskActionNotice(
+                text: DeskPaletteCommandApplication.actionInFlightMessage,
+                isError: true
+            )
+            return
+        }
+        switch DeskPaletteCommandApplication.resolve(
+            verb: verb,
+            handle: handle,
+            activeItems: activeItems
+        ) {
+        case let .dispatch(action):
+            select(handle.trimmingCharacters(in: .whitespacesAndNewlines))
+            perform(action)
+        case let .beginDefer(resolvedHandle):
+            select(resolvedHandle)
             showingDeferOptions = true
-        case .note:
+        case let .beginNote(resolvedHandle):
+            select(resolvedHandle)
             beginNote()
+        case let .refused(message):
+            actionNotice = DeskActionNotice(text: message, isError: true)
         }
     }
 
@@ -942,8 +1211,7 @@ struct DeskView: View {
     /// with what the store actually says — including on failure, so a refused
     /// write cannot leave a lie on screen.
     private func perform(_ action: DeskQuickAction) {
-        guard !actionInFlight else { return }
-        actionInFlight = true
+        guard !actionFlight.isInFlight else { return }
         actionNotice = nil
         showingNoteField = false
         showingDeferOptions = false
@@ -956,19 +1224,18 @@ struct DeskView: View {
         applyOptimistically(action)
         let router = actionRouter
         Task { @MainActor in
-            let outcome = await DeskActionRunner.perform(action, via: router)
+            guard let outcome = await actionFlight.perform(action, via: router) else { return }
             actionNotice = DeskActionNotice(text: outcome.message, isError: !outcome.ok)
-            actionInFlight = false
             let itemsBeforeLoad = items
             await load()
-            if !outcome.ok, items == itemsBeforeLoad || loadError != nil {
-                // The action FAILED and the reload did not replace our echo
-                // with store truth — put the pre-action rows back. (When the
-                // action succeeded but the reload failed, the echo stands: it
-                // matches what the tool reported, and reverting would show
-                // the OPPOSITE lie — an open row the ledger already closed.)
-                items = preActionItems
-            }
+            let reloadedItems = items
+            items = DeskOptimisticItemPatch.reconciled(
+                preAction: preActionItems,
+                optimistic: itemsBeforeLoad,
+                reloaded: reloadedItems,
+                loadFailed: loadError != nil,
+                outcome: outcome,
+                action: action)
             await refreshNagConfig()
             selectedHandle = DeskSelection.reconcile(selectedHandle, order: selectionOrder)
             // The note field held key focus; hand it back to the bench or the
@@ -983,25 +1250,7 @@ struct DeskView: View {
     /// to `load()` — guessing at a derived value is how an optimistic update
     /// starts disagreeing with the store.
     private func applyOptimistically(_ action: DeskQuickAction) {
-        switch action {
-        case let .close(handle, _):
-            guard let idx = items.firstIndex(where: { $0.handle == handle }) else { return }
-            items[idx].status = .done
-            items[idx].closedAt = DeskClock.nowISO()
-            items[idx].updatedAt = DeskClock.nowISO()
-        case let .defer_(handle, until):
-            guard let idx = items.firstIndex(where: { $0.handle == handle }) else { return }
-            items[idx].deferUntil = until
-            items[idx].updatedAt = DeskClock.nowISO()
-        case let .note(handle, text):
-            guard let idx = items.firstIndex(where: { $0.handle == handle }) else { return }
-            items[idx].notes.append(DeskNote(ts: DeskClock.nowISO(), text: text))
-            items[idx].updatedAt = DeskClock.nowISO()
-        case .nagGlobal, .nagProject, .nagItem, .nagMute, .nagUnmute:
-            // Nag state is not desk-item state; the panel re-reads the config
-            // after the write instead of guessing at a window bump.
-            break
-        }
+        items = DeskOptimisticItemPatch.applying(action, to: items)
     }
 
     private func refreshNagConfig() async {
@@ -1030,11 +1279,12 @@ struct DeskView: View {
     // its section. Counts come from the SAME slices the sections render from —
     // a counter may never disagree with the list below it.
 
-    private var needsYouCount: Int {
-        approvalExecutions.count + attentionItems.count + needsUserGitHubItems.count
+    private var needsYouCount: Int? {
+        guard let githubCount = githubNeedsUserCount.value else { return nil }
+        return approvalExecutions.count + attentionItems.count + githubCount
     }
 
-    private static let staleThresholdDays = 7
+    private static let staleThresholdDays = DeskItemPresentation.staleThresholdDays
 
     /// Days since the item was last touched (DeskItem carries one updatedAt;
     /// the motor timestamp is a GitHubCommandItem field, not this type's).
@@ -1059,9 +1309,11 @@ struct DeskView: View {
     private var countersStrip: some View {
         HStack(spacing: 10) {
             triageCounter("Needs you", count: needsYouCount, tint: .red,
-                          symbol: "hand.raised", target: "sec-attention")
-            triageCounter("In progress", count: benchExecutions.count, tint: .blue,
-                          symbol: "hammer", target: "sec-bench")
+                          symbol: "hand.raised", target: "sec-attention",
+                          unavailableReason: githubNeedsUserCount.unavailableReason)
+            triageCounter("In progress", count: inProgressExecutionCount.value, tint: .blue,
+                          symbol: "hammer", target: "sec-bench",
+                          unavailableReason: inProgressExecutionCount.unavailableReason)
             triageCounter("Watching", count: watchItems.count, tint: nil,
                           symbol: "binoculars", target: "sec-watch")
             triageCounter("Stale \(Self.staleThresholdDays)d+", count: staleWatchItems.count,
@@ -1069,9 +1321,10 @@ struct DeskView: View {
         }
     }
 
-    private func triageCounter(_ label: String, count: Int, tint: Color?,
-                               symbol: String, target: String) -> some View {
-        let active = count > 0
+    private func triageCounter(_ label: String, count: Int?, tint: Color?,
+                               symbol: String, target: String,
+                               unavailableReason: String? = nil) -> some View {
+        let active = (count ?? 0) > 0
         let accent = active ? (tint ?? .primary) : Color.secondary
         return VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 5) {
@@ -1079,10 +1332,13 @@ struct DeskView: View {
                 Text(label).font(.caption)
             }
             .foregroundStyle(active && tint != nil ? AnyShapeStyle(accent) : AnyShapeStyle(.secondary))
-            Text("\(count)")
+            Text(count.map(String.init) ?? "—")
                 .font(.title3.weight(.semibold))
                 .foregroundStyle(active ? AnyShapeStyle(.primary) : AnyShapeStyle(.tertiary))
                 .contentTransition(.numericText())
+                .accessibilityLabel(unavailableReason.map {
+                    "\(label) count unavailable: \($0)"
+                } ?? "\(label) \(count ?? 0)")
         }
         .padding(.vertical, 8).padding(.horizontal, 12)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1116,13 +1372,12 @@ struct DeskView: View {
                 selectedTitle: selectedItem?.title,
                 perform: { perform($0) },
                 config: nagConfig,
-                isBusy: actionInFlight)
+                isBusy: actionFlight.isInFlight)
         }
     }
 
     private var nagBellSymbol: String {
-        if nagConfig.isMuted(now: Date()) { return "bell.slash" }
-        return nagConfig.enabled ? "bell.fill" : "bell"
+        DeskItemPresentation.nagBellSymbol(config: nagConfig, now: Date())
     }
 
     private func sectionHeader(_ title: String, count: Int? = nil, systemImage: String) -> some View {
@@ -1184,9 +1439,9 @@ struct DeskView: View {
 
     // MARK: section 1 — waiting on you (only when something actually is)
     //
-    // A compact attention strip, not duplicate rows: blocked/flagged items keep
-    // their full row (and family context) on the board below — this strip only
-    // points at them, plus any execution parked on an approval.
+    // A compact attention strip, not duplicate rows: every row that needs eyes
+    // keeps its full row (and family context) on the board below — this strip
+    // only points at it, plus any execution parked on an approval.
 
     @ViewBuilder
     private var attentionSection: some View {
@@ -1254,34 +1509,12 @@ struct DeskView: View {
     // Organized by who has the next move; healthy/waiting PRs collapse.
     // Absent entirely when nothing is tracked — an empty lane is noise.
 
-    private enum GHBucket: String, CaseIterable {
-        // Display bucket only — persisted state is GitHubCommandItem.state;
-        case actionNeeded = "Action needed"
-        // Historical rows only. The watcher never creates new work.
-        case legacyWork = "Finishing prior work"
-        case needsUser = "Needs you"
-        case waiting = "Waiting upstream"
-        case attention = "Attention"
-        case resolved = "Recently resolved"
+    private func bucket(_ item: GitHubCommandItem) -> DeskGitHubBucket {
+        DeskGitHubBucket.bucket(for: item.state)
     }
 
-    private func bucket(_ item: GitHubCommandItem) -> GHBucket {
-        switch item.state {
-        case .detected, .needsCodex: return .actionNeeded
-        case .codexWorking, .verifying: return .legacyWork
-        case .needsUser: return .needsUser
-        case .waitingUpstream: return .waiting
-        case .attention: return .attention
-        case .resolved: return .resolved
-        }
-    }
-
-    private func ghBucketItems(_ bucket: GHBucket) -> [GitHubCommandItem] {
-        let matching = githubItems.filter { self.bucket($0) == bucket }
-        if bucket == .resolved {
-            return Array(matching.sorted { $0.updatedAt > $1.updatedAt }.prefix(5))
-        }
-        return matching
+    private func ghBucketItems(_ bucket: DeskGitHubBucket) -> [GitHubCommandItem] {
+        DeskGitHubPortfolioStrip.presentation(for: bucket, items: githubItems).renderedItems
     }
 
     private var needsUserGitHubItems: [GitHubCommandItem] { ghBucketItems(.needsUser) }
@@ -1292,17 +1525,16 @@ struct DeskView: View {
         // checking on what she's got with human eyes") — a monitoring surface
         // that hides itself when quiet reads as missing, not as quiet.
         sectionHeader("GitHub Watcher", systemImage: "eye")
-        if let reason = githubLane.unavailableReason {
-            laneUnavailableNotice(
-                title: "GitHub Watcher state unavailable",
-                detail: reason)
-        } else if githubItems.isEmpty {
-            Text("The watcher is quiet. Tracked GitHub changes appear here and notify you when attention is needed; nothing starts automatically.")
+        switch DeskHonestyPresentation.githubLane(githubLane) {
+        case .unavailable(let notice):
+            laneUnavailableNotice(title: notice.title, detail: notice.detail)
+        case .quiet(let copy):
+            Text(copy)
                 .font(.callout).foregroundStyle(.tertiary)
                 .padding(.leading, 4)
-        } else {
+        case .rows:
             ghPortfolioStrip
-            ForEach([GHBucket.actionNeeded, .legacyWork, .needsUser, .attention], id: \.rawValue) { bucket in
+            ForEach(DeskGitHubBucket.inlineBuckets, id: \.rawValue) { bucket in
                 let rows = ghBucketItems(bucket)
                 if !rows.isEmpty {
                     ghSubheader(bucket.rawValue, count: rows.count,
@@ -1311,9 +1543,9 @@ struct DeskView: View {
                 }
             }
             ghWaitingCollapsed
-            let resolved = ghBucketItems(.resolved)
+            let resolved = ghBucketItems(DeskGitHubBucket.resolvedBucket)
             if !resolved.isEmpty {
-                ghSubheader(GHBucket.resolved.rawValue, count: resolved.count, tinted: false)
+                ghSubheader(DeskGitHubBucket.resolvedBucket.rawValue, count: resolved.count, tinted: false)
                 ForEach(resolved, id: \.itemId) { ghItemRow($0) }
             }
         }
@@ -1321,10 +1553,10 @@ struct DeskView: View {
 
     private var ghPortfolioStrip: some View {
         HStack(spacing: 10) {
-            ForEach(GHBucket.allCases, id: \.rawValue) { bucket in
-                let count = githubItems.filter { self.bucket($0) == bucket }.count
-                if count > 0 {
-                    Text("\(bucket.rawValue) \(count)")
+            ForEach(DeskGitHubBucket.allCases, id: \.rawValue) { bucket in
+                let presentation = DeskGitHubPortfolioStrip.presentation(for: bucket, items: githubItems)
+                if presentation.renderedCount > 0 {
+                    Text(presentation.label)
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(bucket == .attention ? Color.red
                                          : bucket == .needsUser ? .orange : .secondary)
@@ -1346,9 +1578,9 @@ struct DeskView: View {
     // Waiting upstream: grouped by kind, collapsed by default (contract).
     @ViewBuilder
     private var ghWaitingCollapsed: some View {
-        let waiting = ghBucketItems(.waiting)
+        let waiting = ghBucketItems(DeskGitHubBucket.collapsedBucket)
         if !waiting.isEmpty {
-            let toggleKey = "ghwait"
+            let toggleKey = DeskGitHubWaitingRollup.toggleKey
             let expanded = expandedRoots.contains(toggleKey)
             HStack(spacing: 8) {
                 Text("Waiting upstream")
@@ -1359,7 +1591,7 @@ struct DeskView: View {
                         return false
                     }.count
                     if n > 0 {
-                        Text("\(kind.rawValue.replacingOccurrences(of: "_", with: " ")) \(n)")
+                        Text("\(DeskGitHubStatePillPresentation.waitingLabel(for: kind)) \(n)")
                             .font(.caption2).foregroundStyle(.tertiary)
                             .padding(.horizontal, 6).padding(.vertical, 1)
                             .background(Color.primary.opacity(0.06), in: Capsule())
@@ -1409,17 +1641,14 @@ struct DeskView: View {
                 }
             }
             .padding(.leading, 2)
-            // Failure detail from the codex completion callback (task #45).
-            // Only failed-ish callbacks carry it; a healthy row stays two lines.
-            if ["failed", "stalled"].contains(item.lastCallbackStatus ?? ""),
-               item.lastCallbackErrorMessage != nil || item.lastCallbackNoWorkObserved != nil {
+            // Callback evidence is explicit: an absent provider error does
+            // not erase a failed/no-final-result callback from the Desk row.
+            if let callbackFailure = DeskGitHubCallbackFailurePresentation.detail(for: item) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    if let error = item.lastCallbackErrorMessage, !error.isEmpty {
-                        Text(error)
-                            .font(.caption).foregroundStyle(.red)
-                            .lineLimit(2).truncationMode(.tail)
-                    }
-                    if let noWork = item.lastCallbackNoWorkObserved {
+                    Text(callbackFailure.message)
+                        .font(.caption).foregroundStyle(.red)
+                        .lineLimit(2).truncationMode(.tail)
+                    if let noWork = callbackFailure.noWorkObserved {
                         Text(noWork ? "no work ran — resend safe" : "partial work possible")
                             .font(.caption2)
                             .foregroundStyle(noWork ? Color.secondary : Color.orange)
@@ -1430,31 +1659,24 @@ struct DeskView: View {
         }
         .padding(.vertical, 8).padding(.horizontal, 10)
         .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+        .id(DeskGitHubWaitingRollup.paletteHandle(for: item))
     }
 
     private func ghStatePill(_ item: GitHubCommandItem) -> some View {
-        let (label, color): (String, Color) = {
-            switch item.state {
-            case .detected, .needsCodex: return ("action needed", .orange)
-            case .codexWorking: return ("codex working", .blue)
-            case .verifying: return ("verifying", .teal)
-            case .needsUser: return ("needs you", .orange)
-            case .waitingUpstream(let kind):
-                return ("waiting · \(kind.rawValue.replacingOccurrences(of: "_", with: " "))", .gray)
-            case .attention(let reason):
-                switch reason {
-                case .codexFailed:
-                    return (item.lastCallbackStatus == "stalled" ? "codex stalled" : "codex no result", .red)
-                case .verificationFailed: return ("GitHub still actionable", .red)
-                case .callbackOverdue: return ("codex stalled", .red)
-                case .codexBusy: return ("legacy codex retry", .red)
-                default: return (reason.rawValue.replacingOccurrences(of: "_", with: " "), .red)
-                }
-            case .resolved: return ("resolved", .green)
-            }
-        }()
-        return Text(label)
-            .capsuleTag(color)
+        let pill = DeskGitHubStatePillPresentation.pill(for: item)
+        return Text(pill.label)
+            .capsuleTag(ghStatePillColor(pill.tone))
+    }
+
+    private func ghStatePillColor(_ tone: DeskGitHubStatePillPresentation.Tone) -> Color {
+        switch tone {
+        case .warning: return .orange
+        case .working: return .blue
+        case .checking: return .teal
+        case .neutral: return .gray
+        case .failure: return .red
+        case .success: return .green
+        }
     }
 
     // MARK: section 2 — in progress (directed execution engine)
@@ -1464,17 +1686,17 @@ struct DeskView: View {
         sectionHeader("In progress", count: benchExecutions.isEmpty ? nil : benchExecutions.count,
                       systemImage: "hammer")
             .id("sec-bench")
-        if let reason = executionsLane.unavailableReason {
-            // "Quiet right now" would be a lie here: the lane didn't say quiet,
-            // it failed to answer.
-            laneUnavailableNotice(
-                title: "Execution lane unavailable",
-                detail: reason)
-        } else if benchExecutions.isEmpty {
-            Text("Quiet right now — nothing running.")
+        switch DeskHonestyPresentation.executionLane(
+            executionsLane,
+            hasRenderedBenchRows: !benchExecutions.isEmpty
+        ) {
+        case .unavailable(let notice):
+            laneUnavailableNotice(title: notice.title, detail: notice.detail)
+        case .quiet(let copy):
+            Text(copy)
                 .font(.callout).foregroundStyle(.tertiary)
                 .padding(.leading, 4)
-        } else {
+        case .rows:
             ForEach(benchExecutions, id: \.id) { executionRow($0) }
         }
     }
@@ -1496,16 +1718,19 @@ struct DeskView: View {
                     .lineLimit(2).truncationMode(.tail)
                     .padding(.leading, 2)
             }
-            if exec.status == "running", !exec.plan.isEmpty {
-                let done = exec.stepsCompleted.count
-                Text("step \(min(done + 1, exec.plan.count)) of \(exec.plan.count)")
+            if let progress = DeskExecutionPresentation.progress(
+                status: exec.status,
+                planCount: exec.plan.count,
+                completedCount: exec.stepsCompleted.count
+            ) {
+                Text(progress)
                     .font(.caption2.weight(.medium)).foregroundStyle(.tertiary)
                     .padding(.leading, 2)
             }
             if let verification = exec.verification,
                exec.status == "completed" || verification.status == .failed {
                 Label(
-                    verificationLabel(verification),
+                    DeskExecutionPresentation.verificationLabel(verification),
                     systemImage: verification.status == .satisfied
                         ? "checkmark.seal.fill"
                         : verification.status == .failed
@@ -1525,35 +1750,16 @@ struct DeskView: View {
         .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
     }
 
-    private func verificationLabel(_ verification: WorkshopVerificationRecord) -> String {
-        switch verification.status {
-        case .satisfied:
-            let methods = verification.methods.map {
-                switch $0 {
-                case "exact_output": return "exact output"
-                case "file_bytes": return "file bytes"
-                default: return $0.replacingOccurrences(of: "_", with: " ")
-                }
-            }.joined(separator: " + ")
-            return methods.isEmpty ? "verified" : "verified: \(methods)"
-        case .failed:
-            return "verification failed"
-        case .unverified:
-            return "completed; outcome not independently verified"
-        }
-    }
-
     private func executionPill(_ status: String) -> some View {
-        let (label, color): (String, Color) = switch status {
-        case "running": ("running", .blue)
-        case "queued": ("queued", .gray)
-        case "blocked_on_approval": ("needs approval", .orange)
-        case "completed": ("done", .green)
-        case "failed": ("failed", .red)
-        case "cancelled": ("cancelled", .gray)
-        default: (status, .gray)
+        let pill = DeskExecutionPresentation.pill(for: status)
+        let color: Color = switch pill.tone {
+        case .info: .blue
+        case .warning: .orange
+        case .success: .green
+        case .danger: .red
+        case .neutral: .gray
         }
-        return Text(label)
+        return Text(pill.label)
             .capsuleTag(color)
     }
 
@@ -1561,40 +1767,43 @@ struct DeskView: View {
 
     @ViewBuilder
     private var pursuitsSection: some View {
-        sectionHeader("Agent pursuits", count: pursuitItems.isEmpty ? nil : pursuitItems.count,
+        sectionHeader("Agent pursuits", count: DeskPursuitSectionPresentation.headerCount(for: pursuitRows),
                       systemImage: "sparkles")
-        if pursuitItems.isEmpty {
+        if pursuitRows.isEmpty {
             Text("None yet. A pursuit opens only when the evidence holds — something has to earn the agent's attention more than once.")
                 .font(.callout).foregroundStyle(.tertiary)
                 .padding(.leading, 4)
         } else {
-            ForEach(pursuitItems, id: \.handle) { pursuitCard($0) }
+            ForEach(pursuitRows) { pursuitCard($0) }
         }
     }
 
     @ViewBuilder
-    private func pursuitCard(_ item: DeskItem) -> some View {
-        if let pursuit = item.pursuit {
+    private func pursuitCard(_ row: DeskPursuitSectionPresentation.Row) -> some View {
+        let item = row.item
+        switch row.cardState {
+        case let .rendered(presentation):
+            if let pursuit = item.pursuit {
             VStack(alignment: .leading, spacing: 5) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     statusPill(item.status)
-                    Text(pursuit.privateName ?? item.title)
+                    Text(presentation.title)
                         .font(.body.weight(.semibold))
                         .lineLimit(2)
                     Spacer(minLength: 4)
-                    Text("\(pursuit.reservations.count)/\(pursuit.maxSessions) sessions")
+                    Text(presentation.sessionLabel)
                         .font(.caption2.weight(.medium)).foregroundStyle(.tertiary)
                 }
                 Text("\u{201C}\(pursuit.why)\u{201D}")
                     .font(.callout.italic())
                     .foregroundStyle(.secondary)
                     .lineLimit(3).truncationMode(.tail)
-                if item.status == .blocked, let reason = item.blockedReason, !reason.isEmpty {
-                    Label(reason, systemImage: "stop.circle")
+                if item.status == .blocked, let hold = presentation.holdLabel {
+                    Label(hold, systemImage: "stop.circle")
                         .font(.caption).foregroundStyle(.red)
                         .lineLimit(2)
-                } else if let waiting = item.waitingOn, !waiting.isEmpty {
-                    Label("waiting on \(waiting)", systemImage: "hourglass")
+                } else if let hold = presentation.holdLabel {
+                    Label(hold, systemImage: "hourglass")
                         .font(.caption).foregroundStyle(.orange)
                         .lineLimit(1)
                 }
@@ -1604,7 +1813,7 @@ struct DeskView: View {
                 sequencingPills(item)
                 HStack(spacing: 12) {
                     Label {
-                        Text(pursuit.doneLooksLike).lineLimit(1).truncationMode(.tail)
+                        Text(presentation.doneLabel).lineLimit(1).truncationMode(.tail)
                     } icon: {
                         Image(systemName: "checkmark.circle")
                     }
@@ -1628,7 +1837,37 @@ struct DeskView: View {
             .naInteractive(radius: 10)
             .onTapGesture { toggleSelection(item.handle) }
             .id(item.handle)
+            } else {
+                pursuitPayloadUnreadableCard(item)
+            }
+        case .payloadUnreadable:
+            pursuitPayloadUnreadableCard(item)
+        case .notPursuit:
+            EmptyView()
         }
+    }
+
+    private func pursuitPayloadUnreadableCard(_ item: DeskItem) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Label(DeskPursuitSectionPresentation.unreadablePayloadLabel, systemImage: "exclamationmark.triangle")
+                .font(.body.weight(.semibold))
+                .foregroundStyle(.orange)
+            Text(item.title)
+                .font(.callout)
+                .lineLimit(2)
+            Text(DeskPursuitSectionPresentation.unreadablePayloadDetail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(3)
+        }
+        .padding(.vertical, 10).padding(.horizontal, 12)
+        .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color.orange.opacity(0.4), lineWidth: 1)
+        )
+        .accessibilityIdentifier("desk.pursuit.payload-unreadable.\(item.handle)")
+        .id(item.handle)
     }
 
     // MARK: section 4 — waiting & watches (ambient, quieter than active work)
@@ -1667,10 +1906,7 @@ struct DeskView: View {
         let expanded = expandedRoots.contains(toggleKey)
         // A collapsed summary must not hide status-critical facts (review
         // finding): count the children that need eyes and say so on the line.
-        let needsEyes = group.items.filter {
-            $0.status == .blocked || $0.status == .flag
-                || ($0.waitingOn?.isEmpty == false)
-        }.count
+        let needsEyes = DeskItemPresentation.githubProjectNeedsEyes(group.items)
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Image(systemName: "arrow.triangle.pull")
                 .font(.caption).foregroundStyle(.secondary)
@@ -1719,12 +1955,15 @@ struct DeskView: View {
     @ViewBuilder
     private var finishedSection: some View {
         if !doneItems.isEmpty || !recentDoneExecutions.isEmpty {
+            let allGroups = groups(doneItems.sorted { $0.updatedAt > $1.updatedAt })
             sectionHeader("Recently finished",
-                          count: doneItems.count + recentDoneExecutions.count,
+                          count: DeskFinishedPresentation.sectionCount(
+                              groupCount: allGroups.count,
+                              recentExecutionCount: recentDoneExecutions.count),
                           systemImage: "checkmark.seal")
             ForEach(recentDoneExecutions, id: \.id) { executionRow($0) }
-            let allGroups = groups(doneItems.sorted { $0.updatedAt > $1.updatedAt })
-            let visible = showAllFinished ? allGroups : Array(allGroups.prefix(Self.finishedGroupCap))
+            let visible = DeskItemPresentation.visiblePrefix(
+                allGroups, showingAll: showAllFinished, cap: Self.finishedGroupCap)
             ForEach(visible, id: \.key) { groupView($0, section: "done") }
             if allGroups.count > Self.finishedGroupCap {
                 Button {
@@ -1930,81 +2169,64 @@ struct DeskView: View {
 
     @ViewBuilder
     private func sequencingPills(_ item: DeskItem) -> some View {
-        if let itemPlan = plan.byHandle[item.handle],
-           itemPlan.totalCount > 0
-            || !itemPlan.effectiveBlockers.isEmpty
-            || itemPlan.blockedByCycle
-            || itemPlan.isDeferred
-            || plan.nextUp.contains(item.handle) {
-            HStack(spacing: 6) {
-                // Campaign rollup — the parent row IS the progress bar.
-                if itemPlan.totalCount > 0 {
-                    Text("\(itemPlan.doneCount)/\(itemPlan.totalCount) closed")
-                        .capsuleTag(itemPlan.doneCount == itemPlan.totalCount ? .green : .gray)
-                }
-                if let blocked = blockedPillText(itemPlan) {
-                    // W5: the pill NAVIGATES. "waiting on 2.1" was a fact User
-                    // then had to go find by eye; clicking it now selects the
-                    // blocker, opening whatever family it's buried in and
-                    // scrolling to it. First blocker only — the pill already
-                    // collapses a fan-in to "+N", and a multi-target click
-                    // would have to pick one anyway.
-                    Button {
-                        if let first = itemPlan.effectiveBlockers.first { select(first) }
-                    } label: {
-                        Label(blocked, systemImage: "arrow.turn.down.right")
-                            .labelStyle(.titleAndIcon)
-                            .lineLimit(1).truncationMode(.tail)
-                            .capsuleTag(.orange)
+        if let itemPlan = plan.byHandle[item.handle] {
+            let pills = DeskSequencingPillPresentation.pills(
+                item: item,
+                itemPlan: itemPlan,
+                isNextUp: plan.nextUp.contains(item.handle),
+                aliases: aliasByHandle,
+                blockerAliasCap: Self.blockerAliasCap
+            )
+            if !pills.isEmpty {
+                HStack(spacing: 6) {
+                    ForEach(pills) { pill in
+                        switch pill.kind {
+                        case .rollup:
+                            Text(pill.text)
+                                .capsuleTag(itemPlan.doneCount == itemPlan.totalCount ? .green : .gray)
+                                .accessibilityIdentifier("desk.sequencing-pill.rollup")
+                        case .blocked:
+                            if let targetHandle = pill.targetHandle {
+                                Button { select(targetHandle) } label: {
+                                    Label(pill.text, systemImage: "arrow.turn.down.right")
+                                        .labelStyle(.titleAndIcon)
+                                        .lineLimit(1).truncationMode(.tail)
+                                        .capsuleTag(.orange)
+                                }
+                                .buttonStyle(.naFeel)
+                                .help("Go to the item this is waiting on")
+                                .accessibilityIdentifier("desk.sequencing-pill.blocked")
+                            }
+                        case .cycle:
+                            Text(pill.text)
+                                .lineLimit(1).truncationMode(.tail)
+                                .capsuleTag(.red)
+                                .accessibilityIdentifier("desk.sequencing-pill.cycle")
+                        case .deferred:
+                            Label(pill.text, systemImage: "pause.circle")
+                                .labelStyle(.titleAndIcon)
+                                .lineLimit(1)
+                                .capsuleTag(.gray)
+                                .accessibilityIdentifier("desk.sequencing-pill.deferred")
+                        case .nextUp:
+                            Label(pill.text, systemImage: "arrow.right.circle.fill")
+                                .labelStyle(.titleAndIcon)
+                                .lineLimit(1)
+                                .capsuleTag(.teal)
+                                .accessibilityIdentifier("desk.sequencing-pill.next-up")
+                        }
                     }
-                    .buttonStyle(.naFeel)
-                    .help("Go to the item this is waiting on")
+                    Spacer(minLength: 0)
                 }
-                // Rare, and worse than an ordinary block: nothing here can ever
-                // clear itself, so it must never be quiet.
-                if itemPlan.blockedByCycle {
-                    Text("\u{26A0} these block each other")
-                        .lineLimit(1).truncationMode(.tail)
-                        .capsuleTag(.red)
-                }
-                // Taste pass: a bare "until 2026-08-14" doesn't say WHY the date
-                // matters — the pause icon carries "parked" so the pill reads
-                // right on the first glance without spending row width on prose.
-                if itemPlan.isDeferred, let raw = item.deferUntil,
-                   let day = DeskSequencing.deferDisplayDay(raw) {
-                    Label("until \(day)", systemImage: "pause.circle")
-                        .labelStyle(.titleAndIcon)
-                        .lineLimit(1)
-                        .capsuleTag(.gray)
-                }
-                // A MARKER, not a re-sort: User's ordering is his. The affordance
-                // points at the rows that are actually startable right now.
-                if plan.nextUp.contains(item.handle) {
-                    Label("start here", systemImage: "arrow.right.circle.fill")
-                        .labelStyle(.titleAndIcon)
-                        .lineLimit(1)
-                        .capsuleTag(.teal)
-                }
-                Spacer(minLength: 0)
+                .padding(.leading, 2)
             }
-            .padding(.leading, 2)
         }
-    }
-
-    /// "waiting on 2.1, 2.3" — ALIASES, never handles. nil when every blocker
-    /// handle is unresolvable (a dangling edge is not a fact worth asserting).
-    private func blockedPillText(_ itemPlan: DeskSequencing.ItemPlan) -> String? {
-        let aliases = itemPlan.effectiveBlockers.compactMap { aliasByHandle[$0] }
-        guard !aliases.isEmpty else { return nil }
-        let shown = aliases.prefix(Self.blockerAliasCap).joined(separator: ", ")
-        let overflow = aliases.count - min(aliases.count, Self.blockerAliasCap)
-        return "waiting on \(shown)" + (overflow > 0 ? " +\(overflow)" : "")
     }
 
     // MARK: status pill
 
     private func statusPill(_ status: DeskStatus) -> some View {
-        Text(status.rawValue)
+        Text(DeskItemPresentation.statusLabel(status))
             .capsuleTag(statusColor(status))
     }
 
@@ -2028,22 +2250,21 @@ struct DeskView: View {
     /// the status pill's job.
     @ViewBuilder
     private func freshnessText(_ item: DeskItem) -> some View {
-        let age = ageDays(item) ?? 0
-        if age >= Self.staleThresholdDays,
-           item.status != .blocked, item.status != .flag, !item.status.isTerminal {
-            Text("\(age)d stale")
+        let freshness = DeskItemPresentation.freshness(for: item, now: Date())
+        if freshness.isStale {
+            Text(freshness.text)
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(.orange)
                 .padding(.horizontal, 5).padding(.vertical, 1)
                 .background(Color.orange.opacity(0.12), in: Capsule())
         } else {
-            Text(relativeTime(item.updatedAt))
+            Text(freshness.text)
                 .font(.caption2).foregroundStyle(.tertiary)
         }
     }
 
     private func relativeTime(_ iso: String) -> String {
-        guard let date = Self.parseISO(iso) else { return "" }
+        guard let date = Self.parseISO(iso) else { return "unknown" }
         let seconds = max(0, Date().timeIntervalSince(date))
         switch seconds {
         case ..<90: return "just now"
@@ -2062,7 +2283,7 @@ struct DeskView: View {
 
     // MARK: load
 
-    @MainActor private func load() async {
+    @MainActor private func load() async -> Bool {
         let root = dataRoot
         // M12: taken BEFORE the await, checked after. A load that lost the race
         // publishes nothing at all — not its items, not its lanes, not its
@@ -2076,7 +2297,7 @@ struct DeskView: View {
                 deskError = nil
             } catch {
                 deskState = nil
-                deskError = "Couldn't load the bench: \(error.localizedDescription)"
+                deskError = DeskItemPresentation.loadFailure(error)
             }
             // Execution and GitHub reads stay independent: one broken lane never
             // blanks the other live Workshop projections. But "lenient" used to
@@ -2106,7 +2327,7 @@ struct DeskView: View {
                 aliasByHandle: aliases
             )
         }.value
-        guard !Task.isCancelled, loadGate.accepts(token) else { return }
+        guard !Task.isCancelled, loadGate.accepts(token) else { return false }
         if let state = snapshot.deskState {
             items = state.items
             // Plan and alias map are replaced ATOMICALLY with the items they
@@ -2124,6 +2345,12 @@ struct DeskView: View {
         // failed still "reported" (the error banner owns the surface), and the
         // empty-state gate already excludes loadError/lane-unavailable.
         hasLoadedOnce = true
+        return true
+    }
+
+    @MainActor private func refreshFromToolbar() async {
+        let accepted = await load()
+        actionNotice = DeskRefreshPresentation.receipt(accepted: accepted)
     }
 
     /// Ground truth for the silent-zero cross-check: what does the execution

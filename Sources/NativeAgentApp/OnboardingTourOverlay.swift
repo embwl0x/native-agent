@@ -3,7 +3,7 @@ import SwiftUI
 
 // MARK: - Tour Step Model
 
-private struct TourStep: Identifiable {
+struct OnboardingTourStep: Identifiable, Sendable {
     let id: Int
     let item: SidebarItem
     let title: String
@@ -11,57 +11,57 @@ private struct TourStep: Identifiable {
     let buttonLabel: String
 }
 
-private let tourSteps: [TourStep] = [
-    TourStep(
+let onboardingTourSteps: [OnboardingTourStep] = [
+    OnboardingTourStep(
         id: 0,
         item: .chat,
         title: "Chat",
         body: "The main conversation surface. Chat, attach files, and use provider/model controls. Drag sessions from the left session list into the chat area to pin them as tabs.",
         buttonLabel: "Continue"
     ),
-    TourStep(
+    OnboardingTourStep(
         id: 1,
         item: .activity,
         title: "Activity",
         body: "The action inbox. Approvals, proactive cards, memory proposals, and self-improvement items that need review collect here.",
         buttonLabel: "Continue"
     ),
-    TourStep(
+    OnboardingTourStep(
         id: 2,
         item: .memories,
         title: "Memories",
         body: "The long-term memory view. Inspect, correct, delete, and verify what the agent thinks it knows.",
         buttonLabel: "Continue"
     ),
-    TourStep(
+    OnboardingTourStep(
         id: 3,
         item: .skills,
         title: "Skills & Tools",
         body: "One place for learned playbooks and executable tools. Use the switch at the top to move between their separate pages; both stay lazy-loaded until needed.",
         buttonLabel: "Continue"
     ),
-    TourStep(
+    OnboardingTourStep(
         id: 4,
         item: .desk,
         title: "Desk",
         body: "The agent's durable work system. Large projects, dependencies, bridge work, scheduled tasks, research, and verified results stay lined up here.",
         buttonLabel: "Continue"
     ),
-    TourStep(
+    OnboardingTourStep(
         id: 5,
         item: .providers,
         title: "Providers",
         body: "Model and provider setup lives here. Connect accounts, choose active providers, and run provider self-tests.",
         buttonLabel: "Continue"
     ),
-    TourStep(
+    OnboardingTourStep(
         id: 6,
         item: .settings,
         title: "Settings",
         body: "Device pairing, Telegram, appearance, memory backend setup, data limits, and replaying this tour live here.",
         buttonLabel: "Continue"
     ),
-    TourStep(
+    OnboardingTourStep(
         id: 7,
         item: .activity,
         title: "Self-Improvement",
@@ -70,16 +70,91 @@ private let tourSteps: [TourStep] = [
     ),
 ]
 
+// MARK: - Tour interaction state
+
+/// The view-free tour state machine. It owns only in-overlay progress and the
+/// exact effect each visible control requests; ContentView remains the owner
+/// of persisted overlay visibility.
+enum OnboardingTourAction: Equatable, Sendable {
+    case advance
+    case retreat
+    case select(stepID: Int)
+    case skip
+}
+
+enum OnboardingTourEffect: Equatable, Sendable {
+    case none
+    case route(SidebarItem)
+    case complete
+}
+
+struct OnboardingTourState: Equatable, Sendable {
+    private(set) var stepIndex = 0
+    private(set) var didComplete = false
+
+    var step: OnboardingTourStep { onboardingTourSteps[stepIndex] }
+    var isLast: Bool { stepIndex == onboardingTourSteps.count - 1 }
+    var route: SidebarItem { step.item }
+
+    /// Applies one visible control action. Completion is idempotent so a
+    /// duplicate Skip/Return event cannot ask ContentView to persist a second
+    /// presentation transition.
+    mutating func apply(_ action: OnboardingTourAction) -> OnboardingTourEffect {
+        guard !didComplete else { return .none }
+        switch action {
+        case .advance:
+            guard !isLast else {
+                didComplete = true
+                return .complete
+            }
+            stepIndex += 1
+            return .route(route)
+        case .retreat:
+            guard stepIndex > 0 else { return .none }
+            stepIndex -= 1
+            return .route(route)
+        case let .select(stepID):
+            guard let index = onboardingTourSteps.firstIndex(where: { $0.id == stepID }) else {
+                return .none
+            }
+            stepIndex = index
+            return .route(route)
+        case .skip:
+            didComplete = true
+            return .complete
+        }
+    }
+}
+
+/// All user-visible tour chrome derived from the same state that routes the
+/// sidebar. Keeping this projection pure prevents the label, disabled Back
+/// state, and action target from drifting into separate SwiftUI branches.
+struct OnboardingTourPresentation: Equatable, Sendable {
+    let progressText: String
+    let title: String
+    let sidebarItem: SidebarItem
+    let advanceLabel: String
+    let backEnabled: Bool
+
+    init(state: OnboardingTourState) {
+        progressText = "Step \(state.stepIndex + 1) of \(onboardingTourSteps.count)"
+        title = state.step.title
+        sidebarItem = state.step.item
+        advanceLabel = state.step.buttonLabel
+        backEnabled = state.stepIndex > 0
+    }
+}
+
 // MARK: - Tour Overlay
 
 struct OnboardingTourOverlay: View {
     let onComplete: () -> Void
     let onSelectTab: (SidebarItem) -> Void
 
-    @State private var stepIndex = 0
+    @State private var tour = OnboardingTourState()
 
-    private var step: TourStep { tourSteps[stepIndex] }
-    private var isLast: Bool { stepIndex == tourSteps.count - 1 }
+    private var step: OnboardingTourStep { tour.step }
+    private var presentation: OnboardingTourPresentation { .init(state: tour) }
 
     var body: some View {
         ZStack {
@@ -93,7 +168,7 @@ struct OnboardingTourOverlay: View {
 
                 VStack(spacing: NativeAgentSpacing.xl) {
                     HStack {
-                        Text("Step \(stepIndex + 1) of \(tourSteps.count)")
+                        Text(presentation.progressText)
                             .font(NativeAgentFont.label)
                             .foregroundStyle(.white.opacity(0.62))
                         Spacer()
@@ -127,11 +202,12 @@ struct OnboardingTourOverlay: View {
 
                     HStack(spacing: NativeAgentSpacing.md) {
                         Button("Skip") {
-                            onComplete()
+                            completeTour()
                         }
                         .buttonStyle(.plain)
                         .foregroundStyle(.white.opacity(0.55))
                         .font(.system(.callout, design: .rounded))
+                        .accessibilityIdentifier("onboarding-tour.skip")
 
                         Spacer()
 
@@ -139,14 +215,16 @@ struct OnboardingTourOverlay: View {
                             retreat()
                         }
                         .buttonStyle(.bordered)
-                        .disabled(stepIndex == 0)
+                        .disabled(!presentation.backEnabled)
+                        .accessibilityIdentifier("onboarding-tour.back")
 
-                        Button(step.buttonLabel) {
+                        Button(presentation.advanceLabel) {
                             advance()
                         }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.large)
                         .tint(.blue)
+                        .accessibilityIdentifier("onboarding-tour.advance")
                     }
                     .frame(maxWidth: 420)
                 }
@@ -164,12 +242,13 @@ struct OnboardingTourOverlay: View {
             }
             .padding(NativeAgentSpacing.xl)
             .transition(.opacity.combined(with: .scale(scale: 0.96)))
-            .id(stepIndex) // force transition on step change
-            .animation(.easeInOut(duration: 0.25), value: stepIndex)
+            .id(tour.stepIndex) // force transition on step change
+            .animation(.easeInOut(duration: 0.25), value: tour.stepIndex)
         }
-        .onAppear(perform: selectCurrentTab)
+        .onAppear { onSelectTab(tour.route) }
         // S.4: mark overlay as accessibility modal so VoiceOver focuses only overlay content
         .accessibilityAddTraits(.isModal)
+        .accessibilityIdentifier("onboarding-tour.overlay")
     }
 
     private var tabRail: some View {
@@ -179,13 +258,10 @@ struct OnboardingTourOverlay: View {
                 .foregroundStyle(.white.opacity(0.62))
                 .padding(.horizontal, 10)
 
-            ForEach(tourSteps) { tabStep in
+            ForEach(onboardingTourSteps) { tabStep in
                 let isSelected = tabStep.id == step.id
                 Button {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        stepIndex = tabStep.id
-                    }
-                    onSelectTab(tabStep.item)
+                    apply(.select(stepID: tabStep.id))
                 } label: {
                     HStack(spacing: 10) {
                         Image(systemName: tabStep.item.systemImage)
@@ -209,6 +285,7 @@ struct OnboardingTourOverlay: View {
                     }
                 }
                 .buttonStyle(.plain)
+                .accessibilityIdentifier("onboarding-tour.step.\(tabStep.id)")
             }
         }
         .padding(12)
@@ -224,25 +301,25 @@ struct OnboardingTourOverlay: View {
     }
 
     private func advance() {
-        if isLast {
-            onComplete()
-        } else {
-            withAnimation(.easeInOut(duration: 0.25)) {
-                stepIndex += 1
-            }
-            selectCurrentTab()
-        }
+        apply(.advance)
     }
 
     private func retreat() {
-        guard stepIndex > 0 else { return }
-        withAnimation(.easeInOut(duration: 0.25)) {
-            stepIndex -= 1
-        }
-        selectCurrentTab()
+        apply(.retreat)
     }
 
-    private func selectCurrentTab() {
-        onSelectTab(tourSteps[stepIndex].item)
+    private func completeTour() {
+        apply(.skip)
+    }
+
+    private func apply(_ action: OnboardingTourAction) {
+        switch tour.apply(action) {
+        case .none:
+            break
+        case let .route(item):
+            onSelectTab(item)
+        case .complete:
+            onComplete()
+        }
     }
 }

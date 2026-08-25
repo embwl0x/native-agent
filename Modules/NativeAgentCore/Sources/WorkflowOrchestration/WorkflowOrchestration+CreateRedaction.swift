@@ -401,6 +401,7 @@ public typealias WorkflowRedaction = NativeAgentSecretRedactor
 public enum WorkflowOrchestrationError: Error, Equatable, LocalizedError {
     case unknownRunState(String)
     case workflowNotRunnable(id: String, reasons: [String])
+    case runControlIneligible(action: String, status: String, reason: String)
     /// Mirrors Python `int("abc")` / `int("1.2")` raising ValueError (and a
     /// truthy list/dict raising TypeError) inside create_workflow's per-step
     /// `int(timeoutSeconds or timeout_seconds or 0)`. The Python route would
@@ -415,6 +416,8 @@ public enum WorkflowOrchestrationError: Error, Equatable, LocalizedError {
             return "unknown workflow run state: \(runId)"
         case .workflowNotRunnable(let id, let reasons):
             return "workflow '\(id)' is not runnable: \(reasons.joined(separator: "; "))"
+        case .runControlIneligible(let action, let status, let reason):
+            return "workflow \(action) is unavailable for run status '\(status)': \(reason)"
         case .invalidTimeout(let value):
             return "invalid workflow timeout: \(value)"
         case .tooManySteps(let count, let maximum):

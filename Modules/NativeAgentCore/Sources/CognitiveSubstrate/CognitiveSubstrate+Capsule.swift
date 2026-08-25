@@ -161,6 +161,10 @@ extension CognitiveSubstrate {
             if !capsule.dynamicContext.contains("- Sound:") {
                 nextPresentationState.negativeSoundEchoRun = expectedPresentationState.negativeSoundEchoRun
             }
+            if !capsule.dynamicContext.contains("- Settling:"),
+               nextPresentationState.settlingRun > expectedPresentationState.settlingRun {
+                nextPresentationState.settlingRun = expectedPresentationState.settlingRun
+            }
             commit = CognitiveCapsulePresentationCommit(
                 fixedAt: read.fixedAt,
                 expected: expectedPresentationState,
@@ -254,6 +258,26 @@ extension CognitiveSubstrate {
         }
         if let bodyLine = organismBodyLine(from: request.organismProjection) {
             tailLines.append(bodyLine)
+        }
+        // SETTLING (2026-08-23, range bench scenario #2): the slow layer is still
+        // below water after a hard stretch and THIS message is kind. The substrate
+        // already carried "on edge" through the repair turns; the words still
+        // snapped ("We're good… 💜" on the first apology). One line, only while
+        // mood is negative and the incoming message warms — it clears itself as
+        // mood recovers, so it can never become a standing instruction.
+        if let settling = settlingLine(
+            mood: frozenRead?.mood ?? derivedMood(at: now),
+            incoming: conversationalAppraisal(in: request.userMessage),
+            affectEnabled: frozenRead?.configuration.affectEnabled
+        ) {
+            // Cadence cap: at most `settlingMaxRun` consecutive presentations;
+            // then silent until the condition lapses (the run resets below).
+            if presentationState.settlingRun < Self.settlingMaxRun {
+                tailLines.append(settling)
+                presentationState.settlingRun += 1
+            }
+        } else {
+            presentationState.settlingRun = 0
         }
         // Wave G: the self-exemplar echo goes LAST so budget truncation drops it
         // before it can displace focus/feeling/inner — it's an enhancer, not core.
@@ -1542,6 +1566,7 @@ extension CognitiveSubstrate {
         lastLiveCapsuleAt = next.lastLiveCapsuleAt
         lastSessionBridgeAt = next.lastSessionBridgeAt
         negativeSoundEchoRun = next.negativeSoundEchoRun
+        settlingRun = next.settlingRun
         return true
     }
 
@@ -1574,6 +1599,20 @@ extension CognitiveSubstrate {
             return (kept.joined(separator: "\n"), true)
         }
         return (kept.joined(separator: "\n"), false)
+    }
+
+    /// "- Settling:" — rendered only while the slow layer (mood valence, node-based)
+    /// is still negative AND the incoming message is kind (repair, praise,
+    /// affection, play). Recovery after a hard stretch is gradual: she takes the
+    /// kindness, but warmth comes back a step at a time, not all at once. Pure.
+    static let settlingMoodThreshold = -0.05
+    static let settlingMaxRun = 2
+    func settlingLine(mood: CognitiveMoodReading, incoming: AffectAppraisal, affectEnabled: Bool?) -> String? {
+        guard configuration.enabled, affectEnabled ?? configuration.affectEnabled else { return nil }
+        guard mood.basis > 0, mood.valence < Self.settlingMoodThreshold else { return nil }
+        guard incoming.valence > 0, incoming.warmth > 0 || incoming.affection else { return nil }
+        return "- Settling: still settling from a hard stretch; the kindness lands, "
+            + "but not all the way back yet — warmth returns a step at a time, not in one move."
     }
 
     func capsuleLineText(_ text: String, maxCharacters: Int) -> String {

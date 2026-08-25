@@ -1,6 +1,64 @@
 import Foundation
+import PersistenceCore
 import SwiftUI
 import UniformTypeIdentifiers
+
+/// The mounted sidebar-row unpin route. It translates the canonical
+/// mirror-first store outcome into the explicit UI outcomes the row can show.
+/// In particular, a failed retention write leaves the pin visible rather than
+/// optimistically claiming the glyph was removed.
+@MainActor
+enum ChatSidebarRowUnpinTransaction {
+    enum Outcome: Equatable {
+        case unpinned(encoded: String)
+        case refusedInvalidSessionID
+        case refusedAlreadyUnpinned
+        case failed
+    }
+
+    static func execute(
+        sessionID: String,
+        defaults: UserDefaults = .standard,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) -> Outcome {
+        do {
+            switch try MacPinnedChatSessionStore.closePinnedTab(
+                sessionID: sessionID,
+                defaults: defaults,
+                dataRoot: dataRoot
+            ) {
+            case .closed(let encoded):
+                return .unpinned(encoded: encoded)
+            case .refusedInvalidSessionID:
+                return .refusedInvalidSessionID
+            case .refusedAlreadyUnpinned:
+                return .refusedAlreadyUnpinned
+            }
+        } catch {
+            return .failed
+        }
+    }
+}
+
+/// A pin snapshot is only valid when it can be reconstructed from the same
+/// UserDefaults value the next launch will read. This deliberately gates the
+/// fire-and-forget iCloud request: publishing an older or half-applied list is
+/// worse than retaining the last proven phone snapshot.
+@MainActor
+enum ChatPinnedSnapshotPublication {
+    @discardableResult
+    static func request(
+        encodedPinnedIDs: String,
+        defaults: UserDefaults = .standard,
+        publish: ([String]) -> Void
+    ) -> Bool {
+        let requested = MacPinnedChatSessionStore.decode(encodedPinnedIDs)
+        let persisted = MacPinnedChatSessionStore.load(defaults: defaults)
+        guard requested == persisted else { return false }
+        publish(persisted)
+        return true
+    }
+}
 
 extension ChatView {
     func decodedPinnedSessionIds() -> [String] {
@@ -14,7 +72,15 @@ extension ChatView {
             showToast("Pinned tabs could not be updated")
             return
         }
-        MacSyncEngine.shared.requestChatSnapshotPublication(includeTranscripts: false)
+        guard ChatPinnedSnapshotPublication.request(
+            encodedPinnedIDs: pinnedChatSessionIdsRaw,
+            publish: { _ in
+                MacSyncEngine.shared.requestChatSnapshotPublication(includeTranscripts: false)
+            }
+        ) else {
+            showToast("Pinned tabs were saved, but their phone snapshot could not be verified")
+            return
+        }
     }
 
     func prunePinnedSessions() {
@@ -42,8 +108,27 @@ extension ChatView {
     }
 
     func unpinSession(_ sessionId: String) {
-        guard decodedPinnedSessionIds().contains(sessionId) else { return }
-        savePinnedSessionIds(decodedPinnedSessionIds().filter { $0 != sessionId })
+        switch ChatSidebarRowUnpinTransaction.execute(sessionID: sessionId) {
+        case .unpinned(let encoded):
+            pinnedChatSessionIdsRaw = encoded
+            guard ChatPinnedSnapshotPublication.request(
+                encodedPinnedIDs: encoded,
+                publish: { _ in
+                    MacSyncEngine.shared.requestChatSnapshotPublication(includeTranscripts: false)
+                }
+            ) else {
+                showToast("Pinned tab closed locally, but its phone snapshot could not be verified")
+                return
+            }
+        case .refusedInvalidSessionID:
+            showToast("This tab cannot be unpinned")
+        case .refusedAlreadyUnpinned:
+            showToast("This tab was already unpinned")
+        case .failed:
+            // The store writes retention before this @AppStorage value. Do not
+            // remove the tab optimistically or it would return after reload.
+            showToast("Pinned tab could not be closed; it remains pinned")
+        }
     }
 
     // 2026-07-24 (desktop-icons fix): `chatSessionDragProvider` deleted — the

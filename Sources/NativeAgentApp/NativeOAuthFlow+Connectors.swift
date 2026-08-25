@@ -17,7 +17,10 @@ extension NativeOAuthFlow {
     /// Drive a full PKCE OAuth2 flow for one of the supported connectors.
     /// Returns when tokens have been persisted (or an error has been surfaced).
     @MainActor
-    static func startConnectorOAuthFlow(connectorId: String) async -> OAuthFlowResult {
+    static func startConnectorOAuthFlow(
+        connectorId: String,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) async -> OAuthFlowResult {
         let cfg: ConnectorOAuthConfig
         switch connectorId {
         case "x":        cfg = .x
@@ -28,7 +31,10 @@ extension NativeOAuthFlow {
                 error: "Unknown OAuth connector id: \(connectorId)")
         }
 
-        guard let credentials = connectorOAuthAppCredentials(connectorId: connectorId) else {
+        guard let credentials = connectorOAuthAppCredentials(
+            connectorId: connectorId,
+            dataRoot: dataRoot
+        ) else {
             return OAuthFlowResult(ok: false,
                 error: "Configure the OAuth app in Connectors before signing in.")
         }
@@ -156,7 +162,7 @@ extension NativeOAuthFlow {
                         ?? Int(tokens["expires_in"] as? Double ?? 3600)
         let expiresAt    = isoBasic(Date().addingTimeInterval(TimeInterval(expiresIn)))
 
-        let path = connectorTokenPath(connectorId: connectorId)
+        let path = connectorTokenPath(connectorId: connectorId, dataRoot: dataRoot)
         let persistence = SwiftNativePersistenceCore()
         do {
             try await persistence.withFileLock(path) {
@@ -186,9 +192,7 @@ extension NativeOAuthFlow {
         // the executor only ever saw the migrated daemon-era token
         // and a fresh sign-in would land at the wrong path/shape.
         if connectorId == "x" {
-            let xPath = PersistenceCore.defaultDataRoot()
-                .appendingPathComponent("oauth_tokens", isDirectory: true)
-                .appendingPathComponent("x.json")
+            let xPath = OAuthCredentialDestinations.xConnectorRuntimeMirror(dataRoot: dataRoot)
             let expiresEpoch = Date().addingTimeInterval(TimeInterval(expiresIn)).timeIntervalSince1970
             try? await persistence.withFileLock(xPath) {
                 var x: [String: Any] = (try? loadJSONObject(xPath)) ?? [:]
@@ -218,7 +222,10 @@ extension NativeOAuthFlow {
         connectorId: String,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> URL {
-        dataRoot
+        if connectorId == "x" {
+            return OAuthCredentialDestinations.xConnector(dataRoot: dataRoot)
+        }
+        return dataRoot
             .appendingPathComponent("connectors", isDirectory: true)
             .appendingPathComponent(connectorId, isDirectory: true)
             .appendingPathComponent("auth.json")

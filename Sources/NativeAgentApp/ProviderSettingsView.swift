@@ -1,13 +1,87 @@
 // PATCH-2026-05-07: model-providers v1 — ProviderSettingsView: Models & Providers settings sub-section
 // PATCH-2026-05-07: leftover-2 per-surface active provider picker (Mac side)
 import SwiftUI
+import Foundation
 import ProviderRouting
+import PersistenceCore
 
-private enum ProviderSurfaceRowLayout {
+enum ProviderSurfaceRowLayout {
     // Includes the field label, the longest current value ("No Think"), and
     // the macOS menu-picker chrome without truncating the active selection.
     static let reasoningPickerWidth: CGFloat = 148
     static let fastToggleWidth: CGFloat = 88
+}
+
+/// Presentation truth for the Providers refresh control. Missing provider
+/// rows are a normal first-run result only after a successful refresh; a
+/// failed authority read must remain distinguishable from that empty state.
+enum ProviderSettingsRefreshPresentation: Equatable {
+    case empty
+    case unavailable(String)
+    case available
+
+    static func resolve(providerCount: Int, loadError: String?) -> Self {
+        guard providerCount == 0 else { return .available }
+        guard let loadError,
+              !loadError.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .empty
+        }
+        return .unavailable(loadError)
+    }
+}
+
+/// The provider picker receives routing identifiers from `ProviderRouting`.
+/// Keep their customer-facing names explicit: a new routing surface must not
+/// silently appear as a prettified storage key in Settings.
+enum ProviderSettingsSurfaceLabel: Equatable, Sendable {
+    case named(String)
+    case unrecognized(String)
+    case malformed
+
+    private static let namedLabels: [String: String] = [
+        "chat": "Chat",
+        "ios": "iPhone",
+        "telegram": "Telegram",
+        "slack": "Slack",
+        "desk": "Desk",
+        "workshop": "Workshop",
+        // Old persisted rows are folded to `workshop` before presentation,
+        // but retain an honest title if an older in-memory caller reaches us.
+        "missions": "Workshop",
+        "autonomy": "Autonomy",
+        "swarms": "Swarms",
+        "dream": "Dream",
+        "rem": "REM",
+        "training": "Training",
+        "memory": "Memory",
+        "heartbeat": "Heartbeat",
+        "diagnostics": "Diagnostics",
+        "cognition_reflection": "Cognition Reflection",
+        "compaction": "Compaction",
+        "self_improvement": "Self-Improvement",
+    ]
+
+    static func presentation(for rawSurface: String) -> Self {
+        let trimmed = rawSurface.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed == rawSurface, rawSurface == rawSurface.lowercased() else {
+            return .malformed
+        }
+        guard let label = namedLabels[rawSurface] else {
+            return .unrecognized(rawSurface)
+        }
+        return .named(label)
+    }
+
+    var text: String {
+        switch self {
+        case .named(let label):
+            return label
+        case .unrecognized(let surface):
+            return "Unrecognized surface (\(surface))"
+        case .malformed:
+            return "Surface label unavailable"
+        }
+    }
 }
 
 // MARK: - Main View
@@ -16,6 +90,10 @@ struct ProviderSettingsView: View {
     @Environment(AppModel.self) private var appModel
     @State private var providers: [ProviderInfo] = []
     @State private var isLoading = false
+    /// The refresh control must distinguish an authority-read failure from a
+    /// genuinely empty provider catalog. Kept separate from the general
+    /// status line because save/configure actions also write that line.
+    @State private var providerLoadError: String?
     @State private var configureSheet: ProviderInfo? = nil
     // SUBSYSTEM #17 (2026-05-31): retired diagnostic UI + /v1/providers/self_test
     @State private var statusText = ""
@@ -38,12 +116,15 @@ struct ProviderSettingsView: View {
     @State private var surfaceReasoningEffort: [String: String] = [:]
     @State private var surfaceFastMode: [String: Bool] = [:]
     @State private var catalogModels: [ModelCatalogItem] = []
+    @State private var rowSet = ProviderSurfaceRowSet(
+        surfacePreferenceKeys: [],
+        activeProviderKeys: []
+    )
 
-    // Single source of truth (2026-06-10): the canonical surface list lives
-    // in ProviderRouting.MODEL_SURFACES. The previous hardcoded copy here
-    // had already drifted — it was missing "rem", so the REM surface was
-    // unpinnable from this panel despite being picker-routed since 06-05.
-    private let surfaces = MODEL_SURFACES
+    // The visible rows remain the routing registry's canonical order. The
+    // store-backed audit below makes an unregistered persisted key visible as
+    // a repair state instead of quietly leaving it unpinnable.
+    private var surfaces: [String] { rowSet.visibleSurfaces }
 
     private struct SurfaceModelChoice: Identifiable, Hashable {
         let id: String
@@ -267,7 +348,9 @@ struct ProviderSettingsView: View {
                             .foregroundStyle(.secondary)
                         Spacer()
                         Button("Open Telegram Settings", systemImage: "arrow.right.circle") {
-                            NotificationCenter.default.post(name: .openTelegramRequest, object: nil)
+                            let receipt = NativeAgentAppCoordinator.shared.request(.sidebar(.telegram))
+                            let presentation = ProviderTelegramSettingsButtonPresentation.presentation(for: receipt)
+                            statusText = presentation.statusText
                         }
                     }
                 }
@@ -278,6 +361,16 @@ struct ProviderSettingsView: View {
                             ProgressView()
                             Text("Loading providers…").font(NativeAgentFont.label).foregroundStyle(.secondary)
                         }
+                    } else if case let .unavailable(detail) = ProviderSettingsRefreshPresentation.resolve(
+                        providerCount: providers.count,
+                        loadError: providerLoadError
+                    ) {
+                        NativeEmptyState(
+                            title: "Providers unavailable",
+                            detail: detail,
+                            systemImage: "server.rack"
+                        )
+                        .frame(minHeight: 120)
                     } else if providers.isEmpty {
                         NativeEmptyState(
                             title: "No Providers",
@@ -314,20 +407,22 @@ struct ProviderSettingsView: View {
                         }
                     }
                     HStack {
-                        Button("Refresh", systemImage: "arrow.clockwise") {
+                        Button(isLoading ? "Refreshing…" : "Refresh", systemImage: "arrow.clockwise") {
                             Task { await loadProviders(refreshCatalog: true) }
                         }
+                        .disabled(isLoading)
                         // SUBSYSTEM #17 (2026-05-31): retired diagnostic UI + /v1/providers/self_test
                     }
                 }
 
                 // SUBSYSTEM #17 (2026-05-31): retired diagnostic UI + /v1/providers/self_test (results panel)
 
-                if !statusText.isEmpty {
-                    Text(statusText)
+                if let status = ProviderSettingsStatusTextPresentation.state(for: statusText) {
+                    Label(status.text, systemImage: status.systemImage)
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(statusColor(status.tone))
                         .textSelection(.enabled)
+                        .accessibilityLabel(status.text)
                 }
             }
         }
@@ -342,6 +437,22 @@ struct ProviderSettingsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 NativePanel(title: "Active per Surface", systemImage: "square.3.layers.3d.top.filled") {
+                    if !rowSet.unsupportedStoredKeys.isEmpty {
+                        Label(
+                            "Saved provider settings need repair: " + rowSet.unsupportedStoredKeys.joined(separator: ", "),
+                            systemImage: "exclamationmark.triangle.fill"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                    }
+                    if !rowSet.retiredStoredKeys.isEmpty {
+                        Label(
+                            "Retired saved settings are ignored: " + rowSet.retiredStoredKeys.joined(separator: ", "),
+                            systemImage: "clock.arrow.circlepath"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                    }
                     if pickerProviders.isEmpty {
                         Text("Load providers first to configure per-surface overrides.")
                             .font(.caption).foregroundStyle(.secondary)
@@ -455,18 +566,21 @@ struct ProviderSettingsView: View {
     }
 
     private func loadProviders(refreshCatalog: Bool = false) async {
+        guard !isLoading else { return }
         isLoading = true
-        do {
-            if refreshCatalog {
-                _ = try await appModel.getModelCatalog(refresh: true)
+        defer { isLoading = false }
+        switch await ProviderSettingsRefreshAction.perform(
+            appModel: appModel,
+            refreshCatalog: refreshCatalog
+        ) {
+        case let .loaded(snapshot):
+            providers = snapshot.providers
+            rowSet = snapshot.rowSet
+            if let catalog = snapshot.catalog {
+                catalogModels = catalog.models
             }
-            providers = try await appModel.listProviders()
-            // Read the canonical active-provider store so the picker and
-            // execution route share one owner. Damaged state fails the whole
-            // refresh and preserves the prior visible values.
-            let liveAps = try await fetchLiveActivePerSurface()
             for surface in surfaces {
-                if let pid = liveAps[surface] {
+                if let pid = snapshot.activeProviders[surface] {
                     activeSurface[surface] = pid
                 } else if activeSurface[surface] == nil {
                     activeSurface[surface] = "codex"
@@ -474,15 +588,11 @@ struct ProviderSettingsView: View {
             }
             // PATCH-2026-05-28 (per-surface model): load the global catalog
             // (fallback model source) and the live per-surface model picks.
-            if let catalog = try? await appModel.getModelCatalog(refresh: false) {
-                catalogModels = catalog.models
-            }
-            let liveModels = try await fetchLiveSurfacePreferences()
             for surface in surfaces {
-                if let preference = liveModels[surface] {
+                if let preference = snapshot.preferences[surface] {
                     surfaceModel[surface] = preference.model
                     surfaceReasoningEffort[surface] = preference.reasoningEffort
-                    surfaceFastMode[surface] = preference.fastMode
+                    surfaceFastMode[surface] = preference.serviceTier == "priority"
                 } else if let choice = modelsForSurface(surface).first {
                     surfaceModel[surface] = choice.id
                     surfaceReasoningEffort[surface] = choice.supportedReasoningEfforts
@@ -492,11 +602,24 @@ struct ProviderSettingsView: View {
                     surfaceFastMode[surface] = false
                 }
             }
-            statusText = "Providers loaded at \(shortTime())"
-        } catch {
-            statusText = "Load failed: \(error.localizedDescription)"
+            statusText = rowSet.unsupportedStoredKeys.isEmpty
+                ? "Providers loaded at \(shortTime())"
+                : "Provider settings need repair before every saved surface can be configured."
+            providerLoadError = nil
+        case let .failed(detail):
+            providerLoadError = detail
+            statusText = "Load failed: \(detail)"
         }
-        isLoading = false
+    }
+
+    private func statusColor(_ tone: ProviderSettingsStatusTextPresentation.Tone) -> Color {
+        switch tone {
+        case .info: return .secondary
+        case .progress: return .secondary
+        case .success: return .green
+        case .warning: return .orange
+        case .failure: return .red
+        }
     }
 
     /// Read the per-surface active-provider map from the SAME on-disk file
@@ -511,8 +634,8 @@ struct ProviderSettingsView: View {
     /// `trust.providerPolicy.active_per_surface` (the prior path) was an
     /// independent source that never reflected the new on-disk state, so the
     /// UI's picker drifted off the actual routing decision after every save.
-    private func fetchLiveActivePerSurface() async throws -> [String: String] {
-        try await NativeClient.readActiveProvidersFromDisk()
+    private func fetchLiveActivePerSurface(dataRoot: URL) async throws -> [String: String] {
+        try await NativeClient.readActiveProvidersFromDisk(dataRoot: dataRoot)
     }
 
     private func requestSetActiveSurface(surface: String, providerId: String) {
@@ -610,8 +733,8 @@ struct ProviderSettingsView: View {
 
     // Read the complete per-surface brain selection from the Swift provider
     // router so Providers shows the same model/Think/Fast values execution uses.
-    private func fetchLiveSurfacePreferences() async throws -> [String: SurfaceBrainSelection] {
-        try await SwiftNativeProviderRouting()
+    private func fetchLiveSurfacePreferences(dataRoot: URL) async throws -> [String: SurfaceBrainSelection] {
+        try await SwiftNativeProviderRouting(dataRoot: dataRoot)
             .computeModelPreferences()
             .reduce(into: [String: SurfaceBrainSelection]()) { out, pair in
                 out[pair.key] = SurfaceBrainSelection(
@@ -752,23 +875,7 @@ struct ProviderSettingsView: View {
     }
 
     private func surfaceLabel(_ surface: String) -> String {
-        switch surface {
-        case "chat":      return "Chat"
-        case "ios":       return "iPhone"
-        case "workshop", "missions":  return "Desk"
-        case "training":  return "Training"
-        case "dream":     return "Dream"
-        case "telegram":  return "Telegram"
-        case "slack":     return "Slack"
-        case "autonomy":  return "Autonomy"
-        case "swarms":    return "Swarms"
-        case "rem":       return "REM"
-        case "memory":    return "Memory"
-        case "heartbeat": return "Heartbeat"
-        case "diagnostics": return "Diagnostics"
-        case "cognition_reflection": return "Cognition Reflection"
-        default:          return surface.capitalized
-        }
+        ProviderSettingsSurfaceLabel.presentation(for: surface).text
     }
 }
 
@@ -921,6 +1028,86 @@ enum ProviderCredentialVerification: Equatable {
     }
 }
 
+/// A provider default is not a per-surface model pin. The sheet may write the
+/// former only after the selected catalog item is still advertised; an absent
+/// or stale default remains visible for replacement rather than being silently
+/// coerced into an unrelated model.
+enum ProviderConfigModelPickerPresentation: Equatable {
+    case noCatalog
+    case selected
+    case staleSelection(String)
+
+    static func resolve(selectedModel: String, advertisedModelIDs: [String]) -> Self {
+        guard !advertisedModelIDs.isEmpty else { return .noCatalog }
+        return advertisedModelIDs.contains(selectedModel)
+            ? .selected
+            : .staleSelection(selectedModel)
+    }
+
+    var needsReplacement: Bool {
+        if case .staleSelection = self { return true }
+        return false
+    }
+
+    var message: String? {
+        switch self {
+        case .noCatalog:
+            return "Model catalog unavailable. Any saved default remains unchanged until models can be loaded."
+        case .selected:
+            return nil
+        case let .staleSelection(model):
+            return "Saved default \(model) is not in this provider's current model catalog. Choose a replacement before saving."
+        }
+    }
+}
+
+/// The provider catalog is the auth-mode authority for the configuration
+/// sheet. Normalize its wire values once so a stale persisted mode cannot
+/// become an untagged Picker selection or be written back as an unsupported
+/// route.
+struct ProviderAuthModePickerState: Equatable {
+    let supportedModes: [String]
+    let selectedMode: String
+    let repairedSavedMode: String?
+
+    var canSave: Bool { supportedModes.contains(selectedMode) }
+}
+
+enum ProviderAuthModePickerPresentation {
+    private static let knownModes: Set<String> = ["api_key", "oauth"]
+
+    static func resolve(
+        advertisedModes: [String],
+        savedMode: String?,
+        providerIsReady: Bool
+    ) -> ProviderAuthModePickerState {
+        var seen = Set<String>()
+        let supportedModes = advertisedModes.compactMap { raw -> String? in
+            let mode = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard knownModes.contains(mode), seen.insert(mode).inserted else { return nil }
+            return mode
+        }
+        let normalizedSavedMode = savedMode?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if let normalizedSavedMode, supportedModes.contains(normalizedSavedMode) {
+            return ProviderAuthModePickerState(
+                supportedModes: supportedModes,
+                selectedMode: normalizedSavedMode,
+                repairedSavedMode: nil
+            )
+        }
+        let fallback = providerIsReady && supportedModes.contains("oauth")
+            ? "oauth"
+            : (supportedModes.first ?? "")
+        return ProviderAuthModePickerState(
+            supportedModes: supportedModes,
+            selectedMode: fallback,
+            repairedSavedMode: normalizedSavedMode?.isEmpty == false ? normalizedSavedMode : nil
+        )
+    }
+}
+
 struct ProviderConfigSheet: View {
     let provider: ProviderInfo
     let onDone: () -> Void
@@ -940,17 +1127,33 @@ struct ProviderConfigSheet: View {
     /// readiness the provider row reports.
     @State private var verification: ProviderCredentialVerification = .idle
 
+    private var authModePickerState: ProviderAuthModePickerState {
+        ProviderAuthModePickerPresentation.resolve(
+            advertisedModes: provider.auth_modes,
+            savedMode: provider.auth_mode,
+            providerIsReady: provider.auth_status.state == "ready"
+        )
+    }
+
     init(provider: ProviderInfo, onDone: @escaping () -> Void) {
         self.provider = provider
         self.onDone = onDone
-        let savedMode = provider.auth_mode?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let fallbackMode = provider.auth_modes.contains("oauth") && provider.auth_status.state == "ready"
-            ? "oauth"
-            : (provider.auth_modes.first ?? "api_key")
-        _authMode = State(initialValue: (savedMode?.isEmpty == false ? savedMode! : fallbackMode))
+        let authModeState = ProviderAuthModePickerPresentation.resolve(
+            advertisedModes: provider.auth_modes,
+            savedMode: provider.auth_mode,
+            providerIsReady: provider.auth_status.state == "ready"
+        )
+        _authMode = State(initialValue: authModeState.selectedMode)
         let savedModel = provider.default_model?.trimmingCharacters(in: .whitespacesAndNewlines)
         _selectedModel = State(initialValue: savedModel?.isEmpty == false ? savedModel! : (provider.models.first?.id ?? ""))
         _availableModels = State(initialValue: provider.models)
+    }
+
+    private var modelPickerPresentation: ProviderConfigModelPickerPresentation {
+        ProviderConfigModelPickerPresentation.resolve(
+            selectedModel: selectedModel,
+            advertisedModelIDs: availableModels.map(\.id)
+        )
     }
 
     var body: some View {
@@ -983,10 +1186,16 @@ struct ProviderConfigSheet: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     // Auth mode
-                    if provider.auth_modes.count > 1 {
+                    if authModePickerState.supportedModes.isEmpty {
+                        NativePanel(title: "Authentication unavailable", systemImage: "exclamationmark.triangle") {
+                            Text("This provider did not advertise a supported authentication method. Refresh Providers or repair its configuration before saving.")
+                                .font(.callout)
+                                .foregroundStyle(.orange)
+                        }
+                    } else if authModePickerState.supportedModes.count > 1 {
                         NativePanel(title: "Authentication Mode", systemImage: "key.fill") {
                             Picker("Mode", selection: $authMode) {
-                                ForEach(provider.auth_modes, id: \.self) { mode in
+                                ForEach(authModePickerState.supportedModes, id: \.self) { mode in
                                     Text(authModeLabel(mode)).tag(mode)
                                 }
                             }
@@ -994,8 +1203,18 @@ struct ProviderConfigSheet: View {
                         }
                     }
 
+                    if let repaired = authModePickerState.repairedSavedMode,
+                       !authModePickerState.supportedModes.isEmpty {
+                        Label(
+                            "The saved authentication method ‘\(repaired)’ is no longer supported; using \(authModeLabel(authMode)).",
+                            systemImage: "exclamationmark.triangle.fill"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                    }
+
                     // API Key input (shown when api_key mode or provider only supports api_key)
-                    if authMode == "api_key" || provider.auth_modes == ["api_key"] {
+                    if authMode == "api_key" {
                         NativePanel(title: "API Key", systemImage: "lock.fill") {
                             SecureField("Paste API key here…", text: $apiKey)
                                 .textFieldStyle(.roundedBorder)
@@ -1018,7 +1237,7 @@ struct ProviderConfigSheet: View {
                             } else if provider.provider_id == "anthropic_mcp" {
                                 AnthropicMCPStatusPanel(provider: provider, appModel: appModel)
                             } else if provider.provider_id == "anthropic_oauth_direct" {
-                                AnthropicOAuthDirectPanel(provider: provider, appModel: appModel)
+                                AnthropicOAuthDirectPanel()
                             } else if provider.provider_id == "xai_oauth_direct" {
                                 VStack(alignment: .leading, spacing: 8) {
                                     Text("NativeAgent-owned xAI OAuth for Grok model access.")
@@ -1043,6 +1262,15 @@ struct ProviderConfigSheet: View {
                                 }
                             }
                             .pickerStyle(.menu)
+                            Text("This changes this provider’s fallback default. Surface model pins are configured separately in the provider table.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            if let message = modelPickerPresentation.message {
+                                Label(message, systemImage: "exclamationmark.triangle.fill")
+                                    .font(.caption)
+                                    .foregroundStyle(.orange)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
                             if let model = availableModels.first(where: { $0.id == selectedModel }) {
                                 HStack(spacing: 8) {
                                     capabilityPill("Streaming", ok: model.supports_streaming)
@@ -1051,6 +1279,14 @@ struct ProviderConfigSheet: View {
                                     capabilityPill("JSON", ok: model.supports_json_mode)
                                 }
                             }
+                        }
+                    } else if !selectedModel.isEmpty,
+                              let message = modelPickerPresentation.message {
+                        NativePanel(title: "Default Model", systemImage: "cpu") {
+                            Label(message, systemImage: "exclamationmark.triangle.fill")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
 
@@ -1092,7 +1328,7 @@ struct ProviderConfigSheet: View {
                             Task { await saveConfig() }
                         }
                         .buttonStyle(.borderedProminent)
-                        .disabled(isSaving)
+                        .disabled(isSaving || modelPickerPresentation.needsReplacement || !authModePickerState.canSave)
 
                         Button(isTesting ? "Testing…" : "Test Connection", systemImage: "network") {
                             Task { await runTest() }
@@ -1128,6 +1364,10 @@ struct ProviderConfigSheet: View {
     }
 
     private func saveConfig() async {
+        guard authModePickerState.supportedModes.contains(authMode) else {
+            statusText = "Save failed: choose a supported authentication method first."
+            return
+        }
         isSaving = true
         do {
             _ = try await appModel.configureProvider(
@@ -1139,9 +1379,6 @@ struct ProviderConfigSheet: View {
             let refreshed = try await appModel.listProviders()
             if let current = refreshed.first(where: { $0.provider_id == provider.provider_id }) {
                 availableModels = current.models
-                if !availableModels.contains(where: { $0.id == selectedModel }) {
-                    selectedModel = availableModels.first?.id ?? ""
-                }
             }
             await appModel.loadProvidersForChat()
             // FIRSTRUN-2: the key is on disk, nothing more. Any earlier
@@ -1218,28 +1455,162 @@ struct ProviderConfigSheet: View {
 
 // MARK: - PATCH-2026-05-07: anthropic-mcp status panel
 
+/// A local Claude CLI presence check is the only evidence this panel has for
+/// its persistent-MCP connection claim. Do not manufacture readiness from a
+/// provider-list payload that may have been collected before the CLI moved or
+/// was removed.
+enum AnthropicMCPCLIProbe {
+    enum Availability: Equatable {
+        case checking
+        case available(path: String)
+        case unavailable(reason: String)
+    }
+
+    static func probe(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) }
+    ) -> Availability {
+        guard let path = environment["PATH"], !path.isEmpty else {
+            return .unavailable(reason: "Claude CLI could not be checked because PATH is unavailable.")
+        }
+        let directories = path.split(separator: ":", omittingEmptySubsequences: true)
+            .map(String.init)
+            .filter { $0.hasPrefix("/") }
+        guard !directories.isEmpty else {
+            return .unavailable(reason: "Claude CLI could not be checked because PATH has no absolute directories.")
+        }
+        for directory in directories {
+            let candidate = URL(fileURLWithPath: directory)
+                .appendingPathComponent("claude")
+                .path
+            if isExecutable(candidate) {
+                return .available(path: candidate)
+            }
+        }
+        return .unavailable(reason: "Claude CLI was not found on PATH. Install or restore Claude Code, then test again.")
+    }
+}
+
+struct AnthropicMCPStatusPresentation: Equatable {
+    enum ProcessStatus: Equatable {
+        case alive
+        case notRunning
+        case unavailable
+
+        var label: String {
+            switch self {
+            case .alive: "Process alive"
+            case .notRunning: "Not running"
+            case .unavailable: "Process status unavailable"
+            }
+        }
+
+        var badgeStatus: String {
+            switch self {
+            case .alive: "ok"
+            case .notRunning, .unavailable: "warn"
+            }
+        }
+    }
+
+    let headline: String?
+    let cliBadge: String
+    let cliBadgeStatus: String
+    let detail: String?
+    let version: String?
+    let mode: String?
+    let processStatus: ProcessStatus?
+
+    static func make(
+        availability: AnthropicMCPCLIProbe.Availability,
+        userInfo: [String: String]?
+    ) -> Self {
+        switch availability {
+        case .checking:
+            return Self(
+                headline: nil,
+                cliBadge: "Checking Claude CLI…",
+                cliBadgeStatus: "warn",
+                detail: nil,
+                version: nil,
+                mode: nil,
+                processStatus: nil
+            )
+        case .unavailable(let reason):
+            return Self(
+                headline: nil,
+                cliBadge: "Claude CLI unavailable",
+                cliBadgeStatus: "error",
+                detail: reason,
+                version: nil,
+                mode: nil,
+                processStatus: nil
+            )
+        case .available:
+            let mode = userInfo?["mode"]
+            let processStatus: ProcessStatus
+            switch userInfo?["mcp_process_alive"]?.lowercased() {
+            case "true": processStatus = .alive
+            case "false": processStatus = .notRunning
+            default: processStatus = .unavailable
+            }
+            return Self(
+                headline: processStatus == .alive
+                    ? "Persistent connection via Claude CLI"
+                    : nil,
+                cliBadge: "Claude CLI available",
+                cliBadgeStatus: "ok",
+                detail: processStatus == .alive
+                    ? nil
+                    : "Claude CLI is available, but no persistent MCP process is confirmed.",
+                version: userInfo?["version"],
+                mode: mode == "mcp_server" ? "MCP server" : "per-call stream",
+                processStatus: processStatus
+            )
+        }
+    }
+}
+
 private struct AnthropicMCPStatusPanel: View {
     let provider: ProviderInfo
     let appModel: AppModel
 
     @State private var testResult: String = ""
     @State private var isTesting = false
+    @State private var cliAvailability: AnthropicMCPCLIProbe.Availability = .checking
 
     var body: some View {
+        let presentation = AnthropicMCPStatusPresentation.make(
+            availability: cliAvailability,
+            userInfo: provider.auth_status.user_info
+        )
         VStack(alignment: .leading, spacing: 8) {
-            Text("Persistent connection via Claude CLI")
-                .font(.callout).bold()
-            if let ui = provider.auth_status.user_info {
-                HStack(spacing: 8) {
-                    InfoPill(text: ui["version"] ?? "claude", systemImage: "terminal")
-                    let mode = ui["mode"] ?? "per_call_stream"
-                    InfoPill(
-                        text: mode == "mcp_server" ? "MCP server" : "per-call stream",
-                        systemImage: mode == "mcp_server" ? "antenna.radiowaves.left.and.right" : "arrow.clockwise"
-                    )
-                    let alive = ui["mcp_process_alive"] == "true"
-                    StatusBadge(text: alive ? "Process alive" : "Not running", status: alive ? "ok" : "warn")
+            if let headline = presentation.headline {
+                Text(headline)
+                    .font(.callout).bold()
+            }
+            HStack(spacing: 8) {
+                StatusBadge(text: presentation.cliBadge, status: presentation.cliBadgeStatus)
+                if let version = presentation.version {
+                    InfoPill(text: version, systemImage: "terminal")
                 }
+                if let mode = presentation.mode {
+                    InfoPill(
+                        text: mode,
+                        systemImage: mode == "MCP server"
+                            ? "antenna.radiowaves.left.and.right"
+                            : "arrow.clockwise"
+                    )
+                }
+                if let processStatus = presentation.processStatus {
+                    StatusBadge(text: processStatus.label, status: processStatus.badgeStatus)
+                }
+            }
+            if let detail = presentation.detail {
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
             }
             HStack(spacing: 8) {
                 Button(isTesting ? "Testing…" : "Test Connection", systemImage: "network") {
@@ -1253,11 +1624,20 @@ private struct AnthropicMCPStatusPanel: View {
                 Text(testResult).font(.caption).foregroundStyle(.secondary)
             }
         }
+        .task(id: provider.auth_status.last_checked_at) {
+            cliAvailability = AnthropicMCPCLIProbe.probe()
+        }
     }
 
     private func runPersistentTest() async {
         isTesting = true
         testResult = ""
+        cliAvailability = AnthropicMCPCLIProbe.probe()
+        if case .unavailable(let reason) = cliAvailability {
+            testResult = reason
+            isTesting = false
+            return
+        }
         do {
             let result = try await appModel.testProvider(provider.provider_id)
             if result.tested {
@@ -1274,73 +1654,24 @@ private struct AnthropicMCPStatusPanel: View {
 
 // MARK: - PATCH-2026-05-07: anthropic-oauth-direct panel
 
-private struct AnthropicOAuthDirectPanel: View {
-    let provider: ProviderInfo
-    let appModel: AppModel
+enum AnthropicOAuthDirectPanelPresentation {
+    static let title = "Connect via Anthropic OAuth"
+    static let detail = "Full capability API access (streaming, vision, tools) using your own OAuth credentials."
+}
 
-    @State private var isConnecting = false
-    @State private var statusMessage = ""
-
+struct AnthropicOAuthDirectPanel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Connect via Anthropic OAuth")
+            Text(AnthropicOAuthDirectPanelPresentation.title)
                 .font(.callout).bold()
-            Text("Full capability API access (streaming, vision, tools) using your own OAuth credentials.")
+            Text(AnthropicOAuthDirectPanelPresentation.detail)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-
-            let hasToken = provider.auth_status.state == "ready"
-            if !hasToken {
-                Button(isConnecting ? "Waiting for authorization…" : "Connect", systemImage: "safari") {
-                    Task { await startOAuth() }
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(isConnecting)
-            } else {
-                // Already connected
-                if let ui = provider.auth_status.user_info, !ui.isEmpty {
-                    HStack(spacing: 8) {
-                        ForEach(Array(ui.prefix(3)), id: \.key) { kv in
-                            InfoPill(text: "\(kv.key): \(kv.value)", systemImage: "person.fill")
-                        }
-                    }
-                }
-                StatusBadge(text: "Authorized", status: "ok")
-            }
-
-            if isConnecting {
-                HStack(spacing: 6) {
-                    ProgressView().scaleEffect(0.7)
-                    Text(statusMessage.isEmpty ? "Waiting for browser authorization…" : statusMessage)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            } else if !statusMessage.isEmpty {
-                Text(statusMessage).font(.caption).foregroundStyle(.secondary)
-            }
-        }
-        .onDisappear {
-            if isConnecting { isConnecting = false }
-        }
-    }
-
-    // Swift-native cutover (2026-06-02): drive the Anthropic Connect button through the
-    // in-process NativeOAuthFlow (same path as OAuthSignInButton). The public
-    // client id belongs to the canonical provider config; users never need to
-    // supply a second, ignored identifier here.
-    @MainActor
-    private func startOAuth() async {
-        isConnecting = true
-        statusMessage = "Opening browser…"
-        let result = await NativeOAuthFlow.startOAuthFlow(
-            providerId: "anthropic_oauth_direct"
-        )
-        isConnecting = false
-        if result.ok {
-            statusMessage = "Authorization complete."
-            await appModel.loadProvidersForChat()
-        } else {
-            statusMessage = "Error: \(result.error ?? "unknown")"
+            // Provider list rows are a snapshot. The canonical sign-in control
+            // reads the same root it writes, so this panel cannot keep offering
+            // Connect after the browser flow committed or claim authorization
+            // from a stale provider-list response.
+            OAuthSignInButton(provider: .anthropic)
         }
     }
 }

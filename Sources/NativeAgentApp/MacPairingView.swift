@@ -2,11 +2,57 @@
 import CoreImage
 import SwiftUI
 
+enum PairingPublicationPresentation {
+    static func error(kvsPublished: Bool, cloudKitPublished: Bool) -> String? {
+        switch (kvsPublished, cloudKitPublished) {
+        case (true, true):
+            return nil
+        case (false, true):
+            return "The new key is saved and CloudKit updated, but KVS did not accept it. iPhones using KVS bootstrap may not receive the new pairing key until KVS recovers."
+        case (true, false):
+            return "The new key is saved and KVS updated, but CloudKit did not accept it. Paired iPhones may reject signed messages until CloudKit recovers."
+        case (false, false):
+            return "The new key is saved, but neither KVS nor CloudKit accepted it yet."
+        }
+    }
+}
+
+/// The pairing key is already rotated when either publication route fails, so
+/// this warning must survive the settings view's local state. Otherwise a user
+/// can navigate away and lose the only indication that every paired phone may
+/// still hold the old key.
+enum PairingPublicationHealth {
+    static let warningDefaultsKey = "NativeAgent.pairing.publicationWarning.v1"
+
+    @discardableResult
+    static func record(
+        kvsPublished: Bool,
+        cloudKitPublished: Bool,
+        defaults: UserDefaults = .standard
+    ) -> String? {
+        let warning = PairingPublicationPresentation.error(
+            kvsPublished: kvsPublished,
+            cloudKitPublished: cloudKitPublished
+        )
+        if let warning {
+            defaults.set(warning, forKey: warningDefaultsKey)
+        } else {
+            defaults.removeObject(forKey: warningDefaultsKey)
+        }
+        return warning
+    }
+
+    static func currentWarning(defaults: UserDefaults = .standard) -> String? {
+        defaults.string(forKey: warningDefaultsKey)
+    }
+}
+
 struct MacPairingView: View {
     @State private var secretBase64: String = ""
     @State private var qrImage: NSImage? = nil
     @State private var copied = false
     @State private var pairingError: String?
+    @AppStorage(PairingPublicationHealth.warningDefaultsKey) private var pairingPublicationWarning = ""
     // S.3: confirmation before regenerate
     @State private var showRegenConfirm = false
     // S.4: reveal/hide key
@@ -42,6 +88,17 @@ struct MacPairingView: View {
                         .foregroundStyle(.red)
                         .padding(10)
                         .background(.red.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+                }
+
+                if !pairingPublicationWarning.isEmpty {
+                    Label(
+                        "Pairing delivery needs attention: \(pairingPublicationWarning)",
+                        systemImage: "exclamationmark.triangle.fill"
+                    )
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+                    .padding(10)
+                    .background(.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
                 }
 
                 if let qr = qrImage {
@@ -202,9 +259,15 @@ struct MacPairingView: View {
             async let kvsPublished = PairingSecretManager.publishMaterialToKVS(persistedSecret)
             async let cloudKitPublished = iCloudBridge.shared.publishPairingSecret(persistedSecret)
             let published = await (kvsPublished, cloudKitPublished)
-            pairingError = published.0 || published.1
-                ? nil
-                : "The new key is saved, but neither iCloud pairing route has accepted it yet."
+            // Each publication route has a distinct consumer. Neither a KVS
+            // success nor a CloudKit success may hide the other route's failure:
+            // doing so leaves some paired iPhones stale while this screen
+            // reports a healthy new QR code.
+            pairingError = nil
+            pairingPublicationWarning = PairingPublicationHealth.record(
+                kvsPublished: published.0,
+                cloudKitPublished: published.1
+            ) ?? ""
             let newSecretBase64 = persistedSecret.base64EncodedString()
             secretBase64 = newSecretBase64
             qrImage = renderQR(payload: pairingPayloadJSON(secret: newSecretBase64))

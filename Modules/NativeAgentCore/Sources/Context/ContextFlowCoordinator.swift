@@ -40,7 +40,17 @@ public struct ContextFlowCoordinatorHealth: Sendable, Equatable {
     public let degradedSourceCount: Int
     public let arenaMetrics: ContextArenaMetrics
     public let pendingPrewarmHints: Int
+    /// Plans retained by the coordinator while awaiting their matching turn.
+    /// This is separate from the planner's pending queue: a planned item has
+    /// left that queue but can still retain a session/workshop scope here.
+    public let trackedPrewarmPlanCount: Int
     public let prewarmUsefulnessReceipts: Int
+    /// Bounded rebuildable feedback retained across a coordinator restart.
+    /// This health gauge never grants authority.
+    public let feedbackEventCount: Int
+    /// Identity of the newest retained advisory event, for restart/cap
+    /// observability without exposing event payloads through every turn.
+    public let newestFeedbackEventID: String?
     public let lastReconciledAt: Date?
     public let lastError: String?
 
@@ -53,7 +63,10 @@ public struct ContextFlowCoordinatorHealth: Sendable, Equatable {
         degradedSourceCount: Int,
         arenaMetrics: ContextArenaMetrics,
         pendingPrewarmHints: Int,
+        trackedPrewarmPlanCount: Int,
         prewarmUsefulnessReceipts: Int,
+        feedbackEventCount: Int = 0,
+        newestFeedbackEventID: String? = nil,
         lastReconciledAt: Date?,
         lastError: String?
     ) {
@@ -65,7 +78,10 @@ public struct ContextFlowCoordinatorHealth: Sendable, Equatable {
         self.degradedSourceCount = degradedSourceCount
         self.arenaMetrics = arenaMetrics
         self.pendingPrewarmHints = pendingPrewarmHints
+        self.trackedPrewarmPlanCount = trackedPrewarmPlanCount
         self.prewarmUsefulnessReceipts = prewarmUsefulnessReceipts
+        self.feedbackEventCount = feedbackEventCount
+        self.newestFeedbackEventID = newestFeedbackEventID
         self.lastReconciledAt = lastReconciledAt
         self.lastError = lastError
     }
@@ -186,6 +202,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         self.monitor = monitor
 
         await reconcileAll(reason: "launch")
+        await restoreFeedbackEvents()
         await refreshWatchedDirectories()
     }
 
@@ -518,6 +535,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                 )
             }
             var need = makeNeed(request.characterBudget)
+            var budgetExpansion: ContextFlowBudgetExpansion?
             let packet: ContextPacket
             do {
                 packet = try selector.select(
@@ -543,6 +561,13 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                     )
                 }
                 need = makeNeed(expandedBudget)
+                budgetExpansion = ContextFlowBudgetExpansion(
+                    requestedCharacterBudget: request.characterBudget,
+                    effectiveCharacterBudget: expandedBudget,
+                    maximumCharacterBudget: request.maximumCharacterBudget,
+                    mandatoryCharacterBudget: required,
+                    grantedPostMandatoryReserve: max(0, expandedBudget - required)
+                )
                 packet = try selector.select(
                     need,
                     from: generation,
@@ -551,7 +576,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                 )
             }
             if policy.recordsSideEffects {
-                recordFeedback(
+                await recordFeedback(
                     signal: .selection,
                     atomIDs: packet.receipt.selectedAtomIDs,
                     evidenceIDs: [packet.receipt.id],
@@ -566,23 +591,35 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                     )
                 }
                 let store = self.store
+                let selectionReceipt = ContextStoreReceipt(
+                    kind: .selection,
+                    generationID: packet.generationID,
+                    summary: "context selection",
+                    details: [
+                        "receipt_id": packet.receipt.id,
+                        "surface": request.surface.rawValue,
+                        "selected": String(packet.selectedItems.count),
+                        "pointers": String(packet.expandablePointers.count),
+                        "mandatory_coverage": String(packet.receipt.mandatoryCoverage),
+                        "characters": String(packet.characterCount),
+                        "budget_expanded": budgetExpansion.map { _ in "true" } ?? "false",
+                        "requested_character_budget": String(request.characterBudget),
+                        "effective_character_budget": String(need.characterBudget),
+                        "maximum_character_budget": String(request.maximumCharacterBudget),
+                        "granted_post_mandatory_reserve": String(
+                            budgetExpansion?.grantedPostMandatoryReserve ?? 0
+                        ),
+                        // Absence is evidence. Do not serialize it as 0:
+                        // a missing/non-monotonic latency sample is not a
+                        // fast selection and must stay out of live windows.
+                        "selection_microseconds": packet.receipt.measuredSelectionMicroseconds
+                            .map { String($0) } ?? "absent",
+                        "selection_latency_provenance": packet.receipt.selectionLatencyProvenance?
+                            .rawValue ?? ContextSelectionLatencyProvenance.unavailable.rawValue,
+                    ]
+                )
                 Task.detached(priority: .background) {
-                    try? await store.recordReceipt(ContextStoreReceipt(
-                        kind: .selection,
-                        generationID: packet.generationID,
-                        summary: "context selection",
-                        details: [
-                            "receipt_id": packet.receipt.id,
-                            "surface": request.surface.rawValue,
-                            "selected": String(packet.selectedItems.count),
-                            "pointers": String(packet.expandablePointers.count),
-                            "mandatory_coverage": String(packet.receipt.mandatoryCoverage),
-                            "characters": String(packet.characterCount),
-                            "selection_microseconds": String(
-                                packet.receipt.measuredSelectionMicroseconds ?? 0
-                            ),
-                        ]
-                    ))
+                    try? await store.recordReceipt(selectionReceipt)
                 }
             }
             let feedbackHandler: (@Sendable (
@@ -610,6 +647,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                 lease: lease,
                 generation: generation,
                 need: need,
+                budgetExpansion: budgetExpansion,
                 feedbackHandler: feedbackHandler
             )
         } catch {
@@ -630,7 +668,10 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             degradedSourceCount: storeHealth?.degradedSources ?? 0,
             arenaMetrics: metrics,
             pendingPrewarmHints: await prewarmPlanner.pendingHintCount(),
+            trackedPrewarmPlanCount: prewarmPlans.count,
             prewarmUsefulnessReceipts: await prewarmPlanner.recentUsefulnessReceipts().count,
+            feedbackEventCount: feedbackEvents.count,
+            newestFeedbackEventID: feedbackEvents.last?.id,
             lastReconciledAt: lastReconciledAt,
             lastError: lastError
         )
@@ -937,7 +978,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         atomIDs: [ContextAtomID],
         evidenceIDs: [String],
         generationID: Int64
-    ) {
+    ) async {
         let ids = Array(Set(atomIDs)).sorted()
         guard !ids.isEmpty else { return }
         feedbackOrdinal &+= 1
@@ -954,9 +995,18 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             timeBucket: bucket,
             evidenceIDs: evidenceIDs
         )
-        feedbackEvents.append(event)
-        if feedbackEvents.count > 4_096 {
-            feedbackEvents.removeFirst(feedbackEvents.count - 4_096)
+        do {
+            try await store.recordFeedbackEvent(event)
+            feedbackEvents.append(event)
+            if feedbackEvents.count > 4_096 {
+                feedbackEvents.removeFirst(feedbackEvents.count - 4_096)
+            }
+        } catch {
+            // Context feedback is advisory, but a failed write must not look
+            // like a healthy restart that merely learned nothing.
+            lastError = "context feedback persistence failed: \(error)"
+            diagnostics("[context-flow] \(lastError ?? "context feedback persistence failed")")
+            return
         }
         let receipt = ContextStoreReceipt(
             kind: .feedback,
@@ -972,6 +1022,19 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         let store = self.store
         Task.detached(priority: .background) {
             try? await store.recordReceipt(receipt)
+        }
+    }
+
+    private func restoreFeedbackEvents() async {
+        do {
+            let restored = try await store.recentFeedbackEvents(limit: 4_096)
+            feedbackEvents = restored
+            // Event IDs are ordinal-scoped. Retaining the current high-water
+            // mark prevents a relaunch from overwriting a retained event.
+            feedbackOrdinal = try await store.feedbackEventOrdinalHighWaterMark()
+        } catch {
+            lastError = "context feedback restore failed: \(error)"
+            diagnostics("[context-flow] \(lastError ?? "context feedback restore failed")")
         }
     }
 

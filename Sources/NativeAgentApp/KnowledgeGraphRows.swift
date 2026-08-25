@@ -46,6 +46,7 @@ struct KGEntityRow: View {
         case "place": return "mappin.circle"
         case "event": return "calendar"
         case "tool": return "wrench.and.screwdriver"
+        case "fact": return "text.quote"
         default: return "circle"
         }
     }
@@ -59,6 +60,7 @@ struct KGEntityRow: View {
         case "place": return .green
         case "event": return .red
         case "tool": return .gray
+        case "fact": return .teal
         default: return .secondary
         }
     }
@@ -115,9 +117,20 @@ struct KGEntityDetailView: View {
                 }
 
                 // Edges / neighbors
-                if loading {
+                let relationshipState = KnowledgeGraphPresentation.entityDetailRelationships(
+                    isLoading: loading,
+                    error: loadError,
+                    rootID: entity.id,
+                    response: neighbors
+                )
+                let visibleEdges = KnowledgeGraphPresentation.visibleRelationshipEdges(
+                    rootID: entity.id,
+                    response: neighbors
+                )
+                switch relationshipState {
+                case .loading:
                     ProgressView("Loading neighbors…")
-                } else if let loadError {
+                case let .failed(loadError):
                     // ui-honesty 2026-06-10: loadError was captured but never
                     // rendered — a failed neighbors fetch looked identical to
                     // "no relationships". Show the error + a Retry.
@@ -134,20 +147,48 @@ struct KGEntityDetailView: View {
                             .controlSize(.small)
                         }
                     }
-                } else if let nbr = neighbors {
-                    if nbr.edges.isEmpty {
-                        NativePanel(title: "Relationships") {
-                            Text("No relationships recorded yet.")
-                                .font(NativeAgentFont.body).foregroundStyle(.secondary)
-                        }
-                    } else {
-                        NativePanel(title: "Relationships (\(nbr.edges.count))", systemImage: "arrow.triangle.branch") {
+                case .none:
+                    NativePanel(title: "Relationships") {
+                        Text("No relationships recorded yet.")
+                            .font(NativeAgentFont.body).foregroundStyle(.secondary)
+                    }
+                case let .loaded(count):
+                    if let nbr = neighbors {
+                        NativePanel(title: "Relationships (\(count))", systemImage: "arrow.triangle.branch") {
                             VStack(alignment: .leading, spacing: NativeAgentSpacing.xs) {
-                                ForEach(nbr.edges) { edge in
+                                ForEach(visibleEdges) { edge in
                                     KGEdgeRow(edge: edge, entities: nbr.neighbors, rootId: entity.id)
                                 }
                             }
                         }
+                    }
+                case let .partial(visibleCount, omittedUnrelatedCount):
+                    if let nbr = neighbors {
+                        NativePanel(title: "Relationships (\(visibleCount))", systemImage: "arrow.triangle.branch") {
+                            VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
+                                Label(
+                                    "\(omittedUnrelatedCount) unrelated relationship record\(omittedUnrelatedCount == 1 ? " was" : "s were") omitted.",
+                                    systemImage: "exclamationmark.triangle"
+                                )
+                                .font(NativeAgentFont.label)
+                                .foregroundStyle(.orange)
+                                if visibleEdges.isEmpty {
+                                    Text("No usable relationships were returned for this entity.")
+                                        .font(NativeAgentFont.body)
+                                        .foregroundStyle(.secondary)
+                                } else {
+                                    ForEach(visibleEdges) { edge in
+                                        KGEdgeRow(edge: edge, entities: nbr.neighbors, rootId: entity.id)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                case .notLoaded:
+                    NativePanel(title: "Relationships") {
+                        Text("Relationship evidence has not loaded yet.")
+                            .font(NativeAgentFont.body)
+                            .foregroundStyle(.secondary)
                     }
                 }
             }

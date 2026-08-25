@@ -7,10 +7,11 @@ enum MacSyncMobileNotificationRelay {
         deviceId: String,
         token: String,
         environment: String,
-        bundleId: String
+        bundleId: String,
+        dataRoot: URL = NativeAgentPaths.dataRoot
     ) async throws {
         let now = ISO8601DateFormatter().string(from: Date())
-        let path = NativeAgentPaths.dataRoot
+        let path = dataRoot
             .appendingPathComponent("notifications", isDirectory: true)
             .appendingPathComponent("push_tokens.json")
         try? FileManager.default.createDirectory(
@@ -26,6 +27,15 @@ enum MacSyncMobileNotificationRelay {
             } else {
                 root = [:]
             }
+            // A push token is one device credential. When APNs reassigns or a
+            // restored phone presents an existing token under a new device id,
+            // retain only the newest owner in BOTH canonical and compatibility
+            // stores; otherwise fan-out can target a stale device identity.
+            for (existingDeviceID, value) in root where existingDeviceID != deviceId {
+                guard case .object(let existing) = value,
+                      jsonString(existing["token"]) == token else { continue }
+                root.removeValue(forKey: existingDeviceID)
+            }
             var entry: [String: JSONValue] = [:]
             entry["deviceId"] = .string(deviceId)
             entry["token"] = .string(token)
@@ -37,7 +47,7 @@ enum MacSyncMobileNotificationRelay {
             try await persistence.writeJSON(.object(root), to: path)
         }
 
-        let legacyPath = NativeAgentPaths.dataRoot
+        let legacyPath = dataRoot
             .appendingPathComponent("mobile_push", isDirectory: true)
             .appendingPathComponent("tokens.json")
         try? FileManager.default.createDirectory(

@@ -87,6 +87,19 @@ enum TurnSummaryComputer {
         "assembly.stage", "stream.tick", "llm.call",
         "tool.dispatch", "file.touch", "thinking.delta", "memory.commit",
     ]
+    /// Every declared trace kind outside `allowedKinds` has an explicit iOS
+    /// privacy/product decision. Keep this separate from the catch-all bucket:
+    /// a newly-emitted kind must be added to one of these sets by the contract
+    /// test, rather than silently becoming indistinguishable from every other
+    /// unknown event on the phone.
+    static let deliberatelyIgnoredKinds: Set<String> = [
+        "turn.accepted", "context.ready", "provider.requestStarted",
+        "provider.firstDelta", "surface.outputEnqueued", "surface.firstRender",
+        "context.stage", "context.summary", "context.snapshot", "context.compact",
+        "context.history.summary", "context.attention.late-completion", "turn.plan",
+        "turn.terminal", "turn.failed", "turn.reaction", "motor.state",
+        "pump.distress", "pump.integration", "vision.attachment_unsupported",
+    ]
     static let otherKindBucket = "other"
 
     /// Identity fields (turnId/surface/sessionId) are also freeform strings; cap

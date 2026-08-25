@@ -93,6 +93,11 @@ public actor CognitiveSQLiteStore {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         self.databaseURL = dir.appendingPathComponent("cognition.sqlite")
         var config = Configuration()
+        // Without a busy timeout GRDB fails a write instantly with SQLITE_BUSY
+        // when any second connection (probe CLI, second process) holds the
+        // lock — persistSnapshot's affect/node snapshot would be lost, and
+        // recordReceipt swallows the throw. Matches every sibling store.
+        config.busyMode = .timeout(2)
         config.prepareDatabase { db in
             try db.execute(sql: "PRAGMA foreign_keys = ON")
         }
@@ -499,13 +504,17 @@ public actor CognitiveSQLiteStore {
         }
     }
 
-    public func appendReceipt(kind: String, payload: JSONValue, at now: Date) async throws {
-        let id = UUID()
+    public func appendReceipt(
+        kind: String,
+        payload: JSONValue,
+        at now: Date,
+        id: UUID = UUID()
+    ) async throws {
         let payloadJSON = Self.jsonString(payload)
         try await dbQueue.write { db in
             try db.execute(
                 sql: """
-                INSERT INTO cognitive_receipts (id, kind, payload_json, created_at)
+                INSERT OR IGNORE INTO cognitive_receipts (id, kind, payload_json, created_at)
                 VALUES (?, ?, ?, ?)
                 """,
                 arguments: [id.uuidString, kind, payloadJSON, now.timeIntervalSince1970]

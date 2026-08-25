@@ -20,6 +20,9 @@ private enum WorkflowOrchestrationProcessIdentity {
 // MARK: - SwiftNative impl
 
 public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestrationClient, MotorActionReadModelProviding {
+    /// A just-written state may outlive a handoff briefly.  Do not relabel it
+    /// as interrupted until this lease has expired.
+    private static let interruptedRunStateRecoveryAge: TimeInterval = 60 * 60
     private let root: URL
     private let persistence: SwiftNativePersistenceCore
     private let now: @Sendable () -> String
@@ -326,6 +329,40 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
         return array
     }
 
+    /// Re-check the same eligibility projection the mounted controls render.
+    /// This always runs against the state read inside the mutation's file lock;
+    /// a stale button or concurrent writer can therefore never overwrite a
+    /// terminal run merely because it was enabled one UI frame earlier.
+    private func requireRunControl(
+        _ action: String,
+        status: String,
+        approvalDecision: String? = nil
+    ) throws {
+        let availability = WorkflowRunControlPreflight.evaluate(
+            status: status,
+            approvalDecision: approvalDecision
+        )
+        let eligibility: WorkflowRunControlEligibility
+        switch action {
+        case "resume": eligibility = availability.resume
+        case "cancel": eligibility = availability.cancel
+        case "rollback": eligibility = availability.rollback
+        default:
+            throw WorkflowOrchestrationError.runControlIneligible(
+                action: action,
+                status: status,
+                reason: "unknown run control"
+            )
+        }
+        guard eligibility.isEligible else {
+            throw WorkflowOrchestrationError.runControlIneligible(
+                action: action,
+                status: status,
+                reason: eligibility.detail
+            )
+        }
+    }
+
     private func appendRun(_ run: JSONValue) async throws {
         let path = runsPath
         // M6 (2026-07-09): workflows/runs.jsonl appended forever while its
@@ -443,8 +480,120 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
         // irreversible effect, so recovery parks it for explicit review.
         try await reconcileInterruptedWorkflowRuns()
         // Python: list(reversed(tail_jsonl(runs_path, 50)))
-        let tail = try await persistence.tailJSONL(runsPath, limit: 50, maxBytes: 1_048_576)
-        return tail.reversed()
+        return try await readWorkflowRunLedgerFeedFamily().recentRuns
+    }
+
+    /// Read the live workflow ledger family without manufacturing a clean empty
+    /// state from damaged bytes.  `listWorkflowRuns()` deliberately returns
+    /// only `recentRuns` for route compatibility; this companion read model is
+    /// the operator-facing contract for source health, state drain, and
+    /// registry executability.
+    public func readWorkflowRunLedgerFeedFamily(
+        drainWindow: TimeInterval = 60 * 60,
+        observedAt: Date = Date()
+    ) async throws -> WorkflowRunLedgerFeedFamily {
+        let fm = FileManager.default
+
+        var registryStatusCounts: [String: Int] = [:]
+        var unsupportedStepKinds: [String: Int] = [:]
+        let registrySource: WorkflowRunLedgerFeedSource
+        if !fm.fileExists(atPath: registryPath.path) {
+            registrySource = .absent
+        } else {
+            do {
+                let raw = try JSONValue.parse(Data(contentsOf: registryPath))
+                if case .array(let rows) = raw {
+                    for row in rows {
+                        let status = stateString(row, "status")
+                        registryStatusCounts[status.isEmpty || status == "None" ? "(missing)" : status, default: 0] += 1
+                        for kind in WorkflowExecutionPreflight.evaluate(workflow: row).unsupportedStepKinds {
+                            unsupportedStepKinds[kind, default: 0] += 1
+                        }
+                    }
+                    registrySource = .available
+                } else {
+                    registrySource = .unavailable(reason: "top level is not a JSON array")
+                }
+            } catch {
+                registrySource = .unavailable(reason: error.localizedDescription)
+            }
+        }
+
+        let tail: SwiftNativePersistenceCore.JSONLTailReadReceipt
+        let runsSource: WorkflowRunLedgerFeedSource
+        var runsPathIsDirectory = ObjCBool(false)
+        if !fm.fileExists(atPath: runsPath.path, isDirectory: &runsPathIsDirectory) {
+            tail = SwiftNativePersistenceCore.JSONLTailReadReceipt(rows: [], physicalRowsScanned: 0, malformedJSONRowCount: 0, bytesRead: 0, truncatedToByteWindow: false)
+            runsSource = .absent
+        } else if runsPathIsDirectory.boolValue {
+            tail = SwiftNativePersistenceCore.JSONLTailReadReceipt(rows: [], physicalRowsScanned: 0, malformedJSONRowCount: 0, bytesRead: 0, truncatedToByteWindow: false)
+            runsSource = .unavailable(reason: "runs.jsonl is a directory")
+        } else {
+            do {
+                tail = try await persistence.tailJSONLReadReceipt(runsPath, limit: 50, maxBytes: 1_048_576)
+                runsSource = tail.malformedJSONRowCount == 0
+                    ? .available
+                    : .partial(malformedRecords: tail.malformedJSONRowCount)
+            } catch {
+                tail = SwiftNativePersistenceCore.JSONLTailReadReceipt(rows: [], physicalRowsScanned: 0, malformedJSONRowCount: 0, bytesRead: 0, truncatedToByteWindow: false)
+                runsSource = .unavailable(reason: error.localizedDescription)
+            }
+        }
+        let recentRuns = Array(tail.rows.reversed())
+        var runStatusCounts: [String: Int] = [:]
+        for run in recentRuns {
+            let status = stateString(run, "status")
+            runStatusCounts[status.isEmpty || status == "None" ? "(missing)" : status, default: 0] += 1
+        }
+
+        let stateDirectory = root.appendingPathComponent("workflows/run_state", isDirectory: true)
+        var isDirectory = ObjCBool(false)
+        let runStateSource: WorkflowRunLedgerFeedSource
+        var runStateStatusCounts: [String: Int] = [:]
+        var staleNonTerminalRunStateIDs: [String] = []
+        if !fm.fileExists(atPath: stateDirectory.path, isDirectory: &isDirectory) {
+            runStateSource = .absent
+        } else if !isDirectory.boolValue {
+            runStateSource = .unavailable(reason: "run_state is not a directory")
+        } else {
+            do {
+                let paths = try fm.contentsOfDirectory(
+                    at: stateDirectory,
+                    includingPropertiesForKeys: [.contentModificationDateKey],
+                    options: [.skipsHiddenFiles]
+                ).filter { $0.pathExtension == "json" }
+                var malformed = 0
+                for path in paths {
+                    do {
+                        let state = try JSONValue.parse(Data(contentsOf: path))
+                        guard case .object = state else { throw WorkflowOrchestrationError.unknownRunState(path.lastPathComponent) }
+                        let status = stateString(state, "status")
+                        runStateStatusCounts[status.isEmpty || status == "None" ? "(missing)" : status, default: 0] += 1
+                        let terminal = ["succeeded", "completed", "done", "failed", "canceled", "cancelled", "rolled_back", "expired"]
+                        if !terminal.contains(status),
+                           let modified = try? path.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
+                           observedAt.timeIntervalSince(modified) > drainWindow {
+                            let runID = stateString(state, "id")
+                            staleNonTerminalRunStateIDs.append(runID.isEmpty || runID == "None" ? path.deletingPathExtension().lastPathComponent : runID)
+                        }
+                    } catch {
+                        malformed += 1
+                    }
+                }
+                staleNonTerminalRunStateIDs.sort()
+                runStateSource = malformed == 0 ? .available : .partial(malformedRecords: malformed)
+            } catch {
+                runStateSource = .unavailable(reason: error.localizedDescription)
+            }
+        }
+
+        return WorkflowRunLedgerFeedFamily(
+            recentRuns: recentRuns, runsSource: runsSource, registrySource: registrySource,
+            runStateSource: runStateSource, registryStatusCounts: registryStatusCounts,
+            unsupportedStepKinds: unsupportedStepKinds, runStatusCounts: runStatusCounts,
+            runStateStatusCounts: runStateStatusCounts,
+            staleNonTerminalRunStateIDs: staleNonTerminalRunStateIDs
+        )
     }
 
     private func reconcileInterruptedWorkflowRuns(only runId: String? = nil) async throws {
@@ -462,8 +611,19 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
 
         var repaired: [JSONValue] = []
         for path in paths where FileManager.default.fileExists(atPath: path.path) {
+            guard runStateIsOldEnoughForInterruptedRecovery(path) else { continue }
             let repair: @Sendable () async throws -> JSONValue? = { [self] in
                 let current = await persistence.readJSON(path, defaultValue: .object([:]))
+                let runId = stateString(current, "id")
+                if let terminal = try await terminalLedgerRun(runId: runId) {
+                    var joined = setField(current, "status", .string(stateString(terminal, "status")))
+                    joined = setField(joined, "completedAt", objectField(terminal, "completedAt") ?? .string(now()))
+                    joined = setField(joined, "updatedAt", .string(now()))
+                    joined = setField(joined, "activeStepAttempt", .null)
+                    joined = setField(joined, "activeStepTimeoutSeconds", .null)
+                    try await persistence.writeJSON(joined, to: path)
+                    return nil
+                }
                 guard stateString(current, "status") == "running",
                       case .object(let attempt)? = objectField(current, "activeStepAttempt"),
                       !attempt.isEmpty,
@@ -514,6 +674,24 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
                 ]
             )
         }
+    }
+
+    /// A durable terminal ledger record wins over a stale running state file.
+    /// This is a read-side join only: it repairs the canonical state but never
+    /// appends a second terminal row to `runs.jsonl`.
+    private func terminalLedgerRun(runId: String) async throws -> JSONValue? {
+        guard !runId.isEmpty, runId != "None" else { return nil }
+        let rows = try await persistence.tailJSONL(runsPath, limit: 512, maxBytes: 4 * 1_048_576)
+        return rows.reversed().first { row in
+            stateString(row, "id") == runId && ["succeeded", "failed", "canceled", "rolled_back"].contains(stateString(row, "status"))
+        }
+    }
+
+    private func runStateIsOldEnoughForInterruptedRecovery(_ path: URL) -> Bool {
+        guard let modifiedAt = try? path.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate else {
+            return false
+        }
+        return Date().timeIntervalSince(modifiedAt) >= Self.interruptedRunStateRecoveryAge
     }
 
     /// Mirror of Runtime.record_activity for the workflow.save side-effect:
@@ -641,6 +819,7 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
         let statePath = runStatePath(id)
         let body: @Sendable () async throws -> JSONValue = { [self] in
             var state = try await loadState(id)
+            try requireRunControl("cancel", status: stateString(state, "status"))
             // Python sets status/completedAt/updatedAt with TWO separate now_iso()
             // calls (completedAt then updatedAt). They can differ by microseconds;
             // mirror that by stamping each independently.
@@ -660,6 +839,10 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
         // str(state.get("workflowName") or run_id).
         let wfName = stateString(state, "workflowName")
         let title = (wfName == "None" || wfName.isEmpty) ? id : wfName
+        // The state file is authoritative for a reload, while runs.jsonl is
+        // the mounted list's durable history. Record BOTH before returning a
+        // success so refresh cannot leave a canceled run looking active.
+        try await appendRun(WorkflowRunState.publicRun(state))
         try await appendTrace(
             kind: "workflow.v2.cancel",
             title: title,
@@ -686,6 +869,7 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
         let result: (state: JSONValue, receipts: [JSONValue]) = try await {
             let body: @Sendable () async throws -> (JSONValue, [JSONValue]) = { [self] in
                 var state = try await loadState(id)
+                try requireRunControl("rollback", status: stateString(state, "status"))
                 var receipts: [JSONValue] = []
                 if case .object(let obj) = state, case .array(let steps)? = obj["steps"] {
                     for receipt in steps.reversed() {
@@ -725,6 +909,7 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
         }()
         let wfName = stateString(result.state, "workflowName")
         let title = (wfName == "None" || wfName.isEmpty) ? id : wfName
+        try await appendRun(WorkflowRunState.publicRun(result.state))
         try await appendTrace(
             kind: "workflow.v2.rollback",
             title: title,
@@ -1771,6 +1956,11 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
                 NSLocalizedDescriptionKey: "Workflow approval has not been approved (approval record missing)"
             ])
         }
+        try requireRunControl(
+            "resume",
+            status: stateString(state, "status"),
+            approvalDecision: approval.decision
+        )
         if approval.decision == ApprovalDecision.denied.rawValue ||
             approval.decision == ApprovalDecision.canceled.rawValue {
             let decision = approval.decision ?? ApprovalDecision.denied.rawValue

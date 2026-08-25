@@ -2,6 +2,8 @@ import Foundation
 import Testing
 import NativeAgentCore
 import MemoryV2
+import PersistenceCore
+import TelegramBot
 @testable import NativeAgentApp
 
 @Suite("Memory note persistence", .serialized)
@@ -103,6 +105,78 @@ struct MemoryNotePersistenceTests {
 
         #expect(try await storage.listMemory(kind: nil).isEmpty)
         #expect(legacyNoteFiles(under: root).isEmpty)
+    }
+
+    // Coverage ledger: telegram.memoryWriterBridge
+    //
+    // The TelegramBot target proves slash parsing with a protocol double, but
+    // that cannot establish that the app-owned bridge commits a canonical
+    // record before its returned ID becomes the user's success reply. Exercise
+    // the real cross-module route here: /remember -> TelegramMemoryWriterBridge
+    // -> MemoryV2 -> response.
+    @Test func telegramRememberReturnsOnlyTheIDOfItsDurablyStoredCanonicalRecord() async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let storage = InMemoryMemoryStorage()
+        let memory = SwiftNativeMemoryV2(
+            embedder: MockEmbeddingProvider(),
+            storage: storage
+        )
+        let bot = SwiftNativeTelegramBot(
+            dataRoot: root,
+            completenessDeps: TelegramBotCompletenessDeps(
+                memory: TelegramMemoryWriterBridge(dataRoot: root, memory: memory)
+            )
+        )
+
+        let reply = try #require(
+            try await bot.dispatchSwiftSlashCommand(
+                "/remember",
+                args: ["User", "prefers", "answer-first", "release", "notes."],
+                chatId: 42
+            )
+        )
+        let records = try await storage.listMemory(kind: nil)
+        #expect(records.count == 1)
+        let record = try #require(records.first)
+
+        // Exact equality rules out a generated/placeholder acknowledgement:
+        // the user-facing ID must name the canonical row just committed.
+        #expect(reply == "Remembered: \(record.id)")
+        #expect(record.text == "User prefers answer-first release notes.")
+        #expect(record.sourceRunId == "telegram:/remember")
+        guard case .object(let metadata)? = record.extras else {
+            Issue.record("the canonical Telegram memory must retain its command provenance")
+            return
+        }
+        #expect(metadata["surface"] == PersistenceCore.JSONValue.string("telegram"))
+        #expect(metadata["command"] == PersistenceCore.JSONValue.string("/remember"))
+    }
+
+    @Test func telegramRememberFailureDoesNotClaimSuccessOrLeaveACanonicalRow() async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let storage = InMemoryMemoryStorage()
+        let failingMemory = SwiftNativeMemoryV2(
+            embedder: FailClosedEmbeddingProvider(),
+            storage: storage
+        )
+        let bot = SwiftNativeTelegramBot(
+            dataRoot: root,
+            completenessDeps: TelegramBotCompletenessDeps(
+                memory: TelegramMemoryWriterBridge(dataRoot: root, memory: failingMemory)
+            )
+        )
+
+        let reply = try #require(
+            try await bot.dispatchSwiftSlashCommand(
+                "/remember", args: ["This", "must", "fail", "closed."], chatId: 42
+            )
+        )
+
+        #expect(reply.hasPrefix("Failed to remember:"))
+        #expect(!reply.contains("Remembered:"))
+        #expect(try await storage.listMemory(kind: nil).isEmpty)
     }
 
     @Test func deletingLastImportedNoteThenRelaunchingDoesNotResurrectIt() async throws {

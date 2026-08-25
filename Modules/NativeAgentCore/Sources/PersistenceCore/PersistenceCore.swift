@@ -358,6 +358,11 @@ public protocol PersistenceCoreProtocol: Sendable {
     func writeJSON(_ value: JSONValue, to path: URL) async throws
     func appendJSONL(_ record: JSONValue, to path: URL) async throws
     func tailJSONL(_ path: URL, limit: Int, maxBytes: Int?) async throws -> [JSONValue]
+    func tailJSONLReadReceipt(
+        _ path: URL,
+        limit: Int,
+        maxBytes: Int?
+    ) async throws -> SwiftNativePersistenceCore.JSONLTailReadReceipt
     func readJSONL(_ path: URL) async throws -> [JSONValue]
     func replaceJSONL(_ records: [JSONValue], to path: URL) async throws
     /// REQUIREMENTS, not just extension members: `SwiftNativeDeskStore` holds an
@@ -421,6 +426,24 @@ public struct JSONLReadReport: Sendable, Equatable {
 }
 
 extension PersistenceCoreProtocol {
+    /// Non-file-backed conformers have no physical JSONL rows beyond the
+    /// bounded values they return. Native file persistence supplies the real
+    /// malformed-row accounting through its witness.
+    public func tailJSONLReadReceipt(
+        _ path: URL,
+        limit: Int,
+        maxBytes: Int?
+    ) async throws -> SwiftNativePersistenceCore.JSONLTailReadReceipt {
+        let rows = try await tailJSONL(path, limit: limit, maxBytes: maxBytes)
+        return SwiftNativePersistenceCore.JSONLTailReadReceipt(
+            rows: rows,
+            physicalRowsScanned: rows.count,
+            malformedJSONRowCount: 0,
+            bytesRead: 0,
+            truncatedToByteWindow: false
+        )
+    }
+
     /// `readJSONL` plus what the scan discarded.
     ///
     /// THE DEFAULT NEVER CLAIMS A CLEAN SCAN IT HAS NOT PROVEN (gpt-5.5 review
@@ -476,19 +499,19 @@ extension PersistenceCoreProtocol {
         try await tailJSONL(path, limit: 20, maxBytes: 1_048_576)
     }
 
-    /// Default atomic JSONL replacement (op-log compaction truncate). Single
-    /// rename via `Data.write(.atomic)` — no window where the file is
-    /// partially written. `SwiftNativePersistenceCore` supplies its own
-    /// implementation; shims that don't override inherit this one.
+    /// Default atomic JSONL replacement (op-log compaction truncate).
+    ///
+    /// A conformer that inherits this implementation must retain the same
+    /// durability contract as the native writer. Compaction writes its base
+    /// first; accepting a non-durable truncate afterward would make a power
+    /// loss look like a successful commit while losing the replay tail.
     public func replaceJSONL(_ records: [JSONValue], to path: URL) async throws {
-        let dir = path.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         var payload = Data()
         for record in records {
             payload.append(contentsOf: try record.serialize(pretty: false).utf8)
             payload.append(0x0A)
         }
-        try payload.write(to: path, options: .atomic)
+        try await writeDataAtomicDurable(payload, to: path)
         _ = chmod(path.path, 0o600)
     }
 }
@@ -498,6 +521,18 @@ extension PersistenceCoreProtocol {
 /// Native Swift implementation. Pure file IO — stateless and implicitly Sendable.
 public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
     public init() {}
+
+    /// Observable only through task-local evaluation scope. Keeping the
+    /// durability phases beside the real atomic writer lets a boundary eval
+    /// distinguish a crash-atomic rename from the required parent-directory
+    /// flush without changing the product's I/O path.
+    enum AtomicWriteDurabilityPhase: Sendable, Equatable {
+        case temporaryFileSynced
+        case parentDirectorySynced
+    }
+
+    @TaskLocal static var atomicWriteDurabilityObserver:
+        (@Sendable (AtomicWriteDurabilityPhase) -> Void)?
 
     public func readJSON(_ path: URL, defaultValue: JSONValue) async -> JSONValue {
         guard let data = try? Data(contentsOf: path) else { return defaultValue }
@@ -677,11 +712,64 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
         _ = chmod(path.path, 0o600)
     }
 
+    /// Bounded JSONL read result. Consumers which need to distinguish an empty
+    /// trace from a malformed one can surface this receipt without changing the
+    /// canonical tailing semantics used by the rest of the persistence layer.
+    public struct JSONLTailReadReceipt: Sendable {
+        public let rows: [JSONValue]
+        public let physicalRowsScanned: Int
+        public let malformedJSONRowCount: Int
+        public let bytesRead: Int
+        public let truncatedToByteWindow: Bool
+
+        public init(
+            rows: [JSONValue],
+            physicalRowsScanned: Int,
+            malformedJSONRowCount: Int,
+            bytesRead: Int,
+            truncatedToByteWindow: Bool
+        ) {
+            self.rows = rows
+            self.physicalRowsScanned = physicalRowsScanned
+            self.malformedJSONRowCount = malformedJSONRowCount
+            self.bytesRead = bytesRead
+            self.truncatedToByteWindow = truncatedToByteWindow
+        }
+    }
+
     public func tailJSONL(_ path: URL, limit: Int, maxBytes: Int?) async throws -> [JSONValue] {
-        guard FileManager.default.fileExists(atPath: path.path) else { return [] }
+        let receipt = try await tailJSONLReadReceipt(path, limit: limit, maxBytes: maxBytes)
+        return receipt.rows
+    }
+
+    /// Same bounded physical-line tail as `tailJSONL`, with enough receipt data
+    /// for read-only evaluations to disclose skipped malformed input. The rows
+    /// remain exactly the valid JSON values `tailJSONL` has always returned.
+    public func tailJSONLReadReceipt(
+        _ path: URL,
+        limit: Int,
+        maxBytes: Int?
+    ) async throws -> JSONLTailReadReceipt {
+        guard FileManager.default.fileExists(atPath: path.path) else {
+            return JSONLTailReadReceipt(
+                rows: [],
+                physicalRowsScanned: 0,
+                malformedJSONRowCount: 0,
+                bytesRead: 0,
+                truncatedToByteWindow: false
+            )
+        }
         let attrs = try FileManager.default.attributesOfItem(atPath: path.path)
         let size = (attrs[.size] as? NSNumber)?.intValue ?? 0
-        if size == 0 { return [] }
+        if size == 0 {
+            return JSONLTailReadReceipt(
+                rows: [],
+                physicalRowsScanned: 0,
+                malformedJSONRowCount: 0,
+                bytesRead: 0,
+                truncatedToByteWindow: false
+            )
+        }
 
         let toRead: Int
         let seekFromEnd: Bool
@@ -704,7 +792,23 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
         // parse and skip malformed entries. So when some of the trailing lines
         // are malformed the return count is < limit (matches Python).
         let tail = lines.suffix(limit)
-        return tail.compactMap { try? JSONValue.parse(Data($0.utf8)) }
+        var rows: [JSONValue] = []
+        rows.reserveCapacity(tail.count)
+        var malformedJSONRowCount = 0
+        for line in tail {
+            if let row = try? JSONValue.parse(Data(line.utf8)) {
+                rows.append(row)
+            } else {
+                malformedJSONRowCount += 1
+            }
+        }
+        return JSONLTailReadReceipt(
+            rows: rows,
+            physicalRowsScanned: tail.count,
+            malformedJSONRowCount: malformedJSONRowCount,
+            bytesRead: data.count,
+            truncatedToByteWindow: seekFromEnd
+        )
     }
 
     /// Decode utf-8 with replacement, split on `\n`, drop trailing empty line, and
@@ -870,7 +974,11 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
 
     /// Write `data` to `path` atomically via a side temp file + rename(2),
     /// using the NativeAgent temp-name convention and 0600 mode.
-    private static func atomicWrite(_ data: Data, to path: URL) throws {
+    /// Internal (not private) so the JSONL cap helpers below share the same
+    /// fsync-before-rename + parent-dir-fsync durability; their previous
+    /// bare `Data.write(.atomic)` + replaceItemAt could lose the whole feed
+    /// on power loss mid-trim (sweep 2026-08-21).
+    static func atomicWrite(_ data: Data, to path: URL) throws {
         let dir = path.deletingLastPathComponent()
         let name = path.lastPathComponent
         let pid = getpid()
@@ -924,6 +1032,7 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
             let err = String(cString: strerror(errno))
             throw PersistenceCoreError.ioFailure("fsync(tmp) failed: \(err)")
         }
+        atomicWriteDurabilityObserver?(.temporaryFileSynced)
         if close(fd) != 0 {
             fdClosed = true
             let err = String(cString: strerror(errno))
@@ -953,6 +1062,7 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
                 "fsync(parent directory) failed: \(String(cString: strerror(errno)))"
             )
         }
+        atomicWriteDurabilityObserver?(.parentDirectorySynced)
     }
 }
 
@@ -1100,14 +1210,11 @@ public func enforceJSONLLineCap(
     guard lines.count > maxLines else { return 0 }
     let dropped = lines.count - maxLines
     let trimmed = lines.suffix(maxLines).joined(separator: "\n") + "\n"
-    // Fixed-path tmp sibling; clean on every exit path (state-lifecycle
-    // hygiene — same as the NotificationInbox cap).
-    let tmp = path.appendingPathExtension("captmp")
-    defer { try? FileManager.default.removeItem(at: tmp) }
-    try Data(trimmed.utf8).write(to: tmp, options: .atomic)
-    _ = chmod(tmp.path, 0o600)
-    _ = try FileManager.default.replaceItemAt(path, withItemAt: tmp)
-    _ = chmod(path.path, 0o600)
+    // Durable rewrite: the append that preceded this trim was fsync'd, so the
+    // trim must not be the weak link — a bare .atomic write + replaceItemAt
+    // can commit the rename before the data blocks on power loss, leaving the
+    // feed truncated with the old contents already unlinked.
+    try SwiftNativePersistenceCore.atomicWrite(Data(trimmed.utf8), to: path)
     return dropped
 }
 
@@ -1156,12 +1263,8 @@ public func enforceJSONLByteCap(
     let dropped = max(0, lines.count - kept.count)
     guard dropped > 0 else { return 0 }
     let trimmed = kept.joined(separator: "\n") + "\n"
-    let tmp = path.appendingPathExtension("bytecaptmp")
-    defer { try? FileManager.default.removeItem(at: tmp) }
-    try Data(trimmed.utf8).write(to: tmp, options: .atomic)
-    _ = chmod(tmp.path, 0o600)
-    _ = try FileManager.default.replaceItemAt(path, withItemAt: tmp)
-    _ = chmod(path.path, 0o600)
+    // Same durable rewrite as enforceJSONLLineCap — see the note there.
+    try SwiftNativePersistenceCore.atomicWrite(Data(trimmed.utf8), to: path)
     return dropped
 }
 
@@ -1344,6 +1447,9 @@ private func pathInsideAppBundle(_ candidate: URL) -> Bool {
 ///   1. `NATIVE_AGENT_DATA_ROOT` env var, used as-is. `~` is NOT expanded
 ///      — Python does `Path(env)` with no expanduser, so a literal `~` in
 ///      the env var produces a literal `~` segment in the URL. Matches.
+///   1b. Test-harness backstop: a `swiftpm-testing-helper` / xctest process
+///      with no env pin gets a per-process temp root (`automaticTestDataRoot`)
+///      so bare tests never reach the checkout's live `data/` via 2 or 3.
 ///   2. Stamped REPO_PATH (Resources/REPO_PATH inside the app bundle, written
 ///      by install_app.sh). The stamp target is canonicalized via
 ///      `resolvingSymlinksInPath` and validated against ALL THREE
@@ -1360,12 +1466,49 @@ private func pathInsideAppBundle(_ candidate: URL) -> Bool {
 ///      creates on first write). Matches Python's
 ///      `Path.home() / "Library" / "Application Support" / APP`.
 ///
-/// Both `fileManager` and `environment` are injectable so tests can pin
-/// CWD-walkup behavior (via a FileManager subclass overriding
-/// `currentDirectoryPath`) and exercise the env var branch in isolation.
+/// The internal resolver also receives bundle identity as a value, so its
+/// public-app branch is executable without mutating process-global
+/// `Bundle.main` state.
 public func defaultDataRoot(
     fileManager: FileManager = .default,
-    environment: [String: String] = ProcessInfo.processInfo.environment
+    environment: [String: String] = ProcessInfo.processInfo.environment,
+    processName: String = ProcessInfo.processInfo.processName
+) -> URL {
+    resolveDefaultDataRoot(
+        fileManager: fileManager,
+        environment: environment,
+        processName: processName,
+        bundleContext: .main
+    )
+}
+
+/// The bundle identity consulted by the canonical data-root resolver. Keeping
+/// this as a value rather than reaching for `Bundle.main` inside a branch makes
+/// the installed-public-app boundary executable without changing the runtime
+/// path: production always supplies `.main` above.
+internal struct DefaultDataRootBundleContext: Sendable {
+    let bundleURL: URL
+    let resourcesURL: URL?
+
+    static var main: Self {
+        Self(bundleURL: Bundle.main.bundleURL, resourcesURL: Bundle.main.resourceURL)
+    }
+
+    init(bundleURL: URL, resourcesURL: URL?) {
+        self.bundleURL = bundleURL
+        self.resourcesURL = resourcesURL
+    }
+}
+
+/// Internal resolver seam for the process-global public entry point above.
+/// `fallbackRoot` exists only so the executable contract can prove where a
+/// first write lands without touching a developer's real Application Support.
+internal func resolveDefaultDataRoot(
+    fileManager: FileManager = .default,
+    environment: [String: String] = ProcessInfo.processInfo.environment,
+    processName: String = ProcessInfo.processInfo.processName,
+    bundleContext: DefaultDataRootBundleContext = .main,
+    fallbackRoot: URL? = nil
 ) -> URL {
     // 1. Env var wins. Empty string is treated as unset (matches Python:
     //    `if env: return Path(env)` — Python treats "" as falsy). The env
@@ -1391,10 +1534,23 @@ public func defaultDataRoot(
         return URL(fileURLWithPath: raw)
     }
 
+    // 1b. Test-harness backstop (2026-08-23). Under a bare `swift test` the
+    //     process is `swiftpm-testing-helper`, no env var is set, and branch 3
+    //     walks up from the checkout into the LIVE repo `data/` — 639 fake
+    //     `llm.call` rows landed in traces/events.jsonl in one week from
+    //     adapter tests alone. Same predicate TurnTrace.automaticTestRoot uses;
+    //     an explicit NATIVE_AGENT_DATA_ROOT (branch 1) still outranks it.
+    if let testRoot = automaticTestDataRoot(environment: environment, processName: processName) {
+        return testRoot
+    }
+
     // 2. Stamped REPO_PATH (bundle install). Look for a `REPO_PATH` text file
-    //    next to Bundle.main's Resources hierarchy. Mirrors Python's
+    //    next to the running bundle's Resources hierarchy. Mirrors Python's
     //    `_bundle_repo_path` walk over `Path(__file__).parent`, etc.
-    if let stamped = _stampedRepoFromBundle(fileManager: fileManager) {
+    if let stamped = _stampedRepoFromBundle(
+        fileManager: fileManager,
+        bundleContext: bundleContext
+    ) {
         let dataDir = stamped.appendingPathComponent("data", isDirectory: true)
         if fileManager.fileExists(atPath: dataDir.path) {
             return dataDir
@@ -1415,8 +1571,11 @@ public func defaultDataRoot(
     //    Guarded HERE in the canonical resolver — not just in the app-side
     //    NativeAgentPaths wrapper — because hundreds of call sites reach this
     //    function directly.
-    if _isUnstampedPublicAppBundle(fileManager: fileManager) {
-        return libraryAppSupportFallback(fileManager: fileManager)
+    if _isUnstampedPublicAppBundle(
+        fileManager: fileManager,
+        bundleContext: bundleContext
+    ) {
+        return fallbackRoot ?? libraryAppSupportFallback(fileManager: fileManager)
     }
     let cwd = URL(fileURLWithPath: fileManager.currentDirectoryPath)
     var dir = cwd
@@ -1442,7 +1601,24 @@ public func defaultDataRoot(
 
     // 4. AppSupport fallback (bare — no /data suffix, no dir creation;
     //    matches Python's `Path.home() / "Library" / ... / APP`).
-    return libraryAppSupportFallback(fileManager: fileManager)
+    return fallbackRoot ?? libraryAppSupportFallback(fileManager: fileManager)
+}
+
+/// Per-process temp data root for test-harness processes, nil otherwise.
+/// PID-keyed so parallel test processes stay isolated; bare (no dir creation),
+/// like every other branch — callers create on first write.
+public func automaticTestDataRoot(
+    environment: [String: String] = ProcessInfo.processInfo.environment,
+    processName: String = ProcessInfo.processInfo.processName,
+    temporaryDirectory: URL = FileManager.default.temporaryDirectory
+) -> URL? {
+    let p = processName.lowercased()
+    guard environment["XCTestConfigurationFilePath"] != nil
+            || p.contains("xctest")
+            || p.contains("swiftpm-testing-helper")
+            || p.contains("packagetests") else { return nil }
+    return temporaryDirectory.appendingPathComponent(
+        "NativeAgent-TestDataRoot-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
 }
 
 /// True only for a distributed public build: a real `.app` bundle carrying a
@@ -1450,9 +1626,12 @@ public func defaultDataRoot(
 /// install_app.sh are always stamped, and test/CLI processes are not `.app`
 /// bundles, so both keep full dev resolution. Mirrors (and must stay in sync
 /// with) `NativeAgentPaths.isPublicReleaseBundle` in the app layer.
-private func _isUnstampedPublicAppBundle(fileManager: FileManager) -> Bool {
-    guard Bundle.main.bundleURL.pathExtension == "app",
-          let resourcesURL = Bundle.main.resourceURL else { return false }
+internal func _isUnstampedPublicAppBundle(
+    fileManager: FileManager,
+    bundleContext: DefaultDataRootBundleContext = .main
+) -> Bool {
+    guard bundleContext.bundleURL.pathExtension == "app",
+          let resourcesURL = bundleContext.resourcesURL else { return false }
     if fileManager.fileExists(atPath: resourcesURL.appendingPathComponent("REPO_PATH").path) {
         return false
     }
@@ -1553,14 +1732,16 @@ public func libraryAppSupportFallback(
 /// the running bundle's Resources hierarchy and return its target as a URL.
 /// Returns `nil` outside a stamped bundle (dev path, swift test runner) —
 /// callers fall through to the next resolution step.
-private func _stampedRepoFromBundle(fileManager: FileManager) -> URL? {
-    let main = Bundle.main
+private func _stampedRepoFromBundle(
+    fileManager: FileManager,
+    bundleContext: DefaultDataRootBundleContext = .main
+) -> URL? {
     var bases: [URL] = []
-    if let res = main.resourceURL { bases.append(res) }
-    bases.append(main.bundleURL
+    if let res = bundleContext.resourcesURL { bases.append(res) }
+    bases.append(bundleContext.bundleURL
         .appendingPathComponent("Contents", isDirectory: true)
         .appendingPathComponent("Resources", isDirectory: true))
-    bases.append(main.bundleURL)
+    bases.append(bundleContext.bundleURL)
     return _stampedRepoFromBundleBases(bases, fileManager: fileManager)
 }
 

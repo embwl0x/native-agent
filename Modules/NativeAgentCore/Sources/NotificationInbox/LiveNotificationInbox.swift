@@ -107,6 +107,23 @@ public actor LiveNotificationInbox {
             var lines = try Self.readLines(path)
             guard let index = lines.firstIndex(where: { Self.id(of: $0.row) == id }),
                   case .object(var object)? = lines[index].row else { return false }
+            // A detail sheet may appear more than once while the same card is
+            // already open.  Its automatic read action is therefore a
+            // state-transition request, not a reason to churn `read_at` (and
+            // the whole JSONL file) on every appearance.  Preserve a prior
+            // read timestamp once the requested state is already complete;
+            // an old read row with no timestamp is still repaired below.
+            let existingStatus: String? = {
+                guard case .string(let value)? = object["status"] else { return nil }
+                return value
+            }()
+            let hasReadTimestamp: Bool = {
+                guard case .string(let value)? = object["read_at"] else { return false }
+                return !value.isEmpty
+            }()
+            if existingStatus == status, readAt == nil || hasReadTimestamp {
+                return true
+            }
             object["status"] = .string(status)
             if let readAt { object["read_at"] = .string(readAt) }
             let row = JSONValue.object(object)

@@ -128,7 +128,7 @@ for url in jsonlFiles(in: messagesDir) {
 
 guard !messages.isEmpty else {
     print("no assistant messages in window")
-    exit(0)
+    exit(1)
 }
 
 var counts: [String: Int] = [:]

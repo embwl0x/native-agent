@@ -653,6 +653,32 @@ extension AppModel {
     var isBusy: Bool { busySessions.contains(activeChatSessionId) }
     /// True iff the active chat session is actively streaming a response.
     var isChatStreaming: Bool { streamingSessions.contains(activeChatSessionId) }
+
+    /// The live-task-backed running set used by pinned conversation tabs.
+    /// `streamingSessions` is intentionally a broad runtime marker while a
+    /// producer unwinds, migrates a placeholder, or processes Stop. A tab's
+    /// green dot is a narrower claim: this exact session still has an
+    /// in-flight chat task. Intersecting the two owners prevents a stale
+    /// marker from becoming permanent "running" chrome.
+    var pinnedTabRunningSessionIDs: Set<String> {
+        Set(Set(chatTasks.keys).intersection(streamingSessions).filter {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        })
+    }
+
+    /// Clears one exact task generation after its producer has reached a
+    /// terminal path. Generation matching prevents a late completion or
+    /// failure from clearing the running marker for a newer turn.
+    @discardableResult
+    func finishChatTurnRuntime(sessionId: String, generation: Int) -> Bool {
+        guard chatTaskGenerations[sessionId] == generation else { return false }
+        streamingSessions.remove(sessionId)
+        busySessions.remove(sessionId)
+        chatTasks[sessionId] = nil
+        chatTaskGenerations[sessionId] = nil
+        return true
+    }
+
     /// Back-compat: the single "running" session id many UI sites still ask
     /// about. We return the active session if it's running, else any other
     /// running session (so "another session running" banners can still
@@ -665,6 +691,18 @@ extension AppModel {
     var anySessionBusy: Bool { !busySessions.isEmpty }
     /// True if any session anywhere is streaming.
     var anySessionStreaming: Bool { !streamingSessions.isEmpty }
+
+    /// The exact runtime projection mounted by the "other sessions running"
+    /// banner. It excludes only the foreground session, preserves canonical
+    /// session-list order, and retains an unknown running id until the user can
+    /// stop it or a lifecycle path clears it.
+    var otherRunningChatSessionIDs: [String] {
+        MacChatOtherSessionsProjection.otherRunning(
+            streamingSessionIDs: streamingSessions,
+            activeSessionID: activeChatSessionId,
+            canonicalSessionIDs: chatSessions.map(\.id)
+        )
+    }
 
     func isSessionBusy(_ sessionId: String) -> Bool {
         guard !sessionId.isEmpty else { return false }

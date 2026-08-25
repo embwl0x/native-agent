@@ -63,4 +63,18 @@ struct HermeticDataRootCanaryTests {
         // the repo's tracked data/ directory.
         #expect(!defaultDataRoot().path.hasSuffix("/NativeAgent/data"))
     }
+
+    /// Bare `swift test` (no env pin) must resolve to a per-process temp root,
+    /// never the checkout's live data/. This is the branch that stopped adapter
+    /// tests from writing fake llm.call rows into traces/events.jsonl.
+    @Test func defaultDataRoot_testHarnessProcessNeverResolvesIntoTheCheckout() {
+        let root = defaultDataRoot(environment: [:], processName: "swiftpm-testing-helper")
+        #expect(!root.path.hasSuffix("/NativeAgent/data"))
+        #expect(root.path.contains("NativeAgent-TestDataRoot-"))
+        // a real app process keeps ordinary resolution
+        #expect(automaticTestDataRoot(environment: [:], processName: "NativeAgent") == nil)
+        // the explicit pin still wins over the backstop
+        let pinned = defaultDataRoot(environment: ["NATIVE_AGENT_DATA_ROOT": "/tmp/x"], processName: "swiftpm-testing-helper")
+        #expect(pinned.path == "/tmp/x")
+    }
 }

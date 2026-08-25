@@ -227,7 +227,7 @@ extension SwiftNativeTrustCenter: OriginAwareAutonomyResolver {
     /// unrecognized caller.
     private nonisolated static func isLocalInteractiveSurface(_ surface: String) -> Bool {
         switch surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "chat", "codex-bridge", "claude-bridge":
+        case "chat", "desk", "codex-bridge", "claude-bridge":
             return true
         // Wave 5b: the three Workshop spellings now come from
         // `WorkshopSurfaceVocabulary.gateSpellings` instead of being open-coded.
@@ -353,6 +353,10 @@ extension SwiftNativeTrustCenter: OriginAwareAutonomyResolver {
              // W3.5 — the fused view. Same category, same read tier: it draws
              // numbers on a picture of the screen and acts on nothing.
              "mac_view", "mac.view", "mac_attention", "mac.attention",
+             // native-look item 2 — the perception compiler. Same category,
+             // same read tier: it distills the AX tree the reads above return
+             // and acts on nothing.
+             "mac_look", "mac.look",
              // W7 — mac_nudge. Same category, same read-tier treatment: with
              // the category on it resolves to auto with no approval floor,
              // exactly like mac_ax_status. It is absent from

@@ -1,9 +1,50 @@
 import Foundation
 import SwiftUI
 
+/// The state transition behind the Voice Auto-Read setting. Keeping the
+/// decision separate from the speaker prevents SwiftUI re-renders from
+/// changing what "new reply" means and makes every refusal inspectable.
+enum ChatVoiceAutoReadGate {
+    enum Decision: Equatable {
+        case speak(messageID: String, text: String)
+        case disabled
+        case unprimedSession
+        case noMessage
+        case messageFromAnotherSession
+        case notAssistant
+        case emptyReply
+        case alreadyRead
+    }
+
+    static func decide(
+        enabled: Bool,
+        sessionID: String,
+        isSessionPrimed: Bool,
+        lastMessage: ChatMessage?,
+        lastReadMessageID: String?
+    ) -> Decision {
+        guard enabled else { return .disabled }
+        guard isSessionPrimed else { return .unprimedSession }
+        guard let lastMessage else { return .noMessage }
+
+        let cleanSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanSessionID.isEmpty else { return .messageFromAnotherSession }
+        if let messageSessionID = lastMessage.sessionId {
+            guard messageSessionID.trimmingCharacters(in: .whitespacesAndNewlines) == cleanSessionID else {
+                return .messageFromAnotherSession
+            }
+        }
+        guard lastMessage.role == "assistant" else { return .notAssistant }
+        let text = lastMessage.content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return .emptyReply }
+        guard lastMessage.id != lastReadMessageID else { return .alreadyRead }
+        return .speak(messageID: lastMessage.id, text: text)
+    }
+}
+
 extension ChatView {
     func showToast(_ s: String) {
-        toasts.show(s)
+        ChatComposerBottomToastPresentation.show(s, in: toasts)
     }
 
     func rename() {
@@ -25,17 +66,34 @@ extension ChatView {
         }
     }
 
+    func primeAutoReadForCurrentSessionIfNeeded() {
+        let sessionID = appModel.activeChatSessionId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !sessionID.isEmpty, !autoReadPrimedSessionIds.contains(sessionID) else { return }
+        // Prime only once per session. A later tab switch must retain its old
+        // cursor so an assistant reply that arrived while the tab was hidden
+        // still passes the gate exactly once when it becomes current again.
+        lastAutoReadMessageIds[sessionID] = appModel.chatMessages
+            .last(where: { $0.role == "assistant" })?.id
+        autoReadPrimedSessionIds.insert(sessionID)
+    }
+
     func speakLatestAssistantIfReady() {
-        guard voiceAutoRead,
-              let last = appModel.chatMessages.last,
-              last.role == "assistant" else { return }
-        let text = last.content.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, last.id != lastAutoReadMessageId else { return }
-        lastAutoReadMessageId = last.id
+        let sessionID = appModel.activeChatSessionId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let decision = ChatVoiceAutoReadGate.decide(
+            enabled: voiceAutoRead,
+            sessionID: sessionID,
+            isSessionPrimed: autoReadPrimedSessionIds.contains(sessionID),
+            lastMessage: appModel.chatMessages.last,
+            lastReadMessageID: lastAutoReadMessageIds[sessionID]
+        )
+        guard case .speak(let messageID, let text) = decision else { return }
+        // Consume before dispatching the asynchronous voice request: a count,
+        // content, and busy-state update may all re-render this same reply.
+        lastAutoReadMessageIds[sessionID] = messageID
         Task {
             await voiceOutput.speak(
                 text: text,
-                mode: voiceUseOpenAI ? .openai : .local
+                resolution: VoiceOutputModeSelection.resolve(for: appModel.trustPolicy)
             )
         }
     }

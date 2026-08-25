@@ -361,6 +361,19 @@ final class _MCPStderrTail: @unchecked Sendable {
     private let lock = NSLock()
     private var buffer = Data()
     private var truncated = false
+    /// Serializes raw reads of the stderr pipe fd between the readability
+    /// handler and the termination-time drain. Without it a handler invocation
+    /// that has read the final bytes but not yet appended them (preempted
+    /// between two statements under GCD starvation) is overtaken by the fold —
+    /// the drain sees an empty pipe and the bytes land in the ring too late.
+    /// Distinct from `lock`, which only guards the buffer.
+    private let pipeReadLock = NSLock()
+
+    func withPipeReadLock<T>(_ body: () -> T) -> T {
+        pipeReadLock.lock()
+        defer { pipeReadLock.unlock() }
+        return body()
+    }
 
     func append(_ chunk: Data) {
         guard !chunk.isEmpty else { return }
@@ -582,12 +595,29 @@ public actor MCPSubprocess {
         // the bytes that explain why discarded. We keep only the tail.
         let tail = _MCPStderrTail()
         stderr.fileHandleForReading.readabilityHandler = { handle in
-            let chunk = handle.availableData
-            if chunk.isEmpty {
-                handle.readabilityHandler = nil
-                return
+            // read + append under the pipe-read lock so the termination-time
+            // drain can never overtake an invocation that holds unappended
+            // bytes. The read never blocks under the lock: the handler only
+            // fires when data is available, and once the drain (which runs
+            // post-mortem) could have emptied the pipe the write end is
+            // already closed, so a raced read returns EOF promptly.
+            tail.withPipeReadLock {
+                // Zero-timeout poll gate: a queued invocation that lost its
+                // bytes to the termination drain must not call the BLOCKING
+                // `availableData` on an empty pipe whose write end a
+                // grandchild may still hold open — that parks a GCD thread
+                // for good. No data and no hangup ⇒ nothing to do.
+                var pfd = pollfd(fd: handle.fileDescriptor, events: Int16(POLLIN), revents: 0)
+                guard poll(&pfd, 1, 0) > 0, pfd.revents & Int16(POLLIN | POLLHUP) != 0 else {
+                    return
+                }
+                let chunk = handle.availableData
+                if chunk.isEmpty {
+                    handle.readabilityHandler = nil
+                    return
+                }
+                tail.append(chunk)
             }
-            tail.append(chunk)
         }
 
         // Capture a non-isolated bridge into the actor so the
@@ -820,6 +850,16 @@ public actor MCPSubprocess {
         // termination so the handler will replay it on install. Without
         // this, a process that exits within microseconds of start() would
         // silently evaporate — the pool would believe the start succeeded.
+        // F-B4 hardening (2026-08-23): the ring is fed by a readabilityHandler
+        // on a background queue that can lose the race against termination —
+        // the child's final chunk (usually the crash traceback) is still in
+        // the kernel pipe buffer when this teardown drops the pipe, losing it
+        // for good (2/14 parallel runs, bytes gone at a 10s deadline). Take
+        // over the read end and drain it dry before folding the ring.
+        if let handle = stderrPipe?.fileHandleForReading, let tail = stderrTail {
+            handle.readabilityHandler = nil
+            Self.drainRemainingStderr(fromDescriptor: handle.fileDescriptor, into: tail)
+        }
         // F-B4: fold the stderr tail into the eviction reason so the pool's
         // `lastError` (and the session-status row the user sees) carries WHY
         // the child died instead of a bare "exited (status=1)".
@@ -836,7 +876,6 @@ public actor MCPSubprocess {
         drainTask?.cancel()
         drainTask = nil
         stdoutPipe?.fileHandleForReading.readabilityHandler = nil
-        stderrPipe?.fileHandleForReading.readabilityHandler = nil
         process = nil
         stdinWriter?.stop()
         stdinWriter = nil
@@ -862,6 +901,39 @@ public actor MCPSubprocess {
             return "killed by signal (status=\(p.terminationStatus))"
         @unknown default:
             return "terminated (status=\(p.terminationStatus))"
+        }
+    }
+
+    /// Synchronously drain whatever the dead child left in the stderr pipe.
+    /// Bounded and non-blocking in effect: each read is gated on a zero-timeout
+    /// poll(2) (no O_NONBLOCK mutation — the fd's open file description is
+    /// shared with the readability handler, and EAGAIN would make its
+    /// `availableData` raise), so EOF, an empty pipe (a grandchild may still
+    /// hold the write end open), or two pipe-buffers' worth of bytes all end
+    /// the loop and the actor can never hang here. Runs under the tail's
+    /// pipe-read lock so an in-flight handler invocation holding unappended
+    /// bytes lands them before we return and the caller folds the ring.
+    private nonisolated static func drainRemainingStderr(
+        fromDescriptor fd: Int32, into tail: _MCPStderrTail
+    ) {
+        tail.withPipeReadLock {
+            var buf = [UInt8](repeating: 0, count: 8 * 1024)
+            var total = 0
+            while total < 128 * 1024 {
+                var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+                let ready = poll(&pfd, 1, 0)
+                if ready < 0, errno == EINTR { continue }
+                guard ready > 0, pfd.revents & Int16(POLLIN | POLLHUP) != 0 else { break }
+                let n = read(fd, &buf, min(buf.count, 128 * 1024 - total))
+                if n > 0 {
+                    tail.append(Data(bytes: buf, count: n))
+                    total += n
+                } else if n < 0, errno == EINTR {
+                    continue
+                } else {
+                    break  // 0 = EOF; -1 = error — the pipe is dry either way
+                }
+            }
         }
     }
 

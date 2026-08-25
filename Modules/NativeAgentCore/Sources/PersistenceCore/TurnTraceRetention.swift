@@ -15,11 +15,21 @@ public struct TurnTraceRetentionReport: Sendable, Equatable {
     public var keptDays: Int
     public var removedDays: Int
     public var removedLocks: Int
+    /// Root-relative paths removed by this pass. Capture their public audit
+    /// identity while the artifact still exists; resolving an already-deleted
+    /// leaf can lose a symlinked root spelling and silently drop an audit row.
+    public var removedArtifactPaths: [String]
 
-    public init(keptDays: Int = 0, removedDays: Int = 0, removedLocks: Int = 0) {
+    public init(
+        keptDays: Int = 0,
+        removedDays: Int = 0,
+        removedLocks: Int = 0,
+        removedArtifactPaths: [String] = []
+    ) {
         self.keptDays = keptDays
         self.removedDays = removedDays
         self.removedLocks = removedLocks
+        self.removedArtifactPaths = removedArtifactPaths
     }
 }
 
@@ -68,12 +78,17 @@ public enum TurnTraceRetention {
                 report.keptDays += 1
                 continue
             }
+            let entryAuditPath = relativePath(entry, from: dataRoot)
+            let lock = entry.appendingPathExtension("lock")
+            let lockExists = FileManager.default.fileExists(atPath: lock.path)
+            let lockAuditPath = lockExists ? relativePath(lock, from: dataRoot) : nil
             try FileManager.default.removeItem(at: entry)
             report.removedDays += 1
-            let lock = entry.appendingPathExtension("lock")
-            if FileManager.default.fileExists(atPath: lock.path) {
+            report.removedArtifactPaths.append(entryAuditPath)
+            if lockExists {
                 try FileManager.default.removeItem(at: lock)
                 report.removedLocks += 1
+                if let lockAuditPath { report.removedArtifactPaths.append(lockAuditPath) }
             }
         }
 
@@ -84,8 +99,10 @@ public enum TurnTraceRetention {
             let day = entry.lastPathComponent.replacingOccurrences(of: ".jsonl.lock", with: "")
             guard let dayDate = dayFormatter.date(from: day), dayDate < cutoff else { continue }
             guard FileManager.default.fileExists(atPath: entry.path) else { continue }
+            let auditPath = relativePath(entry, from: dataRoot)
             try FileManager.default.removeItem(at: entry)
             report.removedLocks += 1
+            report.removedArtifactPaths.append(auditPath)
         }
         return report
     }
@@ -100,4 +117,11 @@ public enum TurnTraceRetention {
         f.dateFormat = "yyyy-MM-dd"
         return f
     }()
+
+    private static func relativePath(_ artifact: URL, from dataRoot: URL) -> String {
+        let root = dataRoot.standardizedFileURL.resolvingSymlinksInPath().path
+        let path = artifact.standardizedFileURL.resolvingSymlinksInPath().path
+        precondition(path.hasPrefix(root + "/"), "turn trace artifact escaped its data root")
+        return String(path.dropFirst(root.count + 1))
+    }
 }

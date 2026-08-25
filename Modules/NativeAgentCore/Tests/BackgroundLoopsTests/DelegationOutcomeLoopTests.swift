@@ -161,7 +161,7 @@ struct DelegationOutcomeLoopTests {
         #expect(obj["status"] == .string("unread"))
         // The job key rides in the field the inbox already reads as a
         // sticky-card signature — that reuse IS the never-re-fire contract.
-        #expect(obj["error_signature"] == .string("claude:job-1"))
+        #expect(obj["error_signature"] == .string("claude:job-1:succeeded"))
     }
 
     @Test func codexSuccessCardSaysCodex() throws {
@@ -367,6 +367,234 @@ struct DelegationOutcomeLoopTests {
         }
         #expect(result?.contains("no newly-terminal") == true)
         #expect(recorder.cards.isEmpty)
+    }
+
+    // MARK: - Outcome upgrade re-card (the codex mid-delivery race)
+
+    /// A codex job as the loop sees it while the POST is still in flight:
+    /// `completedExecution` is written BEFORE delivery, so the record is
+    /// terminal with no delivery verdict. `undelivered: true` is the same job
+    /// after the bridge preserved it under `reply-jobs/undelivered/`.
+    private static func codexJob(
+        id: String = "cx-1", topic: String? = "mac-chat-658-16",
+        completedAt: String? = iso(-600), undelivered: Bool = false
+    ) -> DelegationJobSnapshot {
+        DelegationJobSnapshot(
+            id: id, source: "codex", agent: "codex",
+            topicSlug: topic, state: "watching_turn", status: nil, runStatus: "completed",
+            completedAt: completedAt, deliveryOutcome: undelivered ? "unknown" : nil,
+            deliveryLost: nil, completionTextHead: "658.16 is complete on baseline f6895936."
+        )
+    }
+
+    @Test func alarmRankIsOneWayAndOrdered() {
+        #expect(DelegationOutcome.succeeded.alarmRank < DelegationOutcome.unknown.alarmRank)
+        #expect(DelegationOutcome.unknown.alarmRank < DelegationOutcome.failed.alarmRank)
+        #expect(DelegationOutcome.failed.alarmRank < DelegationOutcome.deliveryLost.alarmRank)
+    }
+
+    @Test func signatureNamesTheOutcomeButJobKeyStaysStable() throws {
+        let finished = try #require(DelegationOutcomeCard.make(from: Self.codexJob(), now: Self.now))
+        let preserved = try #require(DelegationOutcomeCard.make(
+            from: Self.codexJob(undelivered: true), now: Self.now))
+        #expect(finished.cardId == preserved.cardId)
+        #expect(finished.jobKey == preserved.jobKey)
+        #expect(finished.signature == "codex:cx-1:succeeded")
+        #expect(preserved.signature == "codex:cx-1:unknown")
+        #expect(preserved.severity == "actionable")
+        // The JSON row carries the outcome-bearing signature and starts unread.
+        guard case .object(let row) = preserved.toJSON() else { Issue.record("not an object"); return }
+        #expect(row["error_signature"] == .string("codex:cx-1:unknown"))
+        #expect(row["status"] == .string("unread"))
+    }
+
+    /// LIVE BUG PINNED (2026-08-21, 10 of 11 preserved replies): the job cards
+    /// as "finished" while mid-delivery; when the 409 lands and it moves to
+    /// undelivered/ it MUST card again as unconfirmed, same cardId, once.
+    @Test func codexJobPreservedAfterBeingCardedFinishedIsCardedAgainAsUnconfirmed() async throws {
+        let path = cursorPath()
+        let recorder = CardRecorder()
+        _ = await makeLoop(cursor: path, jobs: { [] }, recorder: recorder).tickOutcome()  // seed
+
+        let box = SnapshotBox([Self.codexJob(completedAt: Self.iso(-60))])
+        let loop = makeLoop(cursor: path, jobs: { box.value }, recorder: recorder)
+        _ = await loop.tickOutcome()
+        #expect(recorder.cards.map(\.outcome) == [.succeeded])
+
+        // The bridge preserves it: same id, now under undelivered/.
+        box.value = [Self.codexJob(completedAt: Self.iso(-60), undelivered: true)]
+        let outcome = await loop.tickOutcome()
+        guard case .completed(let result) = outcome else { Issue.record("expected completed, got \(outcome)"); return }
+        #expect(result?.contains("filed 1 delegation outcome card") == true)
+        let perJob = recorder.cards.filter { $0.cardId != DelegationOutcomeCard.codexBacklogCardId }
+        #expect(perJob.map(\.outcome) == [.succeeded, .unknown])
+        #expect(perJob[0].cardId == perJob[1].cardId)
+        #expect(perJob[1].title == "Codex outcome is unconfirmed")
+        // The preserve tick also files the rolling backlog card (1 preserved).
+        #expect(recorder.cards.contains { $0.cardId == DelegationOutcomeCard.codexBacklogCardId })
+        let cursor = try #require(DelegationOutcomeCursor.load(from: path))
+        #expect(cursor.cardedOutcome(source: "codex", id: "cx-1") == .unknown)
+
+        // Steady state: the same preserved job never cards a third time, and
+        // the backlog card (filed on the preserve tick) does not re-file.
+        let before = recorder.cards.count
+        _ = await loop.tickOutcome()
+        #expect(recorder.cards.count == before)
+    }
+
+    /// The rank is ONE-WAY: a job already carded under a worse outcome never
+    /// downgrades to a "finished" card.
+    @Test func outcomeNeverDowngradesAfterTheFact() async throws {
+        let path = cursorPath()
+        let recorder = CardRecorder()
+        _ = await makeLoop(cursor: path, jobs: { [] }, recorder: recorder).tickOutcome()
+        let box = SnapshotBox([Self.codexJob(completedAt: Self.iso(-60), undelivered: true)])
+        let loop = makeLoop(cursor: path, jobs: { box.value }, recorder: recorder)
+        _ = await loop.tickOutcome()
+        let perJob = recorder.cards.filter { $0.cardId != DelegationOutcomeCard.codexBacklogCardId }
+        #expect(perJob.map(\.outcome) == [.unknown])
+        box.value = [Self.codexJob(completedAt: Self.iso(-60), undelivered: false)]
+        _ = await loop.tickOutcome()
+        let perJobAfter = recorder.cards.filter { $0.cardId != DelegationOutcomeCard.codexBacklogCardId }
+        #expect(perJobAfter.count == 1)
+    }
+
+    /// An id recorded by a pre-outcome cursor has no recorded outcome; the
+    /// loop cannot prove what its card said, so it never re-cards it.
+    @Test func legacyCursorIdsWithoutAnOutcomeNeverRecard() async throws {
+        let path = cursorPath()
+        // Hand-write a legacy cursor: carded_ids only, no carded_outcomes.
+        let legacy = """
+        {"version":1,"stores":{"codex":{"carded_ids":["cx-legacy"],"last_seen":"\(Self.iso(-3_600))"}}}
+        """
+        try legacy.write(to: path, atomically: true, encoding: .utf8)
+        let recorder = CardRecorder()
+        let loop = makeLoop(
+            cursor: path,
+            jobs: { [Self.codexJob(id: "cx-legacy", completedAt: Self.iso(-7_200), undelivered: true)] },
+            recorder: recorder)
+        _ = await loop.tickOutcome()
+        #expect(recorder.cards.filter { $0.cardId != DelegationOutcomeCard.codexBacklogCardId }.isEmpty)
+    }
+
+    @Test func cursorRoundTripsCardedOutcomesAndBacklogKey() throws {
+        let path = cursorPath()
+        var cursor = DelegationOutcomeCursor()
+        cursor.record(source: "codex", id: "a", stamp: Self.now, outcome: .succeeded)
+        cursor.record(source: "codex", id: "a", stamp: nil, outcome: .unknown)  // upgrade overwrites
+        cursor.record(source: "claude", id: "b", stamp: nil)  // no outcome recorded
+        cursor.codexBacklogKey = "codex:undelivered-backlog:1:x"
+        try cursor.write(to: path)
+        let loaded = try #require(DelegationOutcomeCursor.load(from: path))
+        #expect(loaded.cardedOutcome(source: "codex", id: "a") == .unknown)
+        #expect(loaded.cardedOutcome(source: "claude", id: "b") == nil)
+        #expect(loaded.codexBacklogKey == "codex:undelivered-backlog:1:x")
+        #expect(loaded == cursor)
+    }
+
+    @Test func cursorEvictionDropsTheOutcomeWithTheId() {
+        var cursor = DelegationOutcomeCursor()
+        for i in 0..<(DelegationOutcomeCursor.cardedIDLimit + 3) {
+            cursor.record(source: "codex", id: "job-\(i)", stamp: nil, outcome: .succeeded)
+        }
+        #expect(cursor.cardedOutcome(source: "codex", id: "job-0") == nil)
+        #expect(cursor.store("codex").cardedOutcomes.count == DelegationOutcomeCursor.cardedIDLimit)
+    }
+
+    // MARK: - Codex undelivered backlog card
+
+    @Test func backlogCardNamesCountOldestAndWhereWithoutRedelivering() throws {
+        let jobs = [
+            Self.codexJob(id: "new", topic: "mac-chat-658-16", completedAt: Self.iso(-3_600), undelivered: true),
+            Self.codexJob(id: "old", topic: "continuum-583-takeover", completedAt: Self.iso(-9 * 86_400), undelivered: true),
+            Self.codexJob(id: "in-flight", completedAt: Self.iso(-60), undelivered: false),
+            Self.claudeSuccess(id: "c1"),
+        ]
+        let card = try #require(DelegationOutcomeCard.makeBacklog(jobs: jobs, now: Self.now))
+        #expect(card.cardId == DelegationOutcomeCard.codexBacklogCardId)
+        #expect(card.title == "Codex: 2 undelivered replies preserved")
+        #expect(card.summary.contains("oldest 9d old"))
+        #expect(card.severity == "info")
+        #expect(card.jobKey.hasPrefix("codex:undelivered-backlog:2:\(Self.iso(-9 * 86_400)):"))
+        // Deterministic across processes (never hashValue): same set → same key.
+        #expect(DelegationOutcomeCard.makeBacklog(jobs: jobs.reversed(), now: Self.now)?.jobKey == card.jobKey)
+        #expect(card.detail.contains("reply-jobs/undelivered/"))
+        #expect(card.detail.contains("continuum-583-takeover"))
+        #expect(card.detail.contains("mac-chat-658-16"))
+        #expect(!card.detail.contains("in-flight"))
+        #expect(card.detail.contains("NOTHING re-delivers"))
+        // Oldest first in the listing.
+        let oldIdx = try #require(card.detail.range(of: "continuum-583-takeover")?.lowerBound)
+        let newIdx = try #require(card.detail.range(of: "mac-chat-658-16")?.lowerBound)
+        #expect(oldIdx < newIdx)
+    }
+
+    /// Same count, same oldest, DIFFERENT membership (one reviewed reply
+    /// removed, a newer one preserved) must move the key — otherwise the card's
+    /// listing goes stale while claiming to track the directory (gpt-5.5 MED).
+    @Test func backlogKeyMovesWhenMembershipChangesAtSameCountAndOldest() throws {
+        let oldest = Self.codexJob(id: "oldest", completedAt: Self.iso(-9 * 86_400), undelivered: true)
+        let a = Self.codexJob(id: "a", completedAt: Self.iso(-3_600), undelivered: true)
+        let b = Self.codexJob(id: "b", completedAt: Self.iso(-1_800), undelivered: true)
+        let before = try #require(DelegationOutcomeCard.makeBacklog(jobs: [oldest, a], now: Self.now))
+        let after = try #require(DelegationOutcomeCard.makeBacklog(jobs: [oldest, b], now: Self.now))
+        #expect(before.jobKey != after.jobKey)
+        #expect(before.title == after.title)  // count and oldest unchanged — only the key moved
+    }
+
+    @Test func noBacklogMeansNoBacklogCard() {
+        #expect(DelegationOutcomeCard.makeBacklog(jobs: [Self.codexJob(), Self.claudeSuccess()], now: Self.now) == nil)
+    }
+
+    @Test func backlogCardFilesOnChangeOnlyAndClearsOnceWhenEmpty() async throws {
+        let path = cursorPath()
+        let recorder = CardRecorder()
+        _ = await makeLoop(cursor: path, jobs: { [] }, recorder: recorder).tickOutcome()  // seed
+        let box = SnapshotBox([Self.codexJob(id: "p1", completedAt: Self.iso(-600), undelivered: true)])
+        let loop = makeLoop(cursor: path, jobs: { box.value }, recorder: recorder)
+        func backlogCards() -> [DelegationOutcomeCard] {
+            recorder.cards.filter { $0.cardId == DelegationOutcomeCard.codexBacklogCardId }
+        }
+
+        _ = await loop.tickOutcome()
+        #expect(backlogCards().map(\.title) == ["Codex: 1 undelivered reply preserved"])
+        _ = await loop.tickOutcome()  // unchanged backlog: no re-file
+        #expect(backlogCards().count == 1)
+
+        box.value.append(Self.codexJob(id: "p2", completedAt: Self.iso(-300), undelivered: true))
+        _ = await loop.tickOutcome()
+        #expect(backlogCards().last?.title == "Codex: 2 undelivered replies preserved")
+        #expect(backlogCards().last?.resolved == false)
+
+        // Both reviewed and removed: ONE cleared card, already read, then quiet.
+        box.value = []
+        _ = await loop.tickOutcome()
+        #expect(backlogCards().count == 3)
+        #expect(backlogCards().last?.resolved == true)
+        guard case .object(let row)? = backlogCards().last?.toJSON() else { Issue.record("no row"); return }
+        #expect(row["status"] == .string("read"))
+        _ = await loop.tickOutcome()
+        #expect(backlogCards().count == 3)
+        let cursor = try #require(DelegationOutcomeCursor.load(from: path))
+        #expect(cursor.codexBacklogKey == nil)
+    }
+
+    @Test func failedBacklogCardWriteRetriesNextTick() async throws {
+        let path = cursorPath()
+        let failing = CardRecorder(accept: { _ in false })
+        _ = await makeLoop(cursor: path, jobs: { [] }, recorder: failing).tickOutcome()
+        let jobs = [Self.codexJob(id: "p1", completedAt: Self.iso(-7_200), undelivered: true)]
+        // Cursor pre-seeded with the job so only the backlog card is in play.
+        var cursor = try #require(DelegationOutcomeCursor.load(from: path))
+        cursor.record(source: "codex", id: "p1", stamp: Self.now.addingTimeInterval(-7_200), outcome: .unknown)
+        try cursor.write(to: path)
+        let outcome = await makeLoop(cursor: path, jobs: { jobs }, recorder: failing).tickOutcome()
+        guard case .completed(let result) = outcome else { Issue.record("expected completed, got \(outcome)"); return }
+        #expect(result?.contains("backlog card write failed") == true)
+        #expect(try #require(DelegationOutcomeCursor.load(from: path)).codexBacklogKey == nil)
+        let succeeding = CardRecorder()
+        _ = await makeLoop(cursor: path, jobs: { jobs }, recorder: succeeding).tickOutcome()
+        #expect(succeeding.cards.map(\.cardId) == [DelegationOutcomeCard.codexBacklogCardId])
     }
 
     @Test func loopIdentityIsStable() {

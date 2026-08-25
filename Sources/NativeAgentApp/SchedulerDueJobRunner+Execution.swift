@@ -7,16 +7,30 @@ import TriggerScheduler
 
 extension SchedulerDueJobRunner {
     func execute(job: DueJob, now: Date) async throws -> JobResult {
-        switch job.kind {
-        case "notify":
+        guard let kind = JobKind(rawValue: job.kind) else {
+            throw NSError(domain: "NativeAgentScheduler", code: -410, userInfo: [
+                NSLocalizedDescriptionKey: "Unsupported scheduled job kind: \(job.kind)"
+            ])
+        }
+        if let executionOverride {
+            return try await executionOverride(kind, job, now)
+        }
+        guard isLiveDataRoot else {
+            throw NSError(domain: "NativeAgentScheduler", code: -403, userInfo: [
+                NSLocalizedDescriptionKey:
+                    "refusing scheduled effect outside the canonical data root; inject an execution owner"
+            ])
+        }
+        switch kind {
+        case .notify:
             return try await executeNotify(job: job, now: now)
-        case "connector_action":
+        case .connectorAction:
             return try await executeConnectorAction(job: job)
-        case "dream":
+        case .dream:
             return try await executeDream(job: job)
-        case "rem":
+        case .rem:
             return try await executeREM(job: job)
-        case "improve":
+        case .improve:
             let objective = string(job.payload["objective"]) ?? "Make NativeAgent meaningfully better."
             let run = try await NativeClient(baseURL: "").startImprovement(objective: objective)
             let runStatus = run.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -33,7 +47,7 @@ extension SchedulerDueJobRunner {
                     "status": .string(run.status),
                 ])
             )
-        case "harness_benchmark":
+        case .harnessBenchmark:
             let run = try await NativeClient(baseURL: "").runHarnessBenchmark()
             let runStatus = run.status ?? "unknown"
             return JobResult(
@@ -44,7 +58,7 @@ extension SchedulerDueJobRunner {
                     "status": .string(runStatus),
                 ])
             )
-        case "proactive_scan":
+        case .proactiveScan:
             let scan = try await surfaceProactiveScan(job: job)
             if scan.itemIds.isEmpty {
                 return JobResult(
@@ -58,7 +72,7 @@ extension SchedulerDueJobRunner {
                 detail: "proactive scan surfaced \(scan.itemIds.count) opportunity card(s)",
                 output: scan.output
             )
-        case "workshop":
+        case .workshop:
             let title = string(job.payload["title"]) ?? job.name
             let objective = string(job.payload["objective"]) ?? ""
             guard !objective.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -80,10 +94,6 @@ extension SchedulerDueJobRunner {
                     "expectedEvidence": job.payload["expectedEvidence"] ?? .string("canonical Desk completion receipt"),
                 ])
             )
-        default:
-            throw NSError(domain: "NativeAgentScheduler", code: -410, userInfo: [
-                NSLocalizedDescriptionKey: "Unsupported scheduled job kind: \(job.kind)"
-            ])
         }
     }
 

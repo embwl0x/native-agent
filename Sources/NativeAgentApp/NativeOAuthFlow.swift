@@ -28,7 +28,10 @@ enum NativeOAuthFlow {
     /// Drive a full PKCE OAuth flow end-to-end.
     /// Returns when tokens have been persisted (or an error has been surfaced).
     @MainActor
-    static func startOAuthFlow(providerId: String) async -> OAuthFlowResult {
+    static func startOAuthFlow(
+        providerId: String,
+        dataRoot: URL? = nil
+    ) async -> OAuthFlowResult {
         if normalizedOAuthProviderId(providerId) == "xai_oauth_direct" {
             return await startXAIOAuthFlow()
         }
@@ -111,9 +114,22 @@ enum NativeOAuthFlow {
                 error: "Token exchange failed: \(redact(error.localizedDescription))")
         }
 
+        guard let accessToken = tokens["access_token"] as? String,
+              !accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return OAuthFlowResult(ok: false,
+                error: "Token exchange did not return an access token.")
+        }
+
         // Persist tokens to disk in the shape the read-side adapters expect.
         do {
-            try config.persistTokens(tokens)
+            if providerId == "anthropic_oauth_direct" {
+                try persistAnthropicOAuthTokens(
+                    tokens,
+                    dataRoot: dataRoot ?? PersistenceCore.defaultDataRoot()
+                )
+            } else {
+                try config.persistTokens(tokens)
+            }
         } catch {
             return OAuthFlowResult(ok: false,
                 error: "Could not write token file: \(error.localizedDescription)")

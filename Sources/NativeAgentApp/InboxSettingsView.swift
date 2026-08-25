@@ -1,5 +1,237 @@
 // PATCH-2026-05-07: proactive-inbox-1 InboxSettingsView — trigger config + master enable
 import SwiftUI
+import Observation
+
+/// A visible Inbox Policy outcome carries its own severity. Status text is
+/// user-facing copy and must never be treated as an error protocol.
+struct InboxPolicyStatus: Equatable {
+    enum Tone: Equatable {
+        case success
+        case warning
+        case failure
+    }
+
+    enum Event: Equatable {
+        case settingsLoadFailed(String)
+        case triggersLoadFailed(String)
+        case masterSaved(enabled: Bool)
+        case masterSaveFailed(String)
+        case triggerSaved(name: String, enabled: Bool)
+        case triggerSaveFailed(String)
+        case testUnavailable
+        case triggerFired(itemID: String?, wasStub: Bool)
+        case triggerCardConfirmed(itemID: String, state: InboxTriggerTestFireReceipt.CardState, wasPlaceholder: Bool)
+        case triggerFireFailed(String)
+        case pathsSaved(count: Int)
+        case pathsSaveFailed(String)
+    }
+
+    let text: String
+    let tone: Tone
+
+    init(_ event: Event) {
+        switch event {
+        case let .settingsLoadFailed(detail):
+            text = "Failed to load inbox settings: \(detail)"
+            tone = .failure
+        case let .triggersLoadFailed(detail):
+            text = "Failed to load triggers: \(detail)"
+            tone = .failure
+        case let .masterSaved(enabled):
+            text = enabled ? "Inbox enabled." : "Inbox disabled."
+            tone = .success
+        case let .masterSaveFailed(detail):
+            text = "Failed: \(detail)"
+            tone = .failure
+        case let .triggerSaved(name, enabled):
+            text = "\(name) \(enabled ? "enabled" : "disabled")."
+            tone = .success
+        case let .triggerSaveFailed(detail):
+            text = "Toggle failed: \(detail)"
+            tone = .failure
+        case .testUnavailable:
+            text = "Test is unavailable until this trigger can produce real evidence-backed content."
+            tone = .warning
+        case let .triggerFired(itemID, wasStub):
+            let label = wasStub ? "Fired (stub)" : "Fired"
+            let head = (itemID ?? "").prefix(8)
+            text = head.isEmpty ? "\(label)." : "\(label) — item: \(head)..."
+            tone = .success
+        case let .triggerCardConfirmed(itemID, state, wasPlaceholder):
+            if wasPlaceholder {
+                text = "Test failed: the trigger returned placeholder content instead of a real inbox card."
+                tone = .failure
+            } else {
+                let label = switch state {
+                case .created: "Test card created"
+                case .alreadyVisible: "Test card already visible"
+                }
+                text = "\(label) — item: \(itemID.prefix(8))..."
+                tone = .success
+            }
+        case let .triggerFireFailed(detail):
+            text = "Fire failed: \(detail)"
+            tone = .failure
+        case let .pathsSaved(count):
+            text = "Paths saved (\(count) entries)."
+            tone = .success
+        case let .pathsSaveFailed(detail):
+            text = "Paths save failed: \(detail)"
+            tone = .failure
+        }
+    }
+}
+
+/// Each Inbox Policy writer owns its own visible outcome. A successful toggle
+/// must not overwrite a failed trust or trigger read merely because both used
+/// to share one `status` slot.
+struct InboxPolicyStatusSlot: Equatable {
+    enum Source: Hashable, Comparable {
+        case settingsRead
+        case triggersRead
+        case masterToggle
+        case triggerToggle(String)
+        case triggerTest(String)
+        case watchedPaths
+
+        private var order: String {
+            switch self {
+            case .settingsRead: return "0-settings"
+            case .triggersRead: return "1-triggers"
+            case .masterToggle: return "2-master"
+            case .triggerToggle(let name): return "3-toggle-\(name)"
+            case .triggerTest(let name): return "4-test-\(name)"
+            case .watchedPaths: return "5-paths"
+            }
+        }
+
+        static func < (lhs: Source, rhs: Source) -> Bool {
+            lhs.order < rhs.order
+        }
+    }
+
+    struct Entry: Equatable {
+        let source: Source
+        let status: InboxPolicyStatus
+    }
+
+    private var bySource: [Source: InboxPolicyStatus] = [:]
+
+    var entries: [Entry] {
+        bySource.map { Entry(source: $0.key, status: $0.value) }
+            .sorted { $0.source < $1.source }
+    }
+
+    mutating func record(_ status: InboxPolicyStatus, from source: Source) {
+        bySource[source] = status
+    }
+
+    mutating func clear(source: Source) {
+        bySource.removeValue(forKey: source)
+    }
+}
+
+/// Owns the policy surface's Inbox History route without becoming a second
+/// inbox store. The mounted history sheet projects `AppModel.inboxItems`, so a
+/// refresh made from policy updates the same cards, badges, and chat strip the
+/// rest of the app already observes.
+@MainActor @Observable
+final class InboxHistoryRoute {
+    enum RefreshResult: Equatable {
+        case loaded
+        case failed
+        case alreadyLoading
+    }
+
+    private(set) var isPresented = false
+    private(set) var isLoading = false
+    private(set) var errorText: String?
+
+    func open(
+        read: @escaping @MainActor () async throws -> [InboxItemRecord],
+        retainedItemCount: @escaping @MainActor () -> Int,
+        adopt: @escaping @MainActor ([InboxItemRecord]) -> Void
+    ) async {
+        isPresented = true
+        _ = await refresh(read: read, retainedItemCount: retainedItemCount, adopt: adopt)
+    }
+
+    @discardableResult
+    func refresh(
+        read: @escaping @MainActor () async throws -> [InboxItemRecord],
+        retainedItemCount: @escaping @MainActor () -> Int,
+        adopt: @escaping @MainActor ([InboxItemRecord]) -> Void
+    ) async -> RefreshResult {
+        guard !isLoading else { return .alreadyLoading }
+        isLoading = true
+        errorText = nil
+        defer { isLoading = false }
+
+        do {
+            adopt(try await read())
+            return .loaded
+        } catch {
+            errorText = InboxLoadFailurePresentation.banner(
+                error: error,
+                retainedItemCount: retainedItemCount()
+            )
+            return .failed
+        }
+    }
+
+    func close() {
+        isPresented = false
+    }
+}
+
+/// Rendered truth for the policy's history sheet. This deliberately has no
+/// collection state: cards come directly from the app-wide inbox mirror.
+enum InboxHistoryPresentation {
+    enum Content: Equatable {
+        case empty
+        case rows([InboxItemRecord])
+    }
+
+    static func content(items: [InboxItemRecord]) -> Content {
+        items.isEmpty ? .empty : .rows(items)
+    }
+
+    static func statusLabel(for item: InboxItemRecord) -> String {
+        switch item.normalizedStatus {
+        case "unread": return "Unread"
+        case "read": return "Read"
+        case "archived": return "Archived"
+        case "dismissed": return "Dismissed"
+        case "": return "Status unavailable"
+        default: return "Unrecognized status"
+        }
+    }
+}
+
+/// Trust reads are a three-state fact. `false` is meaningful only after a
+/// successful read; using it as the initial value made an unreadable policy
+/// look intentionally disabled and hid the trigger inventory behind it.
+enum InboxPolicyTrustReadState: Equatable {
+    case loading
+    case loaded(enabled: Bool)
+    case unavailable(String)
+}
+
+enum InboxPolicyTriggersPanelGate: Equatable {
+    case loading
+    case enabled
+    case disabled
+    case unavailable(String)
+
+    static func resolve(trustRead: InboxPolicyTrustReadState) -> Self {
+        switch trustRead {
+        case .loading: return .loading
+        case .loaded(enabled: true): return .enabled
+        case .loaded(enabled: false): return .disabled
+        case .unavailable(let detail): return .unavailable(detail)
+        }
+    }
+}
 
 struct InboxSettingsView: View {
     @Environment(AppModel.self) private var appModel
@@ -9,8 +241,9 @@ struct InboxSettingsView: View {
     @State private var triggers: [InboxTriggerConfig] = []
     @State private var isLoading = false
     @State private var isSaving = false
-    @State private var statusText: String?
-    @State private var showInboxHistory = false
+    @State private var statusSlot = InboxPolicyStatusSlot()
+    @State private var trustReadState: InboxPolicyTrustReadState = .loading
+    @State private var inboxHistoryRoute = InboxHistoryRoute()
 
     // File watcher watched paths (comma-separated editing)
     @State private var watchedPaths: String = ""
@@ -18,6 +251,16 @@ struct InboxSettingsView: View {
     // R22: source the client from AppModel's canonical `client` (already carries
     // nativeBaseURL + the shared runtime) instead of constructing inline.
     private var client: NativeClient { appModel.client }
+    private var triggersPanelGate: InboxPolicyTriggersPanelGate {
+        InboxPolicyTriggersPanelGate.resolve(trustRead: trustReadState)
+    }
+    private var masterToggleDisabled: Bool {
+        if isSaving { return true }
+        switch trustReadState {
+        case .loaded: return false
+        case .loading, .unavailable: return true
+        }
+    }
     private var agentDisplayName: String {
         let profileName = appModel.personality?.name.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let chatName = appModel.chatPersona.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -33,7 +276,7 @@ struct InboxSettingsView: View {
                 NativePanel(title: "Proactive Inbox", systemImage: "tray.and.arrow.down") {
                     VStack(alignment: .leading, spacing: 10) {
                         Toggle("Enable Proactive Inbox", isOn: $masterEnabled)
-                            .disabled(isSaving)
+                            .disabled(masterToggleDisabled)
                             .onChange(of: masterEnabled) { _, val in
                                 if suppressMasterSave {
                                     suppressMasterSave = false
@@ -48,29 +291,30 @@ struct InboxSettingsView: View {
 
                         HStack {
                             Button("View Inbox History") {
-                                showInboxHistory = true
+                                Task { await openInboxHistory() }
                             }
                             .buttonStyle(.bordered)
                             .controlSize(.small)
+                            .disabled(inboxHistoryRoute.isLoading)
 
                             // SUBSYSTEM #17 (2026-05-31): retired diagnostic UI + /v1/inbox/self_test
                         }
 
-                        if let status = statusText {
-                            // ui-honesty 2026-06-10: the old `contains("ok")`
-                            // heuristic painted every success orange (none of
-                            // the success strings contain "ok"). Key off the
-                            // error marker instead — all failure paths here
-                            // say "fail(ed)".
-                            Text(status)
-                                .font(.caption)
-                                .foregroundStyle(status.localizedCaseInsensitiveContains("fail") ? .orange : .green)
+                        if !statusSlot.entries.isEmpty {
+                            VStack(alignment: .leading, spacing: 4) {
+                                ForEach(statusSlot.entries, id: \.source) { entry in
+                                    Text(entry.status.text)
+                                        .font(.caption)
+                                        .foregroundStyle(statusColor(entry.status.tone))
+                                }
+                            }
                         }
                     }
                 }
 
                 // ── Triggers ───────────────────────────────────────────────
-                if masterEnabled {
+                switch triggersPanelGate {
+                case .enabled:
                     NativePanel(title: "Triggers", systemImage: "bolt") {
                         VStack(alignment: .leading, spacing: 14) {
                             ForEach(triggers) { trigger in
@@ -104,6 +348,26 @@ struct InboxSettingsView: View {
                             }
                         }
                     }
+                case .disabled:
+                    EmptyView()
+                case .loading:
+                    NativePanel(title: "Triggers", systemImage: "bolt") {
+                        Label("Checking whether proactive inbox is enabled…", systemImage: "hourglass")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                case .unavailable(let detail):
+                    NativePanel(title: "Triggers unavailable", systemImage: "exclamationmark.triangle") {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("The proactive inbox setting could not be read. Trigger settings are unavailable, not disabled.")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                            Text(detail)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(3)
+                        }
+                    }
                 }
             }
             .padding()
@@ -111,17 +375,18 @@ struct InboxSettingsView: View {
         // ui-taste-sweep 2026-06-07: was falling back to the bundle name.
         .navigationTitle("Inbox Policy")
         .task { await load() }
-        .sheet(isPresented: $showInboxHistory) {
-            NavigationStack {
-                InboxView()
-                    .environment(appModel)
-                    .navigationTitle("Inbox History")
-                    .toolbar {
-                        ToolbarItem(placement: .confirmationAction) {
-                            Button("Close") { showInboxHistory = false }
-                        }
-                    }
+        .sheet(isPresented: Binding(
+            get: { inboxHistoryRoute.isPresented },
+            set: { presented in
+                if !presented { inboxHistoryRoute.close() }
             }
+        )) {
+            InboxHistoryView(
+                route: inboxHistoryRoute,
+                onRefresh: { await refreshInboxHistory() },
+                onClose: { inboxHistoryRoute.close() }
+            )
+            .environment(appModel)
             .presentationDetents([.large])
         }
     }
@@ -138,6 +403,8 @@ struct InboxSettingsView: View {
             let obj = try await client.getTrustRaw()
             let ip = obj["inboxPolicy"] as? [String: Any]
             let loaded = ip?["enabled"] as? Bool ?? false
+            trustReadState = .loaded(enabled: loaded)
+            statusSlot.clear(source: .settingsRead)
             // Suppress the master toggle's onChange save only when the value
             // actually changes: this is a programmatic load, not a user toggle,
             // so it must not trigger a write-back. Guarding on the delta avoids
@@ -148,7 +415,8 @@ struct InboxSettingsView: View {
                 masterEnabled = loaded
             }
         } catch {
-            statusText = "Failed to load inbox settings: \(error.localizedDescription)"
+            trustReadState = .unavailable(error.localizedDescription)
+            statusSlot.record(InboxPolicyStatus(.settingsLoadFailed(error.localizedDescription)), from: .settingsRead)
         }
         // Load triggers
         // U5 W-A item 1 (:151): the trigger read was swallowed into [] —
@@ -157,8 +425,9 @@ struct InboxSettingsView: View {
         // panel's status line instead.
         do {
             triggers = try await client.getInboxTriggers()
+            statusSlot.clear(source: .triggersRead)
         } catch {
-            statusText = "Failed to load triggers: \(error.localizedDescription)"
+            statusSlot.record(InboxPolicyStatus(.triggersLoadFailed(error.localizedDescription)), from: .triggersRead)
         }
         // Load watched paths for file_watch trigger
         if let fw = triggers.first(where: { $0.name == "file_watch" }),
@@ -170,15 +439,21 @@ struct InboxSettingsView: View {
     func saveMaster(enabled: Bool) async {
         isSaving = true
         defer { isSaving = false }
+        let previousEnabled: Bool = {
+            if case .loaded(let enabled) = trustReadState { return enabled }
+            return !enabled
+        }()
         do {
             _ = try await client.postRaw("/v1/trust", body: [
                 "inboxPolicy": ["enabled": enabled]
             ])
-            statusText = enabled ? "Inbox enabled." : "Inbox disabled."
+            trustReadState = .loaded(enabled: enabled)
+            statusSlot.record(InboxPolicyStatus(.masterSaved(enabled: enabled)), from: .masterToggle)
         } catch {
-            statusText = "Failed: \(error.localizedDescription)"
+            statusSlot.record(InboxPolicyStatus(.masterSaveFailed(error.localizedDescription)), from: .masterToggle)
             suppressMasterSave = true
-            masterEnabled = !enabled
+            masterEnabled = previousEnabled
+            trustReadState = .loaded(enabled: previousEnabled)
         }
     }
 
@@ -191,29 +466,32 @@ struct InboxSettingsView: View {
     func setTriggerEnabled(_ name: String, enabled: Bool) async -> Bool {
         do {
             try await client.inboxTriggerEnable(name, enabled: enabled)
-            statusText = "\(name) \(enabled ? "enabled" : "disabled")."
+            statusSlot.record(InboxPolicyStatus(.triggerSaved(name: name, enabled: enabled)), from: .triggerToggle(name))
             await load()
             return true
         } catch {
-            statusText = "Toggle failed: \(error.localizedDescription)"
+            statusSlot.record(InboxPolicyStatus(.triggerSaveFailed(error.localizedDescription)), from: .triggerToggle(name))
             return false
         }
     }
 
     func fireTriggerNow(_ trigger: InboxTriggerConfig) async {
         guard trigger.supportsRealManualFire else {
-            statusText = "Test is unavailable until this trigger can produce real evidence-backed content."
+            statusSlot.record(InboxPolicyStatus(.testUnavailable), from: .triggerTest(trigger.name))
             return
         }
         do {
-            // Post-rebuild (2026-07-09): time/idle fires carry REAL content now —
-            // the label follows the returned truth instead of assuming stub.
+            // The client returns only after the exact card receipt is readable
+            // from the live notifications inbox. A scheduler "fired" response
+            // alone is not enough to present a successful Desk test.
             let fired = try await client.inboxTriggerFireNow(trigger.name, stub: true)
-            let head = (fired.itemId ?? "").prefix(8)
-            let label = fired.wasStub ? "Fired (stub)" : "Fired"
-            statusText = head.isEmpty ? "\(label)." : "\(label) — item: \(head)..."
+            statusSlot.record(InboxPolicyStatus(.triggerCardConfirmed(
+                itemID: fired.itemID,
+                state: fired.cardState,
+                wasPlaceholder: fired.wasPlaceholder
+            )), from: .triggerTest(trigger.name))
         } catch {
-            statusText = "Fire failed: \(error.localizedDescription)"
+            statusSlot.record(InboxPolicyStatus(.triggerFireFailed(error.localizedDescription)), from: .triggerTest(trigger.name))
         }
     }
 
@@ -228,14 +506,183 @@ struct InboxSettingsView: View {
             // Keep configuration on the typed NativeClient path so validation
             // and persistence remain owned by TriggerScheduler.
             try await client.inboxTriggerConfigure("file_watch", body: ["paths": paths])
-            statusText = "Paths saved (\(paths.count) entries)."
+            statusSlot.record(InboxPolicyStatus(.pathsSaved(count: paths.count)), from: .watchedPaths)
         } catch {
-            statusText = "Paths save failed: \(error.localizedDescription)"
+            statusSlot.record(InboxPolicyStatus(.pathsSaveFailed(error.localizedDescription)), from: .watchedPaths)
+        }
+    }
+
+    private func openInboxHistory() async {
+        await inboxHistoryRoute.open(
+            read: { try await appModel.getInboxItems(unreadOnly: false) },
+            retainedItemCount: { appModel.inboxItems.count },
+            adopt: { appModel.inboxItems = $0 }
+        )
+    }
+
+    private func refreshInboxHistory() async {
+        _ = await inboxHistoryRoute.refresh(
+            read: { try await appModel.getInboxItems(unreadOnly: false) },
+            retainedItemCount: { appModel.inboxItems.count },
+            adopt: { appModel.inboxItems = $0 }
+        )
+    }
+
+    private func statusColor(_ tone: InboxPolicyStatus.Tone) -> Color {
+        switch tone {
+        case .success: return .green
+        case .warning: return .orange
+        case .failure: return .red
         }
     }
 }
 
+// MARK: - Inbox history
+
+/// Read-only history projection used only by Inbox Policy. It intentionally
+/// does not mount `InboxView`: there is one source of inbox rows, the shared
+/// AppModel mirror, and this sheet merely renders it.
+struct InboxHistoryView: View {
+    @Environment(AppModel.self) private var appModel
+
+    let route: InboxHistoryRoute
+    let onRefresh: @MainActor () async -> Void
+    let onClose: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 0) {
+                if let errorText = route.errorText {
+                    Text(errorText)
+                        .font(NativeAgentFont.label)
+                        .foregroundStyle(NativeAgentTheme.fail)
+                        .padding(.horizontal)
+                        .padding(.vertical, 8)
+                }
+
+                switch InboxHistoryPresentation.content(items: appModel.inboxItems) {
+                case .empty where route.isLoading:
+                    ProgressView("Loading Inbox History…")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                case .empty:
+                    NativeEmptyState(
+                        title: "No inbox history",
+                        detail: "Inbox cards will appear here after the agent records an observation.",
+                        systemImage: "tray",
+                        actionTitle: nil,
+                        actionImage: nil,
+                        action: nil
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                case .rows(let items):
+                    List(items) { item in
+                        InboxHistoryRow(item: item)
+                    }
+                    .listStyle(.plain)
+                }
+            }
+            .navigationTitle("Inbox History")
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        Task { await onRefresh() }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .disabled(route.isLoading)
+                    .accessibilityLabel("Refresh Inbox History")
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Close", action: onClose)
+                }
+            }
+        }
+    }
+}
+
+private struct InboxHistoryRow: View {
+    let item: InboxItemRecord
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: item.sourceIcon)
+                .foregroundStyle(item.severityColor)
+                .frame(width: 20)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(item.title.isEmpty ? "Untitled inbox item" : item.title)
+                    .font(NativeAgentFont.label.weight(.semibold))
+                if !item.summary.isEmpty {
+                    Text(item.summary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+                Text(item.created_at.isEmpty ? "Time unavailable" : item.created_at)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.tertiary)
+            }
+            Spacer(minLength: 8)
+            Text(InboxHistoryPresentation.statusLabel(for: item))
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(item.isUnread ? item.severityColor : .secondary)
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
 // MARK: - TriggerRowView
+
+/// Keeps a trigger switch honest while its durable write is in flight. The
+/// visible value is optimistic, but a failed latest request always returns to
+/// the last server snapshot. Later user intent gets its own request instead of
+/// being swallowed by a programmatic-revert suppression latch.
+struct InboxTriggerToggleStateMachine: Equatable {
+    struct Request: Equatable, Sendable {
+        let id: Int
+        let requestedEnabled: Bool
+    }
+
+    private(set) var visualEnabled: Bool
+    private(set) var serverEnabled: Bool
+    private var latestRequestID: Int?
+    private var nextRequestID = 0
+
+    init(serverEnabled: Bool) {
+        visualEnabled = serverEnabled
+        self.serverEnabled = serverEnabled
+    }
+
+    mutating func userToggled(to requestedEnabled: Bool) -> Request {
+        nextRequestID &+= 1
+        let request = Request(id: nextRequestID, requestedEnabled: requestedEnabled)
+        latestRequestID = request.id
+        visualEnabled = requestedEnabled
+        return request
+    }
+
+    mutating func completed(_ request: Request, accepted: Bool) {
+        // A prior request is no longer allowed to repaint a more recent user
+        // choice. Its server reload, when available, still enters through
+        // `synchronizeServer(enabled:)` below.
+        guard latestRequestID == request.id else { return }
+        latestRequestID = nil
+        if accepted {
+            serverEnabled = request.requestedEnabled
+            visualEnabled = request.requestedEnabled
+        } else {
+            visualEnabled = serverEnabled
+        }
+    }
+
+    mutating func synchronizeServer(enabled: Bool) {
+        serverEnabled = enabled
+        // Do not clobber a newer local request while the parent's refresh is
+        // delivering an older server snapshot.
+        if latestRequestID == nil {
+            visualEnabled = enabled
+        }
+    }
+}
 
 struct TriggerRowView: View {
     let trigger: InboxTriggerConfig
@@ -245,15 +692,14 @@ struct TriggerRowView: View {
     let onToggle: (Bool) async -> Bool
     let onFireNow: () -> Void
 
-    @State private var isEnabled: Bool
-    @State private var suppressNextToggle = false
+    @State private var toggleState: InboxTriggerToggleStateMachine
 
     init(trigger: InboxTriggerConfig, watchedPaths: Binding<String>, onToggle: @escaping (Bool) async -> Bool, onFireNow: @escaping () -> Void) {
         self.trigger = trigger
         self._watchedPaths = watchedPaths
         self.onToggle = onToggle
         self.onFireNow = onFireNow
-        self._isEnabled = State(initialValue: trigger.enabled)
+        self._toggleState = State(initialValue: InboxTriggerToggleStateMachine(serverEnabled: trigger.enabled))
     }
 
     // PATCH-2026-05-07: polish-InboxSettingsView PulsingDot for enabled triggers
@@ -264,7 +710,7 @@ struct TriggerRowView: View {
                     .font(.body)
                     .foregroundStyle(.blue)
                     .frame(width: 22)
-                if isEnabled {
+                if toggleState.visualEnabled {
                     PulsingDot(color: .green, size: 6)
                         .offset(x: 4, y: 4)
                 }
@@ -291,38 +737,22 @@ struct TriggerRowView: View {
                     ? "Create one real trigger item now"
                     : "Unavailable until this trigger has real evidence-backed content")
 
-            Toggle("", isOn: $isEnabled)
+            Toggle("", isOn: Binding(
+                get: { toggleState.visualEnabled },
+                set: { requestToggle($0) }
+            ))
                 .labelsHidden()
-                .onChange(of: isEnabled) { _, val in
-                    if suppressNextToggle {
-                        suppressNextToggle = false
-                        return
-                    }
-                    Task {
-                        let ok = await onToggle(val)
-                        if !ok {
-                            // ui-honesty 2026-06-10: server write failed —
-                            // revert the switch instead of leaving it in a
-                            // position the server never accepted. Only arm
-                            // the suppression when the assignment will
-                            // actually fire onChange: if the user already
-                            // toggled back while the request was in flight,
-                            // a no-op assignment would leave the suppression
-                            // stuck and swallow their NEXT real toggle
-                            // (gpt-5.5 review).
-                            if isEnabled == val {
-                                suppressNextToggle = true
-                                isEnabled = !val
-                            }
-                        }
-                    }
-                }
         }
         .onChange(of: trigger.enabled) { _, val in
-            if isEnabled != val {
-                suppressNextToggle = true
-                isEnabled = val
-            }
+            toggleState.synchronizeServer(enabled: val)
+        }
+    }
+
+    private func requestToggle(_ enabled: Bool) {
+        let request = toggleState.userToggled(to: enabled)
+        Task {
+            let accepted = await onToggle(request.requestedEnabled)
+            toggleState.completed(request, accepted: accepted)
         }
     }
 }

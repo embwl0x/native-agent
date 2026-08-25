@@ -156,6 +156,12 @@ func appendStaleInstructionErrors(repo: URL, errors: inout [String]) throws {
             message: "agent instructions must not call retired daemon HTTP endpoints"
         ),
         StaleInstructionRule(
+            id: "retired-smoke-runtime",
+            file: "script/smoke_all.sh",
+            pattern: #"127\.0\.0\.1:8765|native_agentd\.py|daemon HTTP"#,
+            message: "the active smoke workflow must not direct operators to the retired daemon runtime"
+        ),
+        StaleInstructionRule(
             id: "retired-codex-environment",
             file: ".codex/environments/environment.toml",
             pattern: #"\bdaemon\b"#,

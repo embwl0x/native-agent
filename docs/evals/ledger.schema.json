@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NativeAgent eval-coverage ledger fragment (one per fence)",
+  "type": "object",
+  "required": ["fence", "surfaces", "ranRun"],
+  "properties": {
+    "fence": {"type": "string", "description": "the fence id this fragment covers, exactly as assigned"},
+    "surfaces": {
+      "type": "array",
+      "description": "EVERY thing in the fence a user, another module, or a store can observe: public types/functions, settings/switches, UI controls and summaries, stores/feeds written, background loops, tool names, routes, env vars, CLI flags.",
+      "items": {
+        "type": "object",
+        "required": ["id", "kind", "where", "coverage"],
+        "properties": {
+          "id": {"type": "string", "description": "stable dotted id, e.g. chat.toolLoop.maxIterations or ui.DeskView.nagToggle"},
+          "kind": {"type": "string", "enum": ["public-api", "setting", "ui-control", "ui-summary", "store-write", "feed", "loop", "tool", "route", "env", "cli", "telemetry", "turn-ingredient", "speed-stage", "other"]},
+          "where": {"type": "string", "description": "file:line (or file) of the definition"},
+          "writes": {"type": "array", "items": {"type": "string"}, "description": "stores/feeds/paths it writes, if any"},
+          "coverage": {
+            "type": "array",
+            "description": "EXISTING evals that touch it — empty array means UNCOVERED. Evidence required.",
+            "items": {
+              "type": "object",
+              "required": ["tier", "ref", "strength"],
+              "properties": {
+                "tier": {"type": "string", "enum": ["instrument", "bench", "test", "smoke", "ui-walk", "turn-replay"]},
+                "ref": {"type": "string", "description": "section id / test name / script path — file:line"},
+                "strength": {"type": "string", "enum": ["asserts", "reports-only", "incidental"]}
+              }
+            }
+          },
+          "silentFailureMode": {"type": "string", "description": "how this breaks WITHOUT anyone noticing (state lifecycle leak, silent zero, dead control, slowdown, wrong value, stale UI)"},
+          "proposedEval": {
+            "type": "object",
+            "description": "for UNCOVERED or reports-only: the cheapest HONEST eval",
+            "properties": {
+              "tier": {"type": "string", "enum": ["instrument", "bench", "test", "smoke", "ui-walk", "turn-replay"]},
+              "reads": {"type": "string", "description": "exactly what store/feed/trace/AX node it would read"},
+              "asserts": {"type": "string", "description": "the envelope property it asserts (never exact values unless contractual)"},
+              "costSeconds": {"type": "number"},
+              "liveOrClone": {"type": "string", "enum": ["live-readonly", "clone", "hermetic"]}
+            }
+          }
+        }
+      }
+    },
+    "ranRun": {"type": "string", "description": "ONE thing you actually executed in this fence (a test filter, a script, a read of a live feed) and what it returned — not a claim"},
+    "uncertain": {"type": "array", "items": {"type": "string"}, "description": "surfaces you could not classify or could not find evidence for — say so, never guess"}
+  }
+}

@@ -199,7 +199,14 @@ public actor TelegramTurnCoordinator {
             timeoutNanoseconds: confirmationTimeoutNanoseconds,
             sleeper: sleeper
         ) {
-            return phase == .canceled ? .confirmed : .outcomeUnknown
+            guard phase == .canceled else { return .outcomeUnknown }
+            // The card's .canceled phase IS the cooperative-cancellation
+            // evidence. Release the chat slot now instead of waiting for the
+            // task's receipt-writing tail — a confirmed stop must never leave
+            // snapshot(chatId:).isRunning true. The task's own finishTurn call
+            // becomes a no-op (same-id guard).
+            finishTurn(chatId: chatId, turnId: active.id)
+            return .confirmed
         }
         await card.transition(
             .outcomeUnknown(reason: "Stop requested, but cancellation was not confirmed")

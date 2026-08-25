@@ -97,7 +97,7 @@ public struct DelegationJobProjection: Sendable, Equatable {
     ///
     /// The distinction is load-bearing. On the codex side a job preserved
     /// under `undelivered/` is NOT proven lost — replyJobDisposition
-    /// (codex_thread_wakeup.js L3540-3547) preserves there exactly when
+    /// (`replyJobDisposition` in codex_thread_wakeup.js) preserves there exactly when
     /// replyStatus is `outcome_unknown` or `conflict`, i.e. the bridge could
     /// not confirm either way. Reporting those as lost would invent a fact,
     /// which is the precise failure this tool exists to stop.

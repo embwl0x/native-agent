@@ -1,14 +1,104 @@
+import Foundation
+import Observation
 import SwiftUI
 import TrustCenter
 
+typealias SecurityCenterStatusReader = @Sendable (Int) async throws -> SecurityCenterStatus
+
+enum SecurityCenterRefreshPresentation {
+    enum State: Equatable {
+        case loading
+        case refreshing
+        case current
+        case stale(detail: String)
+        case unavailable(detail: String)
+    }
+
+    static func state(
+        hasStatus: Bool,
+        isRefreshing: Bool,
+        lastError: String?
+    ) -> State {
+        if isRefreshing { return hasStatus ? .refreshing : .loading }
+        if let lastError, !lastError.isEmpty {
+            return hasStatus ? .stale(detail: lastError) : .unavailable(detail: lastError)
+        }
+        return hasStatus ? .current : .loading
+    }
+
+    static func boundedDetail(_ error: any Error) -> String {
+        let detail = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        return detail.isEmpty ? "The security reader returned no details." : String(detail.prefix(240))
+    }
+
+    static func message(for state: State) -> String? {
+        switch state {
+        case .loading, .current:
+            return nil
+        case .refreshing:
+            return "Refreshing security status…"
+        case let .stale(detail):
+            return "Showing the last security status; refresh failed: \(detail)"
+        case let .unavailable(detail):
+            return "Security status unavailable: \(detail)"
+        }
+    }
+}
+
+/// The root-scoped state behind Security Center's one refresh affordance. The
+/// previous readable snapshot deliberately survives a failed refresh, while a
+/// failed first read remains unavailable rather than being presented as empty.
+@MainActor @Observable
+final class SecurityCenterRefreshState {
+    private(set) var status: SecurityCenterStatus?
+    private(set) var isRefreshing = false
+    private(set) var lastRefreshError: String?
+    private let statusReader: SecurityCenterStatusReader
+
+    init(statusReader: @escaping SecurityCenterStatusReader) {
+        self.statusReader = statusReader
+    }
+
+    var presentation: SecurityCenterRefreshPresentation.State {
+        SecurityCenterRefreshPresentation.state(
+            hasStatus: status != nil,
+            isRefreshing: isRefreshing,
+            lastError: lastRefreshError
+        )
+    }
+
+    func refresh() async {
+        guard !isRefreshing else { return }
+        isRefreshing = true
+        lastRefreshError = nil
+        defer { isRefreshing = false }
+        do {
+            status = try await statusReader(10)
+        } catch {
+            lastRefreshError = SecurityCenterRefreshPresentation.boundedDetail(error)
+        }
+    }
+}
+
 struct NativeSecurityCenterPanel: View {
-    @State private var status: SecurityCenterStatus?
-    @State private var isRefreshing = false
-    private let securityCenter = SwiftNativeSecurityCenter()
+    @State private var refreshModel: SecurityCenterRefreshState
+    private let loadsOnAppear: Bool
+
+    init(
+        statusReader: @escaping SecurityCenterStatusReader = Self.liveStatus,
+        loadsOnAppear: Bool = true
+    ) {
+        _refreshModel = State(initialValue: SecurityCenterRefreshState(statusReader: statusReader))
+        self.loadsOnAppear = loadsOnAppear
+    }
+
+    private var refreshState: SecurityCenterRefreshPresentation.State {
+        refreshModel.presentation
+    }
 
     var body: some View {
         NativePanel(title: "Security Center", systemImage: "shield.lefthalf.filled", tint: panelTint) {
-            if let status {
+            if let status = refreshModel.status {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 160), spacing: 10)], spacing: 10) {
                     TrustPolicyTile(title: "Mode", value: status.mode, systemImage: "switch.2")
                     TrustPolicyTile(title: "Full Mac", value: status.fullMac ? "active" : "limited", systemImage: "macbook")
@@ -45,44 +135,81 @@ struct NativeSecurityCenterPanel: View {
                     }
                 }
             } else {
-                HStack(spacing: 10) {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text("Loading security status...")
+                switch refreshState {
+                case .unavailable(let detail):
+                    Label(
+                        SecurityCenterRefreshPresentation.message(for: .unavailable(detail: detail)) ?? "Security status unavailable.",
+                        systemImage: "exclamationmark.triangle.fill"
+                    )
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.orange)
+                        .textSelection(.enabled)
+                        .accessibilityIdentifier("security.center.refresh.unavailable")
+                case .loading, .refreshing, .current, .stale:
+                    HStack(spacing: 10) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Loading security status...")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
 
+            switch refreshState {
+            case .refreshing:
+                Label(
+                    SecurityCenterRefreshPresentation.message(for: refreshState) ?? "Refreshing security status…",
+                    systemImage: "arrow.triangle.2.circlepath"
+                )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("security.center.refresh.inflight")
+            case .stale(let detail):
+                Label(
+                    SecurityCenterRefreshPresentation.message(for: .stale(detail: detail))
+                        ?? "Showing the last security status; refresh failed.",
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .textSelection(.enabled)
+                    .accessibilityIdentifier("security.center.refresh.stale")
+            case .loading, .current, .unavailable:
+                EmptyView()
+            }
+
             HStack {
-                Button("Refresh", systemImage: "arrow.clockwise") {
-                    Task { await refresh() }
+                Button(refreshModel.isRefreshing ? "Refreshing…" : "Refresh", systemImage: "arrow.clockwise") {
+                    Task { await refreshModel.refresh() }
                 }
-                .disabled(isRefreshing)
+                .disabled(refreshModel.isRefreshing)
+                .accessibilityIdentifier("security.center.refresh")
                 Spacer()
-                if isRefreshing {
+                if refreshModel.isRefreshing {
                     ProgressView()
                         .controlSize(.small)
                 }
             }
         }
         .task {
-            await refresh()
+            guard loadsOnAppear else { return }
+            await refreshModel.refresh()
         }
     }
 
     private var panelTint: Color {
-        guard let status else { return .blue }
+        guard let status = refreshModel.status else {
+            if case .unavailable = refreshState { return .orange }
+            return .blue
+        }
         if status.killSwitchEnabled { return .red }
         if status.developerMode { return .orange }
         return .green
     }
 
-    @MainActor
-    private func refresh() async {
-        isRefreshing = true
-        status = await securityCenter.status(limit: 10)
-        isRefreshing = false
+    private static func liveStatus(limit: Int) async throws -> SecurityCenterStatus {
+        await SwiftNativeSecurityCenter().status(limit: limit)
     }
 }
 

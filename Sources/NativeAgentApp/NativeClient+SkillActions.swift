@@ -62,7 +62,16 @@ extension NativeClient {
         // manifest natively (Mac process is co-located with the data files),
         // decoding into the same SkillRegistryEntry shape the HTTP path yields.
         // On any native error, fall through to the direct filesystem fallback.
-        let impl = makeSkillsClient(root: PersistenceCore.defaultDataRoot())
+        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let registryURL = dataRoot.appendingPathComponent("skills/manifest_registry.json")
+        // The native merge treats malformed JSON as its default empty value.
+        // Validate existing authority bytes first so the Skills banner can
+        // distinguish unreadable storage from a genuine empty catalog.
+        if FileManager.default.fileExists(atPath: registryURL.path) {
+            let data = try Data(contentsOf: registryURL)
+            _ = try JSONDecoder.nativeAgent.decode(ManifestRegistryFile.self, from: data)
+        }
+        let impl = makeSkillsClient(root: dataRoot)
         if let rows = try? await impl.listManifestSkills(),
            let data = try? JSONValue.array(rows).serializedData(pretty: false),
            let entries = try? JSONDecoder.nativeAgent.decode([SkillRegistryEntry].self, from: data) {
@@ -73,8 +82,6 @@ extension NativeClient {
         // manifest_registry.json directly if the impl returned nil.
         // Fallback: direct filesystem read of manifest_registry.json
         // Phase 11c: read from <repo>/data/ via shared resolver.
-        let appSupport = NativeAgentPaths.dataRoot
-        let registryURL = appSupport.appendingPathComponent("skills/manifest_registry.json")
         guard FileManager.default.fileExists(atPath: registryURL.path) else {
             return []
         }
@@ -114,13 +121,14 @@ extension NativeClient {
 
     func skillDirectory(for entry: SkillRegistryEntry) throws -> URL {
         let fm = FileManager.default
-        let fallback = NativeAgentPaths.dataRoot.appendingPathComponent("skills/\(entry.name)")
+        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let fallback = dataRoot.appendingPathComponent("skills/\(entry.name)")
         let rawPath = entry.path.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !rawPath.isEmpty else { return fallback }
 
         let candidate = URL(fileURLWithPath: rawPath).standardizedFileURL
         let allowedRoots = [
-            NativeAgentPaths.dataRoot.appendingPathComponent("skills").standardizedFileURL,
+            dataRoot.appendingPathComponent("skills").standardizedFileURL,
             fm.homeDirectoryForCurrentUser
                 .appendingPathComponent("Library/Application Support/NativeAgent/skills")
                 .standardizedFileURL,
@@ -139,7 +147,7 @@ extension NativeClient {
     /// wave 32 W15: gated to the Swift impl (legacy update_skill status flip
     /// with the manifest state-machine fallback, all flocked) when .skills ON.
     func enableSkill(name: String) async throws {
-        let impl = makeSkillsClient(root: PersistenceCore.defaultDataRoot())
+        let impl = makeSkillsClient(root: dataRootOverride ?? PersistenceCore.defaultDataRoot())
         _ = try await impl.enableSkill(name: name)
         return
     }

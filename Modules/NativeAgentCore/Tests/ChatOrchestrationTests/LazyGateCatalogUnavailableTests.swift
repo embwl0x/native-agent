@@ -2,6 +2,7 @@ import Foundation
 import Testing
 @testable import ChatOrchestration
 import NativeAgentCore
+import PersistenceCore
 
 // 2026-07-31 — the lazy-load gate must FAIL CLOSED when the tool catalog
 // cannot be enumerated.
@@ -29,7 +30,7 @@ private struct LGCatalogFailure: Error {}
 @Test func lazyGate_healthyCatalog_stillReturnsNotLoaded() async throws {
     let root = try lgTempRoot("healthy")
     defer { try? FileManager.default.removeItem(at: root) }
-    let tools = SwiftToolDispatcher(dataRoot: root)
+    let tools = SwiftToolDispatcher(dataRoot: root, enforceLazyToolLoading: true)
 
     let out = try await tools.dispatch(
         tool: "market_status",
@@ -49,7 +50,7 @@ private struct LGCatalogFailure: Error {}
 @Test func lazyGate_thrownEnumeration_failsClosedWithCatalogUnavailable() async throws {
     let root = try lgTempRoot("throws")
     defer { try? FileManager.default.removeItem(at: root) }
-    let tools = SwiftToolDispatcher(dataRoot: root)
+    let tools = SwiftToolDispatcher(dataRoot: root, enforceLazyToolLoading: true)
     let sessionId = "lg-throws-\(UUID().uuidString)"
 
     let out = try await SwiftToolDispatcher.$lazyGateCatalogOverrideForTests.withValue({
@@ -78,7 +79,7 @@ private struct LGCatalogFailure: Error {}
 @Test func lazyGate_thrownEnumeration_doesNotBreakAlwaysOnCore() async throws {
     let root = try lgTempRoot("alwayson")
     defer { try? FileManager.default.removeItem(at: root) }
-    let tools = SwiftToolDispatcher(dataRoot: root)
+    let tools = SwiftToolDispatcher(dataRoot: root, enforceLazyToolLoading: true)
 
     let out = try await SwiftToolDispatcher.$lazyGateCatalogOverrideForTests.withValue({
         throw LGCatalogFailure()
@@ -97,23 +98,31 @@ private struct LGCatalogFailure: Error {}
     #expect(obj["reason"] != .string("not_loaded"))
 }
 
-/// No session_id ⇒ non-chat surface ⇒ the gate is skipped entirely, so a
-/// broken enumeration must not manufacture a catalog_unavailable there.
-@Test func lazyGate_noSession_unaffectedByCatalogFailure() async throws {
+/// A missing or whitespace-only session id must fail before catalog lookup.
+/// Otherwise any caller that forgets to propagate the current session receives
+/// the full native lazy-tool catalog with no loaded-set discipline.
+@Test(arguments: [
+    [String: JSONValue](),
+    ["__session_id": .string(" \n\t ")],
+])
+func lazyGate_missingOrEmptySession_failsClosed(input: [String: JSONValue]) async throws {
     let root = try lgTempRoot("nosession")
     defer { try? FileManager.default.removeItem(at: root) }
-    let tools = SwiftToolDispatcher(dataRoot: root)
+    let tools = SwiftToolDispatcher(dataRoot: root, enforceLazyToolLoading: true)
 
-    // No try? — a thrown dispatch on the no-session path must FAIL the test,
-    // not silently pass it (gpt-5.5 wave review, 2026-07-31).
+    // The catalog override must not be consulted: the missing-session gate
+    // is the first failure and has no enumeration dependency.
     let out = try await SwiftToolDispatcher.$lazyGateCatalogOverrideForTests.withValue({
         throw LGCatalogFailure()
     }) {
-        try await tools.dispatch(tool: "market_status", input: [:], surface: "chat")
+        try await tools.dispatch(tool: "market_status", input: input, surface: "chat")
     }
     guard case .object(let obj) = out else {
-        Issue.record("no-session dispatch returned a non-object envelope")
+        Issue.record("missing-session dispatch returned a non-object envelope")
         return
     }
-    #expect(obj["reason"] != .string("catalog_unavailable"))
+    #expect(obj["status"] == .string("failed"))
+    #expect(obj["reason"] == .string("missing_session_id"))
+    #expect(obj["tool"] == .string("market_status"))
+    #expect(obj["session_id"] == nil)
 }

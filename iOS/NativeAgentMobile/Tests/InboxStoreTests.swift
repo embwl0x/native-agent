@@ -66,4 +66,45 @@ final class InboxStoreTests: XCTestCase {
 
         XCTAssertEqual(item.presentableActions.map(\.id), ["view", "archive"])
     }
+
+    func test_cardOnlyPresentsActionIDsAcceptedByTheMacInboxRouter() throws {
+        let item = InboxItemRecord(
+            id: "card-1",
+            created_at: "2026-07-12T12:00:00Z",
+            source: "proactive_autonomy:test",
+            severity: "actionable",
+            title: "A thought",
+            summary: "Something worth reviewing",
+            detail: nil,
+            relatedWorkshopExecutionId: nil,
+            related_approval_id: nil,
+            related_paths: nil,
+            related_groups: nil,
+            actions: [
+                InboxActionRecord(id: "view", label: "View", description: nil),
+                InboxActionRecord(id: "repair", label: "Repair", description: nil),
+                InboxActionRecord(id: "removed_by_mac", label: "Old action", description: nil),
+            ],
+            status: "unread",
+            read_at: nil
+        )
+
+        XCTAssertEqual(item.presentableActions.map(\.id), ["view", "repair"])
+        XCTAssertFalse(InboxActionPresentation.forwardedActionIDs.contains("removed_by_mac"))
+
+        let router = try MobileEvalSources.repoFile("Sources/NativeAgentApp/MacSyncActionRouter.swift")
+        guard let declaration = router.range(of: "let nativeActions: Set<String> = ["),
+              let closingBracket = router[declaration.upperBound...].firstIndex(of: "]") else {
+            XCTFail("Mac inbox router must declare its accepted action vocabulary.")
+            return
+        }
+        let routerActionList = String(router[declaration.upperBound..<closingBracket])
+        let macAcceptedActionIDs = Set(MobileEvalSources.matches(#"\"([a-z_]+)\""#, in: routerActionList))
+            .union(["deny"])
+
+        XCTAssertTrue(
+            InboxActionPresentation.forwardedActionIDs.isSubset(of: macAcceptedActionIDs),
+            "Every card action iOS can send must be accepted by the Mac inbox router."
+        )
+    }
 }

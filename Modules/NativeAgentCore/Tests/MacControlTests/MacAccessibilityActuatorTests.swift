@@ -136,6 +136,15 @@ final class _FakeAXActSource: MacAXActSource, @unchecked Sendable {
         return target(for: current)
     }
 
+    /// B2 — the fake tree is ONE app, so a pid-anchored resolve is the same
+    /// walk; the pid it was asked for is recorded so a test can prove which
+    /// app the caller aimed at.
+    func resolve(path: [Int], inAppPid pid: Int32) -> MacAXPidResolution {
+        lock.lock(); attempted.append("resolve_in_pid:\(pid)"); lock.unlock()
+        guard let hit = resolve(path: path) else { return .pathNotFound }
+        return .resolved(hit)
+    }
+
     func perform(_ target: MacAXActTarget, action: String) -> MacAXActOutcome {
         lock.lock(); attempted.append("perform:\(action)"); lock.unlock()
         guard let node = node(target.handle) else { return .invalidTarget }
@@ -614,7 +623,9 @@ private func _buttonTree() -> _FakeAXActNode {
     // EXACTLY rather than by containment: a new action arriving here silently
     // would be a new injection nobody reviewed, and one LEAVING would be an
     // injection that quietly dropped to read tier.
-    #expect(macControlAccessibilityInjectionActions == ["keystroke", "click", "scroll", "ax_act", "wake"])
+    // native-look item 3 added `act` (the closed-loop verb); the four-verb
+    // surface's bounded physical executor, `hand`, is injection too.
+    #expect(macControlAccessibilityInjectionActions == ["keystroke", "click", "scroll", "ax_act", "wake", "act", "hand"])
 }
 
 @Test func keystrokeAndClickMovedIntoThePortedSetWithoutDisturbingDaemonParity() {

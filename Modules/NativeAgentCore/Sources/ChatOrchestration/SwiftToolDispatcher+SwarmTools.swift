@@ -15,6 +15,37 @@ import WorkshopExecution
 
 // MARK: - Agent swarm tools
 
+/// One assembled swarm provider body. The default swarm executor receives this
+/// exact root for every credential authority; the observer is a test-only
+/// assembly probe and never replaces adapters or dispatch behavior.
+public struct SwarmProviderAssembly: Sendable {
+    let dataRoot: URL
+    let codexEnvironment: [String: String]
+    let anthropicDataRoot: URL
+    let openAIDataRoot: URL
+    let openAIOAuthPath: URL
+    let anthropicOAuthPath: URL
+    let xaiOAuthPath: URL
+    let moonshotDataRoot: URL
+
+    init(dataRoot: URL, environment: [String: String] = ProcessInfo.processInfo.environment) {
+        self.dataRoot = dataRoot
+        self.codexEnvironment = environment.merging([
+            "CODEX_HOME": dataRoot.appendingPathComponent("codex_home", isDirectory: true).path,
+            "NATIVE_AGENT_DATA_ROOT": dataRoot.path,
+        ]) { _, bound in bound }
+        self.anthropicDataRoot = dataRoot
+        self.openAIDataRoot = dataRoot
+        self.openAIOAuthPath = OpenAIOAuthDirectAdapter.preferredAuthPath(
+            dataRoot: dataRoot, allowSharedFallbacks: false, defaultRoot: dataRoot
+        )
+        self.anthropicOAuthPath = dataRoot.appendingPathComponent("providers", isDirectory: true)
+            .appendingPathComponent("anthropic_oauth_direct.json")
+        self.xaiOAuthPath = XAIOAuthDirectAdapter.tokenPath(dataRoot: dataRoot)
+        self.moonshotDataRoot = dataRoot
+    }
+}
+
 extension SwiftToolDispatcher {
     func impl_agent_swarm(input: [String: JSONValue], surface: String) async throws -> JSONValue {
         var body = input
@@ -61,21 +92,29 @@ extension SwiftToolDispatcher {
         providerID: String?,
         providerLifecycleObserver: (any LLMCallLifecycleObserving)? = nil
     ) -> any AgentSwarmExecuting {
+        // A swarm is an ordinary child of this dispatcher body. Its provider
+        // adapters must not fall back to the process-default credentials just
+        // because the worker is assembled here instead of by the chat factory.
+        let providerAssembly = SwarmProviderAssembly(dataRoot: dataRoot)
+        swarmProviderAssemblyObserver?(providerAssembly)
         let llm = SwiftNativeLLMClient(
             router: router,
-            codex: CodexAdapter(),
-            anthropic: AnthropicAdapter(),
-            openAI: OpenAIAdapter(),
-            openAIOAuthDirect: OpenAIOAuthDirectAdapter(),
-            anthropicOAuthDirect: AnthropicOAuthDirectAdapter(),
-            xaiOAuthDirect: XAIOAuthDirectAdapter(),
-            moonshot: MoonshotAdapter(),
-            // Root the kimi-code credential/telemetry reads in the SAME
-            // dataRoot the router resolves provider state from — a non-default
-            // runtime must not silently read the default root's key (gpt-5.5
-            // review MED). NOTE: the neighboring adapters predate this fix and
-            // still use default roots — pre-existing pattern, tracked on the
-            // kimi-code-provider board, not widened here.
+            codex: CodexAdapter(processEnvironmentOverride: providerAssembly.codexEnvironment),
+            anthropic: AnthropicAdapter(dataRootOverride: providerAssembly.anthropicDataRoot, telemetryDataRootOverride: providerAssembly.dataRoot),
+            openAI: OpenAIAdapter(dataRootOverride: providerAssembly.openAIDataRoot, telemetryDataRootOverride: providerAssembly.dataRoot),
+            openAIOAuthDirect: OpenAIOAuthDirectAdapter(
+                authPathOverride: providerAssembly.openAIOAuthPath,
+                telemetryDataRootOverride: providerAssembly.dataRoot
+            ),
+            anthropicOAuthDirect: AnthropicOAuthDirectAdapter(
+                authPathOverride: providerAssembly.anthropicOAuthPath,
+                telemetryDataRootOverride: providerAssembly.dataRoot
+            ),
+            xaiOAuthDirect: XAIOAuthDirectAdapter(
+                tokenPathOverride: providerAssembly.xaiOAuthPath,
+                telemetryDataRootOverride: providerAssembly.dataRoot
+            ),
+            moonshot: MoonshotAdapter(dataRootOverride: providerAssembly.moonshotDataRoot, telemetryDataRootOverride: providerAssembly.dataRoot),
             kimiCode: AnthropicAdapter.kimiCode(
                 dataRootOverride: dataRoot,
                 telemetryDataRootOverride: dataRoot
@@ -85,11 +124,25 @@ extension SwiftToolDispatcher {
             moonshotCatalogDataRoot: dataRoot
         )
         let workerTools = AgentSwarmInheritedToolScope(inner: self)
+        let workerCodexFactory: (@Sendable ([String: String]?) -> any LLMAdapter)?
+        if let observer = swarmWorkerCodexEnvironmentObserver {
+            workerCodexFactory = { environment in
+                observer(environment)
+                return CodexAdapter(processEnvironmentOverride: environment)
+            }
+        } else {
+            workerCodexFactory = nil
+        }
         let workerClient = makeChatOrchestrationClient(
             tools: workerTools,
             dataRoot: dataRoot,
+            // Workers are real chat clients; name the swarm body as their
+            // credential authority so they do not fall onto the alternate-root
+            // fail-closed lane or borrow process-default credentials.
+            providersRoot: dataRoot,
             approvalFiler: swarmApprovalFiler,
-            providerLifecycleObserver: providerLifecycleObserver
+            providerLifecycleObserver: providerLifecycleObserver,
+            codexAdapterFactory: workerCodexFactory
         )
         return SwiftNativeAgentSwarmExecutor(
             llm: llm,

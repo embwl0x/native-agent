@@ -629,6 +629,72 @@ public actor SwiftNativeSecurityCenter {
         )
     }
 
+    /// Observe the retention policy and evidence at the same locked path the
+    /// audit writer uses. This is intentionally a read-only diagnostic rather
+    /// than work performed after every append: counting physical rows on each
+    /// tool call would defeat the writer's byte-triggered amortization.
+    ///
+    /// The report keeps the soft byte trigger and deferred row cap separate so
+    /// callers cannot claim the 20k cap holds before the trigger. If the feed
+    /// cannot be scanned cleanly or the lock/read fails, the report says so
+    /// instead of manufacturing a healthy bound.
+    public func auditRetentionReport() async -> SecurityAuditRetentionReport {
+        let path = auditReceiptsPath
+        let triggerBytes = JSONLLineCaps.securityAuditTrimTriggerBytes
+        let rowCap = JSONLLineCaps.securityAudit
+        do {
+            return try await persistence.withFileLock(path) {
+                guard FileManager.default.fileExists(atPath: path.path) else {
+                    return SecurityAuditRetentionReport(
+                        state: .belowTrimTrigger,
+                        effectiveBoundBytes: triggerBytes,
+                        rowCapWhenTriggered: rowCap,
+                        byteCount: 0,
+                        physicalLineCount: 0
+                    )
+                }
+                let attributes = try FileManager.default.attributesOfItem(atPath: path.path)
+                guard let byteCount = (attributes[.size] as? NSNumber)?.intValue else {
+                    throw PersistenceCoreError.ioFailure("security audit size is unavailable")
+                }
+                let scan = try await persistence.readJSONLReporting(path).report
+                if !scan.isClean {
+                    var problems: [String] = []
+                    if scan.malformedLineCount > 0 {
+                        problems.append("\(scan.malformedLineCount) malformed row(s)")
+                    }
+                    if scan.trailingPartialLine {
+                        problems.append("trailing partial row")
+                    }
+                    return SecurityAuditRetentionReport(
+                        state: .incompleteEvidence,
+                        effectiveBoundBytes: triggerBytes,
+                        rowCapWhenTriggered: rowCap,
+                        byteCount: byteCount,
+                        physicalLineCount: scan.physicalLineCount,
+                        evidenceIssue: problems.joined(separator: "; ")
+                    )
+                }
+                return SecurityAuditRetentionReport(
+                    state: byteCount < triggerBytes ? .belowTrimTrigger : .trimTriggerExceeded,
+                    effectiveBoundBytes: triggerBytes,
+                    rowCapWhenTriggered: rowCap,
+                    byteCount: byteCount,
+                    physicalLineCount: scan.physicalLineCount
+                )
+            }
+        } catch {
+            return SecurityAuditRetentionReport(
+                state: .unavailable,
+                effectiveBoundBytes: triggerBytes,
+                rowCapWhenTriggered: rowCap,
+                byteCount: nil,
+                physicalLineCount: nil,
+                evidenceIssue: error.localizedDescription
+            )
+        }
+    }
+
     private var auditReceiptsPath: URL {
         dataRoot
             .appendingPathComponent("security", isDirectory: true)

@@ -18,6 +18,29 @@ import PersistenceCore
 private typealias KVSKey = NativeAgentICloudBridgeConstants.KVSKey
 private typealias DriveFolder = NativeAgentICloudBridgeConstants.DriveFolder
 
+/// Transport presence and CloudKit selection are not interchangeable: the
+/// hermetic bridge constructor accepts any `DeviceSyncTransport`, while only
+/// the entitlement-checked production resolver may activate the CloudKit lane.
+enum ICloudDeviceTransportSelection: Equatable {
+    case legacyKVS
+    case cloudKit
+    case injectedForTesting
+
+    var isCloudKit: Bool { self == .cloudKit }
+}
+
+/// A chat receipt describes the furthest boundary this Mac actually observed.
+/// Neither state implies that iOS fetched, displayed, or acknowledged the
+/// message; that would require a separate signed return receipt from iOS.
+enum ChatDeliveryReceiptStatus: String, Sendable {
+    /// The Drive file exists locally and still depends on iCloud replication.
+    case queuedForICloudSync = "queued_for_icloud_sync"
+    /// CloudKit accepted the outbound record, but iOS has not acknowledged it.
+    case acceptedByTransport = "accepted_by_transport"
+
+    var deliveryConfirmed: Bool { false }
+}
+
 @MainActor
 final class iCloudBridge: ObservableObject {
     static let shared = iCloudBridge()
@@ -40,12 +63,16 @@ final class iCloudBridge: ObservableObject {
     private var driveURL: URL?
     private var metadataQuery: NSMetadataQuery?
     private var messageHandlers: [(BridgeMessage) async -> Bool] = []
-    // CK-3b: the device-sync transport SEAM. Non-nil ⇒ CloudKit is the active
-    // transport (resolver selected `.cloudkit` AND the entitlement is present —
-    // makeCloudKitTransport enforces the crash-guard). nil ⇒ the legacy
-    // KVS/ubiquity path below runs unchanged.
+    private var statusKeyHandlers: [String: [(String) -> Void]] = [:]
+    private var cloudKitObservedStatusKeys: Set<String> = []
+    // The device-sync transport seam. A non-nil transport may be the checked
+    // production CloudKit owner or a hermetic injected transport; callers that
+    // need CloudKit-specific behavior must consult `deviceTransportSelection`.
     private var deviceTransport: DeviceSyncTransport?
-    var usesCloudKitDeviceTransport: Bool { deviceTransport != nil }
+    private(set) var deviceTransportSelection: ICloudDeviceTransportSelection = .legacyKVS
+    var usesCloudKitDeviceTransport: Bool {
+        deviceTransport != nil && deviceTransportSelection.isCloudKit
+    }
     private(set) var cloudKitVisualNotificationPeerReady: Bool = false
     // CK-3c: single-flight guard for the transport drain (timer + observe +
     // on-demand triggers coalesce; per-message delivery is already atomic in the
@@ -78,13 +105,31 @@ final class iCloudBridge: ObservableObject {
     // container resolve that completes late can't re-register observers / start
     // the query for a superseded setup (it checks generation before applying).
     private var setupGeneration: Int = 0
+    /// DeviceSyncTransport currently has last-registration-wins observation but
+    /// no cancellation token. Keep the callback itself lifecycle-gated so a
+    /// retained transport cannot route work after this bridge has torn down.
+    private var incomingObserverGeneration: UInt64 = 0
+    private(set) var incomingObserverInstalled = false
     private var outboxScanTask: Task<Void, Never>?
     private var outboxScanInFlight = false
     private var outboxScanQueued = false
+    /// Makes a cancelled/retired detached scan unable to clear or replay work
+    /// belonging to a newer bridge lifecycle.
+    private var outboxScanGeneration: UInt64 = 0
+    var outboxScanState: (inFlight: Bool, queued: Bool) {
+        (outboxScanInFlight, outboxScanQueued)
+    }
     // N10 fix: idempotency guard — track whether setup() has already run so
     // repeat calls don't stack additional KVS observers (each call added a
     // new addObserver which fired the handler multiple times per external change).
     private var isSetUp: Bool = false
+    /// Hermetic evaluations may provide authority inputs explicitly. Production
+    /// always leaves these nil and uses the canonical pairing/evidence stores.
+    private var testPairingSecret: Data?
+    private var testDataRoot: URL?
+    private var testCKSeenIDDefaults: UserDefaults?
+    private var testOutboxScanHook: (@Sendable () throws -> Void)?
+    private var deliveryNudgeQueue: ICloudDeliveryNudgeQueue?
 
     // Drive folder layout
     // <container>/Documents/outbox/mac/   — Mac writes here
@@ -95,6 +140,40 @@ final class iCloudBridge: ObservableObject {
     // MARK: - Init
 
     private init() {}
+
+    /// Hermetic transport seam for bridge evaluations. Production owns transport
+    /// selection through `configureDeviceTransportIfAvailable`; this initializer
+    /// never resolves an entitlement, starts a listener, or contacts iCloud.
+    init(
+        testDeviceTransport: DeviceSyncTransport,
+        testPairingSecret: Data? = nil,
+        testDataRoot: URL? = nil,
+        testCKSeenIDDefaults: UserDefaults? = nil,
+        testOutboxScanHook: (@Sendable () throws -> Void)? = nil
+    ) {
+        deviceTransport = testDeviceTransport
+        deviceTransportSelection = .injectedForTesting
+        self.testPairingSecret = testPairingSecret
+        self.testDataRoot = testDataRoot
+        self.testCKSeenIDDefaults = testCKSeenIDDefaults
+        self.testOutboxScanHook = testOutboxScanHook
+        // Production performs this restore before its first transport drain in
+        // setup(). The hermetic transport constructor has no setup() path, so
+        // restore the same durable replay filter here.
+        loadCKSeenIDs()
+    }
+
+    init(
+        testDriveURL: URL,
+        testPairingSecret: Data,
+        testDataRoot: URL? = nil,
+        testOutboxScanHook: (@Sendable () throws -> Void)? = nil
+    ) {
+        driveURL = testDriveURL
+        self.testPairingSecret = testPairingSecret
+        self.testDataRoot = testDataRoot
+        self.testOutboxScanHook = testOutboxScanHook
+    }
 
     // N-mem fix: insert a seen id and cap the in-memory set so it can't grow
     // without bound. fix-2026-06-10 sync-audit #2: insertion-ordered, evicting
@@ -121,12 +200,20 @@ final class iCloudBridge: ObservableObject {
     private static let ckProcessedIDsDefaultsKey = "NativeAgent.iCloud.ckProcessedIDs.v1"
 
     private func persistCKSeenIDs() {
-        let capped = Array(seenMessageIDsOrdered.suffix(Self.seenMessageIDsCap))
-        UserDefaults.standard.set(capped, forKey: Self.ckProcessedIDsDefaultsKey)
+        ICloudSeenIDDefaultsStore.save(
+            seenMessageIDsOrdered,
+            defaults: testCKSeenIDDefaults ?? .standard,
+            key: Self.ckProcessedIDsDefaultsKey,
+            cap: Self.seenMessageIDsCap
+        )
     }
 
     private func loadCKSeenIDs() {
-        guard let ckIDs = UserDefaults.standard.array(forKey: Self.ckProcessedIDsDefaultsKey) as? [String] else { return }
+        let ckIDs = ICloudSeenIDDefaultsStore.load(
+            defaults: testCKSeenIDDefaults ?? .standard,
+            key: Self.ckProcessedIDsDefaultsKey,
+            cap: Self.seenMessageIDsCap
+        )
         for id in ckIDs where seenMessageIDs.insert(id).inserted {
             seenMessageIDsOrdered.append(id)
         }
@@ -315,15 +402,12 @@ final class iCloudBridge: ObservableObject {
             return
         }
         deviceTransport = transport
+        deviceTransportSelection = .cloudKit
         available = true
         syncStatus = "CloudKit connecting…"
         NSLog("[iCloudBridge] device transport: CloudKit ACTIVE (role=mac)")
 
-        Task {
-            await transport.observeIncoming { [weak self] msg in
-                await self?.handleIncomingFromTransport(msg) ?? false
-            }
-        }
+        registerIncomingTransportObserver(transport)
         Task {
             await transport.observeStatus(
                 key: NAVisualNotificationCapability.statusKey
@@ -433,7 +517,7 @@ final class iCloudBridge: ObservableObject {
         // verify with one key. Pairing state must be durable and checked before
         // any message is signed or published; an unavailable local secret may
         // never degrade into an unsigned transport message.
-        let secret = try PairingSecretManager.loadOrGenerateSecret()
+        let secret = try testPairingSecret ?? PairingSecretManager.loadOrGenerateSecret()
         let msg = try unsigned.signed(with: secret)
 
         // CK-3b: CloudKit transport path. The signed BridgeMessage rides verbatim
@@ -442,8 +526,21 @@ final class iCloudBridge: ObservableObject {
         // codec rejects an oversized encoded record before CloudKit sees it,
         // producing a clear user-facing error instead of an opaque server failure.
         if let ck = deviceTransport {
-            try await ck.send(msg)
-            await recordChatDeliveryReceipt(msg, transport: "cloudkit", secret: secret)
+            do {
+                try await ck.send(msg)
+            } catch {
+                // A previous success must not remain visible as the status for a
+                // rejected message. No receipt is written because CloudKit never
+                // accepted this handoff.
+                syncStatus = "CloudKit did not accept message: \(error.localizedDescription)"
+                throw error
+            }
+            await recordChatDeliveryReceipt(
+                msg,
+                transport: "cloudkit",
+                status: .acceptedByTransport,
+                secret: secret
+            )
             // CK-5: fire the lightweight KVS "new message" nudge so the peer drains
             // CloudKit IMMEDIATELY — an event-driven foreground trigger (fires on
             // send, not on a timer, so no idle churn / scroll bounce), and it works
@@ -457,7 +554,7 @@ final class iCloudBridge: ObservableObject {
                 return kvs.synchronize()
             }
             lastSyncAt = Date()
-            syncStatus = "Sent via CloudKit"
+            syncStatus = "CloudKit accepted message — waiting for iOS"
             return msg
         }
 
@@ -472,10 +569,20 @@ final class iCloudBridge: ObservableObject {
         let outboxURL = docsURL
             .appendingPathComponent(DriveFolder.outboxMac)
             .appendingPathComponent("\(msg.id).json")
-        try await Task.detached(priority: .utility) { [data, outboxURL] in
-            try data.write(to: outboxURL, options: .atomic)
-        }.value
-        await recordChatDeliveryReceipt(msg, transport: "icloud_drive", secret: secret)
+        do {
+            try await Task.detached(priority: .utility) { [data, outboxURL] in
+                try data.write(to: outboxURL, options: .atomic)
+            }.value
+        } catch {
+            syncStatus = "Could not queue iCloud message: \(error.localizedDescription)"
+            throw error
+        }
+        await recordChatDeliveryReceipt(
+            msg,
+            transport: "icloud_drive",
+            status: .queuedForICloudSync,
+            secret: secret
+        )
 
         // KVS trigger: notify iOS side that a new file is waiting in Drive
         let triggerValue = "\(ISO8601DateFormatter().string(from: Date())):\(msg.id)"
@@ -484,10 +591,10 @@ final class iCloudBridge: ObservableObject {
             kvs.set(triggerValue, forKey: KVSKey.newMessageInDrive)
             return kvs.synchronize()
         }
-        scheduleDeliveryNudges(for: msg.id)
+        await scheduleDeliveryNudges(for: msg.id)
 
         lastSyncAt = Date()
-        syncStatus = "Sent — waiting for iCloud sync"
+        syncStatus = "Queued for iCloud sync — waiting for iOS"
         return msg
     }
 
@@ -511,16 +618,44 @@ final class iCloudBridge: ObservableObject {
             correlationID: correlationID,
             metadata: ["kind": "icloud_action_response"]
         )
-        let secret = try PairingSecretManager.loadOrGenerateSecret()
-        try await deviceTransport.send(unsigned.signed(with: secret))
-        lastSyncAt = Date()
-        syncStatus = "Sent action response via CloudKit"
+        let secret = try testPairingSecret ?? PairingSecretManager.loadOrGenerateSecret()
+        do {
+            try await deviceTransport.send(unsigned.signed(with: secret))
+            lastSyncAt = Date()
+            syncStatus = "Sent action response via CloudKit"
+        } catch {
+            // Do not leave a prior green send painted as current health. The
+            // durable response remains available to MacSync for a restart-safe
+            // resend, but the bridge state must say that this attempt failed.
+            syncStatus = "CloudKit action response waiting to resend: \(error.localizedDescription)"
+            throw error
+        }
     }
 
     private func recordChatDeliveryReceipt(
         _ message: BridgeMessage,
         transport: String,
+        status: ChatDeliveryReceiptStatus,
         secret: Data
+    ) async {
+        await Self.appendChatDeliveryReceipt(
+            message,
+            transport: transport,
+            status: status,
+            secret: secret,
+            dataRoot: testDataRoot ?? PersistenceCore.defaultDataRoot()
+        )
+    }
+
+    /// The durable receipt seam for both CloudKit and Drive sends. Keeping the
+    /// row construction and capped append here lets evaluations exercise the
+    /// exact persisted evidence without opening a live transport.
+    static func appendChatDeliveryReceipt(
+        _ message: BridgeMessage,
+        transport: String,
+        status: ChatDeliveryReceiptStatus,
+        secret: Data,
+        dataRoot: URL
     ) async {
         let row: JSONValue = .object([
             "at": .string(ISO8601DateFormatter().string(from: Date())),
@@ -530,14 +665,15 @@ final class iCloudBridge: ObservableObject {
             "sender": .string(message.sender),
             "direction": .string("mac_to_ios"),
             "transport": .string(transport),
-            "status": .string("sent"),
+            "status": .string(status.rawValue),
+            "deliveryConfirmed": .bool(status.deliveryConfirmed),
             "signatureVerified": .bool(message.verifySignature(secret: secret)),
             "kind": message.metadata?["kind"].map { .string($0) } ?? .string("reply"),
             "targetSourceKey": message.metadata?["targetSourceKey"].map { .string($0) } ?? .null,
             "textPreview": .string(String(message.text.prefix(240))),
             "attachmentCount": .int(Int64(message.attachments?.count ?? 0)),
         ])
-        let path = PersistenceCore.defaultDataRoot()
+        let path = dataRoot
             .appendingPathComponent("icloud", isDirectory: true)
             .appendingPathComponent("chat_delivery_receipts.jsonl")
         try? await appendJSONLCapped(
@@ -566,19 +702,11 @@ final class iCloudBridge: ObservableObject {
             NSUbiquitousKeyValueStore.default.string(forKey: "NativeAgent.pairing.publishedAt") ?? ""
         } ?? ""
         let secretVersion = PairingSecretManager.currentSecretVersion()
-        let metadata: [String: String] = [
-            "kind": "signature_invalid_resync",
-            "rejectedMessageId": correlationID ?? "",
-            "publishedAt": publishedAt,
-            "pairing_secret_version": String(secretVersion),
-            "targetSourceKey": targetSourceKey,
-        ]
-        let msg = BridgeMessage.make(
-            sender: "mac",
-            text: "signature_invalid_resync",
-            sessionID: nil,
+        let msg = Self.unsignedResyncHintMessage(
             correlationID: correlationID,
-            metadata: metadata
+            targetSourceKey: targetSourceKey,
+            publishedAt: publishedAt,
+            secretVersion: secretVersion
         )
         // INTENTIONALLY UNSIGNED — iOS dispatches on metadata.kind first.
         let encoder = JSONEncoder()
@@ -598,18 +726,64 @@ final class iCloudBridge: ObservableObject {
         }
     }
 
-    private func scheduleDeliveryNudges(for messageID: String) {
-        for delayNs in [1_000_000_000, 3_000_000_000] as [UInt64] {
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: delayNs)
-                guard self.available else { return }
-                let triggerValue = "\(ISO8601DateFormatter().string(from: Date())):\(messageID)"
-                _ = await withCKTimeout("iCloudBridge.deliveryNudge.kvsTrigger", seconds: 3) {
-                    let kvs = NSUbiquitousKeyValueStore.default
-                    kvs.set(triggerValue, forKey: KVSKey.newMessageInDrive)
-                    return kvs.synchronize()
+    nonisolated static func unsignedResyncHintMessage(
+        correlationID: String?,
+        targetSourceKey: String,
+        publishedAt: String,
+        secretVersion: Int
+    ) -> BridgeMessage {
+        BridgeMessage.make(
+            sender: "mac",
+            text: "signature_invalid_resync",
+            sessionID: nil,
+            correlationID: correlationID,
+            metadata: [
+                "kind": "signature_invalid_resync",
+                "rejectedMessageId": correlationID ?? "",
+                "publishedAt": publishedAt,
+                "pairing_secret_version": String(secretVersion),
+                "targetSourceKey": targetSourceKey,
+            ]
+        )
+    }
+
+    private func scheduleDeliveryNudges(for messageID: String) async {
+        let queue: ICloudDeliveryNudgeQueue
+        if let deliveryNudgeQueue {
+            queue = deliveryNudgeQueue
+        } else {
+            queue = ICloudDeliveryNudgeQueue(
+                isAvailable: { [weak self] in
+                    await self?.available ?? false
+                },
+                sendNudge: { messageID in
+                    let triggerValue = "\(ISO8601DateFormatter().string(from: Date())):\(messageID)"
+                    return await withCKTimeout(
+                        "iCloudBridge.deliveryNudge.kvsTrigger",
+                        seconds: 3
+                    ) {
+                        let kvs = NSUbiquitousKeyValueStore.default
+                        kvs.set(triggerValue, forKey: KVSKey.newMessageInDrive)
+                        return kvs.synchronize()
+                    } ?? false
+                },
+                observeOutcome: { [weak self] outcome in
+                    await self?.recordDeliveryNudgeOutcome(outcome)
                 }
-            }
+            )
+            deliveryNudgeQueue = queue
+        }
+        await queue.schedule(for: messageID)
+    }
+
+    private func recordDeliveryNudgeOutcome(_ outcome: ICloudDeliveryNudgeOutcome) {
+        switch outcome.disposition {
+        case .synchronized:
+            break
+        case .unavailable:
+            syncStatus = "iCloud delivery nudge skipped: iCloud unavailable"
+        case .synchronizeFailed:
+            syncStatus = "iCloud delivery nudge failed: iOS will retry on its next sync"
         }
     }
 
@@ -684,15 +858,14 @@ final class iCloudBridge: ObservableObject {
                 surfaces: surfaces
             )
             let value = try NAProviderCatalogStatusCodec.encode(catalog)
-            if value == lastPublishedProviderCatalogStatus {
-                return true
-            }
-            try await deviceTransport.setStatus(
+            let outcome = await ICloudBridgeStatusPublication.publish(
                 key: NAProviderCatalogStatusCodec.statusKey,
-                value: value
+                value: value,
+                lastPublished: lastPublishedProviderCatalogStatus,
+                transport: deviceTransport
             )
-            lastPublishedProviderCatalogStatus = value
-            return true
+            lastPublishedProviderCatalogStatus = outcome.retainedValue
+            return outcome.succeeded
         } catch {
             NSLog("[iCloudBridge] provider catalog publication failed: \(error.localizedDescription)")
             return false
@@ -750,22 +923,16 @@ final class iCloudBridge: ObservableObject {
         correlationID: String,
         metadata: [String: String]
     ) async -> Bool {
-        var compactMetadata = metadata.mapValues { String($0.prefix(240)) }
-        compactMetadata["ephemeral"] = "true"
-        compactMetadata["transport"] = compactMetadata["transport"] ?? "icloud"
-        compactMetadata["source"] = compactMetadata["source"] ?? "mac"
-
-        let unsigned = BridgeMessage.make(
-            sender: "mac",
-            text: String(text.prefix(240)),
-            sessionID: sessionID,
-            correlationID: correlationID,
-            metadata: compactMetadata
-        )
         let msg: BridgeMessage
         do {
-            let secret = try PairingSecretManager.loadOrGenerateSecret()
-            msg = try unsigned.signed(with: secret)
+            let secret = try testPairingSecret ?? PairingSecretManager.loadOrGenerateSecret()
+            msg = try Self.makeKVSChatProgressMessage(
+                text: text,
+                sessionID: sessionID,
+                correlationID: correlationID,
+                metadata: metadata,
+                secret: secret
+            )
         } catch {
             syncStatus = "iPhone pairing unavailable — repair the Mac pairing key"
             NSLog("[iCloudBridge] failed to sign KVS progress msg=%@: %@", correlationID, "\(error)")
@@ -782,25 +949,81 @@ final class iCloudBridge: ObservableObject {
             return false
         }
 
-        let delivered = await withCKTimeout("iCloudBridge.sendKVSChatProgress", seconds: 3) {
+        let delivery: ICloudKVSProgressDeliveryResult = await withCKTimeout(
+            "iCloudBridge.sendKVSChatProgress",
+            seconds: 3
+        ) { () -> ICloudKVSProgressDeliveryResult in
             let kvs = NSUbiquitousKeyValueStore.default
+            let admission = ICloudKVSProgressWriteAdmission.assess(
+                keys: Set(kvs.dictionaryRepresentation.keys),
+                progressKey: KVSKey.chatProgressLatest
+            )
+            guard admission.isAllowed else { return .blocked(admission) }
             kvs.set(data, forKey: KVSKey.chatProgressLatest)
-            return kvs.synchronize()
-        } ?? false
+            return kvs.synchronize() ? .synchronized : .synchronizeFailed
+        } ?? .timedOut
 
-        if delivered {
+        switch delivery {
+        case .synchronized:
             lastSyncAt = Date()
             syncStatus = "Progress sent via iCloud KVS"
-        } else {
+            return true
+        case .blocked(let admission):
+            let snapshot = admission.snapshot
+            let detail = admission.failureDescription ?? "KVS keyspace unavailable"
+            syncStatus = "iCloud KVS progress blocked: \(detail)"
+            NSLog(
+                "[iCloudBridge] KVS progress blocked msg=%@ totalKeys=%d responseKeys=%d: %@",
+                correlationID,
+                snapshot.totalKeyCount,
+                snapshot.inboxResponseKeyCount,
+                detail
+            )
+        case .synchronizeFailed, .timedOut:
+            syncStatus = delivery == .timedOut
+                ? "iCloud KVS progress timed out"
+                : "iCloud KVS progress sync failed"
             NSLog("[iCloudBridge] KVS progress sync did not complete msg=%@", correlationID)
         }
-        return delivered
+        return false
+    }
+
+    nonisolated static func makeKVSChatProgressMessage(
+        text: String,
+        sessionID: String,
+        correlationID: String,
+        metadata: [String: String],
+        secret: Data
+    ) throws -> BridgeMessage {
+        var compactMetadata = metadata.mapValues { String($0.prefix(240)) }
+        compactMetadata["ephemeral"] = "true"
+        compactMetadata["transport"] = compactMetadata["transport"] ?? "icloud"
+        compactMetadata["source"] = compactMetadata["source"] ?? "mac"
+
+        let unsigned = BridgeMessage.make(
+            sender: "mac",
+            text: String(text.prefix(240)),
+            sessionID: sessionID,
+            correlationID: correlationID,
+            metadata: compactMetadata
+        )
+        return try unsigned.signed(with: secret)
     }
 
     func observeStatusKey(_ key: String, onChange: @escaping (String) -> Void) {
-        // Handled in kvsDidChange; register per-key handlers via a dict in a full impl.
-        // For v1, callers can observe `available` and `syncStatus` @Published props.
-        _ = key; _ = onChange  // placeholder — extend in v2
+        statusKeyHandlers[key, default: []].append(onChange)
+        guard let transport = deviceTransport,
+              cloudKitObservedStatusKeys.insert(key).inserted
+        else { return }
+        Task { [weak self] in
+            await transport.observeStatus(key: key) { [weak self] value in
+                await MainActor.run { self?.deliverObservedStatus(key: key, value: value) }
+            }
+        }
+    }
+
+    private func deliverObservedStatus(key: String, value: String) {
+        for handler in statusKeyHandlers[key] ?? [] { handler(value) }
     }
 
     // MARK: - Observe incoming messages from iOS (Drive)
@@ -812,15 +1035,38 @@ final class iCloudBridge: ObservableObject {
         // There is exactly one logical forwarder, so idempotent single-slot
         // registration is correct.
         messageHandlers = [onMessage]
-        // CK-3b: with CloudKit active, the forwarder is already registered (at
-        // transport birth in applyContainerResult); just re-drain to pull
-        // anything that arrived before this handler existed. Live push→drain
-        // wakeups are CK-3c. The legacy Drive scan runs otherwise.
+        // Keep the transport callback bound to this bridge as well as draining
+        // records that arrived before the app-side forwarder. The production
+        // setup path already installs this same callback, but registering here
+        // is idempotent (the transport is last-registration-wins) and prevents
+        // a late/recovered observer from becoming a green bridge with no route.
         if let ck = deviceTransport {
-            Task { await ck.drainIncoming() }
+            registerIncomingTransportObserver(ck)
             return
         }
         checkIosOutbox()
+    }
+
+    private func acceptsIncomingObserver(generation: UInt64) -> Bool {
+        generation == incomingObserverGeneration && deviceTransport != nil
+    }
+
+    private func registerIncomingTransportObserver(_ transport: DeviceSyncTransport) {
+        incomingObserverGeneration &+= 1
+        incomingObserverInstalled = false
+        let observerGeneration = incomingObserverGeneration
+        Task { [weak self] in
+            await transport.observeIncoming { [weak self] message in
+                guard let self,
+                      await self.acceptsIncomingObserver(generation: observerGeneration)
+                else { return false }
+                return await self.handleIncomingFromTransport(message)
+            }
+            guard let self,
+                  self.acceptsIncomingObserver(generation: observerGeneration)
+            else { return }
+            self.incomingObserverInstalled = true
+        }
     }
 
     /// CK-3b: validate + forward a message pulled from the CloudKit transport,
@@ -834,25 +1080,29 @@ final class iCloudBridge: ObservableObject {
         if seenMessageIDs.contains(msg.id) { return true }
         let secret: Data
         do {
-            secret = try PairingSecretManager.loadOrGenerateSecret()
+            secret = try testPairingSecret ?? PairingSecretManager.loadOrGenerateSecret()
         } catch {
             syncStatus = "iPhone pairing unavailable — repair the Mac pairing key"
             NSLog("[iCloudBridge] deferring iOS→Mac CK msg %@: %@", msg.id, error.localizedDescription)
             return false
         }
-        // HMAC — a CK record is no more trusted than a Drive file. Verify or drop.
-        // (Full resync self-heal parity — republish secret + resync hint — is a
-        // follow-up; it needs pairing-over-CK wired first. Drop+log is secure.)
-        if msg.signature == nil || !msg.verifySignature(secret: secret) {
-            NSLog("[iCloudBridge] dropping iOS→Mac CK msg %@: bad signature", msg.id)
+        switch ICloudIncomingMessageDisposition.classify(msg, secret: secret, now: Date()) {
+        case .permanentlyRejected(let reason):
+            NSLog("[iCloudBridge] dropping iOS→Mac CK msg %@: %@", msg.id, reason)
+            guard await recordPermanentIncomingRejection(msg, reason: reason) else {
+                syncStatus = "iPhone rejection receipt unavailable — retaining message for retry"
+                return false
+            }
             recordSeenMessageID(msg.id)
-            return true  // consume — permanently bad, do not retry
-        }
-        let messageAge = Date().timeIntervalSince(msg.timestamp)
-        if messageAge > 24 * 60 * 60 || messageAge < -15 * 60 {
-            NSLog("[iCloudBridge] dropping iOS→Mac CK msg %@: stale timestamp", msg.id)
-            recordSeenMessageID(msg.id)
-            return true  // consume
+            // The transport is told to advance for a permanent rejection. Keep
+            // that decision durable as well, otherwise a restart inside the
+            // transport's re-pull window reopens a message already classified
+            // as tampered/stale.
+            persistCKSeenIDs()
+            syncStatus = "Rejected iPhone message (CloudKit): \(reason)"
+            return true  // permanently rejected: consume, never wedge transport
+        case .deliver:
+            break
         }
         if msg.metadata?["kind"] == "icloud_action" {
             let handled = await MacSyncEngine.shared.processCloudKitActionMessage(msg)
@@ -869,7 +1119,7 @@ final class iCloudBridge: ObservableObject {
                 eventID: msg.id,
                 channel: .chat,
                 peerCreatedAt: msg.timestamp,
-                dataRoot: NativeAgentPaths.dataRoot
+                dataRoot: testDataRoot ?? NativeAgentPaths.dataRoot
             )
         } catch {
             NSLog("[iCloudBridge] could not persist signed peer evidence for %@: %@",
@@ -893,8 +1143,47 @@ final class iCloudBridge: ObservableObject {
             syncStatus = "Received message from iOS (CloudKit)"
             return true
         }
-        syncStatus = "iPhone message waiting — Mac runtime unavailable"
+        markMacRuntimeUnavailable()
         return false  // transient — retry next drain
+    }
+
+    /// A terminal rejection advances the transport cursor only after this
+    /// bounded receipt is durable. Otherwise a bad message remains retryable
+    /// instead of disappearing without its reason/status evidence.
+    private func recordPermanentIncomingRejection(
+        _ message: BridgeMessage,
+        reason: String
+    ) async -> Bool {
+        let row: JSONValue = .object([
+            "at": .string(ISO8601DateFormatter().string(from: Date())),
+            "messageId": .string(message.id),
+            "sender": .string(message.sender),
+            "direction": .string("ios_to_mac"),
+            "transport": .string("cloudkit"),
+            "status": .string("permanently_rejected"),
+            "reason": .string(reason),
+            "signaturePresent": .bool(message.signature != nil),
+        ])
+        let path = (testDataRoot ?? PersistenceCore.defaultDataRoot())
+            .appendingPathComponent("icloud", isDirectory: true)
+            .appendingPathComponent("incoming_rejections.jsonl")
+        do {
+            try await appendJSONLCapped(
+                row,
+                to: path,
+                using: SwiftNativePersistenceCore(),
+                maxLines: 500,
+                logLabel: "iCloudBridge.incomingRejection"
+            )
+            return true
+        } catch {
+            NSLog("[iCloudBridge] could not persist rejection receipt for %@: %@", message.id, error.localizedDescription)
+            return false
+        }
+    }
+
+    private func markMacRuntimeUnavailable() {
+        syncStatus = "iPhone message waiting — Mac runtime unavailable"
     }
 
     /// CK-3c: drain the CloudKit transport (incoming + pairing + status) if it is
@@ -938,22 +1227,29 @@ final class iCloudBridge: ObservableObject {
         let inFlightSnapshot = inFlightIncomingMessageIDs
         let secret: Data
         do {
-            secret = try PairingSecretManager.loadOrGenerateSecret()
+            secret = try testPairingSecret ?? PairingSecretManager.loadOrGenerateSecret()
         } catch {
             syncStatus = "iPhone pairing unavailable — repair the Mac pairing key"
             NSLog("[iCloudBridge] pairing authority unavailable during Drive scan: %@", error.localizedDescription)
             return
         }
         outboxScanInFlight = true
-        outboxScanTask = Task.detached(priority: .utility) { [docsURL, seenSnapshot, inFlightSnapshot, secret] in
-            let scan = Self.scanIosOutboxFiles(
-                docsURL: docsURL,
-                seenMessageIDs: seenSnapshot,
-                inFlightMessageIDs: inFlightSnapshot,
-                secret: secret
-            )
+        outboxScanGeneration &+= 1
+        let scanGeneration = outboxScanGeneration
+        let testScanHook = testOutboxScanHook
+        outboxScanTask = Task.detached(priority: .utility) { [docsURL, seenSnapshot, inFlightSnapshot, secret, testScanHook] in
+            do {
+                try testScanHook?()
+                let scan = Self.scanIosOutboxFiles(
+                    docsURL: docsURL,
+                    seenMessageIDs: seenSnapshot,
+                    inFlightMessageIDs: inFlightSnapshot,
+                    secret: secret
+                )
             await MainActor.run {
+                guard self.outboxScanGeneration == scanGeneration else { return }
                 self.outboxScanInFlight = false
+                self.outboxScanTask = nil
                 defer {
                     if self.outboxScanQueued {
                         self.outboxScanQueued = false
@@ -1030,7 +1326,7 @@ final class iCloudBridge: ObservableObject {
                                 eventID: pending.message.id,
                                 channel: .chat,
                                 peerCreatedAt: pending.message.timestamp,
-                                dataRoot: NativeAgentPaths.dataRoot
+                                dataRoot: self.testDataRoot ?? NativeAgentPaths.dataRoot
                             )
                         } catch {
                             NSLog("[iCloudBridge] could not persist signed peer evidence for %@: %@",
@@ -1045,9 +1341,24 @@ final class iCloudBridge: ObservableObject {
                         if delivered {
                             await self.markIosMessageProcessed(pending, docsURL: docsURL)
                         } else {
-                            self.syncStatus = "iPhone message waiting — Mac runtime unavailable"
+                            self.markMacRuntimeUnavailable()
                         }
                     }
+                }
+            }
+            } catch {
+                await MainActor.run {
+                    guard self.outboxScanGeneration == scanGeneration else { return }
+                    self.outboxScanInFlight = false
+                    self.outboxScanTask = nil
+                    defer {
+                        if self.outboxScanQueued {
+                            self.outboxScanQueued = false
+                            self.checkIosOutbox()
+                        }
+                    }
+                    guard !Task.isCancelled else { return }
+                    self.syncStatus = "iPhone inbox scan failed — retained claims will retry: \(error.localizedDescription)"
                 }
             }
         }
@@ -1066,7 +1377,7 @@ final class iCloudBridge: ObservableObject {
         var fileURL: URL
     }
 
-    nonisolated private static func processedMessageIDsURL(docsURL: URL) -> URL {
+    nonisolated static func processedMessageIDsURL(docsURL: URL) -> URL {
         docsURL
             .appendingPathComponent(DriveFolder.processed)
             .appendingPathComponent("ios_chat_processed_ids.json")
@@ -1075,7 +1386,7 @@ final class iCloudBridge: ObservableObject {
     // fix-2026-06-10 sync-audit #2: load/save the ORDERED id array (oldest →
     // newest) so eviction is insertion-ordered, not the old lexicographic
     // .sorted().suffix() which evicted age-randomly.
-    nonisolated private static func loadProcessedMessageIDs(docsURL: URL) -> [String] {
+    nonisolated static func loadProcessedMessageIDs(docsURL: URL) -> [String] {
         let url = processedMessageIDsURL(docsURL: docsURL)
         guard let data = try? Data(contentsOf: url),
               let ids = try? JSONDecoder().decode([String].self, from: data) else {
@@ -1084,7 +1395,7 @@ final class iCloudBridge: ObservableObject {
         return ids
     }
 
-    nonisolated private static func saveProcessedMessageIDs(_ ids: [String], docsURL: URL) {
+    nonisolated static func saveProcessedMessageIDs(_ ids: [String], docsURL: URL) {
         let url = processedMessageIDsURL(docsURL: docsURL)
         let capped = Array(ids.suffix(seenMessageIDsCap))
         guard let data = try? JSONEncoder().encode(capped) else { return }
@@ -1288,6 +1599,10 @@ final class iCloudBridge: ObservableObject {
                     self.checkIosOutbox()
                 }
             }
+            for key in changedKeys ?? [] {
+                guard let value = NSUbiquitousKeyValueStore.default.string(forKey: key) else { continue }
+                self.deliverObservedStatus(key: key, value: value)
+            }
         }
     }
 
@@ -1299,11 +1614,21 @@ final class iCloudBridge: ObservableObject {
         setupTask?.cancel()
         setupTask = nil
         setupGeneration += 1
+        incomingObserverGeneration &+= 1
+        incomingObserverInstalled = false
+        outboxScanGeneration &+= 1
+        outboxScanTask?.cancel()
+        outboxScanTask = nil
+        outboxScanInFlight = false
+        outboxScanQueued = false
         metadataQuery?.stop()
         metadataQuery = nil
         NotificationCenter.default.removeObserver(self)
         messageHandlers = []
+        statusKeyHandlers = [:]
+        cloudKitObservedStatusKeys = []
         deviceTransport = nil  // CK-3b: drop the transport; setup() re-resolves it
+        deviceTransportSelection = .legacyKVS
         cloudKitVisualNotificationPeerReady = false
         lastPublishedProviderCatalogStatus = nil
         lastPublishedMobileSnapshotStatus = [:]
@@ -1311,6 +1636,10 @@ final class iCloudBridge: ObservableObject {
         deviceDrainTimerTask = nil
         deviceDrainInFlight = false
         deviceDrainQueued = false
+        if let deliveryNudgeQueue {
+            Task { await deliveryNudgeQueue.cancelAll() }
+            self.deliveryNudgeQueue = nil
+        }
         // N8 fix (R16): reset isSetUp so a subsequent setup() call can succeed.
         // Without this, tearDown() left isSetUp=true and setup() returned early
         // at the guard-!isSetUp check, leaving the bridge permanently stopped.

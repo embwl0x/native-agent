@@ -125,7 +125,7 @@ struct CognitionBackgroundOutcomeTests {
         }
         let substrate = await runtime.substrateForIntegration()
         let proposed = try #require(await substrate.standingViewSnapshot().first)
-        await runtime.resolveStandingView(id: proposed.id, approved: true)
+        _ = await runtime.resolveStandingView(id: proposed.id, approved: true)
         #expect(await substrate.standingViewSnapshot().contains { $0.status == .active })
         let deskStore = SwiftNativeDeskStore(dataRoot: root)
         let pursuitCountBeforeFailure = try await deskStore.liveState().items.filter {

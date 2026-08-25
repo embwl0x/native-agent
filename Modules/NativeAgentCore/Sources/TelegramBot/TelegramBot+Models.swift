@@ -164,7 +164,7 @@ public struct TelegramAPIMessageResult: Sendable, Codable, Equatable {
 
 /// A semantic Telegram transport failure. The typed fields preserve retry and
 /// migration information while the description is sanitized before exposure.
-public struct TelegramAPIFailure: Error, LocalizedError, Sendable, Equatable {
+public struct TelegramAPIFailure: Error, LocalizedError, CustomStringConvertible, Sendable, Equatable {
     public enum Kind: String, Sendable, Codable, Equatable {
         case httpStatus
         case rejected
@@ -202,8 +202,22 @@ public struct TelegramAPIFailure: Error, LocalizedError, Sendable, Equatable {
         if let telegramDescription, !telegramDescription.isEmpty {
             detail += ": \(telegramDescription)"
         }
+        if let retryAfter = parameters?.retryAfter, retryAfter > 0 {
+            detail += " [retry_after=\(retryAfter)s]"
+        }
+        if let chatID = parameters?.migrateToChatId {
+            // This string is persisted by TelegramPollLoop.recordError into
+            // state.json/errors.jsonl, so a migration hint cannot disappear
+            // behind a generic rejection.
+            detail += " [migrate_to_chat_id=\(chatID)]"
+        }
         return detail
     }
+
+    /// Most poll-loop error receipts accept a String.  Preserve the structured
+    /// Bot API hints there instead of letting Swift's synthesized struct
+    /// description turn a migration into an opaque rejection.
+    public var description: String { errorDescription ?? "telegram: \(operation) \(kind.rawValue)" }
 }
 
 public enum TelegramBotError: Error, LocalizedError {

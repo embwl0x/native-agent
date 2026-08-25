@@ -759,3 +759,178 @@ private func recordById(_ rows: [JSONValue], _ id: String) -> [String: JSONValue
     let client = makeConnectorAuthClient(root: tempRoot())
     #expect(client is SwiftNativeConnectorAuthClient)
 }
+
+// MARK: - workspace-search caps (eval ledger: connectors.workspaces.search.*)
+
+// The two caps at Connectors.swift:98/99 are the connector's only bounds on a
+// walk over User's own directories, and both fail SILENTLY: a truncated walk
+// and an unread oversize file are indistinguishable from "not in the files".
+// The caps are constructor-injected, so these run in milliseconds against the
+// same code path production uses with 2000/512_000.
+
+/// A workspace whose matches sit in SORTED subdirectories — walkDirectory
+/// recurses into subdirs in sorted order, so which matches fall after the
+/// scan cap is deterministic (files inside one directory are not ordered).
+private func makeTieredWorkspace(name: String, dirs: Int) throws -> (URL, JSONValue) {
+    var files: [String: String] = [:]
+    for index in 1...dirs {
+        files["d\(index)/hit.txt"] = "body"
+    }
+    return try makeWorkspaceDir(name: name, files: files)
+}
+
+private func relativePaths(_ results: [JSONValue]) -> Set<String> {
+    Set(results.compactMap { stringField($0, "relativePath") })
+}
+
+@Test func searchScannedCapTruncatesRatherThanEmptiesTheWalk() async throws {
+    let root = tempRoot()
+    let (_, row) = try makeTieredWorkspace(name: "tiered", dirs: 6)
+    try writeWorkspaces(root, [row])
+
+    let client = SwiftNativeConnectorsClient(root: root, maxScanned: 3)
+    let results = resultsOf(try await client.searchWorkspaces(query: "hit"))
+
+    // Truncation, not collapse: the pre-cap matches are all present and the
+    // post-cap ones are all absent.
+    #expect(results.count == 3)
+    let paths = relativePaths(results)
+    #expect(paths == ["d1/hit.txt", "d2/hit.txt", "d3/hit.txt"])
+    #expect(!paths.contains("d4/hit.txt"))
+
+    // Same tree, cap above the file count → nothing is hidden. Without this
+    // half, a search that returned 3 for an unrelated reason would pass.
+    let uncapped = SwiftNativeConnectorsClient(root: root, maxScanned: 100)
+    #expect(resultsOf(try await uncapped.searchWorkspaces(query: "hit")).count == 6)
+}
+
+@Test func searchScannedCapResetsForEachWorkspace() async throws {
+    let root = tempRoot()
+    let (_, first) = try makeTieredWorkspace(name: "first", dirs: 3)
+    let (_, second) = try makeTieredWorkspace(name: "second", dirs: 3)
+    try writeWorkspaces(root, [first, second])
+
+    // Cap of 1 stops each workspace after its first scanned file. If the
+    // counter leaked across workspaces the second workspace would contribute
+    // nothing and a whole registered workspace would go dark.
+    let client = SwiftNativeConnectorsClient(root: root, maxScanned: 1)
+    let results = resultsOf(try await client.searchWorkspaces(query: "hit"))
+    #expect(results.count == 2)
+    let workspaces = Set(results.compactMap { stringField($0, "workspaceName") })
+    #expect(workspaces == ["first", "second"])
+}
+
+@Test func searchContentCapSkipsOversizeFilesWhileNamesStillMatch() async throws {
+    let root = tempRoot()
+    let needle = "needle"
+    let (_, row) = try makeWorkspaceDir(name: "sized", files: [
+        "small.txt": String(repeating: "a", count: 200) + needle,
+        "big.txt": String(repeating: "b", count: 4_000) + needle,
+        "named-needle.bin": String(repeating: "c", count: 4_000),
+    ])
+    try writeWorkspaces(root, [row])
+
+    let client = SwiftNativeConnectorsClient(root: root, maxContentBytes: 1_000)
+    let results = resultsOf(try await client.searchWorkspaces(query: needle))
+    let byPath = Dictionary(uniqueKeysWithValues: results.compactMap { result -> (String, String)? in
+        guard let path = stringField(result, "relativePath"),
+              let reason = stringField(result, "reason") else { return nil }
+        return (path, reason)
+    })
+
+    #expect(byPath["small.txt"] == "content")
+    // The over-cap file is never content-scanned — and nothing in the envelope
+    // says so, which is exactly the silent zero this pins.
+    #expect(byPath["big.txt"] == nil)
+    // The cap is CONTENT-only: an oversize file whose NAME matches still lands.
+    #expect(byPath["named-needle.bin"] == "filename")
+
+    // Raise the cap above the file size and the same file matches by content.
+    let generous = SwiftNativeConnectorsClient(root: root, maxContentBytes: 512_000)
+    let all = resultsOf(try await generous.searchWorkspaces(query: needle))
+    #expect(relativePaths(all).contains("big.txt"))
+}
+
+// walkDirectory (Connectors.swift:254) recurses with no depth bound and no
+// visited-inode check. What actually keeps a symlink CYCLE from recursing
+// forever is a Foundation detail, not a guard: `contentsOfDirectory` +
+// `.isDirectoryKey` does NOT resolve a symlink, so a link to a directory
+// reports isDirectory=false AND isRegularFile=false and lands in neither
+// `files` nor `subdirs` — it is skipped entirely (verified against Foundation
+// on this platform; the same probe is what this test pins).
+//
+// That makes ONE assertion load-bearing here: a symlinked directory is never
+// descended. It is simultaneously the termination proof (a cycle cannot
+// recurse) and a recorded silent zero (content reachable only through a
+// symlinked directory is never searched, with nothing in the envelope saying
+// so). If a future Foundation/API change starts following symlinks, this test
+// goes red BEFORE an unbounded recursion reaches a user's workspace.
+@Test func searchDoesNotDescendSymlinkedDirectoriesSoACycleCannotRecurse() async throws {
+    let root = tempRoot()
+    let (dir, row) = try makeWorkspaceDir(name: "cycle", files: [
+        "a/hit.txt": "body",
+        "target/hidden-hit.txt": "body",
+    ])
+    let inner = dir.appendingPathComponent("a", isDirectory: true)
+    // A true cycle: a/loop -> a.
+    try FileManager.default.createSymbolicLink(
+        at: inner.appendingPathComponent("loop", isDirectory: true),
+        withDestinationURL: inner
+    )
+    // A symlink to a sibling directory holding a would-be match.
+    try FileManager.default.createSymbolicLink(
+        at: inner.appendingPathComponent("aliased", isDirectory: true),
+        withDestinationURL: dir.appendingPathComponent("target", isDirectory: true)
+    )
+    try writeWorkspaces(root, [row])
+
+    let client = SwiftNativeConnectorsClient(root: root)
+    let results = resultsOf(try await client.searchWorkspaces(query: "hit"))
+    let paths = relativePaths(results)
+
+    // Terminated, and every match was reached through real directories.
+    #expect(paths.contains("a/hit.txt"))
+    #expect(paths.contains("target/hidden-hit.txt"))
+    // Not reached a second time through the alias, and not once per cycle turn.
+    #expect(!paths.contains(where: { $0.contains("aliased") }))
+    #expect(!paths.contains(where: { $0.contains("loop") }))
+    #expect(results.count == 2)
+}
+
+// MARK: - connect with no registry record (ledger: connectors.connect.missingRegistryRecord)
+
+// Connectors+Auth.swift:382 iterates EXISTING registry entries and mutates a
+// matching one; there is no insert path. With a usable token and no record for
+// the provider the write is a complete no-op, yet the caller still receives
+// `authorized: true`. This PINS today's behaviour rather than asserting the
+// behaviour we want — the honest fix (insert the record, or report the miss)
+// is a production change, reported as a needed seam instead of made here.
+@Test func connectReportsAuthorizedEvenWhenNoRegistryRecordWasWritten() async throws {
+    let root = tempRoot()
+    _ = try writeToken(root, "github")
+    _ = try writeRegistry(root, [
+        .object([
+            "id": .string("slack"),
+            "name": .string("Slack"),
+            "enabled": .bool(false),
+            "authState": .string("not_connected"),
+            "healthStatus": .string("planned"),
+        ]),
+    ])
+
+    let client = SwiftNativeConnectorAuthClient(root: root)
+    let body = try await client.connectConnector(provider: "github")
+
+    #expect(body == .object([
+        "provider": .string("github"),
+        "authorized": .bool(true),
+        "message": .string("github connected successfully."),
+    ]))
+    // KNOWN GAP: no github record exists afterwards, so the Connectors pane
+    // keeps showing not_connected while the envelope reported success.
+    let rows = try readRegistry(root)
+    #expect(recordById(rows, "github") == nil)
+    // The unrelated record must not be collaterally flipped.
+    let slack = try #require(recordById(rows, "slack"))
+    #expect(slack["authState"] == .string("not_connected"))
+}

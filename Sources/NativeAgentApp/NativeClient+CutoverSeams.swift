@@ -142,20 +142,10 @@ extension NativeClient {
     //     There is no mock fallback, no empty-Data return, no daemon HTTP
     //     path — that's where the fail-closed rule lives.
     //
-    //   Layer 2 (this seam): the v1 spec for this hook is
-    //     `func captureScreenForChat() async -> Data?` — it CATCHES the
-    //     thrown error from layer 1 so callers that just want an optional
-    //     image don't have to wrap try/catch at every call site. The error
-    //     is logged via NSLog. NativeClient is a stateless `struct` so
-    //     there's no `statusText` to assign here; the chat composer's
-    //     existing handler in ContentView surfaces a user-visible toast
-    //     via its own ScreenVisionError -> CaptureError mapping in
-    //     NativeScreenCapture.captureImageBase64().
-    //
-    // If a future caller needs the underlying ScreenVisionError, call
-    // `SwiftNativeScreenVision().captureScreen()` directly and handle the
-    // throws yourself — this hook is the "best-effort, log on failure"
-    // convenience wrapper.
+    //   Layer 2 (this seam): preserves that typed failure for chat callers.
+    //     Returning nil/empty data here is not a benign convenience: it lets
+    //     a turn proceed as though it has a screen attachment when capture was
+    //     denied or produced no image bytes.
     //
     // v1 callers: none yet — this is a public seam for future
     // vision-decision-loop work (e.g. /show slash command, autonomous
@@ -163,13 +153,16 @@ extension NativeClient {
     // ContentView.NativeScreenCapture.captureImageBase64() which delegates
     // to the SAME ScreenVision module under the hood.
     @MainActor
-    func captureScreenForChat() async -> Data? {
-        do {
-            return try await SwiftNativeScreenVision().captureScreen()
-        } catch {
-            NSLog("[NativeClient] captureScreenForChat failed: \(error.localizedDescription)")
-            return nil
+    func captureScreenForChat(
+        capture: @escaping @Sendable () async throws -> Data = {
+            try await SwiftNativeScreenVision().captureScreen()
         }
+    ) async throws -> Data {
+        let image = try await capture()
+        guard !image.isEmpty else {
+            throw ScreenVisionError.captureFailed("capture returned no image bytes")
+        }
+        return image
     }
 
     // --- Mac control --------------------------------------------------------
@@ -190,10 +183,12 @@ extension NativeClient {
 
     /// Path to the app-owned `mac_control_audit.jsonl`. Threaded into
     /// `makeMacControl` so in-process gate refusals can append the same audit
-    /// shape as older records. Uses `NativeAgentPaths.dataRoot` for the
-    /// canonical data location.
+    /// shape as older records. Isolated/recovered clients keep this write in
+    /// their supplied canonical root; production falls back to the process
+    /// default root.
     var macControlAuditPath: URL {
-        NativeAgentPaths.dataRoot.appendingPathComponent("mac_control_audit.jsonl")
+        (dataRootOverride ?? PersistenceCore.defaultDataRoot())
+            .appendingPathComponent("mac_control_audit.jsonl")
     }
 
     // W-H lift (move-only): private→internal so the root mac-tool caller

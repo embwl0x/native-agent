@@ -119,6 +119,35 @@ public enum CapabilityCatalogStoreReader {
     ) throws -> [[String: JSONValue]] {
         try loadObjectRowsChecked(at: path, recordKind: "capability trust root")
     }
+
+    /// Reads the capability-pack install receipt authority.  A missing receipt
+    /// file is the legitimate no-installs bootstrap state; an existing file
+    /// must contain complete, uniquely-addressable receipts.  In particular,
+    /// do not turn a damaged receipt store into an empty catalog, because that
+    /// would make installed capabilities look safely absent and enable a
+    /// misleading reinstall/rollback decision.
+    public static func loadCapabilityPackInstallsChecked(
+        at path: URL
+    ) throws -> [[String: JSONValue]] {
+        let rows = try loadObjectRowsChecked(at: path, recordKind: "capability pack install")
+        for (index, row) in rows.enumerated() {
+            guard case .string(let packID)? = row["packId"],
+                  !packID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw CapabilityCatalogPersistenceError.malformed(
+                    path: path.path,
+                    detail: "capability pack install row \(index) has no non-empty string packId"
+                )
+            }
+            guard case .string(let status)? = row["status"],
+                  !status.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw CapabilityCatalogPersistenceError.malformed(
+                    path: path.path,
+                    detail: "capability pack install row \(index) has no non-empty string status"
+                )
+            }
+        }
+        return rows
+    }
 }
 
 private func mergeRecords(
@@ -186,6 +215,51 @@ private func mergeID(_ item: [String: JSONValue]) -> String {
 ///      and read back before it can be used.
 /// Existing invalid state is never silently rotated and persistence failures
 /// never return an ephemeral in-memory secret.
+private func checkedExistingPackSigningKey(at keyPath: URL) throws -> String? {
+    let fileManager = FileManager.default
+    guard fileManager.fileExists(atPath: keyPath.path) else { return nil }
+    let data: Data
+    do {
+        data = try Data(contentsOf: keyPath)
+    } catch {
+        throw CapabilityCatalogPersistenceError.signingKeyUnavailable(
+            path: keyPath.path,
+            detail: "existing key cannot be read: \(error.localizedDescription)"
+        )
+    }
+    guard let existing = String(data: data, encoding: .utf8)?
+        .trimmingCharacters(in: .whitespacesAndNewlines),
+          existing.count == 64,
+          existing.unicodeScalars.allSatisfy({ scalar in
+              switch scalar.value {
+              case 0x30...0x39, 0x41...0x46, 0x61...0x66: return true
+              default: return false
+              }
+          }) else {
+        throw CapabilityCatalogPersistenceError.signingKeyUnavailable(
+            path: keyPath.path,
+            detail: "existing key must contain exactly 64 hexadecimal characters"
+        )
+    }
+    let attributes: [FileAttributeKey: Any]
+    do {
+        attributes = try fileManager.attributesOfItem(atPath: keyPath.path)
+    } catch {
+        throw CapabilityCatalogPersistenceError.signingKeyUnavailable(
+            path: keyPath.path,
+            detail: "existing key permissions cannot be verified: \(error.localizedDescription)"
+        )
+    }
+    guard (attributes[.type] as? FileAttributeType) == .typeRegular,
+          (attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600 else {
+        throw CapabilityCatalogPersistenceError.signingKeyUnavailable(
+            path: keyPath.path,
+            detail: "existing key must be a regular file with mode 0600"
+        )
+    }
+    return existing
+}
+
 private func resolvePackSigningKey(
     dataRoot: URL,
     persistence: any PersistenceCoreProtocol
@@ -195,46 +269,7 @@ private func resolvePackSigningKey(
         .appendingPathComponent(".pack_signing_key")
     let work: @Sendable () async throws -> String = {
         let fileManager = FileManager.default
-        if fileManager.fileExists(atPath: keyPath.path) {
-            let data: Data
-            do {
-                data = try Data(contentsOf: keyPath)
-            } catch {
-                throw CapabilityCatalogPersistenceError.signingKeyUnavailable(
-                    path: keyPath.path,
-                    detail: "existing key cannot be read: \(error.localizedDescription)"
-                )
-            }
-            guard let existing = String(data: data, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-                  existing.count == 64,
-                  existing.unicodeScalars.allSatisfy({ scalar in
-                      switch scalar.value {
-                      case 0x30...0x39, 0x41...0x46, 0x61...0x66: return true
-                      default: return false
-                      }
-                  }) else {
-                throw CapabilityCatalogPersistenceError.signingKeyUnavailable(
-                    path: keyPath.path,
-                    detail: "existing key must contain exactly 64 hexadecimal characters"
-                )
-            }
-            let attributes: [FileAttributeKey: Any]
-            do {
-                attributes = try fileManager.attributesOfItem(atPath: keyPath.path)
-            } catch {
-                throw CapabilityCatalogPersistenceError.signingKeyUnavailable(
-                    path: keyPath.path,
-                    detail: "existing key permissions cannot be verified: \(error.localizedDescription)"
-                )
-            }
-            guard (attributes[.type] as? FileAttributeType) == .typeRegular,
-                  (attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600 else {
-                throw CapabilityCatalogPersistenceError.signingKeyUnavailable(
-                    path: keyPath.path,
-                    detail: "existing key must be a regular file with mode 0600"
-                )
-            }
+        if let existing = try checkedExistingPackSigningKey(at: keyPath) {
             return existing
         }
 
@@ -520,12 +555,19 @@ public struct SwiftNativeCapabilityPackSigner: Sendable {
     /// keyed by the UTF-8 bytes of the pack signing key.
     /// Mirrors `capability_pack_signature()`.
     public func signature(for pack: [String: JSONValue]) async throws -> String {
+        let key = try await resolvePackSigningKey(dataRoot: dataRoot, persistence: persistence)
+        return try Self.signature(for: pack, signingKey: key)
+    }
+
+    private static func signature(
+        for pack: [String: JSONValue],
+        signingKey: String
+    ) throws -> String {
         var payload = pack
         payload.removeValue(forKey: "signature")
         let canonical = try SwiftNativeManifestSigner.compactCanonicalJSON(.object(payload))
-        let key = try await resolvePackSigningKey(dataRoot: dataRoot, persistence: persistence)
         let mac = HMAC<SHA256>.authenticationCode(
-            for: canonical, using: SymmetricKey(data: Data(key.utf8))
+            for: canonical, using: SymmetricKey(data: Data(signingKey.utf8))
         )
         return mac.map { String(format: "%02x", $0) }.joined()
     }
@@ -544,8 +586,9 @@ public struct SwiftNativeCapabilityPackSigner: Sendable {
         return out
     }
 
-    /// Port of `validate_capability_pack()`. Returns the
-    /// validation report object byte-shape-identical to the Python route.
+    /// Read-only install preflight. It preserves the validation report shape,
+    /// but never bootstraps a signing key or trust root merely to inspect an
+    /// untrusted pack.
     public func validate(_ pack: [String: JSONValue]) async throws -> [String: JSONValue] {
         let nowISO = SwiftNativeManifestSigner.isoTimestamp(clock())
         var errors: [String] = []
@@ -557,7 +600,21 @@ public struct SwiftNativeCapabilityPackSigner: Sendable {
             errors.append("Missing required field(s): \(missing.joined(separator: ", "))")
         }
 
-        let expected = try await signature(for: pack)
+        let keyPath = dataRoot
+            .appendingPathComponent("catalog", isDirectory: true)
+            .appendingPathComponent(".pack_signing_key")
+        let expected: String
+        do {
+            if let signingKey = try checkedExistingPackSigningKey(at: keyPath) {
+                expected = try Self.signature(for: pack, signingKey: signingKey)
+            } else {
+                errors.append("Capability pack signing key is unavailable; an invalid pack cannot initialize signing state.")
+                expected = ""
+            }
+        } catch {
+            errors.append(error.localizedDescription)
+            expected = ""
+        }
         let actualSig: String? = {
             if case .string(let s)? = pack["signature"] { return s }
             return nil
@@ -583,11 +640,15 @@ public struct SwiftNativeCapabilityPackSigner: Sendable {
 
         var status = errors.isEmpty ? "valid" : "invalid"
 
-        // trusted roots id set
-        let rootsActor = SwiftNativeCapabilityTrustRoots(
-            dataRoot: dataRoot, persistence: persistence, clock: clock
-        )
-        let roots = try await rootsActor.capabilityTrustRoots()
+        // Trust-root validation is read-only for the same reason as key
+        // validation above. Missing roots do not need a persisted bootstrap
+        // record for the built-in local identity, while damaged roots still
+        // fail closed and leave their bytes untouched.
+        let trustPath = dataRoot
+            .appendingPathComponent("catalog", isDirectory: true)
+            .appendingPathComponent("trust", isDirectory: true)
+            .appendingPathComponent("roots.json")
+        let roots = try CapabilityCatalogStoreReader.loadCapabilityTrustRootsChecked(at: trustPath)
         // Python: root_ids = {str(item.get("id")) for item in roots} (:6475) —
         // stringifies non-string ids. Use pyStr for byte-faithful membership.
         var rootIDs: Set<String> = []
@@ -598,7 +659,10 @@ public struct SwiftNativeCapabilityPackSigner: Sendable {
         // signing_identity = str(pack.get("signingIdentity") or "") — non-string
         // scalars stringify, falsy -> "".
         let signingIdentity = pyStrOr([pack["signingIdentity"]], default: "")
-        var trustTier = "local"
+        // The bootstrap root is deliberately machine-local: it is keyed by
+        // the same local signing secret used to create demo packs.  It proves
+        // integrity against that local key, not third-party attestation.
+        var trustTier = signingIdentity == "local-trusted" ? "self_issued" : "local"
         if !signingIdentity.isEmpty
             && !rootIDs.contains(signingIdentity)
             && signingIdentity != "local-trusted" {
@@ -784,8 +848,10 @@ public actor SwiftNativeCatalogWrites {
         for install in installs {
             let packId = install["packId"] ?? .null
             let version = install["version"] ?? .null
-            // f"update:{install.get('packId')}" — missing -> "update:None",
-            // numeric -> "update:123", string -> raw.
+            // f"update:{install.get('packId')}" — numeric -> "update:123",
+            // string -> raw. (Python's missing -> "update:None" is unreachable
+            // now: loadCapabilityPackInstallsChecked rejects packId-less rows
+            // before this loop runs.)
             updates.append(.object([
                 "id": .string("update:\(pyStr(install["packId"]))"),
                 "packId": packId,
@@ -825,12 +891,9 @@ public actor SwiftNativeCatalogWrites {
     /// Lock-free read; sorts by installedAt||createdAt descending (string sort,
     /// matching Python's `str(...)` key with reverse=True).
     public func listCapabilityPackInstalls() async throws -> [[String: JSONValue]] {
-        let raw = await persistence.readJSON(installsPath, defaultValue: .array([]))
-        guard case .array(let items) = raw else { return [] }
-        let rows: [[String: JSONValue]] = items.compactMap {
-            if case .object(let o) = $0 { return o }
-            return nil
-        }
+        let rows = try CapabilityCatalogStoreReader.loadCapabilityPackInstallsChecked(
+            at: installsPath
+        )
         // str(item.get("installedAt") or item.get("createdAt") or "") —
         // non-string scalars stringify; falsy falls through.
         func sortKey(_ row: [String: JSONValue]) -> String {

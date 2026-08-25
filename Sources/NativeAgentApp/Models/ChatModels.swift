@@ -2,6 +2,7 @@ import Foundation
 import Observation
 import NativeAgentShared
 import PersistenceCore
+import ChatOrchestration
 
 struct ChatMessage: Identifiable, Codable, Hashable {
     var id: String = UUID().uuidString
@@ -85,7 +86,15 @@ struct ChatMessage: Identifiable, Codable, Hashable {
     }
 }
 
+typealias NativeAppChatMessage = ChatMessage
+
 struct ChatMessageMetadata: Codable, Hashable {
+    /// Shared transcript vocabulary for an approval awaiting a human decision.
+    /// Producers must mint this value and transcript grouping/rendering must
+    /// consume it through `isPendingApproval`; a literal drift must never hide
+    /// an actionable card behind a collapsed tool summary.
+    static let approvalPendingKind = ChatTranscriptToolMessageKind.approvalPending
+
     // Assistant brain metadata
     var model: String?
     var requestedModel: String?
@@ -101,7 +110,7 @@ struct ChatMessageMetadata: Codable, Hashable {
     var partial: Bool? = nil
     var cancelled: Bool? = nil
     // PATCH-2026-05-08: wave2-chat-ux Tool-use pill metadata (role=tool messages)
-    var kind: String?          // "tool_use" | "approval_pending"
+    var kind: String?          // "tool_use" | `approvalPendingKind`
     var toolName: String?      // e.g. "read_file"
     // Input dict serialized as JSON string for Codable simplicity
     var inputJSON: String?
@@ -113,6 +122,10 @@ struct ChatMessageMetadata: Codable, Hashable {
     var afterContent: String?
     // approval_pending
     var approvalId: String?
+
+    var isPendingApproval: Bool {
+        kind == Self.approvalPendingKind
+    }
     // eval3/T3: attachments persisted under metadata.attachments by
     // ChatOrchestrationClient.appendMessage (NativeAgentCore). Round-tripped
     // here so getChatMessages → MacSyncEngine snapshot → iOS refreshChatHistory
@@ -136,6 +149,7 @@ struct ChatMessageMetadata: Codable, Hashable {
         case beforeContent = "before_content"
         case afterContent = "after_content"
         case approvalId = "approval_id"
+        case approvalIdCamel = "approvalId"
         case inputJSON = "input"
         case attachments
         case origin
@@ -212,7 +226,8 @@ struct ChatMessageMetadata: Codable, Hashable {
             try? c.decodeIfPresent(String.self, forKey: .afterContent),
             16_000
         )
-        approvalId = try? c.decodeIfPresent(String.self, forKey: .approvalId)
+        approvalId = (try? c.decodeIfPresent(String.self, forKey: .approvalId))
+            ?? (try? c.decodeIfPresent(String.self, forKey: .approvalIdCamel))
         attachments = try? c.decodeIfPresent([PersistedAttachment].self, forKey: .attachments)
         // 658.14: this decode is the whole badge. A CodingKey alone does
         // nothing here — the synthesized decoder is suppressed by this custom

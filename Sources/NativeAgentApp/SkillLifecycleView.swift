@@ -16,22 +16,327 @@ import PersonaEngine
 // chat-built DRAFT awaiting approval); the filter chips, settings sheet,
 // and per-card lifecycle furniture are gone.
 
+enum SkillLifecycleSearchPresentation {
+    struct Results {
+        let displayed: [SkillInfo]
+        let isFiltering: Bool
+        let resultCountText: String?
+        let emptyTitle: String
+        let emptyDetail: String
+    }
+
+    static func results(_ skills: [SkillInfo], query: String) -> Results {
+        let isFiltering = !normalized(query).isEmpty
+        let displayed = filtered(skills, query: query)
+        return Results(
+            displayed: displayed,
+            isFiltering: isFiltering,
+            resultCountText: isFiltering
+                ? "\(displayed.count) \(displayed.count == 1 ? "match" : "matches")"
+                : nil,
+            emptyTitle: isFiltering ? "No matches" : "No skills yet",
+            emptyDetail: isFiltering
+                ? "Nothing matches \u{201C}\(query)\u{201D}."
+                : "Ask the agent to build a skill — a draft lands here for your review, and once approved it becomes a playbook recall can surface."
+        )
+    }
+
+    static func filtered(_ skills: [SkillInfo], query: String) -> [SkillInfo] {
+        let needle = normalized(query)
+        guard !needle.isEmpty else { return skills }
+        return skills.filter { info in
+            searchableFields(for: info).contains { normalized($0).contains(needle) }
+        }
+    }
+
+    private static func searchableFields(for info: SkillInfo) -> [String] {
+        [
+            info.id,
+            info.registry.name,
+            info.registry.state,
+            info.manifest.name,
+            info.manifest.type,
+            info.manifest.description,
+        ] + (info.manifest.tags ?? [])
+    }
+
+    private static func normalized(_ value: String) -> String {
+        let folded = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+        return folded
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+}
+
+/// The review sheet is an approval surface for a chat-built draft, not a
+/// general-purpose state changer. Its displayed outcome is derived only after
+/// the authoritative registry refresh confirms the post-write state.
+struct SkillReviewInstallReceipt: Equatable {
+    let requestedName: String
+    let confirmedName: String
+    let confirmedState: String
+}
+
+enum SkillReviewInstallOutcome: Equatable {
+    case installed(SkillReviewInstallReceipt)
+    case refused(detail: String)
+    case failed(detail: String)
+}
+
+enum SkillReviewInstallPresentation {
+    static let installAccessibilityIdentifier = "skills.review.install"
+
+    struct InstallControl: Equatable {
+        let isEnabled: Bool
+        let refusal: String?
+    }
+
+    static func preflight(for info: SkillInfo) -> String? {
+        let state = info.registry.state.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard state == "drafted" else {
+            let shownState = state.isEmpty ? "missing" : state
+            return "Only a drafted skill can be installed from this review sheet. This skill is currently \(shownState)."
+        }
+        let name = info.registry.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else {
+            return "This draft has no registry identity, so NativeAgent cannot install it safely."
+        }
+        return nil
+    }
+
+    /// The review sheet's install affordance and the writer share this exact
+    /// eligibility decision. A visible disabled control must name the same
+    /// reason that `installReviewedSkill` will return if invoked directly.
+    static func installControl(for info: SkillInfo, isInstalling: Bool) -> InstallControl {
+        let refusal = preflight(for: info)
+        return InstallControl(
+            isEnabled: !isInstalling && refusal == nil,
+            refusal: refusal
+        )
+    }
+
+    static func needsOAuth(for info: SkillInfo) -> Bool {
+        info.manifest.type == "connector" && info.manifest.oauth?.deviceFlow == true
+    }
+
+    static func connectorID(for provider: String) -> String? {
+        switch provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "x", "twitter": return "x"
+        case "gmail", "email": return "gmail"
+        case "calendar", "google_calendar": return "calendar"
+        default: return nil
+        }
+    }
+
+    /// OAuth is an admission step, not a partial registry mutation. A cancel
+    /// or failed callback cannot reach the draft-install action.
+    static func installAfterAuthorizedOAuth(
+        oauthSucceeded: Bool,
+        wasCancelled: Bool,
+        install: @MainActor () async -> Bool
+    ) async -> Bool {
+        guard oauthSucceeded, !wasCancelled else { return false }
+        return await install()
+    }
+
+    static func successMessage(for receipt: SkillReviewInstallReceipt) -> String {
+        let verb = receipt.confirmedState == "active" ? "is now active" : "is installed"
+        return "‘\(receipt.confirmedName)’ \(verb) and available to recall."
+    }
+}
+
+/// Header actions have separate production owners: Build writes a chat draft,
+/// while Refresh reads the skill authorities. Keep the action result typed so
+/// neither a missing chat session nor an existing draft is called a build.
+enum SkillLifecycleActionPresentation {
+    enum Build: Equatable {
+        case draftPrepared
+        case existingDraftPreserved
+        case awaitingChatSession
+    }
+
+    static func build(activeSessionID: String, existingDraft: String) -> Build {
+        guard !activeSessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .awaitingChatSession
+        }
+        return existingDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? .draftPrepared
+            : .existingDraftPreserved
+    }
+}
+
+/// Both visible Skills entry points start the same real chat-draft handoff.
+/// Keeping the starter and owner here prevents the empty-state button from
+/// drifting from the header button and makes an existing draft's preservation
+/// part of the button contract rather than an incidental UI detail.
+enum SkillBuildButtonPresentation {
+    static let starter = "Build me a skill that "
+
+    @MainActor
+    @discardableResult
+    static func beginBuild(using appModel: AppModel) -> SkillLifecycleActionPresentation.Build {
+        appModel.requestSkillBuild(starter: starter)
+    }
+}
+
+/// The pointer-sync receipt is the only confirmation that skill bodies were
+/// reconciled into recallable memory pointers. Do not infer that outcome from
+/// the currently loaded manifest list: it can be stale, filtered, or reflect
+/// a different source shelf.
+enum SkillPointerSyncReceiptPresentation {
+    struct Receipt: Equatable, Sendable {
+        let at: String
+        let added: Int
+        let updated: Int
+        let removed: Int
+        let unchanged: Int
+
+        var reconciledPointerCount: Int { added + updated + unchanged }
+    }
+
+    enum State: Equatable, Sendable {
+        case loading
+        case current(Receipt)
+        case failed(detail: String)
+        case unavailable(detail: String)
+    }
+
+    /// The sync writer and the Skills surface share this exact data-root
+    /// boundary.  A receipt from another app body must never make the current
+    /// root claim that its skill pointers are reconciled.
+    static func receiptURL(dataRoot: URL) -> URL {
+        dataRoot
+            .standardizedFileURL
+            .appendingPathComponent("skills/.pointer_sync_receipt.json")
+    }
+
+    static func read(dataRoot: URL) -> State {
+        read(at: receiptURL(dataRoot: dataRoot))
+    }
+
+    static func read(at url: URL) -> State {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: url.path) else {
+            return .unavailable(detail: "No pointer-sync receipt has been recorded yet.")
+        }
+        do {
+            let data = try Data(contentsOf: url)
+            guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let status = object["status"] as? String else {
+                return .unavailable(detail: "The pointer-sync receipt is malformed.")
+            }
+            switch status.lowercased() {
+            case "ok":
+                guard let at = nonEmptyString(object["at"]),
+                      let added = nonNegativeInt(object["added"]),
+                      let updated = nonNegativeInt(object["updated"]),
+                      let removed = nonNegativeInt(object["removed"]),
+                      let unchanged = nonNegativeInt(object["unchanged"])
+                else {
+                    return .unavailable(detail: "The successful pointer-sync receipt is incomplete.")
+                }
+                return .current(Receipt(
+                    at: at,
+                    added: added,
+                    updated: updated,
+                    removed: removed,
+                    unchanged: unchanged
+                ))
+            case "failed":
+                return .failed(detail: boundedDetail(nonEmptyString(object["error"]) ?? "unknown"))
+            default:
+                return .unavailable(detail: "The pointer-sync receipt has an unknown status.")
+            }
+        } catch {
+            return .unavailable(detail: "The pointer-sync receipt could not be read: \(boundedDetail(error.localizedDescription))")
+        }
+    }
+
+    static func line(for state: State) -> String {
+        switch state {
+        case .loading:
+            return "Checking recall-pointer sync receipt…"
+        case .current(let receipt):
+            return "\(receipt.reconciledPointerCount) recall pointers confirmed · synced \(friendlyTime(receipt.at))"
+        case .failed(let detail):
+            return "Pointer sync failed · \(boundedDetail(detail))"
+        case .unavailable(let detail):
+            return "Pointer sync receipt unavailable · \(boundedDetail(detail))"
+        }
+    }
+
+    private static func nonEmptyString(_ value: Any?) -> String? {
+        guard let value = value as? String else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func nonNegativeInt(_ value: Any?) -> Int? {
+        // The writer's durable schema stores every receipt field as a string.
+        // Reject coerced JSON values and implausible counts rather than making
+        // a malformed receipt look like an enormous completed reconciliation.
+        guard let text = value as? String,
+              let integer = Int(text),
+              (0...100_000).contains(integer) else { return nil }
+        return integer
+    }
+
+    private static func boundedDetail(_ detail: String, limit: Int = 240) -> String {
+        let normalized = detail.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalized.count > limit else { return normalized }
+        return String(normalized.prefix(limit)) + "…"
+    }
+
+    private static func friendlyTime(_ iso: String) -> String {
+        UserDisplayFormatters.relativeISOTimestamp(iso, unitsStyle: .short, fallback: "at an unknown time")
+    }
+}
+
+struct SkillPointerSyncReceiptLine: View {
+    let state: SkillPointerSyncReceiptPresentation.State
+
+    var body: some View {
+        Label(SkillPointerSyncReceiptPresentation.line(for: state), systemImage: icon)
+            .font(.caption)
+            .foregroundStyle(color)
+            .help("Every skill gets a one-line pointer in memory so recall can surface it. Synced at launch and after skill changes.")
+    }
+
+    private var icon: String {
+        switch state {
+        case .current: return "checkmark.circle"
+        case .failed, .unavailable: return "exclamationmark.triangle"
+        case .loading: return "hourglass"
+        }
+    }
+
+    private var color: Color {
+        switch state {
+        case .current: return .secondary
+        case .failed: return .red
+        case .unavailable: return .orange
+        case .loading: return .secondary
+        }
+    }
+}
+
 struct SkillLifecycleView: View {
     @Environment(AppModel.self) private var appModel
     @State private var searchText = ""
     @State private var reviewTarget: SkillInfo?
     @State private var readerTarget: SkillInfo?
-    @State private var toastMessage: String?
-    @State private var syncReceiptLine: String?
+    @State private var syncReceiptState: SkillPointerSyncReceiptPresentation.State = .loading
+    private let loadsOnAppear: Bool
 
-    private var filtered: [SkillInfo] {
-        let base = appModel.skillManifests
-        let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !q.isEmpty else { return base }
-        return base.filter {
-            $0.id.lowercased().contains(q)
-                || $0.manifest.description.lowercased().contains(q)
-        }
+    init(initialSearchText: String = "", loadsOnAppear: Bool = true) {
+        _searchText = State(initialValue: initialSearchText)
+        self.loadsOnAppear = loadsOnAppear
+    }
+
+    private var searchResults: SkillLifecycleSearchPresentation.Results {
+        SkillLifecycleSearchPresentation.results(appModel.skillManifests, query: searchText)
     }
 
     var body: some View {
@@ -45,11 +350,12 @@ struct SkillLifecycleView: View {
                 }
                 Spacer()
                 Button {
-                    appModel.requestSkillBuild(starter: "Build me a skill that")
+                    _ = SkillBuildButtonPresentation.beginBuild(using: appModel)
                 } label: {
-                    Label("Build a Skill", systemImage: "wand.and.stars")
+                    Label("Build in Chat", systemImage: "wand.and.stars")
                 }
                 .buttonStyle(.borderedProminent)
+                .accessibilityIdentifier("skills.lifecycle.build")
 
                 Button {
                     Task {
@@ -57,9 +363,11 @@ struct SkillLifecycleView: View {
                         await loadSyncReceipt()
                     }
                 } label: {
-                    Label("Refresh", systemImage: "arrow.clockwise")
+                    Label(appModel.isLoadingSkillManifests ? "Refreshing…" : "Refresh", systemImage: "arrow.clockwise")
                 }
                 .buttonStyle(.naFeel)
+                .disabled(appModel.isLoadingSkillManifests)
+                .accessibilityIdentifier("skills.lifecycle.refresh")
             }
             .padding(.horizontal, NativeAgentSpacing.xl)
             .padding(.top, NativeAgentSpacing.lg)
@@ -69,12 +377,21 @@ struct SkillLifecycleView: View {
                 TextField("Search skills", text: $searchText)
                     .textFieldStyle(.roundedBorder)
                     .frame(maxWidth: 320)
-                if let syncReceiptLine {
-                    Label(syncReceiptLine, systemImage: "brain")
+                    .accessibilityIdentifier("skills.lifecycle.search")
+                if searchResults.isFiltering, let resultCountText = searchResults.resultCountText {
+                    Text(resultCountText)
                         .font(.caption)
-                        .foregroundStyle(.tertiary)
-                        .help("Every skill gets a one-line pointer in memory so recall can surface it. Synced at launch and after skill changes.")
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("skills.lifecycle.search.resultCount")
+                    Button("Clear search", systemImage: "xmark.circle.fill") {
+                        searchText = ""
+                    }
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Clear skill search")
+                    .accessibilityIdentifier("skills.lifecycle.search.clear")
                 }
+                SkillPointerSyncReceiptLine(state: syncReceiptState)
                 Spacer()
             }
             .padding(.horizontal, NativeAgentSpacing.xl)
@@ -82,15 +399,15 @@ struct SkillLifecycleView: View {
 
             Divider()
 
-            if let err = appModel.skillManifestError {
+            if let feedback = appModel.skillLifecycleFeedback, feedback.kind == .failure {
                 HStack(spacing: NativeAgentSpacing.sm) {
                     Image(systemName: "exclamationmark.triangle")
                         .foregroundStyle(NativeAgentTheme.warn)
-                    Text(err)
+                    Text(feedback.message)
                         .font(.callout)
                         .foregroundStyle(.secondary)
                     Spacer()
-                    Button("Dismiss") { appModel.skillManifestError = nil }
+                    Button("Dismiss") { appModel.dismissSkillManifestFeedback() }
                         .buttonStyle(.naFeel)
                 }
                 .padding(.horizontal, NativeAgentSpacing.xl)
@@ -98,17 +415,21 @@ struct SkillLifecycleView: View {
                 .background(NativeAgentTheme.warn.opacity(0.08))
             }
 
-            if let msg = toastMessage {
+            if let feedback = appModel.skillLifecycleFeedback, feedback.kind == .success {
                 HStack(spacing: NativeAgentSpacing.sm) {
                     Image(systemName: "checkmark.circle.fill")
                         .foregroundStyle(NativeAgentTheme.ok)
-                    Text(msg).font(.callout)
+                    Text(feedback.message).font(.callout)
                     Spacer()
                 }
                 .padding(.horizontal, NativeAgentSpacing.xl)
                 .padding(.vertical, NativeAgentSpacing.sm)
                 .background(NativeAgentTheme.ok.opacity(0.08))
                 .transition(.opacity)
+                .task(id: feedback.id) {
+                    try? await Task.sleep(for: .seconds(3))
+                    appModel.dismissSkillManifestSuccess(id: feedback.id)
+                }
             }
 
             if appModel.isLoadingSkillManifests {
@@ -123,23 +444,21 @@ struct SkillLifecycleView: View {
                     }
                     .padding(NativeAgentSpacing.xl)
                 }
-            } else if filtered.isEmpty {
+            } else if searchResults.displayed.isEmpty {
                 NativeEmptyState(
-                    title: searchText.isEmpty ? "No skills yet" : "No matches",
-                    detail: searchText.isEmpty
-                        ? "Ask the agent to build a skill — a draft lands here for your review, and once approved it becomes a playbook recall can surface."
-                        : "Nothing matches \u{201C}\(searchText)\u{201D}.",
-                    systemImage: searchText.isEmpty ? "puzzlepiece.extension" : "magnifyingglass",
-                    actionTitle: searchText.isEmpty ? "Build a Skill" : nil,
-                    actionImage: searchText.isEmpty ? "wand.and.stars" : nil,
-                    action: searchText.isEmpty ? {
-                        appModel.requestSkillBuild(starter: "Build me a skill that")
-                    } : nil
+                    title: searchResults.emptyTitle,
+                    detail: searchResults.emptyDetail,
+                    systemImage: searchResults.isFiltering ? "magnifyingglass" : "puzzlepiece.extension",
+                    actionTitle: searchResults.isFiltering ? nil : "Build a Skill",
+                    actionImage: searchResults.isFiltering ? nil : "wand.and.stars",
+                    action: searchResults.isFiltering ? nil : {
+                        _ = SkillBuildButtonPresentation.beginBuild(using: appModel)
+                    }
                 )
             } else {
                 ScrollView {
                     VStack(spacing: NativeAgentSpacing.sm) {
-                        ForEach(filtered) { info in
+                        ForEach(searchResults.displayed) { info in
                             SkillRow(info: info,
                                      onRead: { readerTarget = info },
                                      onReview: { reviewTarget = info })
@@ -150,63 +469,50 @@ struct SkillLifecycleView: View {
             }
         }
         .task {
+            guard loadsOnAppear else { return }
             await appModel.loadSkillManifests()
             await loadSyncReceipt()
         }
         .sheet(item: $reviewTarget) { info in
             SkillReviewSheet(info: info, onDismiss: {
                 reviewTarget = nil
-            }, onInstallSuccess: { name in
+            }, onInstallSuccess: { message in
                 reviewTarget = nil
-                showToast("\u{2018}\(name)\u{2019} is now active.")
+                appModel.recordSkillManifestSuccess(message)
                 Task { await appModel.loadSkillManifests() }
             })
             .environment(appModel)
         }
         .sheet(item: $readerTarget) { info in
-            SkillBodySheet(info: info) { readerTarget = nil }
+            let dataRoot = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+            let personaRoot = appModel.dataRootOverride.map { override in
+                // A preview opened from an injected data root is a sandboxed
+                // read: never let an environment or stamped-repository
+                // persona redirect it outside that root.
+                return PersonaRootResolver.resolveIsolated(dataRoot: override)
+            } ?? PersonaRootResolver.resolve()
+            SkillBodySheet(
+                info: info,
+                dataRoot: dataRoot,
+                personaRoot: personaRoot
+            ) { readerTarget = nil }
         }
     }
 
-    /// Read the pointer-sync receipt the launch/mutation syncs write. Absent
-    /// file → no line (fresh install before first sync).
+    /// Read the pointer-sync receipt the launch/mutation syncs write. Missing
+    /// or malformed evidence stays visibly unavailable rather than reading as
+    /// an empty successful sync.
     ///
     /// Render-cost audit F9: the `Data(contentsOf:)` + `JSONSerialization`
     /// pair used to run synchronously on the MainActor on every appear. Same
     /// parse, same resulting line, now off the main thread.
     private func loadSyncReceipt() async {
-        let receipt = PersistenceCore.defaultDataRoot()
-            .appendingPathComponent("skills/.pointer_sync_receipt.json")
-        let obj = await Task.detached(priority: .utility) { () -> [String: String]? in
-            guard let data = try? Data(contentsOf: receipt) else { return nil }
-            return try? JSONSerialization.jsonObject(with: data) as? [String: String]
+        let dataRoot = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        syncReceiptState = await Task.detached(priority: .utility) {
+            SkillPointerSyncReceiptPresentation.read(dataRoot: dataRoot)
         }.value
-        guard let obj else {
-            syncReceiptLine = nil
-            return
-        }
-        if obj["status"] == "ok" {
-            let total = appModel.skillManifests.count
-            syncReceiptLine = "\(total) recall pointers in memory · synced \(Self.friendlyTime(obj["at"]))"
-        } else {
-            syncReceiptLine = "pointer sync FAILED — \(obj["error"] ?? "unknown")"
-        }
     }
 
-    private static func friendlyTime(_ iso: String?) -> String {
-        guard let iso else { return "recently" }
-        // Route through the shared parser (fractional seconds tolerated). The
-        // old bare ISO8601DateFormatter() lacked .withFractionalSeconds, so
-        // every daemon timestamp failed to parse and rendered "recently".
-        return UserDisplayFormatters.relativeISOTimestamp(iso, unitsStyle: .short, fallback: "recently")
-    }
-
-    private func showToast(_ msg: String) {
-        withAnimation { toastMessage = msg }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-            withAnimation { toastMessage = nil }
-        }
-    }
 }
 
 // MARK: - One skill row
@@ -261,10 +567,87 @@ private struct SkillRow: View {
 
 // MARK: - Read-only body sheet
 
-private struct SkillBodySheet: View {
+enum SkillBodyPresentation {
+    static let maximumDisplayBytes = 128 * 1024
+
+    enum State: Equatable, Sendable {
+        case loading
+        case content(String, truncated: Bool)
+        case empty
+        case unavailable(String)
+    }
+
+    static func bodyRoots(dataRoot: URL, personaRoot: URL) -> [URL] {
+        [
+            dataRoot.appendingPathComponent("skills/bodies", isDirectory: true),
+            personaRoot.appendingPathComponent("skills/bodies", isDirectory: true),
+        ].map { $0.standardizedFileURL.resolvingSymlinksInPath() }
+    }
+
+    /// Component comparison is intentional: a textual prefix would accept
+    /// `bodies-backup/` as though it were nested inside `bodies/`.
+    private static func isDescendant(_ child: URL, of root: URL) -> Bool {
+        let childComponents = child.pathComponents
+        let rootComponents = root.pathComponents
+        return childComponents.count > rootComponents.count
+            && childComponents.starts(with: rootComponents)
+    }
+
+    static func read(
+        path: String,
+        dataRoot: URL,
+        personaRoot: URL,
+        fileManager: FileManager = .default
+    ) -> State {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return .unavailable("This skill has no body file recorded.")
+        }
+
+        let raw = URL(fileURLWithPath: (trimmed as NSString).expandingTildeInPath)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+        let allowed = bodyRoots(dataRoot: dataRoot, personaRoot: personaRoot)
+        guard allowed.contains(where: { isDescendant(raw, of: $0) }) else {
+            return .unavailable("The recorded body path is outside this skill store.")
+        }
+
+        guard raw.pathExtension.lowercased() == "md" else {
+            return .unavailable("The recorded body is not a Markdown skill file.")
+        }
+
+        var isDirectory = ObjCBool(false)
+        guard fileManager.fileExists(atPath: raw.path, isDirectory: &isDirectory),
+              !isDirectory.boolValue else {
+            return .unavailable("The recorded body file is missing.")
+        }
+
+        do {
+            let attributes = try fileManager.attributesOfItem(atPath: raw.path)
+            guard attributes[.type] as? FileAttributeType == .typeRegular else {
+                return .unavailable("The recorded body is not a regular file.")
+            }
+            let byteCount = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+            guard byteCount > 0 else { return .empty }
+            let handle = try FileHandle(forReadingFrom: raw)
+            defer { try? handle.close() }
+            let data = try handle.read(upToCount: maximumDisplayBytes) ?? Data()
+            return .content(
+                String(decoding: data, as: UTF8.self),
+                truncated: byteCount > Int64(maximumDisplayBytes)
+            )
+        } catch {
+            return .unavailable("The body file could not be read: \(error.localizedDescription)")
+        }
+    }
+}
+
+struct SkillBodySheet: View {
     let info: SkillInfo
+    let dataRoot: URL
+    let personaRoot: URL
     let onDismiss: () -> Void
-    @State private var body_: String = ""
+    @State private var state: SkillBodyPresentation.State = .loading
 
     var body: some View {
         VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
@@ -274,17 +657,38 @@ private struct SkillBodySheet: View {
                 Button("Done") { onDismiss() }
                     .keyboardShortcut(.defaultAction)
             }
-            if body_.isEmpty {
-                Text("Couldn\u{2019}t read the skill body at \(info.registry.path)")
-                    .font(.callout)
-                    .foregroundStyle(.orange)
-            } else {
+            switch state {
+            case .loading:
+                ProgressView("Loading skill body…")
+                    .accessibilityIdentifier("skills.lifecycle.body.loading")
+            case .content(let body, let truncated):
                 ScrollView {
-                    Text(body_)
+                    Text(body)
                         .font(.system(.callout, design: .monospaced))
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
+                .accessibilityIdentifier("skills.lifecycle.body.content")
+                if truncated {
+                    Text("Showing the first \(SkillBodyPresentation.maximumDisplayBytes.formatted()) bytes of this skill body.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            case .empty:
+                Label("Skill body is empty", systemImage: "doc")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("skills.lifecycle.body.empty")
+            case .unavailable(let detail):
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Skill body unavailable", systemImage: "exclamationmark.triangle")
+                        .font(.callout.weight(.semibold))
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .foregroundStyle(.orange)
+                .accessibilityIdentifier("skills.lifecycle.body.unavailable")
             }
             Text(info.registry.path)
                 .font(NativeAgentFont.mono)
@@ -295,37 +699,16 @@ private struct SkillBodySheet: View {
         }
         .padding(20)
         .frame(minWidth: 620, minHeight: 480)
-        .task {
-            // Bounded read (gpt-5.5 review MED): a malformed registry/body
-            // row must not turn this sheet into an arbitrary-file viewer.
-            // Only the two skills roots are readable here.
-            // Resolve symlinks BEFORE the prefix check and read the RESOLVED
-            // path (gpt-5.5 wave-1 BLOCKING): a lexical prefix check on the
-            // raw path passes for `bodies/x.md → /anywhere/else`, and
-            // String(contentsOf:) follows the link. Resolving both sides
-            // closes the escape and the check/read race on the same inode
-            // path.
-            let raw = URL(fileURLWithPath: info.registry.path)
-                .standardizedFileURL.resolvingSymlinksInPath()
-            let allowedRoots = [
-                PersistenceCore.defaultDataRoot()
-                    .appendingPathComponent("skills/bodies", isDirectory: true),
-                PersonaRootResolver.resolve()
-                    .appendingPathComponent("skills/bodies", isDirectory: true),
-            ].map { root -> String in
-                let resolved = root.standardizedFileURL.resolvingSymlinksInPath().path
-                return resolved.hasSuffix("/") ? resolved : resolved + "/"
-            }
-            guard allowedRoots.contains(where: { raw.path.hasPrefix($0) }) else {
-                body_ = ""
-                return
-            }
-            // Render-cost audit F9: the body can be arbitrarily large; read it
-            // off the MainActor. The root check above stays on main — it is
-            // pure path arithmetic, and keeping it here keeps the security
-            // gate ahead of any I/O.
-            body_ = await Task.detached(priority: .utility) {
-                (try? String(contentsOf: raw, encoding: .utf8)) ?? ""
+        .task(id: info.registry.path) {
+            let path = info.registry.path
+            let dataRoot = dataRoot
+            let personaRoot = personaRoot
+            state = await Task.detached(priority: .utility) {
+                SkillBodyPresentation.read(
+                    path: path,
+                    dataRoot: dataRoot,
+                    personaRoot: personaRoot
+                )
             }.value
         }
     }
@@ -357,6 +740,14 @@ struct SkillReviewSheet: View {
     // 4k is plenty for the at-a-glance review pane, and users can click
     // "Show full preview" if they want more.
     private let readmePreviewLimit = 4_000
+
+    private var installRefusal: String? {
+        installControl.refusal
+    }
+
+    private var installControl: SkillReviewInstallPresentation.InstallControl {
+        SkillReviewInstallPresentation.installControl(for: info, isInstalling: isInstalling)
+    }
 
     var body: some View {
         NavigationStack {
@@ -486,15 +877,28 @@ struct SkillReviewSheet: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Install") {
-                        let needsOAuth = info.manifest.type == "connector" && info.manifest.oauth?.deviceFlow == true
-                        if needsOAuth {
+                        if let refusal = installRefusal {
+                            installError = refusal
+                        } else if SkillReviewInstallPresentation.needsOAuth(for: info) {
                             showOAuthFlow = true
                         } else {
-                            Task { await installSkill() }
+                            Task { _ = await installSkill() }
                         }
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(isInstalling)
+                    .disabled(!installControl.isEnabled)
+                    .accessibilityIdentifier(SkillReviewInstallPresentation.installAccessibilityIdentifier)
+                }
+            }
+            .safeAreaInset(edge: .bottom) {
+                if let installRefusal {
+                    Label(installRefusal, systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, NativeAgentSpacing.xl)
+                        .padding(.vertical, NativeAgentSpacing.sm)
+                        .background(NativeAgentTheme.warn.opacity(0.08))
                 }
             }
             .sheet(isPresented: $showOAuthFlow) {
@@ -504,7 +908,13 @@ struct SkillReviewSheet: View {
                         skillName: info.manifest.name,
                         onSuccess: { _ in
                             showOAuthFlow = false
-                            Task { await installSkill() }
+                            Task {
+                                _ = await SkillReviewInstallPresentation.installAfterAuthorizedOAuth(
+                                    oauthSucceeded: true,
+                                    wasCancelled: false,
+                                    install: { await installSkill() }
+                                )
+                            }
                         },
                         onCancel: {
                             showOAuthFlow = false
@@ -525,15 +935,18 @@ struct SkillReviewSheet: View {
     }
 
     @MainActor
-    private func installSkill() async {
-        guard !isInstalling else { return }
+    private func installSkill() async -> Bool {
+        guard !isInstalling else { return false }
         isInstalling = true
         defer { isInstalling = false }
-        guard await appModel.enableSkillManifest(name: info.id) else {
-            installError = appModel.skillManifestError ?? "The installed registry state could not be verified."
-            return
+        switch await appModel.installReviewedSkill(info) {
+        case .installed(let receipt):
+            onInstallSuccess(SkillReviewInstallPresentation.successMessage(for: receipt))
+            return true
+        case .refused(let detail), .failed(let detail):
+            installError = detail
+            return false
         }
-        onInstallSuccess(info.id)
     }
 
     private func reviewSection<Content: View>(
@@ -593,6 +1006,7 @@ private struct BoundedSkillText: View {
 // MARK: - OAuth flow sheet
 
 struct OAuthFlowSheet: View {
+    @Environment(AppModel.self) private var appModel
     let provider: String
     let skillName: String
     let onSuccess: (String) -> Void
@@ -605,6 +1019,11 @@ struct OAuthFlowSheet: View {
     @State private var flowTask: Task<Void, Never>?
     @State private var showSuccess = false
     @State private var successLogin = ""
+    @State private var wasCancelled = false
+
+    private var oauthDataRoot: URL {
+        appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+    }
 
     var body: some View {
         NavigationStack {
@@ -630,8 +1049,13 @@ struct OAuthFlowSheet: View {
             }
         }
         .frame(minWidth: 440, minHeight: 360)
-        .task { await startFlow() }
-        .onDisappear { flowTask?.cancel() }
+        .task {
+            flowTask = Task { @MainActor in await startFlow() }
+        }
+        .onDisappear {
+            wasCancelled = true
+            flowTask?.cancel()
+        }
     }
 
     @ViewBuilder
@@ -659,6 +1083,7 @@ struct OAuthFlowSheet: View {
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
             Button("Try Again") {
+                wasCancelled = false
                 isLoading = true
                 error = nil
                 flowTask?.cancel()
@@ -672,13 +1097,16 @@ struct OAuthFlowSheet: View {
     private func startFlow() async {
         isLoading = true
         error = nil
-        guard let connectorId = nativeOAuthConnectorId(for: provider) else {
+        guard let connectorId = SkillReviewInstallPresentation.connectorID(for: provider) else {
             self.error = "Native OAuth is not configured for \(provider)."
             isLoading = false
             return
         }
-        let result = await NativeOAuthFlow.startConnectorOAuthFlow(connectorId: connectorId)
-        guard !Task.isCancelled else { isLoading = false; return }
+        let result = await NativeOAuthFlow.startConnectorOAuthFlow(
+            connectorId: connectorId,
+            dataRoot: oauthDataRoot
+        )
+        guard !Task.isCancelled, !wasCancelled else { isLoading = false; return }
         isLoading = false
         if result.ok {
             successLogin = ""
@@ -686,23 +1114,17 @@ struct OAuthFlowSheet: View {
                 showSuccess = true
             }
             try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard !Task.isCancelled, !wasCancelled else { return }
             onSuccess(successLogin)
         } else {
             self.error = result.error ?? "Sign-in failed."
         }
     }
 
-    private func nativeOAuthConnectorId(for provider: String) -> String? {
-        switch provider.lowercased() {
-        case "x", "twitter": return "x"
-        case "gmail", "email": return "gmail"
-        case "calendar", "google_calendar": return "calendar"
-        default: return nil
-        }
-    }
-
     private func cancelFlow() {
+        wasCancelled = true
         flowTask?.cancel()
+        isLoading = false
         onCancel()
     }
 }

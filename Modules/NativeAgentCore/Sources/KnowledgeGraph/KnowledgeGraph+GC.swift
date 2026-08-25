@@ -71,6 +71,7 @@ public struct KnowledgeGraphGCReport: Sendable, Equatable {
     /// True when apply was REFUSED because candidates exceeded the threshold
     /// and `approvedOverThreshold` was false. No mutations were performed.
     public var requiresApproval: Bool
+    public var candidateSetDiverged: Bool
     public var entitiesDeleted: Int
     public var edgesDeleted: Int
     public var staleIndexRowsDeleted: Int
@@ -103,7 +104,8 @@ extension SwiftNativeKnowledgeGraphIndexer {
         liveFacts: [KnowledgeGraphMemoryFact],
         apply: Bool = false,
         approvalThreshold: Int = SwiftNativeKnowledgeGraphIndexer.gcDefaultApprovalThreshold,
-        approvedOverThreshold: Bool = false
+        approvedOverThreshold: Bool = false,
+        expectedCandidateIDs: Set<String>? = nil
     ) async throws -> KnowledgeGraphGCReport {
         let dbPool = try await gcPool()
         let primaryUserName = resolvedPrimaryUserName()
@@ -151,6 +153,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
                     legacyUntrackedEntities: scan.legacyUntracked,
                     applied: false,
                     requiresApproval: false,
+                    candidateSetDiverged: false,
                     entitiesDeleted: 0,
                     edgesDeleted: 0,
                     staleIndexRowsDeleted: 0
@@ -166,12 +169,26 @@ extension SwiftNativeKnowledgeGraphIndexer {
             let scan = try Self.scanForOrphans(
                 db, liveIDs: liveIDs, liveKeys: liveKeySnapshot, graceCutoff: graceCutoff
             )
+            if let expectedCandidateIDs,
+               Set(scan.candidates.map(\.id)) != expectedCandidateIDs {
+                return KnowledgeGraphGCReport(
+                    candidates: scan.candidates,
+                    legacyUntrackedEntities: scan.legacyUntracked,
+                    applied: false,
+                    requiresApproval: false,
+                    candidateSetDiverged: true,
+                    entitiesDeleted: 0,
+                    edgesDeleted: 0,
+                    staleIndexRowsDeleted: 0
+                )
+            }
             if scan.candidates.count > approvalThreshold && !approvedOverThreshold {
                 return KnowledgeGraphGCReport(
                     candidates: scan.candidates,
                     legacyUntrackedEntities: scan.legacyUntracked,
                     applied: false,
                     requiresApproval: true,
+                    candidateSetDiverged: false,
                     entitiesDeleted: 0,
                     edgesDeleted: 0,
                     staleIndexRowsDeleted: 0
@@ -215,6 +232,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
                 legacyUntrackedEntities: scan.legacyUntracked,
                 applied: true,
                 requiresApproval: false,
+                candidateSetDiverged: false,
                 entitiesDeleted: orphanIDs.count,
                 edgesDeleted: edgesDeleted,
                 staleIndexRowsDeleted: staleDeleted

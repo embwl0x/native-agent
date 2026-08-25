@@ -66,24 +66,77 @@ enum NightlyReflectionJobOutcome: Equatable {
     }
 }
 
+/// The scheduler read result belongs to the scheduler surface. Its detail is
+/// carried with the read rather than recovered later from AppModel.statusText,
+/// which any unrelated operation may replace before SchedulerView renders.
+enum SchedulerJobsRefreshResult: Equatable {
+    case current
+    case partial(detail: String)
+    case unavailable(detail: String)
+
+    var failureDetail: String? {
+        switch self {
+        case .current:
+            nil
+        case .partial(let detail), .unavailable(let detail):
+            detail
+        }
+    }
+
+    static func make(from feed: SchedulerJobsFeedState) -> Self {
+        switch feed {
+        case .current:
+            return .current
+        case .partial(let rows, let rejectedRows):
+            return .partial(detail: SchedulerJobsFeedState.partial(rows, rejectedRows: rejectedRows).failureDetail
+                ?? "Schedule is partially unavailable.")
+        case .sourceAbsent:
+            return .unavailable(detail: SchedulerJobsFeedState.sourceAbsent.failureDetail
+                ?? "Schedule source is absent.")
+        case .unavailable(let detail):
+            return .unavailable(detail: SchedulerJobsFeedState.unavailable(detail).failureDetail
+                ?? "Schedule source is unavailable.")
+        }
+    }
+}
+
 @MainActor
 extension AppModel {
     @MainActor
-    func refreshSchedulerJobs() async -> Bool {
-        do {
-            jobs = try await client.getJobs()
-            return true
-        } catch {
-            statusText = "Schedule load failed: \(error.localizedDescription)"
-            return false
+    @discardableResult
+    func refreshSchedulerJobs() async -> SchedulerJobsRefreshResult {
+        let feed = await client.schedulerJobsFeed()
+        let result = SchedulerJobsRefreshResult.make(from: feed)
+        switch feed {
+        case .current(let rows):
+            jobs = rows
+            return result
+        case .partial(let rows, let rejectedRows):
+            jobs = rows
+            statusText = result.failureDetail ?? "Schedule is partially unavailable."
+            return result
+        case .sourceAbsent:
+            statusText = result.failureDetail ?? "Schedule source is absent."
+            return result
+        case .unavailable(let detail):
+            statusText = result.failureDetail ?? "Schedule source is unavailable."
+            return result
         }
     }
 
     @MainActor
     func createDreamJob() async -> NightlyReflectionJobOutcome {
         do {
-            let before = try await client.getJobs().first {
-                $0.id == "nativeagent-nightly-dream"
+            let before: SchedulerJob?
+            do {
+                before = try await client.getJobs().first {
+                    $0.id == "nativeagent-nightly-dream"
+                }
+            } catch SchedulerJobsFeedError.sourceAbsent {
+                // Missing is the one recoverable feed state for this explicit
+                // create action: the due-job owner will create the canonical
+                // source below. Damage remains unavailable and is never reset.
+                before = nil
             }
 
             // The due-job runner owns the canonical id, calendar cadence,
@@ -93,7 +146,13 @@ extension AppModel {
             // cancellation tombstone (F3-M1): otherwise a once-cancelled dream
             // job could never be re-created — cancelledAt is never stripped by
             // the passive bootstrap pass.
-            _ = try await SchedulerDueJobRunner.shared.ensureDefaultCycleJobs(
+            let scheduler: SchedulerDueJobRunner
+            if let dataRootOverride {
+                scheduler = SchedulerDueJobRunner(root: dataRootOverride)
+            } else {
+                scheduler = .shared
+            }
+            _ = try await scheduler.ensureDefaultCycleJobs(
                 now: Date(),
                 reactivateCancelled: true
             )
@@ -165,7 +224,8 @@ extension AppModel {
 
     @MainActor
     // PATCH-2026-05-06: dev-mode added as parameter, forwarded to daemon payload
-    func saveTrustPolicy(permissionLevel: String, autonomyDefault: String, requireBackups: Bool, outsideDefault: String, developerMode: Bool = false, autonomousTraining: Bool? = nil, dreamScheduler: Bool? = nil) async {
+    @discardableResult
+    func saveTrustPolicy(permissionLevel: String, autonomyDefault: String, requireBackups: Bool, outsideDefault: String, developerMode: Bool = false, autonomousTraining: Bool? = nil, dreamScheduler: Bool? = nil) async -> Bool {
         do {
             let savedPolicy = try await client.saveTrustPolicy(
                 permissionLevel: permissionLevel,
@@ -178,8 +238,10 @@ extension AppModel {
             )
             applySavedTrustPolicy(savedPolicy, status: "Trust policy saved")
             await refreshAll()
+            return true
         } catch {
-            statusText = "Trust save failed: \(error.localizedDescription)"
+            recordTrustActionFailure("Trust save failed: \(error.localizedDescription)")
+            return false
         }
     }
 
@@ -193,28 +255,55 @@ extension AppModel {
             )
             applySavedTrustPolicy(savedPolicy, status: "Memory policy saved")
         } catch {
-            statusText = "Memory policy save failed: \(error.localizedDescription)"
+            recordTrustActionFailure("Memory policy save failed: \(error.localizedDescription)")
         }
     }
 
     @MainActor
-    func saveMultimodalPolicy(_ policy: TrustMultimodalPolicy) async {
+    @discardableResult
+    func saveMultimodalPolicy(_ policy: TrustMultimodalPolicy) async -> Bool {
         do {
             let savedPolicy = try await client.saveMultimodalPolicy(policy)
             applySavedTrustPolicy(savedPolicy, status: "Multimodal policy saved")
+            return true
         } catch {
-            statusText = "Multimodal policy save failed: \(error.localizedDescription)"
+            // A failed canonical write can mean the underlying policy bytes
+            // became unreadable between the UI read and this mutation. Do not
+            // leave a stale OpenAI-voice grant available to playback.
+            trustPolicy = nil
+            recordTrustActionFailure("Multimodal policy save failed: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// Reads the canonical policy directly for the mounted voice-output
+    /// controls.  The card must never treat a failed refresh as the ordinary
+    /// local-voice setting, because playback uses the same policy to decide
+    /// whether a remote synthesis request is permitted.
+    @MainActor
+    @discardableResult
+    func refreshVoiceOutputPolicy() async -> Bool {
+        do {
+            trustPolicy = try await client.getTrustPolicy()
+            return true
+        } catch {
+            // Trust policy is a hard output-route authority. Its previous
+            // snapshot cannot stand in for a failed canonical reload.
+            trustPolicy = nil
+            statusText = "Voice output policy unavailable: \(error.localizedDescription)"
+            return false
         }
     }
 
     @MainActor
+    @discardableResult
     func patchMemoryPolicy(
         knowledgeGraphEnabled: Bool? = nil,
         adaptivePromotion: Bool? = nil,
         hygieneEnabled: Bool? = nil,
         archiveNoisyReflections: Bool? = nil,
         rejectLowValueProposals: Bool? = nil
-    ) async {
+    ) async -> Bool {
         do {
             let savedPolicy = try await client.patchMemoryPolicy(
                 knowledgeGraphEnabled: knowledgeGraphEnabled,
@@ -224,8 +313,10 @@ extension AppModel {
                 rejectLowValueProposals: rejectLowValueProposals
             )
             applySavedTrustPolicy(savedPolicy, status: "Memory policy saved")
+            return true
         } catch {
-            statusText = "Memory policy save failed: \(error.localizedDescription)"
+            recordTrustActionFailure("Memory policy save failed: \(error.localizedDescription)")
+            return false
         }
     }
 
@@ -235,7 +326,7 @@ extension AppModel {
             let savedPolicy = try await client.saveEnableAutonomy(enabled)
             applySavedTrustPolicy(savedPolicy, status: enabled ? "Autonomy enabled" : "Autonomy disabled")
         } catch {
-            statusText = "Autonomy save failed: \(error.localizedDescription)"
+            recordTrustActionFailure("Autonomy save failed: \(error.localizedDescription)")
         }
     }
 
@@ -249,19 +340,22 @@ extension AppModel {
             )
             await ChromeControlRuntime.shared.reconcilePolicy()
         } catch {
-            statusText = "Chrome control save failed: \(error.localizedDescription)"
+            recordTrustActionFailure("Chrome control save failed: \(error.localizedDescription)")
         }
     }
 
     @MainActor
-    func saveAgentAccessMode(_ mode: String, developerMode: Bool? = nil) async {
+    @discardableResult
+    func saveAgentAccessMode(_ mode: String, developerMode: Bool? = nil) async -> Bool {
         do {
             let savedPolicy = try await client.saveAgentAccessMode(mode, currentPolicy: trustPolicy, developerMode: developerMode)
-            applySavedTrustPolicy(savedPolicy)
+            let status = "Agent access saved: \(Self.agentAccessLabel(mode))"
+            applySavedTrustPolicy(savedPolicy, status: status)
             chatFileAccess = Self.normalizedAgentAccessMode(mode)
-            statusText = "Agent access saved: \(Self.agentAccessLabel(mode))"
+            return true
         } catch {
-            statusText = "Agent access save failed: \(error.localizedDescription)"
+            recordTrustActionFailure("Agent access save failed: \(error.localizedDescription)")
+            return false
         }
     }
 
@@ -282,7 +376,7 @@ extension AppModel {
             )
             applySavedTrustPolicy(savedPolicy, status: "Full Mac duration saved: \(option.label)")
         } catch {
-            statusText = "Full Mac duration save failed: \(error.localizedDescription)"
+            recordTrustActionFailure("Full Mac duration save failed: \(error.localizedDescription)")
         }
     }
 
@@ -291,7 +385,13 @@ extension AppModel {
         trustPolicy = policy
         if let status {
             statusText = status
+            trustCenterActionOutcome = .saved(status)
         }
+    }
+
+    func recordTrustActionFailure(_ message: String) {
+        statusText = message
+        trustCenterActionOutcome = .failed(message)
     }
 
     nonisolated static func normalizedAgentAccessMode(_ mode: String) -> String {
@@ -371,10 +471,13 @@ extension AppModel {
 
     @MainActor
     func simulatePolicy(action: String, path: String) async {
+        policySimulation = nil
+        policySimulationFailure = nil
         do {
             policySimulation = try await client.simulatePolicy(action: action, path: path)
             statusText = "Policy simulation complete"
         } catch {
+            policySimulationFailure = error.localizedDescription
             statusText = "Policy simulation failed: \(error.localizedDescription)"
         }
     }

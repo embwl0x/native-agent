@@ -6,7 +6,28 @@ import TelegramBot
 import TriggerScheduler
 
 actor SchedulerDueJobRunner {
+    typealias CycleNotificationDelivery = @Sendable (String, String, String, String, String?) async -> JSONValue
+    /// The scheduler's single effect handoff. Production leaves this nil and
+    /// dispatches the native kind switch; hermetic owners supply a recorder so
+    /// the durable claim → effect → settlement boundary can be exercised
+    /// without borrowing process-global clients from another data root.
+    typealias JobExecutionOverride = @Sendable (JobKind, DueJob, Date) async throws -> JobResult
     static let shared = SchedulerDueJobRunner()
+
+    /// Canonical scheduler effect vocabulary. Every job crosses this resolver
+    /// before either the production switch or a hermetic execution owner runs.
+    /// Keeping it typed prevents an injected recorder from masking a removed or
+    /// misspelled production dispatch case.
+    enum JobKind: String, CaseIterable, Sendable {
+        case notify
+        case connectorAction = "connector_action"
+        case dream
+        case rem
+        case improve
+        case harnessBenchmark = "harness_benchmark"
+        case proactiveScan = "proactive_scan"
+        case workshop
+    }
 
     struct DueJob: Sendable {
         let id: String
@@ -76,6 +97,12 @@ actor SchedulerDueJobRunner {
 
     let root: URL
     let persistence = SwiftNativePersistenceCore()
+    let cycleNotificationDelivery: CycleNotificationDelivery
+    let executionOverride: JobExecutionOverride?
+    /// The loop owner reads this after a tick and publishes a failed loop
+    /// receipt. Activity evidence is not best-effort: if it cannot be written,
+    /// subsequent scheduled effects stop rather than becoming unaccountable.
+    var activityFeedError: String?
     var running = false
     /// Bodies that crossed their caller-facing deadline but have not actually
     /// exited yet. A new scheduler pass must not overlap them.
@@ -97,8 +124,22 @@ actor SchedulerDueJobRunner {
             .appendingPathComponent("inbox.jsonl")
     }
 
-    init(root: URL = PersistenceCore.defaultDataRoot()) {
+    init(
+        root: URL = PersistenceCore.defaultDataRoot(),
+        cycleNotificationDelivery: @escaping CycleNotificationDelivery = { title, body, jobId, source, itemId in
+            await SchedulerDueJobRunner.deliverCycleNotification(
+                title: title, body: body, jobId: jobId, source: source, itemId: itemId
+            )
+        },
+        executionOverride: JobExecutionOverride? = nil
+    ) {
         self.root = root
+        self.cycleNotificationDelivery = cycleNotificationDelivery
+        self.executionOverride = executionOverride
+    }
+
+    var isLiveDataRoot: Bool {
+        root.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL
     }
 
     /// Read the canonical scheduler array without converting damaged durable
@@ -122,12 +163,13 @@ actor SchedulerDueJobRunner {
         if running || inFlightJobBodies > 0 { return [] }
         running = true
         defer { running = false }
+        activityFeedError = nil
 
         let now = Date()
         do {
             let repaired = try await ensureDefaultCycleJobs(now: now)
             if !repaired.isEmpty {
-                try? await appendActivity(
+                try await appendActivity(
                     jobId: nil,
                     kind: "scheduler",
                     title: "Default cycle schedules repaired",
@@ -137,7 +179,7 @@ actor SchedulerDueJobRunner {
                 )
             }
             if let backfilled = try await backfillDreamReceiptIfNeeded(now: now) {
-                try? await appendActivity(
+                try await appendActivity(
                     jobId: "nativeagent-nightly-dream",
                     kind: "dream",
                     title: "Dream cycle receipt backfilled",
@@ -149,9 +191,9 @@ actor SchedulerDueJobRunner {
             // FIX 3 (A4.5): bound completed oneShot rows — they previously only
             // gained enabled=false + completedAt and were never removed, so
             // jobs.json grew without limit.
-            let prunedOneShots = (try? await pruneCompletedOneShotJobs(now: now)) ?? 0
+            let prunedOneShots = try await pruneCompletedOneShotJobs(now: now)
             if prunedOneShots > 0 {
-                try? await appendActivity(
+                try await appendActivity(
                     jobId: nil,
                     kind: "scheduler",
                     title: "Completed one-shot jobs pruned",
@@ -161,14 +203,19 @@ actor SchedulerDueJobRunner {
                 )
             }
         } catch {
-            try? await appendActivity(
-                jobId: nil,
-                kind: "scheduler",
-                title: "Default cycle schedule repair failed",
-                detail: error.localizedDescription,
-                status: "warn",
-                payload: .object([:])
-            )
+            // appendActivity records its own durable-evidence failure. Either
+            // way, a failed scheduler-state repair is not safe to continue.
+            do {
+                try await appendActivity(
+                    jobId: nil,
+                    kind: "scheduler",
+                    title: "Default cycle schedule repair failed",
+                    detail: error.localizedDescription,
+                    status: "warn",
+                    payload: .object([:])
+                )
+            } catch { }
+            return []
         }
 
         var completedNames: [String] = []
@@ -180,21 +227,25 @@ actor SchedulerDueJobRunner {
             do {
                 claimed = try await claimDueJobs(now: now, maxJobs: 1)
             } catch {
-                try? await appendActivity(
-                    jobId: nil,
-                    kind: "scheduler",
-                    title: "Scheduled job scan failed",
-                    detail: error.localizedDescription,
-                    status: "error",
-                    payload: .object([:])
-                )
-                break
+                do {
+                    try await appendActivity(
+                        jobId: nil,
+                        kind: "scheduler",
+                        title: "Scheduled job scan failed",
+                        detail: error.localizedDescription,
+                        status: "error",
+                        payload: .object([:])
+                    )
+                } catch { }
+                return completedNames
             }
 
             // A durable claim left by a prior process means the effect may
             // have happened. Never blindly replay it.
             for recovery in claimed.recoveredUnknown {
-                await recordUnknownOccurrence(recovery)
+                guard await recordUnknownOccurrence(recovery) else {
+                    return completedNames
+                }
             }
             guard let job = claimed.jobs.first else {
                 if claimed.recoveredUnknown.isEmpty { break }
@@ -229,14 +280,18 @@ actor SchedulerDueJobRunner {
                     completedNames.append(job.name)
                 }
             } catch {
-                try? await appendActivity(
-                    jobId: job.id,
-                    kind: job.kind,
-                    title: "Scheduled job update failed",
-                    detail: "\(job.name): \(error.localizedDescription)",
-                    status: "error",
-                    payload: .object(["jobId": .string(job.id)])
-                )
+                do {
+                    try await appendActivity(
+                        jobId: job.id,
+                        kind: job.kind,
+                        title: "Scheduled job update failed",
+                        detail: "\(job.name): \(error.localizedDescription)",
+                        status: "error",
+                        payload: .object(["jobId": .string(job.id)])
+                    )
+                } catch {
+                    return completedNames
+                }
             }
             // Parent-cancel propagation (W3b Finding 2): if the scheduler loop was
             // stopped mid-job, executeWithTimeout returned the loud .cancelled
@@ -255,26 +310,34 @@ actor SchedulerDueJobRunner {
         return completedNames
     }
 
-    private func recordUnknownOccurrence(_ recovery: OccurrenceRecovery) async {
-        try? await appendActivity(
-            jobId: recovery.jobId,
-            kind: recovery.kind,
-            title: "Scheduled job outcome needs reconciliation",
-            detail: recovery.detail,
-            status: "warn",
-            payload: .object([
-                "occurrenceKey": .string(recovery.occurrenceKey),
-                "outcome": .string("unknown_after_restart"),
-            ])
-        )
-        try? await appendNotificationInbox(
-            title: "\(recovery.jobName) needs a quick check",
-            message: recovery.detail,
-            source: "scheduler_reconciliation",
-            severity: "important",
-            jobId: recovery.jobId,
-            itemId: Self.reconciliationItemId(for: recovery.occurrenceKey)
-        )
+    private func recordUnknownOccurrence(_ recovery: OccurrenceRecovery) async -> Bool {
+        do {
+            try await appendActivity(
+                jobId: recovery.jobId,
+                kind: recovery.kind,
+                title: "Scheduled job outcome needs reconciliation",
+                detail: recovery.detail,
+                status: "warn",
+                payload: .object([
+                    "occurrenceKey": .string(recovery.occurrenceKey),
+                    "outcome": .string("unknown_after_restart"),
+                ])
+            )
+            try await appendNotificationInbox(
+                title: "\(recovery.jobName) needs a quick check",
+                message: recovery.detail,
+                source: "scheduler_reconciliation",
+                severity: "important",
+                jobId: recovery.jobId,
+                itemId: Self.reconciliationItemId(for: recovery.occurrenceKey)
+            )
+            return true
+        } catch {
+            if activityFeedError == nil {
+                activityFeedError = "Scheduler reconciliation evidence could not be written: \(error.localizedDescription)"
+            }
+            return false
+        }
     }
 
     private static func reconciliationItemId(for occurrenceKey: String) -> String {

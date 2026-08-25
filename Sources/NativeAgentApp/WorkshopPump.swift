@@ -96,6 +96,10 @@ public struct WorkshopPump: Sendable {
     /// carries the receipt written.
     public enum TickOutcome: Sendable, Equatable {
         case disabled           // enableAutonomy off
+        /// The organism cannot provide a posture at all. This is deliberately
+        /// distinct from a conservative/disabled posture so observability can
+        /// say whether the body is absent or actively withholding work.
+        case organismUnavailable
         case postureNotNormal   // organism not in a green window (H4)
         case resourcePressure   // low power / thermal
         case quiet              // nothing due — ZERO dispatch
@@ -176,8 +180,10 @@ public struct WorkshopPump: Sendable {
         default: break
         }
 
-        guard let posture = await posture(),
-              posture.enabled,
+        guard let posture = await posture() else {
+            return .organismUnavailable
+        }
+        guard posture.enabled,
               posture.loopBudget == .normal else {
             return .postureNotNormal
         }

@@ -9,6 +9,7 @@ import UniformTypeIdentifiers
 import NativeAgentShared
 import MemoryV2
 import PersistenceCore
+import ChatOrchestration
 #if canImport(CoreSpotlight)
 import CoreSpotlight
 #endif
@@ -23,6 +24,248 @@ struct MessageGroup: Identifiable {
     var id: String
     var messages: [ChatMessage]
     var isToolGroup: Bool
+}
+
+enum ChatTranscriptPresentation {
+    static func liveToolGroupID(
+        groups: [MessageGroup],
+        isStreaming: Bool,
+        lastMessage: ChatMessage?
+    ) -> String? {
+        let assistantStarted = lastMessage?.role == "assistant"
+            && lastMessage?.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        guard isStreaming, !assistantStarted else { return nil }
+        return groups.last(where: { $0.isToolGroup })?.id
+    }
+}
+
+/// The mounted assistant bubble owns the only honest first-render boundary: a
+/// non-empty final assistant bubble has become visible to the person using the
+/// Mac app. The registry supplies correlation and claim-once behavior; this
+/// type keeps eligibility/refusal observable without making a visual render
+/// depend on telemetry delivery.
+enum ChatFirstRenderTelemetry {
+    enum Eligibility: Equatable, Sendable {
+        case eligible(sessionID: String)
+        case notAssistant
+        case notLastAssistant
+        case emptyContent
+        case missingSessionID
+    }
+
+    enum Outcome: Equatable, Sendable {
+        case emitted(TurnTraceEvent)
+        case ineligible(Eligibility)
+        case noPendingTurn
+    }
+
+    static func eligibility(
+        role: String,
+        content: String,
+        isLastAssistant: Bool,
+        messageSessionID: String?,
+        activeSessionID: String
+    ) -> Eligibility {
+        guard role == "assistant" else { return .notAssistant }
+        guard isLastAssistant else { return .notLastAssistant }
+        guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .emptyContent
+        }
+        // A present-but-blank message session is malformed; do not fall back
+        // to the active tab and attach its first render to the wrong turn.
+        let sessionID = messageSessionID ?? activeSessionID
+        let cleanSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanSessionID.isEmpty else { return .missingSessionID }
+        return .eligible(sessionID: cleanSessionID)
+    }
+
+    static func emit(
+        eligibility: Eligibility,
+        registry: TurnFirstRenderRegistry = .shared,
+        bus: TurnTraceBus = .shared
+    ) async -> Outcome {
+        guard case .eligible(let sessionID) = eligibility else {
+            return .ineligible(eligibility)
+        }
+        guard let event = await registry.claimFirstRenderEvent(
+            sessionId: sessionID,
+            observedBy: "NativeAgentApp.MessageBubble"
+        ) else {
+            return .noPendingTurn
+        }
+        TurnTraceBus.fire(event, on: bus)
+        return .emitted(event)
+    }
+}
+
+enum ToolPillPresentation {
+    enum Outcome: Equatable {
+        case pending
+        case succeeded
+        case failed
+
+        var icon: String {
+            switch self {
+            case .pending: "clock"
+            case .succeeded: "checkmark.circle.fill"
+            case .failed: "xmark.circle.fill"
+            }
+        }
+
+        var color: Color {
+            switch self {
+            case .pending: .secondary
+            case .succeeded: .green
+            case .failed: .red
+            }
+        }
+    }
+
+    static func outcome(ok: Bool?) -> Outcome {
+        guard let ok else { return .pending }
+        return ok ? .succeeded : .failed
+    }
+
+    static func durationText(_ durationMs: Int?) -> String {
+        guard let durationMs else { return "unknown duration" }
+        return "\(durationMs)ms"
+    }
+}
+
+enum ToolCallGroupPresentation {
+    static func skillToolNames(catalog: ChatToolCatalogSnapshot?) -> Set<String> {
+        catalog?.skillReaderToolNames ?? SwiftToolDispatcher.skillReaderToolNames
+    }
+
+    static func expandsInline(messages: [ChatMessage]) -> Bool {
+        messages.contains { $0.metadata?.isPendingApproval == true }
+    }
+}
+
+enum ToolDiffPresentation {
+    static func lines(before: String, after: String, limit: Int = 60) -> [String] {
+        let beforeLines = before.split(separator: "\n", maxSplits: 1001, omittingEmptySubsequences: false).map(String.init)
+        let afterLines = after.split(separator: "\n", maxSplits: 1001, omittingEmptySubsequences: false).map(String.init)
+        let rows = alignedRows(before: beforeLines, after: afterLines)
+        let displayed = Array(rows.prefix(limit))
+        guard rows.count > displayed.count else { return displayed }
+        return displayed + ["... (\(rows.count - displayed.count) more lines)"]
+    }
+
+    private static func alignedRows(before: [String], after: [String]) -> [String] {
+        let m = before.count
+        let n = after.count
+        var lengths = Array(repeating: Array(repeating: 0, count: n + 1), count: m + 1)
+        if m > 0, n > 0 {
+            for i in stride(from: m - 1, through: 0, by: -1) {
+                for j in stride(from: n - 1, through: 0, by: -1) {
+                    lengths[i][j] = before[i] == after[j]
+                        ? lengths[i + 1][j + 1] + 1
+                        : max(lengths[i + 1][j], lengths[i][j + 1])
+                }
+            }
+        }
+        var rows: [String] = []
+        var i = 0
+        var j = 0
+        while i < m, j < n {
+            if before[i] == after[j] {
+                rows.append(" \(before[i])")
+                i += 1
+                j += 1
+            } else if lengths[i + 1][j] >= lengths[i][j + 1] {
+                rows.append("-\(before[i])")
+                i += 1
+            } else {
+                rows.append("+\(after[j])")
+                j += 1
+            }
+        }
+        while i < m { rows.append("-\(before[i])"); i += 1 }
+        while j < n { rows.append("+\(after[j])"); j += 1 }
+        return rows
+    }
+}
+
+enum ChatAttachmentPresentation {
+    static func partition(_ attachments: [PersistedAttachment]) -> (localImages: [PersistedAttachment], chips: [PersistedAttachment]) {
+        let localImages = attachments.filter { attachment in
+            attachment.type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "image"
+                && (attachment.path?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+        }
+        let chips = attachments.filter { attachment in
+            !(attachment.type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "image"
+                && (attachment.path?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false))
+        }
+        return (localImages, chips)
+    }
+}
+
+/// The visible state for an image attachment that was persisted with a local
+/// path. A load failure is distinct from the short loading placeholder: a
+/// transcript must not silently turn an unreadable image into a blank bubble.
+enum ChatLocalImageAttachmentPresentation {
+    enum State: Equatable {
+        case loading
+        case loaded
+        case unavailable
+    }
+
+    static func state(
+        path: String?,
+        hasLoadedImage: Bool,
+        loadFailed: Bool
+    ) -> State {
+        let hasPath = path?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty == false
+        guard hasPath else { return .unavailable }
+        if hasLoadedImage { return .loaded }
+        return loadFailed ? .unavailable : .loading
+    }
+
+    static func unavailableDetail(for attachment: PersistedAttachment) -> String {
+        let name = attachment.name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !name.isEmpty { return name }
+        let path = attachment.path?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !path.isEmpty { return (path as NSString).lastPathComponent }
+        return "Image attachment"
+    }
+}
+
+/// The inline approval card is a safety control, so it has an explicit state
+/// for missing authority rather than presenting disabled actions as though the
+/// card were merely busy. This also keeps an absent/stale approvals refresh
+/// from turning a still-pending request into a resolved-looking card.
+enum InlineApprovalPresentation {
+    enum State: Equatable {
+        case unavailable
+        case pending
+        case resolved(decision: String)
+    }
+
+    static func state(
+        approvalID: String,
+        locallyResolved: Bool,
+        localDecision: String,
+        externalStatus: String?
+    ) -> State {
+        guard !approvalID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .unavailable
+        }
+        let externalDecision = externalStatus?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if locallyResolved {
+            return .resolved(decision: localDecision)
+        }
+        guard let externalDecision,
+              !externalDecision.isEmpty,
+              externalDecision != "pending" else {
+            return .pending
+        }
+        return .resolved(decision: externalDecision)
+    }
 }
 
 // chat-smoothness phase 1 (2026-06-12): env-gated render-count instrumentation.
@@ -169,16 +412,16 @@ struct ChatMessageListView: View {
         // Same rule as the main window (ChatView): the live flip-box is the LAST
         // tool group while the session is still working and the reply text has
         // not started arriving yet.
-        let liveAssistantStarted = messages.last?.role == "assistant"
-            && messages.last?.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-        let liveToolGroupId = (isStreaming && !liveAssistantStarted)
-            ? groups.last(where: { $0.isToolGroup })?.id : nil
+        let liveToolGroupId = ChatTranscriptPresentation.liveToolGroupID(
+            groups: groups,
+            isStreaming: isStreaming,
+            lastMessage: messages.last
+        )
         ForEach(groups) { group in
             if group.isToolGroup {
                 if group.messages.count == 1 {
                     let msg = group.messages[0]
-                    let kind = msg.metadata?.kind ?? ""
-                    if kind == "approval_pending" {
+                    if msg.metadata?.isPendingApproval == true {
                         InlineApprovalCard(message: msg)
                     } else {
                         ToolPillView(message: msg)
@@ -238,34 +481,11 @@ struct ToolPillView: View {
 
     private var meta: ChatMessageMetadata? { message.metadata }
     private var toolName: String { meta?.toolName ?? "tool" }
-    private var outcome: ToolOutcome {
-        guard let ok = meta?.ok else { return .pending }
-        return ok ? .succeeded : .failed
+    private var outcome: ToolPillPresentation.Outcome {
+        ToolPillPresentation.outcome(ok: meta?.ok)
     }
-    private var durationMs: Int { meta?.durationMs ?? 0 }
+    private var durationText: String { ToolPillPresentation.durationText(meta?.durationMs) }
     private var resultSummary: String { meta?.resultSummary ?? "" }
-
-    private enum ToolOutcome {
-        case pending
-        case succeeded
-        case failed
-
-        var icon: String {
-            switch self {
-            case .pending: "clock"
-            case .succeeded: "checkmark.circle.fill"
-            case .failed: "xmark.circle.fill"
-            }
-        }
-
-        var color: Color {
-            switch self {
-            case .pending: .secondary
-            case .succeeded: .green
-            case .failed: .red
-            }
-        }
-    }
 
     private var icon: String {
         switch toolName {
@@ -308,11 +528,9 @@ struct ToolPillView: View {
                     }
                     Spacer(minLength: 4)
                     // Duration badge
-                    if durationMs > 0 {
-                        Text("\(durationMs)ms")
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                    }
+                    Text(durationText)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
                     // A missing outcome is pending/unknown, never implicit success.
                     Image(systemName: outcome.icon)
                         .font(.caption2)
@@ -378,24 +596,7 @@ struct ToolDiffView: View {
     var after: String
 
     private var diffLines: [String] {
-        // Fix 4: use split(separator:maxSplits:) to avoid double-materialising the full array
-        let beforeLines = before.split(separator: "\n", maxSplits: 1001, omittingEmptySubsequences: false).map(String.init)
-        let afterLines = after.split(separator: "\n", maxSplits: 1001, omittingEmptySubsequences: false).map(String.init)
-        var result: [String] = []
-        // Simple line-by-line diff (no LCS — good enough for inline preview)
-        let maxLen = max(beforeLines.count, afterLines.count)
-        for i in 0..<min(maxLen, 60) {
-            let b = i < beforeLines.count ? beforeLines[i] : nil
-            let a = i < afterLines.count ? afterLines[i] : nil
-            if b == a {
-                result.append(" \(b ?? "")")
-            } else {
-                if let b { result.append("-\(b)") }
-                if let a { result.append("+\(a)") }
-            }
-        }
-        if maxLen > 60 { result.append("... (\(maxLen - 60) more lines)") }
-        return result
+        ToolDiffPresentation.lines(before: before, after: after)
     }
 
     var body: some View {
@@ -471,9 +672,13 @@ struct InlineApprovalCard: View {
                 .first(where: { $0.id == approvalId })?
                 .status
                 .lowercased()
-            let alreadyResolved = resolved || (externalDecision != nil && externalDecision != "pending")
-            if alreadyResolved {
-                let decision = resolvedDecision.isEmpty ? externalDecision : resolvedDecision
+            switch InlineApprovalPresentation.state(
+                approvalID: approvalId,
+                locallyResolved: resolved,
+                localDecision: resolvedDecision,
+                externalStatus: externalDecision
+            ) {
+            case .resolved(let decision):
                 let approved = decision == "approved"
                 let rejected = decision == "denied" || decision == "rejected"
                 let badge = approved ? "Approved" : (rejected ? "Rejected" : "Resolved")
@@ -481,7 +686,7 @@ struct InlineApprovalCard: View {
                 Label(badge, systemImage: icon)
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(approved ? Color.green : (rejected ? Color.red : Color.secondary))
-            } else {
+            case .pending:
                 HStack(spacing: 8) {
                     Button {
                         Task { await resolve("approved") }
@@ -503,6 +708,10 @@ struct InlineApprovalCard: View {
                     .tint(.red)
                     .disabled(resolving || approvalId.isEmpty)
                 }
+            case .unavailable:
+                Label("Approval details unavailable", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.orange)
             }
             // B.3: show daemon error inline; card stays actionable
             if let err = resolveError {
@@ -544,6 +753,7 @@ struct InlineApprovalCard: View {
 
 // PATCH-2026-05-08: wave2-chat-ux — collapsible tool-call group for consecutive tool messages
 struct ToolCallGroup: View {
+    @Environment(AppModel.self) private var appModel
     var messages: [ChatMessage]
     /// True only for the currently-streaming last group: show the live
     /// flip-through box. Otherwise collapse to an "N tools used" summary.
@@ -552,17 +762,21 @@ struct ToolCallGroup: View {
     @State private var skillsExpanded = false
 
     // Skill use shows up as these tool calls — split them into their own
-    // "N skills used" box, separate from regular tools.
-    private static let skillToolNames: Set<String> = ["read_skill", "list_skills"]
+    // "N skills used" box, separate from regular tools. The checked catalog
+    // owns the classification; the dispatcher taxonomy is only the startup
+    // fallback before this surface has a catalog snapshot.
+    private var skillToolNames: Set<String> {
+        ToolCallGroupPresentation.skillToolNames(catalog: appModel.chatToolCatalog)
+    }
     private func isSkill(_ msg: ChatMessage) -> Bool {
-        Self.skillToolNames.contains(msg.metadata?.toolName ?? "")
+        skillToolNames.contains(msg.metadata?.toolName ?? "")
     }
     private var skillMsgs: [ChatMessage] { messages.filter(isSkill) }
     private var toolMsgs: [ChatMessage] { messages.filter { !isSkill($0) } }
 
     // An unresolved approval must never be hidden behind a collapsed summary.
     private var hasPendingApproval: Bool {
-        messages.contains { ($0.metadata?.kind ?? "") == "approval_pending" }
+        ToolCallGroupPresentation.expandsInline(messages: messages)
     }
 
     var body: some View {
@@ -629,8 +843,7 @@ struct ToolCallGroup: View {
             .buttonStyle(.borderless)
             if expanded.wrappedValue {
                 ForEach(items) { msg in
-                    let kind = msg.metadata?.kind ?? ""
-                    if kind == "approval_pending" { InlineApprovalCard(message: msg) }
+                    if msg.metadata?.isPendingApproval == true { InlineApprovalCard(message: msg) }
                     else { ToolPillView(message: msg) }
                 }
             }
@@ -640,8 +853,7 @@ struct ToolCallGroup: View {
     private var fullList: some View {
         VStack(alignment: .leading, spacing: 4) {
             ForEach(messages) { msg in
-                let kind = msg.metadata?.kind ?? ""
-                if kind == "approval_pending" {
+                if msg.metadata?.isPendingApproval == true {
                     InlineApprovalCard(message: msg)
                 } else {
                     ToolPillView(message: msg)
@@ -860,13 +1072,42 @@ final class ChatImageCache: @unchecked Sendable {
     }
 }
 
+/// The production image read/decode/cache seam used by transcript bubbles.
+/// It is synchronous by design so callers can move the whole disk operation
+/// off the render actor; it never fabricates a thumbnail when the bytes cannot
+/// be read or decoded.
+enum ChatLocalImageAttachmentLoader {
+    static func cachedImage(forKey key: String?) -> NSImage? {
+        guard let key else { return nil }
+        return ChatImageCache.image(forKey: key)
+    }
+
+    static func readData(at url: URL) -> Data? {
+        try? Data(contentsOf: url)
+    }
+
+    static func decode(_ data: Data, cacheKey: String?) -> NSImage? {
+        guard let image = NSImage(data: data) else { return nil }
+        if let key = cacheKey { ChatImageCache.store(image, forKey: key) }
+        return image
+    }
+
+    static func load(at url: URL) -> NSImage? {
+        let key = ChatImageCache.identityKey(for: url)
+        if let cached = cachedImage(forKey: key) {
+            return cached
+        }
+        guard let data = readData(at: url) else { return nil }
+        return decode(data, cacheKey: key)
+    }
+}
+
 struct MessageBubble: View {
     var message: ChatMessage
     /// Whether this is the last assistant message in the list (enables Regenerate action)
     var isLastAssistant: Bool = false
 
     @State private var voiceOutput = VoiceOutputController()
-    @AppStorage("voiceUseOpenAI") private var voiceUseOpenAI = false
     @Environment(AppModel.self) private var appModel
     @State private var showJSONSheet = false
     @State private var bubbleToast: String? = nil
@@ -1134,26 +1375,22 @@ struct MessageBubble: View {
         Task {
             await voiceOutput.speak(
                 text: message.content,
-                mode: voiceUseOpenAI ? .openai : .local
+                resolution: VoiceOutputModeSelection.resolve(for: appModel.trustPolicy)
             )
         }
     }
 
     private func emitFirstRenderIfNeeded() {
-        guard message.role == "assistant",
-              isLastAssistant,
-              !trimmedContent.isEmpty else {
-            return
-        }
-        let sessionId = message.sessionId ?? appModel.activeChatSessionId
-        guard appModel.isSessionStreaming(sessionId) else { return }
+        let eligibility = ChatFirstRenderTelemetry.eligibility(
+            role: message.role,
+            content: message.content,
+            isLastAssistant: isLastAssistant,
+            messageSessionID: message.sessionId,
+            activeSessionID: appModel.activeChatSessionId
+        )
+        guard case .eligible = eligibility else { return }
         Task {
-            if let event = await TurnFirstRenderRegistry.shared.claimFirstRenderEvent(
-                sessionId: sessionId,
-                observedBy: "NativeAgentApp.MessageBubble"
-            ) {
-                TurnTraceBus.fire(event)
-            }
+            _ = await ChatFirstRenderTelemetry.emit(eligibility: eligibility)
         }
     }
 
@@ -1225,10 +1462,7 @@ struct MessageBubble: View {
     }
 
     private var localImageAttachments: [PersistedAttachment] {
-        (message.metadata?.attachments ?? []).filter { attachment in
-            attachment.type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "image"
-                && (attachment.path?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
-        }
+        ChatAttachmentPresentation.partition(message.metadata?.attachments ?? []).localImages
     }
 
     /// Sweep R4 C14: everything the image branch above filters OUT used to
@@ -1237,10 +1471,7 @@ struct MessageBubble: View {
     /// includes image-typed rows with no local path: the bytes are gone, but
     /// the fact that an image was attached is not.
     private var nonImageAttachments: [PersistedAttachment] {
-        (message.metadata?.attachments ?? []).filter { attachment in
-            !(attachment.type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "image"
-                && (attachment.path?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false))
-        }
+        ChatAttachmentPresentation.partition(message.metadata?.attachments ?? []).chips
     }
 
     private func postFeedback(messageId: String, rating: String) {
@@ -1395,7 +1626,12 @@ private struct MessageLocalImageAttachmentView: View {
     var body: some View {
         // 2026-07-21 audit: NSImage(contentsOfFile:) used to run synchronously
         // in body on every re-render; the load is now cached in @State via .task.
-        if let image = loadedImage {
+        let state = ChatLocalImageAttachmentPresentation.state(
+            path: imagePath,
+            hasLoadedImage: loadedImage != nil,
+            loadFailed: loadFailed
+        )
+        if state == .loaded, let image = loadedImage {
             Image(nsImage: image)
                 .resizable()
                 .scaledToFit()
@@ -1415,39 +1651,65 @@ private struct MessageLocalImageAttachmentView: View {
                         }
                     }
                 }
-        } else if imagePath != nil && !loadFailed {
+        } else if state == .loading {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .fill(Color.secondary.opacity(0.08))
                 .frame(width: 160, height: 120)
                 .overlay { ProgressView().controlSize(.small) }
                 .task(id: attachment.path) { await loadImage() }
+        } else {
+            VStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle")
+                    .foregroundStyle(.secondary)
+                Text("Image unavailable")
+                    .font(NativeAgentFont.label.weight(.medium))
+                Text(ChatLocalImageAttachmentPresentation.unavailableDetail(for: attachment))
+                    .font(NativeAgentFont.tag)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .frame(width: 160, height: 120)
+            .background {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.secondary.opacity(0.08))
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.8)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(
+                "Image attachment unavailable: "
+                    + ChatLocalImageAttachmentPresentation.unavailableDetail(for: attachment)
+            )
         }
     }
 
     private func loadImage() async {
-        guard let path = imagePath else { return }
-        let url = URL(fileURLWithPath: path)
-        // F10: consult the shared cache first. The stat stays off the main
-        // actor like the read does — a hit costs one syscall instead of a full
-        // file read + decode, and returns the identical decoded image.
-        let key = await Task.detached(priority: .userInitiated) {
-            ChatImageCache.identityKey(for: url)
-        }.value
-        if let key, let cached = ChatImageCache.image(forKey: key) {
-            loadedImage = cached
-            return
-        }
-        // Keep the disk read off the render path; NSImage decoding stays lazy.
-        let data = await Task.detached(priority: .userInitiated) {
-            try? Data(contentsOf: url)
-        }.value
-        guard let data, let image = NSImage(data: data) else {
+        guard let path = imagePath else {
             loadFailed = true
             return
         }
-        // Only cache under a real file identity; an unstat-able file stays
-        // uncached rather than being keyed on a guess.
-        if let key { ChatImageCache.store(image, forKey: key) }
+        let url = URL(fileURLWithPath: path)
+        let key = await Task.detached(priority: .userInitiated) {
+            ChatImageCache.identityKey(for: url)
+        }.value
+        if let cached = ChatLocalImageAttachmentLoader.cachedImage(forKey: key) {
+            loadedImage = cached
+            return
+        }
+        // Keep the real disk read off the render actor. NSImage construction
+        // stays on the view actor so an AppKit object never crosses a detached
+        // task boundary.
+        let imageData = await Task.detached(priority: .userInitiated) {
+            ChatLocalImageAttachmentLoader.readData(at: url)
+        }.value
+        guard let imageData,
+              let image = ChatLocalImageAttachmentLoader.decode(imageData, cacheKey: key) else {
+            loadFailed = true
+            return
+        }
         loadedImage = image
     }
 }

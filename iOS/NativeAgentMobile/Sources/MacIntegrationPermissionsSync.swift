@@ -19,6 +19,7 @@
 // `defaultValue(id:mode:)` so an unset key still answers the hot-path gate.
 
 import Foundation
+import CoreFoundation
 import SwiftUI
 
 @MainActor
@@ -31,21 +32,34 @@ final class MacIntegrationPermissionsSync: ObservableObject {
     static let kvsKey = "nativeagent.mac_integration_permissions"
 
     private let kvs = NSUbiquitousKeyValueStore.default
+    private let projectionLoader: () -> [String: Any]?
 
     /// `id -> ["read": Bool, "write": Bool]`. Only axes the integration supports
     /// are stored; axis lookups fall back to `defaultValue(id:mode:)` via
     /// `get(id:mode:)`.
     @Published private(set) var permissions: [String: [String: Bool]] = [:]
+    /// Existing malformed KVS state is unavailable, never silently presented
+    /// as the Mac's defaults. The view renders this instead of a plausible
+    /// toggle matrix until the Mac republishes a complete projection.
+    @Published private(set) var projectionError: String?
 
-    private init() {
+    init(
+        projectionLoader: @escaping () -> [String: Any]? = {
+            NSUbiquitousKeyValueStore.default.dictionary(forKey: MacIntegrationPermissionsSync.kvsKey)
+        },
+        observesExternalChanges: Bool = true
+    ) {
+        self.projectionLoader = projectionLoader
         load()
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(externalChange(_:)),
-            name: NSUbiquitousKeyValueStore.didChangeExternallyNotification,
-            object: kvs
-        )
-        kvs.synchronize()
+        if observesExternalChanges {
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(externalChange(_:)),
+                name: NSUbiquitousKeyValueStore.didChangeExternallyNotification,
+                object: kvs
+            )
+            kvs.synchronize()
+        }
     }
 
     deinit {
@@ -54,26 +68,63 @@ final class MacIntegrationPermissionsSync: ObservableObject {
 
     // MARK: - Persistence
 
-    /// Pull the current KVS dictionary into `permissions`. Tolerates malformed
-    /// entries (silently drops anything that isn't a `[String: Bool]`-shaped
-    /// inner dict) so a corrupted KVS write can't crash the iOS app.
+    /// Pull the current KVS dictionary into `permissions`. A malformed entry
+    /// is surfaced and makes permission reads fail closed, rather than being
+    /// silently replaced with believable defaults.
     private func load() {
-        guard let raw = kvs.dictionary(forKey: Self.kvsKey) else {
+        guard let raw = projectionLoader() else {
             permissions = [:]
+            projectionError = nil
             return
         }
         var out: [String: [String: Bool]] = [:]
+        var malformedIDs: [String] = []
         out.reserveCapacity(raw.count)
         for (id, value) in raw {
-            guard let entry = value as? [String: Any] else { continue }
+            guard let entry = value as? [String: Any] else {
+                malformedIDs.append(id)
+                continue
+            }
             var pair: [String: Bool] = [:]
-            if let r = entry["read"] as? Bool { pair["read"] = r }
-            if let w = entry["write"] as? Bool { pair["write"] = w }
+            var rowIsMalformed = false
+            if let rawRead = entry["read"] {
+                if let read = Self.strictBool(rawRead) {
+                    pair["read"] = read
+                } else {
+                    rowIsMalformed = true
+                }
+            }
+            if let rawWrite = entry["write"] {
+                if let write = Self.strictBool(rawWrite) {
+                    pair["write"] = write
+                } else {
+                    rowIsMalformed = true
+                }
+            }
             if !pair.isEmpty {
                 out[id] = pair
             }
+            if pair.isEmpty || rowIsMalformed {
+                malformedIDs.append(id)
+            }
         }
         permissions = out
+        let malformedCount = malformedIDs.count
+        projectionError = malformedCount == 0
+            ? nil
+            : "Mac permission sync is unavailable: \(malformedCount) malformed \(malformedCount == 1 ? "row" : "rows") in projection (\(malformedIDs.sorted().joined(separator: ", ")))."
+    }
+
+    /// `NSUbiquitousKeyValueStore` carries property-list scalars as bridged
+    /// Foundation values. A numeric `1` can bridge through `as? Bool`, but it
+    /// is not the Mac's documented Boolean wire value and must not make an OFF
+    /// permission silently read as ON.
+    private static func strictBool(_ value: Any) -> Bool? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) == CFBooleanGetTypeID() else {
+            return nil
+        }
+        return number.boolValue
     }
 
     /// Fired when the Mac side (or another paired iPhone) updates KVS while
@@ -85,6 +136,15 @@ final class MacIntegrationPermissionsSync: ObservableObject {
         }
     }
 
+    /// Reconcile the current KVS projection on explicit screen entry or
+    /// pull-to-refresh. External-change notifications remain the live-update
+    /// path; this prevents a screen opened after a missed notification from
+    /// presenting process-start defaults as a fresh Mac policy.
+    func refreshProjection() {
+        kvs.synchronize()
+        load()
+    }
+
     // MARK: - Gate
 
     /// Effective value for one (id, mode) pair: the stored axis if present,
@@ -92,7 +152,8 @@ final class MacIntegrationPermissionsSync: ObservableObject {
     /// the whole row should read `permissions[id]` directly and let the row
     /// view fall back per axis.
     func get(id: String, mode: String) -> Bool {
-        permissions[id]?[mode] ?? defaultValue(id: id, mode: mode)
+        if projectionError != nil { return false }
+        return permissions[id]?[mode] ?? defaultValue(id: id, mode: mode)
     }
 
     /// Apply a local projection only. The caller must pair this with a signed

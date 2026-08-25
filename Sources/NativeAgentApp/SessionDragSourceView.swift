@@ -23,6 +23,19 @@
 
 import SwiftUI
 import AppKit
+
+enum SessionDragPresentation {
+    static func shouldDetach(
+        pressedMouseButtons: Int,
+        screenPoint: NSPoint,
+        visibleWindowFrames: [NSRect]
+    ) -> Bool {
+        guard pressedMouseButtons & 0x1 == 0 else { return false }
+        // A release on a window edge is still an in-app drop, not a desktop
+        // detach. The one-point margin avoids a flickering boundary decision.
+        return !visibleWindowFrames.contains { $0.insetBy(dx: -1, dy: -1).contains(screenPoint) }
+    }
+}
 import UniformTypeIdentifiers
 
 private let sessionDragUTI = "com.nativeagent.chat-session"
@@ -208,26 +221,19 @@ final class SessionDragSourceNSView: NSView, NSDraggingSource {
         //   • Esc-cancel → left button still pressed → no detach.
         //   • genuine desktop drop → released, OUTSIDE all app windows →
         //     detach at the drop point.
-        guard NSEvent.pressedMouseButtons & 0x1 == 0 else { return }
-        guard !Self.pointIsInsideAnyAppWindow(screenPoint) else { return }
+        let visibleFrames = NSApp.windows.compactMap { window -> NSRect? in
+            guard window.isVisible, window.frame.width > 1, window.frame.height > 1 else { return nil }
+            return window.frame
+        }
+        guard SessionDragPresentation.shouldDetach(
+            pressedMouseButtons: NSEvent.pressedMouseButtons,
+            screenPoint: screenPoint,
+            visibleWindowFrames: visibleFrames
+        ) else { return }
         let sid = sessionId
         Task { @MainActor in
             DetachedChatWindowController.shared.open(sessionId: sid, origin: screenPoint)
         }
     }
 
-    /// True if `screenPoint` (screen coords, bottom-left origin) falls
-    /// inside any visible ordinary app window. Used to suppress the detach
-    /// gesture for cancelled drags and in-app drops. The transient drag-
-    /// feedback window is not an app window in `NSApp.windows`, so it
-    /// doesn't interfere.
-    @MainActor
-    private static func pointIsInsideAnyAppWindow(_ screenPoint: NSPoint) -> Bool {
-        for window in NSApp.windows where window.isVisible {
-            // Skip off-screen / zero-size utility windows.
-            guard window.frame.width > 1, window.frame.height > 1 else { continue }
-            if window.frame.contains(screenPoint) { return true }
-        }
-        return false
-    }
 }

@@ -41,13 +41,17 @@ enum TriggerNotifierBinding {
 
     /// Returns `.failed` on write failure, having logged loudly; each caller
     /// decides what a failed or deduped mirror means for it.
-    static func mirrorCardIntoRealInbox(_ card: JSONValue, triggerName: String) async -> MirrorOutcome {
+    static func mirrorCardIntoRealInbox(
+        _ card: JSONValue,
+        triggerName: String,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) async -> MirrorOutcome {
         guard case .object(var cardObj) = card else {
             NSLog("trigger_mirror: card for %@ is not a JSON object — NOT written to the real inbox",
                   triggerName)
             return .failed
         }
-        let inboxPath = PersistenceCore.defaultDataRoot()
+        let inboxPath = dataRoot
             .appendingPathComponent("notifications", isDirectory: true)
             .appendingPathComponent("inbox.jsonl")
         // Normalize the card to the notifications-store shape.
@@ -182,10 +186,13 @@ enum TriggerNotifierBinding {
     /// manual "Fire now" path can report an honest failure instead of success
     /// with an empty inbox (gpt-5.5 review, 2026-07-09).
     @discardableResult
-    static func mirrorNonNotifiedFire(_ result: TriggerFireResult) async -> Bool {
+    static func mirrorNonNotifiedFire(
+        _ result: TriggerFireResult,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) async -> Bool {
         guard result.status == "fired", result.notified != true, let item = result.item else { return true }
         let name = result.name ?? "unknown"
-        switch await mirrorCardIntoRealInbox(item, triggerName: name) {
+        switch await mirrorCardIntoRealInbox(item, triggerName: name, dataRoot: dataRoot) {
         case .failed:
             NSLog("trigger_mirror: non-notified fire for %@ (item %@) did NOT reach the real inbox — the card was DROPPED",
                   name, result.itemId ?? "?")
@@ -195,7 +202,11 @@ enum TriggerNotifierBinding {
             // mirror; the fire is honestly represented by the existing card.
             return true
         case .appended:
-            await MacSyncEngine.shared.writeSnapshots()
+            // A recovered/test root must never borrow production iCloud state
+            // merely to prove its own local card write.
+            if dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL {
+                await MacSyncEngine.shared.writeSnapshots()
+            }
             return true
         }
     }
@@ -204,14 +215,21 @@ enum TriggerNotifierBinding {
     /// runner and manual "fire now". Every other call site (list / enable / disable /
     /// configure) keeps the plain `makeTriggerScheduler()`: they never fire, so
     /// they must never carry a sender.
-    static func makeNotifyingTriggerScheduler() -> any TriggerSchedulerClient {
+    static func makeNotifyingTriggerScheduler(
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) -> any TriggerSchedulerClient {
         // L5 G3: manual "fire now" is a FIRE site, so it gets the same brief a
         // scheduled fire gets — synthesized lead over deterministic evidence.
         // A "fire now" that produced a visibly different brief from the 8am one
         // would make the button useless for checking what the 8am one will say.
-        makeTriggerScheduler(
-            notifier: pairedDevicePush,
-            morningBriefSynthesizer: BackgroundLoopsAssembly.makeMorningBriefSynthesizer()
+        let isLiveRoot = dataRoot.standardizedFileURL
+            == PersistenceCore.defaultDataRoot().standardizedFileURL
+        return makeTriggerScheduler(
+            notifier: isLiveRoot ? pairedDevicePush : nil,
+            dataRoot: dataRoot,
+            morningBriefSynthesizer: isLiveRoot
+                ? BackgroundLoopsAssembly.makeMorningBriefSynthesizer()
+                : nil
         )
     }
 }

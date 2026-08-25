@@ -48,9 +48,10 @@ extension BackgroundLoopsAssembly {
         )
     }
 
-    /// M7 (2026-07-09): `turn_traces/` grew one file plus one orphaned `.lock`
-    /// per day, forever — `ChatSessionRetention` only ever covered
-    /// `chat/sessions.json`. Six-hourly is ample for a day-granularity sweep.
+    /// The mounted six-hour retention wake handles both date-named trace
+    /// expiry and old orphan lock sidecars left by any `withFileLock` caller.
+    /// The generic sweep is bounded, so it drains large historical residue
+    /// across wakes instead of turning a maintenance tick into a disk walk.
     static func makeTurnTraceRetentionLoop(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         intervalSeconds: TimeInterval = 6 * 60 * 60
@@ -496,12 +497,33 @@ private struct TurnTraceRetentionRunner: LoopRunner {
 
     func tickOutcome() async -> LoopTickOutcome {
         do {
-            let report = try TurnTraceRetention.enforce(dataRoot: dataRoot, now: Date())
-            if report.removedDays > 0 || report.removedLocks > 0 {
+            let now = Date()
+            let traceReport = try TurnTraceRetention.enforce(dataRoot: dataRoot, now: now)
+            let lockReport = try await FileLockSidecarLifecycle.reapOrphanedSidecars(
+                dataRoot: dataRoot,
+                now: now
+            )
+            try await MaintenanceSweepFeed.append(
+                traceReport: traceReport,
+                lockReport: lockReport,
+                dataRoot: dataRoot,
+                completedAt: now
+            )
+            if traceReport.removedDays > 0 || traceReport.removedLocks > 0 {
                 NSLog("turn_trace_retention: removed %d day file(s) and %d lock(s), kept %d day(s)",
-                      report.removedDays, report.removedLocks, report.keptDays)
+                      traceReport.removedDays, traceReport.removedLocks, traceReport.keptDays)
             }
-            return .completed(result: "turn-trace retention completed")
+            if lockReport.reaped > 0 || lockReport.deferred > 0 || lockReport.failures > 0 {
+                NSLog("file_lock_sidecar_lifecycle: reaped %d orphan lock(s), deferred %d, failures %d",
+                      lockReport.reaped, lockReport.deferred, lockReport.failures)
+            }
+            if lockReport.failures > 0 {
+                return .failed(error: "lock-sidecar sweep had \(lockReport.failures) failed candidate(s)")
+            }
+            let bounded = lockReport.deferred > 0
+                ? "; \(lockReport.deferred) orphan lock(s) deferred"
+                : ""
+            return .completed(result: "turn-trace retention and lock-sidecar sweep completed\(bounded)")
         } catch {
             NSLog("turn_trace_retention: sweep failed: %@", String(describing: error))
             return .failed(error: String(describing: error))

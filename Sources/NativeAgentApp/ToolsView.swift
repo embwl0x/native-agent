@@ -6,6 +6,8 @@ import ScreenVision
 import Speech
 import AVFoundation
 import UniformTypeIdentifiers
+import ChatOrchestration
+import NativeAgentCore
 import NativeAgentShared
 import MemoryV2
 import PersistenceCore
@@ -18,12 +20,10 @@ import CloudKit
 
 struct ToolsView: View {
     @Environment(AppModel.self) private var appModel
-
-    // ui-honesty 2026-06-10: Approve / Enable Auto-run / Quarantine report
-    // success AND failure via appModel.statusText, which this tab never
-    // rendered — errors vanished. Flash statusText changes as a transient
-    // bottom banner while the Tools tab is visible.
-    @State private var statusFlash: String?
+    /// Production loads the authoritative runtime catalog when this surface
+    /// becomes visible. Hermetic presentation hosts can hold a supplied state
+    /// still, without accidentally reading the user's live data root.
+    var loadsOnAppear = true
 
     /// Posts the existing openCommandRouteRequest notification (handled
     /// in ContentView.swift at line 272+) instead of mutating a child-
@@ -31,194 +31,497 @@ struct ToolsView: View {
     /// ContentView.openCommandRoute() which also expands Advanced /
     /// sets focus correctly. (gpt-5.5 review NEEDS_FIX 3)
     private func jumpToTrust() {
-        NotificationCenter.default.post(name: .openCommandRouteRequest, object: "trust")
+        ToolsNavigation.openTrustCenter()
     }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                if let catalog = appModel.chatToolCatalog {
-                    ChatToolCatalogSection(
-                        catalog: catalog,
-                        jumpToTrust: jumpToTrust
-                    )
-                } else if !appModel.chatToolCatalogLoadFailed {
-                    // Still loading — show progress, NOT the empty state.
-                    HStack {
-                        ProgressView()
-                        Text("Loading tool catalog...")
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(.vertical, 8)
+                if let message = ToolsRefreshPresentation.message(for: appModel.toolsRefreshState) {
+                    Label(message, systemImage: ToolsRefreshPresentation.systemImage(for: appModel.toolsRefreshState))
+                        .font(.caption)
+                        .foregroundStyle(
+                            appModel.toolsRefreshState == .refreshed ? .green : .orange
+                        )
+                        .textSelection(.enabled)
                 }
+
+                catalogContent(ChatToolCatalogPresentation.catalogState(
+                    catalog: appModel.chatToolCatalog,
+                    loadFailed: appModel.chatToolCatalogLoadFailed,
+                    loadError: appModel.chatToolCatalogLoadError
+                ))
 
                 if !appModel.tools.isEmpty {
                     AuthoredToolsSection(tools: appModel.tools, appModel: appModel)
                 }
 
-                // Only render the empty state when the catalog actually
-                // FAILED to load (loadFailed=true) AND there are no
-                // authored tools either. Loading state was racing the
-                // empty state on initial paint. (gpt-5.5 review NEEDS_FIX 4)
-                if appModel.chatToolCatalogLoadFailed && appModel.tools.isEmpty {
-                    NativeEmptyState(
-                        title: "No Tools Yet",
-                        detail: "Tool catalog failed to load. Tap Refresh to retry — if it keeps failing, run Doctor for diagnostics.",
-                        systemImage: "hammer"
-                    )
+                if !appModel.toolOperationStatusReceipts.isEmpty {
+                    NativePanel(title: "Recent Tool Activity", systemImage: "checkmark.circle") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(appModel.toolOperationStatusReceipts) { receipt in
+                                CapabilityDetailRow(
+                                    title: receipt.outcome == .succeeded ? "Completed" : "Needs attention",
+                                    detail: receipt.message,
+                                    status: receipt.outcome.badgeStatus,
+                                    systemImage: receipt.outcome.systemImage
+                                )
+                                if receipt.id != appModel.toolOperationStatusReceipts.last?.id {
+                                    Divider()
+                                }
+                            }
+                        }
+                    }
                 }
             }
             .padding()
         }
         .toolbar {
-            Button("Refresh", systemImage: "arrow.clockwise") {
-                Task { await appModel.refreshForSidebarItem(.tools) }
-            }
-        }
-        .overlay(alignment: .bottom) {
-            if let statusFlash {
-                Text(statusFlash)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
-                    .padding(.bottom, 10)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
-        }
-        .onChange(of: appModel.statusText) { _, newValue in
-            let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { return }
-            withAnimation { statusFlash = trimmed }
-            Task {
-                try? await Task.sleep(for: .seconds(4))
-                if statusFlash == trimmed {
-                    withAnimation { statusFlash = nil }
+            Button {
+                Task { await appModel.refreshToolsFromToolbar() }
+            } label: {
+                if appModel.isRefreshingTools {
+                    Label("Refreshing Tools", systemImage: "arrow.triangle.2.circlepath")
+                } else {
+                    Label("Refresh", systemImage: "arrow.clockwise")
                 }
             }
+            .disabled(appModel.isRefreshingTools)
+            .accessibilityIdentifier("tools.refresh")
+        }
+        .task {
+            guard loadsOnAppear else { return }
+            await appModel.refreshForSidebarItem(.tools)
+        }
+    }
+
+    @ViewBuilder
+    private func catalogContent(_ catalogState: ChatToolCatalogPresentation.CatalogState) -> some View {
+        switch ToolsCatalogSurfacePresentation.state(for: catalogState) {
+        case .loading(let presentation):
+            HStack {
+                ProgressView()
+                Text(presentation.detail)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.vertical, 8)
+        case let .empty(presentation), let .unavailable(presentation):
+            NativeEmptyState(
+                title: presentation.title,
+                detail: presentation.detail,
+                systemImage: presentation.systemImage
+            )
+        case .catalog:
+            switch catalogState {
+            case let .available(catalog, bucketResult):
+                ChatToolCatalogSection(
+                    catalog: catalog,
+                    bucketResult: bucketResult,
+                    trustPolicy: appModel.trustPolicy,
+                    trustRefreshStatus: appModel.panelRefreshStatus[.tools],
+                    jumpToTrust: jumpToTrust
+                )
+            case let .stale(catalog, bucketResult, detail):
+                ChatToolCatalogSection(
+                    catalog: catalog,
+                    bucketResult: bucketResult,
+                    staleDetail: detail,
+                    trustPolicy: appModel.trustPolicy,
+                    trustRefreshStatus: appModel.panelRefreshStatus[.tools],
+                    jumpToTrust: jumpToTrust
+                )
+            case .loading, .unavailable, .empty:
+                EmptyView()
+            }
+        }
+    }
+}
+
+enum ToolsNavigation {
+    static func openTrustCenter(notificationCenter: NotificationCenter = .default) {
+        notificationCenter.post(name: .openCommandRouteRequest, object: "trust")
+    }
+}
+
+/// The toolbar reports the outcome of its scoped refresh rather than treating
+/// a tap, or completion of only the side reads, as proof that the tool catalog
+/// itself was refreshed.
+enum ToolsRefreshPresentation {
+    enum State: Equatable {
+        case idle
+        case refreshing
+        case refreshed
+        case partial
+        case unavailable
+        case alreadyRefreshing
+    }
+
+    static func completion(
+        panelRefresh: AppModel.PanelRefreshStatus?,
+        catalogLoadFailed: Bool,
+        hasCatalog: Bool
+    ) -> State {
+        if catalogLoadFailed && !hasCatalog { return .unavailable }
+        if catalogLoadFailed || panelRefresh?.isStale == true { return .partial }
+        return panelRefresh == nil ? .unavailable : .refreshed
+    }
+
+    static func message(for state: State) -> String? {
+        switch state {
+        case .idle, .refreshing:
+            return nil
+        case .refreshed:
+            return "Tools refreshed from current sources."
+        case .partial:
+            return "Some Tools data could not be refreshed; retained rows are marked stale."
+        case .unavailable:
+            return "The Tools catalog could not be refreshed. Check the displayed diagnostics and try again."
+        case .alreadyRefreshing:
+            return "Tools refresh is already in progress."
+        }
+    }
+
+    static func systemImage(for state: State) -> String {
+        switch state {
+        case .refreshed: return "checkmark.circle.fill"
+        case .partial, .unavailable: return "exclamationmark.triangle.fill"
+        case .refreshing: return "arrow.triangle.2.circlepath"
+        case .alreadyRefreshing: return "hourglass"
+        case .idle: return "arrow.clockwise"
+        }
+    }
+}
+
+/// The visible catalog state, distinct from the toolbar receipt. A completed
+/// `tools: []` runtime response is an honest empty state, whereas no catalog
+/// after a failed read remains unavailable and no catalog before a read stays
+/// loading. This is the exact projection ToolsView renders.
+enum ToolsCatalogSurfacePresentation {
+    struct Detail: Equatable {
+        let title: String
+        let detail: String
+        let systemImage: String
+    }
+
+    enum State: Equatable {
+        case loading(Detail)
+        case empty(Detail)
+        case unavailable(Detail)
+        case catalog
+    }
+
+    static func state(for catalogState: ChatToolCatalogPresentation.CatalogState) -> State {
+        switch catalogState {
+        case .loading:
+            return .loading(Detail(
+                title: "Loading tool catalog",
+                detail: "Loading tool catalog...",
+                systemImage: "arrow.triangle.2.circlepath"
+            ))
+        case .empty:
+            return .empty(Detail(
+                title: "No Chat Tools Available",
+                detail: "The live catalog completed successfully but returned no tools.",
+                systemImage: "hammer"
+            ))
+        case let .unavailable(detail):
+            return .unavailable(Detail(
+                title: "Chat Tool Catalog Unavailable",
+                detail: detail.map { "The live catalog could not be read: \($0). Tap Refresh to retry." }
+                    ?? "The live catalog could not be read. Tap Refresh to retry — if it keeps failing, run Doctor for diagnostics.",
+                systemImage: "exclamationmark.triangle"
+            ))
+        case .available, .stale:
+            return .catalog
+        }
+    }
+}
+
+/// The catalog is the authority for which tools are currently mounted, while
+/// `FullMacExpiry` explains the Trust-policy lifecycle behind that verdict.
+/// Keep an unavailable or expired policy distinct from a deliberately-off
+/// Full Mac session; all paths remain locked until the catalog says otherwise.
+enum ToolsFullMacBannerPresentation {
+    struct State: Equatable {
+        let title: String
+        let detail: String
+        let status: String
+        let systemImage: String
+    }
+
+    static func state(
+        catalogFullMacActive: Bool,
+        expiryState: FullMacExpiryState?,
+        hasTrustRefreshAttempt: Bool,
+        trustPolicyReadFailed: Bool,
+        now: Date = Date()
+    ) -> State? {
+        if catalogFullMacActive {
+            switch expiryState {
+            case .expired, .unreadable:
+                return State(
+                    title: "Full Mac status needs refresh",
+                    detail: "The current tool catalog still exposes Full Mac tools, but \(FullMacExpiry.statusLine(expiryState!, now: now)). Refresh Tools before relying on that catalog.",
+                    status: "warn",
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+            case .off:
+                return State(
+                    title: "Full Mac status needs refresh",
+                    detail: "The current tool catalog still exposes Full Mac tools, but Trust now reports Full Mac inactive. Refresh Tools before relying on that catalog.",
+                    status: "warn",
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+            case .active, .never, nil:
+                return nil
+            }
+        }
+
+        if trustPolicyReadFailed || expiryState == nil {
+            return State(
+                title: "Full Mac tools are locked",
+                detail: hasTrustRefreshAttempt
+                    ? "The Trust policy could not be refreshed, so NativeAgent cannot explain why Full Mac is locked. Check Trust Center and refresh Tools."
+                    : "Trust status has not loaded yet. Full Mac tools stay locked until the current catalog is available.",
+                status: "warn",
+                systemImage: "lock.trianglebadge.exclamationmark"
+            )
+        }
+
+        switch expiryState! {
+        case .off:
+            return State(
+                title: "Full Mac is off",
+                detail: "File, system, shell, and Mac-control tools are policy-locked. Enable and confirm Full Mac in Trust Center to unlock.",
+                status: "warn",
+                systemImage: "lock.shield"
+            )
+        case .expired, .unreadable:
+            return State(
+                title: "Full Mac is unavailable",
+                detail: FullMacExpiry.statusLine(expiryState!, now: now),
+                status: "warn",
+                systemImage: "exclamationmark.octagon.fill"
+            )
+        case .active, .never:
+            return State(
+                title: "Full Mac tools are locked",
+                detail: "Trust reports an active Full Mac window, but the current tool catalog still has these tools locked. Refresh Tools; if it persists, reconfirm in Trust Center.",
+                status: "warn",
+                systemImage: "lock.trianglebadge.exclamationmark"
+            )
         }
     }
 }
 
 // MARK: - Chat Tool Catalog
 
-private struct ChatToolCatalogSection: View {
-    let catalog: ChatToolCatalogSnapshot
-    let jumpToTrust: () -> Void
+/// The catalog envelope is produced by the shared runtime. Keep the decisions
+/// that turn that envelope into visible Settings state as values so they can be
+/// exercised without a SwiftUI snapshot or a second copy of the classification
+/// rules in tests.
+enum ChatToolCatalogPresentation {
+    enum ToolStatusBadgeTone: Equatable {
+        case positive
+        case neutral
+        case warning
+        case danger
+    }
 
-    @State private var expanded: Set<String> = []
-    @State private var expandedBuckets: Set<String> = []
+    /// The tool catalog is the live authority for this badge. A row with
+    /// incomplete or unrecognised authority fields is not advertised as
+    /// available: a stale or malformed receipt cannot establish usability.
+    struct ToolStatusBadge: Equatable {
+        let title: String
+        let systemImage: String
+        let tone: ToolStatusBadgeTone
+    }
 
-    private static let shellNames: Set<String> = [
-        "shell", "bash", "git", "apply_patch", "run_tests",
-        "swift_build", "swift_test",
-    ]
-    private static let fileOpsHardcoded: Set<String> = [
-        "read_file", "list_dir", "write_file", "file_excerpt", "grep",
-        "git_status", "git_diff", "git_log", "repo_dirty_summary",
-    ]
-    private static let systemNames: Set<String> = ["system_info"]
-    private static let macIntegrationPrefixes: [String] = [
-        "mac_", "mail_", "messages_", "calendar_", "reminders_",
-        "contacts_", "notes_", "music_",
-    ]
-    private static let macIntegrationExact: Set<String> = ["notify", "mac.notify", "mobile.notify"]
-
-    private struct Bucket: Identifiable {
+    struct Bucket: Identifiable, Equatable {
         let id: String
         let title: String
         let icon: String
         let tools: [ChatCatalogTool]
     }
 
-    private var buckets: [Bucket] {
-        // gpt-5.5 review NEEDS_FIX 2: derive bucket assignment from the
-        // CATALOG ENVELOPE's own sets, not just hardcoded name lists. The
-        // hardcoded sets are still used as overrides for the most-specific
-        // categorization (shell tools, system_info), but builder-set names
-        // not in those overrides now flow to File Ops via the envelope's
-        // builderAvailable + builderPolicyLocked sets — so new builder tools
-        // added to the dispatcher get bucketed correctly without UI code
-        // changes. (builderNotImplemented retired 2026-08-01: the list had
-        // been permanently empty since the builder cutover completed.)
-        let builderSet = Set(
-            catalog.builderAvailable + catalog.builderPolicyLocked
-        )
-        let macAppSet = Set(catalog.macAppAvailable + catalog.macAppPolicyLocked)
-        var mcp: [ChatCatalogTool] = []
-        var alwaysOn: [ChatCatalogTool] = []
-        var fileOps: [ChatCatalogTool] = []
-        var system: [ChatCatalogTool] = []
-        var shell: [ChatCatalogTool] = []
-        var macControl: [ChatCatalogTool] = []
-        var macIntegration: [ChatCatalogTool] = []
-        var other: [ChatCatalogTool] = []
+    /// A catalog row cannot be rendered safely when it has no stable name or
+    /// shares its SwiftUI identity with another row. Withhold the whole
+    /// ambiguous identity group rather than silently showing an arbitrary one.
+    struct BucketResult: Equatable {
+        let buckets: [Bucket]
+        let visibleToolCount: Int
+        let withheldToolCount: Int
+        let unclassifiedToolCount: Int
 
-        for tool in catalog.tools {
-            let name = tool.name
-            // 1) MCP first (most-specific by name prefix; catches every
-            //    external server tool ahead of any other classification).
-            if name.hasPrefix("mcp__") {
-                mcp.append(tool)
-                continue
-            }
-            // 2) Shell/build hardcoded (most-critical, most-specific).
-            if Self.shellNames.contains(name) {
-                shell.append(tool)
-                continue
-            }
-            // 3) System.
-            if Self.systemNames.contains(name) {
-                system.append(tool)
-                continue
-            }
-            // 4) Mac Control (envelope-driven).
-            if macAppSet.contains(name) {
-                macControl.append(tool)
-                continue
-            }
-            // 5) Mac Integration (prefix + exact name).
-            if Self.macIntegrationExact.contains(name) ||
-               Self.macIntegrationPrefixes.contains(where: { name.hasPrefix($0) }) {
-                macIntegration.append(tool)
-                continue
-            }
-            // 6) File Ops — hardcoded OR envelope builderSet (catches future
-            //    builder tools the hardcoded list doesn't know about).
-            if Self.fileOpsHardcoded.contains(name) || builderSet.contains(name) {
-                fileOps.append(tool)
-                continue
-            }
-            // 7) Always-on fallback for anything currently loaded that
-            //    didn't fit a more-specific bucket.
-            if catalog.currentlyLoaded.contains(name) {
-                alwaysOn.append(tool)
-                continue
-            }
-            // 8) Last resort.
-            other.append(tool)
+        var withheldNotice: String? {
+            guard withheldToolCount > 0 else { return nil }
+            return "\(withheldToolCount) malformed or duplicate catalog \(withheldToolCount == 1 ? "row was" : "rows were") withheld; refresh Tools after the runtime catalog is repaired."
         }
 
-        // Display order matches classification specificity (most-specific
-        // first) so the most powerful / highest-leverage buckets render
-        // at the top of the tab: external MCP servers, then shell, then
-        // system/mac control, then integration reads, then plain file
-        // ops, then the safe-by-default always-on tools, then the
-        // catch-all. (gpt-5.5 review R2 NEEDS_FIX)
-        let raw: [Bucket] = [
-            Bucket(id: "mcp", title: "MCP (External Servers)", icon: "link", tools: mcp),
-            Bucket(id: "shell", title: "Shell / Build", icon: "terminal", tools: shell),
-            Bucket(id: "system", title: "System", icon: "cpu", tools: system),
-            Bucket(id: "mac-control", title: "Mac Control", icon: "macwindow", tools: macControl),
-            Bucket(id: "mac-integration", title: "Mac Integration", icon: "app.badge", tools: macIntegration),
-            Bucket(id: "file-ops", title: "File Ops", icon: "doc.text", tools: fileOps),
-            Bucket(id: "always-on", title: "Always-on", icon: "bolt.circle", tools: alwaysOn),
-            Bucket(id: "other", title: "Other", icon: "ellipsis.circle", tools: other),
-        ]
-        return raw.filter { !$0.tools.isEmpty }
+        var unclassifiedNotice: String? {
+            guard unclassifiedToolCount > 0 else { return nil }
+            return "\(unclassifiedToolCount) runtime \(unclassifiedToolCount == 1 ? "tool has" : "tools have") no reviewed dispatcher bucket. Their availability is shown, but their category needs runtime registration before it can be trusted."
+        }
     }
+
+    enum CatalogState: Equatable {
+        case loading
+        case unavailable(detail: String?)
+        case empty
+        case available(catalog: ChatToolCatalogSnapshot, buckets: BucketResult)
+        case stale(catalog: ChatToolCatalogSnapshot, buckets: BucketResult, detail: String?)
+    }
+
+    static func catalogState(
+        catalog: ChatToolCatalogSnapshot?,
+        loadFailed: Bool,
+        loadError: String?
+    ) -> CatalogState {
+        let detail = boundedDetail(loadError)
+        guard let catalog else {
+            return loadFailed ? .unavailable(detail: detail) : .loading
+        }
+        let result = bucketResult(for: catalog)
+        if loadFailed {
+            return .stale(catalog: catalog, buckets: result, detail: detail)
+        }
+        return catalog.tools.isEmpty
+            ? .empty
+            : .available(catalog: catalog, buckets: result)
+    }
+
+    static func buckets(for catalog: ChatToolCatalogSnapshot) -> [Bucket] {
+        bucketResult(for: catalog).buckets
+    }
+
+    static func bucketResult(for catalog: ChatToolCatalogSnapshot) -> BucketResult {
+        var toolsByBucket = Dictionary(uniqueKeysWithValues: ChatToolCatalogBucket.allCases.map {
+            ($0.rawValue, [ChatCatalogTool]())
+        })
+
+        let normalizedNames = catalog.tools.map { $0.name.trimmingCharacters(in: .whitespacesAndNewlines) }
+        let nameCounts = Dictionary(normalizedNames.map { ($0, 1) }, uniquingKeysWith: { $0 + $1 })
+        let validTools = zip(catalog.tools, normalizedNames).compactMap { tool, normalizedName -> ChatCatalogTool? in
+            guard !normalizedName.isEmpty, nameCounts[normalizedName] == 1 else { return nil }
+            return tool
+        }
+
+        for tool in validTools {
+            let bucket = bucket(for: tool, in: catalog)
+            toolsByBucket[bucket.rawValue, default: []].append(tool)
+        }
+
+        let buckets: [Bucket] = ChatToolCatalogBucket.allCases.compactMap { definition -> Bucket? in
+            guard let tools = toolsByBucket[definition.rawValue], !tools.isEmpty else { return nil }
+            return Bucket(
+                id: definition.rawValue,
+                title: definition.title,
+                icon: definition.systemImage,
+                tools: tools.sorted { lhs, rhs in
+                    let comparison = lhs.name.localizedCaseInsensitiveCompare(rhs.name)
+                    return comparison == .orderedSame ? lhs.name < rhs.name : comparison == .orderedAscending
+                }
+            )
+        }
+        return BucketResult(
+            buckets: buckets,
+            visibleToolCount: validTools.count,
+            withheldToolCount: catalog.tools.count - validTools.count,
+            unclassifiedToolCount: toolsByBucket[ChatToolCatalogBucket.unclassified.rawValue]?.count ?? 0
+        )
+    }
+
+    private static func bucket(for tool: ChatCatalogTool, in catalog: ChatToolCatalogSnapshot) -> ChatToolCatalogBucket {
+        if let rawBucket = tool.catalogBucket,
+           let bucket = ChatToolCatalogBucket(rawValue: rawBucket) {
+            if bucket == .core, catalog.currentlyLoaded.contains(tool.name) {
+                return .alwaysOn
+            }
+            return bucket
+        }
+        if tool.name.hasPrefix("mcp__") { return .mcp }
+        if let bucket = SwiftToolDispatcher.catalogBucket(forRegisteredToolNamed: tool.name) {
+            if bucket == .core, catalog.currentlyLoaded.contains(tool.name) {
+                return .alwaysOn
+            }
+            return bucket
+        }
+        if let bucket = AppChatToolDispatcher.catalogBucket(forRegisteredToolNamed: tool.name) {
+            if bucket == .core, catalog.currentlyLoaded.contains(tool.name) {
+                return .alwaysOn
+            }
+            return bucket
+        }
+        return .unclassified
+    }
+
+    private static func boundedDetail(_ value: String?, limit: Int = 240) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return trimmed.count > limit ? String(trimmed.prefix(limit)) + "…" : trimmed
+    }
+
+    static func toolStatusBadge(for tool: ChatCatalogTool, in catalog: ChatToolCatalogSnapshot) -> ToolStatusBadge {
+        let name = normalized(tool.name)
+        let policyLockedNames = Set((catalog.builderPolicyLocked + catalog.macAppPolicyLocked).map { normalized($0) })
+        if !name.isEmpty, policyLockedNames.contains(name) {
+            return ToolStatusBadge(title: "policy-locked", systemImage: "lock", tone: .warning)
+        }
+        if tool.availableNow == false {
+            return ToolStatusBadge(title: "unavailable", systemImage: "minus.circle", tone: .neutral)
+        }
+
+        let autonomy = normalized(tool.effectiveAutonomy)
+        if autonomy == "blocked" {
+            return ToolStatusBadge(title: "blocked", systemImage: "hand.raised", tone: .danger)
+        }
+        guard tool.availableNow == true, ["", "auto", "confirm"].contains(autonomy) else {
+            return unavailableStatusBadge()
+        }
+        if autonomy == "confirm" {
+            return ToolStatusBadge(title: "approval", systemImage: "checkmark.shield", tone: .warning)
+        }
+
+        let loadState = normalized(tool.loadState)
+        let currentlyLoaded = Set(catalog.currentlyLoaded.map { normalized($0) })
+        if loadState == "loaded" || (!name.isEmpty && currentlyLoaded.contains(name)) {
+            return ToolStatusBadge(title: "active", systemImage: "circle.fill", tone: .positive)
+        }
+        if loadState == "discovery_only" {
+            return ToolStatusBadge(title: "on demand", systemImage: "bolt.circle", tone: .neutral)
+        }
+        guard loadState.isEmpty else { return unavailableStatusBadge() }
+        return ToolStatusBadge(title: "available", systemImage: "checkmark.circle", tone: .neutral)
+    }
+
+    /// Compatibility for existing presentation-only readers. New rendering
+    /// uses `toolStatusBadge(for:in:)` so its text, icon, and tone stay bound
+    /// to one authoritative classification.
+    static func status(for tool: ChatCatalogTool, in catalog: ChatToolCatalogSnapshot) -> String {
+        toolStatusBadge(for: tool, in: catalog).title
+    }
+
+    private static func unavailableStatusBadge() -> ToolStatusBadge {
+        ToolStatusBadge(title: "status unavailable", systemImage: "questionmark.circle", tone: .warning)
+    }
+
+    private static func normalized(_ value: String?) -> String {
+        (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+}
+
+private struct ChatToolCatalogSection: View {
+    let catalog: ChatToolCatalogSnapshot
+    let bucketResult: ChatToolCatalogPresentation.BucketResult
+    var staleDetail: String? = nil
+    let trustPolicy: TrustPolicy?
+    let trustRefreshStatus: AppModel.PanelRefreshStatus?
+    let jumpToTrust: () -> Void
+
+    @State private var expanded: Set<String> = []
+    @State private var expandedBuckets: Set<String> = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -226,30 +529,74 @@ private struct ChatToolCatalogSection: View {
                 Text("Chat Tool Catalog")
                     .font(.title2.weight(.semibold))
                 Spacer()
-                Text("\(catalog.tools.count) tools • permission: \(catalog.permissionLevel.isEmpty ? "—" : catalog.permissionLevel)")
+                Text("\(bucketResult.visibleToolCount) usable of \(catalog.tools.count) tools • permission: \(catalog.permissionLevel.isEmpty ? "—" : catalog.permissionLevel)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
-            if !catalog.fullMacActive {
-                fullMacBanner
+            if let staleDetail {
+                catalogWarning(
+                    "Showing the last loaded catalog. The latest refresh failed\(staleDetail.isEmpty ? "." : ": \(staleDetail)")",
+                    systemImage: "clock.arrow.circlepath"
+                )
             }
 
-            ForEach(buckets) { bucket in
-                bucketView(bucket)
+            if let withheldNotice = bucketResult.withheldNotice {
+                catalogWarning(withheldNotice, systemImage: "exclamationmark.triangle")
+            }
+
+            if let unclassifiedNotice = bucketResult.unclassifiedNotice {
+                catalogWarning(unclassifiedNotice, systemImage: "exclamationmark.triangle")
+            }
+
+            TimelineView(.periodic(from: .now, by: 30)) { timeline in
+                let expiryState = trustPolicy.map { FullMacExpiry.state($0, now: timeline.date) }
+                let trustPolicyReadFailed = trustRefreshStatus?.failedEndpoints.contains("trust policy") == true
+                if let banner = ToolsFullMacBannerPresentation.state(
+                    catalogFullMacActive: catalog.fullMacActive,
+                    expiryState: expiryState,
+                    hasTrustRefreshAttempt: trustRefreshStatus != nil,
+                    trustPolicyReadFailed: trustPolicyReadFailed,
+                    now: timeline.date
+                ) {
+                    fullMacBanner(banner)
+                }
+            }
+
+            if bucketResult.buckets.isEmpty {
+                NativeEmptyState(
+                    title: "No Usable Chat Tool Rows",
+                    detail: catalog.tools.isEmpty
+                        ? "The last successfully loaded catalog contained no tools. Refresh to obtain a current catalog receipt."
+                        : "The live catalog returned \(catalog.tools.count) row\(catalog.tools.count == 1 ? "" : "s"), but none had a unique non-empty tool identity.",
+                    systemImage: "exclamationmark.triangle"
+                )
+            } else {
+                ForEach(bucketResult.buckets) { bucket in
+                    bucketView(bucket)
+                }
             }
         }
     }
 
-    private var fullMacBanner: some View {
+    private func catalogWarning(_ detail: String, systemImage: String) -> some View {
+        Label(detail, systemImage: systemImage)
+            .font(.caption)
+            .foregroundStyle(.orange)
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func fullMacBanner(_ banner: ToolsFullMacBannerPresentation.State) -> some View {
         HStack(alignment: .top, spacing: 10) {
-            Image(systemName: "lock.shield")
-                .foregroundStyle(.orange)
+            Image(systemName: banner.systemImage)
+                .foregroundStyle(NativeAgentTheme.statusColor(banner.status))
                 .font(.title3)
             VStack(alignment: .leading, spacing: 4) {
-                Text("Full Mac is OFF")
+                Text(banner.title)
                     .font(.subheadline.weight(.semibold))
-                Text("File, system, shell, and Mac-control tools are policy-locked. Toggle Full Mac in Trust Center to unlock.")
+                Text(banner.detail)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Button("Open Trust Center") { jumpToTrust() }
@@ -259,11 +606,11 @@ private struct ChatToolCatalogSection: View {
             Spacer()
         }
         .padding(10)
-        .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+        .background(NativeAgentTheme.statusColor(banner.status).opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
     }
 
     @ViewBuilder
-    private func bucketView(_ bucket: Bucket) -> some View {
+    private func bucketView(_ bucket: ChatToolCatalogPresentation.Bucket) -> some View {
         DisclosureGroup(isExpanded: bucketExpandedBinding(bucket.id)) {
             VStack(alignment: .leading, spacing: 0) {
                 ForEach(bucket.tools) { tool in
@@ -342,39 +689,102 @@ private struct ChatToolCatalogSection: View {
 
     @ViewBuilder
     private func statusBadge(for tool: ChatCatalogTool) -> some View {
-        let isLocked = catalog.builderPolicyLocked.contains(tool.name)
-            || catalog.macAppPolicyLocked.contains(tool.name)
-        let isActive = tool.loadState == "loaded" || catalog.currentlyLoaded.contains(tool.name)
+        let badge = ChatToolCatalogPresentation.toolStatusBadge(for: tool, in: catalog)
+        Label(badge.title, systemImage: badge.systemImage)
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(statusColor(badge.tone))
+            .accessibilityLabel(badge.title)
+    }
 
-        if isLocked {
-            Label("policy-locked", systemImage: "lock")
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.orange)
-        } else if tool.availableNow == false {
-            Label("unavailable", systemImage: "minus.circle")
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.secondary)
-        } else if tool.effectiveAutonomy == "blocked" {
-            Label("blocked", systemImage: "hand.raised")
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.red)
-        } else if tool.effectiveAutonomy == "confirm" {
-            Label("approval", systemImage: "checkmark.shield")
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.orange)
-        } else if isActive {
-            Label("active", systemImage: "circle.fill")
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.green)
-        } else if tool.loadState == "discovery_only" {
-            Label("on demand", systemImage: "bolt.circle")
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(Color.accentColor)
-        } else {
-            Label("available", systemImage: "checkmark.circle")
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.secondary)
+    private func statusColor(_ tone: ChatToolCatalogPresentation.ToolStatusBadgeTone) -> Color {
+        switch tone {
+        case .positive: .green
+        case .neutral: .secondary
+        case .warning: .orange
+        case .danger: .red
         }
+    }
+}
+
+/// Values consumed by the mounted authored-tool controls.
+enum AuthoredToolPresentation {
+    enum Action: Equatable {
+        case approve
+        case autoRun
+        case quarantine
+    }
+
+    struct ActionControl: Equatable {
+        let action: Action
+        let title: String
+        let isEnabled: Bool
+        let accessibilityIdentifier: String?
+        let help: String?
+        let refusal: String?
+    }
+
+    static func autoRunTitle(_ tool: ToolRecord) -> String {
+        tool.autoRun == true ? "Disable Auto-run" : "Enable Auto-run"
+    }
+
+    static func canQuarantine(_ tool: ToolRecord) -> Bool { tool.status != "quarantined" }
+
+    /// Authored rows are durable registry records, not live dispatcher
+    /// receipts. Keep their distinct lifecycle labels explicit rather than
+    /// borrowing the catalog's availability wording.
+    static func statusBadge(for tool: ToolRecord) -> ChatToolCatalogPresentation.ToolStatusBadge {
+        let status = (tool.status ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        switch status {
+        case "active":
+            return .init(title: "active", systemImage: "circle.fill", tone: .positive)
+        case "proposed":
+            return .init(title: "proposed", systemImage: "clock", tone: .warning)
+        case "quarantined":
+            return .init(title: "quarantined", systemImage: "exclamationmark.triangle", tone: .danger)
+        default:
+            return .init(title: "status unavailable", systemImage: "questionmark.circle", tone: .warning)
+        }
+    }
+
+    /// Every authored-tool row is derived from this one action catalog. The
+    /// executor repeats its own gates, but the control cannot claim a mutation
+    /// is available when its durable precondition is already absent.
+    static func actionCatalog(for tool: ToolRecord) -> [ActionControl] {
+        var controls: [ActionControl] = []
+        if tool.status != "active" {
+            let approval = ToolApprovalPresentation.control(for: tool)
+            controls.append(ActionControl(
+                action: .approve,
+                title: "Approve",
+                isEnabled: approval.isEnabled,
+                accessibilityIdentifier: approval.accessibilityIdentifier,
+                help: approval.help,
+                refusal: approval.refusal
+            ))
+        }
+        controls.append(ActionControl(
+            action: .autoRun,
+            title: autoRunTitle(tool),
+            isEnabled: tool.status == "active",
+            accessibilityIdentifier: nil,
+            help: tool.status == "active"
+                ? "Change whether this active tool may run automatically."
+                : "Activate this tool before changing auto-run.",
+            refusal: nil
+        ))
+        controls.append(ActionControl(
+            action: .quarantine,
+            title: "Quarantine",
+            isEnabled: canQuarantine(tool),
+            accessibilityIdentifier: nil,
+            help: canQuarantine(tool)
+                ? "Quarantine this tool and remove it from the active registry."
+                : "This tool is already quarantined.",
+            refusal: nil
+        ))
+        return controls
     }
 }
 
@@ -425,9 +835,10 @@ private struct AuthoredToolsSection: View {
                 Text(tool.name)
                     .font(.headline)
                 Spacer()
-                Text(tool.status ?? "unknown")
+                let badge = AuthoredToolPresentation.statusBadge(for: tool)
+                Label(badge.title, systemImage: badge.systemImage)
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(statusColor(tool.status))
+                    .foregroundStyle(statusColor(badge.tone))
             }
             Text(tool.description)
                 .textSelection(.enabled)
@@ -472,31 +883,41 @@ private struct AuthoredToolsSection: View {
             }
 
             HStack {
-                if tool.status != "active" {
-                    Button("Approve", systemImage: "checkmark.seal") {
+                let actionCatalog = AuthoredToolPresentation.actionCatalog(for: tool)
+                if let approval = actionCatalog.first(where: { $0.action == .approve }) {
+                    Button(approval.title, systemImage: "checkmark.seal") {
                         Task { await appModel.promoteTool(tool, userRequested: true) }
                     }
-                    .disabled(tool.validationStatus != "valid")
+                    .disabled(!approval.isEnabled)
+                    .accessibilityIdentifier(approval.accessibilityIdentifier ?? "")
+                    .help(approval.help ?? "")
+                    if let refusal = approval.refusal {
+                        Text(refusal)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                 }
-                Button(tool.autoRun == true ? "Disable Auto-run" : "Enable Auto-run", systemImage: tool.autoRun == true ? "pause.circle" : "play.circle") {
+                let autoRun = actionCatalog.first(where: { $0.action == .autoRun })!
+                Button(autoRun.title, systemImage: tool.autoRun == true ? "pause.circle" : "play.circle") {
                     Task { await appModel.setToolAutoRun(tool, autoRun: !(tool.autoRun ?? false)) }
                 }
-                .disabled(tool.status != "active")
-                Button("Quarantine", systemImage: "exclamationmark.triangle") {
+                .disabled(!autoRun.isEnabled)
+                let quarantine = actionCatalog.first(where: { $0.action == .quarantine })!
+                Button(quarantine.title, systemImage: "exclamationmark.triangle") {
                     quarantineCandidate = tool
                 }
-                .disabled(tool.status == "quarantined")
+                .disabled(!quarantine.isEnabled)
             }
             .buttonStyle(.borderless)
         }
     }
 
-    private func statusColor(_ status: String?) -> Color {
-        switch status {
-        case "active": .green
-        case "quarantined": .red
-        case "proposed": .orange
-        default: .secondary
+    private func statusColor(_ tone: ChatToolCatalogPresentation.ToolStatusBadgeTone) -> Color {
+        switch tone {
+        case .positive: .green
+        case .neutral: .secondary
+        case .warning: .orange
+        case .danger: .red
         }
     }
 

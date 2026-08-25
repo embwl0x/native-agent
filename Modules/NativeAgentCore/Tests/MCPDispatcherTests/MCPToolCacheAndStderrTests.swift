@@ -24,7 +24,8 @@ import PersistenceCore
 private func writeStdioServer(
     toolNames: [String],
     stderrFloodBytes: Int = 0,
-    dieAfterInitialize: Bool = false
+    dieAfterInitialize: Bool = false,
+    tracebackAtExitOnly: Bool = false
 ) throws -> URL {
     let dir = FileManager.default.temporaryDirectory
         .appendingPathComponent("mcp-fixture-\(UUID().uuidString)", isDirectory: true)
@@ -38,6 +39,7 @@ private func writeStdioServer(
 
     FLOOD = \(stderrFloodBytes)
     DIE = \(dieAfterInitialize ? "True" : "False")
+    AT_EXIT = \(tracebackAtExitOnly ? "True" : "False")
 
     # The flood happens BEFORE we ever read stdin. With an undrained stderr pipe
     # this blocks in write(2) at ~64KB and the initialize handshake never lands.
@@ -48,6 +50,22 @@ private func writeStdioServer(
             sys.stderr.write(chunk)
             written += len(chunk)
         sys.stderr.write("MCP-FIXTURE-TAIL-MARKER\\n")
+        sys.stderr.flush()
+
+    # The fatal traceback is written UP FRONT (and flushed) when DIE is set;
+    # the process then survives the handshake and exits on the first
+    # post-handshake REQUEST. Writing it at exit time raced the host: under
+    # parallel suite load the termination handler folded the (still-empty)
+    # stderr ring into the death reason and tore down the readability handler,
+    # dropping the bytes for good — no poll can recover them. Up-front + a
+    # test-triggered death lets the test PROVE the ring holds the tail before
+    # the child is allowed to die.
+    # AT_EXIT variant: the traceback is written ONLY at exit time — the exact
+    # race the host's termination-time pipe drain must win. No test-side poll
+    # can make this ordering safe; the production hardening has to.
+    if DIE and not AT_EXIT:
+        sys.stderr.write("Traceback (most recent call last):\\n")
+        sys.stderr.write("RuntimeError: MCP-FIXTURE-FATAL\\n")
         sys.stderr.flush()
 
     TOOLS = [\(toolsJSON)]
@@ -67,12 +85,13 @@ private func writeStdioServer(
             sys.stdout.flush()
             continue
         if mid is None:
-            if DIE:
+            continue
+        if DIE:
+            if AT_EXIT:
                 sys.stderr.write("Traceback (most recent call last):\\n")
                 sys.stderr.write("RuntimeError: MCP-FIXTURE-FATAL\\n")
                 sys.stderr.flush()
-                sys.exit(3)
-            continue
+            sys.exit(3)
         if method == "tools/list":
             sys.stdout.write(json.dumps({
                 "jsonrpc": "2.0", "id": mid, "result": {"tools": TOOLS}
@@ -282,7 +301,8 @@ struct MCPSubprocessStderrDrainTests {
     }
 
     /// The death reason must carry the stderr tail so the eviction record says
-    /// WHY. PRE-FIX the reason was a bare "exited (status=3)".
+    /// WHY. PRE-FIX (F-B4) the reason was a bare "exited (status=3)". The tail
+    /// is proven ingested before the death is triggered — see below.
     @Test func unexpectedDeathReasonCarriesStderrTail() async throws {
         let script = try writeStdioServer(toolNames: ["alpha"], dieAfterInitialize: true)
         defer { try? FileManager.default.removeItem(at: script.deletingLastPathComponent()) }
@@ -298,24 +318,89 @@ struct MCPSubprocessStderrDrainTests {
             func set(_ value: String) { lock.lock(); _reason = value; lock.unlock() }
         }
         let box = Box()
-        // The fixture exits on the first NOTIFICATION it sees, which is
-        // `notifications/initialized` — i.e. during start(), before the
-        // handshake returns. Either surface (thrown spawnFailed or the
-        // termination reason) must carry the tail.
         await proc.onUnexpectedTermination { _, reason in box.set(reason) }
-        var thrownMessage: String?
-        do {
-            try await proc.start()
-        } catch let error as MCPSubprocessError {
-            if case .spawnFailed(let message) = error { thrownMessage = message }
-        }
+        try await proc.start()
 
-        // Give the terminationHandler a beat to land.
-        for _ in 0..<50 where box.reason == nil {
+        // Deterministic ordering, not a race: the fixture wrote its fatal
+        // traceback up front, so wait until the host's stderr drain has
+        // ingested it BEFORE triggering the death. The termination path folds
+        // whatever the ring holds at that instant into the reason AND tears
+        // the drain down, so bytes still in flight at death are lost for
+        // good — a death that races the drain flakes under parallel suite
+        // load (observed 3/11, 2026-08-23). 10s deadline — positive step
+        // under suite load; a green run exits at the first poll that sees it.
+        var ingested = false
+        for _ in 0..<500 {
+            if await proc.stderrTailSnapshot().contains("MCP-FIXTURE-FATAL") {
+                ingested = true
+                break
+            }
             try? await Task.sleep(for: .milliseconds(20))
         }
-        let surfaced = [thrownMessage, box.reason].compactMap { $0 }.joined(separator: " | ")
+        #expect(ingested, "stderr drain never ingested the fixture's up-front tail")
+        guard ingested else {
+            await proc.stop()
+            return
+        }
+
+        // NOW let it die: the fixture exits(3) on the first post-handshake
+        // request. The request itself fails (streamClosed) — that's the point.
+        _ = try? await proc.request(method: "tools/list", params: .object([:]))
+
+        // The reason lands via the off-actor terminationHandler hop — poll
+        // until it CARRIES the tail. 10s deadline — positive step.
+        var surfaced = box.reason ?? ""
+        for _ in 0..<500 where !surfaced.contains("MCP-FIXTURE-FATAL") {
+            try? await Task.sleep(for: .milliseconds(20))
+            surfaced = box.reason ?? ""
+        }
         #expect(surfaced.contains("MCP-FIXTURE-FATAL"), "death reason lost the stderr tail: \(surfaced)")
+
+        await proc.stop()
+    }
+
+    /// THE termination race, pinned (2026-08-23): the fixture writes its
+    /// traceback ONLY at exit time, immediately before sys.exit(3), and the
+    /// test triggers the death with NO ingestion poll — the readabilityHandler
+    /// on its background queue routinely loses this race (2/14 parallel runs
+    /// pre-fix, bytes gone for good at a 10s deadline). The production
+    /// hardening drains the pipe at termination BEFORE folding the ring, which
+    /// is deterministic: the child's writes precede its exit in program order,
+    /// so the bytes are in the kernel pipe buffer when the termination handler
+    /// runs.
+    @Test func exitTimeStderrSurvivesTerminationRace() async throws {
+        let script = try writeStdioServer(
+            toolNames: ["alpha"],
+            dieAfterInitialize: true,
+            tracebackAtExitOnly: true
+        )
+        defer { try? FileManager.default.removeItem(at: script.deletingLastPathComponent()) }
+
+        let proc = try MCPSubprocess.fromServerCommand(
+            serverId: "exit-write-srv",
+            command: "/usr/bin/python3 \(script.path)"
+        )
+        final class Box: @unchecked Sendable {
+            private let lock = NSLock()
+            private var _reason: String?
+            var reason: String? { lock.lock(); defer { lock.unlock() }; return _reason }
+            func set(_ value: String) { lock.lock(); _reason = value; lock.unlock() }
+        }
+        let box = Box()
+        await proc.onUnexpectedTermination { _, reason in box.set(reason) }
+        try await proc.start()
+
+        // No ingestion poll — the death IS the first chance to see the bytes.
+        _ = try? await proc.request(method: "tools/list", params: .object([:]))
+
+        // The reason lands via the off-actor terminationHandler hop — poll
+        // until it CARRIES the tail. 10s deadline — positive step.
+        var surfaced = box.reason ?? ""
+        for _ in 0..<500 where !surfaced.contains("MCP-FIXTURE-FATAL") {
+            try? await Task.sleep(for: .milliseconds(20))
+            surfaced = box.reason ?? ""
+        }
+        #expect(surfaced.contains("MCP-FIXTURE-FATAL"), "death reason lost the exit-time stderr tail: \(surfaced)")
 
         await proc.stop()
     }

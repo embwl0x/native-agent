@@ -1,0 +1,14 @@
+{
+  "_contract": "Triage acknowledgments the agent instrument reads. An entry NEVER deletes or hides data — it moves matching findings from the alarming LEADS into a quiet 'acknowledged' line, with this file as the receipt. Occurrences AFTER an entry's horizon still alarm. Every entry needs: detector (the instrument's detector id), horizon (ISO timestamp — only rows created BEFORE it are acknowledged), verdict (one sentence), evidence (where the triage lives), tracked (what carries any follow-up), by, on. Remove entries when the underlying rows are actually cleaned up.",
+  "acknowledgments": [
+    {
+      "detector": "bridge.undelivered",
+      "horizon": "2026-08-21T19:00:00Z",
+      "verdict": "Triaged 2026-08-21: bulk is the July 16-28 failure cluster from an already-fixed era; recent 409/504 non-retry is reviewed bridge design (ambiguous outcomes preserved, not retried); the 13 preserved dead-letter replies are the real item.",
+      "evidence": "docs/build_plans/full-system-eval-coverage.md § Wave-1 lead triage",
+      "tracked": "chip task_d99f693c — surface the codex dead-letter reply box",
+      "by": "claude",
+      "on": "2026-08-21"
+    }
+  ]
+}

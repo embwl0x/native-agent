@@ -23,7 +23,28 @@ public actor BackgroundLoopsManager {
 
     public struct LoopStatus: Sendable, Equatable {
         public let loopId: String
+        public let lastRun: Date?
+        public let nextRun: Date?
+        public let runCount: Int
+        public let lastError: String?
         public let running: Bool
+        public let executing: Bool
+        public let executionStartedAt: Date?
+        public let executionTimeout: TimeInterval
+        public let eventListener: BackgroundLoops.LoopEventListenerHealth?
+
+        init(_ status: BackgroundLoops.LoopStatus) {
+            loopId = status.name
+            lastRun = status.lastRun
+            nextRun = status.nextRun
+            runCount = status.runCount
+            lastError = status.lastError
+            running = status.running
+            executing = status.executing
+            executionStartedAt = status.executionStartedAt
+            executionTimeout = status.executionTimeout
+            eventListener = status.eventListener
+        }
     }
 
     init(
@@ -213,9 +234,7 @@ public actor BackgroundLoopsManager {
     }
 
     public func status() async -> [LoopStatus] {
-        await coreManager.status().map {
-            LoopStatus(loopId: $0.name, running: $0.running)
-        }
+        await coreManager.status().map(LoopStatus.init)
     }
 
     public func isRunning() async -> Bool {
@@ -280,6 +299,10 @@ public actor BackgroundLoopsManager {
     }
 }
 
+/// Unambiguous app-composition name for clients that also import the core
+/// `BackgroundLoops` module, whose manager intentionally has the same base name.
+typealias NativeAppBackgroundLoopsManager = BackgroundLoopsManager
+
 /// Honest result of `BackgroundLoopsManager.restartLoop(id:)`.
 ///
 /// `.restarted` is the only outcome that means the running loop now reflects
@@ -326,21 +349,37 @@ public enum LoopRestartOutcome: Sendable, Equatable {
 public actor MemorySpotlightBootstrap {
     public static let shared = MemorySpotlightBootstrap()
     private var didReindex = false
+    private let dataRootOverride: URL?
+    private let indexClientOverride: (any SpotlightIndexClient)?
 
-    private init() {}
+    private init() {
+        dataRootOverride = nil
+        indexClientOverride = nil
+    }
+
+    /// Hermetic seam for the launch projection's exact durable behavior. The
+    /// mounted app uses `shared`; an injected root never touches the user's
+    /// Spotlight domain.
+    init(dataRoot: URL, indexClient: any SpotlightIndexClient) {
+        dataRootOverride = dataRoot
+        indexClientOverride = indexClient
+    }
 
     /// Read every active memory through SwiftNativeMemoryV2.shared and push
     /// CSSearchableItems to the system Spotlight index. The sentinel is
     /// written only after success, so a crash retries on the next launch.
     public func reindexAll() async {
         if didReindex { return }
-        let marker = PersistenceCore.defaultDataRoot()
+        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let marker = dataRoot
             .appendingPathComponent("memory")
             .appendingPathComponent(".spotlight_reindexed")
-        guard let bridge = await SwiftNativeMemoryV2.shared.underlyingBridge() else {
+        let storage: MemoryStorage
+        do {
+            storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
+        } catch {
             return
         }
-        let storage = await bridge.underlyingStorage()
         let generation: String
         do {
             generation = try await storage.projectionGenerationFingerprint()
@@ -360,10 +399,11 @@ public actor MemorySpotlightBootstrap {
             return
         }
         #if canImport(CoreSpotlight) && !os(Linux)
-        let client: any SpotlightIndexClient = SystemSpotlightIndexClient()
+        let defaultClient: any SpotlightIndexClient = SystemSpotlightIndexClient()
         #else
-        let client: any SpotlightIndexClient = MockSpotlightIndexClient()
+        let defaultClient: any SpotlightIndexClient = MockSpotlightIndexClient()
         #endif
+        let client = indexClientOverride ?? defaultClient
         let indexer = SwiftNativeMemoryIndexer(client: client)
         let batch = memories
             .filter { !$0.id.hasPrefix(SwiftNativeMemoryV2.skillPointerIDPrefix) }

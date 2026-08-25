@@ -279,7 +279,7 @@ final class DeskStoreTests: XCTestCase {
         // no blockers and no defer render exactly as before.
         let expected = """
         desk · owner · rev \(gen) · stale ok
-        status: watch · flag · now · next · todo · done · blocked
+        status: watching · needs attention · now · next · to do · done · blocked · cancelled
         1 watch na · executions list refresh lag -> #50 · stale:42m
         2 plan atrium · clean-rebuild cmd center · now session store -> GRDB · 1/3 closed · refs:3
           2.1 done GRDB schema scaffold

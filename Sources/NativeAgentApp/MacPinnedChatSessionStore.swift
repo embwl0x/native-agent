@@ -11,6 +11,15 @@ import PersistenceCore
 enum MacPinnedChatSessionStore {
     static let defaultsKey = ChatSessionRetention.macPinnedSessionIdsDefaultsKey
 
+    /// The concrete outcome of a pinned-tab close request. Keeping refusal
+    /// separate from success lets the mounted control show an honest outcome
+    /// when another surface has already removed a pin.
+    enum CloseResult: Equatable {
+        case closed(encoded: String)
+        case refusedInvalidSessionID
+        case refusedAlreadyUnpinned
+    }
+
     nonisolated static func normalized(_ ids: [String]) -> [String] {
         var seen = Set<String>()
         return ids.compactMap { id -> String? in
@@ -51,5 +60,31 @@ enum MacPinnedChatSessionStore {
         let encoded = String(decoding: data, as: UTF8.self)
         defaults.set(encoded, forKey: defaultsKey)
         return encoded
+    }
+
+    /// Removes one pin through the same mirror-first transaction used by every
+    /// pinned-session mutation. If the retention mirror cannot be written,
+    /// `save` throws before it changes `UserDefaults`, leaving the visible tab
+    /// pinned now and after the next reload.
+    static func closePinnedTab(
+        sessionID: String,
+        defaults: UserDefaults = .standard,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) throws -> CloseResult {
+        let cleanSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanSessionID.isEmpty else {
+            return .refusedInvalidSessionID
+        }
+
+        let current = load(defaults: defaults)
+        guard current.contains(cleanSessionID) else {
+            return .refusedAlreadyUnpinned
+        }
+
+        return .closed(encoded: try save(
+            current.filter { $0 != cleanSessionID },
+            defaults: defaults,
+            dataRoot: dataRoot
+        ))
     }
 }

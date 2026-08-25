@@ -488,7 +488,8 @@ private final class FixedCWDFileManager: FileManager, @unchecked Sendable {
     let fm = FixedCWDFileManager(cwd: tempDir.path)
     let url = defaultDataRoot(
         fileManager: fm,
-        environment: ["NATIVE_AGENT_DATA_ROOT": ""]
+        environment: ["NATIVE_AGENT_DATA_ROOT": ""],
+        processName: "NativeAgent"
     )
     #expect(url.path != "")
     #expect(url.path != "/")
@@ -515,7 +516,7 @@ private final class FixedCWDFileManager: FileManager, @unchecked Sendable {
     try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
 
     let fm = FixedCWDFileManager(cwd: nested.path)
-    let root = defaultDataRoot(fileManager: fm, environment: [:])
+    let root = defaultDataRoot(fileManager: fm, environment: [:], processName: "NativeAgent")
     let expected = tempRoot.appendingPathComponent("data", isDirectory: true)
     #expect(root.standardizedFileURL.path == expected.standardizedFileURL.path)
 }
@@ -529,7 +530,7 @@ private final class FixedCWDFileManager: FileManager, @unchecked Sendable {
         to: tempRoot.appendingPathComponent("Package.swift"))
     // INTENTIONALLY no data/ dir.
     let fm = FixedCWDFileManager(cwd: tempRoot.path)
-    let url = defaultDataRoot(fileManager: fm, environment: [:])
+    let url = defaultDataRoot(fileManager: fm, environment: [:], processName: "NativeAgent")
     #expect(!url.path.hasPrefix(tempRoot.path))
 }
 
@@ -583,6 +584,107 @@ private final class FixedCWDFileManager: FileManager, @unchecked Sendable {
     }
 }
 
+@Test func defaultDataRoot_unstampedPublicBundleRefusesCwdCloneAndWritesOnlyFallback() throws {
+    // This is the public-release failure mode: launch an unstamped .app from
+    // inside a source clone that contains Package.swift + data/. The resolver
+    // must not let the CWD convenience path adopt the clone's private data.
+    let fixture = try makeTempDir()
+    defer { try? FileManager.default.removeItem(at: fixture) }
+    let fm = FileManager.default
+    let clone = fixture.appendingPathComponent("throwaway-clone", isDirectory: true)
+    let cloneData = clone.appendingPathComponent("data", isDirectory: true)
+    let launchDirectory = clone.appendingPathComponent("Sources/App", isDirectory: true)
+    try fm.createDirectory(at: cloneData, withIntermediateDirectories: true)
+    try fm.createDirectory(at: launchDirectory, withIntermediateDirectories: true)
+    try "// clone manifest".write(
+        to: clone.appendingPathComponent("Package.swift"), atomically: true, encoding: .utf8)
+
+    let publicApp = fixture.appendingPathComponent("NativeAgent.app", isDirectory: true)
+    let resources = publicApp
+        .appendingPathComponent("Contents", isDirectory: true)
+        .appendingPathComponent("Resources", isDirectory: true)
+    try fm.createDirectory(at: resources, withIntermediateDirectories: true)
+    try "1.0.0".write(to: resources.appendingPathComponent("VERSION"), atomically: true, encoding: .utf8)
+    let publicBundle = DefaultDataRootBundleContext(
+        bundleURL: publicApp,
+        resourcesURL: resources
+    )
+    let isolatedAppSupport = fixture
+        .appendingPathComponent("Application Support/NativeAgent", isDirectory: true)
+
+    let root = resolveDefaultDataRoot(
+        fileManager: FixedCWDFileManager(cwd: launchDirectory.path),
+        // Empty is adversarial here: it must be treated as unset and must not
+        // disable the public-bundle guard.
+        environment: ["NATIVE_AGENT_DATA_ROOT": ""],
+        processName: "NativeAgent",
+        bundleContext: publicBundle,
+        fallbackRoot: isolatedAppSupport
+    )
+    #expect(root.standardizedFileURL.path == isolatedAppSupport.standardizedFileURL.path)
+
+    // Prove the observable write lands at the selected fallback rather than
+    // merely asserting a predicate. The clone's data directory began empty.
+    let probe = root.appendingPathComponent("root-selection-probe.json")
+    try fm.createDirectory(at: root, withIntermediateDirectories: true)
+    try Data("{}".utf8).write(to: probe)
+    #expect(fm.fileExists(atPath: probe.path))
+    #expect(try fm.contentsOfDirectory(atPath: cloneData.path).isEmpty,
+            "unstamped public launch must not create a file under the CWD clone's data/")
+}
+
+@Test func defaultDataRoot_stampedBundleAndExplicitEnvironmentKeepTheirAuthorizedRoots() throws {
+    let fixture = try makeTempDir()
+    defer { try? FileManager.default.removeItem(at: fixture) }
+    let fm = FileManager.default
+    let repo = fixture.appendingPathComponent("stamped-repo", isDirectory: true)
+    let repoData = repo.appendingPathComponent("data", isDirectory: true)
+    try fm.createDirectory(at: repoData, withIntermediateDirectories: true)
+    try fm.createDirectory(at: repo.appendingPathComponent("persona"), withIntermediateDirectories: true)
+    try fm.createDirectory(at: repo.appendingPathComponent("script"), withIntermediateDirectories: true)
+    try "x".write(to: repo.appendingPathComponent("Package.swift"), atomically: true, encoding: .utf8)
+    try "x".write(to: repo.appendingPathComponent("persona/SOUL.template.md"), atomically: true, encoding: .utf8)
+    try "x".write(to: repo.appendingPathComponent("script/init_persona.sh"), atomically: true, encoding: .utf8)
+
+    let publicApp = fixture.appendingPathComponent("NativeAgent.app", isDirectory: true)
+    let resources = publicApp
+        .appendingPathComponent("Contents", isDirectory: true)
+        .appendingPathComponent("Resources", isDirectory: true)
+    try fm.createDirectory(at: resources, withIntermediateDirectories: true)
+    try "1.0.0".write(to: resources.appendingPathComponent("VERSION"), atomically: true, encoding: .utf8)
+    try repo.path.write(to: resources.appendingPathComponent("REPO_PATH"), atomically: true, encoding: .utf8)
+    let stampedBundle = DefaultDataRootBundleContext(bundleURL: publicApp, resourcesURL: resources)
+    let unrelatedCWD = fixture.appendingPathComponent("hostile-cwd", isDirectory: true)
+    try fm.createDirectory(at: unrelatedCWD, withIntermediateDirectories: true)
+    let fallback = fixture.appendingPathComponent("Application Support/NativeAgent", isDirectory: true)
+
+    let stampedRoot = resolveDefaultDataRoot(
+        fileManager: FixedCWDFileManager(cwd: unrelatedCWD.path),
+        environment: [:],
+        processName: "NativeAgent",
+        bundleContext: stampedBundle,
+        fallbackRoot: fallback
+    )
+    #expect(stampedRoot.standardizedFileURL.path == repoData.standardizedFileURL.path,
+            "a valid REPO_PATH stamp is the authorized non-AppSupport root")
+
+    let explicitRoot = fixture.appendingPathComponent("operator-selected-root", isDirectory: true)
+    try fm.removeItem(at: resources.appendingPathComponent("REPO_PATH"))
+    let overrideRoot = resolveDefaultDataRoot(
+        fileManager: FixedCWDFileManager(cwd: unrelatedCWD.path),
+        environment: ["NATIVE_AGENT_DATA_ROOT": explicitRoot.path],
+        processName: "NativeAgent",
+        // The same now-unstamped public bundle proves an explicit operator
+        // override outranks the public-bundle safety fallback.
+        bundleContext: DefaultDataRootBundleContext(
+            bundleURL: publicApp,
+            resourcesURL: resources
+        ),
+        fallbackRoot: fallback
+    )
+    #expect(overrideRoot.standardizedFileURL.path == explicitRoot.standardizedFileURL.path)
+}
+
 @Test func defaultDataRoot_rejectsRepoLayoutInsideAppBundle() throws {
     // Build <tempDir>/Fake.app/Contents/Resources/{Package.swift, data/}
     // and CWD-inject from inside that Resources dir. The walkup would match
@@ -600,7 +702,7 @@ private final class FixedCWDFileManager: FileManager, @unchecked Sendable {
     try fm.createDirectory(at: data, withIntermediateDirectories: true)
     try "// stub".write(to: resources.appendingPathComponent("Package.swift"), atomically: true, encoding: .utf8)
     let scoped = FixedCWDFileManager(cwd: resources.path)
-    let url = defaultDataRoot(fileManager: scoped, environment: [:])
+    let url = defaultDataRoot(fileManager: scoped, environment: [:], processName: "NativeAgent")
     #expect(!url.path.contains("Fake.app"),
             "resolver must NOT return a path inside .app bundle, got \(url.path)")
 }
@@ -615,20 +717,14 @@ private final class FixedCWDFileManager: FileManager, @unchecked Sendable {
     try FileManager.default.createDirectory(at: isolated, withIntermediateDirectories: true)
 
     let fm = FixedCWDFileManager(cwd: isolated.path)
-    let root = defaultDataRoot(fileManager: fm, environment: [:])
+    let root = defaultDataRoot(fileManager: fm, environment: [:], processName: "NativeAgent")
     // The walkup will eventually reach `/` and find no markers. The stamp
     // lookup will not find REPO_PATH in the test runner's bundle. So we
     // must land on the AppSupport fallback.
     //
-    // NOTE: in a fully-stamped scenario (NativeAgent.app with
-    // Resources/REPO_PATH pointing at this repo) step 2 would fire first
-    // and return <repo>/data. That branch is NOT exercised here because
-    // Bundle.main inside `swift test` is the test runner, not a stamped
-    // app bundle — the production code has the implementation, but
-    // injecting Bundle.main would require a new param on defaultDataRoot
-    // which the public-API constraint forbids. Step 2 will be exercised
-    // by the running daemon when installed via script/install_app.sh; the
-    // dev/swift-test paths exercise steps 1, 3, 4.
+    // The installed stamped and unstamped bundle branches are exercised by
+    // the explicit bundle-context contracts above; this test stays focused on
+    // the ordinary no-marker fallback.
     #expect(root.lastPathComponent == "NativeAgent")
 }
 

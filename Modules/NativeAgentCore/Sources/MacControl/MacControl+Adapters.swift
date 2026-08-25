@@ -16,8 +16,60 @@ import UserNotifications
 
 // MARK: - Adapter protocols (test-injectable)
 
+/// What the notification adapter can prove after a post request returns.
+///
+/// UserNotifications acknowledges that it accepted a request for delivery; it
+/// does not provide a receipt that the user saw, heard, or acted on it. Keep
+/// those facts separate so a successful API call never becomes a fabricated
+/// external effect.
+public enum NotificationPostDisposition: String, Sendable, Equatable {
+    case acceptedForDelivery = "accepted_for_delivery"
+}
+
+public enum NotificationAuthorizationDisposition: String, Sendable, Equatable {
+    case authorized
+    case provisional
+    /// A non-system adapter accepted the request but does not expose a
+    /// platform authorization query. This is deliberately not `authorized`.
+    case adapterManaged = "adapter_managed"
+}
+
+public struct NotificationPostReceipt: Sendable, Equatable {
+    public let disposition: NotificationPostDisposition
+    public let authorization: NotificationAuthorizationDisposition
+    public let requestIdentifier: String?
+
+    public init(
+        disposition: NotificationPostDisposition = .acceptedForDelivery,
+        authorization: NotificationAuthorizationDisposition,
+        requestIdentifier: String? = nil
+    ) {
+        self.disposition = disposition
+        self.authorization = authorization
+        self.requestIdentifier = requestIdentifier
+    }
+}
+
 public protocol NotificationCenterAdapter: Sendable {
     func postNotification(title: String, message: String, soundName: String?) async throws
+    func postNotificationReceipt(
+        title: String,
+        message: String,
+        soundName: String?
+    ) async throws -> NotificationPostReceipt
+}
+
+public extension NotificationCenterAdapter {
+    /// Compatibility receipt for injectable adapters which can submit a
+    /// notification but cannot query platform authorization or delivery.
+    func postNotificationReceipt(
+        title: String,
+        message: String,
+        soundName: String?
+    ) async throws -> NotificationPostReceipt {
+        try await postNotification(title: title, message: message, soundName: soundName)
+        return NotificationPostReceipt(authorization: .adapterManaged)
+    }
 }
 
 public protocol AppleScriptAdapter: Sendable {
@@ -100,6 +152,13 @@ public protocol AppControlAdapter: Sendable {
     func quitApp(named name: String) async throws -> AppControlRunResult
 }
 
+/// Requests that macOS open a concrete file, folder, or web URL. `true` means
+/// only that Launch Services accepted the request; callers must observe the
+/// screen separately before claiming where it landed.
+public protocol OpenTargetAdapter: Sendable {
+    func requestOpen(_ url: URL) async -> Bool
+}
+
 /// Optional exact postcondition observer for application mutations. The
 /// command result alone proves only that AppKit accepted the request; motor
 /// verification requires a separate observation of the resulting state.
@@ -128,6 +187,14 @@ public protocol FileStateVerificationAdapter: Sendable {
 public final class SystemNotificationCenterAdapter: NotificationCenterAdapter {
     public init() {}
     public func postNotification(title: String, message: String, soundName: String?) async throws {
+        _ = try await postNotificationReceipt(title: title, message: message, soundName: soundName)
+    }
+
+    public func postNotificationReceipt(
+        title: String,
+        message: String,
+        soundName: String?
+    ) async throws -> NotificationPostReceipt {
         #if canImport(UserNotifications)
         let center = UNUserNotificationCenter.current()
         // Authorization is the user's responsibility — we don't force a runtime
@@ -136,9 +203,12 @@ public final class SystemNotificationCenterAdapter: NotificationCenterAdapter {
         // drops the request, so check settings explicitly: unauthorized must
         // map to ok:false with an actionable reason, not a fabricated success.
         let settings = await center.notificationSettings()
+        let authorization: NotificationAuthorizationDisposition
         switch settings.authorizationStatus {
-        case .authorized, .provisional:
-            break
+        case .authorized:
+            authorization = .authorized
+        case .provisional:
+            authorization = .provisional
         default:
             throw MacControlError.notificationFailed(
                 "notifications not authorized (status: \(Self.describe(settings.authorizationStatus))) — enable NativeAgent in System Settings → Notifications"
@@ -152,8 +222,9 @@ public final class SystemNotificationCenterAdapter: NotificationCenterAdapter {
         } else {
             content.sound = .default
         }
+        let requestIdentifier = UUID().uuidString
         let req = UNNotificationRequest(
-            identifier: UUID().uuidString,
+            identifier: requestIdentifier,
             content: content,
             trigger: nil
         )
@@ -163,6 +234,10 @@ public final class SystemNotificationCenterAdapter: NotificationCenterAdapter {
                 else { cont.resume(returning: ()) }
             }
         }
+        return NotificationPostReceipt(
+            authorization: authorization,
+            requestIdentifier: requestIdentifier
+        )
         #else
         throw MacControlError.notificationFailed("UserNotifications unavailable on this platform")
         #endif
@@ -806,7 +881,17 @@ public final class SystemAppControlAdapter: AppControlAdapter, AppStateVerificat
         fallbackSucceeded: Bool,
         fallbackFailure: String?
     ) -> String {
-        var steps = ["NSRunningApplication.activate returned \(activationRequestAccepted)"]
+        var steps: [String] = []
+        // loginwindow frontmost = the screensaver (or a lock) owns the display
+        // and nothing can come frontmost over it. Say so FIRST and name the
+        // tools that clear it: Agent read the generic failure on 2026-08-22 as
+        // "activation policy / connector not wired" when the Mac was simply on
+        // its screensaver — which her own mac_wake / mac_nudge clear (User: "the
+        // screen is never locked, it's a screensaver and she can get through it").
+        if NSWorkspace.shared.frontmostApplication?.bundleIdentifier == MacWakeGuard.loginWindowBundleID {
+            steps.append("display_obstructed: loginwindow is frontmost (the screensaver layer) — call mac_wake / mac_nudge to clear it, then retry; no app can be activated over it")
+        }
+        steps.append("NSRunningApplication.activate returned \(activationRequestAccepted)")
         if fallbackAttempted {
             steps.append(
                 fallbackSucceeded
@@ -953,6 +1038,25 @@ public final class SystemAppControlAdapter: AppControlAdapter, AppStateVerificat
             activationFailureReason: activationFailureReason,
             terminated: terminated
         )
+    }
+    #endif
+}
+
+public struct SystemOpenTargetAdapter: OpenTargetAdapter {
+    public init() {}
+
+    public func requestOpen(_ url: URL) async -> Bool {
+        #if canImport(AppKit)
+        return await Self.requestOpenOnMain(url)
+        #else
+        return false
+        #endif
+    }
+
+    #if canImport(AppKit)
+    @MainActor
+    private static func requestOpenOnMain(_ url: URL) -> Bool {
+        NSWorkspace.shared.open(url)
     }
     #endif
 }

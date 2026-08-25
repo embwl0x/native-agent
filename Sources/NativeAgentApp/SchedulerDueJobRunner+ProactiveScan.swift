@@ -28,6 +28,7 @@ extension SchedulerDueJobRunner {
                 jobId: job.id,
                 itemId: itemId,
                 relatedPaths: opportunity.relatedPaths,
+                relatedGroups: opportunity.relatedGroups,
                 detail: opportunity.detail,
                 actions: NativeAgentScheduledProactiveScan.inboxActions(for: opportunity),
                 notifyPhone: true

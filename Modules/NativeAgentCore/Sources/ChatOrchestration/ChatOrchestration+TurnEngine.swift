@@ -164,15 +164,55 @@ public protocol MemoryPromoting: Sendable {
     func observeTurn(userMessage: String, assistantMessage: String, sessionId: String) async
 }
 
-public struct SharedAdaptiveMemoryPromoter: MemoryPromoting {
+/// Bounded, payload-free result of the memory-promotion side channel.
+///
+/// `MemoryPromoting` stays intentionally source-compatible for narrow or
+/// legacy injectors. Production promoters that can name their outcome adopt
+/// this refinement so the turn receipt can distinguish "configured but no
+/// candidate crossed the gate" from an unobservable promotion attempt.
+public struct MemoryPromotionTelemetry: Sendable, Equatable {
+    public let stagedProposalCount: Int64
+
+    public init(stagedProposalCount: Int) {
+        self.stagedProposalCount = Int64(max(0, stagedProposalCount))
+    }
+}
+
+/// Optional outcome reporting for the post-turn memory-promotion seam.
+///
+/// The telemetry contains only a count. Candidate text, proposal IDs, and
+/// session content remain in the canonical memory store and never enter a
+/// turn trace receipt.
+public protocol MemoryPromotionTelemetryReporting: MemoryPromoting {
+    func observeTurnWithTelemetry(
+        userMessage: String,
+        assistantMessage: String,
+        sessionId: String
+    ) async -> MemoryPromotionTelemetry
+}
+
+public struct SharedAdaptiveMemoryPromoter: MemoryPromotionTelemetryReporting {
     public init() {}
 
     public func observeTurn(userMessage: String, assistantMessage: String, sessionId: String) async {
-        await AdaptiveMemoryPromoter.shared.observeTurn(
+        _ = await observeTurnWithTelemetry(
             userMessage: userMessage,
             assistantMessage: assistantMessage,
             sessionId: sessionId
         )
+    }
+
+    public func observeTurnWithTelemetry(
+        userMessage: String,
+        assistantMessage: String,
+        sessionId: String
+    ) async -> MemoryPromotionTelemetry {
+        let staged = await AdaptiveMemoryPromoter.shared.observeTurn(
+            userMessage: userMessage,
+            assistantMessage: assistantMessage,
+            sessionId: sessionId
+        )
+        return MemoryPromotionTelemetry(stagedProposalCount: staged.count)
     }
 }
 
@@ -195,7 +235,6 @@ extension ToolDispatchClient {
 
 struct TurnContextSnapshot: Sendable {
     let providerPreferences: [String: SurfacePreference]
-    let activeProviders: [String: String]
     let toolNames: [String]
     let toolSchemas: [LLMToolSchema]
 
@@ -638,7 +677,7 @@ public actor SwiftNativeTurnEngine {
         // the unwired path (all default args, no empty strings).
         let attentionStartNs = DispatchTime.now().uptimeNanoseconds
         let attention = await resolvedAttentionInputs(now: clock(), trace: &trace)
-        trace.record("contextFlow.attention", since: attentionStartNs)
+        trace.record(.contextFlowAttention, since: attentionStartNs)
         // M9 (2026-07-11): on the Workshop surface, ContextFlow reuses
         // `activeTask` as the execution prewarm-cache id (ContextFlowCoordinator
         // prewarmScopes). Her pursuit intent now populates activeTask/goal, so
@@ -729,26 +768,33 @@ public actor SwiftNativeTurnEngine {
             do {
                 preparedContextTurn = try await contextFlow?.prepareContextTurn(contextFlowRequest)
                 trace.setFlag("contextFlow.active", preparedContextTurn != nil)
-                if let effectiveBudget = preparedContextTurn?.need.characterBudget,
-                   effectiveBudget > contextFlowRequest.characterBudget {
+                if let expansion = preparedContextTurn?.budgetExpansion {
                     trace.setFlag("contextFlow.budgetExpanded", true)
                     trace.setCount(
                         "contextFlow.requestedCharacterBudget",
-                        contextFlowRequest.characterBudget
+                        expansion.requestedCharacterBudget
                     )
                     trace.setCount(
                         "contextFlow.effectiveCharacterBudget",
-                        effectiveBudget
+                        expansion.effectiveCharacterBudget
+                    )
+                    trace.setCount(
+                        "contextFlow.maximumCharacterBudget",
+                        expansion.maximumCharacterBudget
+                    )
+                    trace.setCount(
+                        "contextFlow.grantedPostMandatoryReserve",
+                        expansion.grantedPostMandatoryReserve
                     )
                 }
-                trace.record("contextFlow.prepare", since: start)
+                trace.record(.contextFlowPrepare, since: start)
             } catch {
                 trace.setFlag("contextFlow.fallback", true)
                 trace.setLabel(
                     "contextFlow.fallbackError",
                     "\(String(reflecting: type(of: error))): \(String(describing: error))"
                 )
-                trace.record("contextFlow.prepare", since: start)
+                trace.record(.contextFlowPrepare, since: start)
             }
         }
         // 1. Reuse the facade's already-checked route when present. Direct
@@ -767,7 +813,6 @@ public actor SwiftNativeTurnEngine {
         let effort: String
         let admittedProvider: String?
         let admittedServiceTier: String?
-        var activeProviders: [String: String] = [:]
         if let boundModel, !boundModel.isEmpty,
            let boundEffort, !boundEffort.isEmpty {
             modelId = boundModel
@@ -781,14 +826,11 @@ public actor SwiftNativeTurnEngine {
                 reasoningEffort: effort,
                 serviceTier: admittedServiceTier ?? "default"
             )]
-            if includeClockContext, let admittedProvider {
-                activeProviders[routingSurface] = admittedProvider
-            }
             trace.setFlag("provider.admissionReused", true)
         } else {
             let prefsStartNs = DispatchTime.now().uptimeNanoseconds
             let routingSnapshot = try await router.checkedRoutingSnapshot()
-            trace.record("provider.preferences", since: prefsStartNs)
+            trace.record(.providerPreferences, since: prefsStartNs)
             prefs = routingSnapshot.preferences
             // Bridged, not subscripted (P2-3): a snapshot still keyed
             // `missions` must not fall through to the CHAT model here.
@@ -799,15 +841,8 @@ public actor SwiftNativeTurnEngine {
                 .value(routingSnapshot.activeProviders, routingSurface)
                 ?? router.inferProviderForModel(modelId)
             admittedServiceTier = pick?.serviceTier
-            if includeClockContext {
-                activeProviders = routingSnapshot.activeProviders
-                if let admittedProvider {
-                    activeProviders[routingSurface] = admittedProvider
-                }
-            }
             trace.setFlag("provider.admissionReused", false)
         }
-        trace.setFlag("snapshot.activeProviders.loaded", includeClockContext)
 
         // 2. Compile the Agent/Custom persona packet for THIS surface. This
         //    replaces the legacy `persona.listPersonaDocs()` dir-scan path
@@ -854,9 +889,9 @@ public actor SwiftNativeTurnEngine {
                 personaMap = Dictionary(uniqueKeysWithValues: docs.map { ($0.id, $0.content) })
                 compiledPersonaPrompt = nil
             }
-            trace.record("persona.compile", since: personaStartNs)
+            trace.record(.personaCompile, since: personaStartNs)
         } catch {
-            trace.record("persona.compile", since: personaStartNs)
+            trace.record(.personaCompile, since: personaStartNs)
             throw TurnEngineError.personaLoadFailed(underlying: error)
         }
 
@@ -869,7 +904,7 @@ public actor SwiftNativeTurnEngine {
             let idx = REMPinsReader.read(dataRoot: dataRoot)
             remPins = REMPinsReader.latest(idx, latestN: 3)
         }
-        trace.record("rem_pins.read", since: remStartNs)
+        trace.record(.remPinsRead, since: remStartNs)
 
         // 4. Recall memory if configured. Session-backed chat can provide a
         //    compact deterministic expansion of the current user message with
@@ -931,7 +966,7 @@ public actor SwiftNativeTurnEngine {
         } else {
             trace.setMemoryRecallOutcome(.notConfigured)
         }
-        trace.record("memory.recall", since: memoryStartNs)
+        trace.record(.memoryRecall, since: memoryStartNs)
         // Dedup: drop recalls whose text is superseded by a REM pin sharing
         // the same key or whose preview contains the pin's text verbatim.
         // This keeps the context tight — the pin IS the authoritative fact.
@@ -951,15 +986,14 @@ public actor SwiftNativeTurnEngine {
         let toolNames = await FluidContextToolScope.$current.withValue(preparedContextTurn) {
             (try? await tools.listAvailableTools()) ?? []
         }
-        trace.record("tools.names", since: toolNamesStartNs)
+        trace.record(.toolsNames, since: toolNamesStartNs)
         let toolSchemasStartNs = DispatchTime.now().uptimeNanoseconds
         let toolSchemas = await FluidContextToolScope.$current.withValue(preparedContextTurn) {
             (try? await tools.listAvailableToolSchemas()) ?? []
         }
-        trace.record("tools.schemas", since: toolSchemasStartNs)
+        trace.record(.toolsSchemas, since: toolSchemasStartNs)
         let snapshot = TurnContextSnapshot(
             providerPreferences: prefs,
-            activeProviders: activeProviders,
             toolNames: toolNames,
             toolSchemas: toolSchemas
         )
@@ -1001,7 +1035,7 @@ public actor SwiftNativeTurnEngine {
                 : packetDynamic + "\n\n" + rawSegments.dynamic
             resolvedSegments = SystemPromptSegments(stable: rawSegments.stable, dynamic: dynamic)
         }
-        trace.record("prompt.render", since: renderStartNs)
+        trace.record(.promptRender, since: renderStartNs)
         let baseContext = TurnContext(
             surface: surface,
             personaID: resolvedPersonaID,
@@ -1020,25 +1054,58 @@ public actor SwiftNativeTurnEngine {
             fluidContextTurn: preparedContextTurn
         )
         let finalContext: TurnContext
+        // Pin one clock instant for both the dynamic clock line and the receipt
+        // flag. The flag is the active semantic, not mere preference-file
+        // availability: an outside-window turn must never look quiet merely
+        // because a window happens to be configured.
+        let currentTurnClock = clockNowOverride ?? clock()
+        let quietHoursActive: Bool = {
+            guard let quietHours = remPinsDataRoot.flatMap(TurnQuietHoursWindow.read(dataRoot:)) else {
+                return false
+            }
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = .current
+            return quietHours.contains(hour: calendar.component(.hour, from: currentTurnClock))
+        }()
+        // The summary is emitted even when a history caller asks this base
+        // builder to defer clock rendering, so stamp the same pinned semantic
+        // before the branch. The history assembler then owns the one eventual
+        // prompt rendering without leaving its base context receipt ambiguous.
+        trace.setFlag(
+            "clock.quietHoursActive",
+            quietHoursActive
+        )
         if includeClockContext {
+            // Receipt truth: the dynamic prompt gets the quiet-hours marker
+            // only on an active turn, and the summary carries that same pinned
+            // active state for live-rate observation.
             let runtimeStartNs = DispatchTime.now().uptimeNanoseconds
             finalContext = await contextByAppendingCurrentTurnFacts(
                 baseContext,
-                clockNowOverride: clockNowOverride
+                clockNowOverride: currentTurnClock
             )
-            trace.record("context.clock_runtime", since: runtimeStartNs)
+            trace.record(ContextStageName.contextClockRuntime, since: runtimeStartNs)
         } else {
             finalContext = baseContext
         }
         trace.setCount("snapshot.providerPrefs", snapshot.providerPreferences.count)
-        trace.setCount("snapshot.activeProviders", snapshot.activeProviders.count)
         trace.setCount("snapshot.toolNames", snapshot.toolNames.count)
         trace.setCount("snapshot.toolSchemas", snapshot.toolSchemas.count)
         trace.setCount("snapshot.toolSchemaParameterBytes", snapshot.toolSchemaParameterBytes)
         trace.setCount("persona.docCount", personaMap.count)
         trace.setCount("persona.docChars", personaMap.values.reduce(0) { $0 + $1.count })
         trace.setCount("remPins.count", remPins.count)
-        trace.setCount("memory.recallHits", recalled.count)
+        // `memory.recallHits` = the memory record identities that actually went
+        // INTO this turn: legacy recall hits ∪ ContextFlow packet provenance
+        // (TurnContext.resolvedRecalledIds — the same union the recalled-memory
+        // stamp and next-turn memoryActivation consume). On `.active` turns the
+        // legacy lane is empty BY DESIGN (memory rides the packet), so counting
+        // only `recalled` read 0 on 511/511 live turns (2026-08-21) while
+        // contextFlow.memoryRecords averaged ~12 — a measurement lie, not a
+        // recall outage. The legacy lane keeps its own honest name; on a
+        // legacy (non-ContextFlow) turn both lanes read the same value.
+        trace.setCount("memory.recallHits", baseContext.resolvedRecalledIds.count)
+        trace.setCount("memory.recallHits.legacy", recalled.count)
         trace.setCount("system.stableChars", finalContext.systemSegments?.stable.count ?? 0)
         trace.setCount("system.dynamicChars", finalContext.systemSegments?.dynamic.count ?? 0)
         trace.setCount("system.combinedChars", finalContext.systemPrompt?.count ?? 0)
@@ -1176,8 +1243,9 @@ public actor SwiftNativeTurnEngine {
         _ snapshot: CognitiveAttentionTraceRecorder.Snapshot,
         into trace: inout ContextStageTrace
     ) {
-        for (stage, milliseconds) in snapshot.stagesMilliseconds {
-            trace.setTiming("contextFlow.attention.\(stage)", milliseconds: milliseconds)
+        for (rawStage, milliseconds) in snapshot.stagesMilliseconds {
+            guard let stage = CognitiveAttentionStage(rawValue: rawStage) else { continue }
+            trace.setTiming(stage.contextStage, milliseconds: milliseconds)
         }
         trace.setFlag("contextFlow.attentionCompleted", snapshot.completed)
         trace.setFlag("contextFlow.attentionCancellationObserved", snapshot.cancellationObserved)
@@ -1286,31 +1354,49 @@ public actor SwiftNativeTurnEngine {
         let startNs = DispatchTime.now().uptimeNanoseconds
         guard let memoryPromoter else {
             ContextStageTrace.emitStage(
-                name: "memory.promotion",
+                name: .memoryPromotion,
                 elapsedMs: Int64((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000),
                 surface: surface,
                 counts: [
                     "userMessageChars": Int64(userMessage.count),
                     "assistantMessageChars": Int64(assistantMessage.count),
+                    "stagedProposalCount": 0,
                 ],
-                flags: ["configured": false]
+                flags: [
+                    "configured": false,
+                    "outcomeReported": false,
+                ]
             )
             return
         }
-        await memoryPromoter.observeTurn(
-            userMessage: userMessage,
-            assistantMessage: assistantMessage,
-            sessionId: sessionId ?? "swift-turn-engine"
-        )
+        let promotionTelemetry: MemoryPromotionTelemetry?
+        if let reportingPromoter = memoryPromoter as? any MemoryPromotionTelemetryReporting {
+            promotionTelemetry = await reportingPromoter.observeTurnWithTelemetry(
+                userMessage: userMessage,
+                assistantMessage: assistantMessage,
+                sessionId: sessionId ?? "swift-turn-engine"
+            )
+        } else {
+            await memoryPromoter.observeTurn(
+                userMessage: userMessage,
+                assistantMessage: assistantMessage,
+                sessionId: sessionId ?? "swift-turn-engine"
+            )
+            promotionTelemetry = nil
+        }
         ContextStageTrace.emitStage(
-            name: "memory.promotion",
+            name: .memoryPromotion,
             elapsedMs: Int64((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000),
             surface: surface,
             counts: [
                 "userMessageChars": Int64(userMessage.count),
                 "assistantMessageChars": Int64(assistantMessage.count),
+                "stagedProposalCount": promotionTelemetry?.stagedProposalCount ?? 0,
             ],
-            flags: ["configured": true]
+            flags: [
+                "configured": true,
+                "outcomeReported": promotionTelemetry != nil,
+            ]
         )
     }
 
@@ -1724,9 +1810,9 @@ public actor SwiftNativeTurnEngine {
             var calendar = Calendar(identifier: .gregorian)
             calendar.timeZone = localTimeZone
             let hour = calendar.component(.hour, from: now)
-            let inside = quietHours.contains(hour: hour)
-            line += " Quiet hours: \(formatHour(quietHours.startHour))–\(formatHour(quietHours.endHour))"
-                + " local (right now: \(inside ? "inside" : "outside") that window)."
+            if quietHours.contains(hour: hour) {
+                line += " Quiet hours: \(formatHour(quietHours.startHour))–\(formatHour(quietHours.endHour)) local."
+            }
         }
         return line
     }

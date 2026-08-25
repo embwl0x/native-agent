@@ -19,11 +19,180 @@ import NativeAgentShared
 // Which sub-queue ActivityView is currently drilled into. iOS doesn't have
 // the Cmd+Shift shortcuts that Mac uses, but keeping the enum keeps the
 // navigation pattern symmetric and ready for deep-link plumbing.
-enum ActivitySection: String, Hashable {
+enum ActivitySection: String, CaseIterable, Hashable {
     case approvals
     case inbox
     case memoryProposals
     case selfImprovement
+}
+
+/// The one presentation seam for the Activity tab and its badge. Keeping the
+/// count and affordance rules here prevents the tab from telling a different
+/// story than the four rows it opens.
+enum ActivityScreenPresentation {
+    struct Counts: Equatable {
+        let approvals: Int
+        let inbox: Int
+        let memoryProposals: Int
+        let selfImprovement: Int
+
+        var total: Int { approvals + inbox + memoryProposals + selfImprovement }
+    }
+
+    enum SectionCountState: Equatable {
+        case unavailable
+        case clear
+        case pending(Int)
+    }
+
+    static func sectionCountState(for count: Int?) -> SectionCountState {
+        guard let count else { return .unavailable }
+        return count > 0 ? .pending(count) : .clear
+    }
+
+    /// Activity's Memory Proposals drill-in must enter the corresponding
+    /// segment, rather than the Memories default used by the root tab.
+    static func memoryInitialSegment(for section: ActivitySection) -> MemoryView.MemorySegment {
+        switch section {
+        case .memoryProposals: return .proposals
+        case .approvals, .inbox, .selfImprovement: return .memories
+        }
+    }
+
+    static func counts(
+        storedApprovals: Int,
+        snapshotApprovals: [ApprovalRequest],
+        storedInbox: Int,
+        snapshotInbox: [InboxItemRecord],
+        memoryProposals: [MemoryProposalRecord],
+        trainingProposals: [TrainingProposalSummary],
+        promotionCandidates: [PromotionCandidateSummary]
+    ) -> Counts {
+        counts(
+            storedApprovals: storedApprovals,
+            snapshotApprovalsPending: snapshotApprovals.filter { $0.status.lowercased() == "pending" }.count,
+            storedInbox: storedInbox,
+            snapshotInboxPending: snapshotInbox.filter {
+                let status = $0.status.lowercased()
+                return status == "unread" || status == "active"
+            }.count,
+            memoryProposalsPending: memoryProposals.filter(\.isPending).count,
+            trainingProposalsPending: trainingProposals.filter(\.isHumanActionable).count,
+            promotionCandidatesPending: promotionCandidates.filter(\.isHumanActionable).count
+        )
+    }
+
+    static func counts(
+        storedApprovals: Int,
+        snapshotApprovalsPending: Int,
+        storedInbox: Int,
+        snapshotInboxPending: Int,
+        memoryProposalsPending: Int,
+        trainingProposalsPending: Int,
+        promotionCandidatesPending: Int
+    ) -> Counts {
+        Counts(
+            approvals: max(storedApprovals, snapshotApprovalsPending),
+            inbox: max(storedInbox, snapshotInboxPending),
+            memoryProposals: memoryProposalsPending,
+            selfImprovement: trainingProposalsPending + promotionCandidatesPending
+        )
+    }
+
+    /// A partial approval record must never unlock a remote decision. Older
+    /// snapshots without these fields remain readable, but are Mac-only until
+    /// the canonical authority explicitly says the decision is resolvable.
+    static func canDecideRemotely(localOnly: Bool?, remoteResolvable: Bool?) -> Bool {
+        localOnly == false && remoteResolvable == true
+    }
+
+    /// Preserve wire order for ordinary actions, but make a resolving action
+    /// reachable even when a writer reorders the action array.
+    static func visibleInboxActions(_ actions: [InboxActionRecord], limit: Int = 2) -> [InboxActionRecord] {
+        let actionable = actions.filter { $0.id != "view" && $0.id != "read" }
+        let primary = actionable.filter { isPrimaryInboxAction($0.id) }
+        let secondary = actionable.filter { !isPrimaryInboxAction($0.id) }
+        return Array((primary + secondary).prefix(limit))
+    }
+
+    static func isPrimaryInboxAction(_ actionID: String) -> Bool {
+        ["act", "approve", "open_approvals", "repair"].contains(actionID)
+    }
+
+    static func showsOverflow(total: Int, visibleCount: Int = 2) -> Bool {
+        total > visibleCount
+    }
+
+    /// Notification-open suppression is consumed once. Leaving the latch set
+    /// after a cancelled appearance would otherwise skip the next real refresh.
+    static func shouldRefreshOnAppear(skipInitialRefresh: inout Bool) -> Bool {
+        guard skipInitialRefresh else { return true }
+        skipInitialRefresh = false
+        return false
+    }
+
+    /// Activity owns the surrounding NavigationStack, so every pushed queue
+    /// must render as its content rather than creating a stack that can bounce
+    /// the destination back to the Activity list.
+    static func destinationEmbedsNavigationStack(for _: ActivitySection) -> Bool {
+        false
+    }
+
+    /// A review request from another iOS surface must open the queue that can
+    /// actually resolve it, rather than merely switching to Activity's summary.
+    static func activityDestination(for notificationScreen: String) -> ActivitySection? {
+        switch notificationScreen.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "approvals": return .approvals
+        default: return nil
+        }
+    }
+}
+
+/// An action response and the next published snapshot arrive independently.
+/// Once the user has decided an inline memory proposal, retain that decision
+/// state until the row disappears from the Mac-owned snapshot so a stale row
+/// cannot invite a duplicate accept/reject action.
+enum InlineMemoryProposalDecisionPresentation {
+    enum Decision: Equatable {
+        case accept
+        case reject
+    }
+
+    enum State: Equatable {
+        case ready
+        case deciding
+        case awaitingPublication(Decision)
+        case failed(String)
+
+        var canDecide: Bool {
+            switch self {
+            case .ready, .failed: return true
+            case .deciding, .awaitingPublication: return false
+            }
+        }
+
+        var showsProgress: Bool {
+            if case .deciding = self { return true }
+            return false
+        }
+
+        var feedback: (message: String, isError: Bool)? {
+            switch self {
+            case .ready, .deciding:
+                return nil
+            case .awaitingPublication(.accept):
+                return ("Accepted; waiting for the Mac/iCloud snapshot.", false)
+            case .awaitingPublication(.reject):
+                return ("Rejected; waiting for the Mac/iCloud snapshot.", false)
+            case let .failed(message):
+                return (message, true)
+            }
+        }
+    }
+
+    static func submitted(approve: Bool) -> State {
+        .awaitingPublication(approve ? .accept : .reject)
+    }
 }
 
 struct ActivityView: View {
@@ -31,6 +200,7 @@ struct ActivityView: View {
     @EnvironmentObject private var inboxStore: InboxStore
     @ObservedObject private var sync = iCloudSyncEngine.shared
     @Binding var skipInitialRefresh: Bool
+    @Binding var navigationTarget: ActivitySection?
 
     @State private var path = NavigationPath()
     // 2026-06-07: the inline inbox preview's "More" button used to push
@@ -45,8 +215,12 @@ struct ActivityView: View {
     // directly with the item.
     @State private var inboxDetailItem: InboxItemRecord?
 
-    init(skipInitialRefresh: Binding<Bool> = .constant(false)) {
+    init(
+        skipInitialRefresh: Binding<Bool> = .constant(false),
+        navigationTarget: Binding<ActivitySection?> = .constant(nil)
+    ) {
         self._skipInitialRefresh = skipInitialRefresh
+        self._navigationTarget = navigationTarget
     }
 
     // MARK: - Pending slices
@@ -74,20 +248,39 @@ struct ActivityView: View {
         sync.promotionCandidates.filter(\.isHumanActionable)
     }
 
-    private var pendingApprovalsCount: Int {
-        max(approvalsStore.pendingCount, pendingApprovals.count)
+    /// Empty arrays before the first completed snapshot are an absence of
+    /// evidence, not proof that a section is clear. Once the engine has a
+    /// measured snapshot, zero is rendered as the distinct "Clear" state.
+    private var hasMeasuredActivityProjection: Bool {
+        sync.lastSyncAt != nil
     }
 
-    private var pendingInboxCount: Int {
-        max(inboxStore.activeCount, pendingInbox.count)
+    private var pendingApprovalsCount: Int? {
+        hasMeasuredActivityProjection ? activityCounts.approvals : nil
     }
 
-    private var pendingMemoryProposalsCount: Int {
-        pendingMemoryProposals.count
+    private var pendingInboxCount: Int? {
+        hasMeasuredActivityProjection ? activityCounts.inbox : nil
     }
 
-    private var pendingSelfImprovementCount: Int {
-        pendingTrainingProposals.count + pendingPromotionCandidates.count
+    private var pendingMemoryProposalsCount: Int? {
+        hasMeasuredActivityProjection ? activityCounts.memoryProposals : nil
+    }
+
+    private var pendingSelfImprovementCount: Int? {
+        hasMeasuredActivityProjection ? activityCounts.selfImprovement : nil
+    }
+
+    private var activityCounts: ActivityScreenPresentation.Counts {
+        ActivityScreenPresentation.counts(
+            storedApprovals: approvalsStore.pendingCount,
+            snapshotApprovals: sync.approvals,
+            storedInbox: inboxStore.activeCount,
+            snapshotInbox: sync.inboxItems,
+            memoryProposals: sync.memoryProposals,
+            trainingProposals: sync.trainingProposals,
+            promotionCandidates: sync.promotionCandidates
+        )
     }
 
     // MARK: - Body
@@ -118,23 +311,39 @@ struct ActivityView: View {
                 // back, leaving the user staring at a blank slide-out.
                 // AutonomyView already doesn't wrap, so it's unchanged here.
                 switch section {
-                case .approvals:        ApprovalsView(embedInNavigationStack: false)
+                case .approvals:
+                    ApprovalsView(
+                        embedInNavigationStack: ActivityScreenPresentation.destinationEmbedsNavigationStack(for: .approvals)
+                    )
                                             .environmentObject(approvalsStore)
-                case .inbox:            InboxView(embedInNavigationStack: false)
+                case .inbox:
+                    InboxView(
+                        embedInNavigationStack: ActivityScreenPresentation.destinationEmbedsNavigationStack(for: .inbox)
+                    )
                                             .environmentObject(inboxStore)
-                case .memoryProposals:  MemoryView(initialSegment: .proposals, embedInNavigationStack: false)
-                case .selfImprovement:  AutonomyView()
+                case .memoryProposals:
+                    MemoryView(
+                        initialSegment: ActivityScreenPresentation.memoryInitialSegment(for: section),
+                        embedInNavigationStack: ActivityScreenPresentation.destinationEmbedsNavigationStack(for: .memoryProposals)
+                    )
+                case .selfImprovement:
+                    AutonomyView()
                 }
             }
             .refreshable {
                 await sync.refreshActivitySnapshot()
             }
             .task {
-                if skipInitialRefresh {
-                    skipInitialRefresh = false
+                if !ActivityScreenPresentation.shouldRefreshOnAppear(skipInitialRefresh: &skipInitialRefresh) {
                     return
                 }
                 await sync.refreshActivitySnapshot()
+            }
+            .onChange(of: navigationTarget) { _, section in
+                openRequestedSection(section)
+            }
+            .onAppear {
+                openRequestedSection(navigationTarget)
             }
             // 2026-06-07: dream-card "More" → read the full dream right here.
             // Reuses InboxDetailSheet (the same sheet InboxView presents),
@@ -154,6 +363,13 @@ struct ActivityView: View {
                 )
             }
         }
+    }
+
+    private func openRequestedSection(_ section: ActivitySection?) {
+        guard let section else { return }
+        path = NavigationPath()
+        path.append(section)
+        navigationTarget = nil
     }
 
     // MARK: - Sections
@@ -177,7 +393,7 @@ struct ActivityView: View {
                 .listRowSeparator(.hidden)
                 .listRowBackground(Color.clear)
             }
-            if pendingApprovals.count > 2 {
+            if ActivityScreenPresentation.showsOverflow(total: pendingApprovals.count) {
                 Button {
                     path.append(ActivitySection.approvals)
                 } label: {
@@ -214,7 +430,7 @@ struct ActivityView: View {
                 .listRowSeparator(.hidden)
                 .listRowBackground(Color.clear)
             }
-            if pendingInbox.count > 2 {
+            if ActivityScreenPresentation.showsOverflow(total: pendingInbox.count) {
                 Button {
                     path.append(ActivitySection.inbox)
                 } label: {
@@ -244,7 +460,7 @@ struct ActivityView: View {
                     .listRowSeparator(.hidden)
                     .listRowBackground(Color.clear)
             }
-            if pendingMemoryProposals.count > 2 {
+            if ActivityScreenPresentation.showsOverflow(total: pendingMemoryProposals.count) {
                 Button {
                     path.append(ActivitySection.memoryProposals)
                 } label: {
@@ -297,11 +513,12 @@ struct ActivityView: View {
                     .listRowBackground(Color.clear)
                 }
             }
-            if pendingSelfImprovementCount > 2 {
+            if let total = pendingSelfImprovementCount,
+               ActivityScreenPresentation.showsOverflow(total: total) {
                 Button {
                     path.append(ActivitySection.selfImprovement)
                 } label: {
-                    Label("All \(pendingSelfImprovementCount) self-improvement items", systemImage: "arrow.right")
+                    Label("All \(total) self-improvement items", systemImage: "arrow.right")
                         .font(AppFont.label)
                         .foregroundStyle(.pink)
                 }
@@ -326,7 +543,10 @@ private struct InlineApprovalPreviewCard: View {
     @State private var decisionStatusIsError = false
 
     private var isMacOnly: Bool {
-        approval.localOnly == true || approval.remoteResolvable == false
+        !ActivityScreenPresentation.canDecideRemotely(
+            localOnly: approval.localOnly,
+            remoteResolvable: approval.remoteResolvable
+        )
     }
 
     var body: some View {
@@ -464,10 +684,7 @@ private struct InlineInboxPreviewCard: View {
     @State private var errorText: String?
 
     private var topActions: [InboxActionRecord] {
-        item.actions
-            .filter { $0.id != "view" && $0.id != "read" }
-            .prefix(2)
-            .map { $0 }
+        ActivityScreenPresentation.visibleInboxActions(item.actions)
     }
 
     var body: some View {
@@ -504,7 +721,7 @@ private struct InlineInboxPreviewCard: View {
             }
             HStack(spacing: 8) {
                 ForEach(topActions, id: \.id) { action in
-                    if isPrimary(action.id) {
+                    if ActivityScreenPresentation.isPrimaryInboxAction(action.id) {
                         Button {
                             runAction(action.id)
                         } label: {
@@ -549,10 +766,6 @@ private struct InlineInboxPreviewCard: View {
         }
     }
 
-    private func isPrimary(_ actionID: String) -> Bool {
-        actionID == "act" || actionID == "approve" || actionID == "open_approvals" || actionID == "repair"
-    }
-
     private func runAction(_ actionID: String) {
         runningActionID = actionID
         errorText = nil
@@ -578,9 +791,7 @@ private struct InlineInboxPreviewCard: View {
 private struct InlineMemoryProposalPreviewCard: View {
     let proposal: MemoryProposalRecord
 
-    @State private var isDeciding = false
-    @State private var decisionStatusText: String?
-    @State private var decisionStatusIsError = false
+    @State private var decisionState: InlineMemoryProposalDecisionPresentation.State = .ready
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -605,10 +816,10 @@ private struct InlineMemoryProposalPreviewCard: View {
                 .font(AppFont.body)
                 .lineLimit(3)
                 .textSelection(.enabled)
-            if let decisionStatusText {
-                Text(decisionStatusText)
+            if let feedback = decisionState.feedback {
+                Text(feedback.message)
                     .font(.caption)
-                    .foregroundStyle(decisionStatusIsError ? .red : .purple)
+                    .foregroundStyle(feedback.isError ? .red : .purple)
             }
             HStack(spacing: 8) {
                 Button {
@@ -619,7 +830,7 @@ private struct InlineMemoryProposalPreviewCard: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.regular)
                 .tint(.purple)
-                .disabled(isDeciding)
+                .disabled(!decisionState.canDecide)
 
                 Button {
                     decide(approve: false)
@@ -629,9 +840,9 @@ private struct InlineMemoryProposalPreviewCard: View {
                 .buttonStyle(.bordered)
                 .controlSize(.regular)
                 .tint(.red)
-                .disabled(isDeciding)
+                .disabled(!decisionState.canDecide)
 
-                if isDeciding {
+                if decisionState.showsProgress {
                     ProgressView().controlSize(.small)
                 }
                 Spacer()
@@ -647,9 +858,8 @@ private struct InlineMemoryProposalPreviewCard: View {
     }
 
     private func decide(approve: Bool) {
-        isDeciding = true
-        decisionStatusText = nil
-        decisionStatusIsError = false
+        guard decisionState.canDecide else { return }
+        decisionState = .deciding
         let id = proposal.id
         Task {
             do {
@@ -660,19 +870,17 @@ private struct InlineMemoryProposalPreviewCard: View {
                     _ = try await iCloudSyncEngine.shared.rejectMemoryProposal(proposalId: id)
                     iOSSystemToastCenter.shared.push(info: "Memory rejected")
                 }
+                decisionState = InlineMemoryProposalDecisionPresentation.submitted(approve: approve)
                 await iCloudSyncEngine.shared.refreshActivitySnapshot()
             } catch {
                 if iCloudSyncEngine.isMacResponseTimeout(error) {
-                    decisionStatusText = "Decision sent; waiting for Mac/iCloud to publish the result."
-                    decisionStatusIsError = false
+                    decisionState = InlineMemoryProposalDecisionPresentation.submitted(approve: approve)
                     iOSSystemToastCenter.shared.push(info: "Decision sent; still waiting on the Mac")
                     await iCloudSyncEngine.shared.refreshActivitySnapshot()
                 } else {
-                    decisionStatusText = "Failed: \(error.localizedDescription)"
-                    decisionStatusIsError = true
+                    decisionState = .failed("Failed: \(error.localizedDescription)")
                 }
             }
-            isDeciding = false
         }
     }
 }
@@ -700,6 +908,9 @@ private struct InlineSelfImprovementPreviewCard: View {
                 .font(AppFont.body)
                 .foregroundStyle(.secondary)
                 .lineLimit(3)
+            Label("Apply changes on the Mac", systemImage: "macwindow.badge.exclamationmark")
+                .font(AppFont.label)
+                .foregroundStyle(.secondary)
             HStack(spacing: 8) {
                 Button {
                     onView()
@@ -728,7 +939,7 @@ private struct ActivityCardRow: View {
     let subtitle: String
     let systemImage: String
     let tint: Color
-    let count: Int
+    let count: Int?
 
     var body: some View {
         HStack(spacing: 14) {
@@ -746,15 +957,20 @@ private struct ActivityCardRow: View {
 
             Spacer()
 
-            if count > 0 {
+            switch ActivityScreenPresentation.sectionCountState(for: count) {
+            case .pending(let count):
                 Text("\(count)")
                     .font(AppFont.label)
                     .foregroundStyle(.white)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 2)
                     .background(tint, in: Capsule())
-            } else {
+            case .clear:
                 Text("Clear")
+                    .font(AppFont.tag)
+                    .foregroundStyle(.secondary)
+            case .unavailable:
+                Text("Syncing")
                     .font(AppFont.tag)
                     .foregroundStyle(.secondary)
             }

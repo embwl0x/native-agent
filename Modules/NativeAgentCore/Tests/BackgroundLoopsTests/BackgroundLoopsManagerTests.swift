@@ -769,3 +769,63 @@ private actor SuspendedTickProbe {
         }
     }
 }
+
+// MARK: - core.loops eval wave — loops.manager.isRunningForLoop
+//
+// `isRunning(loopId:)` is a BEHAVIORAL GATE with no test:
+//   Modules/NativeAgentCore/Sources/TelegramBot/TelegramBot+Client.swift:26
+//   decides whether the poller is live from it, and
+//   Sources/NativeAgentApp/BackgroundLoopsManagerComposition.swift:233/245
+//   gates work on it.
+//
+// The predicate is `started && registrations[loopId] != nil` — it proves
+// REGISTRATION, not liveness. A loop whose tick is wedged past its timeout and
+// whose registration is quarantined still answers `true`. These tests pin that
+// contract explicitly and name `status().executing` as the field that actually
+// distinguishes the two, so a caller reaching for the wrong one is a caught
+// mistake rather than an invisible "poller is fine" while no tick has landed.
+
+@Test("isRunning(loopId:) reports registration, not liveness")
+func isRunningForLoopReportsRegistrationOnly() async throws {
+    let probe = SuspendedTickProbe()
+    let loop = WedgedTimeoutStubLoop { await probe.tick() }
+    let manager = BackgroundLoopsManager()
+
+    // Not started yet: false for everything.
+    #expect(await manager.isRunning(loopId: loop.loopId) == false)
+
+    await manager.start(loops: [loop])
+    #expect(await manager.isRunning(loopId: loop.loopId) == true)
+    #expect(await manager.isRunning(loopId: "never_registered") == false,
+            "an unregistered id must never read as running")
+    #expect(await manager.registered().contains(loop.loopId))
+
+    // Drive the registration into quarantine: a tick that ignores the timeout.
+    let first = await manager.runTickOnce(loopId: loop.loopId)
+    guard case .failed(let error) = first else {
+        Issue.record("expected the wedged first tick to time out, got \(first)")
+        await probe.release()
+        await manager.stop()
+        return
+    }
+    #expect(error.hasPrefix("timeout after"))
+
+    // THE CONTRACT: the gate still says "running" while the child is wedged.
+    #expect(
+        await manager.isRunning(loopId: loop.loopId) == true,
+        "isRunning(loopId:) is registration-only — a quarantined loop with a wedged, timed-out tick still answers true. Callers needing liveness must read status().executing / lastRun, not this predicate."
+    )
+    let quarantined = try #require(await manager.status().first { $0.name == loop.loopId })
+    #expect(quarantined.executing == true,
+            "`executing` is the field that distinguishes a wedged tick from a healthy one")
+    #expect(quarantined.running == true)
+
+    await probe.release()
+
+    // stop() flips the gate for every registered loop at once, even though the
+    // registrations survive — the manager-wide `started` flag dominates.
+    await manager.stop()
+    #expect(await manager.isRunning(loopId: loop.loopId) == false)
+    #expect(await manager.registered().contains(loop.loopId),
+            "the registration itself is retained across stop()")
+}

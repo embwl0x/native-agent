@@ -60,11 +60,13 @@ struct InspectorView: View {
                         .font(NativeAgentFont.label)
                         .foregroundStyle(.secondary)
                     Spacer()
-                    if store.liveDropCount > 0 {
-                        Label("\(store.liveDropCount) dropped", systemImage: "exclamationmark.triangle")
+                    if let dropLabel = TurnInspectorLiveDropPresentation.label(
+                        for: store.liveDropCountState
+                    ) {
+                        Label(dropLabel, systemImage: "exclamationmark.triangle")
                             .font(NativeAgentFont.tag)
                             .foregroundStyle(.orange)
-                            .help("Bus dropped events because the UI consumed too slowly — the turn was never slowed.")
+                            .help("Bus drops mean the UI consumed too slowly; an unavailable count means the live diagnostic feed ended before it could be measured. The turn was never slowed.")
                     }
                     Button("Clear", systemImage: "trash") { store.clearLive() }
                         .controlSize(.small)

@@ -15,6 +15,33 @@ enum NativeAgentScheduledProactiveScan {
         let severity: String
         let score: Double
         let relatedPaths: [String]
+        /// Structured inbox groups are the wire for the Desk's Review Groups
+        /// control. They are not reconstructed from presentation prose.
+        let relatedGroups: [JSONValue]
+
+        init(
+            id: String,
+            kind: String,
+            title: String,
+            summary: String,
+            detail: String,
+            source: String,
+            severity: String,
+            score: Double,
+            relatedPaths: [String],
+            relatedGroups: [JSONValue] = []
+        ) {
+            self.id = id
+            self.kind = kind
+            self.title = title
+            self.summary = summary
+            self.detail = detail
+            self.source = source
+            self.severity = severity
+            self.score = score
+            self.relatedPaths = relatedPaths
+            self.relatedGroups = relatedGroups
+        }
     }
 
     struct Result: Sendable, Equatable {
@@ -208,6 +235,17 @@ enum NativeAgentScheduledProactiveScan {
         }
         if !actionableInbox.isEmpty {
             let id = stableID(kind: "inbox_digest", seed: "visible-unread-\(actionableInbox.count)")
+            let memberIDs = actionableInbox.compactMap { row -> String? in
+                guard case .object(let object) = row else { return nil }
+                return nonEmptyString(object["id"])
+            }
+            let relatedGroups: [JSONValue] = memberIDs.isEmpty ? [] : [.object([
+                "id": .string("digest-actionable-\(id)"),
+                "title": .string("Actionable inbox items"),
+                "count": .int(Int64(memberIDs.count)),
+                "item_ids": .array(memberIDs.map(JSONValue.string)),
+                "source": .string("proactive_inbox_digest"),
+            ])]
             opportunities.append(Opportunity(
                 id: id,
                 kind: "inbox_digest",
@@ -217,7 +255,8 @@ enum NativeAgentScheduledProactiveScan {
                 source: source(kind: "inbox_digest", id: id),
                 severity: actionableInbox.count >= 3 ? "actionable" : "important",
                 score: actionableInbox.count >= 3 ? 0.74 : 0.62,
-                relatedPaths: [dataRoot.appendingPathComponent("notifications/inbox.jsonl").path]
+                relatedPaths: [dataRoot.appendingPathComponent("notifications/inbox.jsonl").path],
+                relatedGroups: relatedGroups
             ))
         }
 
@@ -379,7 +418,8 @@ enum NativeAgentScheduledProactiveScan {
                 source: opportunity.source,
                 severity: opportunity.severity,
                 score: max(0, opportunity.score - NativeAgentScheduledProactiveScan.outcomeScorePenalty),
-                relatedPaths: opportunity.relatedPaths
+                relatedPaths: opportunity.relatedPaths,
+                relatedGroups: opportunity.relatedGroups
             )
         }
     }

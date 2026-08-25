@@ -90,11 +90,11 @@ extension InboxItemRecord {
     var hasLinkedApproval: Bool { !(related_approval_id ?? "").isEmpty }
 
     /// Presentation must expose only actions with a real end-to-end native
-    /// contract. `reply` remains a compatibility wire action on old cards, but
-    /// there is no typed proactive-card destination/result contract yet; hiding
-    /// it is safer than accepting text and losing it after Mac rejects the call.
+    /// contract. This is deliberately closed: an action introduced by a card
+    /// producer cannot become a tappable iOS control until the signed Mac
+    /// action router accepts it.
     var presentableActions: [InboxActionRecord] {
-        actions.filter { $0.id != "reply" }
+        actions.filter { InboxActionPresentation.presentableActionIDs.contains($0.id) }
     }
 
     var severityColor: Color {
@@ -204,6 +204,46 @@ struct InboxActionRecord: Codable, Hashable, Sendable {
     let description: String?
 }
 
+/// The complete inbox-card vocabulary this iOS build can present. `view` is
+/// local-only; every other id is sent through `iCloudSyncEngine.inboxAction`.
+enum InboxActionPresentation {
+    static let localOnlyActionIDs: Set<String> = ["view"]
+    static let forwardedActionIDs: Set<String> = [
+        "read", "act", "approve", "reject", "deny",
+        "archive", "dismiss", "repair", "open_approvals",
+    ]
+
+    static let presentableActionIDs = localOnlyActionIDs.union(forwardedActionIDs)
+}
+
+/// A bounded notification plan for one inbox snapshot. Large arrivals still
+/// get one summary notification so the safety cap never becomes a silent
+/// "notify nothing" policy for a Mac that publishes in batches.
+enum InboxLocalNotificationPlan: Equatable {
+    case none
+    case items([InboxItemRecord])
+    case summary(newUnreadCount: Int)
+}
+
+enum InboxNotificationBurstPresentation {
+    static let burstThreshold = 8
+    static let individualFireCap = 3
+
+    static func plan(
+        newUnreadItems: [InboxItemRecord],
+        isInboxVisible: Bool
+    ) -> InboxLocalNotificationPlan {
+        guard !isInboxVisible, !newUnreadItems.isEmpty else { return .none }
+        if newUnreadItems.count >= burstThreshold {
+            return .summary(newUnreadCount: newUnreadItems.count)
+        }
+        let alertable = newUnreadItems.filter {
+            $0.severity == "important" || $0.severity == "actionable"
+        }
+        return alertable.isEmpty ? .none : .items(Array(alertable.prefix(individualFireCap)))
+    }
+}
+
 // MARK: - Store
 
 @MainActor
@@ -216,6 +256,11 @@ final class InboxStore: ObservableObject {
     private var knownIDs: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "NativeAgentMobile.inboxKnownIDs") ?? [])
     // Whether we are currently on the Inbox tab (caller sets this)
     var isVisible: Bool = false
+    private let notificationScheduler: ((InboxLocalNotificationPlan, Int) -> Void)?
+
+    init(notificationScheduler: ((InboxLocalNotificationPlan, Int) -> Void)? = nil) {
+        self.notificationScheduler = notificationScheduler
+    }
 
     var activeCount: Int {
         items.filter { $0.isUnread }.count
@@ -287,7 +332,9 @@ final class InboxStore: ObservableObject {
         }
     }
 
-    private func applySuccessfulLocalAction(id: String, actionID: String) {
+    /// Project an already accepted Mac action while the next signed snapshot
+    /// catches up. This does not treat a transport acknowledgement as success.
+    func applySuccessfulLocalAction(id: String, actionID: String) {
         let nextStatus: String?
         switch actionID {
         case "archive", "repair":
@@ -307,7 +354,7 @@ final class InboxStore: ObservableObject {
         }
     }
 
-    private func applyFetchedItems(
+    func applyFetchedItems(
         _ fetched: [InboxItemRecord],
         animated: Bool = true,
         notifyNewArrivals: Bool = true
@@ -322,24 +369,20 @@ final class InboxStore: ObservableObject {
         // But a Mac-side burst (e.g. Auto-Doctor batch-publishing 50
         // cards in one tick) would still fire 50 simultaneous local
         // notifications, which can wedge SpringBoard's notification UI.
-        // Cap fires per refresh at FIRE_CAP and treat anything above
-        // BURST_THRESHOLD as a batch (no notifications, just update
-        // knownIDs so we don't re-fire next refresh).
+        // Cap individual fires per refresh. A larger batch becomes one
+        // summary notification, preserving the safety limit without making a
+        // batch-only Mac publisher invisible to the person using the phone.
         let fetchedIDs = Set(fetchedUnread.map { $0.id })
         let newIDs = fetchedIDs.subtracting(knownIDs)
         NSLog("[InboxStore] apply fetched=%d unread=%d known=%d new=%d visible=%@", fetched.count, fetchedUnread.count, knownIDs.count, newIDs.count, isVisible ? "true" : "false")
+        let notificationPlan: InboxLocalNotificationPlan
         if notifyNewArrivals && !knownIDs.isEmpty && !newIDs.isEmpty {
-            let BURST_THRESHOLD = 8
-            let FIRE_CAP = 3
-            if newIDs.count >= BURST_THRESHOLD {
-                // Batch arrival — silently update knownIDs to avoid spamming SpringBoard.
-                NSLog("[InboxStore] suppressing notifications for batch arrival of %d cards", newIDs.count)
-            } else {
-                let newItems = fetchedUnread.filter { newIDs.contains($0.id) }.prefix(FIRE_CAP)
-                for item in newItems {
-                    fireLocalNotification(for: item)
-                }
-            }
+            notificationPlan = InboxNotificationBurstPresentation.plan(
+                newUnreadItems: fetchedUnread.filter { newIDs.contains($0.id) },
+                isInboxVisible: isVisible
+            )
+        } else {
+            notificationPlan = .none
         }
         knownIDs = fetchedIDs
         UserDefaults.standard.set(Array(Array(fetchedIDs).sorted().suffix(500)), forKey: "NativeAgentMobile.inboxKnownIDs")
@@ -349,6 +392,7 @@ final class InboxStore: ObservableObject {
         } else {
             items = fetched
         }
+        scheduleLocalNotifications(notificationPlan, badgeCount: activeCount)
     }
 
     func shouldIgnoreTransientEmptySnapshot(fetched: [InboxItemRecord], snapshotLoaded: Bool) -> Bool {
@@ -372,12 +416,25 @@ final class InboxStore: ObservableObject {
         }
     }
 
-    private func fireLocalNotification(for item: InboxItemRecord) {
-        // Skip if user is on the Inbox tab right now
-        guard !isVisible else { return }
-        guard item.severity == "important" || item.severity == "actionable" else { return }
+    private func scheduleLocalNotifications(_ plan: InboxLocalNotificationPlan, badgeCount: Int) {
+        if let notificationScheduler {
+            guard plan != .none else { return }
+            notificationScheduler(plan, badgeCount)
+            return
+        }
+        switch plan {
+        case .none:
+            return
+        case .items(let items):
+            for item in items {
+                Self.fireLocalNotification(for: item, badgeCount: badgeCount)
+            }
+        case .summary(let newUnreadCount):
+            Self.fireBatchNotification(newUnreadCount: newUnreadCount, badgeCount: badgeCount)
+        }
+    }
 
-        let badgeCount = activeCount
+    private static func fireLocalNotification(for item: InboxItemRecord, badgeCount: Int) {
         var userInfo = [
             "itemId": item.id,
             "source": item.source,
@@ -406,6 +463,28 @@ final class InboxStore: ObservableObject {
             }
         }
     }
+
+    private static func fireBatchNotification(newUnreadCount: Int, badgeCount: Int) {
+        Task.detached {
+            let content = UNMutableNotificationContent()
+            content.title = "NativeAgent Inbox"
+            content.body = "\(newUnreadCount) new Inbox items are ready to review."
+            content.sound = .default
+            content.badge = NSNumber(value: badgeCount)
+            content.userInfo = ["screen": "activity", "source": "inbox_batch"]
+            let request = UNNotificationRequest(
+                identifier: "nativeagent.inbox.batch.\(UUID().uuidString)",
+                content: content,
+                trigger: UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false)
+            )
+            do {
+                try await UNUserNotificationCenter.current().add(request)
+                NSLog("[InboxStore] scheduled batch notification for %d cards", newUnreadCount)
+            } catch {
+                NSLog("[InboxStore] batch notification add failed: %@", error.localizedDescription)
+            }
+        }
+    }
 }
 
 // MARK: - Top-level view
@@ -417,6 +496,7 @@ struct InboxView: View {
     @StateObject private var sync = iCloudSyncEngine.shared
     @State private var groupFilter: InboxRelatedGroup?
     @State private var selectedDetailItem: InboxItemRecord?
+    @State private var showsAllEarlier = false
 
     /// When `true` (the default — used by tab roots), wraps the content in a
     /// NavigationStack. When `false`, returns just the inner content so the
@@ -447,6 +527,10 @@ struct InboxView: View {
         sync.agentDisplayName
     }
 
+    private var earlierSection: InboxListPresentation.EarlierSection {
+        InboxListPresentation.earlierSection(items: read, showsAll: showsAllEarlier)
+    }
+
     var body: some View {
         Group {
             if embedInNavigationStack {
@@ -471,7 +555,11 @@ struct InboxView: View {
             }
         }
         .navigationTitle("Inbox")
+        .macSyncErrorBanner()
         .toolbar {
+            ToolbarItem(placement: .navigationBarLeading) {
+                MacStatusChip()
+            }
             ToolbarItem(placement: .navigationBarTrailing) {
                 if store.isLoading {
                     ProgressView().scaleEffect(0.8)
@@ -497,6 +585,7 @@ struct InboxView: View {
                 selectedDetailItem = nil
                 withAnimation(AppMotion.snappy) {
                     groupFilter = group
+                    showsAllEarlier = false
                 }
             }) {
                 selectedDetailItem = nil
@@ -513,6 +602,7 @@ struct InboxView: View {
             AppEmptyState(
                 title: "Inbox empty",
                 systemImage: "tray",
+                kind: .empty,
                 description: "\(agentDisplayName) will surface things here when something is worth flagging.",
                 tint: NativeAgentPalette.agentAccent
             )
@@ -534,6 +624,7 @@ struct InboxView: View {
                             Button("Clear") {
                                 withAnimation(AppMotion.snappy) {
                                     self.groupFilter = nil
+                                    showsAllEarlier = false
                                 }
                             }
                             .font(AppFont.label)
@@ -566,9 +657,10 @@ struct InboxView: View {
                     }
                 }
 
-                if !read.isEmpty {
-                    Section("Earlier") {
-                        ForEach(read.prefix(10)) { item in
+                let earlier = earlierSection
+                if !earlier.visibleItems.isEmpty {
+                    Section("Earlier (\(earlier.totalCount))") {
+                        ForEach(earlier.visibleItems) { item in
                             InboxCardRow(item: item, onAction: { action in
                                 Task {
                                     await store.performAction(
@@ -585,11 +677,53 @@ struct InboxView: View {
                             .listRowSeparator(.hidden)
                             .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
                         }
+
+                        if earlier.hiddenCount > 0 {
+                            Button("Show \(earlier.hiddenCount) more earlier") {
+                                withAnimation(AppMotion.snappy) {
+                                    showsAllEarlier = true
+                                }
+                            }
+                            .font(AppFont.label)
+                        } else if showsAllEarlier,
+                                  earlier.totalCount > InboxListPresentation.earlierPreviewLimit {
+                            Button("Show fewer earlier") {
+                                withAnimation(AppMotion.snappy) {
+                                    showsAllEarlier = false
+                                }
+                            }
+                            .font(AppFont.label)
+                        }
                     }
                 }
             }
             .listStyle(.plain)
         }
+    }
+}
+
+/// Presentation projection for the read-history section. The section title
+/// always carries the complete count, while a capped preview exposes an
+/// explicit path to every remaining card.
+enum InboxListPresentation {
+    static let earlierPreviewLimit = 10
+
+    struct EarlierSection {
+        let visibleItems: [InboxItemRecord]
+        let totalCount: Int
+        let hiddenCount: Int
+    }
+
+    static func earlierSection(
+        items: [InboxItemRecord],
+        showsAll: Bool
+    ) -> EarlierSection {
+        let visibleItems = showsAll ? items : Array(items.prefix(earlierPreviewLimit))
+        return EarlierSection(
+            visibleItems: visibleItems,
+            totalCount: items.count,
+            hiddenCount: max(0, items.count - visibleItems.count)
+        )
     }
 }
 
@@ -749,10 +883,7 @@ struct InboxDetailSheet: View {
     let onDone: () -> Void
 
     private var relatedGroups: [InboxRelatedGroup] {
-        if let groups = item.related_groups, !groups.isEmpty {
-            return groups
-        }
-        return Self.groupsFromDigestDetail(item: item, allItems: allItems)
+        InboxDetailGroupProjection.groups(item: item, allItems: allItems)
     }
 
     var body: some View {
@@ -824,8 +955,20 @@ struct InboxDetailSheet: View {
         .presentationDetents([.medium, .large])
     }
 
-    private static func groupsFromDigestDetail(item: InboxItemRecord, allItems: [InboxItemRecord]) -> [InboxRelatedGroup] {
-        guard item.source == "autonomy_maintenance:inbox_digest",
+}
+
+/// The only route from a persisted digest card to the detail sheet's Review
+/// Groups controls. Current Mac cards carry structured groups; the bounded
+/// prose parser keeps existing JSONL digest cards useful after the migration.
+enum InboxDetailGroupProjection {
+    static func groups(item: InboxItemRecord, allItems: [InboxItemRecord]) -> [InboxRelatedGroup] {
+        if let groups = item.related_groups, !groups.isEmpty { return groups }
+        return legacyGroups(item: item, allItems: allItems)
+    }
+
+    static func legacyGroups(item: InboxItemRecord, allItems: [InboxItemRecord]) -> [InboxRelatedGroup] {
+        guard (item.source == "autonomy_maintenance:inbox_digest"
+                || item.source.hasPrefix("proactive_autonomy:inbox_digest:")),
               let detail = item.detail,
               detail.contains("Top groups:")
         else { return [] }
@@ -839,7 +982,7 @@ struct InboxDetailSheet: View {
             if line.isEmpty { continue }
             guard line.hasPrefix("- ") else { break }
             let entry = String(line.dropFirst(2))
-            let parsed = parseDigestGroupLine(entry)
+            let parsed = parseLegacyLine(entry)
             let matchingIDs = allItems
                 .filter { $0.id != item.id && $0.title == parsed.title }
                 .map(\.id)
@@ -854,7 +997,7 @@ struct InboxDetailSheet: View {
         return groups
     }
 
-    private static func parseDigestGroupLine(_ entry: String) -> (title: String, count: Int) {
+    private static func parseLegacyLine(_ entry: String) -> (title: String, count: Int) {
         let trimmed = entry.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.hasSuffix(")"), let open = trimmed.lastIndex(of: "(") else {
             return (trimmed, 0)

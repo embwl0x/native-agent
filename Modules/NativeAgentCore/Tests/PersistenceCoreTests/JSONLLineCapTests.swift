@@ -237,6 +237,89 @@ struct JSONLLineCapTests {
             )
         }
     }
+
+    // MARK: - LEDGER: core.persistence.enforceJSONLLineCap.nonUTF8SkipPath
+    //
+    // THE SILENT FAILURE. One non-UTF8 byte anywhere in a feed — a torn append
+    // mid-multibyte, a stray binary blob — makes `String(data:encoding:.utf8)`
+    // return nil, and the cap returns 0 after an NSLog nobody reads. The cap is
+    // then disabled for that feed FOREVER: it grows unbounded, and (for the
+    // callers that pass no byte trigger) every subsequent append pays a
+    // full-file read to reach the same dead end.
+    //
+    // The assertion is an envelope, not a value: 0 dropped AND the file is
+    // byte-identical, i.e. garbage is never truncated on a guess.
+
+    /// A feed with one invalid UTF-8 byte: the cap reports zero and the bytes on
+    /// disk are untouched.
+    @Test func nonUTF8Feed_skipsTheCapAndNeverTruncates() throws {
+        let path = tmpFile()
+        defer { try? FileManager.default.removeItem(at: path.deletingLastPathComponent()) }
+        let corrupt = Self.feedBytes(lineCount: 200, invalidByteAtLine: 100)
+        try corrupt.write(to: path)
+
+        let dropped = try enforceJSONLLineCap(at: path, maxLines: 10)
+
+        #expect(dropped == 0, "a non-UTF8 feed cannot be capped — it must report zero, not guess")
+        let after = try Data(contentsOf: path)
+        #expect(after == corrupt, "the cap must never truncate a feed it could not decode")
+    }
+
+    /// THE TOOTH. The SAME feed with the one bad byte removed does trim, and by
+    /// the expected amount. Without this the test above would pass just as well
+    /// against a cap that had been silently disabled for every feed.
+    @Test func nonUTF8SkipIsTheOnlyDifference_cleanFeedStillTrims() throws {
+        let path = tmpFile()
+        defer { try? FileManager.default.removeItem(at: path.deletingLastPathComponent()) }
+        let clean = Self.feedBytes(lineCount: 200, invalidByteAtLine: nil)
+        try clean.write(to: path)
+
+        let dropped = try enforceJSONLLineCap(at: path, maxLines: 10)
+
+        #expect(dropped == 190)
+        let kept = try String(contentsOf: path, encoding: .utf8)
+            .split(separator: "\n").map(String.init)
+        #expect(kept.count == 10)
+        #expect(kept.last == #"{"i":199}"#)
+    }
+
+    /// Two feeds identical except for that one byte, driven through the same
+    /// call: one trims, one does not. Stated as a single comparison so the pair
+    /// above cannot drift apart.
+    @Test func nonUTF8Feed_andItsCleanTwin_divergeOnlyOnDecodability() throws {
+        let corruptPath = tmpFile()
+        let cleanPath = tmpFile()
+        defer {
+            try? FileManager.default.removeItem(at: corruptPath.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: cleanPath.deletingLastPathComponent())
+        }
+        try Self.feedBytes(lineCount: 200, invalidByteAtLine: 100).write(to: corruptPath)
+        try Self.feedBytes(lineCount: 200, invalidByteAtLine: nil).write(to: cleanPath)
+
+        let corruptDropped = try enforceJSONLLineCap(at: corruptPath, maxLines: 10)
+        let cleanDropped = try enforceJSONLLineCap(at: cleanPath, maxLines: 10)
+
+        #expect(corruptDropped == 0)
+        #expect(cleanDropped > 0)
+        #expect(corruptDropped != cleanDropped, "decodability is the ONLY difference between these two feeds")
+    }
+
+    /// 200 JSONL rows; when `invalidByteAtLine` is set, that row carries a lone
+    /// 0x80 continuation byte — invalid UTF-8 in any position.
+    private static func feedBytes(lineCount: Int, invalidByteAtLine: Int?) -> Data {
+        var out = Data()
+        for index in 0..<lineCount {
+            if index == invalidByteAtLine {
+                out.append(contentsOf: Array(#"{"i":"#.utf8))
+                out.append(0x80)
+                out.append(contentsOf: Array(#""}"#.utf8))
+            } else {
+                out.append(contentsOf: Array(#"{"i":\#(index)}"#.utf8))
+            }
+            out.append(0x0A)
+        }
+        return out
+    }
 }
 
 /// A PersistenceCoreProtocol conformer that is NOT `SwiftNativePersistenceCore`

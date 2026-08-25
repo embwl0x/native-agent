@@ -61,8 +61,14 @@ public actor OrganismKernel {
     }
 
     public func configure(_ configuration: OrganismConfiguration) async {
+        let now = dependencies.now()
+        // Settle owed wall-time first, and never move the anchor backward:
+        // settleContinuity() parks lastSettledAt in the future after its forward
+        // decay, and resetting it to now would re-apply hours that were already
+        // decayed (the F3-M5 double-decay bug, re-fixed 2026-08-21).
+        settleElapsedTime(at: now)
         self.configuration = configuration
-        lastSettledAt = dependencies.now()
+        lastSettledAt = max(lastSettledAt, now)
         publishPredictedToolGroups(at: lastSettledAt)
     }
 
@@ -136,10 +142,23 @@ public actor OrganismKernel {
                     at: ingestedAt
                 )
         }
-        // Historical reflex rows remain readable/reviewable, including any
-        // explicitly approved low-risk bias. Routine tool/provider/Desk signals
-        // no longer compile generic prose proposals: prediction, chemistry, and
-        // body-schema caution above already carry their real behavioral effect.
+        // Only canonical chat-tool outcomes carry a checked risk class. Those
+        // are the producer contract for reviewable reflexes: generic motor,
+        // provider, and Desk signals still affect prediction/chemistry/body
+        // schema above but cannot manufacture a proposal from unclassified
+        // telemetry. This keeps the human review surface live for its one
+        // declared producer without broadening it into a prose reflex engine.
+        if case .string(let rawRisk)? = bounded.metadata["trustRisk"],
+           ["low", "medium", "high", "critical"].contains(
+                rawRisk.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+           ),
+           bounded.kind == .toolSucceeded || bounded.kind == .toolFailed {
+            reflexState = OrganismReflexCompiler.applying(
+                signal: bounded,
+                to: reflexState,
+                limits: configuration.reflexLimits
+            )
+        }
         signalCount += 1
         // Quiet physiology follows when the signal reached this organism, not
         // an untrusted/delayed source timestamp. The anchor is monotonic so an
@@ -550,7 +569,8 @@ public actor OrganismKernel {
         decision: OrganismReflexReviewDecision,
         note: String? = nil,
         reviewedBy: String = "operator",
-        source: String = "runtime"
+        source: String = "runtime",
+        receiptID: String? = nil
     ) async -> OrganismReflexReviewApplication? {
         guard configuration.enabled else { return nil }
         settleElapsedTime(at: dependencies.now())
@@ -561,7 +581,7 @@ public actor OrganismKernel {
             reviewedBy: reviewedBy,
             source: source,
             note: note,
-            receiptID: dependencies.makeUUID().uuidString,
+            receiptID: receiptID ?? dependencies.makeUUID().uuidString,
             limits: configuration.reflexLimits
         ) else { return nil }
         reflexState = application.state

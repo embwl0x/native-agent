@@ -20,6 +20,11 @@ extension CognitionObservatoryView {
                         .font(.caption)
                         .textSelection(.enabled)
                 }
+                if let overflow = CognitionObservatoryPresentation.thoughtSeedOverflowLabel(total: seeds.count) {
+                    Text(overflow)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
     }

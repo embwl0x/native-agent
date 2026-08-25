@@ -238,8 +238,17 @@ extension NativeClient {
         )
     }
 
+    /// The one canonical approvals location shared by the reader and mounted
+    /// Desk invalidation. Keeping this at the client boundary preserves an
+    /// isolated/recovered client's explicit root instead of silently watching
+    /// the process-global inbox.
+    func approvalRequestsPath() async -> URL {
+        let inbox = approvalInbox()
+        return await inbox.approvalsPath
+    }
+
     func swiftListApprovals() async throws -> [ApprovalRequest] {
-        let inbox = SwiftNativeApprovalInbox(root: SwiftNativeApprovalInbox.defaultDataRoot())
+        let inbox = approvalInbox()
         let items = try await inbox.list(filter: .all)
         return items.map { rec in
             ApprovalRequest(
@@ -260,6 +269,12 @@ extension NativeClient {
         }
     }
 
+    private func approvalInbox() -> SwiftNativeApprovalInbox {
+        SwiftNativeApprovalInbox(
+            root: dataRootOverride ?? SwiftNativeApprovalInbox.defaultDataRoot()
+        )
+    }
+
     /// The canonical inbox already records which conversation asked for a chat
     /// tool approval (`NativeAgentChatApprovalFiler` writes
     /// `payload.origin.sessionId`). This mapping stops dropping it on the way
@@ -277,7 +292,7 @@ extension NativeClient {
     }
 
     func swiftListMCPConsents() async throws -> [MCPConsentRecord] {
-        let disp = SwiftNativeMCPDispatcher(root: SwiftNativeMCPDispatcher.defaultDataRoot())
+        let disp = mcpDispatcherForClientRoot()
         let items = try await disp.listConsents()
         return items.map(NativeClient._mapMCPConsent)
     }
@@ -314,7 +329,7 @@ extension NativeClient {
         toolName: String,
         risk: String?
     ) async throws -> MCPConsentRecord {
-        let disp = makeMCPDispatcher()
+        let disp = mcpDispatcherForClientRoot()
         // Resolve risk the same way the daemon does: explicit value wins, else
         // the server's riskClass, else the daemon's "app_data_read" default.
         var resolvedRisk = (risk?.isEmpty == false) ? risk! : ""
@@ -354,7 +369,7 @@ extension NativeClient {
         serverId: String,
         toolName: String
     ) async throws -> MCPConsentRecord {
-        let disp = makeMCPDispatcher()
+        let disp = mcpDispatcherForClientRoot()
         try await disp.revokeConsent(serverId: serverId, toolName: toolName)
         let key = "\(serverId):\(toolName)"
         let consents = try await disp.listConsents()
@@ -378,6 +393,15 @@ extension NativeClient {
         )
     }
 
+    /// MCP consent is durable execution authority. Reads and mutations must
+    /// share the NativeClient's resolved root so an injected surface cannot
+    /// display one ledger while changing another.
+    func mcpDispatcherForClientRoot() -> SwiftNativeMCPDispatcher {
+        SwiftNativeMCPDispatcher(
+            root: dataRootOverride ?? SwiftNativeMCPDispatcher.defaultDataRoot()
+        )
+    }
+
     // MARK: - Training / Promotion / Evals read-side helpers
     //
     // Each reads the SAME data files the daemon reads (co-located on the Mac)
@@ -396,11 +420,14 @@ extension NativeClient {
     // Each helper constructs the actor directly (the read methods live on the
     // concrete SwiftNativeSelfImprovement, not the protocol).
 
-    static func _trainingPromotionActor() -> SwiftNativeSelfImprovement {
+    static func _trainingPromotionActor(dataRoot: URL? = nil) -> SwiftNativeSelfImprovement {
         // dataRoot defaults to defaultDataRoot(), which reads the live process
         // environment exactly as the daemon's _resolve_data_root() does, so the
         // Swift reader is co-located with the daemon's files on the Mac.
-        SwiftNativeSelfImprovement()
+        if let dataRoot {
+            return SwiftNativeSelfImprovement(dataRoot: dataRoot)
+        }
+        return SwiftNativeSelfImprovement()
     }
 
     /// The 403 NSError the daemon's HTTP path produces on a closed gate. The
@@ -420,7 +447,7 @@ extension NativeClient {
     }
 
     func swiftGetTrainingRuns() async throws -> [TrainingRunSummary] {
-        let actor = NativeClient._trainingPromotionActor()
+        let actor = NativeClient._trainingPromotionActor(dataRoot: dataRootOverride)
         guard await actor.trainingAllowed() else {
             throw NativeClient._trustForbidden(detail: "autonomous_training not enabled in trust policy")
         }
@@ -443,7 +470,7 @@ extension NativeClient {
     // detail. The full run dict is returned verbatim (NOT the 5-field list
     // projection) — the daemon returns `_get_training().get_run(run_id)` whole.
     func swiftGetTrainingRun(id: String) async throws -> [String: Any] {
-        let actor = NativeClient._trainingPromotionActor()
+        let actor = NativeClient._trainingPromotionActor(dataRoot: dataRootOverride)
         guard await actor.trainingAllowed() else {
             throw NativeClient._trustForbidden(detail: "autonomous_training not enabled in trust policy")
         }
@@ -462,7 +489,7 @@ extension NativeClient {
     }
 
     func swiftGetTrainingProposals() async throws -> [TrainingProposalSummary] {
-        let actor = NativeClient._trainingPromotionActor()
+        let actor = NativeClient._trainingPromotionActor(dataRoot: dataRootOverride)
         guard await actor.trainingAllowed() else {
             throw NativeClient._trustForbidden(detail: "autonomous_training not enabled in trust policy")
         }
@@ -472,7 +499,7 @@ extension NativeClient {
     }
 
     func swiftGetPromotionCandidates() async throws -> [PromotionCandidateSummary] {
-        let actor = NativeClient._trainingPromotionActor()
+        let actor = NativeClient._trainingPromotionActor(dataRoot: dataRootOverride)
         guard await actor.promotionAllowed() else {
             throw NativeClient._trustForbidden(detail: "promotionPolicy.enabled not set in trust policy")
         }
@@ -482,7 +509,7 @@ extension NativeClient {
     }
 
     func swiftGetPromotionPending() async throws -> [PromotionCandidateSummary] {
-        let actor = NativeClient._trainingPromotionActor()
+        let actor = NativeClient._trainingPromotionActor(dataRoot: dataRootOverride)
         guard await actor.promotionAllowed() else {
             throw NativeClient._trustForbidden(detail: "promotionPolicy.enabled not set in trust policy")
         }
@@ -492,7 +519,7 @@ extension NativeClient {
     }
 
     func swiftGetEvals() async throws -> [EvalRun] {
-        let raw = await NativeClient._trainingPromotionActor().listEvalsLocal()
+        let raw = await NativeClient._trainingPromotionActor(dataRoot: dataRootOverride).listEvalsLocal()
         let data = try raw.serializedData(pretty: false)
         return try JSONDecoder.nativeAgent.decode([EvalRun].self, from: data)
     }
@@ -510,7 +537,7 @@ extension NativeClient {
     // so a flag-ON caller sees identical not-found behavior. See CUTOVER_PLAN §6.96.
     // W-H ImprovementOps-band lift (move-only): fileprivate->internal.
     func swiftImprovementDiff(runId: String) async throws -> ImprovementDiffPayload {
-        let actor = NativeClient._trainingPromotionActor()
+        let actor = NativeClient._trainingPromotionActor(dataRoot: dataRootOverride)
         do {
             // The module returns SelfImprovement.ImprovementDiffPayload; we
             // re-encode and decode into the app-side ImprovementDiffPayload
@@ -536,7 +563,7 @@ extension NativeClient {
     // null/absent status to "ready" at the seam (the daemon's own fallback for
     // the empty-runs case) before decoding into the app struct.
     func swiftImprovementGauntlet() async throws -> ImprovementGauntletStatus {
-        let actor = NativeClient._trainingPromotionActor()
+        let actor = NativeClient._trainingPromotionActor(dataRoot: dataRootOverride)
         let status = await actor.improvementGauntletStatusLocal()
         let data = try JSONEncoder().encode(status)
         // Normalize status: null/absent -> "ready" for the app's non-optional field.
@@ -575,7 +602,7 @@ extension NativeClient {
     /// the actor stages a Swift-native promotion candidate instead of applying
     /// the personality-doc write immediately.
     func swiftApproveTrainingProposal(id: String) async throws -> [String: Any] {
-        let actor = NativeClient._trainingPromotionActor()
+        let actor = NativeClient._trainingPromotionActor(dataRoot: dataRootOverride)
         guard await actor.trainingAllowed() else {
             throw NativeClient._trustForbidden(detail: "autonomous_training not enabled in trust policy")
         }
@@ -584,7 +611,7 @@ extension NativeClient {
     }
 
     func swiftRejectTrainingProposal(id: String, reason: String) async throws -> [String: Any] {
-        let actor = NativeClient._trainingPromotionActor()
+        let actor = NativeClient._trainingPromotionActor(dataRoot: dataRootOverride)
         guard await actor.trainingAllowed() else {
             throw NativeClient._trustForbidden(detail: "autonomous_training not enabled in trust policy")
         }
@@ -609,7 +636,19 @@ extension NativeClient {
     }
 
     func swiftListTools() async throws -> [ToolRecord] {
-        let reg = makeToolRegistry()
+        let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let registryPath = root.appendingPathComponent("tools/registry.json")
+        let fm = FileManager.default
+        if fm.fileExists(atPath: registryPath.path) {
+            let data = try Data(contentsOf: registryPath)
+            let parsed = try JSONValue.parse(data)
+            guard case .array = parsed else {
+                throw ToolRegistryError.registryUnreadable(
+                    reason: "tools registry must be a JSON array"
+                )
+            }
+        }
+        let reg = SwiftNativeToolRegistry(root: root)
         let coreRecords = try await reg.listTools(filter: .all)
         return try coreRecords.map { try NativeClient._mapCoreToolRecord($0) }
     }
@@ -634,7 +673,9 @@ extension NativeClient {
     /// with description/triggers) so those land in extras and survive decode.
     // W-H RegistryMutations-band lift (move-only): fileprivate->internal.
     func swiftPromoteTool(id: String, allowRisky: Bool) async throws -> ToolRecord {
-        let exec = SwiftNativeToolExecution(root: PersistenceCore.defaultDataRoot())
+        let exec = SwiftNativeToolExecution(
+            root: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        )
         let proposal = try await exec.promote(id: id, allowRisky: allowRisky)
         let data = try proposal.toJSON().serializedData(pretty: false)
         return try JSONDecoder.nativeAgent.decode(ToolRecord.self, from: data)
@@ -649,7 +690,11 @@ extension NativeClient {
         id: String,
         reason: String
     ) async throws -> ToolRecord {
-        let reg = makeToolRegistry()
+        // Keep the app action coordinator on the same injectable canonical
+        // root as its readers.  Production has no override; hermetic app
+        // integration tests exercise this exact route without touching live
+        // tool authority.
+        let reg = SwiftNativeToolRegistry(root: dataRootOverride ?? PersistenceCore.defaultDataRoot())
         let coreRec = try await reg.quarantine(id: id, reason: reason)
         return try NativeClient._mapCoreToolRecord(coreRec)
     }
@@ -693,7 +738,7 @@ extension NativeClient {
     /// `listSessions()` (subprocess pool + idle/warm/failed status per spec).
     // W-H MCP-band lift (move-only): fileprivate→internal for NativeClient+MCP.swift.
     func swiftListMCPSessions() async throws -> [MCPSessionStatus] {
-        let disp = SwiftNativeMCPDispatcher(root: SwiftNativeMCPDispatcher.defaultDataRoot())
+        let disp = mcpDispatcherForClientRoot()
         let rows = try await disp.listSessions()
         return rows.map { row in
             MCPSessionStatus(
@@ -719,7 +764,7 @@ extension NativeClient {
 
         serverId: String
     ) async throws -> MCPToolsResponse {
-        let disp = SwiftNativeMCPDispatcher(root: SwiftNativeMCPDispatcher.defaultDataRoot())
+        let disp = mcpDispatcherForClientRoot()
         let raw = try await disp.listToolsLive(forServer: serverId)
         var tools: [MCPToolRecord] = []
         for entry in raw {
@@ -745,7 +790,7 @@ extension NativeClient {
 
         serverId: String
     ) async throws -> MCPResourcesResponse {
-        let disp = SwiftNativeMCPDispatcher(root: SwiftNativeMCPDispatcher.defaultDataRoot())
+        let disp = mcpDispatcherForClientRoot()
         let raw = try await disp.listResourcesLive(forServer: serverId)
         var resources: [MCPResourceRecord] = []
         for entry in raw {
@@ -769,7 +814,9 @@ extension NativeClient {
     /// shape the daemon returned. (Daemon-config path was retired
     /// 2026-06-06 — Swift now owns research config in its own file.)
     func swiftAutodetectSearXNG() async throws -> DetectSearXNGResponse {
-        let client = makeResearchClient()
+        let client = makeResearchClient(
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        )
         let result = try await client.autodetectSearXNG()
         return DetectSearXNGResponse(
             found: result.found,
@@ -784,7 +831,9 @@ extension NativeClient {
     /// to `data/research/<id>.json`, returns the same per-result
     /// {title, url, snippet, source} shape the daemon returns.
     func swiftResearchSearch(query: String) async throws -> [ResearchResult] {
-        let client = makeResearchClient()
+        let client = makeResearchClient(
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        )
         let response = try await client.search(query: query)
         return response.results.map { row in
             ResearchResult(
@@ -850,7 +899,7 @@ extension NativeClient {
     /// the shared PersonalityProfile struct share the same field set 1:1.
     func swiftPersonality() async throws -> PersonalityProfile {
         let compiled = await PersonaCompiler().compileProfile(
-            dataRoot: PersistenceCore.defaultDataRoot()
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
         )
         // Shared with the wave-33 W06 write-gate result mapping so the read and
         // write paths can't drift on the CompiledPersonalityProfile → app shape.
@@ -899,7 +948,15 @@ extension NativeClient {
     /// insertion-order keys) so the Personality tab text matches byte-
     /// for-byte.
     func swiftCompiledPersonality(surface: String) async throws -> CompiledPersonality {
-        let wire = try await PersonaCompiler().compiledPacket(surface: surface)
+        let compiler: PersonaCompiler
+        if let dataRootOverride {
+            compiler = PersonaCompiler(
+                engine: SwiftNativePersonaEngine.isolated(dataRoot: dataRootOverride)
+            )
+        } else {
+            compiler = PersonaCompiler()
+        }
+        let wire = try await compiler.compiledPacket(surface: surface)
         return CompiledPersonality(
             surface: wire.surface,
             fingerprint: wire.fingerprint,
@@ -916,7 +973,8 @@ extension NativeClient {
     /// `NativeAgentApp` lookup is implicit — module-local `TrustPolicy` wins
     /// over the imported `TrustCenter.TrustPolicy` for unqualified use.
     func swiftTrustPolicy() async throws -> TrustPolicy {
-        let data = try await SwiftNativeTrustCenter().loadTrustPolicyJSON()
+        let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let data = try await SwiftNativeTrustCenter(dataRoot: root).loadTrustPolicyJSON()
         return try JSONDecoder.nativeAgent.decode(TrustPolicy.self, from: data)
     }
 
@@ -927,7 +985,9 @@ extension NativeClient {
     /// app-side `NativeAgentShared.PersonalityDoc`. Core owns the listing
     /// + mapping logic; this adapter only crosses the module boundary.
     func swiftPersonalityDocs() async throws -> PersonalityDocsResponse {
-        let listing = try await SwiftNativePersonaEngine().listPersonaDocSpecs()
+        let engine: SwiftNativePersonaEngine = dataRootOverride.map(SwiftNativePersonaEngine.isolated(dataRoot:))
+            ?? SwiftNativePersonaEngine()
+        let listing = try await engine.listPersonaDocSpecs()
         let docs: [PersonalityDoc] = listing.docs.map { spec in
             PersonalityDoc(
                 id: spec.id,

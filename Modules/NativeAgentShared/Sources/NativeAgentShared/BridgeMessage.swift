@@ -118,6 +118,37 @@ public struct BridgeMessage: Codable, Identifiable, Sendable {
             return false
         }
     }
+
+    /// The only deliberately unsigned message accepted on the Mac→iOS wire.
+    /// It is a pairing wake-up, never a command: the receiver may refresh the
+    /// separately authenticated KVS material, but cannot infer an action,
+    /// session, attachment, or arbitrary metadata from this envelope.
+    public var isUnsignedResyncHint: Bool {
+        let requiredKeys: Set<String> = [
+            "kind",
+            "rejectedMessageId",
+            "publishedAt",
+            "pairing_secret_version",
+            "targetSourceKey",
+        ]
+        guard signature == nil,
+              sender == "mac",
+              text == "signature_invalid_resync",
+              sessionID == nil,
+              attachments?.isEmpty != false,
+              let metadata,
+              Set(metadata.keys) == requiredKeys,
+              metadata["kind"] == "signature_invalid_resync",
+              metadata["rejectedMessageId"] == (correlationID ?? ""),
+              metadata["targetSourceKey"]?.isEmpty == false,
+              let versionText = metadata["pairing_secret_version"],
+              let version = Int(versionText),
+              version >= 0
+        else { return false }
+        // `publishedAt` may be empty when the KVS timestamp has not reached
+        // this Mac yet; the hint is still only a request to re-read KVS.
+        return metadata["publishedAt"] != nil
+    }
 }
 
 // MARK: - Durable iCloud action transactions

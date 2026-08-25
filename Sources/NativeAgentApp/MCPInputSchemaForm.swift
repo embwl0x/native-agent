@@ -359,6 +359,136 @@ struct MCPInputSchemaForm: View {
 
     // MARK: - Foundation conversion (used by callMCPToolWithInput)
 
+    /// Returns a user-facing refusal reason when form values do not satisfy
+    /// the schema that was mounted for this tool. This is intentionally shared
+    /// by the Run button and AppModel's dispatch boundary: a stale binding or
+    /// a direct caller must not bypass the UI's required/type checks.
+    nonisolated static func validationMessage(
+        schema: JSONValue?,
+        values: [String: JSONValue]
+    ) -> String? {
+        guard let schema else { return nil }
+        guard case .object(let root) = schema else {
+            return "This tool's input schema is unavailable because it is not an object."
+        }
+
+        let properties: [String: JSONValue]?
+        if let rawProperties = root["properties"] {
+            guard case .object(let decodedProperties) = rawProperties else {
+                return "This tool's input schema has malformed properties."
+            }
+            properties = decodedProperties
+        } else {
+            properties = nil
+        }
+
+        let required: [String]
+        if let rawRequired = root["required"] {
+            guard case .array(let values) = rawRequired,
+                  values.allSatisfy({ if case .string = $0 { return true } else { return false } })
+            else {
+                return "This tool's input schema has malformed required fields."
+            }
+            required = values.compactMap { if case .string(let field) = $0 { return field } else { return nil } }
+        } else {
+            required = []
+        }
+
+        guard let properties else {
+            return required.isEmpty ? nil : "This tool's input schema cannot identify its required fields."
+        }
+
+        for field in required {
+            guard properties[field] != nil else {
+                return "This tool's input schema requires an unknown field ‘\(displayField(field))’."
+            }
+            guard values[field] != nil else {
+                return "Enter a value for required field ‘\(displayField(field))’."
+            }
+        }
+
+        for (field, value) in values {
+            guard let propertySchema = properties[field] else {
+                return "Input field ‘\(displayField(field))’ is not accepted by this tool."
+            }
+            if let reason = propertyValidationMessage(value: value, schema: propertySchema) {
+                return "Input ‘\(displayField(field))’ \(reason)."
+            }
+        }
+        return nil
+    }
+
+    nonisolated private static func propertyValidationMessage(
+        value: JSONValue,
+        schema: JSONValue
+    ) -> String? {
+        guard case .object(let object) = schema else {
+            return "has an unavailable schema"
+        }
+
+        for keyword in ["anyOf", "oneOf"] {
+            if let union = object[keyword] {
+                guard case .array(let branches) = union, !branches.isEmpty else {
+                    return "has a malformed \(keyword) schema"
+                }
+                return branches.contains { propertyValidationMessage(value: value, schema: $0) == nil }
+                    ? nil
+                    : "does not match the \(keyword) schema"
+            }
+        }
+
+        if case .array(let options)? = object["enum"], !options.isEmpty,
+           !options.contains(value) {
+            return "is not one of the allowed values"
+        }
+
+        guard let rawType = object["type"] else { return nil }
+        let types: [String]
+        switch rawType {
+        case .string(let type):
+            types = [type]
+        case .array(let values):
+            guard values.allSatisfy({ if case .string = $0 { return true } else { return false } }) else {
+                return "has a malformed type schema"
+            }
+            types = values.compactMap { if case .string(let type) = $0 { return type } else { return nil } }
+        default:
+            return "has a malformed type schema"
+        }
+
+        guard !types.isEmpty,
+              types.count <= 8,
+              types.allSatisfy({ !$0.isEmpty && $0.count <= 40 }),
+              types.allSatisfy({ ["null", "boolean", "string", "integer", "number", "array", "object"].contains($0) })
+        else { return "has an unavailable type schema" }
+        guard types.contains(where: { valueMatchesType(value, type: $0) }) else {
+            return "must be \(types.joined(separator: " or "))"
+        }
+        if types.contains("integer"), case .int(let integer) = value,
+           let (minimum, maximum) = propMinMaxInt(schema),
+           !(Int64(minimum)...Int64(maximum)).contains(integer) {
+            return "must be between \(minimum) and \(maximum)"
+        }
+        return nil
+    }
+
+    nonisolated private static func valueMatchesType(_ value: JSONValue, type: String) -> Bool {
+        switch (type, value) {
+        case ("null", .null), ("boolean", .bool), ("string", .string),
+             ("integer", .int), ("number", .int), ("array", .array), ("object", .object):
+            return true
+        case ("number", .double(let value)):
+            return value.isFinite
+        default:
+            return false
+        }
+    }
+
+    nonisolated private static func displayField(_ field: String) -> String {
+        let trimmed = field.trimmingCharacters(in: .whitespacesAndNewlines)
+        return String((trimmed.isEmpty ? "unnamed" : trimmed).prefix(80))
+    }
+
     nonisolated static func toFoundationDict(_ values: [String: JSONValue]) -> [String: Any] {
         var out: [String: Any] = [:]
         for (k, v) in values { out[k] = jsonValueToAny(v) }

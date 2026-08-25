@@ -1,5 +1,33 @@
 import SwiftUI
 
+/// The banner's live-state projection. It is deliberately derived from the
+/// runtime streaming set rather than session-list membership: a turn may still
+/// be real while its index row is refreshing, and the user needs a route/Stop
+/// affordance for that adverse state instead of a silently missing banner.
+enum MacChatOtherSessionsProjection {
+    static func otherRunning(
+        streamingSessionIDs: Set<String>,
+        activeSessionID: String,
+        canonicalSessionIDs: [String]
+    ) -> [String] {
+        let active = activeSessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let running = Set(streamingSessionIDs.compactMap { rawID -> String? in
+            let sessionID = rawID.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !sessionID.isEmpty, sessionID != active else { return nil }
+            return sessionID
+        })
+        let knownOrder = Dictionary(
+            canonicalSessionIDs.enumerated().map { ($0.element, $0.offset) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        return running.sorted { lhs, rhs in
+            let lhsOrder = knownOrder[lhs] ?? Int.max
+            let rhsOrder = knownOrder[rhs] ?? Int.max
+            return lhsOrder == rhsOrder ? (lhs < rhs) : (lhsOrder < rhsOrder)
+        }
+    }
+}
+
 /// 658.14 — the "work is running somewhere else" banner, and the way to get to
 /// it.
 ///

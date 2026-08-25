@@ -76,7 +76,110 @@ private enum SkillFilter: String, CaseIterable, Identifiable {
     case installed = "Installed"
     case active   = "Active"
     case dormant  = "Dormant"
+    case quarantined = "Quarantined"
+    case unknown = "Unknown"
     var id: String { rawValue }
+}
+
+enum SkillLifecyclePresentation {
+    enum CanonicalState: Equatable {
+        case drafted, installed, active, dormant, quarantined
+        case unknown(String?)
+    }
+
+    static func canonicalState(for skill: SkillManifestEntry) -> CanonicalState {
+        canonicalState(raw: skill.state)
+    }
+
+    static func canonicalState(raw: String?) -> CanonicalState {
+        switch raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "drafted": return .drafted
+        case "installed": return .installed
+        case "active": return .active
+        case "dormant": return .dormant
+        case "quarantined": return .quarantined
+        default: return .unknown(raw)
+        }
+    }
+
+    static func filtered(_ skills: [SkillManifestEntry], state: String?) -> [SkillManifestEntry] {
+        guard let state else { return skills }
+        if state == "unknown" {
+            return skills.filter {
+                if case .unknown = canonicalState(for: $0) { return true }
+                return false
+            }
+        }
+        return skills.filter { $0.state?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == state }
+    }
+
+    static func stateLabel(for skill: SkillManifestEntry) -> String {
+        stateLabel(for: canonicalState(for: skill))
+    }
+
+    static func stateLabel(for state: CanonicalState) -> String {
+        switch state {
+        case .drafted: return "Drafted"
+        case .installed: return "Installed"
+        case .active: return "Active"
+        case .dormant: return "Dormant"
+        case .quarantined: return "Quarantined"
+        case .unknown(let raw):
+            let value = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return value.isEmpty ? "State unknown" : "Unknown: \(value)"
+        }
+    }
+
+    static func stateColor(for skill: SkillManifestEntry) -> Color {
+        stateColor(for: canonicalState(for: skill))
+    }
+
+    static func stateColor(for state: CanonicalState) -> Color {
+        switch state {
+        case .active: return .green
+        case .installed: return .blue
+        case .drafted: return .orange
+        case .dormant: return .gray
+        case .quarantined: return .red
+        case .unknown: return .secondary
+        }
+    }
+}
+
+enum SkillSourcePresentation {
+    enum Source: Equatable {
+        case persona, learned, registry
+        case unknown(String?)
+    }
+
+    static func source(for skill: SkillManifestEntry) -> Source {
+        switch skill.source?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "persona": return .persona
+        case "learned", "data": return .learned
+        case "registry": return .registry
+        default: return .unknown(skill.source)
+        }
+    }
+
+    static func label(for source: Source) -> String {
+        switch source {
+        case .persona: return "PERSONA"
+        case .learned: return "LEARNED"
+        case .registry: return "REGISTRY"
+        case .unknown(let raw):
+            let value = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return value.isEmpty ? "UNKNOWN" : value.uppercased()
+        }
+    }
+
+    static func color(for source: Source) -> Color {
+        switch source {
+        case .persona: return .purple
+        case .learned: return .teal
+        case .registry: return .indigo
+        case .unknown: return .secondary
+        }
+    }
 }
 
 // MARK: - Store
@@ -90,13 +193,10 @@ final class SkillLifecycleStore: ObservableObject {
     // MARK: Fetch (iCloud snapshot)
 
     func refresh(pairingStore: PairingStore) async {
-        guard pairingStore.isPaired else {
-            bannerError = "Pair iPhone with the Mac to see skills."
-            return
-        }
-        bannerError = nil
         isLoading = true
         defer { isLoading = false }
+
+        guard applyPairingGate(isPaired: pairingStore.isPaired) else { return }
 
         let engine = iCloudSyncEngine.shared
         await iCloudBridge.shared.pollIncomingNow()
@@ -113,28 +213,40 @@ final class SkillLifecycleStore: ObservableObject {
         }
     }
 
+    /// A prior paired snapshot is no longer current once pairing is absent.
+    /// Clearing it prevents an old Mac catalog from looking live behind an
+    /// unpaired warning banner.
+    @discardableResult
+    func applyPairingGate(isPaired: Bool) -> Bool {
+        guard isPaired else {
+            skills = []
+            bannerError = "Pair iPhone with the Mac to see skills."
+            return false
+        }
+        bannerError = nil
+        return true
+    }
+
     private static func mergedSkills(learned: [SkillManifestEntry], manifest: [SkillManifestEntry]) -> [SkillManifestEntry] {
         var seen: Set<String> = []
         var merged: [SkillManifestEntry] = []
 
-        func append(_ skill: SkillManifestEntry, fallbackSource: String) {
+        func append(_ skill: SkillManifestEntry) {
             let key = (skill.id.isEmpty ? skill.name : skill.id).lowercased()
             guard !seen.contains(key) else { return }
             seen.insert(key)
-            var normalized = skill
-            if normalized.source?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true {
-                normalized.source = fallbackSource
-            }
-            merged.append(normalized)
+            // A missing or blank producer provenance is meaningful: retain it
+            // so the screen can say Unknown instead of inventing "learned".
+            merged.append(skill)
         }
 
         // Learned skills are the useful runtime catalog; manifest skills are
         // connector/tool packs and should supplement, not hide, that list.
         for skill in learned {
-            append(skill, fallbackSource: "learned")
+            append(skill)
         }
         for skill in manifest {
-            append(skill, fallbackSource: "registry")
+            append(skill)
         }
         return merged
     }
@@ -150,13 +262,10 @@ struct SkillLifecycleView: View {
     @State private var selectedSkill: SkillManifestEntry?
 
     private var filtered: [SkillManifestEntry] {
-        switch filter {
-        case .all:       return store.skills
-        case .drafted:   return store.skills.filter { $0.state == "drafted" }
-        case .installed: return store.skills.filter { $0.state == "installed" }
-        case .active:    return store.skills.filter { $0.state == "active" }
-        case .dormant:   return store.skills.filter { $0.state == "dormant" }
-        }
+        SkillLifecyclePresentation.filtered(
+            store.skills,
+            state: filter == .all ? nil : filter.rawValue.lowercased()
+        )
     }
 
     var body: some View {
@@ -179,12 +288,14 @@ struct SkillLifecycleView: View {
                     AppEmptyState(
                         title: "Skills unavailable",
                         systemImage: "iphone.and.arrow.forward",
+                        kind: .unavailable,
                         description: error
                     )
                 } else if filtered.isEmpty {
                     AppEmptyState(
                         title: "No skills match this filter",
                         systemImage: "sparkles",
+                        kind: .empty,
                         description: emptyDescription
                     )
                 } else {
@@ -256,6 +367,8 @@ struct SkillLifecycleView: View {
         case .installed: return "No installed skills. Skills move to Installed after you approve them."
         case .active:    return "No active skills. Skills become Active the first time the agent calls them."
         case .dormant:   return "No dormant skills. Dormant skills haven't been called in a while."
+        case .quarantined: return "No quarantined skills. Quarantined skills require Mac review before they can run again."
+        case .unknown: return "No skills with unknown state. Their original Mac state is preserved when present."
         }
     }
 }
@@ -267,32 +380,15 @@ struct SkillRow: View {
     let onTap: () -> Void
 
     private var stateColor: Color {
-        switch skill.state ?? "" {
-        case "active":      return .green
-        case "installed":   return .blue
-        case "drafted":     return .orange
-        case "dormant":     return .gray
-        case "quarantined": return .red
-        default:            return .secondary
-        }
+        SkillLifecyclePresentation.stateColor(for: skill)
     }
 
     private var sourceColor: Color {
-        switch (skill.source ?? "").lowercased() {
-        case "persona":  return .purple
-        case "learned", "data": return .teal
-        case "registry": return .indigo
-        default:         return .secondary
-        }
+        SkillSourcePresentation.color(for: SkillSourcePresentation.source(for: skill))
     }
 
     private var sourceBadgeLabel: String {
-        switch (skill.source ?? "").lowercased() {
-        case "persona":  return "PERSONA"
-        case "learned", "data": return "LEARNED"
-        case "registry": return "REGISTRY"
-        default:         return (skill.source ?? "UNKNOWN").uppercased()
-        }
+        SkillSourcePresentation.label(for: SkillSourcePresentation.source(for: skill))
     }
 
     var body: some View {
@@ -311,7 +407,7 @@ struct SkillRow: View {
                                     .lineLimit(1)
                             }
                             // State badge
-                            Text((skill.state ?? "unknown").capitalized)
+                            Text(SkillLifecyclePresentation.stateLabel(for: skill))
                                 .font(AppFont.label)
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 3)
@@ -320,14 +416,12 @@ struct SkillRow: View {
                         }
                         Spacer()
                         // Source badge
-                        if skill.source != nil {
-                            Text(sourceBadgeLabel)
-                                .font(AppFont.tag)
-                                .padding(.horizontal, 7)
-                                .padding(.vertical, 3)
-                                .background(sourceColor.opacity(0.15), in: Capsule())
-                                .foregroundStyle(sourceColor)
-                        }
+                        Text(sourceBadgeLabel)
+                            .font(AppFont.tag)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(sourceColor.opacity(0.15), in: Capsule())
+                            .foregroundStyle(sourceColor)
                     }
 
                     // Description
@@ -392,9 +486,7 @@ struct SkillLifecycleDetailSheet: View {
                             if let state = skill.state {
                                 stateChip(state)
                             }
-                            if let source = skill.source {
-                                sourceChip(source)
-                            }
+                            sourceChip(skill)
                             if let kind = skill.kind {
                                 Text(kind.capitalized)
                                     .font(AppFont.tag)
@@ -448,6 +540,9 @@ struct SkillLifecycleDetailSheet: View {
             .navigationTitle(skill.name)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    MacStatusChip()
+                }
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Close") { dismiss() }
                 }
@@ -458,17 +553,9 @@ struct SkillLifecycleDetailSheet: View {
     // MARK: Badge helpers
 
     private func stateChip(_ state: String) -> some View {
-        let color: Color = {
-            switch state {
-            case "active":      return .green
-            case "installed":   return .blue
-            case "drafted":     return .orange
-            case "dormant":     return .gray
-            case "quarantined": return .red
-            default:            return .secondary
-            }
-        }()
-        return Text(state.capitalized)
+        let canonical = SkillLifecyclePresentation.canonicalState(raw: state)
+        let color = SkillLifecyclePresentation.stateColor(for: canonical)
+        return Text(SkillLifecyclePresentation.stateLabel(for: canonical))
             .font(AppFont.label)
             .padding(.horizontal, 8)
             .padding(.vertical, 3)
@@ -476,21 +563,14 @@ struct SkillLifecycleDetailSheet: View {
             .foregroundStyle(color)
     }
 
-    private func sourceChip(_ source: String) -> some View {
-        let (label, color): (String, Color) = {
-            switch source.lowercased() {
-            case "persona":  return ("PERSONA", .purple)
-            case "learned", "data": return ("LEARNED", .teal)
-            case "registry": return ("REGISTRY", .indigo)
-            default:         return (source.uppercased(), .secondary)
-            }
-        }()
-        return Text(label)
+    private func sourceChip(_ skill: SkillManifestEntry) -> some View {
+        let source = SkillSourcePresentation.source(for: skill)
+        return Text(SkillSourcePresentation.label(for: source))
             .font(AppFont.tag)
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
-            .background(color.opacity(0.15), in: Capsule())
-            .foregroundStyle(color)
+            .background(SkillSourcePresentation.color(for: source).opacity(0.15), in: Capsule())
+            .foregroundStyle(SkillSourcePresentation.color(for: source))
     }
 }
 

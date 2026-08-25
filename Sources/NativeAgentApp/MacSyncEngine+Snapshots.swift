@@ -15,6 +15,97 @@ import CognitiveSubstrate
 import KnowledgeGraph
 import PersistenceCore
 
+/// Reconciles the persisted snapshot-digest cache against the files the iPhone
+/// actually reads.  The digest cache is an optimization, never evidence that
+/// a file remains intact: a same-name file can be truncated or replaced by an
+/// out-of-process iCloud/crash-window event while its old digest still sits in
+/// memory.  This bounded check runs only in MacSync's slow integrity fallback.
+enum MacSyncSnapshotIntegrity {
+    static let maximumSnapshotBytes = 8 * 1024 * 1024
+
+    struct Report: Equatable {
+        let retainedDigests: [String: String]
+        let missingManagedFiles: [String]
+        let mismatchedManagedFiles: [String]
+        let unreadableManagedFiles: [String]
+        let retiredDigestKeys: [String]
+
+        var requiresRepair: Bool {
+            !missingManagedFiles.isEmpty
+                || !mismatchedManagedFiles.isEmpty
+                || !unreadableManagedFiles.isEmpty
+        }
+
+        var integrityFailures: [String] {
+            (missingManagedFiles.map { "\($0) is missing" }
+                + mismatchedManagedFiles.map { "\($0) digest mismatch" }
+                + unreadableManagedFiles.map { "\($0) unreadable" })
+                .sorted()
+        }
+    }
+
+    /// Only files carried by the current mobile snapshot manifest are repaired.
+    /// A missing digest for a retired file is pruned without manufacturing a
+    /// costly rebuild for a contract the phone no longer consumes.
+    static func reconcile(
+        digests: [String: String],
+        in directory: URL,
+        managedFilenames: Set<String> = Set(NAMobileSnapshotGroup.allCases.flatMap(\.filenames))
+    ) -> Report {
+        let fileManager = FileManager.default
+        var retained: [String: String] = [:]
+        var missing: [String] = []
+        var mismatched: [String] = []
+        var unreadable: [String] = []
+        var retired: [String] = []
+
+        for (filename, expectedDigest) in digests {
+            let isManaged = managedFilenames.contains(filename)
+            let url = directory.appendingPathComponent(filename)
+            guard fileManager.fileExists(atPath: url.path) else {
+                if isManaged { missing.append(filename) } else { retired.append(filename) }
+                continue
+            }
+            guard isManaged else {
+                // A stale key must not keep claiming a file that no longer
+                // belongs to the mobile contract, even if a same-name artifact
+                // happens to remain in the directory.
+                retired.append(filename)
+                continue
+            }
+            do {
+                let attributes = try fileManager.attributesOfItem(atPath: url.path)
+                guard attributes[.type] as? FileAttributeType == .typeRegular,
+                      let byteCount = attributes[.size] as? NSNumber,
+                      byteCount.intValue >= 0,
+                      byteCount.intValue <= maximumSnapshotBytes else {
+                    unreadable.append(filename)
+                    continue
+                }
+                let actualDigest = digest(try Data(contentsOf: url))
+                guard actualDigest == expectedDigest else {
+                    mismatched.append(filename)
+                    continue
+                }
+                retained[filename] = expectedDigest
+            } catch {
+                unreadable.append(filename)
+            }
+        }
+        return Report(
+            retainedDigests: retained,
+            missingManagedFiles: missing.sorted(),
+            mismatchedManagedFiles: mismatched.sorted(),
+            unreadableManagedFiles: unreadable.sorted(),
+            retiredDigestKeys: retired.sorted()
+        )
+    }
+
+    static func digest(_ data: Data) -> String {
+        Data(SHA256.hash(data: data)).map { String(format: "%02x", $0) }.joined()
+    }
+}
+
 struct MobileToolCatalogRecord: Codable, Equatable, Sendable {
     var id: String
     var name: String
@@ -243,12 +334,12 @@ extension MacSyncEngine {
             var promotion: [PromotionCandidateSummary]?
             do { promotion = try await promotionTask } catch { recordFetchFailure("promotion_candidates", error) }
             var organismLivingStatus = await organismTask
-            var organismLivingStatusReady = true
             // Needs-User APNS is reserved for an exact canonical owner wait.
             // Approvals have their own APNS lane. Generic blocked work,
             // provider caution, reflex review, and other body trouble stay
             // visible as attention but must not manufacture a user request.
             var deskItems: [DeskItem]?
+            var deskLivingStatusReadSucceeded = false
             do {
                 let desk = try await SwiftNativeDeskStore(
                     dataRoot: PersistenceCore.defaultDataRoot()
@@ -265,10 +356,18 @@ extension MacSyncEngine {
                     needsUser: ownerDecisionCount > 0,
                     why: why
                 )
+                deskLivingStatusReadSucceeded = true
             } catch {
-                organismLivingStatusReady = false
-                NSLog("needs_user_notify: desk read failed, skipping evaluation: \(error.localizedDescription)")
+                // Do not retain a prior healthy-looking mobile snapshot when
+                // the desk half of the living-status projection is unreadable.
+                // This bounded marker replaces it and tells the phone that its
+                // counters/attention state are not a complete current read.
+                NSLog("needs_user_notify: desk read failed, publishing explicit status: \(error.localizedDescription)")
             }
+            organismLivingStatus = Self.organismLivingStatusAfterDeskRead(
+                organismLivingStatus,
+                deskReadSucceeded: deskLivingStatusReadSucceeded
+            )
             var providers: [ProviderInfo]?
             if includeHeavySnapshots {
                 do { skills = try await api.getSkills() } catch { recordFetchFailure("skills", error) }
@@ -470,9 +569,7 @@ extension MacSyncEngine {
                 }
             }
             if let health { await write(health, to: "health.json") }
-            if organismLivingStatusReady {
-                await write(organismLivingStatus, to: "organism_living_status.json")
-            }
+            await write(organismLivingStatus, to: "organism_living_status.json")
             if let memProposals { await write(memProposals, to: "memory_proposals.json") }
             if let training { await write(training, to: "training_proposals.json") }
             if let promotion { await write(promotion, to: "promotion_candidates.json") }
@@ -522,6 +619,14 @@ extension MacSyncEngine {
 
             // Notify iOS via KVS only when content changed; unchanged digest
             // ticks should not wake the phone into another full snapshot read.
+            // A digest whose file is gone (a retired snapshot name, or a deleted
+            // cache) must not survive: the phone diffs against this map, and a
+            // key with no file reads as "already have it" for data it never saw.
+            let prunedDigests = Self.digestsPrunedToExistingFiles(snapshotFileDigests, in: snapshotDir)
+            if prunedDigests.count != snapshotFileDigests.count {
+                snapshotFileDigests = prunedDigests
+                saveSnapshotDigests()   // durable even on a pass that wrote nothing
+            }
             if wroteAnySnapshot {
                 let changedGroups = NAMobileSnapshotGroup.groups(
                     containingAny: changedSnapshotFilenames
@@ -750,6 +855,13 @@ extension MacSyncEngine {
         return .changed
     }
 
+    /// Digest keys whose snapshot file is present in `dir`. Pure, so the
+    /// retire-a-snapshot lifecycle (file removed, digest must go too) is pinned
+    /// without driving the engine.
+    nonisolated static func digestsPrunedToExistingFiles(_ digests: [String: String], in dir: URL) -> [String: String] {
+        digests.filter { FileManager.default.fileExists(atPath: dir.appendingPathComponent($0.key).path) }
+    }
+
     /// Coordinated write returning an optional error description (nil = success).
     /// nonisolated static — safe to call from detached tasks off the main actor.
     nonisolated private static func coordinatedWriteReturningError(data: Data, to url: URL) -> String? {
@@ -895,8 +1007,22 @@ extension MacSyncEngine {
                     evidenceIDs: $0.evidenceIDs,
                     reviewRequired: $0.reviewRequired
                 )
-            }
+            },
+            availability: snapshot.enabled ? .live : .disabled
         )
+    }
+
+    /// The status file is the mobile boundary for this combined organism + desk
+    /// projection. A failed desk read must replace, rather than preserve, a
+    /// previously complete file; disabled organism snapshots stay disabled.
+    nonisolated static func organismLivingStatusAfterDeskRead(
+        _ status: OrganismLivingStatusFile,
+        deskReadSucceeded: Bool
+    ) -> OrganismLivingStatusFile {
+        guard !deskReadSucceeded, status.enabled else { return status }
+        var unavailable = status
+        unavailable.markUnavailable(reason: "desk_status_unavailable")
+        return unavailable
     }
 
     /// Turn Inspector W4: compute the per-turn SUMMARY snapshot for the iOS

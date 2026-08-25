@@ -17,6 +17,70 @@ import Sparkle
 // When it is false the updater is never started (no background 404s either) and
 // the menu tells the truth instead of pretending to check.
 
+/// The modal model for builds where Sparkle cannot check. It owns both the
+/// release-page admission boundary and button-to-action mapping so the view
+/// never silently loses its only recovery path or routes an unrelated future
+/// button to the browser.
+struct UpdateUnavailableAlertPresentation: Equatable {
+    enum Action: Equatable {
+        case dismiss
+        case openReleases(URL)
+    }
+
+    struct Button: Equatable {
+        let title: String
+        let action: Action
+    }
+
+    let message: String
+    let informativeText: String
+    let buttons: [Button]
+
+    static func make(
+        reason: UpdateController.Unavailability,
+        info: [String: Any]
+    ) -> Self {
+        let rawVersion = (info["CFBundleShortVersionString"] as? String ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let version = rawVersion.isEmpty ? "this version" : rawVersion
+        var buttons = [Button(title: "OK", action: .dismiss)]
+        if let releaseURL = releasePageURL(in: info) {
+            buttons.append(Button(title: "Open Releases", action: .openReleases(releaseURL)))
+        }
+        return Self(
+            message: reason.message,
+            informativeText: "NativeAgent \(version)\n\n\(reason.detail)",
+            buttons: buttons
+        )
+    }
+
+    /// A release page is a user-facing escape hatch, so only an absolute HTTPS
+    /// URL with a host is admissible. Relative, scheme-less, and HTTP values
+    /// never become an external-navigation action.
+    static func releasePageURL(in info: [String: Any]) -> URL? {
+        let rawValue = (info["NativeAgentReleasePageURL"] as? String ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: rawValue),
+              url.scheme?.lowercased() == "https",
+              let host = url.host,
+              !host.isEmpty
+        else {
+            return nil
+        }
+        return url
+    }
+
+    /// NSAlert returns a button ordinal. Resolve that ordinal through the
+    /// presentation's ordered button model instead of assuming the second
+    /// button always opens releases; a future inserted action stays dismissive
+    /// unless it is explicitly declared as `.openReleases`.
+    func action(for response: NSApplication.ModalResponse) -> Action {
+        let index = response.rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
+        guard buttons.indices.contains(index) else { return .dismiss }
+        return buttons[index].action
+    }
+}
+
 @MainActor
 final class UpdateController: NSObject {
     /// One updater owns the host app. The app menu and both Settings surfaces
@@ -69,7 +133,25 @@ final class UpdateController: NSObject {
         var publicKey: String
     }
 
+    /// The scheduler has a materially different contract from a manual
+    /// "Check for Updates" click: it must keep landing without the user
+    /// remembering to ask. These states deliberately rely only on Sparkle's
+    /// scheduled-cycle callbacks plus the updater's own preferences domain.
+    enum ScheduledCheckEvidence: Equatable {
+        case unavailable(Unavailability)
+        case automaticChecksDisabled
+        case awaitingFirstCheck(expectedBy: Date)
+        case healthy(lastCompletedAt: Date)
+        case stale(lastCompletedAt: Date?, expectedBy: Date)
+        case failed(lastCompletedAt: Date, failedAt: Date)
+    }
+
     private static let persistedNoticeKey = "NativeAgent.updateNotice.v1"
+    static let scheduledCheckActivatedAtKey = "NativeAgent.updateScheduleActivatedAt.v1"
+    static let scheduledCheckCompletedAtKey = "NativeAgent.updateLastScheduledCheckAt.v1"
+    static let scheduledCheckFailureAtKey = "NativeAgent.updateLastScheduledFailureAt.v1"
+    static let scheduledCheckContextKey = "NativeAgent.updateScheduleContext.v1"
+    static let defaultScheduledCheckInterval: TimeInterval = 24 * 60 * 60
 
     let status = Status()
 
@@ -87,6 +169,7 @@ final class UpdateController: NSObject {
         // Created after super.init so the controller can carry `self` as the
         // updater delegate (found/not-found mirror into `status`).
         if unavailability == nil {
+            activateScheduledCheckEvidence(info: Bundle.main.infoDictionary ?? [:])
             updaterController = SPUStandardUpdaterController(
                 startingUpdater: true,
                 updaterDelegate: self,
@@ -123,11 +206,71 @@ final class UpdateController: NSObject {
 
     /// Compact copy shared by the visible Settings row and its footer.
     var settingsDetail: String {
-        if updatesAreAvailable {
+        Self.settingsDetail(for: unavailability)
+    }
+
+    /// Pure copy boundary for the Settings row. Keeping this separate from the
+    /// Sparkle controller makes the three truthful states testable without
+    /// starting an updater (which can otherwise contact the network at init).
+    static func settingsDetail(for unavailability: Unavailability?) -> String {
+        guard let unavailability else {
             return "NativeAgent checks the signed release feed automatically. "
                 + "You can also check now."
         }
-        return (unavailability ?? .notConfigured).detail
+        return unavailability.detail
+    }
+
+    /// Pure evaluator shared by the installed updater and its executable
+    /// contract. `preferences` is the app's actual UserDefaults domain when
+    /// called in production; passing a dictionary keeps adverse scheduler
+    /// states hermetic in evaluation.
+    static func scheduledCheckEvidence(
+        info: [String: Any],
+        preferences: [String: Any],
+        now: Date
+    ) -> ScheduledCheckEvidence {
+        if let unavailable = resolveUnavailability(info: info) {
+            return .unavailable(unavailable)
+        }
+        if (preferences["SUEnableAutomaticChecks"] as? Bool) == false {
+            return .automaticChecksDisabled
+        }
+
+        let interval = scheduledCheckInterval(info: info)
+        guard let context = scheduledCheckContext(info: info),
+              preferences[scheduledCheckContextKey] as? String == context,
+              let activatedAt = preferences[scheduledCheckActivatedAtKey] as? Date
+        else {
+            return .awaitingFirstCheck(expectedBy: now.addingTimeInterval(interval))
+        }
+
+        let expectedBy = activatedAt.addingTimeInterval(interval)
+        let completedAt = preferences[scheduledCheckCompletedAtKey] as? Date
+        let validCompletion = completedAt.flatMap { $0 >= activatedAt ? $0 : nil }
+        if let failedAt = preferences[scheduledCheckFailureAtKey] as? Date,
+           failedAt >= activatedAt,
+           failedAt >= (validCompletion ?? .distantPast) {
+            return .failed(lastCompletedAt: validCompletion ?? failedAt, failedAt: failedAt)
+        }
+        guard let validCompletion else {
+            return now > expectedBy
+                ? .stale(lastCompletedAt: nil, expectedBy: expectedBy)
+                : .awaitingFirstCheck(expectedBy: expectedBy)
+        }
+        let nextExpectedBy = validCompletion.addingTimeInterval(interval)
+        return now > nextExpectedBy
+            ? .stale(lastCompletedAt: validCompletion, expectedBy: nextExpectedBy)
+            : .healthy(lastCompletedAt: validCompletion)
+    }
+
+    static func scheduledCheckInterval(info: [String: Any]) -> TimeInterval {
+        guard let interval = (info["SUScheduledCheckInterval"] as? NSNumber)?.doubleValue,
+              interval.isFinite,
+              interval >= 60
+        else {
+            return defaultScheduledCheckInterval
+        }
+        return interval
     }
 
     /// Call from the "Check for Updates…" menu item.
@@ -146,27 +289,15 @@ final class UpdateController: NSObject {
     private func presentUnavailableExplanation() {
         let reason = unavailability ?? .notConfigured
         let info = Bundle.main.infoDictionary ?? [:]
-        let version = (info["CFBundleShortVersionString"] as? String) ?? "this version"
+        let presentation = UpdateUnavailableAlertPresentation.make(reason: reason, info: info)
 
         let alert = NSAlert()
         alert.alertStyle = .informational
-        alert.messageText = reason.message
-        alert.informativeText = "NativeAgent \(version)\n\n\(reason.detail)"
-        alert.addButton(withTitle: "OK")
+        alert.messageText = presentation.message
+        alert.informativeText = presentation.informativeText
+        presentation.buttons.forEach { alert.addButton(withTitle: $0.title) }
 
-        // Only offer the release page when the build actually carries one — never
-        // invent a destination just to make the dialog look more finished.
-        let releasePage = (info["NativeAgentReleasePageURL"] as? String ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let releaseURL = URL(string: releasePage).flatMap { url -> URL? in
-            guard let scheme = url.scheme?.lowercased(), scheme == "https" else { return nil }
-            return url
-        }
-        if releaseURL != nil {
-            alert.addButton(withTitle: "Open Releases")
-        }
-
-        if alert.runModal() == .alertSecondButtonReturn, let releaseURL {
+        if case let .openReleases(releaseURL) = presentation.action(for: alert.runModal()) {
             NSWorkspace.shared.open(releaseURL)
         }
     }
@@ -250,6 +381,11 @@ final class UpdateController: NSObject {
         return (installed, feed, key)
     }
 
+    private static func scheduledCheckContext(info: [String: Any]) -> String? {
+        guard let context = updateContext(info: info) else { return nil }
+        return "\(context.installedVersion)\u{1F}\(context.feedURL)"
+    }
+
     private static func isVersion(_ candidate: String, newerThan installed: String) -> Bool {
         SUStandardVersionComparator.default.compareVersion(
             candidate,
@@ -286,6 +422,41 @@ final class UpdateController: NSObject {
         status.availableVersion = version
     }
 
+    /// Marks the start of the first expected scheduled-check window for this
+    /// exact installed build/feed. A changed build or feed cannot inherit an
+    /// old receipt and falsely look healthy.
+    private func activateScheduledCheckEvidence(info: [String: Any]) {
+        guard let context = Self.scheduledCheckContext(info: info) else { return }
+        let defaults = UserDefaults.standard
+        guard defaults.string(forKey: Self.scheduledCheckContextKey) != context
+                || defaults.object(forKey: Self.scheduledCheckActivatedAtKey) == nil
+        else { return }
+
+        defaults.set(context, forKey: Self.scheduledCheckContextKey)
+        defaults.set(Date(), forKey: Self.scheduledCheckActivatedAtKey)
+        defaults.removeObject(forKey: Self.scheduledCheckCompletedAtKey)
+        defaults.removeObject(forKey: Self.scheduledCheckFailureAtKey)
+    }
+
+    /// Sparkle tells its delegate which cycles were background-scheduled. This
+    /// is intentionally not called by `checkForUpdates()`, so a manual click
+    /// cannot mask a silent scheduler failure.
+    private func recordScheduledCheckCompletion(error: Error?) {
+        let info = Bundle.main.infoDictionary ?? [:]
+        activateScheduledCheckEvidence(info: info)
+        guard let context = Self.scheduledCheckContext(info: info) else { return }
+        let defaults = UserDefaults.standard
+        guard defaults.string(forKey: Self.scheduledCheckContextKey) == context else { return }
+
+        let completedAt = Date()
+        defaults.set(completedAt, forKey: Self.scheduledCheckCompletedAtKey)
+        if error == nil {
+            defaults.removeObject(forKey: Self.scheduledCheckFailureAtKey)
+        } else {
+            defaults.set(completedAt, forKey: Self.scheduledCheckFailureAtKey)
+        }
+    }
+
     /// Hosts that only ever appear in placeholder/dry-run configuration. A build
     /// carrying one of these has no real feed no matter what else it claims.
     private static let placeholderHosts: Set<String> = [
@@ -305,5 +476,14 @@ extension UpdateController: SPUUpdaterDelegate {
 
     func updaterDidNotFindUpdate(_ updater: SPUUpdater) {
         setAvailableVersion(nil)
+    }
+
+    func updater(
+        _ updater: SPUUpdater,
+        didFinishUpdateCycleFor updateCheck: SPUUpdateCheck,
+        error: Error?
+    ) {
+        guard updateCheck == .updatesInBackground else { return }
+        recordScheduledCheckCompletion(error: error)
     }
 }

@@ -37,6 +37,10 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
 
     let allowsCanonicalBodyTools: Bool
     var usesCanonicalBody: Bool { allowsCanonicalBodyTools }
+    /// Interactive chat bodies enforce the per-session lazy-tool loadout.
+    /// Explicit diagnostic/procedure dispatchers can opt out because they do
+    /// not have a chat session whose loadout could be consulted.
+    let enforcesLazyToolLoading: Bool
 
     private struct BuiltInSchemaCacheKey: Hashable {
         let accessFlags: Int
@@ -51,6 +55,12 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
     /// Exact KG projection belonging to `dataRoot`.
     let knowledgeGraphPath: URL
     let swarmExecutor: (any AgentSwarmExecuting)?
+    /// Test-only observation of the default swarm provider assembly. It never
+    /// replaces the provider client or alters an agent_swarm execution.
+    let swarmProviderAssemblyObserver: (@Sendable (SwarmProviderAssembly) -> Void)?
+    /// Test-only observation of the inherited worker chat factory's Codex
+    /// environment. The default worker remains the ordinary chat factory.
+    let swarmWorkerCodexEnvironmentObserver: (@Sendable ([String: String]?) -> Void)?
     let providerLifecycleObserver: (any LLMCallLifecycleObserving)?
     /// Parent conversation approval projection reused by inherited swarm
     /// workers. It adds no authority; it only preserves the ordinary CONFIRM
@@ -60,6 +70,10 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
     /// Spotlight). nil in headless contexts — dispatch surfaces a
     /// `bridge_not_wired` error envelope to the LLM in that case.
     public let macIntegrationBridge: (any MacIntegrationToolBridge)?
+    /// Permission authority for the Mac integration route. Production uses the
+    /// shared app-root store; an explicit store keeps a dispatcher assembled
+    /// for another root from consulting live permission state.
+    let macIntegrationPermissionStore: MacIntegrationPermissionStore
     /// App-injected bridge for the self-evolution chat tools (propose / status
     /// / self_install). nil in headless / restricted contexts — dispatch
     /// surfaces a `bridge_not_wired` error envelope to the LLM in that case.
@@ -72,6 +86,10 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
     let claudeMessageWakeupOverride: (@Sendable ([String: JSONValue]) async -> JSONValue)?
     let ompMessageWakeupHelperOverride: URL?
     let ompMessageWakeupOverride: (@Sendable ([String: JSONValue]) async -> JSONValue)?
+    /// Rebuildable temporal continuity for the agent-readable screen. This is
+    /// dispatcher-local perception state, never memory, authority, or a second
+    /// screen owner.
+    let fourVerbLiveScene = SwiftToolDispatcherFourVerbLiveScene()
     private let builtInSchemaCacheLock = NSLock()
     private var builtInSchemaCache: [BuiltInSchemaCacheKey: [LLMToolSchema]] = [:]
 
@@ -111,10 +129,14 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
         memoryV2: SwiftNativeMemoryV2? = nil,
         knowledgeGraphPath: URL? = nil,
         allowProcessGlobalTools: Bool = true,
+        enforceLazyToolLoading: Bool? = nil,
         swarmExecutor: (any AgentSwarmExecuting)? = nil,
+        swarmProviderAssemblyObserver: (@Sendable (SwarmProviderAssembly) -> Void)? = nil,
+        swarmWorkerCodexEnvironmentObserver: (@Sendable ([String: String]?) -> Void)? = nil,
         providerLifecycleObserver: (any LLMCallLifecycleObserving)? = nil,
         swarmApprovalFiler: (any ApprovalFiler)? = nil,
         macIntegrationBridge: (any MacIntegrationToolBridge)? = nil,
+        macIntegrationPermissionStore: MacIntegrationPermissionStore? = nil,
         evolutionBridge: (any EvolutionToolBridge)? = nil,
         agentBridgeConfigRoot: URL? = nil,
         codexMessageNotificationPermissionOverride: Bool? = nil,
@@ -135,10 +157,18 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
             .appendingPathComponent("memory", isDirectory: true)
             .appendingPathComponent("knowledge_graph.json")
         self.allowsCanonicalBodyTools = allowProcessGlobalTools
+        self.enforcesLazyToolLoading = enforceLazyToolLoading
+            ?? (dataRoot == PersistenceCore.defaultDataRoot())
         self.swarmExecutor = swarmExecutor
+        self.swarmProviderAssemblyObserver = swarmProviderAssemblyObserver
+        self.swarmWorkerCodexEnvironmentObserver = swarmWorkerCodexEnvironmentObserver
         self.providerLifecycleObserver = providerLifecycleObserver
         self.swarmApprovalFiler = swarmApprovalFiler
         self.macIntegrationBridge = macIntegrationBridge
+        self.macIntegrationPermissionStore = macIntegrationPermissionStore
+            ?? (dataRoot == PersistenceCore.defaultDataRoot()
+                ? .shared
+                : MacIntegrationPermissionStore(dataRoot: dataRoot))
         self.evolutionBridge = evolutionBridge
         self.agentBridgeConfigRoot = agentBridgeConfigRoot
         self.codexMessageNotificationPermissionOverride = codexMessageNotificationPermissionOverride
@@ -237,7 +267,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
             return try await listAvailableToolSchemas()
         }
         let access = await fullMacToolAccess()
-        let allowed = Self.alwaysOnCoreNames.union(activeTools)
+        let allowed = Self.normalModelToolNames(activeTools: activeTools)
         var builtIn = cachedBuiltInToolSchemas(
             includeFullMacFileTools: access.fileOpsAllowed,
             includeFullMacSystemTools: access.systemAllowed,

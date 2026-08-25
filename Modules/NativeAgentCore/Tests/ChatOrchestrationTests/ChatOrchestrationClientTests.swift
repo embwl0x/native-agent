@@ -172,6 +172,7 @@ private final class RouteTupleCapturingAdapter: LLMAdapter, @unchecked Sendable 
 
     struct Call: Sendable {
         let model: String
+        let admittedModel: String?
         let provider: String?
         let effort: String?
         let tier: String?
@@ -190,6 +191,7 @@ private final class RouteTupleCapturingAdapter: LLMAdapter, @unchecked Sendable 
         let index = lock.withLock {
             recorded.append(Call(
                 model: model,
+                admittedModel: LLMCallContext.admittedModel,
                 provider: LLMCallContext.providerId,
                 effort: LLMCallContext.reasoningEffort,
                 tier: LLMCallContext.serviceTier,
@@ -676,6 +678,7 @@ private final class StructuredStreamingScriptLLM: LLMClient, @unchecked Sendable
 private final class ScriptedTextStreamingLLM: StreamingLLMClient, @unchecked Sendable {
     struct RouteCall: Sendable {
         let model: String?
+        let admittedModel: String?
         let provider: String?
         let effort: String?
         let tier: String?
@@ -747,6 +750,7 @@ private final class ScriptedTextStreamingLLM: StreamingLLMClient, @unchecked Sen
             _prompts.append(prompt)
             _routeCalls.append(RouteCall(
                 model: model,
+                admittedModel: LLMCallContext.admittedModel,
                 provider: LLMCallContext.providerId,
                 effort: LLMCallContext.reasoningEffort,
                 tier: LLMCallContext.serviceTier,
@@ -872,6 +876,22 @@ private func readJSONL(_ root: URL, sessionId: String) -> [[String: Any]] {
         out.append(parsed)
     }
     return out
+}
+
+private func durableAssistantOutcome(
+    root: URL,
+    sessionID: String
+) async throws -> (message: ChatMessage, value: JSONValue, observation: ResponseOutcomeObservationV2) {
+    let messages = try await SessionHistoryReader(dataRoot: root).messages(forSessionId: sessionID)
+    let assistant = try #require(messages.last { $0.role == "assistant" })
+    guard case .object(let row)? = assistant.extras,
+          case .object(let metadata)? = row["metadata"],
+          let value = metadata["outcomeObservation"],
+          let observation = ResponseOutcomeObservationV2(jsonValue: value) else {
+        Issue.record("durable assistant outcome did not pass the canonical decoder")
+        throw CocoaError(.coderReadCorrupt)
+    }
+    return (assistant, value, observation)
 }
 
 private func writeChatMessagesJSONL(root: URL, sessionId: String, rows: [[String: JSONValue]]) throws {
@@ -1207,6 +1227,13 @@ func swiftToolDispatcher_reports_swift_runtime_introspection_aliases() async thr
     }
     #expect(availableCount >= Int64(activeTools.count))
     #expect(agentObj["lazy_loading"] != nil)
+    guard case .object(let outcomeHealth)? = agentObj["outcome_dimension_health"] else {
+        Issue.record("expected production outcome population health")
+        return
+    }
+    #expect(outcomeHealth["status"] == .string("absent"))
+    #expect(outcomeHealth["source_status"] == .string("absent"))
+    #expect(outcomeHealth["absent_is_zero"] == .bool(false))
 
     let compat = try await tools.dispatch(tool: "daemon_introspect", input: [:], surface: "chat")
     guard case .object(let compatObj) = compat else {
@@ -1215,6 +1242,30 @@ func swiftToolDispatcher_reports_swift_runtime_introspection_aliases() async thr
     }
     #expect(compatObj["runtime"] == .string("swift-native"))
     #expect(compatObj["invoked_as"] == .string("daemon_introspect"))
+}
+
+@Test
+func swiftToolDispatcher_introspection_marksUnreadableOutcomePopulationUnavailable() async throws {
+    let root = try makeTempRoot("introspect-unreadable-outcome-population")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let chat = root.appendingPathComponent("chat", isDirectory: true)
+    try FileManager.default.createDirectory(at: chat, withIntermediateDirectories: true)
+    // A non-directory at the canonical population path is deterministic
+    // unreadable-store evidence (unlike chmod, which uid 0 can bypass).
+    try Data("not-a-transcript-directory".utf8).write(
+        to: chat.appendingPathComponent("messages")
+    )
+
+    let tools = SwiftToolDispatcher(dataRoot: root)
+    let value = try await tools.dispatch(tool: "agent_introspect", input: [:], surface: "chat")
+    guard case .object(let object) = value,
+          case .object(let health)? = object["outcome_dimension_health"] else {
+        Issue.record("expected outcome health in production introspection")
+        return
+    }
+    #expect(health["status"] == .string("unavailable"))
+    #expect(health["absent_is_zero"] == .bool(false))
+    #expect(health["error_class"] != nil)
 }
 
 @Test
@@ -2798,7 +2849,7 @@ func swiftToolDispatcher_tool_load_categoryWithSession_persistsTools() async thr
 func swiftToolDispatcher_turnActiveToolsAllowsLazyDispatchWithoutPersisting() async throws {
     let root = try makeTempRoot("turn-active-tools")
     defer { try? FileManager.default.removeItem(at: root) }
-    let tools = SwiftToolDispatcher(dataRoot: root)
+    let tools = SwiftToolDispatcher(dataRoot: root, enforceLazyToolLoading: true)
     let sessionId = "turn-active-\(UUID().uuidString)"
 
     let blocked = try await tools.dispatch(
@@ -3611,12 +3662,27 @@ func swiftToolDispatcher_lists_and_reads_persona_skill_bodies() async throws {
     }
 }
 
+// EVAL FENCE: core.chat.persistence
+// Ledger row: chat.persistence.outcomeDimensionStates
+//
+// This is the canonical accepted-turn path: admission, provider execution,
+// durable assistant persistence, then a reload of the exact outcome bytes.
 @Test
 func chatClient_non_streaming_no_tools_returns_response_and_persists() async throws {
     let root = try makeTempRoot("plain")
     let llm = MockLLMClient(scriptedResponses: ["hello from the model"])
     let tools = MockToolDispatchClient()
-    let engine = makeEngine(root: root, llm: llm, tools: tools)
+    let engine = makeEngine(
+        root: root,
+        llm: llm,
+        tools: tools,
+        router: StubRoutingForClient(
+            prefs: ["chat": SurfacePreference(
+                surface: "chat", model: "client-model", reasoningEffort: "high"
+            )],
+            active: ["chat": "openai_oauth_direct"]
+        )
+    )
     let client = SwiftNativeChatOrchestrationClient(
         engine: engine, tools: tools, llm: llm,
         history: SessionHistoryReader(dataRoot: root), dataRoot: root,
@@ -3640,9 +3706,119 @@ func chatClient_non_streaming_no_tools_returns_response_and_persists() async thr
     #expect(outcome["messageID"] as? String == lines[1]["id"] as? String)
     #expect(outcome["sessionID"] as? String == "s-plain")
     #expect(outcome["responsePersistence"] as? String == "persisted")
+    #expect(outcome["providerID"] as? String == "openai_oauth_direct")
+    let evidence = try #require(outcome["dimensionStates"] as? [String: String])
+    #expect(evidence["provider"] == "observed")
     let serializedOutcome = try JSONSerialization.data(withJSONObject: outcome)
     let outcomeText = String(decoding: serializedOutcome, as: UTF8.self)
     #expect(!outcomeText.contains("hello from the model"))
+
+    let admitted = try await durableAssistantOutcome(root: root, sessionID: "s-plain")
+    #expect(admitted.observation.dimensionStates == [
+        "responsePersistence": .observed,
+        "context": .censored,
+        "provider": .observed,
+        "tools": .notApplicable,
+        "motor": .notApplicable,
+        "reaction": .unknown,
+    ])
+
+    // A real accepted turn with no checked/inferred provider still persists a
+    // response, but must call that provider evidence unknown rather than
+    // inferring transport from successful model prose.
+    let missingLLM = MockLLMClient(scriptedResponses: ["reply without a provider route"])
+    let missingTools = MockToolDispatchClient()
+    let missingModel = "opaque-eval-model-with-no-provider"
+    let missingEngine = makeEngine(
+        root: root,
+        llm: missingLLM,
+        tools: missingTools,
+        router: StubRoutingForClient(prefs: [
+            "chat": SurfacePreference(
+                surface: "chat", model: missingModel, reasoningEffort: "medium"
+            ),
+        ])
+    )
+    let missingClient = SwiftNativeChatOrchestrationClient(
+        engine: missingEngine, tools: missingTools, llm: missingLLM,
+        history: SessionHistoryReader(dataRoot: root), dataRoot: root,
+        trust: SwiftNativeTrustCenter(dataRoot: root)
+    )
+    _ = try await missingClient.chat(
+        message: "provider route unavailable", sessionId: "s-missing-provider",
+        model: missingModel, reasoningEffort: "medium",
+        fileAccess: "workspace", attachments: [], suppressUserAppend: false
+    )
+    let missing = try await durableAssistantOutcome(
+        root: root,
+        sessionID: "s-missing-provider"
+    )
+    #expect(missing.observation.providerID == nil)
+    #expect(missing.observation.dimensionStates == [
+        "responsePersistence": .observed,
+        "context": .censored,
+        "provider": .unknown,
+        "tools": .notApplicable,
+        "motor": .notApplicable,
+        "reaction": .unknown,
+    ])
+
+    // Population health keeps absent observations separate from state counts,
+    // and names a permanently-dark nonterminal lane instead of presenting it
+    // as measured zero evidence.
+    try writeChatMessagesJSONL(
+        root: root,
+        sessionId: "s-legacy-without-outcome",
+        rows: [[
+            "id": .string("legacy-assistant"),
+            "sessionId": .string("s-legacy-without-outcome"),
+            "role": .string("assistant"),
+            "content": .string("legacy durable reply"),
+            "createdAt": .string("2026-08-24T00:00:00Z"),
+        ]]
+    )
+    let audit = try await OutcomeDimensionStatePopulationReader(dataRoot: root).read()
+    #expect(audit.totalRows == 3)
+    #expect(audit.absentObservations == 1)
+    #expect(audit.distributions["provider"]?[.observed] == 1)
+    #expect(audit.distributions["provider"]?[.unknown] == 1)
+    #expect(audit.distributions["reaction"]?[.unknown] == 2)
+    #expect(audit.permanentlyNonterminalDimensions.contains("reaction"))
+    #expect(audit.permanentlyNonterminalDimensions.contains("context"))
+    #expect(!audit.permanentlyNonterminalDimensions.contains("provider"))
+    #expect(audit.rankedLeads.contains("reaction: this dimension has no promoter wired"))
+    #expect(audit.rankedLeads.first?.contains("outcome observation absent") == true)
+
+    // A row derived from the real persisted assistant bytes but missing one of
+    // the six closed dimensions is corrupt, not a five-dimensional success.
+    guard case .object(var corruptRow)? = missing.message.extras,
+          case .object(var corruptMetadata)? = corruptRow["metadata"],
+          case .object(var corruptOutcome) = missing.value,
+          case .object(var corruptStates)? = corruptOutcome["dimensionStates"] else {
+        Issue.record("could not prepare durable corrupt outcome fixture")
+        return
+    }
+    corruptStates.removeValue(forKey: "reaction")
+    corruptOutcome["dimensionStates"] = .object(corruptStates)
+    corruptMetadata["outcomeObservation"] = .object(corruptOutcome)
+    corruptRow["metadata"] = .object(corruptMetadata)
+    let corruptRoot = try makeTempRoot("plain-corrupt-outcome")
+    defer { try? FileManager.default.removeItem(at: corruptRoot) }
+    try writeChatMessagesJSONL(
+        root: corruptRoot,
+        sessionId: "s-corrupt-outcome",
+        rows: [corruptRow]
+    )
+    let corruptMessages = try await SessionHistoryReader(dataRoot: corruptRoot)
+        .messages(forSessionId: "s-corrupt-outcome")
+    let corruptAssistant = try #require(corruptMessages.first)
+    guard case .object(let reloadedCorruptRow)? = corruptAssistant.extras,
+          case .object(let reloadedCorruptMetadata)? = reloadedCorruptRow["metadata"],
+          let reloadedCorruptOutcome = reloadedCorruptMetadata["outcomeObservation"] else {
+        Issue.record("corrupt durable row did not reload")
+        return
+    }
+    #expect(ResponseOutcomeObservationV2(jsonValue: reloadedCorruptOutcome) == nil)
 }
 
 // Ack-on-enqueue seam (wake-delivery-classification, 2026-07-25): the enqueue
@@ -3714,6 +3890,113 @@ func enqueueUserMessage_rejects_empty_message_without_touching_disk() async thro
         )
     }
     #expect(readJSONL(root, sessionId: "s-empty").isEmpty)
+}
+
+// Ledger row `chat.persistence.resolveSessionId`. The resolver is the one
+// filename/index boundary for every durable chat row. A missing identity used
+// to mint an invisible UUID here, producing an orphan transcript; malformed
+// identities already failed, but nothing proved all failure classes leave the
+// store untouched or that a normalized valid ID lands on one stable file.
+@Test
+func resolveSessionId_requiresAnExplicitSafeIdentity_andPersistenceUsesItsStableNormalizedForm() async throws {
+    let root = try makeTempRoot("resolve-session-id")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let llm = MockLLMClient(scriptedResponses: [])
+    let tools = MockToolDispatchClient()
+    let engine = makeEngine(root: root, llm: llm, tools: tools)
+    let client = SwiftNativeChatOrchestrationClient(
+        engine: engine, tools: tools, llm: llm,
+        history: SessionHistoryReader(dataRoot: root), dataRoot: root,
+        trust: SwiftNativeTrustCenter(dataRoot: root)
+    )
+
+    func expectRejected(_ sessionID: String?, _ expected: ChatOrchestrationError) {
+        do {
+            _ = try SwiftNativeChatOrchestrationClient.resolveSessionId(sessionID)
+            Issue.record("expected session id \(String(describing: sessionID)) to be rejected")
+        } catch let error as ChatOrchestrationError {
+            #expect(error == expected)
+        } catch {
+            Issue.record("unexpected error: \(error)")
+        }
+    }
+
+    // Nil is distinct from malformed input: it means the caller lost the
+    // conversation identity and must not be silently assigned a new one.
+    expectRejected(nil, .underlying("missing chat session id"))
+    for invalid in ["", " \n\t ", "../escape", "chat/messages", "chat\\messages", ".hidden", "a..b", "bad\u{0000}id"] {
+        expectRejected(invalid, .underlying("invalid chat session id"))
+    }
+
+    let rawID = " \n telegram:12345 \t "
+    let normalized = try SwiftNativeChatOrchestrationClient.resolveSessionId(rawID)
+    #expect(normalized == "telegram:12345")
+    #expect(
+        try SwiftNativeChatOrchestrationClient.resolveSessionId(rawID) == normalized,
+        "normalization must be stable across retries so a reload cannot split the transcript"
+    )
+
+    // Exercise the real append/index transaction, not a path helper: the raw
+    // input must become one canonical transcript and sessions.json identity.
+    let enqueued = try await client.enqueueUserMessage(
+        message: "retain this in the canonical session",
+        sessionId: rawID,
+        persona: nil,
+        surface: "chat"
+    )
+    #expect(enqueued.sessionId == normalized)
+    let messageDirectory = root
+        .appendingPathComponent("chat", isDirectory: true)
+        .appendingPathComponent("messages", isDirectory: true)
+    let transcript = messageDirectory.appendingPathComponent("\(normalized).jsonl")
+    #expect(FileManager.default.fileExists(atPath: transcript.path))
+    #expect(!FileManager.default.fileExists(atPath: messageDirectory.appendingPathComponent(rawID + ".jsonl").path))
+    #expect(readJSONL(root, sessionId: normalized).map { $0["content"] as? String } == ["retain this in the canonical session"])
+
+    let sessionsPath = root.appendingPathComponent("chat", isDirectory: true)
+        .appendingPathComponent("sessions.json")
+    let indexBefore = try Data(contentsOf: sessionsPath)
+    let indexRows = try JSONSerialization.jsonObject(with: indexBefore) as? [[String: Any]] ?? []
+    #expect(indexRows.map { $0["id"] as? String }.contains(normalized))
+
+    // The next mounted caller threads the retained canonical identity back to
+    // the same persistence boundary. It appends to this conversation rather
+    // than creating an orphan transcript/index row.
+    let repeated = try await client.enqueueUserMessage(
+        message: "append through the retained session",
+        sessionId: enqueued.sessionId,
+        persona: nil,
+        surface: "chat"
+    )
+    #expect(repeated.sessionId == normalized)
+    #expect(
+        readJSONL(root, sessionId: normalized).map { $0["content"] as? String }
+            == ["retain this in the canonical session", "append through the retained session"]
+    )
+    let indexAfterRepeat = try Data(contentsOf: sessionsPath)
+    let repeatRows = try JSONSerialization.jsonObject(with: indexAfterRepeat) as? [[String: Any]] ?? []
+    #expect(repeatRows.filter { $0["id"] as? String == normalized }.count == 1)
+
+    // Every adverse input fails before either the transcript or session index
+    // is changed. This includes nil, which is the former orphaning path.
+    let adverseInputs: [String?] = [nil, "", "   ", "../escape", "chat/messages", "bad\\id"]
+    for invalid in adverseInputs {
+        await #expect(throws: (any Error).self) {
+            _ = try await client.enqueueUserMessage(
+                message: "must not persist",
+                sessionId: invalid,
+                persona: nil,
+                surface: "chat"
+            )
+        }
+    }
+    #expect(try Data(contentsOf: sessionsPath) == indexAfterRepeat)
+    #expect(readJSONL(root, sessionId: normalized).count == 2)
+    let files = try FileManager.default.contentsOfDirectory(
+        at: messageDirectory,
+        includingPropertiesForKeys: nil
+    ).map(\.lastPathComponent).sorted()
+    #expect(files == ["\(normalized).jsonl", "\(normalized).jsonl.lock"])
 }
 
 @Test
@@ -4423,6 +4706,7 @@ func chatClient_freezesOneCheckedRouteAcrossContextAndMultipleProviderCalls() as
     #expect(router.checkedCallCount == 3)
     #expect(adapter.calls.count == 2)
     #expect(adapter.calls.allSatisfy { $0.model == "gpt-route-a" })
+    #expect(adapter.calls.allSatisfy { $0.admittedModel == "gpt-route-a" })
     #expect(adapter.calls.allSatisfy { $0.provider == "openai" })
     #expect(adapter.calls.allSatisfy { $0.effort == "medium" })
     #expect(adapter.calls.allSatisfy { $0.tier == "priority" })
@@ -4473,6 +4757,7 @@ func chatClient_streamingFreezesOneCheckedRouteAcrossIOSProviderCalls() async th
     #expect(finalText == "route remained frozen")
     #expect(adapter.calls.count == 2)
     #expect(adapter.calls.allSatisfy { $0.model == "gpt-route-a" })
+    #expect(adapter.calls.allSatisfy { $0.admittedModel == "gpt-route-a" })
     #expect(adapter.calls.allSatisfy { $0.provider == "openai" })
     #expect(adapter.calls.allSatisfy { $0.effort == "medium" })
     #expect(adapter.calls.allSatisfy { $0.tier == "priority" })
@@ -4526,11 +4811,56 @@ func chatClient_anthropicTextCompatibilityFreezesTelegramRouteAcrossToolRounds()
     #expect(llm.models.isEmpty)
     #expect(textStream.routeCalls.count == 2)
     #expect(textStream.routeCalls.allSatisfy { $0.model == "claude-opus-route-a" })
+    #expect(textStream.routeCalls.allSatisfy { $0.admittedModel == "claude-opus-route-a" })
     #expect(textStream.routeCalls.allSatisfy { $0.provider == "anthropic_oauth_direct" })
     #expect(textStream.routeCalls.allSatisfy { $0.effort == "high" })
     #expect(textStream.routeCalls.allSatisfy { $0.tier == "priority" })
     #expect(textStream.routeCalls.allSatisfy { $0.surface == "telegram" })
     #expect(router.checkedCallCount >= 1)
+}
+
+// EVAL FENCE: core.chat.engine / chat.admission.llmCallContextBinding
+// A provider invocation must receive the complete admitted tuple through its
+// structured task chain. `Task.detached` deliberately does not inherit it;
+// this negative control catches any future attempt to move an admitted read
+// across that isolation boundary and silently fall back to current routing.
+@Test
+func chatAdmissionBinding_isPresentInStructuredTasks_andAbsentInDetachedTasks() async throws {
+    struct Route: Sendable, Equatable {
+        let model: String?
+        let provider: String?
+        let effort: String?
+        let tier: String?
+    }
+    func currentRoute() -> Route {
+        Route(
+            model: LLMCallContext.admittedModel,
+            provider: LLMCallContext.providerId,
+            effort: LLMCallContext.reasoningEffort,
+            tier: LLMCallContext.serviceTier
+        )
+    }
+
+    let expected = Route(
+        model: "gpt-admitted",
+        provider: "openai_oauth_direct",
+        effort: "xhigh",
+        tier: "priority"
+    )
+    let observations = try await LLMCallContext.$admittedModel.withValue(expected.model) {
+        try await LLMCallContext.$providerId.withValue(expected.provider) {
+            try await LLMCallContext.$reasoningEffort.withValue(expected.effort) {
+                try await LLMCallContext.$serviceTier.withValue(expected.tier) {
+                    let structured = await Task { currentRoute() }.value
+                    let detached = await Task.detached { currentRoute() }.value
+                    return (structured, detached)
+                }
+            }
+        }
+    }
+
+    #expect(observations.0 == expected)
+    #expect(observations.1 == Route(model: nil, provider: nil, effort: nil, tier: nil))
 }
 
 @Test

@@ -28,6 +28,7 @@ enum SystemPermissionCapability: String, CaseIterable, Sendable {
     case speechRecognition
     case microphone
     case accessibility
+    case fullDiskAccess
     case screenRecording
     case automation
     case calendars
@@ -40,6 +41,7 @@ enum SystemPermissionCapability: String, CaseIterable, Sendable {
         case .speechRecognition: return "Speech Recognition"
         case .microphone: return "Microphone"
         case .accessibility: return "Accessibility"
+        case .fullDiskAccess: return "Full Disk Access"
         case .screenRecording: return "Screen Recording"
         case .automation: return "Automation"
         case .calendars: return "Calendar"
@@ -60,6 +62,7 @@ enum SystemPermissionCapability: String, CaseIterable, Sendable {
         case .speechRecognition: return "Privacy_SpeechRecognition"
         case .microphone: return "Privacy_Microphone"
         case .accessibility: return "Privacy_Accessibility"
+        case .fullDiskAccess: return "Privacy_AllFiles"
         case .screenRecording: return "Privacy_ScreenCapture"
         case .automation: return "Privacy_Automation"
         case .calendars: return "Privacy_Calendars"
@@ -80,7 +83,7 @@ enum SystemPermissionCapability: String, CaseIterable, Sendable {
         switch self {
         case .speechRecognition, .accessibility, .automation, .notifications:
             return true
-        case .microphone, .screenRecording, .calendars, .reminders, .contacts:
+        case .microphone, .screenRecording, .fullDiskAccess, .calendars, .reminders, .contacts:
             return false
         }
     }
@@ -158,6 +161,10 @@ enum SystemPermissionPreflight {
             // AX exposes no notDetermined/restricted distinction — it is a
             // boolean trust bit — so a non-trusted process reads as .denied.
             return AXIsProcessTrusted() ? .granted : .denied
+        case .fullDiskAccess:
+            // macOS has no safe, universal non-prompting FDA read. Do not
+            // infer authority from a probe of one arbitrary path.
+            return .unknown
         case .screenRecording:
             // CGPreflightScreenCaptureAccess is the preflight (no prompt);
             // CGRequestScreenCaptureAccess is the prompting sibling.

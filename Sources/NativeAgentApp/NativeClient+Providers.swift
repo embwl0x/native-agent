@@ -217,7 +217,7 @@ extension NativeClient {
     // or malformed — the daemon's empty-registry shape was an empty list.
     func listProviders() async throws -> [ProviderInfo] {
         try await listProviders(
-            dataRoot: PersistenceCore.defaultDataRoot(),
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(),
             authEnvironment: ProcessInfo.processInfo.environment
         )
     }
@@ -563,14 +563,31 @@ extension NativeClient {
     }
 
     func configureProvider(_ id: String, apiKey: String?, authMode: String, defaultModel: String? = nil) async throws -> EmptyResponse {
-        var config: [String: JSONValue] = ["auth_mode": .string(authMode)]
+        let provider = try await getProvider(id)
+        let supportedModes = provider.auth_modes.map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }
+        let requestedMode = authMode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        // The sheet always supplies a selected mode. Keep the existing
+        // programmatic/iCloud compatibility behavior for omitted values by
+        // selecting the provider's first advertised mode, never an invented
+        // generic fallback.
+        let normalizedMode = requestedMode.isEmpty ? (supportedModes.first ?? "") : requestedMode
+        guard supportedModes.contains(normalizedMode) else {
+            throw NSError(domain: "NativeAgentProvider", code: 400, userInfo: [
+                NSLocalizedDescriptionKey: "\(provider.display_name) does not support the \(normalizedMode.isEmpty ? "requested" : normalizedMode) authentication method"
+            ])
+        }
+        var config: [String: JSONValue] = ["auth_mode": .string(normalizedMode)]
         if let key = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty {
             config["api_key"] = .string(key)
         }
         if let model = defaultModel?.trimmingCharacters(in: .whitespacesAndNewlines), !model.isEmpty {
             config["default_model"] = .string(model)
         }
-        _ = try await SwiftNativeProviderRouting(dataRoot: PersistenceCore.defaultDataRoot())
+        _ = try await SwiftNativeProviderRouting(
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        )
             .configureProvider(id: id, config: .object(config))
         return EmptyResponse()
     }
@@ -580,7 +597,20 @@ extension NativeClient {
     // OpenAI hits GET /v1/models with a Bearer token and reports latency.
     // Anthropic has no free probe endpoint so we report tested:false.
     func testProvider(_ id: String) async throws -> ProviderTestResult {
-        let dataRoot = PersistenceCore.defaultDataRoot()
+        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        // This write is deliberately attached to the canonical, user-initiated
+        // reachability probe rather than to a provider-list refresh. A readable
+        // credential is not evidence that the provider was reachable. If the
+        // status-file write itself fails, leave the prior record untouched so
+        // its age truthfully becomes stale instead of fabricating a fresh row.
+        func recordProbeResult(_ result: ProviderTestResult) async -> ProviderTestResult {
+            do {
+                try await LLMProviderStatusFeed.write(result, dataRoot: dataRoot)
+            } catch {
+                NSLog("provider_status: could not persist provider check: \(error.localizedDescription)")
+            }
+            return result
+        }
         let (envVar, configFile): (String?, String?) = {
             switch id {
             case "openai": return ("OPENAI_API_KEY", "openai.json")
@@ -592,28 +622,28 @@ extension NativeClient {
         }()
 
         guard let envVar, let configFile else {
-            return ProviderTestResult(
+            return await recordProbeResult(ProviderTestResult(
                 provider_id: id, status: "unknown", tested: false,
                 response: nil, model_used: nil,
                 detail: "no native probe for \(id)", error: nil
-            )
+            ))
         }
         guard let apiKey = LLMCredentialResolver.resolveAPIKey(
             envVar: envVar, providerConfigFile: configFile, dataRoot: dataRoot
         ), !apiKey.isEmpty else {
-            return ProviderTestResult(
+            return await recordProbeResult(ProviderTestResult(
                 provider_id: id, status: "error", tested: false,
                 response: nil, model_used: nil,
                 detail: nil, error: "no api key configured"
-            )
+            ))
         }
 
         if id == "anthropic" {
-            return ProviderTestResult(
+            return await recordProbeResult(ProviderTestResult(
                 provider_id: id, status: "ok", tested: false,
                 response: nil, model_used: nil,
                 detail: "anthropic probe skipped", error: nil
-            )
+            ))
         }
 
         if id == "kimi-code" {
@@ -638,24 +668,24 @@ extension NativeClient {
                 let ms = Int(Date().timeIntervalSince(start) * 1000)
                 let code = (response as? HTTPURLResponse)?.statusCode ?? 0
                 if (200..<300).contains(code) {
-                    return ProviderTestResult(
+                    return await recordProbeResult(ProviderTestResult(
                         provider_id: id, status: "ok", tested: true,
                         response: nil, model_used: "kimi-for-coding",
                         detail: "latency=\(ms)ms", error: nil
-                    )
+                    ))
                 }
                 let hint = code == 401 ? "key rejected" : "HTTP \(code)"
-                return ProviderTestResult(
+                return await recordProbeResult(ProviderTestResult(
                     provider_id: id, status: "error", tested: true,
                     response: nil, model_used: "kimi-for-coding",
                     detail: "latency=\(ms)ms", error: hint
-                )
+                ))
             } catch {
-                return ProviderTestResult(
+                return await recordProbeResult(ProviderTestResult(
                     provider_id: id, status: "error", tested: true,
                     response: nil, model_used: nil,
                     detail: nil, error: error.localizedDescription
-                )
+                ))
             }
         }
 
@@ -675,23 +705,23 @@ extension NativeClient {
                 if id == "moonshot" {
                     _ = await MoonshotModelCatalog.models(dataRoot: dataRoot, refresh: true)
                 }
-                return ProviderTestResult(
+                return await recordProbeResult(ProviderTestResult(
                     provider_id: id, status: "ok", tested: true,
                     response: nil, model_used: nil,
                     detail: "latency=\(ms)ms", error: nil
-                )
+                ))
             }
-            return ProviderTestResult(
+            return await recordProbeResult(ProviderTestResult(
                 provider_id: id, status: "error", tested: true,
                 response: nil, model_used: nil,
                 detail: "latency=\(ms)ms", error: "HTTP \(code)"
-            )
+            ))
         } catch {
-            return ProviderTestResult(
+            return await recordProbeResult(ProviderTestResult(
                 provider_id: id, status: "error", tested: true,
                 response: nil, model_used: nil,
                 detail: nil, error: error.localizedDescription
-            )
+            ))
         }
     }
 
@@ -889,15 +919,24 @@ extension NativeClient {
 
     // Swift-native embedding status. The app no longer installs or probes
     // sentence-transformers/Python extras; the live truth is the MemoryV2
-    // process-wide embedder. Three terminal states: CoreML MiniLM when the
+    // root-resolved embedder. Three terminal states: CoreML MiniLM when the
     // bundled model loads, explicit mock when the user opted out via config
     // OR set NATIVE_AGENT_EMBEDDING_MOCK=1, and fail-closed (embed() throws)
     // when CoreML was requested but resources are missing / load failed and
     // no env opt-in.
     func getEmbeddingsStatus() async throws -> EmbeddingsStatus {
-        guard let runtime = await SwiftNativeMemoryV2.shared.embeddingRuntimeSnapshot() else {
+        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
+        guard let runtime = await memory.embeddingRuntimeSnapshot() else {
             throw MemoryV2Error.storageUnavailable
         }
+        return Self.embeddingsStatus(from: runtime)
+    }
+
+    /// Project a status from the exact runtime snapshot that performed an
+    /// action. Release uses this rather than resolving a second alternate-root
+    /// owner, which could make a fresh idle owner look like proof of release.
+    private static func embeddingsStatus(from runtime: EmbeddingRuntimeSnapshot) -> EmbeddingsStatus {
         let requestedCoreML = runtime.requestedBackend != ManagedEmbeddingProvider.mockBackend
         // effectiveCoreML must be TRUE only when the runtime is ACTUALLY
         // serving CoreML vectors — not when it's mock and not when it's
@@ -1050,10 +1089,12 @@ extension NativeClient {
     // The managed provider persists <dataRoot>/config/embeddings.json::backend
     // and immediately releases CoreML when disabled.
     func setEmbeddingsBackend(enabled: Bool) async throws -> EmbeddingsToggleResult {
-        let before = await SwiftNativeMemoryV2.shared.embeddingRuntimeSnapshot()
+        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
+        let before = await memory.embeddingRuntimeSnapshot()
         do {
-            try await SwiftNativeMemoryV2.shared.configureEmbeddingBackend(enabled: enabled)
-            let report = try await SwiftNativeMemoryV2.shared
+            try await memory.configureEmbeddingBackend(enabled: enabled)
+            let report = try await memory
                 .reindexAllMemoryEmbeddingsForCurrentProvider()
             let detail = "Atomically activated one embedding epoch across \(report.memories) memories, \(report.proposals) proposals, and \(report.tombstones) tombstones."
             let status = try await getEmbeddingsStatus()
@@ -1063,7 +1104,7 @@ extension NativeClient {
             // in the prior space. Restore the requested backend so recall
             // immediately returns to the previously active epoch.
             let wasEnabled = before?.requestedBackend != ManagedEmbeddingProvider.mockBackend
-            try? await SwiftNativeMemoryV2.shared.configureEmbeddingBackend(enabled: wasEnabled)
+            try? await memory.configureEmbeddingBackend(enabled: wasEnabled)
             throw error
         }
     }
@@ -1071,18 +1112,36 @@ extension NativeClient {
     // DAEMON-DEAD PORT (2026-06-02): configure the managed Swift embedding
     // runtime's idle-retention mode and return current status.
     func setEmbeddingsMemoryMode(mode: String) async throws -> EmbeddingsToggleResult {
-        try await SwiftNativeMemoryV2.shared.configureEmbeddingMemoryMode(mode)
+        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
+            .configureEmbeddingMemoryMode(mode)
         let status = try await getEmbeddingsStatus()
         return EmbeddingsToggleResult(ok: true, error: nil, detail: nil, status: status)
     }
 
     // DAEMON-DEAD PORT (2026-06-03): release the process-owned CoreML provider
     // reference. The next semantic recall lazy-loads it again unless the
-    // backend is disabled.
+    // backend is disabled. A returned success requires both the owner snapshot
+    // and the re-read status to agree that no model remains resident.
     func releaseEmbeddingsMemory() async throws -> EmbeddingsToggleResult {
-        _ = await SwiftNativeMemoryV2.shared.releaseEmbeddingMemory(reason: "manual release")
-        let status = try await getEmbeddingsStatus()
-        return EmbeddingsToggleResult(ok: true, error: nil, detail: "Released Swift CoreML embedding model memory.", status: status)
+        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
+        let released = await memory
+            .releaseEmbeddingMemory(reason: "manual release")
+        guard let postRelease = await memory.embeddingRuntimeSnapshot() else {
+            throw MemoryV2Error.storageUnavailable
+        }
+        let status = Self.embeddingsStatus(from: postRelease)
+        let verification = EmbeddingsMemoryReleaseVerification.verify(
+            releasedSnapshot: released,
+            reportedStatus: status
+        )
+        return EmbeddingsToggleResult(
+            ok: verification.ok,
+            error: verification.error,
+            detail: verification.detail,
+            status: status
+        )
     }
 
     // Retired with the zero-Python cutover. Embeddings are bundled as a CoreML

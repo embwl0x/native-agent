@@ -175,7 +175,7 @@ struct ChatRowDurabilityTests {
 
         await client.persistPartialIfNeeded(
             sessionId: "s-partial", runId: "r1", text: "half a rep",
-            cancelled: false, source: "app"
+            cancelled: false, source: "app", onNotice: { _, _ in }
         )
 
         #expect(spy.fastAppends == ["assistant/partial"])

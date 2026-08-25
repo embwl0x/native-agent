@@ -41,6 +41,28 @@ private actor RecordingSwarmToolClient: ToolDispatchClient {
     }
 }
 
+private final class SwarmProviderAssemblyCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var assembly: SwarmProviderAssembly?
+    private var workerCodexEnvironment: [String: String]?
+
+    func record(_ value: SwarmProviderAssembly) {
+        lock.withLock { assembly = value }
+    }
+
+    func value() -> SwarmProviderAssembly? {
+        lock.withLock { assembly }
+    }
+
+    func recordWorkerCodexEnvironment(_ environment: [String: String]?) {
+        lock.withLock { workerCodexEnvironment = environment }
+    }
+
+    func workerEnvironment() -> [String: String]? {
+        lock.withLock { workerCodexEnvironment }
+    }
+}
+
 private func tempSwarmToolRoot() throws -> URL {
     let url = URL(fileURLWithPath: NSTemporaryDirectory())
         .appendingPathComponent("chat-swarm-tool-\(UUID().uuidString)", isDirectory: true)
@@ -164,6 +186,50 @@ private func tempSwarmToolRoot() throws -> URL {
     #expect(obj["runtime"] == .string("swift-native"))
     #expect(obj["surface"] == .string("telegram"))
     #expect(obj["policyMaxAgents"] == .int(20))
+}
+
+/// Ledger row `chat.factory.credentialRootEnvOverride`. This invokes the
+/// DEFAULT agent_swarm assembly (no fake swarm executor) in dry-run mode, so
+/// no worker/provider call can reach the network. The observer sees the actual
+/// provider assembly immediately before it is installed into that executor.
+@Test func defaultAgentSwarmAssemblesEveryCredentialAuthorityUnderItsScratchRoot() async throws {
+    let root = try tempSwarmToolRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let capture = SwarmProviderAssemblyCapture()
+    let dispatcher = SwiftToolDispatcher(
+        dataRoot: root,
+        swarmProviderAssemblyObserver: { assembly in capture.record(assembly) },
+        swarmWorkerCodexEnvironmentObserver: { environment in
+            capture.recordWorkerCodexEnvironment(environment)
+        }
+    )
+
+    let result = try await dispatcher.dispatch(
+        tool: "agent_swarm",
+        input: ["objective": .string("plan only"), "dryRun": .bool(true)],
+        surface: "chat"
+    )
+    guard case .object(let object) = result else {
+        Issue.record("expected the default swarm dry-run plan")
+        return
+    }
+    #expect(object["status"] == .string("dry_run"))
+
+    let assembly = try #require(capture.value())
+    #expect(assembly.dataRoot.standardizedFileURL == root.standardizedFileURL)
+    #expect(assembly.codexEnvironment["CODEX_HOME"] == root
+        .appendingPathComponent("codex_home", isDirectory: true).path)
+    #expect(assembly.codexEnvironment["NATIVE_AGENT_DATA_ROOT"] == root.path)
+    #expect(assembly.anthropicDataRoot.standardizedFileURL == root.standardizedFileURL)
+    #expect(assembly.openAIDataRoot.standardizedFileURL == root.standardizedFileURL)
+    #expect(assembly.moonshotDataRoot.standardizedFileURL == root.standardizedFileURL)
+    for path in [assembly.openAIOAuthPath, assembly.anthropicOAuthPath, assembly.xaiOAuthPath] {
+        #expect(path.standardizedFileURL.path.hasPrefix(root.standardizedFileURL.path + "/"))
+    }
+    let workerEnvironment = try #require(capture.workerEnvironment())
+    #expect(workerEnvironment["CODEX_HOME"] == root
+        .appendingPathComponent("codex_home", isDirectory: true).path)
+    #expect(workerEnvironment["NATIVE_AGENT_DATA_ROOT"] == root.path)
 }
 
 @Test func swiftToolDispatcher_toolLoadSwarmCategoryReturnsAgentSwarm() async throws {

@@ -1,0 +1,30 @@
+{
+  "surfaces": [
+    { "fence": "app.background", "id": "app.background.scheduler.activityFeed" },
+    { "fence": "app.bridges", "id": "icloud.ensureChatSessionIndex" },
+    { "fence": "app.bridges", "id": "icloud.published.state" },
+    { "fence": "app.bridges", "id": "icloud.sendCloudKitActionResponse" },
+    { "fence": "app.mac", "id": "ui.activityCapture.modelAccess" },
+    { "fence": "app.mac", "id": "ui.activityCapture.titleControls" },
+    { "fence": "app.settings", "id": "ui.Connectors.addWorkspaceForm" },
+    { "fence": "app.settings", "id": "ui.Connectors.workspaceSearch" },
+    { "fence": "app.settings", "id": "ui.ConnectorWizard.githubAndNotionTokenFields" },
+    { "fence": "app.settings", "id": "ui.ConnectorWizard.slackTokenForm" },
+    { "fence": "app.settings", "id": "ui.Telegram.clearLogsButton" },
+    { "fence": "app.settings", "id": "ui.Telegram.disconnectButton" },
+    { "fence": "app.settings", "id": "ui.Telegram.receiptsAndBlockedPanels" },
+    { "fence": "app.settings", "id": "ui.Telegram.testReplyButton" },
+    { "fence": "ios.screens", "id": "ios.kg.emptyState" },
+    { "fence": "ios.screens", "id": "ios.kg.search" },
+    { "fence": "ios.screens", "id": "ios.skills.filter.quarantinedBucketMissing" },
+    { "fence": "ios.screens", "id": "ios.skills.row" },
+    { "fence": "ios.screens", "id": "ios.skills.stateChip" },
+    { "fence": "ios.screens", "id": "ios.tools.catalog.autoRunBadge" },
+    { "fence": "ios.screens", "id": "ios.tools.catalog.row.status" },
+    { "fence": "ios.screens", "id": "ios.tools.catalog.search" },
+    { "fence": "ios.screens", "id": "ios.turninspector.emptyState" },
+    { "fence": "ios.screens", "id": "ios.turninspector.kindsMix" },
+    { "fence": "ios.screens", "id": "ios.turninspector.rowMetrics" },
+    { "fence": "ios.sync", "id": "ios.chatStore.streamingHint" }
+  ]
+}

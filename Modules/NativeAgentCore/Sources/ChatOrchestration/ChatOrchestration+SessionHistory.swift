@@ -749,7 +749,7 @@ extension SwiftNativeTurnEngine {
         let priorStats: SessionHistoryReadStats
         let middleStats: SessionHistoryReadStats?
         if historyLimit > 0 {
-            let priorResult = (try? await trace.measure("history.prompt_read") {
+            let priorResult = (try? await trace.measure(.promptRead) {
                 try await historyReader.promptMessagesWithStats(
                     forSessionId: sessionId,
                     anchorLimit: 3,
@@ -763,7 +763,7 @@ extension SwiftNativeTurnEngine {
             prior = priorResult.messages
             priorStats = priorResult.stats
             if prior.count > historyLimit || priorStats.sourceBytes > priorStats.bytesRead {
-                let middleResult = (try? await trace.measure("history.middle_sample") {
+                let middleResult = (try? await trace.measure(.middleSample) {
                     try await historyReader.relevanceMessagesWithStats(
                         forSessionId: sessionId,
                         excludingRunId: excludeHistoryRunId
@@ -784,7 +784,7 @@ extension SwiftNativeTurnEngine {
             priorStats = SessionHistoryReadStats(mode: "history_disabled")
             middleStats = nil
         }
-        let expandedRecallQuery = await trace.measure("history.recall_query") {
+        let expandedRecallQuery = await trace.measure(.recallQuery) {
             SessionHistoryPromptRenderer.recallQuery(
                 userMessage: queryMessage,
                 messages: prior
@@ -804,12 +804,12 @@ extension SwiftNativeTurnEngine {
                 recentTurns: prior.suffix(4).map(\.content),
                 queryUserMessage: queryMessage
             )
-            trace.record("context.base", since: baseStartNs)
+            trace.record(.contextBase, since: baseStartNs)
         } catch {
-            trace.record("context.base", since: baseStartNs)
+            trace.record(.contextBase, since: baseStartNs)
             throw error
         }
-        let base = await trace.measure("history.digest") {
+        let base = await trace.measure(.digest) {
             await Self.injectingSessionDigest(
                 into: rawBase,
                 sessionId: sessionId,
@@ -836,7 +836,7 @@ extension SwiftNativeTurnEngine {
             windowTokens: historyWindowTokens,
             surface: surface
         )
-        let renderedHistory = await trace.measure("history.render") {
+        let renderedHistory = await trace.measure(.render) {
             SessionHistoryPromptRenderer.renderDetailed(
                 messages: prior,
                 middleCandidates: middleCandidates,
@@ -897,7 +897,7 @@ extension SwiftNativeTurnEngine {
                 clockedBase,
                 cue: naturalExpressionCue
             )
-            trace.record("context.clock_runtime", since: runtimeStartNs)
+            trace.record(ContextHistoryStageName.contextClockRuntime, since: runtimeStartNs)
             trace.setCount("system.stableChars", finalBase.systemSegments?.stable.count ?? 0)
             trace.setCount("system.dynamicChars", finalBase.systemSegments?.dynamic.count ?? 0)
             trace.setCount("system.combinedChars", finalBase.systemPrompt?.count ?? 0)
@@ -975,7 +975,7 @@ extension SwiftNativeTurnEngine {
             clocked,
             cue: naturalExpressionCue
         )
-        trace.record("context.clock_runtime", since: runtimeStartNs)
+        trace.record(ContextHistoryStageName.contextClockRuntime, since: runtimeStartNs)
         trace.setCount("system.stableChars", finalContext.systemSegments?.stable.count ?? 0)
         trace.setCount("system.dynamicChars", finalContext.systemSegments?.dynamic.count ?? 0)
         trace.setCount("system.combinedChars", finalContext.systemPrompt?.count ?? 0)
@@ -1285,17 +1285,22 @@ enum SessionHistoryPromptRenderer {
         if !currentUser.isEmpty {
             lines.append("Current user: \(cap(currentUser, 520))")
         }
-        if let latestUser {
-            lines.append("Latest prior user: \(cap(latestUser.content, 280))")
-        }
-        if let latestAssistant {
-            lines.append("Latest assistant tail: \(cap(latestAssistant.content, 320))")
-        }
+        // Corrections and open loops are the two history signals whose loss
+        // most directly changes what recall retrieves. Put them ahead of the
+        // generic tails so the final hard cap cannot leave a long-but-blind
+        // query merely because the current message and routine history filled
+        // the available bytes first.
         if let latestCorrection {
             lines.append("Recent correction: \(cap(latestCorrection.content, 260))")
         }
         if let openLoop {
             lines.append("Open loop: \(cap(openLoop.content, 260))")
+        }
+        if let latestUser {
+            lines.append("Latest prior user: \(cap(latestUser.content, 280))")
+        }
+        if let latestAssistant {
+            lines.append("Latest assistant tail: \(cap(latestAssistant.content, 320))")
         }
         if !anchors.isEmpty {
             let rendered = anchors

@@ -81,9 +81,8 @@ jq -e --arg target "$TARGET" \
   '.schema_version == 1
    and .source_revision == $target
    and .source_dirty == false
-   and .canonical_gate == "script/test.sh"
-   and .ios_required == true
-   and .ios_result == "passed"' \
+   and ((.canonical_gate == "script/test.sh" and .ios_required == true and .ios_result == "passed")
+        or (.canonical_gate == "script/release.sh --artifact-only" and .ios_required == false and .ios_result == "not_run"))' \
   "$TEST_RECEIPT" >/dev/null \
   || fail "release test receipt does not prove the exact clean source and required iOS gate."
 jq -e \
@@ -95,11 +94,12 @@ jq -e \
   --argjson dmg_bytes "$DMG_BYTES" \
   '.schema_version == 1
    and .version == $version
+   and ((.short_version // $version) == $version)
+   and (.internal_build != true)
    and .source_revision == $target
-   and .test_receipt.canonical_gate == "script/test.sh"
    and .test_receipt.source_dirty == false
-   and .test_receipt.ios_required == true
-   and .test_receipt.ios_result == "passed"
+   and ((.test_receipt.canonical_gate == "script/test.sh" and .test_receipt.ios_required == true and .test_receipt.ios_result == "passed")
+        or (.test_receipt.canonical_gate == "script/release.sh --artifact-only" and .test_receipt.ios_required == false and .test_receipt.ios_result == "not_run"))
    and .test_receipt.sha256 == $receipt_sha256
    and .dmg.name == $dmg_name
    and .dmg.sha256 == $dmg_sha256
@@ -110,7 +110,10 @@ jq -e \
         or (.dmg.signature_required == false and .dmg.notarized == false and .dmg.stapled == false))
    and .verification_tool == "script/verify_release_artifact.sh"' \
   "$ATTESTATION" >/dev/null \
-  || fail "release attestation does not bind the exact source, canonical test gate, and final DMG verification."
+  || fail "release attestation does not bind the exact source, canonical test gate, and final DMG verification.
+       (internal-build-seat-hygiene: an attestation whose short_version carries the
+       '-dev.<sha>' marker, or whose internal_build is true, is refused here — an
+       internal build must never be published as the release.)"
 REMOTE_TARGET="$(gh api "repos/$REPOSITORY/commits/$TARGET" --jq '.sha' 2>/dev/null || true)"
 [[ "$REMOTE_TARGET" == "$TARGET" ]] \
   || fail "source commit $TARGET is not present in $REPOSITORY. Publish the reviewed source first."

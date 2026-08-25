@@ -194,7 +194,7 @@ extension NativeOAuthFlow {
                 NSLocalizedDescriptionKey: "xAI token response did not include access_token.",
             ])
         }
-        let path = XAIOAuthDirectAdapter.tokenPath()
+        let path = OAuthCredentialDestinations.xAIProvider()
         var existing = (try? loadJSONObject(path)) ?? [:]
         existing["provider_id"] = "xai_oauth_direct"
         existing["auth_mode"] = "oauth_pkce"

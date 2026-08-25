@@ -18,15 +18,32 @@ import PersistenceCore
 extension BackgroundLoopsAssembly {
     static func makeDeskNotifyLoop(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        intervalSeconds: TimeInterval = 24 * 60 * 60
+        intervalSeconds: TimeInterval = 24 * 60 * 60,
+        postMacNotification: @escaping @Sendable (String, String) async -> Bool = { title, body in
+            await NativeAgentNotifications.postAndReport(title: title, body: body).posted
+        },
+        postPairedDeviceNotification: @escaping @Sendable (String, String) async -> Bool = { title, body in
+            (try? await MacSyncEngine.shared.sendNotificationToPairedDevices(
+                title: title,
+                body: body,
+                userInfo: ["screen": "inbox", "source": "desk"]
+            )) != nil
+        }
     ) -> some LoopRunner {
-        DeskNotifyRunner(interval: intervalSeconds, dataRoot: dataRoot)
+        DeskNotifyRunner(
+            interval: intervalSeconds,
+            dataRoot: dataRoot,
+            postMacNotification: postMacNotification,
+            postPairedDeviceNotification: postPairedDeviceNotification
+        )
     }
 }
 
 private struct DeskNotifyRunner: EventDeadlineLoopRunner {
     let interval: TimeInterval
     let dataRoot: URL
+    let postMacNotification: @Sendable (String, String) async -> Bool
+    let postPairedDeviceNotification: @Sendable (String, String) async -> Bool
 
     var loopId: String { "desk_notify" }
     var tickTimeoutOverride: TimeInterval? { 30 }
@@ -85,14 +102,10 @@ private struct DeskNotifyRunner: EventDeadlineLoopRunner {
             // failure isn't silent. v1 marks after attempting; success-gated retry
             // with backoff is a noted refinement (failures here are near-always a
             // permanent notification-setup issue, where retry only spams).
-            let macResult = await NativeAgentNotifications.postAndReport(title: decision.title, body: decision.body)
-            let mobileOK = (try? await MacSyncEngine.shared.sendNotificationToPairedDevices(
-                title: decision.title,
-                body: decision.body,
-                userInfo: ["screen": "inbox", "source": "desk"]
-            )) != nil
+            let macOK = await postMacNotification(decision.title, decision.body)
+            let mobileOK = await postPairedDeviceNotification(decision.title, decision.body)
             // Log BOTH channel outcomes so no failure is silent (Agent review).
-            if !macResult.posted {
+            if !macOK {
                 NSLog("desk_notify: Mac banner failed for \(decision.handle)")
                 failures.append("\(decision.handle) Mac banner")
             }

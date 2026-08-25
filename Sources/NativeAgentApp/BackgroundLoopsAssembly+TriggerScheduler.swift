@@ -48,9 +48,11 @@ extension BackgroundLoopsAssembly {
         }
         let dueJobRunner = SchedulerDueJobRunner(root: standardized)
         let runDueJobs: @Sendable () async -> [String]
+        let schedulerActivityFailure: @Sendable () async -> String?
         let nextJobDeadline: @Sendable (Date) async -> Date?
         if isLiveRoot {
             runDueJobs = { await dueJobRunner.runDueJobs(maxJobs: 5) }
+            schedulerActivityFailure = { await dueJobRunner.activityFeedError }
             nextJobDeadline = { date in
                 await dueJobRunner.nextMeaningfulDeadline(after: date)
             }
@@ -59,6 +61,7 @@ extension BackgroundLoopsAssembly {
             // connector, provider, and sync owners. Secondary/test roots may
             // inspect their own files but never borrow those live effects.
             runDueJobs = { [] }
+            schedulerActivityFailure = { nil }
             nextJobDeadline = { _ in nil }
         }
         return TriggerSchedulerEventDeadlineRunner(
@@ -66,6 +69,7 @@ extension BackgroundLoopsAssembly {
             schedulerJobsPath: dueJobRunner.jobsPath,
             triggerScheduler: native,
             runDueJobs: runDueJobs,
+            schedulerActivityFailure: schedulerActivityFailure,
             nextSchedulerJobDeadline: nextJobDeadline,
             mirrorFire: mirror
         )
@@ -193,6 +197,10 @@ struct TriggerSchedulerEventDeadlineRunner: EventDeadlineLoopRunner {
     let schedulerJobsPath: URL
     let triggerScheduler: SwiftNativeTriggerScheduler
     let runDueJobs: @Sendable () async -> [String]
+    /// Read immediately after `runDueJobs`. A durable scheduler effect without
+    /// its activity evidence is deliberately a failed loop receipt, not a
+    /// quiet "nothing due" tick that lets later trigger effects proceed.
+    let schedulerActivityFailure: @Sendable () async -> String?
     let nextSchedulerJobDeadline: @Sendable (Date) async -> Date?
     let mirrorFire: @Sendable (TriggerFireResult) async -> Bool
 
@@ -201,6 +209,7 @@ struct TriggerSchedulerEventDeadlineRunner: EventDeadlineLoopRunner {
         schedulerJobsPath: URL,
         triggerScheduler: SwiftNativeTriggerScheduler,
         runDueJobs: @escaping @Sendable () async -> [String],
+        schedulerActivityFailure: @escaping @Sendable () async -> String? = { nil },
         nextSchedulerJobDeadline: @escaping @Sendable (Date) async -> Date?,
         mirrorFire: @escaping @Sendable (TriggerFireResult) async -> Bool
     ) {
@@ -208,6 +217,7 @@ struct TriggerSchedulerEventDeadlineRunner: EventDeadlineLoopRunner {
         self.schedulerJobsPath = schedulerJobsPath
         self.triggerScheduler = triggerScheduler
         self.runDueJobs = runDueJobs
+        self.schedulerActivityFailure = schedulerActivityFailure
         self.nextSchedulerJobDeadline = nextSchedulerJobDeadline
         self.mirrorFire = mirrorFire
     }
@@ -235,6 +245,9 @@ struct TriggerSchedulerEventDeadlineRunner: EventDeadlineLoopRunner {
     func tickOutcome() async -> LoopTickOutcome {
         let dueJobs = await runDueJobs()
         guard !Task.isCancelled else { return .skipped(reason: "cancelled") }
+        if let activityFailure = await schedulerActivityFailure() {
+            return .failed(error: activityFailure)
+        }
 
         let fires = await triggerScheduler.evaluateAndFireDetailed()
         for fire in fires {

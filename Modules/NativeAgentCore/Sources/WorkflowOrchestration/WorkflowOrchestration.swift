@@ -107,6 +107,59 @@ public protocol WorkflowOrchestrationClient: Sendable {
     func rollbackWorkflowRun(id: String) async throws -> JSONValue
 }
 
+/// Read-side evidence for the workflow run-ledger family.  The UI's compact
+/// run list intentionally remains a last-50 projection, but operations and
+/// diagnostics must not mistake an absent, damaged, or unavailable backing
+/// source for a real empty workflow history.
+public enum WorkflowRunLedgerFeedSource: Sendable, Equatable {
+    case absent
+    case available
+    /// Some valid evidence was retained, but one or more records could not be
+    /// decoded.  Consumers may show the valid rows only when they also disclose
+    /// this count.
+    case partial(malformedRecords: Int)
+    case unavailable(reason: String)
+}
+
+/// The bounded, durable workflow feed as actually read by
+/// `SwiftNativeWorkflowOrchestrationClient`.  This is intentionally a summary
+/// of the three co-owned stores rather than a second ledger: `runs.jsonl` is
+/// append history, `registry.json` defines what may run, and `run_state/` owns
+/// in-progress state across relaunch.
+public struct WorkflowRunLedgerFeedFamily: Sendable, Equatable {
+    public let recentRuns: [JSONValue]
+    public let runsSource: WorkflowRunLedgerFeedSource
+    public let registrySource: WorkflowRunLedgerFeedSource
+    public let runStateSource: WorkflowRunLedgerFeedSource
+    public let registryStatusCounts: [String: Int]
+    public let unsupportedStepKinds: [String: Int]
+    public let runStatusCounts: [String: Int]
+    public let runStateStatusCounts: [String: Int]
+    public let staleNonTerminalRunStateIDs: [String]
+
+    public init(
+        recentRuns: [JSONValue],
+        runsSource: WorkflowRunLedgerFeedSource,
+        registrySource: WorkflowRunLedgerFeedSource,
+        runStateSource: WorkflowRunLedgerFeedSource,
+        registryStatusCounts: [String: Int],
+        unsupportedStepKinds: [String: Int],
+        runStatusCounts: [String: Int],
+        runStateStatusCounts: [String: Int],
+        staleNonTerminalRunStateIDs: [String]
+    ) {
+        self.recentRuns = recentRuns
+        self.runsSource = runsSource
+        self.registrySource = registrySource
+        self.runStateSource = runStateSource
+        self.registryStatusCounts = registryStatusCounts
+        self.unsupportedStepKinds = unsupportedStepKinds
+        self.runStatusCounts = runStatusCounts
+        self.runStateStatusCounts = runStateStatusCounts
+        self.staleNonTerminalRunStateIDs = staleNonTerminalRunStateIDs
+    }
+}
+
 // MARK: - Execution preflight
 
 /// Canonical answer to whether a workflow record represents an executable
@@ -126,6 +179,108 @@ public struct WorkflowExecutionAvailability: Sendable, Equatable {
 
     public var detail: String {
         reasons.joined(separator: "; ")
+    }
+}
+
+/// One checked eligibility projection for the three mutable controls attached
+/// to a durable v2 run. The view may render these reasons, but the workflow
+/// client re-evaluates them under the run-state lock before changing bytes.
+/// A disabled button is convenience; it is never the authority.
+public struct WorkflowRunControlEligibility: Sendable, Equatable {
+    public let isEligible: Bool
+    public let detail: String
+
+    public init(isEligible: Bool, detail: String) {
+        self.isEligible = isEligible
+        self.detail = detail
+    }
+}
+
+public struct WorkflowRunControlAvailability: Sendable, Equatable {
+    public let resume: WorkflowRunControlEligibility
+    public let cancel: WorkflowRunControlEligibility
+    public let rollback: WorkflowRunControlEligibility
+
+    public init(
+        resume: WorkflowRunControlEligibility,
+        cancel: WorkflowRunControlEligibility,
+        rollback: WorkflowRunControlEligibility
+    ) {
+        self.resume = resume
+        self.cancel = cancel
+        self.rollback = rollback
+    }
+
+    /// The UI renders this when the current state has no useful next control,
+    /// so a terminal/refused run is an explicit condition rather than three
+    /// buttons that simply do nothing.
+    public var firstIneligibleDetail: String? {
+        [resume, cancel, rollback].first(where: { !$0.isEligible })?.detail
+    }
+}
+
+/// Shared state-machine vocabulary for mounted Run / Resume / Cancel /
+/// Rollback controls. Approval decisions remain authoritative in
+/// ApprovalInbox; this projection only describes what the currently read
+/// decision makes possible.
+public enum WorkflowRunControlPreflight {
+    public static func evaluate(
+        status rawStatus: String?,
+        approvalDecision rawApprovalDecision: String? = nil
+    ) -> WorkflowRunControlAvailability {
+        let status = rawStatus?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+        let displayedStatus = status.isEmpty ? "missing" : status
+        let approvalDecision = rawApprovalDecision?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+
+        let resume: WorkflowRunControlEligibility
+        if status != "waiting_approval" {
+            resume = WorkflowRunControlEligibility(
+                isEligible: false,
+                detail: "Resume is available only while the run is waiting for approval (current: \(displayedStatus))."
+            )
+        } else if approvalDecision == "approved" {
+            resume = WorkflowRunControlEligibility(
+                isEligible: true,
+                detail: "Approval is approved; resume will claim and continue this run."
+            )
+        } else if approvalDecision == "denied" || approvalDecision == "canceled" {
+            resume = WorkflowRunControlEligibility(
+                isEligible: true,
+                detail: "Approval is \(approvalDecision); resume will record the terminal refusal."
+            )
+        } else if approvalDecision.isEmpty {
+            resume = WorkflowRunControlEligibility(
+                isEligible: false,
+                detail: "Resume is waiting for an approval decision."
+            )
+        } else {
+            resume = WorkflowRunControlEligibility(
+                isEligible: false,
+                detail: "Resume is unavailable because the approval decision `\(approvalDecision)` is not recognized."
+            )
+        }
+
+        let cancellable = ["queued", "ready", "running", "waiting_approval", "blocked"].contains(status)
+        let cancel = WorkflowRunControlEligibility(
+            isEligible: cancellable,
+            detail: cancellable
+                ? "Cancel will durably stop this \(displayedStatus) run."
+                : "Cancel is unavailable after the run is \(displayedStatus)."
+        )
+
+        let rollbackEligible = ["succeeded", "failed", "canceled"].contains(status)
+        let rollback = WorkflowRunControlEligibility(
+            isEligible: rollbackEligible,
+            detail: rollbackEligible
+                ? "Rollback will record compensation for succeeded steps."
+                : "Rollback is available only after a succeeded, failed, or canceled run (current: \(displayedStatus))."
+        )
+
+        return WorkflowRunControlAvailability(resume: resume, cancel: cancel, rollback: rollback)
     }
 }
 

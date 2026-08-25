@@ -16,6 +16,39 @@ import SwarmRuns
 import MacIntegration
 
 extension SwiftToolDispatcher {
+    /// Delegated bridge transcripts contain prompts and replies, so retain a
+    /// bounded recent audit window rather than letting an unobserved side feed
+    /// grow forever. Session pointers are not audits; a last-message sidecar
+    /// is removed only with the matching evicted audit, never by itself while
+    /// an active Codex process may still be writing it.
+    static let agentBridgeAuditRetention = 100
+    private static let agentBridgeAuditLock = NSLock()
+
+    static func trimAgentBridgeAudits(in directory: URL) {
+        agentBridgeAuditLock.lock()
+        defer { agentBridgeAuditLock.unlock() }
+        let fm = FileManager.default
+        let audits = ((try? fm.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        )) ?? []).filter { file in
+            file.pathExtension == "json"
+                && (try? file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+        }.sorted { left, right in
+            let leftDate = (try? left.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            let rightDate = (try? right.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            return leftDate < rightDate
+        }
+        guard audits.count > agentBridgeAuditRetention else { return }
+        for file in audits.prefix(audits.count - agentBridgeAuditRetention) {
+            try? fm.removeItem(at: file)
+            guard !fm.fileExists(atPath: file.path) else { continue }
+            let runID = file.deletingPathExtension().lastPathComponent
+            let lastMessage = directory.appendingPathComponent("\(runID)-last-message.txt")
+            try? fm.removeItem(at: lastMessage)
+        }
+    }
     /// A wire handle over the builder CLIs' existing conversation state.
     /// NativeAgent does not copy transcripts or create a second session store:
     /// Codex owns its thread id, while Claude and OMP own per-topic pointers.
@@ -1787,11 +1820,19 @@ extension SwiftToolDispatcher {
         let existingLines = (try? String(contentsOf: existingSessionFile, encoding: .utf8))?
             .split(separator: "\n", omittingEmptySubsequences: false)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        let pointerProvenance = dataRoot.standardizedFileURL.path
+        let pointerIsForeign = existingLines?.count ?? 0 >= 3
+            && existingLines?[2] != pointerProvenance
+        if pointerIsForeign {
+            let rejected = existingSessionFile.deletingPathExtension()
+                .appendingPathExtension("foreign-\(Int(started.timeIntervalSince1970))")
+            try? FileManager.default.moveItem(at: existingSessionFile, to: rejected)
+        }
         let sessionId: String
         let sessionArgs: [String]
         let isNewSession: Bool
         let sessionCwd: String
-        if let existingLines, let first = existingLines.first, !first.isEmpty {
+        if !pointerIsForeign, let existingLines, let first = existingLines.first, !first.isEmpty {
             sessionId = first
             sessionArgs = ["--resume", sessionId]
             isNewSession = false
@@ -1899,6 +1940,7 @@ extension SwiftToolDispatcher {
                 if let commitHash { auditEntry["commitHash"] = commitHash }
                 if let data = try? JSONSerialization.data(withJSONObject: auditEntry, options: [.prettyPrinted]) {
                     try? data.write(to: auditURL)
+                    Self.trimAgentBridgeAudits(in: auditDir)
                 }
 
                 // Persist the delegated session id on first successful create
@@ -1909,13 +1951,13 @@ extension SwiftToolDispatcher {
                     if exitCode == 0 {
                         // Persist id + the creation cwd so the next invoke resumes
                         // the SAME thread from the SAME project dir.
-                        try? "\(sessionId)\n\(sessionCwd)".write(to: sessionFile, atomically: true, encoding: .utf8)
+                        try? "\(sessionId)\n\(sessionCwd)\n\(pointerProvenance)".write(to: sessionFile, atomically: true, encoding: .utf8)
                     }
                 } else if exitCode == 0, existingSessionFile != sessionFile {
                     // Promote a successfully resumed legacy pointer to the
                     // identity-neutral filename. Keep the legacy file as a
                     // rollback breadcrumb; all future reads prefer the new one.
-                    try? "\(sessionId)\n\(sessionCwd)".write(
+                    try? "\(sessionId)\n\(sessionCwd)\n\(pointerProvenance)".write(
                         to: sessionFile,
                         atomically: true,
                         encoding: .utf8
@@ -2190,6 +2232,7 @@ extension SwiftToolDispatcher {
                 if let fast = brain.fast { auditEntry["fast"] = fast }
                 if let data = try? JSONSerialization.data(withJSONObject: auditEntry, options: [.prettyPrinted]) {
                     try? data.write(to: auditURL)
+                    Self.trimAgentBridgeAudits(in: auditDir)
                 }
 
                 guard resumed.tryResume() else { return }

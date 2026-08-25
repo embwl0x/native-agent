@@ -196,8 +196,38 @@ extension NativeCognitionRuntime {
         }
     }
 
-    func runManualReflection(reason: String = "observatory manual reflection") async {
+    @discardableResult
+    func runManualReflection(reason: String = "observatory manual reflection") async -> CognitiveBackgroundRunOutcome {
         await bootstrap()
+        let configuration = await substrate.configurationSnapshot()
+        guard configuration.enabled && configuration.reflectiveCallsEnabled else {
+            let gateReason = "reflection is disabled"
+            await substrate.recordReceipt(
+                kind: "reflection.skipped",
+                payload: .object([
+                    "reason": .string(reason),
+                    "status": .string("gate_denied"),
+                    "error": .string(gateReason),
+                ])
+            )
+            publishRuntimeChange(reason: "reflection:gate_denied")
+            return .skipped(gateReason)
+        }
+        switch await backgroundCognitionGate(reason: reason) {
+        case .allowed:
+            break
+        case .skipped(let gateReason):
+            await substrate.recordReceipt(
+                kind: "reflection.skipped",
+                payload: .object([
+                    "reason": .string(reason),
+                    "status": .string("gate_denied"),
+                    "error": .string(gateReason),
+                ])
+            )
+            publishRuntimeChange(reason: "reflection:gate_denied")
+            return .skipped(gateReason)
+        }
         if let providerRoutingFailure {
             await substrate.recordReceipt(
                 kind: "reflection.skipped",
@@ -208,9 +238,8 @@ extension NativeCognitionRuntime {
                 ])
             )
             publishRuntimeChange(reason: "reflection:provider_unavailable")
-            return
+            return .skipped("provider routing unavailable: \(providerRoutingFailure)")
         }
-        guard case .allowed = await backgroundCognitionGate(reason: reason) else { return }
         guard let request = await substrate.planReflection(reason: reason) else {
             await substrate.recordReceipt(
                 kind: "reflection.skipped",
@@ -220,9 +249,9 @@ extension NativeCognitionRuntime {
                 ])
             )
             publishRuntimeChange(reason: "reflection:skipped")
-            return
+            return .skipped("reflection disabled, not due, or out of budget")
         }
-        _ = await executeReflection(
+        let outcome = await executeReflection(
             request: request,
             llm: BackgroundLoopsAssembly.makeSharedLLMClient(
                 dataRoot: dataRoot,
@@ -230,6 +259,7 @@ extension NativeCognitionRuntime {
             )
         )
         publishRuntimeChange(reason: "reflection:manual_finished")
+        return outcome
     }
 
     @discardableResult
@@ -378,7 +408,7 @@ extension NativeCognitionRuntime {
     }
 
     func setReflectionSelection(model: String, provider: String) async throws {
-        guard usesLiveAppBody else {
+        guard usesLiveAppBody || allowsReflectionSelectionMutationForTesting else {
             throw NSError(
                 domain: "NativeCognitionRuntime",
                 code: 409,

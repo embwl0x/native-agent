@@ -9,18 +9,28 @@ final class ChatToastQueue {
 
     private var queue: [String] = []
     private var recentKeys: [(key: String, at: Date)] = []
+    private let displayDuration: TimeInterval
 
-    func show(_ message: String) {
+    init(displayDuration: TimeInterval = 2.0) {
+        self.displayDuration = max(0, displayDuration)
+    }
+
+    /// `deduplicating: false` is for the chat composer sink: every call there
+    /// is an independently actionable outcome, even when its human text has
+    /// the same timestamp/UUID-normalized shape as a prior failure.
+    func show(_ message: String, deduplicating: Bool = true) {
         let normalized = normalizedKey(message)
-        let normalizedCurrent = normalizedKey(current ?? "")
-        if normalized == normalizedCurrent { return }
+        if deduplicating {
+            let normalizedCurrent = normalizedKey(current ?? "")
+            if normalized == normalizedCurrent { return }
 
-        let now = Date()
-        recentKeys.removeAll { now.timeIntervalSince($0.at) > 10 }
-        if recentKeys.contains(where: { $0.key == normalized }) { return }
+            let now = Date()
+            recentKeys.removeAll { now.timeIntervalSince($0.at) > 10 }
+            if recentKeys.contains(where: { $0.key == normalized }) { return }
 
-        recentKeys.append((key: normalized, at: now))
-        if recentKeys.count > 5 { recentKeys.removeFirst() }
+            recentKeys.append((key: normalized, at: now))
+            if recentKeys.count > 5 { recentKeys.removeFirst() }
+        }
 
         if queue.count >= 10 { queue.removeFirst() }
         queue.append(message)
@@ -30,7 +40,7 @@ final class ChatToastQueue {
     private func advance() {
         guard !queue.isEmpty else { return }
         current = queue.removeFirst()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + displayDuration) {
             self.current = nil
             self.advance()
         }
@@ -52,6 +62,21 @@ final class ChatToastQueue {
         output = output.replacing(/\b\d{2}:\d{2}:\d{2}\b/, with: "<time>")
         output = output.replacing(/\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/, with: "<id>")
         return output
+    }
+}
+
+/// The composer is the visible sink for ChatView.showToast.  It deliberately
+/// retains every producer occurrence: pin persistence, voice, and slash
+/// command outcomes may share normalized text while still requiring separate
+/// acknowledgement by the user.
+@MainActor
+enum ChatComposerBottomToastPresentation {
+    static func show(_ message: String, in queue: ChatToastQueue) {
+        queue.show(message, deduplicating: false)
+    }
+
+    static func visibleEntry(from queue: ChatToastQueue) -> String? {
+        queue.current
     }
 }
 

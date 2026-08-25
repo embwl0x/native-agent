@@ -4,6 +4,7 @@ import Testing
 import ChatOrchestration
 import CognitiveSubstrate
 import Context
+import MacIntegration
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
@@ -809,6 +810,43 @@ func appChatToolDispatcher_exposesNotificationToolsAndDispatchesMobileNotify() a
     #expect(mac.count == 1)
     #expect(mac.first?.title == "Build update")
     #expect(mac.first?.body == "mac ping")
+}
+
+@Test
+func appChatToolDispatcher_deniedMobileNotifyNeverStartsDelivery() async throws {
+    let root = try makeDispatcherTestRoot("notify-denied")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let permissions = MacIntegrationPermissionStore(dataRoot: root)
+    try await permissions.set(
+        integrationId: MacIntegrationID.notifyMobile,
+        read: false,
+        write: false
+    )
+    let capture = NotificationCapture()
+    let dispatcher = AppChatToolDispatcher(
+        inner: StubInnerToolDispatcher(),
+        mobileNotificationSender: { title, body, userInfo in
+            await capture.recordMobile(title: title, body: body, userInfo: userInfo)
+            return MobileNotificationDeliveryReceipt(
+                bridgeMessageID: "must-not-be-created",
+                bridgeError: nil,
+                apnsReceipts: [],
+                apnsErrors: []
+            )
+        },
+        macIntegrationPermissionStore: permissions
+    )
+
+    let result = try await dispatcher.dispatch(
+        tool: "mobile.notify",
+        input: ["title": .string("Denied"), "message": .string("must not deliver")],
+        surface: "telegram"
+    )
+    #expect(jsonString(result, key: "status") == "denied")
+    #expect(jsonString(result, key: "reason") == "integration_permission_denied")
+    #expect(jsonString(result, key: "integration") == MacIntegrationID.notifyMobile)
+    #expect(await capture.mobile.isEmpty,
+            "permission denial must return before the injected mobile sender can deliver")
 }
 
 @Test

@@ -46,14 +46,16 @@ extension NativeClient {
         // Swift-native MemoryV2 source of truth is SQLite. The old
         // <dataRoot>/memory/proposals.jsonl path disappeared with the daemon,
         // so listing from it made the Mac/iOS review surfaces permanently empty.
-        let proposals = try await SwiftNativeMemoryV2.shared.listProposals(status: "pending")
+        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
+        let proposals = try await storage.listProposals(status: "pending")
         return proposals.compactMap { proposal in
             Self.memoryProposalPresentationRecord(
                 id: proposal.id,
                 content: proposal.content,
                 source: proposal.source,
                 status: proposal.status,
-                createdAt: proposal.createdAt,
+                createdAt: proposal.stagedAt,
                 rejectionReason: proposal.rejectionReason,
                 metadata: proposal.metadata
             )
@@ -170,7 +172,7 @@ extension NativeClient {
     // counterpart. Honor `dryRun=false` with a real run and `dryRun=true` with
     // a read-only preview of active memories + pending proposals.
     func triggerMemoryConsolidation(dryRun: Bool) async throws -> [String: Any] {
-        let dataRoot = PersistenceCore.defaultDataRoot()
+        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
         if dryRun {
             let active = (try? await storage.listMemories(persona: nil, status: "active", limit: nil).count) ?? 0

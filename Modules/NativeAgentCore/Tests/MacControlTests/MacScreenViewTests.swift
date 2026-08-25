@@ -45,7 +45,7 @@ private struct _StubCaptureSource: MacScreenCaptureSource {
 private struct _StubRenderer: MacScreenImageRenderer {
     var baseBytes: Int = 1_000_000
     final class Box: @unchecked Sendable {
-        var calls: [(downscale: Double, placements: [MacScreenMarkerPlacement])] = []
+        var calls: [(downscale: Double, placements: [MacScreenMarkerPlacement], shot: MacScreenShot)] = []
         init() {}
     }
     var box = Box()
@@ -55,7 +55,7 @@ private struct _StubRenderer: MacScreenImageRenderer {
         placements: [MacScreenMarkerPlacement],
         downscale: Double
     ) -> Data? {
-        box.calls.append((downscale, placements))
+        box.calls.append((downscale, placements, shot))
         let count = max(1, Int(Double(baseBytes) * downscale * downscale))
         return Data(repeating: 0x7f, count: count)
     }
@@ -179,6 +179,25 @@ private func _composeWindowSource() -> _ViewAXSource {
                 title: "Cancel",
                 frame: MacAXFrame(x: 200, y: 700, w: 100, h: 40),
                 actions: ["AXPress"]
+            ),
+            children: []
+        ),
+    ])
+}
+
+private func _visualSurfaceWindowSource() -> _ViewAXSource {
+    _ViewAXSource(elements: [
+        0: _ViewElement(
+            attributes: MacAXAttributes(
+                role: "AXWindow", title: "Canvas",
+                frame: MacAXFrame(x: 100, y: 200, w: 800, h: 600), actions: []
+            ),
+            children: [1]
+        ),
+        1: _ViewElement(
+            attributes: MacAXAttributes(
+                role: "AXImage", title: "Interactive canvas",
+                frame: MacAXFrame(x: 150, y: 250, w: 700, h: 500), actions: []
             ),
             children: []
         ),
@@ -790,6 +809,54 @@ private func _client(
     #expect(placements.count == 3)
     let send = try #require(placements.first { $0.mark == 3 })
     #expect(send.x == 1200 && send.y == 1000 && send.w == 200 && send.h == 80)
+}
+
+@Test func semanticScreenReceivesTheFrozenRawFrameWithoutHumanMarkerInk() async throws {
+    let capture = _StubCaptureSource(shot: _shot())
+    let renderer = _StubRenderer(baseBytes: 100_000)
+    let client = _client(
+        ax: _composeWindowSource(),
+        capture: capture,
+        renderer: renderer,
+        store: MacScreenViewStore()
+    )
+
+    let result = try await client.dispatch(action: "view", body: [
+        "semantic_raw_frame": .bool(true),
+    ])
+
+    #expect(result.ok)
+    #expect(_marks(result.output).count == 3, "raw pixels must not discard the AX half of fusion")
+    #expect(_bool(result.output, "image_annotations") == false)
+    #expect(renderer.box.calls.first?.placements.isEmpty == true)
+}
+
+@Test func semanticScreenFocusesAVisualSurfaceBeforeEncodingWithoutChangingWindowGeometry() async throws {
+    let capture = _StubCaptureSource(shot: _shot())
+    let renderer = _StubRenderer(baseBytes: 100_000)
+    let client = _client(
+        ax: _visualSurfaceWindowSource(),
+        capture: capture,
+        renderer: renderer,
+        store: MacScreenViewStore()
+    )
+
+    let result = try await client.dispatch(action: "view", body: [
+        "semantic_raw_frame": .bool(true),
+        "semantic_focus_visual_surface": .bool(true),
+    ])
+
+    #expect(result.ok)
+    let rendered = try #require(renderer.box.calls.first?.shot)
+    #expect(rendered.bounds == MacAXFrame(x: 150, y: 250, w: 700, h: 500))
+    #expect(rendered.pixelWidth == 1400)
+    #expect(rendered.pixelHeight == 1000)
+
+    let output = _object(result.output)
+    #expect(_object(output["origin"] ?? .null)["x"] == .double(100))
+    #expect(_object(output["logical_size"] ?? .null)["w"] == .double(800))
+    #expect(_object(output["image_origin"] ?? .null)["x"] == .double(150))
+    #expect(_object(output["image_logical_size"] ?? .null)["w"] == .double(700))
 }
 
 @Test func attentionRunsTheIntegratedObserveYieldReobserveActCycle() async throws {

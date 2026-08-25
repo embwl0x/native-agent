@@ -23,6 +23,34 @@ public extension GitHubConnectorActions {
     }
 
     static func listPullRequests(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> JSONValue {
+        let request = try pullRequestReadRequest(input: input)
+        let result = try await call(path: request.path, params: request.params, dataRoot: dataRoot)
+        let projection = GitHubToolProjection.pullRequests(result, limit: request.perPage)
+        return envelope("github.list_pull_requests", fields: [
+            "repository": .string(request.repo), "count": .int(Int64(projection.rows.count)),
+            "sourcePageCount": .int(Int64(projection.sourceCount)),
+            "resultsTruncated": .bool(projection.truncated),
+            "page": .int(Int64(request.page)), "perPage": .int(Int64(request.perPage)),
+            "pullRequests": JSONValue(fromFoundation: projection.rows),
+        ])
+    }
+
+    static func getIssue(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> JSONValue {
+        let request = try issueReadRequest(input: input)
+        let issue = try await call(path: request.path, dataRoot: dataRoot)
+        return envelope("github.get_issue", fields: [
+            "repository": .string(request.repo), "number": .int(Int64(request.number)),
+            "issue": JSONValue(fromFoundation: GitHubToolProjection.issue(issue as? [String: Any] ?? [:])),
+        ])
+    }
+
+    /// Canonicalize the bounded list-read request before any external call.
+    /// This is intentionally shared by the action and hermetic tests: a bad
+    /// repository, implicit state, or dropped pagination must fail here rather
+    /// than becoming a plausible read from the wrong GitHub entity.
+    static func pullRequestReadRequest(input: [String: JSONValue]) throws -> (
+        repo: String, path: String, page: Int, perPage: Int, params: [String: String]
+    ) {
         let repo = try repository(input)
         let page = clamp(int(input["page"], default: 1), min: 1, max: 1_000)
         let perPage = clamp(int(input["limit"] ?? input["per_page"], default: 20), min: 1, max: GitHubToolProjection.collectionLimit)
@@ -32,26 +60,20 @@ public extension GitHubConnectorActions {
             "direction": normalized(input["direction"]) ?? "desc",
             "page": String(page), "per_page": String(perPage),
         ]
-        for key in ["head", "base"] where normalized(input[key]) != nil { params[key] = normalized(input[key]) }
-        let result = try await call(path: "repos/\(repo)/pulls", params: params, dataRoot: dataRoot)
-        let projection = GitHubToolProjection.pullRequests(result, limit: perPage)
-        return envelope("github.list_pull_requests", fields: [
-            "repository": .string(repo), "count": .int(Int64(projection.rows.count)),
-            "sourcePageCount": .int(Int64(projection.sourceCount)),
-            "resultsTruncated": .bool(projection.truncated),
-            "page": .int(Int64(page)), "perPage": .int(Int64(perPage)),
-            "pullRequests": JSONValue(fromFoundation: projection.rows),
-        ])
+        for key in ["head", "base"] where normalized(input[key]) != nil {
+            params[key] = normalized(input[key])
+        }
+        return (repo, "repos/\(repo)/pulls", page, perPage, params)
     }
 
-    static func getIssue(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> JSONValue {
+    /// Canonicalize an issue identity before dispatch. The action must never
+    /// coerce an absent/zero issue into a network request that looks valid.
+    static func issueReadRequest(input: [String: JSONValue]) throws -> (
+        repo: String, number: Int, path: String
+    ) {
         let repo = try repository(input)
         let number = try positiveNumber(input)
-        let issue = try await call(path: "repos/\(repo)/issues/\(number)", dataRoot: dataRoot)
-        return envelope("github.get_issue", fields: [
-            "repository": .string(repo), "number": .int(Int64(number)),
-            "issue": JSONValue(fromFoundation: GitHubToolProjection.issue(issue as? [String: Any] ?? [:])),
-        ])
+        return (repo, number, "repos/\(repo)/issues/\(number)")
     }
 
     static func getPullRequest(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> JSONValue {
@@ -193,14 +215,10 @@ public extension GitHubConnectorActions {
         let authenticatedLogin = try await authenticatedLogin(dataRoot: dataRoot)
         let contributorLogin: String?
         if mode == .contributions {
-            let requested = normalized(input["contributor_login"] ?? input["contributor"] ?? input["login"])
-                ?? authenticatedLogin
-            guard requested.caseInsensitiveCompare(authenticatedLogin) == .orderedSame else {
-                throw GitHubConnectorError.invalidInput(
-                    "Contribution tracking login '\(requested)' does not match the authenticated GitHub account '\(authenticatedLogin)'."
-                )
-            }
-            contributorLogin = authenticatedLogin
+            contributorLogin = try contributionLogin(
+                requested: normalized(input["contributor_login"] ?? input["contributor"] ?? input["login"]),
+                authenticated: authenticatedLogin
+            )
         } else {
             contributorLogin = nil
         }
@@ -239,7 +257,7 @@ public extension GitHubConnectorActions {
         }
         let persist = bool(input["persist"]) ?? true
         let project = normalized(input["project"]) ?? suppliedQuery ?? resolved.first!.name
-        let interval = clamp(int(input["refresh_interval_minutes"], default: 5), min: 5, max: 1_440)
+        let timing = trackingTiming(input: input)
         let priorRepositoryCount = (try? GitHubProjectTracker.loadConfig(dataRoot: dataRoot).repositories.count) ?? 0
         if persist {
             try await GitHubProjectTracker.saveConfig(
@@ -250,8 +268,8 @@ public extension GitHubConnectorActions {
                     contributorLogin: contributorLogin,
                     discoveryQuery: discoveryQuery,
                     repositories: resolved,
-                    refreshIntervalMinutes: interval,
-                    staleAfterHours: clamp(int(input["stale_after_hours"], default: 72), min: 1, max: 2_160),
+                    refreshIntervalMinutes: timing.refreshIntervalMinutes,
+                    staleAfterHours: timing.staleAfterHours,
                     updatedAt: DeskClock.nowISO()
                 ),
                 dataRoot: dataRoot
@@ -266,6 +284,33 @@ public extension GitHubConnectorActions {
         ]
         if let contributorLogin { fields["contributorLogin"] = .string(contributorLogin) }
         return envelope("github.discover_tracking", fields: fields)
+    }
+
+    /// Contribution tracking is self-scoped. Preserve the verified account
+    /// spelling rather than accepting a lookalike requested login.
+    static func contributionLogin(requested: String?, authenticated: String) throws -> String {
+        let authenticated = authenticated.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !authenticated.isEmpty else {
+            throw GitHubConnectorError.invalidResponse("authenticated GitHub user did not include a login")
+        }
+        let candidate = requested?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let effectiveRequested = candidate?.isEmpty == false ? candidate! : authenticated
+        guard effectiveRequested.caseInsensitiveCompare(authenticated) == .orderedSame else {
+            throw GitHubConnectorError.invalidInput(
+                "Contribution tracking login '\(effectiveRequested)' does not match the authenticated GitHub account '\(authenticated)'."
+            )
+        }
+        return authenticated
+    }
+
+    /// One bounded timing normalization feeds the persisted tracker config.
+    static func trackingTiming(input: [String: JSONValue]) -> (
+        refreshIntervalMinutes: Int, staleAfterHours: Int
+    ) {
+        (
+            refreshIntervalMinutes: clamp(int(input["refresh_interval_minutes"], default: 5), min: 5, max: 1_440),
+            staleAfterHours: clamp(int(input["stale_after_hours"], default: 72), min: 1, max: 2_160)
+        )
     }
 
     static func projectDigest(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> JSONValue {

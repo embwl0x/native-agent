@@ -1,28 +1,309 @@
 // PATCH-2026-05-07: mac-control-ui-1 iOS Mac Tools — remote Mac Control from iPhone/iPad
 import SwiftUI
 
+enum MacSystemQuickAction: String, CaseIterable {
+    case lockScreen = "lock_screen"
+    case sleepDisplay = "sleep_display"
+}
+
+/// A system action may only claim completion after the matching Mac call has
+/// been issued successfully. Unknown strings are a failed completion and do
+/// not invoke the send closure.
+enum MacSystemQuickActionExecution {
+    struct Completion: Equatable {
+        let state: RemoteActionState
+        let status: String
+        let detail: String
+    }
+
+    static func unsupported(named action: String) -> Completion {
+        let message = "Unsupported Mac system action: \(action)"
+        return Completion(state: .failed, status: message, detail: message)
+    }
+
+    static func execute(
+        named action: String,
+        send: (MacSystemQuickAction) async throws -> Void
+    ) async -> Completion {
+        guard let quickAction = MacSystemQuickAction(rawValue: action) else {
+            return unsupported(named: action)
+        }
+        return await execute(quickAction, send: send)
+    }
+
+    static func execute(
+        _ action: MacSystemQuickAction,
+        send: (MacSystemQuickAction) async throws -> Void
+    ) async -> Completion {
+        do {
+            try await send(action)
+            return Completion(
+                state: .ranOnMac,
+                status: "Done.",
+                detail: "Ran on Mac through iCloud"
+            )
+        } catch {
+            return Completion(
+                state: RemoteActionState.forError(error),
+                status: error.localizedDescription,
+                detail: error.localizedDescription
+            )
+        }
+    }
+}
+
+/// The Mac router has distinct remedies for an absent Shortcut and a policy
+/// refusal. Preserve that distinction instead of showing both as opaque raw
+/// transport errors on the phone.
+enum MacShortcutRunnerPresentation {
+    struct Failure: Equatable {
+        let status: String
+        let detail: String
+    }
+
+    static func failure(for error: Error, shortcutName: String) -> Failure {
+        let detail = error.localizedDescription
+        let normalized = detail.lowercased()
+
+        if normalized.contains("shortcut_not_found") || normalized.contains("shortcut not found") {
+            return Failure(
+                status: "Shortcut \"\(shortcutName)\" was not found on the Mac.",
+                detail: "Check the exact Shortcut name in the Mac Shortcuts app."
+            )
+        }
+
+        if normalized.contains("policy")
+            || normalized.contains("denied")
+            || normalized.contains("not allowed")
+            || normalized.contains("shortcuts_allowed") {
+            return Failure(
+                status: "Mac Control policy refused this Shortcut.",
+                detail: "Enable Shortcuts in the Mac app's Trust settings, then try again."
+            )
+        }
+
+        return Failure(
+            status: "Shortcut \"\(shortcutName)\" could not run.",
+            detail: detail
+        )
+    }
+}
+
+/// The iPhone must not treat a missing Mac trust projection as evidence that
+/// Mac Control was intentionally disabled. The two cases have different owner
+/// actions: wait for publishing versus change a policy on the Mac.
+enum MacToolsPolicyGatePresentation {
+    enum State: Equatable {
+        case snapshotUnavailable
+        case macControlDisabled
+        case iosRemoteDisabled
+        case enabled
+    }
+
+    static func state(for policy: TrustMacControlPolicy?) -> State {
+        guard let policy else { return .snapshotUnavailable }
+        guard policy.enabled else { return .macControlDisabled }
+        return policy.remoteFromIosAllowed ? .enabled : .iosRemoteDisabled
+    }
+
+    /// A failed targeted refresh must not reuse an older, cached policy to
+    /// unlock privileged controls. Until this exact snapshot is proven current,
+    /// the safe presentation is the same as an unavailable policy.
+    static func policyForGate(
+        snapshotLoaded: Bool,
+        refreshedPolicy: TrustMacControlPolicy?
+    ) -> TrustMacControlPolicy? {
+        snapshotLoaded ? refreshedPolicy : nil
+    }
+
+    static func disabledDescription(for policy: TrustMacControlPolicy?) -> String {
+        switch state(for: policy) {
+        case .snapshotUnavailable:
+            "No Mac Control policy snapshot yet. Keep the Mac app open until it publishes Trust settings."
+        case .macControlDisabled:
+            "Mac Control is disabled by policy. Enable Agent Access → Full Mac or turn on Mac Control in the Mac app's Trust tab."
+        case .iosRemoteDisabled:
+            "iOS remote control is disabled by policy. Enable iOS remote control in the Mac app's Trust tab under Mac Control."
+        case .enabled:
+            "Mac Tools are available."
+        }
+    }
+}
+
+/// The individual Mac privileges remain independently fail-closed even after
+/// the enclosing Mac Control policy has enabled this screen. Keeping their
+/// decision and owner-facing explanation together prevents a dimmed control
+/// from losing the reason it is unavailable.
+enum MacToolsPrivilege: CaseIterable {
+    case shortcuts
+    case notifications
+    case systemControl
+    case spotlight
+}
+
+enum MacToolsPrivilegePresentation {
+    static func isAllowed(_ privilege: MacToolsPrivilege, policy: TrustMacControlPolicy?) -> Bool {
+        guard let policy else { return false }
+        return switch privilege {
+        case .shortcuts: policy.shortcutsAllowed
+        case .notifications: policy.notificationsAllowed
+        case .systemControl: policy.systemControlAllowed
+        case .spotlight: policy.spotlightAllowed
+        }
+    }
+
+    static func disabledDescription(for privilege: MacToolsPrivilege) -> String {
+        switch privilege {
+        case .shortcuts: "Shortcuts are disabled by Mac Control policy."
+        case .notifications: "Notifications are disabled by Mac Control policy."
+        case .systemControl: "System controls are disabled by Mac Control policy."
+        case .spotlight: "Spotlight is disabled by Mac Control policy."
+        }
+    }
+}
+
+/// The iPhone can request a volume target, but the Mac control response does
+/// not include a current output-volume readback. Keep the control's local
+/// target and its post-action wording separate from an observed Mac state.
+enum MacVolumeControlPresentation {
+    static let defaultTargetFraction = 0.5
+    static let currentVolumeDisclosure = "The Mac does not publish its current output volume to iPhone. This is a target to send, not a readback."
+
+    static func targetPercent(for fraction: Double) -> Int {
+        guard fraction.isFinite else { return 50 }
+        return Int((min(max(fraction, 0), 1) * 100).rounded())
+    }
+
+    static func isValid(percent: Int) -> Bool {
+        (0...100).contains(percent)
+    }
+
+    static func acknowledgement(percent: Int) -> String {
+        "The Mac accepted the request to set volume to \(percent)%. Its current output volume is not read back to iPhone."
+    }
+}
+
+/// Explicit presentation state for the notification composer. A result must
+/// identify both the operation and its outcome instead of appearing as an
+/// unlabeled line beside a disabled-looking control.
+enum MacNotificationSendPresentation {
+    enum Feedback: Equatable {
+        case sent
+        case failed(String)
+
+        var text: String {
+            switch self {
+            case .sent: "Notification sent to the Mac."
+            case .failed(let detail): "Couldn’t send notification: \(detail)"
+            }
+        }
+
+        var systemImage: String {
+            switch self {
+            case .sent: "checkmark.circle.fill"
+            case .failed: "exclamationmark.triangle.fill"
+            }
+        }
+
+        var tint: Color {
+            switch self {
+            case .sent: .green
+            case .failed: .red
+            }
+        }
+    }
+}
+
+/// Spotlight's empty string means the Mac did not provide a search response.
+/// That is different from a nonempty response whose lines contain no usable
+/// results, which is a completed zero-result search.
+enum MacToolsSpotlightPresentation {
+    static let collapsedResultLimit = 8
+
+    enum Outcome: Equatable {
+        case emptyResponse
+        case noResults
+        case results([String])
+
+        var rows: [String] {
+            switch self {
+            case .results(let results): results
+            case .emptyResponse, .noResults: []
+            }
+        }
+
+        var statusText: String {
+            switch self {
+            case .emptyResponse:
+                "Mac returned an empty Spotlight response; results are unavailable."
+            case .noResults:
+                "No Spotlight results."
+            case .results(let results):
+                "\(results.count) Spotlight result(s)."
+            }
+        }
+
+        var resultCount: Int { rows.count }
+
+        func visibleRows(showingAll: Bool) -> [String] {
+            guard !showingAll else { return rows }
+            return Array(rows.prefix(MacToolsSpotlightPresentation.collapsedResultLimit))
+        }
+
+        var hiddenResultCount: Int {
+            max(0, resultCount - MacToolsSpotlightPresentation.collapsedResultLimit)
+        }
+
+        func truncationText(showingAll: Bool) -> String? {
+            guard hiddenResultCount > 0 else { return nil }
+            return showingAll
+                ? "Showing all \(resultCount) Spotlight results."
+                : "Showing \(MacToolsSpotlightPresentation.collapsedResultLimit) of \(resultCount) Spotlight results."
+        }
+    }
+
+    static func outcome(from rawResponse: String) -> Outcome {
+        guard !rawResponse.isEmpty else { return .emptyResponse }
+
+        let results = rawResponse
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        return results.isEmpty ? .noResults : .results(results)
+    }
+}
+
 // MARK: - MacToolsView
 
 struct MacToolsView: View {
     @State private var macPolicy: TrustMacControlPolicy?
     @State private var hasLoadedPolicy = false
-    @State private var policyLoadError: String?
     @State private var manualShortcutName = ""
     @State private var notifTitle = ""
     @State private var notifMessage = ""
     @State private var isSendingNotif = false
-    @State private var notifResult: String?
-    @State private var volume: Double = 0.5
+    @State private var notifResult: MacNotificationSendPresentation.Feedback?
+    @State private var volume: Double = MacVolumeControlPresentation.defaultTargetFraction
     @State private var isSettingVolume = false
     @State private var spotlightQuery = ""
-    @State private var spotlightResults: [String] = []
+    @State private var spotlightOutcome: MacToolsSpotlightPresentation.Outcome?
+    @State private var showsAllSpotlightResults = false
     @State private var isSearching = false
     @State private var actionStatus: String?
-    @State private var remoteActions: [RemoteActionCard] = []
+    @StateObject private var remoteActionLedger = RemoteActionLedger.shared
 
-    private var masterEnabled: Bool { macPolicy?.enabled == true }
-    private var remoteAllowed: Bool { macPolicy?.remoteFromIosAllowed == true }
-    private var iosOk: Bool { masterEnabled && remoteAllowed }
+    private var remoteActions: [RemoteActionCard] {
+        remoteActionLedger.actions
+    }
+
+    private var iosOk: Bool {
+        MacToolsPolicyGatePresentation.state(for: macPolicy) == .enabled
+    }
+
+    private var volumeTargetPercent: Int {
+        MacVolumeControlPresentation.targetPercent(for: volume)
+    }
 
     var body: some View {
         Group {
@@ -37,7 +318,13 @@ struct MacToolsView: View {
         }
         .task { await refresh() }
         .navigationTitle("Mac Tools")
+        .macSyncErrorBanner()
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .navigationBarLeading) {
+                MacStatusChip()
+            }
+        }
         .refreshable { await refresh() }
     }
 
@@ -49,9 +336,8 @@ struct MacToolsView: View {
             AppEmptyState(
                 title: "Mac Tools Unavailable",
                 systemImage: "macbook.and.iphone",
-                description: policyLoadError ?? (!masterEnabled
-                    ? "Enable Agent Access → Full Mac or turn on Mac Control in the Mac app's Trust tab."
-                    : "Enable iOS remote control in the Mac app's Trust tab under Mac Control.")
+                kind: .unavailable,
+                description: MacToolsPolicyGatePresentation.disabledDescription(for: macPolicy)
             )
         }
         .padding()
@@ -102,12 +388,15 @@ struct MacToolsView: View {
             } header: {
                 Label("Remote Actions", systemImage: "arrow.triangle.2.circlepath")
                     .font(AppFont.section)
+            } footer: {
+                Text("Remote action receipts remain available while this app session is open.")
+                    .font(AppFont.label)
             }
 
             // ── Shortcuts ──────────────────────────────────────────────
             Section {
-                if macPolicy?.shortcutsAllowed != true {
-                    lockedPolicyRow("Shortcuts are disabled by Mac Control policy.")
+                if !MacToolsPrivilegePresentation.isAllowed(.shortcuts, policy: macPolicy) {
+                    lockedPolicyRow(MacToolsPrivilegePresentation.disabledDescription(for: .shortcuts))
                 } else {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack(spacing: 8) {
@@ -155,6 +444,9 @@ struct MacToolsView: View {
                         .textFieldStyle(.roundedBorder)
                     TextField("Message", text: $notifMessage)
                         .textFieldStyle(.roundedBorder)
+                    if !MacToolsPrivilegePresentation.isAllowed(.notifications, policy: macPolicy) {
+                        lockedPolicyRow(MacToolsPrivilegePresentation.disabledDescription(for: .notifications))
+                    }
                     HStack {
                         Button {
                             Task { await sendNotification() }
@@ -166,13 +458,16 @@ struct MacToolsView: View {
                             }
                         }
                         .buttonStyle(.borderedProminent)
-                        .disabled(notifMessage.isEmpty || isSendingNotif || macPolicy?.notificationsAllowed != true)
+                        .disabled(
+                            notifMessage.isEmpty || isSendingNotif
+                                || !MacToolsPrivilegePresentation.isAllowed(.notifications, policy: macPolicy)
+                        )
                         if let r = notifResult {
-                            Text(r).font(.caption).foregroundStyle(.secondary)
+                            Label(r.text, systemImage: r.systemImage)
+                                .font(.caption)
+                                .foregroundStyle(r.tint)
+                                .accessibilityLabel("Notification status: \(r.text)")
                         }
-                    }
-                    if macPolicy?.notificationsAllowed != true {
-                        lockedPolicyRow("Notifications are disabled by Mac Control policy.")
                     }
                 }
                 .padding(.vertical, 4)
@@ -183,7 +478,7 @@ struct MacToolsView: View {
                 } label: {
                     Label("Lock Screen", systemImage: "lock.display")
                 }
-                .disabled(macPolicy?.systemControlAllowed != true)
+                .disabled(!MacToolsPrivilegePresentation.isAllowed(.systemControl, policy: macPolicy))
 
                 // Sleep display
                 Button {
@@ -191,17 +486,17 @@ struct MacToolsView: View {
                 } label: {
                     Label("Sleep Display", systemImage: "display")
                 }
-                .disabled(macPolicy?.systemControlAllowed != true)
+                .disabled(!MacToolsPrivilegePresentation.isAllowed(.systemControl, policy: macPolicy))
 
                 // A2: reason for the Lock Screen / Sleep Display pair — both gate
                 // on systemControlAllowed and were previously opacity-only.
-                if macPolicy?.systemControlAllowed != true {
-                    lockedPolicyRow("System controls are disabled by Mac Control policy.")
+                if !MacToolsPrivilegePresentation.isAllowed(.systemControl, policy: macPolicy) {
+                    lockedPolicyRow(MacToolsPrivilegePresentation.disabledDescription(for: .systemControl))
                 }
 
                 // Volume slider
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("Set Volume")
+                    Text("Choose a volume target")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
                     HStack {
@@ -209,19 +504,28 @@ struct MacToolsView: View {
                         Slider(value: $volume, in: 0...1, step: 0.05)
                         Image(systemName: "speaker.wave.3.fill").foregroundStyle(.secondary)
                     }
+                    Text("Target: \(volumeTargetPercent)%")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(MacVolumeControlPresentation.currentVolumeDisclosure)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                     Button {
                         Task { await setVolume() }
                     } label: {
                         if isSettingVolume {
                             ProgressView()
                         } else {
-                            Text("Set \(Int(volume * 100))%")
+                            Text("Set target \(volumeTargetPercent)%")
                         }
                     }
                     .buttonStyle(.bordered)
-                    .disabled(isSettingVolume || macPolicy?.systemControlAllowed != true)
-                    if macPolicy?.systemControlAllowed != true {
-                        lockedPolicyRow("System controls are disabled by Mac Control policy.")
+                    .disabled(
+                        isSettingVolume
+                            || !MacToolsPrivilegePresentation.isAllowed(.systemControl, policy: macPolicy)
+                    )
+                    if !MacToolsPrivilegePresentation.isAllowed(.systemControl, policy: macPolicy) {
+                        lockedPolicyRow(MacToolsPrivilegePresentation.disabledDescription(for: .systemControl))
                     }
                 }
                 .padding(.vertical, 4)
@@ -242,20 +546,16 @@ struct MacToolsView: View {
                             if isSearching { ProgressView() } else { Image(systemName: "magnifyingglass") }
                         }
                         .buttonStyle(.bordered)
-                        .disabled(spotlightQuery.isEmpty || isSearching || macPolicy?.spotlightAllowed != true)
+                        .disabled(
+                            spotlightQuery.isEmpty || isSearching
+                                || !MacToolsPrivilegePresentation.isAllowed(.spotlight, policy: macPolicy)
+                        )
                     }
-                    if macPolicy?.spotlightAllowed != true {
-                        lockedPolicyRow("Spotlight is disabled by Mac Control policy.")
+                    if !MacToolsPrivilegePresentation.isAllowed(.spotlight, policy: macPolicy) {
+                        lockedPolicyRow(MacToolsPrivilegePresentation.disabledDescription(for: .spotlight))
                     }
-                    if !spotlightResults.isEmpty {
-                        VStack(alignment: .leading, spacing: 2) {
-                            ForEach(spotlightResults.prefix(8), id: \.self) { result in
-                                Text(result)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                            }
-                        }
+                    if let spotlightOutcome {
+                        spotlightResultPresentation(spotlightOutcome)
                     }
                 }
                 .padding(.vertical, 4)
@@ -275,6 +575,39 @@ struct MacToolsView: View {
         .listStyle(.insetGrouped)
     }
 
+    @ViewBuilder
+    private func spotlightResultPresentation(_ outcome: MacToolsSpotlightPresentation.Outcome) -> some View {
+        switch outcome {
+        case .emptyResponse:
+            Label(outcome.statusText, systemImage: "exclamationmark.triangle")
+                .font(AppFont.label)
+                .foregroundStyle(.orange)
+        case .noResults:
+            Label(outcome.statusText, systemImage: "magnifyingglass")
+                .font(AppFont.label)
+                .foregroundStyle(.secondary)
+        case .results:
+            VStack(alignment: .leading, spacing: 5) {
+                ForEach(outcome.visibleRows(showingAll: showsAllSpotlightResults), id: \.self) { result in
+                    Text(result)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(showsAllSpotlightResults ? nil : 1)
+                        .textSelection(.enabled)
+                }
+                if let truncationText = outcome.truncationText(showingAll: showsAllSpotlightResults) {
+                    Text(truncationText)
+                        .font(AppFont.label)
+                        .foregroundStyle(.secondary)
+                    Button(showsAllSpotlightResults ? "Show fewer Spotlight results" : "Show all Spotlight results") {
+                        showsAllSpotlightResults.toggle()
+                    }
+                    .font(AppFont.label)
+                }
+            }
+        }
+    }
+
     // A2: reusable inline reason for a policy-gated control. Appends the
     // actionable Trust-tab hint so a disabled control isn't just dimmed — it
     // says why it's off and where to turn it on. Matches the app's existing
@@ -288,20 +621,14 @@ struct MacToolsView: View {
 
     @discardableResult
     private func startRemoteAction(_ kind: RemoteActionKind, title: String, subtitle: String) -> UUID {
-        let card = RemoteActionCard(kind: kind, title: title, subtitle: subtitle, state: .waiting, detail: "Queued for Mac")
         withAnimation(AppMotion.snappy) {
-            remoteActions.insert(card, at: 0)
-            remoteActions = Array(remoteActions.prefix(12))
+            remoteActionLedger.start(kind, title: title, subtitle: subtitle)
         }
-        return card.id
     }
 
     private func updateRemoteAction(_ id: UUID, state: RemoteActionState, detail: String) {
         withAnimation(AppMotion.snappy) {
-            guard let idx = remoteActions.firstIndex(where: { $0.id == id }) else { return }
-            remoteActions[idx].state = state
-            remoteActions[idx].detail = detail
-            remoteActions[idx].updatedAt = Date()
+            remoteActionLedger.update(id, state: state, detail: detail)
         }
     }
 
@@ -331,14 +658,11 @@ struct MacToolsView: View {
     // every Mac action below goes through iCloudSyncEngine.
 
     private func loadPolicy() async {
-        policyLoadError = nil
-        await iCloudSyncEngine.shared.refreshTrustSnapshot()
-        if let snap = iCloudSyncEngine.shared.trustPolicy,
-           let mcPolicy = snap.macControlPolicy {
-            macPolicy = mcPolicy
-        } else {
-            policyLoadError = "No Mac Control policy snapshot yet."
-        }
+        let snapshotLoaded = await iCloudSyncEngine.shared.refreshTrustSnapshot()
+        macPolicy = MacToolsPolicyGatePresentation.policyForGate(
+            snapshotLoaded: snapshotLoaded,
+            refreshedPolicy: iCloudSyncEngine.shared.trustPolicy?.macControlPolicy
+        )
         hasLoadedPolicy = true
     }
 
@@ -348,51 +672,78 @@ struct MacToolsView: View {
         let title = titleOverride ?? (notifTitle.isEmpty ? "NativeAgent" : notifTitle)
         let message = messageOverride ?? notifMessage
         let actionID = cardID ?? startRemoteAction(.notify(title: title, message: message), title: "Send notification", subtitle: title)
-        updateRemoteAction(actionID, state: .running, detail: "Sending to Mac")
+        updateRemoteAction(
+            actionID,
+            state: .running,
+            detail: RemoteActionRetryPresentation.dispatchDetail(
+                for: .notify(title: title, message: message),
+                isRetry: cardID != nil
+            )
+        )
         do {
             _ = try await iCloudSyncEngine.shared.macNotify(title: title, message: message)
-            notifResult = "Sent."
+            notifResult = .sent
             updateRemoteAction(actionID, state: .ranOnMac, detail: "Ran on Mac through iCloud")
             notifMessage = ""
             notifTitle = ""
         } catch {
-            notifResult = error.localizedDescription
-            updateRemoteAction(actionID, state: error.localizedDescription.lowercased().contains("approval") ? .waitingApproval : .failed, detail: error.localizedDescription)
+            notifResult = .failed(error.localizedDescription)
+            updateRemoteAction(actionID, state: RemoteActionState.forError(error), detail: error.localizedDescription)
         }
         isSendingNotif = false
     }
 
     private func quickAction(_ action: String, retrying cardID: UUID? = nil) async {
+        guard let quickAction = MacSystemQuickAction(rawValue: action) else {
+            let completion = MacSystemQuickActionExecution.unsupported(named: action)
+            actionStatus = completion.status
+            if let cardID {
+                updateRemoteAction(cardID, state: completion.state, detail: completion.detail)
+            }
+            return
+        }
         actionStatus = "Running \(action)…"
         let actionID = cardID ?? startRemoteAction(.system(action), title: action.replacingOccurrences(of: "_", with: " ").capitalized, subtitle: "System action")
-        updateRemoteAction(actionID, state: .running, detail: "Sending to Mac")
-        do {
-            if action == "lock_screen" {
+        updateRemoteAction(
+            actionID,
+            state: .running,
+            detail: RemoteActionRetryPresentation.dispatchDetail(
+                for: .system(action),
+                isRetry: cardID != nil
+            )
+        )
+        let completion = await MacSystemQuickActionExecution.execute(quickAction) { action in
+            switch action {
+            case .lockScreen:
                 _ = try await iCloudSyncEngine.shared.macLockScreen()
-            } else if action == "sleep_display" {
+            case .sleepDisplay:
                 _ = try await iCloudSyncEngine.shared.macSleepDisplay()
             }
-            actionStatus = "Done."
-            updateRemoteAction(actionID, state: .ranOnMac, detail: "Ran on Mac through iCloud")
-        } catch {
-            actionStatus = error.localizedDescription
-            updateRemoteAction(actionID, state: error.localizedDescription.lowercased().contains("approval") ? .waitingApproval : .failed, detail: error.localizedDescription)
         }
+        actionStatus = completion.status
+        updateRemoteAction(actionID, state: completion.state, detail: completion.detail)
     }
 
     private func setVolume(percentOverride: Int? = nil, retrying cardID: UUID? = nil) async {
         isSettingVolume = true
         actionStatus = nil
-        let percent = percentOverride ?? Int(volume * 100)
+        let percent = percentOverride ?? volumeTargetPercent
         let actionID = cardID ?? startRemoteAction(.volume(percent), title: "Set volume", subtitle: "\(percent)%")
-        updateRemoteAction(actionID, state: .running, detail: "Sending to Mac")
+        updateRemoteAction(
+            actionID,
+            state: .running,
+            detail: RemoteActionRetryPresentation.dispatchDetail(
+                for: .volume(percent),
+                isRetry: cardID != nil
+            )
+        )
         do {
             _ = try await iCloudSyncEngine.shared.macSetVolume(percent: percent)
-            actionStatus = "Volume set."
-            updateRemoteAction(actionID, state: .ranOnMac, detail: "Ran on Mac through iCloud")
+            actionStatus = MacVolumeControlPresentation.acknowledgement(percent: percent)
+            updateRemoteAction(actionID, state: .ranOnMac, detail: "Mac accepted the request; current volume is not read back.")
         } catch {
             actionStatus = error.localizedDescription
-            updateRemoteAction(actionID, state: error.localizedDescription.lowercased().contains("approval") ? .waitingApproval : .failed, detail: error.localizedDescription)
+            updateRemoteAction(actionID, state: RemoteActionState.forError(error), detail: error.localizedDescription)
         }
         isSettingVolume = false
     }
@@ -401,18 +752,32 @@ struct MacToolsView: View {
         let query = queryOverride ?? spotlightQuery
         guard !query.isEmpty else { return }
         isSearching = true
-        spotlightResults = []
+        spotlightOutcome = nil
+        showsAllSpotlightResults = false
         let actionID = cardID ?? startRemoteAction(.spotlight(query), title: "Spotlight search", subtitle: query)
-        updateRemoteAction(actionID, state: .running, detail: "Searching Mac")
+        updateRemoteAction(
+            actionID,
+            state: .running,
+            detail: RemoteActionRetryPresentation.dispatchDetail(
+                for: .spotlight(query),
+                isRetry: cardID != nil
+            )
+        )
         do {
             let raw = try await iCloudSyncEngine.shared.macSpotlight(query: query)
-            let lines = raw.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
-            spotlightResults = lines.isEmpty ? [] : lines
-            actionStatus = "\(spotlightResults.count) Spotlight result(s)."
-            updateRemoteAction(actionID, state: .ranOnMac, detail: "\(spotlightResults.count) result(s)")
+            let outcome = MacToolsSpotlightPresentation.outcome(from: raw)
+            spotlightOutcome = outcome
+            actionStatus = outcome.statusText
+
+            switch outcome {
+            case .emptyResponse:
+                updateRemoteAction(actionID, state: .failed, detail: outcome.statusText)
+            case .noResults, .results:
+                updateRemoteAction(actionID, state: .ranOnMac, detail: "\(outcome.resultCount) result(s)")
+            }
         } catch {
             actionStatus = error.localizedDescription
-            updateRemoteAction(actionID, state: error.localizedDescription.lowercased().contains("approval") ? .waitingApproval : .failed, detail: error.localizedDescription)
+            updateRemoteAction(actionID, state: RemoteActionState.forError(error), detail: error.localizedDescription)
         }
         isSearching = false
     }
@@ -420,26 +785,43 @@ struct MacToolsView: View {
     private func runShortcut(_ name: String, retrying cardID: UUID? = nil) async {
         actionStatus = "Running shortcut \"\(name)\"…"
         let actionID = cardID ?? startRemoteAction(.shortcut(name), title: "Run shortcut", subtitle: name)
-        updateRemoteAction(actionID, state: .running, detail: "Sending to Mac")
+        updateRemoteAction(
+            actionID,
+            state: .running,
+            detail: RemoteActionRetryPresentation.dispatchDetail(
+                for: .shortcut(name),
+                isRetry: cardID != nil
+            )
+        )
         do {
             _ = try await iCloudSyncEngine.shared.macShortcut(name: name)
             actionStatus = "Shortcut ran."
             updateRemoteAction(actionID, state: .ranOnMac, detail: "Ran on Mac through iCloud")
         } catch {
-            actionStatus = error.localizedDescription
-            updateRemoteAction(actionID, state: error.localizedDescription.lowercased().contains("approval") ? .waitingApproval : .failed, detail: error.localizedDescription)
+            let failure = MacShortcutRunnerPresentation.failure(for: error, shortcutName: name)
+            actionStatus = failure.status
+            updateRemoteAction(actionID, state: RemoteActionState.forError(error), detail: failure.detail)
         }
     }
 }
 
 // MARK: - Remote Action Cards
 
-private enum RemoteActionState: String {
+enum RemoteActionState: String, Equatable {
     case waiting = "waiting"
     case running = "running"
     case waitingApproval = "waiting approval"
     case ranOnMac = "ran on Mac"
     case failed = "failed"
+
+    static func forError(_ error: Error) -> Self {
+        if case SyncError.approvalRequired = error {
+            return .waitingApproval
+        }
+        return .failed
+    }
+
+    var offersRetry: Bool { self == .failed }
 
     var color: Color {
         switch self {
@@ -461,7 +843,26 @@ private enum RemoteActionState: String {
     }
 }
 
-private enum RemoteActionKind: Equatable {
+/// A remote action's recovery is determined by its typed terminal state, not
+/// by matching an error sentence.  Pending approval and ordinary failure have
+/// distinct next steps and must never collapse into the same Retry affordance.
+enum RemoteActionCardRecoveryPresentation {
+    enum Control: Equatable {
+        case none
+        case reviewApproval
+        case retry
+    }
+
+    static func control(for state: RemoteActionState) -> Control {
+        switch state {
+        case .waitingApproval: .reviewApproval
+        case .failed: .retry
+        case .waiting, .running, .ranOnMac: .none
+        }
+    }
+}
+
+enum RemoteActionKind: Equatable {
     case notify(title: String, message: String)
     case system(String)
     case volume(Int)
@@ -469,7 +870,29 @@ private enum RemoteActionKind: Equatable {
     case shortcut(String)
 }
 
-private struct RemoteActionCard: Identifiable, Equatable {
+enum RemoteActionRetryPresentation {
+    static func dispatchDetail(for action: RemoteActionKind, isRetry: Bool) -> String {
+        guard isRetry else {
+            if case .spotlight = action { return "Searching Mac" }
+            return "Sending to Mac"
+        }
+
+        switch action {
+        case .notify(let title, let message):
+            return "Retrying original notification \"\(title)\": \"\(message)\" — not the current composer draft."
+        case .system(let command):
+            return "Retrying original system action: \(command.replacingOccurrences(of: "_", with: " "))."
+        case .volume(let percent):
+            return "Retrying original volume target: \(percent)% — not the current slider value."
+        case .spotlight(let query):
+            return "Retrying original Spotlight search \"\(query)\" — not the current search field."
+        case .shortcut(let name):
+            return "Retrying original shortcut \"\(name)\" — not the current shortcut field."
+        }
+    }
+}
+
+struct RemoteActionCard: Identifiable, Equatable {
     let id: UUID
     var kind: RemoteActionKind
     var title: String
@@ -488,6 +911,49 @@ private struct RemoteActionCard: Identifiable, Equatable {
         self.detail = detail
         self.createdAt = Date()
         self.updatedAt = Date()
+    }
+}
+
+/// App-session receipt ownership for Mac Tools. A waiting approval is the
+/// user's only direct breadcrumb from an interrupted remote action to
+/// Activity, so ordinary receipt trimming may never evict it.
+@MainActor
+final class RemoteActionLedger: ObservableObject {
+    static let shared = RemoteActionLedger()
+
+    @Published private(set) var actions: [RemoteActionCard] = []
+    private let maximumOrdinaryActions: Int
+
+    init(maximumOrdinaryActions: Int = 12) {
+        self.maximumOrdinaryActions = max(0, maximumOrdinaryActions)
+    }
+
+    @discardableResult
+    func start(_ kind: RemoteActionKind, title: String, subtitle: String) -> UUID {
+        let card = RemoteActionCard(
+            kind: kind,
+            title: title,
+            subtitle: subtitle,
+            state: .waiting,
+            detail: "Queued for Mac"
+        )
+        actions.insert(card, at: 0)
+        trimOrdinaryActions()
+        return card.id
+    }
+
+    func update(_ id: UUID, state: RemoteActionState, detail: String) {
+        guard let index = actions.firstIndex(where: { $0.id == id }) else { return }
+        actions[index].state = state
+        actions[index].detail = detail
+        actions[index].updatedAt = Date()
+        trimOrdinaryActions()
+    }
+
+    private func trimOrdinaryActions() {
+        let approvalWaits = actions.filter { $0.state == .waitingApproval }
+        let ordinary = actions.filter { $0.state != .waitingApproval }
+        actions = approvalWaits + Array(ordinary.prefix(maximumOrdinaryActions))
     }
 }
 
@@ -527,12 +993,21 @@ private struct RemoteActionCardView: View {
                         .font(AppFont.tag)
                         .foregroundStyle(.tertiary)
                     Spacer()
-                    if action.state == .waitingApproval {
+                    if action.state == .waitingApproval,
+                       RemoteActionCardRecoveryPresentation.control(for: action.state) == .reviewApproval {
+                        Text("Approval status is local to this session; review it in Activity.")
+                            .font(AppFont.tag)
+                            .foregroundStyle(.secondary)
                         Button("Review Approval", systemImage: "checkmark.shield") {
-                            NotificationCenter.default.post(name: .nativeagentOpenActivity, object: nil)
+                            NotificationCenter.default.post(
+                                name: .nativeagentOpenActivity,
+                                object: nil,
+                                userInfo: ["screen": "approvals"]
+                            )
                         }
                         .buttonStyle(.borderedProminent)
-                    } else if action.state == .failed {
+                    } else if action.state == .failed,
+                              RemoteActionCardRecoveryPresentation.control(for: action.state) == .retry {
                         Button("Retry", systemImage: "arrow.clockwise", action: onRetry)
                             .buttonStyle(.bordered)
                     }

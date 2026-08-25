@@ -11,6 +11,26 @@ import Foundation
 import SwiftUI
 import NativeAgentShared
 
+/// Outcome of the provider snapshot read that powers the chat model menu.
+/// Keeping an explicit result lets an on-demand refresh distinguish a catalog
+/// that was retained because iCloud is not ready from a usable model list.
+enum ProviderControlsRefreshOutcome: Equatable, Sendable {
+    case refreshed
+    case unavailable
+    case superseded
+
+    var feedbackMessage: String? {
+        switch self {
+        case .refreshed:
+            nil
+        case .unavailable:
+            "Couldn't refresh models. Provider snapshots are still downloading from iCloud. Try again in a moment."
+        case .superseded:
+            "Couldn't refresh models because iCloud sync was reconfigured. Try again."
+        }
+    }
+}
+
 extension iCloudSyncEngine {
     /// Apply the credential-free CloudKit projection published by the Mac.
     /// Decode/validation is all-or-nothing so malformed or future payloads
@@ -131,17 +151,23 @@ extension iCloudSyncEngine {
         // Resumption of an @MainActor async func is back on the main actor.
         guard generation == snapshotRefreshGeneration,
               lifecycle == lifecycleGeneration else { return }
-        if let v = bundle.workshopTasks { workshopTasks = v }
+        if let v = bundle.workshopTasks { workshopTasks = v; WorkshopCompletionNotificationTracker.shared.apply(v) }
         if let v = bundle.deskItems { deskItems = v }
         if let v = bundle.skills { skills = v }
         if let v = bundle.memories { memories = v }
         if let v = bundle.memoryProposals { memoryProposals = v.filter(\.isPending) }
         if let v = bundle.trainingProposals { trainingProposals = v }
         if let v = bundle.promotionCandidates { promotionCandidates = v }
+        if bundle.trainingProposals != nil, bundle.promotionCandidates != nil {
+            selfImprovementSnapshotPublishedAt = Date()
+        }
         if let v = bundle.trustPolicy { trustPolicy = v }
         if let v = bundle.personality { personality = v }
         if let v = bundle.health { health = v }
-        if let v = bundle.organismLivingStatus { organismLivingStatus = v }
+        // This status has an explicit ABSENT presentation. Retaining a prior
+        // value when its file disappears would turn a missing projection into
+        // a false current posture.
+        organismLivingStatus = bundle.organismLivingStatus
         if let v = bundle.sessions { sessions = v }
         if let v = bundle.pinnedChatSessions { pinnedChatSessions = v }
         if let v = bundle.chatTranscripts { chatTranscripts = Self.transcriptMap(v) }
@@ -197,7 +223,7 @@ extension iCloudSyncEngine {
         if let v = bundle.trustPolicy { trustPolicy = v }
         if let v = bundle.personality { personality = v }
         if let v = bundle.health { health = v }
-        if let v = bundle.organismLivingStatus { organismLivingStatus = v }
+        organismLivingStatus = bundle.organismLivingStatus
         if let v = bundle.sessions { sessions = v }
         if let v = bundle.pinnedChatSessions { pinnedChatSessions = v }
         if let v = bundle.connectors { connectors = v }
@@ -249,7 +275,7 @@ extension iCloudSyncEngine {
         let bundle = await Self.loadActivitySnapshots(snapshotDir: snapshotDir)
         guard generation == targetedRefreshGeneration,
               lifecycle == lifecycleGeneration else { return }
-        if let v = bundle.workshopTasks { workshopTasks = v }
+        if let v = bundle.workshopTasks { workshopTasks = v; WorkshopCompletionNotificationTracker.shared.apply(v) }
         if let v = bundle.deskItems { deskItems = v }
         if let v = bundle.memories { memories = v }
         if let v = bundle.inboxItems {
@@ -259,6 +285,9 @@ extension iCloudSyncEngine {
         if let v = bundle.memoryProposals { memoryProposals = v.filter(\.isPending) }
         if let v = bundle.trainingProposals { trainingProposals = v }
         if let v = bundle.promotionCandidates { promotionCandidates = v }
+        if bundle.trainingProposals != nil, bundle.promotionCandidates != nil {
+            selfImprovementSnapshotPublishedAt = Date()
+        }
         if bundle.loadedAllSnapshots {
             lastSyncAt = Date()
             syncError = nil
@@ -306,6 +335,7 @@ extension iCloudSyncEngine {
         if let latest: [WorkshopTaskRecord] = await Self.loadSnapshotArrayOnly(named: "workshop_tasks.json", in: snapshotDir) {
             guard lifecycle == lifecycleGeneration else { return }
             workshopTasks = latest
+            WorkshopCompletionNotificationTracker.shared.apply(latest)
             lastSyncAt = Date()
             syncError = nil
         } else {
@@ -382,9 +412,10 @@ extension iCloudSyncEngine {
         if let latest {
             health = latest
         }
-        if let organism {
-            organismLivingStatus = organism
-        }
+        // A missing/corrupt file is an explicit absent state for this focused
+        // health consumer. Keeping the prior object here would let the Status
+        // screen render yesterday's posture as if the current file existed.
+        organismLivingStatus = organism
         if latest != nil && organism != nil {
             lastSyncAt = Date()
             syncError = nil
@@ -412,28 +443,32 @@ extension iCloudSyncEngine {
         }
     }
 
-    func refreshTrustSnapshot() async {
-        guard let snapshotDir else { return }
+    @discardableResult
+    func refreshTrustSnapshot() async -> Bool {
+        guard let snapshotDir else { return false }
         let lifecycle = lifecycleGeneration
         if let latest: TrustPolicy = await Self.loadSnapshotObjectOnly(named: "trust_policy.json", in: snapshotDir) {
-            guard lifecycle == lifecycleGeneration else { return }
+            guard lifecycle == lifecycleGeneration else { return false }
             trustPolicy = latest
             lastSyncAt = Date()
             syncError = nil
+            return true
         } else {
-            guard lifecycle == lifecycleGeneration else { return }
+            guard lifecycle == lifecycleGeneration else { return false }
             syncError = "Trust snapshot is still downloading from iCloud. Try again in a moment."
+            return false
         }
     }
 
-    func refreshProviderControlsSnapshot() async {
-        guard let snapshotDir else { return }
+    @discardableResult
+    func refreshProviderControlsSnapshot() async -> ProviderControlsRefreshOutcome {
+        guard let snapshotDir else { return .unavailable }
         let lifecycle = lifecycleGeneration
         async let latestProviders: [ProviderInfo]? = Self.loadSnapshotArrayOnly(named: "providers.json", in: snapshotDir)
         async let latestTrust: TrustPolicy? = Self.loadSnapshotObjectOnly(named: "trust_policy.json", in: snapshotDir)
         async let latestSurfaceModels: [String: SurfaceModelPref]? = Self.loadSnapshotObjectOnly(named: "model_preferences.json", in: snapshotDir)
         let (providerRows, trustRow, surfaceModelRows) = await (latestProviders, latestTrust, latestSurfaceModels)
-        guard lifecycle == lifecycleGeneration else { return }
+        guard lifecycle == lifecycleGeneration else { return .superseded }
         if let providerRows { providers = providerRows }
         if let trustRow { trustPolicy = trustRow }
         // gpt-5.5 review finding #2: see the bulk-apply site above for why
@@ -447,6 +482,7 @@ extension iCloudSyncEngine {
         } else {
             syncError = "Provider snapshots are still downloading from iCloud. Try again in a moment."
         }
+        return providerRows == nil ? .unavailable : .refreshed
     }
 
     func refreshChatSessionsSnapshot() async {

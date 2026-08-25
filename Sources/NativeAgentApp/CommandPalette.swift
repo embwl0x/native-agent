@@ -24,6 +24,123 @@ struct PaletteItem: Identifiable, Hashable {
     }
 }
 
+enum CommandPaletteRecentAction: String, CaseIterable, Sendable {
+    case openSkills = "open_skills"
+    case openTools = "open_tools"
+    case newChat = "new_chat"
+    case refreshActivity = "refresh_activity"
+    case reloadAll = "reload_all"
+    case openDoctor = "open_doctor"
+
+    static func visible(showDeveloperSurfaces: Bool) -> [Self] {
+        allCases.filter { showDeveloperSurfaces || !$0.isDeveloperOnly }
+    }
+
+    var isDeveloperOnly: Bool { self == .openDoctor }
+
+    var presentation: (title: String, subtitle: String, systemImage: String) {
+        switch self {
+        case .openSkills:
+            ("Skills", "Skills & Tools", "puzzlepiece.extension")
+        case .openTools:
+            ("Tools", "Skills & Tools", "wrench.and.screwdriver")
+        case .newChat:
+            ("New chat session", "Start a fresh chat", "plus.bubble")
+        case .refreshActivity:
+            ("Refresh Activity", "Reload approvals, Inbox, and proposals", "arrow.clockwise")
+        case .reloadAll:
+            ("Reload all", "Full refreshAll() pass", "arrow.triangle.2.circlepath")
+        case .openDoctor:
+            ("Open Doctor", "Diagnostics surface", "stethoscope")
+        }
+    }
+}
+
+/// The visible, deterministic projection behind Cmd+K. Keeping this separate
+/// from the sheet lets every presentation state use the same exact pool and
+/// ranking rules the user interacts with.
+enum CommandPalettePresentation {
+    static func filteredItems(pool: [PaletteItem], query: String) -> [PaletteItem] {
+        let cleanQuery = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !cleanQuery.isEmpty else {
+            return Array(pool.filter {
+                if case .tab(let item) = $0.kind { return SidebarItem.primaryItems.contains(item) }
+                return false
+            }.prefix(8))
+        }
+
+        let scored: [(PaletteItem, Int, Int)] = pool.enumerated().compactMap { index, item in
+            let title = item.title.lowercased()
+            let subtitle = (item.subtitle ?? "").lowercased()
+            if title == cleanQuery { return (item, 0, index) }
+            if title.hasPrefix(cleanQuery) { return (item, 1, index) }
+            if subtitle.hasPrefix(cleanQuery) { return (item, 2, index) }
+            if title.contains(cleanQuery) { return (item, 3, index) }
+            if subtitle.contains(cleanQuery) { return (item, 4, index) }
+            return nil
+        }
+        return scored.sorted {
+            if $0.1 != $1.1 { return $0.1 < $1.1 }
+            return $0.2 < $1.2
+        }.map(\.0)
+    }
+
+    static func itemPool(
+        sessions: [ChatSession],
+        showDeveloperSurfaces: Bool
+    ) -> [PaletteItem] {
+        let tabCases: [SidebarItem] =
+            SidebarItem.primaryItems
+            + SidebarItem.visibleAdvancedItems(developerSurfacesEnabled: showDeveloperSurfaces)
+            + [.telegram]
+        let tabs = tabCases.map { item in
+            PaletteItem(
+                id: "tab.\(item.rawValue)",
+                title: item.displayName,
+                subtitle: item == .telegram ? "Settings" : (item.isAdvanced ? "Advanced" : "Primary"),
+                systemImage: item.systemImage,
+                kind: .tab(item)
+            )
+        }
+        let chats = visibleSessions(sessions).map { session in
+            let title = session.displayTitle.isEmpty ? "Untitled chat" : session.displayTitle
+            let preview = session.lastMessagePreview?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return PaletteItem(
+                id: "chat.\(session.id)",
+                title: title,
+                subtitle: (preview?.isEmpty == false) ? preview : "Chat session",
+                systemImage: "bubble.left.and.bubble.right",
+                kind: .chatSession(session.id)
+            )
+        }
+        return tabs + chats + CommandPaletteRecentAction.visible(
+            showDeveloperSurfaces: showDeveloperSurfaces
+        ).map { action in
+            let presentation = action.presentation
+            return PaletteItem(
+                id: "action.\(action.rawValue)",
+                title: presentation.title,
+                subtitle: presentation.subtitle,
+                systemImage: presentation.systemImage,
+                kind: .recentAction(action.rawValue)
+            )
+        }
+    }
+
+    static func visibleSessions(_ sessions: [ChatSession]) -> [ChatSession] {
+        let ordered = sessions
+            .filter { $0.archived != true }
+            .sorted {
+                let lhsRecency = $0.updatedAt ?? $0.createdAt
+                let rhsRecency = $1.updatedAt ?? $1.createdAt
+                if lhsRecency != rhsRecency { return lhsRecency > rhsRecency }
+                return $0.id < $1.id
+            }
+        var ids = Set<String>()
+        return ordered.filter { ids.insert($0.id).inserted }.prefix(50).map { $0 }
+    }
+}
+
 /// Cmd+K command palette. Presented as a sheet from ContentView.
 struct CommandPaletteView: View {
     @Environment(AppModel.self) private var appModel
@@ -230,100 +347,14 @@ struct CommandPaletteView: View {
     // MARK: - Filtering / ranking
 
     private func filteredItems() -> [PaletteItem] {
-        let pool = itemPool()
-        let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !q.isEmpty else {
-            // Empty query → top 8 primary sidebar items.
-            return Array(pool.filter {
-                if case .tab(let s) = $0.kind { return SidebarItem.primaryItems.contains(s) }
-                return false
-            }.prefix(8))
-        }
-        // Preserve original pool index as a stable tie-breaker so equal-score
-        // matches don't reshuffle between keystrokes (Swift's sort is not
-        // guaranteed stable). Tabs come first in the pool, so a tab title
-        // match outranks a same-bucket chat-session or action title match.
-        let scored: [(PaletteItem, Int, Int)] = pool.enumerated().compactMap { (idx, item) in
-            let title = item.title.lowercased()
-            let subtitle = (item.subtitle ?? "").lowercased()
-            if title == q { return (item, 0, idx) }
-            if title.hasPrefix(q) { return (item, 1, idx) }
-            if subtitle.hasPrefix(q) { return (item, 2, idx) }
-            if title.contains(q) { return (item, 3, idx) }
-            if subtitle.contains(q) { return (item, 4, idx) }
-            return nil
-        }
-        let result = scored.sorted {
-            if $0.1 != $1.1 { return $0.1 < $1.1 }
-            return $0.2 < $1.2
-        }.map(\.0)
-        return result
+        CommandPalettePresentation.filteredItems(pool: itemPool(), query: query)
     }
 
     private func itemPool() -> [PaletteItem] {
-        var pool: [PaletteItem] = []
-
-        // All sidebar tabs (primary + advanced + the routed-only .telegram
-        // child surface so it stays discoverable via Cmd+K). Legacy aliases
-        // are skipped — they route through `.normalized` already.
-        let tabCases: [SidebarItem] =
-            SidebarItem.primaryItems
-            + SidebarItem.visibleAdvancedItems(developerSurfacesEnabled: showDeveloperSurfaces)
-            + [.telegram]
-        for s in tabCases {
-            pool.append(
-                PaletteItem(
-                    id: "tab.\(s.rawValue)",
-                    title: s.displayName,
-                    subtitle: s == .telegram ? "Settings" : (s.isAdvanced ? "Advanced" : "Primary"),
-                    systemImage: s.systemImage,
-                    kind: .tab(s)
-                )
-            )
-        }
-
-        // All chat sessions (non-archived first, capped at 50).
-        let liveSessions = appModel.chatSessions.filter { $0.archived != true }
-        for session in liveSessions.prefix(50) {
-            let title = session.displayTitle.isEmpty ? "Untitled chat" : session.displayTitle
-            let preview = session.lastMessagePreview?.trimmingCharacters(in: .whitespacesAndNewlines)
-            pool.append(
-                PaletteItem(
-                    id: "chat.\(session.id)",
-                    title: title,
-                    subtitle: (preview?.isEmpty == false) ? preview : "Chat session",
-                    systemImage: "bubble.left.and.bubble.right",
-                    kind: .chatSession(session.id)
-                )
-            )
-        }
-
-        // Recent / well-known actions. Each id is wired in handleRecentAction.
-        var actions: [(String, String, String, String)] = [
-            ("open_skills", "Skills", "Skills & Tools", "puzzlepiece.extension"),
-            ("open_tools", "Tools", "Skills & Tools", "wrench.and.screwdriver"),
-            ("new_chat", "New chat session", "Start a fresh chat", "plus.bubble"),
-            ("refresh_activity", "Refresh Activity", "Reload approvals, Inbox, and proposals", "arrow.clockwise"),
-            ("reload_all", "Reload all", "Full refreshAll() pass", "arrow.triangle.2.circlepath"),
-        ]
-        // B2.2 review fix (gpt-5.5 BLOCKING): discoverable actions that jump
-        // to a developer-gated surface hide with the gate — same contract as
-        // the tab pool above. Explicit deep links still resolve.
-        if showDeveloperSurfaces {
-            actions.append(("open_doctor", "Open Doctor", "Diagnostics surface", "stethoscope"))
-        }
-        for (id, title, subtitle, image) in actions {
-            pool.append(
-                PaletteItem(
-                    id: "action.\(id)",
-                    title: title,
-                    subtitle: subtitle,
-                    systemImage: image,
-                    kind: .recentAction(id)
-                )
-            )
-        }
-        return pool
+        CommandPalettePresentation.itemPool(
+            sessions: appModel.chatSessions,
+            showDeveloperSurfaces: showDeveloperSurfaces
+        )
     }
 
     // MARK: - Commit / navigation
@@ -362,23 +393,22 @@ struct CommandPaletteView: View {
     }
 
     private func handleRecentAction(_ id: String) {
-        switch id {
-        case "open_skills":
+        guard let action = CommandPaletteRecentAction(rawValue: id) else { return }
+        switch action {
+        case .openSkills:
             NativeAgentAppCoordinator.shared.request(.skillsTools(.skills))
-        case "open_tools":
+        case .openTools:
             NativeAgentAppCoordinator.shared.request(.skillsTools(.tools))
-        case "new_chat":
+        case .newChat:
             Task { await appModel.newChatSession() }
             NativeAgentAppCoordinator.shared.request(.sidebar(.chat))
-        case "refresh_activity":
+        case .refreshActivity:
             Task { await appModel.refreshForSidebarItem(.activity) }
             NativeAgentAppCoordinator.shared.request(.sidebar(.activity))
-        case "open_doctor":
+        case .openDoctor:
             NativeAgentAppCoordinator.shared.request(.sidebar(.diagnostics))
-        case "reload_all":
+        case .reloadAll:
             Task { await appModel.refreshAll() }
-        default:
-            break
         }
     }
 
@@ -394,6 +424,55 @@ func commandPaletteIsBareKeyEvent(_ flags: NSEvent.ModifierFlags) -> Bool {
     flags.intersection(.deviceIndependentFlagsMask)
         .subtracting([.function, .numericPad])
         .isEmpty
+}
+
+/// The executable contract for the palette's AppKit key monitor. Keeping the
+/// routing and monitor lifecycle here prevents a local event hook from either
+/// consuming keys belonging to another window or lingering after its view is
+/// removed.
+enum CommandPaletteKeyCatcherMonitor {
+    enum KeyAction: Equatable {
+        case passThrough
+        case moveUp
+        case moveDown
+        case dismiss
+    }
+
+    enum LifecycleAction: Equatable {
+        case none
+        case install
+        case uninstall
+    }
+
+    static func lifecycleAction(
+        isAttachedToWindow: Bool,
+        hasMonitor: Bool
+    ) -> LifecycleAction {
+        switch (isAttachedToWindow, hasMonitor) {
+        case (true, false): return .install
+        case (false, true): return .uninstall
+        default: return .none
+        }
+    }
+
+    static func action(
+        eventBelongsToPaletteWindow: Bool,
+        paletteWindowIsKey: Bool,
+        modifierFlags: NSEvent.ModifierFlags,
+        keyCode: UInt16
+    ) -> KeyAction {
+        guard eventBelongsToPaletteWindow,
+              paletteWindowIsKey,
+              commandPaletteIsBareKeyEvent(modifierFlags) else {
+            return .passThrough
+        }
+        switch keyCode {
+        case 126: return .moveUp
+        case 125: return .moveDown
+        case 53: return .dismiss
+        default: return .passThrough
+        }
+    }
 }
 
 @MainActor
@@ -463,10 +542,16 @@ final class KeyCatcherView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        if window != nil {
+        switch CommandPaletteKeyCatcherMonitor.lifecycleAction(
+            isAttachedToWindow: window != nil,
+            hasMonitor: monitor != nil
+        ) {
+        case .install:
             install()
-        } else {
+        case .uninstall:
             uninstall()
+        case .none:
+            break
         }
     }
 
@@ -481,27 +566,23 @@ final class KeyCatcherView: NSView {
             // Scope strictly to the palette's own window so we never swallow
             // arrows/escape in another NativeAgent window (or after the sheet
             // has visually dismissed but a stray monitor is still alive).
-            guard let paletteWindow = self.window,
-                  event.window === paletteWindow,
-                  paletteWindow.isKeyWindow else {
-                return event
-            }
-            // Only intercept BARE arrows / escape — no user-held modifiers — so
-            // Cmd+Arrow / Shift+Arrow / etc. inside the search field still do
-            // their normal text-nav job. See commandPaletteIsBareKeyEvent for
-            // the .function/.numericPad hardware-flag trap.
-            guard commandPaletteIsBareKeyEvent(event.modifierFlags) else { return event }
-            switch event.keyCode {
-            case 126: // up arrow
+            let paletteWindow = self.window
+            switch CommandPaletteKeyCatcherMonitor.action(
+                eventBelongsToPaletteWindow: event.window === paletteWindow,
+                paletteWindowIsKey: paletteWindow?.isKeyWindow == true,
+                modifierFlags: event.modifierFlags,
+                keyCode: event.keyCode
+            ) {
+            case .moveUp:
                 self.onMoveUp?()
                 return nil
-            case 125: // down arrow
+            case .moveDown:
                 self.onMoveDown?()
                 return nil
-            case 53:  // escape
+            case .dismiss:
                 self.onEscape?()
                 return nil
-            default:
+            case .passThrough:
                 return event
             }
         }

@@ -84,6 +84,7 @@ NATIVEAGENT_ICLOUD_CONTAINER_ID="${NATIVEAGENT_ICLOUD_CONTAINER_ID:-iCloud.io.gi
 NATIVEAGENT_MOBILE_SOURCE_KEY="${NATIVEAGENT_MOBILE_SOURCE_KEY:-mobile_app}"
 NATIVEAGENT_BACKGROUND_TASK_PREFIX="${NATIVEAGENT_BACKGROUND_TASK_PREFIX:-io.github.embwl0x.nativeagent}"
 NATIVEAGENT_DEVICE_SYNC="${NATIVEAGENT_DEVICE_SYNC:-cloudkit}"
+NATIVEAGENT_RELEASE_PAGE_URL="${NATIVE_AGENT_RELEASE_PAGE_URL:-${NATIVEAGENT_RELEASE_PAGE_URL:-https://github.com/embwl0x/native-agent/releases}}"
 NATIVEAGENT_BUILD_VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION" 2>/dev/null || true)"
 NATIVEAGENT_BUILD_VERSION="${NATIVEAGENT_BUILD_VERSION:-0.0.0-dev}"
 NATIVEAGENT_SOURCE_REVISION="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
@@ -93,6 +94,25 @@ if [[ -n "$(git -C "$ROOT" status --porcelain --untracked-files=normal 2>/dev/nu
 else
   NATIVEAGENT_SOURCE_DIRTY=false
 fi
+
+# internal-build-seat-hygiene item 1 (2026-08-21): an internal build must never
+# be mistakable for the published release. Aug 19 a locally built 0.4.1 was
+# scp-installed onto the Nova seat, carried no updater config, and still said
+# "0.4.1" — the seat silently left the update train while looking identical to
+# the shipped DMG. The HUMAN-visible string now carries the build identity;
+# CFBundleVersion stays bare because that is Sparkle's comparison key.
+# Kept textually identical in install_app.sh and release.sh (guard-tested).
+nativeagent_internal_version_suffix() { # $1 = repo root; echoes "-dev.<sha8>[.dirty]"
+  local root="$1" sha dirty=""
+  sha="$(git -C "$root" rev-parse --short=8 HEAD 2>/dev/null || true)"
+  [[ "$sha" =~ ^[0-9a-f]{8}$ ]] || sha="nogit"
+  if [[ -n "$(git -C "$root" status --porcelain --untracked-files=normal 2>/dev/null || true)" ]]; then
+    dirty=".dirty"
+  fi
+  printf '%s' "-dev.${sha}${dirty}"
+}
+# build_and_run.sh has no publish lane: every bundle it produces is internal.
+NATIVEAGENT_BUILD_SHORT_VERSION="$NATIVEAGENT_BUILD_VERSION$(nativeagent_internal_version_suffix "$ROOT")"
 export NATIVEAGENT_MAC_BUNDLE_ID
 export NATIVEAGENT_ICLOUD_CONTAINER_ID
 export NATIVEAGENT_MOBILE_SOURCE_KEY
@@ -227,7 +247,7 @@ cat > "$BUNDLE/Contents/Info.plist" <<PLIST
   <key>CFBundleVersion</key>
   <string>$NATIVEAGENT_BUILD_VERSION</string>
   <key>CFBundleShortVersionString</key>
-  <string>$NATIVEAGENT_BUILD_VERSION</string>
+  <string>$NATIVEAGENT_BUILD_SHORT_VERSION</string>
   <key>NativeAgentSourceRevision</key>
   <string>$NATIVEAGENT_SOURCE_REVISION</string>
   <key>NativeAgentSourceDirty</key>
@@ -242,6 +262,8 @@ cat > "$BUNDLE/Contents/Info.plist" <<PLIST
   <string>$NATIVEAGENT_BACKGROUND_TASK_PREFIX</string>
   <key>NativeAgentDeviceSync</key>
   <string>$NATIVEAGENT_DEVICE_SYNC</string>
+  <key>NativeAgentReleasePageURL</key>
+  <string>$NATIVEAGENT_RELEASE_PAGE_URL</string>
   <key>CFBundleIconFile</key>
   <string>AppIcon</string>
   <key>CFBundleIconName</key>

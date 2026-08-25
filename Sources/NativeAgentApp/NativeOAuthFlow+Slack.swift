@@ -28,6 +28,12 @@ extension NativeOAuthFlow {
             return OAuthFlowResult(ok: false,
                 error: "Paste a Slack Socket Mode app token such as xapp-... with connections:write, or leave that field blank.")
         }
+        let channels = allowedChannelIds ?? []
+        let users = allowedUserIds ?? []
+        guard !channels.isEmpty || !users.isEmpty else {
+            return OAuthFlowResult(ok: false,
+                error: "Add at least one allowed Slack channel or user before saving. NativeAgent will not create an inbound connector with an empty allowlist.")
+        }
 
         let authFields: [String: String]
         if validateWithSlack {
@@ -62,8 +68,8 @@ extension NativeOAuthFlow {
                 obj["saved_at"] = now
                 mergeSlackSocketModeFields(appToken: appToken, into: &obj)
                 mergeSlackIngressFields(
-                    allowedChannelIds: allowedChannelIds,
-                    allowedUserIds: allowedUserIds,
+                    allowedChannelIds: channels,
+                    allowedUserIds: users,
                     requireMention: requireMention,
                     into: &obj
                 )
@@ -81,8 +87,8 @@ extension NativeOAuthFlow {
                 obj["validated_at"] = validateWithSlack ? now : nil
                 mergeSlackSocketModeFields(appToken: appToken, into: &obj)
                 mergeSlackIngressFields(
-                    allowedChannelIds: allowedChannelIds,
-                    allowedUserIds: allowedUserIds,
+                    allowedChannelIds: channels,
+                    allowedUserIds: users,
                     requireMention: requireMention,
                     into: &obj
                 )

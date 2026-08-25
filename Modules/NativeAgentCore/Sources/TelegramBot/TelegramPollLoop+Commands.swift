@@ -534,7 +534,7 @@ extension TelegramPollLoop {
             )
             if let model = outcome.reply?.trimmingCharacters(in: .whitespacesAndNewlines),
                !model.isEmpty {
-                lines.append("Model: \(model.replacingOccurrences(of: "\n", with: " | "))")
+                lines.append("Model: \(Self._tgRedactToken(model.replacingOccurrences(of: "\n", with: " | ")))")
             } else {
                 lines.append("Model: not configured")
             }
@@ -544,7 +544,9 @@ extension TelegramPollLoop {
 
         do {
             let session = try await TelegramSessionStore(dataRoot: dataRoot).status(chatId: chatId)
-            lines.append("Session: \(session.sessionId) (\(session.messageCount) message(s), persona \(session.persona))")
+            lines.append(Self._tgRedactToken(
+                "Session: \(session.sessionId) (\(session.messageCount) message(s), persona \(session.persona))"
+            ))
         } catch {
             lines.append("Session: unavailable")
         }
@@ -553,13 +555,13 @@ extension TelegramPollLoop {
         if turn.isRunning {
             lines.append("Task: running since \(turn.startedAt ?? "unknown")")
             if let preview = turn.promptPreview, !preview.isEmpty {
-                lines.append("Task prompt: \(preview)")
+                lines.append("Task prompt: \(Self._tgRedactToken(preview))")
             }
         } else {
             lines.append("Task: idle")
         }
         if let last = turn.lastUserMessagePreview, !last.isEmpty {
-            lines.append("Last user message: \(last)")
+            lines.append("Last user message: \(Self._tgRedactToken(last))")
         }
         return lines.joined(separator: "\n")
     }

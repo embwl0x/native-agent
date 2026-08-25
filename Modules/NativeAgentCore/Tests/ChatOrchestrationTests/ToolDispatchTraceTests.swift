@@ -316,9 +316,10 @@ func tracer_records_one_row_with_argKeys_not_values() async throws {
     #expect(receipt["target"] == .string("time_now"))
     #expect(receipt["decision"] == .string("attempted"))
     #expect(receipt["outcome"] == .string("completed"))
-    #expect(receipt["permanence"] == .string("unknown"))
+    #expect(receipt["permanence"] == .string("bounded_trace"))
+    #expect(receipt["risk"] == .string("low"))
     #expect(receipt["tracePath"] == .string("data/traces/events.jsonl"))
-    #expect(receipt["errorClass"] == .null)
+    #expect(receipt["errorClass"] == nil)
     if case .int(let ms)? = payload["durationMs"] {
         #expect(ms >= 0)
     } else {
@@ -371,7 +372,7 @@ func tracer_failure_shaped_envelope_records_failed_row() async throws {
         return
     }
     #expect(receipt["outcome"] == .string("failed"))
-    #expect(receipt["errorClass"] == .string("tool_failed"))
+    #expect(receipt["errorClass"] == .string("result_failed"))
 }
 
 @Test
@@ -647,4 +648,186 @@ func tracer_turn_event_uses_injected_session_id() async throws {
     let event = await firstTraceEvent(subscription.stream)
     #expect(event?.kind == "tool.dispatch")
     #expect(event?.sessionId == "session-injected")
+}
+
+// MARK: - null-error misclassification (2026-08-21) + bounded errorDetail
+
+/// The REAL envelope shape MacControl returned for every one of the 12
+/// "failed" `mac_ax_find` dispatches on 2026-08-18 (turn_traces bus preview):
+/// `ok:true`, `error:null`, `operationState:completed`. MacControl's own op
+/// store had all 12 `completed`; only the trace/receipt/`is_error` bit said
+/// failed, because `obj["error"] != nil` is true for a present JSON null.
+private let macControlSuccessEnvelope: JSONValue = .object([
+    "action": .string("ax_find"),
+    "durationMs": .int(67),
+    "error": .null,
+    "httpStatus": .null,
+    "ok": .bool(true),
+    "operationId": .string("75D436E4-F471-4BC7-A70A-E3BA0D1B0E0E"),
+    "operationState": .string("completed"),
+    "verification": .string("satisfied"),
+    "viaSwift": .bool(true),
+    "output": .object([
+        "trusted": .bool(true), "count": .int(0), "searched": .int(14), "matches": .array([]),
+    ]),
+])
+
+private struct ThrowingDispatchClient: ToolDispatchClient {
+    let message: String
+    struct Failure: Error, CustomStringConvertible { let description: String }
+    func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        throw Failure(description: message)
+    }
+    func listAvailableTools() async throws -> [String] { [] }
+    func listAvailableToolSchemas() async throws -> [LLMToolSchema] { [] }
+}
+
+@Test
+func present_null_error_key_is_success_not_failure() {
+    // The pin: a present-but-null `error` is NOT an error.
+    #expect(ChatToolOutcome.outputLooksSuccessful(macControlSuccessEnvelope))
+    #expect(ChatToolOutcome.exactResultClass(macControlSuccessEnvelope) == .succeeded)
+    #expect(ChatToolOutcome.failureDetail(macControlSuccessEnvelope) == nil)
+    // Mutation: the same envelope with a REAL error string still fails, and
+    // the detail names it — so the fix did not make the check blind.
+    var failed = macControlSuccessEnvelope
+    if case .object(var obj) = failed {
+        obj["ok"] = .bool(false)
+        obj["error"] = .string("no_frontmost_window")
+        failed = .object(obj)
+    }
+    #expect(!ChatToolOutcome.outputLooksSuccessful(failed))
+    #expect(ChatToolOutcome.failureDetail(failed) == "no_frontmost_window")
+    // Bare `"error": null` with nothing else is still success (no status).
+    #expect(ChatToolOutcome.outputLooksSuccessful(.object(["error": .null])))
+    // status:"failed" with a null error stays failed (status wins).
+    #expect(!ChatToolOutcome.outputLooksSuccessful(.object(["status": .string("failed"), "error": .null])))
+    // `ok:false` / `success:false` beside a null error stay failed (review
+    // 2026-08-21: null-stops-counting must not flip boolean failures to ok).
+    #expect(!ChatToolOutcome.outputLooksSuccessful(.object(["ok": .bool(false), "error": .null])))
+    #expect(!ChatToolOutcome.outputLooksSuccessful(.object(["success": .bool(false), "error": .null])))
+    #expect(ChatToolOutcome.failureDetail(.object(["ok": .bool(false), "error": .null])) == nil)
+}
+
+@Test
+func tracer_writes_ok_row_for_mac_control_success_envelope() async throws {
+    let root = try makeTempRoot("macok")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let inner = MockToolDispatchClient(scripted: ["mac_ax_find": macControlSuccessEnvelope])
+    let tracer = ChatToolDispatchTracer(inner: inner, dataRoot: root)
+    _ = try await tracer.dispatch(tool: "mac_ax_find", input: ["title": .string("x")], surface: "telegram")
+    let rows = parseRows(readTraceLines(root))
+    #expect(rows.count == 1)
+    #expect(rows.first?["status"] == .string("ok"))
+    guard case .object(let payload)? = rows.first?["payload"],
+          case .object(let receipt)? = payload["receipt"] else {
+        Issue.record("missing payload/receipt"); return
+    }
+    #expect(receipt["errorClass"] == nil)
+    #expect(receipt["outcome"] == .string("completed"))
+    // An ok row carries NO errorDetail key at all — not even null.
+    #expect(receipt["errorDetail"] == nil)
+}
+
+@Test
+func failure_envelope_row_carries_bounded_redacted_errorDetail() async throws {
+    let root = try makeTempRoot("detail")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let secret = "sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdef"
+    let longTail = String(repeating: "x", count: 400)
+    let inner = MockToolDispatchClient(scripted: [
+        "mac_ax_find": .object([
+            "ok": .bool(false),
+            "status": .string("failed"),
+            "error": .string("accessibility_not_trusted token=\(secret) \(longTail)"),
+            "reason": .string("accessibility_not_trusted token=\(secret) \(longTail)"),
+            "output": .object(["body": .string("RESULT BODY MUST NOT LEAK")]),
+        ]),
+    ])
+    let tracer = ChatToolDispatchTracer(inner: inner, dataRoot: root)
+    _ = try await tracer.dispatch(tool: "mac_ax_find", input: [:], surface: "telegram")
+    let lines = readTraceLines(root)
+    #expect(lines.count == 1)
+    let rows = parseRows(lines)
+    guard case .object(let payload)? = rows.first?["payload"],
+          case .object(let receipt)? = payload["receipt"],
+          case .string(let detail)? = receipt["errorDetail"] else {
+        Issue.record("failed row must carry receipt.errorDetail"); return
+    }
+    #expect(rows.first?["status"] == .string("failed"))
+    #expect(receipt["errorClass"] == .string("result_failed"))
+    #expect(detail.hasPrefix("status=failed | accessibility_not_trusted"))
+    // Bounded: limit + the ellipsis.
+    #expect(detail.count <= ChatToolOutcome.failureDetailLimit + 1)
+    // Redacted BEFORE the cap, so the secret is gone from the whole row.
+    #expect(!lines[0].contains(secret))
+    #expect(detail.contains("[REDACTED_"))
+    // Result body never rides along.
+    #expect(!lines[0].contains("RESULT BODY MUST NOT LEAK"))
+    // `error` and `reason` repeat one message — kept once.
+    #expect(detail.components(separatedBy: "accessibility_not_trusted").count == 2)
+}
+
+@Test
+func thrown_dispatch_error_row_carries_errorDetail() async throws {
+    let root = try makeTempRoot("thrown")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let tracer = ChatToolDispatchTracer(
+        inner: ThrowingDispatchClient(message: "Trust Center Full Mac Accessibility category is not active for mac_ax_find"),
+        dataRoot: root
+    )
+    await #expect(throws: (any Error).self) {
+        _ = try await tracer.dispatch(tool: "mac_ax_find", input: [:], surface: "telegram")
+    }
+    let rows = parseRows(readTraceLines(root))
+    guard case .object(let payload)? = rows.first?["payload"],
+          case .object(let receipt)? = payload["receipt"] else {
+        Issue.record("missing row"); return
+    }
+    #expect(rows.first?["status"] == .string("failed"))
+    #expect(receipt["errorClass"] == .string("dispatch_threw"))
+    #expect(receipt["errorDetail"] == .string("Trust Center Full Mac Accessibility category is not active for mac_ax_find"))
+}
+
+@Test
+func receiptFixedFields_successAndFailureUseCanonicalRiskAndExplicitProvenance() async throws {
+    let successRoot = try makeTempRoot("receipt-fixed-success")
+    defer { try? FileManager.default.removeItem(at: successRoot) }
+    let successTracer = ChatToolDispatchTracer(
+        inner: MockToolDispatchClient(scripted: ["time_now": .object(["status": .string("ok")])]),
+        dataRoot: successRoot
+    )
+    _ = try await successTracer.dispatch(tool: "time_now", input: [:], surface: "chat")
+    guard case .object(let successPayload)? = parseRows(readTraceLines(successRoot)).first?["payload"],
+          case .object(let successReceipt)? = successPayload["receipt"] else {
+        Issue.record("missing successful receipt"); return
+    }
+    #expect(successReceipt["permanence"] == .string("bounded_trace"))
+    #expect(successReceipt["risk"] == .string("low"))
+    #expect(successReceipt["errorClass"] == nil)
+    #expect(successReceipt["errorDetail"] == nil)
+    if case .array(let proof)? = successReceipt["proof"] {
+        #expect(proof.contains(.string("permanence_source:events_jsonl_tail_retention")))
+        #expect(proof.contains(.string("risk_source:security_center.canonical_tool_risk")))
+    } else {
+        Issue.record("successful receipt must carry provenance proof")
+    }
+
+    let failureRoot = try makeTempRoot("receipt-fixed-failure")
+    defer { try? FileManager.default.removeItem(at: failureRoot) }
+    let failureTracer = ChatToolDispatchTracer(
+        inner: MockToolDispatchClient(scripted: [
+            "shell": .object(["status": .string("failed"), "error_code": .string("command_failed")]),
+        ]),
+        dataRoot: failureRoot
+    )
+    _ = try await failureTracer.dispatch(tool: "shell", input: [:], surface: "chat")
+    guard case .object(let failurePayload)? = parseRows(readTraceLines(failureRoot)).first?["payload"],
+          case .object(let failureReceipt)? = failurePayload["receipt"] else {
+        Issue.record("missing failed receipt"); return
+    }
+    #expect(failureReceipt["permanence"] == .string("bounded_trace"))
+    #expect(failureReceipt["risk"] == .string("critical"))
+    #expect(failureReceipt["errorClass"] == .string("result_failed"))
+    #expect(failureReceipt["errorDetail"] == .string("code=command_failed | status=failed"))
 }

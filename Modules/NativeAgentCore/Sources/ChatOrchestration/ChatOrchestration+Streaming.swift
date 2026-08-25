@@ -610,6 +610,7 @@ extension SwiftNativeTurnEngine {
                 }
                 if let conversation,
                    let messagesLLM = streamingLLM as? any MessagesStreamingLLMClient {
+                    await LLMCallContext.$admittedModel.withValue(resolvedModel) {
                     await LLMCallContext.$providerId.withValue(snapshotContext.providerId) {
                     await LLMCallContext.$serviceTier.withValue(snapshotContext.serviceTier) {
                     await LLMCallContext.$systemSegments.withValue(resolvedSegments) {
@@ -648,6 +649,7 @@ extension SwiftNativeTurnEngine {
                     }
                     }
                     }
+                    }
                 } else {
                     // TRIPWIRE (streaming legacy prompt lane): the plain
                     // `stream(prompt:)` transport has NO image channel, so any
@@ -665,6 +667,7 @@ extension SwiftNativeTurnEngine {
                         )
                     }
                     let streamPrompt = promptForStream
+                    await LLMCallContext.$admittedModel.withValue(resolvedModel) {
                     await LLMCallContext.$providerId.withValue(snapshotContext.providerId) {
                     await LLMCallContext.$serviceTier.withValue(snapshotContext.serviceTier) {
                     await LLMCallContext.$systemSegments.withValue(resolvedSegments) {
@@ -676,6 +679,7 @@ extension SwiftNativeTurnEngine {
                             model: resolvedModel,
                             surface: surface
                         ))
+                    }
                     }
                     }
                     }
@@ -841,7 +845,9 @@ extension SwiftNativeTurnEngine {
         names: [String]
     ) -> String {
         let rows: [String]
+        let totalToolCount: Int
         if !schemas.isEmpty {
+            totalToolCount = schemas.count
             rows = schemas
                 .sorted { $0.name < $1.name }
                 .prefix(80)
@@ -851,12 +857,19 @@ extension SwiftNativeTurnEngine {
                     return "- \(schema.name)\(suffix): \(compact(schema.description, limit: 180))"
                 }
         } else {
+            totalToolCount = names.count
             rows = names
                 .sorted()
                 .prefix(80)
                 .map { "- \($0)" }
         }
-        let renderedRows = rows.isEmpty ? "- No Swift tools are exposed for this turn." : rows.joined(separator: "\n")
+        let omittedToolCount = max(0, totalToolCount - rows.count)
+        let disclosure = omittedToolCount > 0
+            ? "\n- \(omittedToolCount) more tools not listed in this bounded catalog; use tool_load to expose a needed capability."
+            : ""
+        let renderedRows = rows.isEmpty
+            ? "- No Swift tools are exposed for this turn."
+            : rows.joined(separator: "\n") + disclosure
         return """
         NativeAgent Swift tool protocol (text compatibility):
         - This provider request intentionally does not include provider-native tools. Do not infer that tools are unavailable.

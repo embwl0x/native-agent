@@ -61,6 +61,13 @@ struct ChatCatalogTool: Identifiable, Codable, Hashable, Sendable {
     var loadState: String?
     var effectiveAutonomy: String?
     var availableNow: Bool?
+    /// Typed runtime category emitted by the dispatcher registry. Unlike tags,
+    /// this is the visible safety contract for every registered tool name.
+    var catalogBucket: String? = nil
+    /// Catalog-provided, presentation-only taxonomy. An absent tag is never
+    /// inferred from a display name; callers keep it in the ordinary-tool
+    /// bucket until a checked catalog (or canonical fallback) says otherwise.
+    var tags: Set<String>? = nil
 }
 
 struct ChatToolCatalogSnapshot: Codable, Hashable, Sendable {
@@ -115,6 +122,20 @@ struct ChatToolCatalogSnapshot: Codable, Hashable, Sendable {
                 }
                 var availableNow: Bool?
                 if case .bool(let available)? = r["available_now"] { availableNow = available }
+                var catalogBucket: String?
+                if case .string(let bucket)? = r["catalog_bucket"] {
+                    catalogBucket = bucket
+                }
+                let tags: Set<String>
+                if case .array(let values)? = r["tags"] {
+                    tags = Set(values.compactMap { value in
+                        guard case .string(let tag) = value else { return nil }
+                        let normalized = tag.trimmingCharacters(in: .whitespacesAndNewlines)
+                        return normalized.isEmpty ? nil : normalized
+                    })
+                } else {
+                    tags = []
+                }
                 var paramsPreview: String?
                 if case .object(let pobj)? = r["parameters"],
                    case .object(let props)? = pobj["properties"] {
@@ -131,7 +152,9 @@ struct ChatToolCatalogSnapshot: Codable, Hashable, Sendable {
                     dispatchableVia: dispatchVia,
                     loadState: loadState,
                     effectiveAutonomy: effectiveAutonomy,
-                    availableNow: availableNow
+                    availableNow: availableNow,
+                    catalogBucket: catalogBucket,
+                    tags: tags
                 ))
             }
         }
@@ -150,5 +173,11 @@ struct ChatToolCatalogSnapshot: Codable, Hashable, Sendable {
             builderModeDetail: stringVal("builder_mode_detail"),
             permissionLevel: stringVal("permission_level")
         )
+    }
+
+    var skillReaderToolNames: Set<String> {
+        Set(tools.compactMap { tool in
+            tool.tags?.contains("skill_reader") == true ? tool.name : nil
+        })
     }
 }

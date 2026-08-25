@@ -41,6 +41,27 @@ import Skills
 import Connectors
 import Browser
 
+/// Serializes durable session-index mutations without holding an actor across
+/// a re-entrant await. A newer rename intent can supersede a queued older one;
+/// once a write has started, the next intent waits and writes last.
+actor ChatRenameMutationGate {
+    private var held = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func acquire() async {
+        guard held else { held = true; return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func release() {
+        if waiters.isEmpty {
+            held = false
+        } else {
+            waiters.removeFirst().resume()
+        }
+    }
+}
+
 @MainActor
 extension AppModel {
     func loadChatState() async {
@@ -128,7 +149,8 @@ extension AppModel {
     // InboxView.load's catch → errorText pattern, but per-endpoint: one dead
     // endpoint should not blank a panel whose other fetches succeeded.
     @MainActor
-    func refreshForSidebarItem(_ item: SidebarItem) async {
+    @discardableResult
+    func refreshForSidebarItem(_ item: SidebarItem) async -> PanelRefreshStatus {
         let api = client
         var failedEndpoints: [String] = []
         /// Returns `value`, recording `endpoint` as failed when it is nil.
@@ -217,9 +239,7 @@ extension AppModel {
             )
             if let config = fresh("config", configRow) {
                 codexAuthStatus = config.codexAuth
-                if let base = config.searxngBaseURL, !base.isEmpty {
-                    searxngBaseURL = base
-                }
+                _ = applyRefreshedSearXNGBaseURL(config.searxngBaseURL)
             }
             privacyMap = fresh("privacy map", privacyRow) ?? privacyMap
             telegramStatus = fresh("telegram status", telegramRow) ?? telegramStatus
@@ -253,9 +273,26 @@ extension AppModel {
             async let nextSkills = try? api.getSkills()
             async let nextTools = try? api.getTools()
             async let nextCapabilitySummary = try? api.getCapabilities()
+            async let nextApprovals = try? api.getApprovals()
             async let nextWorkflows = try? api.getWorkflows()
             async let nextWorkflowRuns = try? api.getWorkflowRuns()
             async let nextMCPServers = try? api.getMCPServers()
+            // The compact MCP Builder is mounted in Capabilities too. Its
+            // server controls render live session and consent evidence, so
+            // refresh all three authorities together rather than leaving
+            // those rows stale/empty until someone opens the separate MCP tab.
+            async let nextMCPSessions = try? api.getMCPSessions()
+            async let nextMCPConsent = try? api.getMCPConsent()
+            // Native macOS Power is part of the Capabilities hardening view.
+            // Refresh each live tile and action registry here so that view
+            // never inherits a stale launch snapshot from another surface.
+            async let nextNotificationStatus = try? api.getNotificationStatus()
+            async let nextBrowserRuntimeStatus = try? api.getBrowserStatus()
+            async let nextMemoryVectorStatus = try? api.getMemoryVectorStatus()
+            async let nextNativeActions = try? api.getNativeActionRegistry().actions
+            async let nextNativeActionReceipts = try? api.getNativeActionReceipts()
+            async let nextConnectorActionRegistry = try? api.getConnectorActions()
+            async let nextImprovementGauntletStatus = try? api.getImprovementGauntlet()
             async let nextCatalog = try? api.getCapabilityCatalog()
             async let nextCatalogSources = try? api.getCapabilityCatalogSources()
             async let nextPackInstalls = try? api.getCapabilityPackInstalls()
@@ -263,46 +300,106 @@ extension AppModel {
             async let nextSummary = try? api.getNextGenSummary()
             async let nextPhases = try? api.getNextGenPhases()
             async let nextReceipts = try? api.getNextGenReceipts()
+            async let nextAgentGraph = try? api.getAgentGraph()
+            async let nextGraphEntities = try? api.getGraphEntities()
+            async let nextGraphStatus = try? api.getGraphStatus()
             let (
                 skillRows,
                 toolRows,
                 capabilityRow,
+                approvalRows,
                 workflowRows,
                 workflowRunRows,
                 mcpRows,
+                mcpSessionRows,
+                mcpConsentRows,
+                notificationStatusRow,
+                browserRuntimeStatusRow,
+                memoryVectorStatusRow,
+                nativeActionRows,
+                nativeActionReceiptRows,
+                connectorActionRegistryRow,
+                improvementGauntletStatusRow,
                 catalogRows,
                 sourceRows,
                 installRows,
                 trustRow,
                 summaryRow,
                 phaseRows,
-                receiptRows
+                receiptRows,
+                agentGraphRow,
+                graphRows,
+                graphStatusRow
             ) = await (
                 nextSkills,
                 nextTools,
                 nextCapabilitySummary,
+                nextApprovals,
                 nextWorkflows,
                 nextWorkflowRuns,
                 nextMCPServers,
+                nextMCPSessions,
+                nextMCPConsent,
+                nextNotificationStatus,
+                nextBrowserRuntimeStatus,
+                nextMemoryVectorStatus,
+                nextNativeActions,
+                nextNativeActionReceipts,
+                nextConnectorActionRegistry,
+                nextImprovementGauntletStatus,
                 nextCatalog,
                 nextCatalogSources,
                 nextPackInstalls,
                 nextCapabilityTrust,
                 nextSummary,
                 nextPhases,
-                nextReceipts
+                nextReceipts,
+                nextAgentGraph,
+                nextGraphEntities,
+                nextGraphStatus
             )
             skills = fresh("skills", skillRows) ?? skills
             tools = fresh("tools", toolRows) ?? tools
             capabilitySummary = fresh("capability summary", capabilityRow) ?? capabilitySummary
+            approvals = fresh("approvals", approvalRows) ?? approvals
             workflows = fresh("workflows", workflowRows) ?? workflows
             workflowRuns = fresh("workflow runs", workflowRunRows) ?? workflowRuns
             mcpServers = fresh("mcp servers", mcpRows) ?? mcpServers
+            mcpSessions = fresh("mcp sessions", mcpSessionRows) ?? mcpSessions
+            mcpConsent = fresh("mcp consent", mcpConsentRows) ?? mcpConsent
+            notificationStatus = fresh("notification status", notificationStatusRow) ?? notificationStatus
+            browserRuntimeStatus = fresh("browser status", browserRuntimeStatusRow) ?? browserRuntimeStatus
+            memoryVectorStatus = fresh("memory vector status", memoryVectorStatusRow) ?? memoryVectorStatus
+            nativeActions = fresh("native actions", nativeActionRows) ?? nativeActions
+            nativeActionReceipts = fresh("native action receipts", nativeActionReceiptRows) ?? nativeActionReceipts
+            connectorActionRegistry = fresh("connector actions", connectorActionRegistryRow) ?? connectorActionRegistry
+            improvementGauntletStatus = fresh("improvement gauntlet", improvementGauntletStatusRow) ?? improvementGauntletStatus
+            // The Builder renders the selected server's tools inline. Never
+            // leave those tools attached to a server which the same refresh
+            // proved absent, or an empty registry would still expose callable
+            // rows from the previous selection.
+            let previousMCPSelection = selectedMCPServerId
+            if selectedMCPServerId == nil || !mcpServers.contains(where: { $0.id == selectedMCPServerId }) {
+                selectedMCPServerId = mcpServers.first?.id
+            }
+            if selectedMCPServerId != previousMCPSelection || mcpServers.isEmpty {
+                mcpTools = []
+                mcpToolReadState = .notLoaded
+                mcpResources = []
+            }
             capabilityCatalog = fresh("capability catalog", catalogRows) ?? capabilityCatalog
             capabilityCatalogSources = fresh("catalog sources", sourceRows) ?? capabilityCatalogSources
             capabilityPackInstalls = fresh("pack installs", installRows) ?? capabilityPackInstalls
             capabilityTrust = fresh("capability trust", trustRow) ?? capabilityTrust
             nextGenSummary = fresh("nextgen summary", summaryRow) ?? nextGenSummary
+            agentGraph = fresh("skill memory graph", agentGraphRow) ?? agentGraph
+            graphEntities = fresh("skill memory graph entities", graphRows) ?? graphEntities
+            graphStatus = fresh("skill memory graph status", graphStatusRow) ?? graphStatus
+            if agentGraphRow != nil, graphRows != nil, graphStatusRow != nil {
+                graphLoadError = nil
+            } else {
+                graphLoadError = "The graph could not be loaded for Capabilities. Refresh Graph to retry."
+            }
             // `phaseRows` legitimately falls back to the summary's embedded
             // phases, so only count it as failed when BOTH sources are absent.
             nextGenPhases = phaseRows ?? fresh("nextgen phases", summaryRow?.phases) ?? nextGenPhases
@@ -346,7 +443,7 @@ extension AppModel {
             // them are also refreshed by refreshAll() (launch + post-action), so no
             // consumer is starved. See prerelease-upgrade-campaign.md B2.1 [W7#1].
             async let nextActivity = try? api.getActivity()
-            async let nextRuns = try? api.getRuns()
+            async let nextRuns = api.getRunsStrict()
             async let nextWatchdog = try? api.getWatchdog()
             let (activityRows, runRows, watchdogRow) = await (
                 nextActivity,
@@ -401,11 +498,23 @@ extension AppModel {
             async let nextTools = try? api.getTools()
             async let nextConnectorActions = try? api.getConnectorActions()
             async let nextMCPServers = try? api.getMCPServers()
-            let (toolRows, connectorRows, mcpRows) = await (nextTools, nextConnectorActions, nextMCPServers)
+            // Tools renders the current catalog *and* its Full Mac lifecycle
+            // explanation. Refresh the Trust policy in the same pass so an
+            // expired/unreadable window is never flattened into "off".
+            async let nextTrustPolicy = try? api.getTrustPolicy()
+            let (toolRows, connectorRows, mcpRows, trustPolicyRow) = await (
+                nextTools,
+                nextConnectorActions,
+                nextMCPServers,
+                nextTrustPolicy
+            )
             tools = fresh("tools", toolRows) ?? tools
             connectorActionRegistry = fresh("connector actions", connectorRows) ?? connectorActionRegistry
             mcpServers = fresh("mcp servers", mcpRows) ?? mcpServers
-            await refreshChatToolCatalog()
+            trustPolicy = fresh("trust policy", trustPolicyRow) ?? trustPolicy
+            if !(await refreshChatToolCatalog()) {
+                failedEndpoints.append("tool catalog")
+            }
         case .mcp:
             async let nextMCPServers = try? api.getMCPServers()
             async let nextMCPSessions = try? api.getMCPSessions()
@@ -424,43 +533,94 @@ extension AppModel {
             }
             if selectedMCPServerId != previousSelection {
                 mcpTools = []
+                mcpToolReadState = .notLoaded
                 mcpResources = []
+                mcpResourceReadState = .notLoaded
             }
             if mcpServers.isEmpty {
                 mcpTools = []
+                mcpToolReadState = .notLoaded
                 mcpResources = []
+                mcpResourceReadState = .notLoaded
             }
             if let server = selectedMCPServer {
                 // Race-safe apply: only adopt fetched tools/resources if the
                 // user's selection didn't change while we were awaiting.
                 let pendingId = server.id
-                let fetchedTools = (try? await api.getMCPTools(serverId: pendingId).tools) ?? nil
-                let fetchedResources = (try? await api.getMCPResources(serverId: pendingId).resources) ?? nil
+                mcpToolReadState = .loading
+                let fetchedTools: [MCPToolRecord]?
+                do {
+                    fetchedTools = try await api.getMCPTools(serverId: pendingId).tools
+                } catch {
+                    fetchedTools = nil
+                    failedEndpoints.append("mcp tools")
+                    if selectedMCPServerId == pendingId {
+                        mcpToolReadState = .unavailable(String(error.localizedDescription.prefix(240)))
+                    }
+                }
+                mcpResourceReadState = .loading
+                let fetchedResources: [MCPResourceRecord]?
+                do {
+                    fetchedResources = try await api.getMCPResources(serverId: pendingId).resources
+                } catch {
+                    fetchedResources = nil
+                    failedEndpoints.append("mcp resources")
+                    if selectedMCPServerId == pendingId {
+                        mcpResourceReadState = .unavailable(String(error.localizedDescription.prefix(240)))
+                    }
+                }
                 if selectedMCPServerId == pendingId {
-                    if let t = fetchedTools { mcpTools = t }
-                    if let r = fetchedResources { mcpResources = r }
+                    if let t = fetchedTools {
+                        mcpTools = t
+                        mcpToolReadState = .current
+                    }
+                    if let r = fetchedResources {
+                        mcpResources = r
+                        mcpResourceReadState = .current
+                    }
                 }
             }
+            refreshMCPHubRecentCall()
         case .inspector:
             // Turn Inspector (W3) owns its own data: it subscribes to the
             // in-process TurnTraceBus for live events and reads the persisted
             // turn_traces JSONL for replay. No daemon refresh on tab select.
             break
         }
-        recordPanelRefresh(item, failedEndpoints: failedEndpoints)
+        let receipt = recordPanelRefresh(item, failedEndpoints: failedEndpoints)
+        if item.normalized == .activity {
+            // The Activity page owns a complete five-queue read, while the
+            // sidebar badge deliberately tracks only its three compact
+            // sources. Reuse this completed fetch for the badge receipt so
+            // entering Activity does not leave the sidebar's stale marker
+            // behind or issue a second set of reads.
+            let badgeEndpoints: Set<String> = ["approvals", "inbox", "memory proposals"]
+            let badgeFailures = failedEndpoints.filter { badgeEndpoints.contains($0) }
+            if let nextStatus = Self.staleFlagOnlyStatusToStore(
+                previous: sidebarActivityRefreshStatus,
+                failedEndpoints: badgeFailures,
+                at: receipt.lastAttemptAt
+            ) {
+                sidebarActivityRefreshStatus = nextStatus
+            }
+        }
         statusText = health?.ok == true ? "Native runtime online" : "Native runtime unavailable"
+        return receipt
     }
 
     // MARK: - Panel staleness (M12)
 
     @MainActor
-    func recordPanelRefresh(_ item: SidebarItem, failedEndpoints: [String]) {
+    @discardableResult
+    func recordPanelRefresh(_ item: SidebarItem, failedEndpoints: [String]) -> PanelRefreshStatus {
         let now = Date()
-        panelRefreshStatus[item] = Self.nextRefreshStatus(
+        let status = Self.nextRefreshStatus(
             previous: panelRefreshStatus[item],
             failedEndpoints: failedEndpoints,
             at: now
         )
+        panelRefreshStatus[item] = status
+        return status
     }
 
     static func nextRefreshStatus(
@@ -553,7 +713,8 @@ extension AppModel {
     }
 
     @MainActor
-    func refreshSidebarActivityBadge() async {
+    @discardableResult
+    func refreshSidebarActivityBadge() async -> PanelRefreshStatus {
         let api = client
         async let nextApprovals = try? api.getApprovals()
         async let nextInbox = try? api.getInboxItems(unreadOnly: false)
@@ -581,13 +742,20 @@ extension AppModel {
         if approvalRows == nil { failed.append("approvals") }
         if inboxRows == nil { failed.append("inbox") }
         if proposalRows == nil { failed.append("memory proposals") }
+        let attemptedAt = Date()
+        let receipt = PanelRefreshStatus(
+            lastAttemptAt: attemptedAt,
+            lastSuccessAt: failed.isEmpty ? attemptedAt : sidebarActivityRefreshStatus?.lastSuccessAt,
+            failedEndpoints: failed
+        )
         if let nextStatus = Self.staleFlagOnlyStatusToStore(
             previous: sidebarActivityRefreshStatus,
             failedEndpoints: failed,
-            at: Date()
+            at: attemptedAt
         ) {
             sidebarActivityRefreshStatus = nextStatus
         }
+        return receipt
     }
 
     // S.1: touch a draft key to mark it recently used; call on every chatDrafts write.
@@ -638,10 +806,23 @@ extension AppModel {
         chatDrafts[sessionId] ?? ""
     }
 
-    // S.7: navigate to Chat and prefill the draft — ContentView's .onReceive handles tab switch + prefill.
+    /// Prepare the actual composer draft before routing to Chat. A
+    /// notification-only handoff can select Chat before its first session
+    /// exists and silently lose the requested starter; an existing draft is
+    /// intentionally preserved.
     @MainActor
-    func requestSkillBuild(starter: String = "Create a skill from this conversation: ") {
+    @discardableResult
+    func requestSkillBuild(starter: String = "Create a skill from this conversation: ") -> SkillLifecycleActionPresentation.Build {
+        let sessionID = activeChatSessionId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let outcome = SkillLifecycleActionPresentation.build(
+            activeSessionID: sessionID,
+            existingDraft: sessionID.isEmpty ? "" : chatDraft(for: sessionID)
+        )
+        if case .draftPrepared = outcome {
+            injectChatDraft(starter, sessionId: sessionID)
+        }
         NotificationCenter.default.post(name: .skillBuildRequest, object: starter)
+        return outcome
     }
 
     @MainActor
@@ -758,12 +939,12 @@ extension AppModel {
                 // A live turn owns this slot. Disk is necessarily behind its
                 // optimistic bubble/deltas, so a full Chat reload must not
                 // replace the stream's exact message identity mid-turn.
-                chatStateLoadFailed = false
+                markChatSidebarLoadSucceeded()
                 return
             }
             applyLoadedChatMessages(messages, for: targetSessionId)
             latestContextReceipt = receipt
-            chatStateLoadFailed = false
+            markChatSidebarLoadSucceeded()
         } catch {
             chatStateLoadFailed = true
             statusText = "Chat load failed: \(error.localizedDescription)"
@@ -1008,7 +1189,7 @@ extension AppModel {
             let session = try await client.createChatSession(title: "New Chat", sourceKey: "app", forceNew: true)
             chatSelectionGeneration += 1
             activeChatSessionId = session.id
-            UserDefaults.standard.set(activeChatSessionId, forKey: "activeChatSessionId")
+            persistActiveChatSessionID(activeChatSessionId)
             chatSessions = try await client.getChatSessions()
             migrateEmptySessionChatState(to: activeChatSessionId)
             pruneChatDrafts()
@@ -1019,7 +1200,7 @@ extension AppModel {
             chatMessages = []
             latestContextReceipt = nil
             statusText = "New chat session ready"
-            MacSyncEngine.shared.requestChatSnapshotPublication(includeTranscripts: false)
+            publishChatSnapshot()
         } catch {
             statusText = "New chat failed: \(error.localizedDescription)"
         }
@@ -1034,6 +1215,20 @@ extension AppModel {
     func renameChatSession(id sessionId: String, title: String) async {
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !sessionId.isEmpty, !cleanTitle.isEmpty else { return }
+        let intent = (chatRenameIntentGeneration[sessionId] ?? 0) &+ 1
+        chatRenameIntentGeneration[sessionId] = intent
+        await chatRenameMutationGate.acquire()
+        defer { Task { await chatRenameMutationGate.release() } }
+        // A newer request arrived while this one was waiting. Do not write an
+        // obsolete title; the newest queued intent owns the durable index.
+        guard chatRenameIntentGeneration[sessionId] == intent else { return }
+        // Both visible rename controls already prevent an unchanged commit, but
+        // keep that no-write guarantee at their shared durable owner too. A
+        // recycled/focus-lost editor must not needlessly touch the session
+        // index or publish a snapshot.
+        if chatSessions.first(where: { $0.id == sessionId })?.title == cleanTitle {
+            return
+        }
         do {
             let updated = try await client.updateChatSession(id: sessionId, title: cleanTitle, archived: nil)
             if let refreshed = try? await client.getChatSessions() {
@@ -1042,7 +1237,7 @@ extension AppModel {
                 chatSessions[index] = updated
             }
             statusText = "Renamed chat session"
-            MacSyncEngine.shared.requestChatSnapshotPublication(includeTranscripts: false)
+            publishChatSnapshot()
         } catch {
             statusText = "Rename failed: \(error.localizedDescription)"
         }

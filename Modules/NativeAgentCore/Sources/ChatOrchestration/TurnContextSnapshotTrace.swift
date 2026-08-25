@@ -121,8 +121,10 @@ extension SwiftNativeTurnEngine {
             "toolSchemaParameterBytes": .int(Int64(toolSchemaParameterBytes)),
             "toolSchemaMaterialBytes": .int(Int64(toolSchemaMaterialBytes)),
             "toolSchemaBytes": .array(schemaSizes),
+            // Injected = legacy hits ∪ packet provenance (resolvedRecalledIds);
+            // `context.recalled` alone is empty on every `.active` turn.
             "memoryRecall": resolvedMemoryRecallOutcome.payload(
-                injectedHitCount: context.recalled.count
+                injectedHitCount: context.resolvedRecalledIds.count
             ),
             "promptFingerprintSHA256": .string(promptFingerprint(
                 systemPrompt: systemPrompt,

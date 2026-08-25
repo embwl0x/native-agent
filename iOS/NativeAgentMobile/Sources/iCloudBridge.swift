@@ -177,6 +177,14 @@ final class iCloudBridge: ObservableObject {
     // re-drains coalesce; per-message delivery is already atomic in the transport).
     private var deviceDrainInFlight = false
     private var deviceDrainQueued = false
+    /// The bridge's deduplication receipt is durable state, but tests may
+    /// provide an isolated suite so a replay proof never observes or changes a
+    /// developer's real phone receipt history.
+    private let userDefaults: UserDefaults
+    /// The Drive fallback's mount lookup is injected only to make setup's
+    /// unavailable state executable without touching a simulator's iCloud
+    /// account. Production continues to call FileManager directly.
+    private let ubiquityContainerURL: @Sendable (String?) -> URL?
     private var messageHandlers: [UUID: (BridgeMessage) -> Void] = [:]
     private var rejectionHandlers: [UUID: (ICloudBridgeRejectedMessage) -> Void] = [:]
     // Phase 14e-iCloud HMAC self-heal: callbacks invoked when an unsigned
@@ -202,6 +210,11 @@ final class iCloudBridge: ObservableObject {
     private var isCheckingMacOutbox = false
     private var macOutboxScanQueued = false
     private var setupTask: Task<Void, Never>?
+    /// The injected and production CloudKit paths both install their incoming
+    /// forwarder asynchronously. Explicit refresh/push drains wait for that
+    /// one-time registration so an early message cannot be mistaken for an
+    /// empty inbox merely because setup lost the scheduling race.
+    private var deviceIncomingSetupTask: Task<Void, Never>?
     private var setupGeneration = 0
     private let processedMacReplyIDsKey = "NativeAgentMobile.iCloud.processedMacReplyIDs.v1"
     private let maxProcessedMacReplyIDs = 500
@@ -214,8 +227,19 @@ final class iCloudBridge: ObservableObject {
 
     // MARK: - Init
 
-    private init() {
-        if let saved = UserDefaults.standard.array(forKey: processedMacReplyIDsKey) as? [String] {
+    init(
+        deviceTransport: DeviceSyncTransport? = nil,
+        pairingStore: PairingStore? = nil,
+        userDefaults: UserDefaults = .standard,
+        ubiquityContainerURL: @escaping @Sendable (String?) -> URL? = {
+            FileManager.default.url(forUbiquityContainerIdentifier: $0)
+        }
+    ) {
+        self.deviceTransport = deviceTransport
+        self.pairingStore = pairingStore
+        self.userDefaults = userDefaults
+        self.ubiquityContainerURL = ubiquityContainerURL
+        if let saved = userDefaults.array(forKey: processedMacReplyIDsKey) as? [String] {
             // fix-2026-06-10 sync-audit #2: restore the ordered array (disk
             // order = insertion order) so eviction stays oldest-first.
             for id in saved where seenMessageIDs.insert(id).inserted {
@@ -286,11 +310,12 @@ final class iCloudBridge: ObservableObject {
         //
         // Move the container resolve + directory bootstrap off the main actor;
         // hop back to update @Published state and start the metadata query.
-        setupTask = Task.detached(priority: .userInitiated) {
+        let containerURLResolver = ubiquityContainerURL
+        setupTask = Task.detached(priority: .userInitiated) { [weak self] in
             let containerID = NativeAgentICloudBridgeConstants.containerID
             // This call is what was blocking — runs on a background thread now.
-            let containerURL = FileManager.default.url(forUbiquityContainerIdentifier: containerID)
-            await iCloudBridge.shared.applyContainerResult(containerURL, generation: generation)
+            let containerURL = containerURLResolver(containerID)
+            await self?.applyContainerResult(containerURL, generation: generation)
         }
     }
 
@@ -300,6 +325,10 @@ final class iCloudBridge: ObservableObject {
     @MainActor
     private func applyContainerResult(_ containerURL: URL?, generation: Int) {
         guard generation == setupGeneration, isSetUp else { return }
+        // The detached lookup has settled. Clear its handle before publishing
+        // either outcome so a later retry never treats a completed setup task
+        // as active work.
+        setupTask = nil
         guard let containerURL else {
             available = false
             syncStatus = "iCloud unavailable — sign into iCloud in Settings → Apple Account"
@@ -330,14 +359,20 @@ final class iCloudBridge: ObservableObject {
     /// Incoming pairing material is handed to PairingStore, the existing
     /// transactional Keychain owner; the bridge never persists a second copy.
     private func configureDeviceTransportIfAvailable() {
-        guard deviceTransport == nil else { return }
-        guard let transport = DeviceSyncTransportResolver.makeCloudKitTransport(
-            role: .ios,
-            containerIdentifier: NativeAgentICloudBridgeConstants.containerID
-        ) else {
-            return
+        let resolvedProductionTransport: Bool
+        if deviceTransport == nil {
+            guard let transport = DeviceSyncTransportResolver.makeCloudKitTransport(
+                role: .ios,
+                containerIdentifier: NativeAgentICloudBridgeConstants.containerID
+            ) else {
+                return
+            }
+            deviceTransport = transport
+            resolvedProductionTransport = true
+        } else {
+            resolvedProductionTransport = false
         }
-        deviceTransport = transport
+        guard let transport = deviceTransport else { return }
         available = true
         syncStatus = "CloudKit connecting…"
         NSLog("[iCloudBridge] device transport: CloudKit ACTIVE (role=ios)")
@@ -347,18 +382,23 @@ final class iCloudBridge: ObservableObject {
         // but they do require APNS device registration. Register as soon as the
         // entitled transport exists instead of waiting until pairing has
         // already completed (which is too late for an iOS-starts-first flow).
-        UIApplication.shared.registerForRemoteNotifications()
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(cloudKitAppDidBecomeActive(_:)),
-            name: UIApplication.didBecomeActiveNotification,
-            object: nil
-        )
+        if resolvedProductionTransport {
+            UIApplication.shared.registerForRemoteNotifications()
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(cloudKitAppDidBecomeActive(_:)),
+                name: UIApplication.didBecomeActiveNotification,
+                object: nil
+            )
+        }
 
-        Task {
+        deviceIncomingSetupTask = Task {
             await transport.observeIncoming { [weak self] msg in
                 await self?.handleIncomingFromTransport(msg) ?? false
             }
+        }
+        Task {
+            await deviceIncomingSetupTask?.value
             let ready = await transport.ensurePushSubscriptions()
             await self.publishVisualNotificationCapability(
                 ready: ready && transport.presentsVisualNotifications,
@@ -404,7 +444,13 @@ final class iCloudBridge: ObservableObject {
                 using: transport
             )
             if self.pairingStore?.isPaired != true {
-                _ = await transport.drainPairing()
+                let pairingApplied = await transport.drainPairing()
+                // A message held before the pairing secret was committed cannot
+                // pass signature verification on the first drain. Once this
+                // foreground retry installs the secret, immediately re-drain
+                // the transport instead of waiting for another push or launch.
+                guard pairingApplied, self.pairingStore?.isPaired == true else { return }
+                _ = await self.drainDeviceTransport()
             }
         }
     }
@@ -594,7 +640,7 @@ final class iCloudBridge: ObservableObject {
     func checkMacOutbox() async {
         guard let docsURL = driveURL else { return }
         guard let secret = pairingStore?.iCloudPairingSecret else { return }
-        guard !messageHandlers.isEmpty || !notificationHandlers.isEmpty else {
+        guard !messageHandlers.isEmpty || !notificationHandlers.isEmpty || !resyncHintHandlers.isEmpty else {
             syncStatus = "Mac reply waiting — open Chat to receive it"
             return
         }
@@ -670,16 +716,13 @@ final class iCloudBridge: ObservableObject {
     /// transport re-delivers on the next drain (the halt-on-undelivered contract,
     /// which correctly holds a chat message until ChatView opens and re-drains).
     @MainActor
-    private func handleIncomingFromTransport(_ msg: BridgeMessage) async -> Bool {
+    func handleIncomingFromTransport(_ msg: BridgeMessage) async -> Bool {
         let kind = msg.metadata?["kind"]
-        // No consumer at all yet → hold for retry.
-        guard kind == "icloud_action_response"
-                || !messageHandlers.isEmpty
-                || !notificationHandlers.isEmpty else { return false }
         if seenMessageIDs.contains(msg.id) { return true }
-        guard let secret = pairingStore?.iCloudPairingSecret else { return false }  // can't verify → retry
 
-        // targetSourceKey filter (mirrors the scan): not addressed here → consume.
+        // targetSourceKey filter (mirrors the scan): not addressed here → consume
+        // without waiting for a local surface or pairing material. A record for
+        // another device must never hold the shared cursor behind it.
         if let tsk = msg.metadata?["targetSourceKey"], !tsk.isEmpty,
            tsk != ChatRuntimeControls.deviceSourceKey,
            !NativeAgentICloudBridgeConstants.isMobileSourceKey(tsk) {
@@ -687,10 +730,16 @@ final class iCloudBridge: ObservableObject {
             return true
         }
 
-        // Resync hint arrives UNSIGNED by design — dispatch on kind BEFORE the
-        // signature check (Mac/iOS have disagreeing secrets at this point).
+        // Resync is the one unsigned wire exception. Its exact bounded shape
+        // is checked before it may refresh pairing material; a lookalike with
+        // an action/session/attachment is terminally consumed but never
+        // dispatched or allowed to mutate local state.
         if msg.metadata?["kind"] == "signature_invalid_resync" {
             recordSeenMacReplyID(msg.id); persistSeenMacReplyIDs()
+            guard msg.isUnsignedResyncHint else {
+                syncStatus = "Rejected malformed iCloud pairing refresh hint"
+                return true
+            }
             syncStatus = "iCloud pairing refresh from Mac"
             if await pairingStore?.refreshFromKVS() == true {
                 NSLog("[iCloudBridge] signature_invalid_resync applied — new HMAC installed")
@@ -698,6 +747,15 @@ final class iCloudBridge: ObservableObject {
             }
             return true
         }
+
+        // Signed records remain eligible until their exact consumer is ready.
+        // Do this after foreign-target and resync handling: neither is a local
+        // chat/notification delivery, and both must not wedge the cursor.
+        guard kind == "icloud_action_response"
+                || !messageHandlers.isEmpty
+                || !notificationHandlers.isEmpty
+                || !rejectionHandlers.isEmpty else { return false }
+        guard let secret = pairingStore?.iCloudPairingSecret else { return false }  // can't verify → retry
 
         // HMAC — verify or reject (a CK record is no more trusted than a file).
         if msg.signature == nil || !msg.verifySignature(secret: secret) {
@@ -765,6 +823,7 @@ final class iCloudBridge: ObservableObject {
     @discardableResult
     func drainDeviceTransport() async -> Bool {
         guard let ck = deviceTransport else { return false }
+        await deviceIncomingSetupTask?.value
         if deviceDrainInFlight { deviceDrainQueued = true; return false }
         deviceDrainInFlight = true
         defer {
@@ -915,6 +974,8 @@ final class iCloudBridge: ObservableObject {
         setupGeneration += 1
         setupTask?.cancel()
         setupTask = nil
+        deviceIncomingSetupTask?.cancel()
+        deviceIncomingSetupTask = nil
         metadataQuery?.stop()
         metadataQuery = nil
         NotificationCenter.default.removeObserver(self)
@@ -938,7 +999,7 @@ final class iCloudBridge: ObservableObject {
         // fix-2026-06-10 sync-audit #2: persist the ORDERED array (oldest →
         // newest). The old Array(set.suffix(cap)) kept an arbitrary subset.
         let capped = Array(seenMessageIDsOrdered.suffix(maxProcessedMacReplyIDs))
-        UserDefaults.standard.set(capped, forKey: processedMacReplyIDsKey)
+        userDefaults.set(capped, forKey: processedMacReplyIDsKey)
     }
 
     private struct MacOutboxScanResult: Sendable {
@@ -1072,22 +1133,23 @@ final class iCloudBridge: ObservableObject {
                !NativeAgentICloudBridgeConstants.isMobileSourceKey(targetSourceKey) {
                 continue
             }
+            // Resync hints do not need a chat/notification consumer. A
+            // registered recovery observer is enough, and only the exact
+            // bounded envelope below can bypass normal signature handling.
+            if msg.metadata?["kind"] == "signature_invalid_resync" {
+                result.seenIDs.append(msg.id)
+                if msg.isUnsignedResyncHint {
+                    result.resyncHints.append(msg)
+                }
+                moveToProcessed(fileURL, processedDir: processedDir, fileManager: fm)
+                continue
+            }
+
             let isNotification = msg.metadata?["kind"] == "notification"
             if isNotification {
                 guard consumeNotifications else { continue }
             } else {
                 guard consumeChatMessages else { continue }
-            }
-
-            // Phase 14e-iCloud HMAC self-heal: resync hints from Mac arrive
-            // UNSIGNED by design (Mac and iOS have disagreeing secrets at
-            // this point - signing would just hit the same mismatch).
-            // Dispatch on metadata.kind BEFORE the signature check.
-            if msg.metadata?["kind"] == "signature_invalid_resync" {
-                result.seenIDs.append(msg.id)
-                result.resyncHints.append(msg)
-                moveToProcessed(fileURL, processedDir: processedDir, fileManager: fm)
-                continue
             }
 
             if msg.signature == nil || !msg.verifySignature(secret: secret) {

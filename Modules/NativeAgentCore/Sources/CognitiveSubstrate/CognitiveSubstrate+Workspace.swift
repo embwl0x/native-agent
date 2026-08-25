@@ -31,7 +31,11 @@ public struct CognitiveMaintenanceOpportunity: Sendable, Equatable {
 extension CognitiveSubstrate {
     public func workspaceSnapshot(currentSessionId: String? = nil) async -> CognitiveWorkspaceSnapshot {
         let now = dependencies.now()
-        guard configuration.enabled, configuration.workspaceEnabled else {
+        // Observatory ablation is a real read-side intervention: it must
+        // change the exact workspace the panel and capsule consume, rather
+        // than merely recording a checkbox in experiment metadata.
+        guard configuration.enabled, configuration.workspaceEnabled,
+              ablations["workspace"] != false else {
             return CognitiveWorkspaceSnapshot(generatedAt: now, items: [])
         }
         let settledNodes = field.snapshot(at: now, configuration: configuration)
@@ -147,7 +151,7 @@ extension CognitiveSubstrate {
             nodes: settledNodes,
             persistenceHealth: persistenceHealth
         )
-        guard frozenConfiguration.workspaceEnabled else {
+        guard frozenConfiguration.workspaceEnabled, ablations["workspace"] != false else {
             return CognitiveFrozenRead(
                 fixedAt: fixedAt,
                 stateRevision: dirtyRevision,

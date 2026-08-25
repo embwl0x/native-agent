@@ -7,6 +7,12 @@ import PersonaEngine
 import PersistenceCore
 import ProviderRouting
 
+struct NativeCognitionPreferenceDefaults: @unchecked Sendable {
+    let defaults: UserDefaults
+
+    static let standard = Self(defaults: .standard)
+}
+
 struct CognitiveObservatoryDetail: Sendable {
     var configuration: CognitiveConfiguration
     var summary: CognitiveObservatorySnapshot
@@ -20,6 +26,10 @@ struct CognitiveObservatoryDetail: Sendable {
     var standingViews: [CognitiveStandingView]
     var developmentalTimeline: [CognitiveDevelopmentalTimelineEvent]
     var reflections: [CognitiveReflectionReceipt]
+    /// Carries receipt-read availability through the runtime boundary.  The
+    /// compatibility `receipts` projection below remains for older consumers,
+    /// but the Observatory must render this state rather than infer from it.
+    var receiptRead: CognitiveReceiptRead
     var receipts: [CognitiveReceiptRecord]
     var facultyMeasurements: [CognitiveFacultyMeasurement]
     var experiments: [CognitiveExperimentResult]
@@ -32,6 +42,30 @@ struct CognitiveObservatoryDetail: Sendable {
     /// signals the fingerprint is built from. nil when cognition/affect is off or no
     /// mode is genuinely dominant. Read-only: it adds no capsule text and drives nothing.
     var feltMode: CognitiveSubstrate.FeltMode?
+}
+
+/// The Observatory's complete projection plus the truthfulness of its
+/// receipt-evidence lane. An otherwise useful live snapshot is still partial
+/// when its durable loop receipts cannot be read; callers must carry that
+/// state rather than treat the compatibility `receipts` array as a quiet zero.
+struct CognitiveObservatoryDetailRead: Sendable {
+    enum EvidenceStatus: Sendable, Equatable {
+        case complete
+        case receiptEvidenceUnavailable(CognitiveReceiptReadUnavailability)
+    }
+
+    let detail: CognitiveObservatoryDetail
+    let evidenceStatus: EvidenceStatus
+
+    init(detail: CognitiveObservatoryDetail) {
+        self.detail = detail
+        switch detail.receiptRead {
+        case .available:
+            self.evidenceStatus = .complete
+        case .unavailable(let reason):
+            self.evidenceStatus = .receiptEvidenceUnavailable(reason)
+        }
+    }
 }
 
 /// Provenance for the Observatory's Capsule Preview: whether the shown capsule is
@@ -61,6 +95,69 @@ struct NativeCognitionRuntimeChange: Sendable, Equatable {
     let revision: UInt64
     let occurredAt: Date
     let reason: String
+}
+
+/// The observable result of invoking every registered cognition evaluation
+/// sampler. A nil substrate result is an unavailable sampler, not an empty or
+/// successful evaluation run.
+struct CognitiveEvaluationSamplerOutcome: Sendable, Equatable {
+    let recordedKinds: [CognitiveExperimentKind]
+    let unavailableKinds: [CognitiveExperimentKind]
+    let failureDetail: String?
+
+    var isFailed: Bool { failureDetail != nil }
+
+    var isComplete: Bool {
+        !isFailed
+            && unavailableKinds.isEmpty
+            && recordedKinds.count == CognitiveExperimentKind.allCases.count
+    }
+
+    var presentationText: String {
+        if let failureDetail {
+            return "Cognitive evaluation samplers failed: \(failureDetail)."
+        }
+        if isComplete {
+            return "Recorded \(recordedKinds.count) cognitive evaluation samples."
+        }
+        let unavailable = unavailableKinds.map(\.rawValue).joined(separator: ", ")
+        if recordedKinds.isEmpty {
+            return "Cognitive evaluation samplers unavailable: \(unavailable)."
+        }
+        return "Recorded \(recordedKinds.count) cognitive evaluation samples; unavailable: \(unavailable)."
+    }
+}
+
+/// The exact provenance of the installed-physiology recorder decision. A
+/// missing report is not evidence that installed collection was meant to be
+/// active: alternate roots and test processes are deliberately excluded.
+enum InstalledPhysiologySoakEnablement: Sendable, Equatable {
+    /// The real installed root is collecting elapsed evidence.
+    case installedElapsed
+    /// An injected root must never write into the user's installed evidence feed.
+    case disabledNonDefaultDataRoot
+    /// Test processes must not create evidence that could be mistaken for an
+    /// installed elapsed observation.
+    case disabledTestProcess
+    /// Explicit alternate-runtime controls are a test/diagnostic choice, not
+    /// the production root gate.
+    case forcedEnabled
+    case forcedDisabled
+    /// An injected recorder is generated/diagnostic evidence and retains that
+    /// provenance even when the ambient root would otherwise be excluded.
+    case injectedEvidence
+
+    var createsInstalledRecorder: Bool {
+        switch self {
+        case .installedElapsed, .forcedEnabled:
+            true
+        case .disabledNonDefaultDataRoot,
+             .disabledTestProcess,
+             .forcedDisabled,
+             .injectedEvidence:
+            false
+        }
+    }
 }
 
 struct NativeSubconsciousRuntimeState: Sendable, Equatable {
@@ -127,6 +224,8 @@ enum OrganismReflexReviewApplyStatus: String, Sendable, Equatable {
     case applied
     case organismDisabled = "organism_disabled"
     case candidateNotFound = "candidate_not_found"
+    case reviewInFlight = "review_in_flight"
+    case notAwaitingReview = "not_awaiting_review"
     case approvalRequiresLowRisk = "approval_requires_low_risk"
     case persistenceFailed = "persistence_failed"
 }
@@ -136,6 +235,24 @@ struct OrganismReflexReviewApplyOutcome: Sendable, Equatable {
     var snapshot: OrganismSnapshot
     var candidate: OrganismReflexCandidate?
     var receipt: OrganismReflexReviewReceipt?
+    var error: String?
+
+    var applied: Bool { status == .applied }
+}
+
+/// The mutation receipt behind the Observatory's Settle and Reset controls.
+/// A body snapshot alone is not proof that a requested state made it to disk:
+/// callers must be able to distinguish a committed change from an in-memory
+/// change that was rolled back after the persistence barrier refused it.
+enum OrganismContinuityApplyStatus: String, Sendable, Equatable {
+    case applied
+    case organismDisabled = "organism_disabled"
+    case persistenceFailed = "persistence_failed"
+}
+
+struct OrganismContinuityApplyOutcome: Sendable, Equatable {
+    var status: OrganismContinuityApplyStatus
+    var snapshot: OrganismSnapshot
     var error: String?
 
     var applied: Bool { status == .applied }
@@ -215,6 +332,14 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
     private let monotonicNowNanoseconds: @Sendable () -> UInt64
     let microcycleSchedulingMode: CognitiveMicrocycleSchedulingMode  // internal for actor extensions (move-only Wave C)
     let configurationOverride: CognitiveConfiguration?  // internal for actor extensions (move-only Wave C)
+    /// The durable preference owner used by the real Observatory/Settings
+    /// control actions. Production uses `.standard`; isolated mounted tests
+    /// inject a suite without replacing the action or runtime configuration.
+    let preferenceDefaults: UserDefaults  // internal for actor extensions
+    private let configurationEnvironment: [String: String]
+    /// Explicit test-only escape hatch for proving the same canonical reflection
+    /// route transaction on an injected root. Production defaults to false.
+    let allowsReflectionSelectionMutationForTesting: Bool
     private let organismConfigurationOverride: OrganismConfiguration?
     private let cognitiveStore: CognitiveSQLiteStore?
     let substrate: CognitiveSubstrate  // internal for actor extensions (move-only Wave C)
@@ -252,6 +377,10 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
     /// synthetic constant-message compile. Display-only — never affects injection.
     private var lastInjectedCapsule: (capsule: CognitiveCapsule, userMessage: String)?
     var organismDebugBodyOverride: OrganismDebugBodyOverride?  // internal for actor extensions (move-only Wave C)
+    /// One pending durable reflex journal at a time. A single journal file is
+    /// the cross-store transaction authority; the UI is only a convenience.
+    var organismReflexReviewingIDs: Set<String> = []
+    var organismReflexReviewTransactionInFlight = false
     /// Suppress-when-unchanged for the felt body line: the last line actually
     /// injected into a prompt, and when. A held-steady line goes quiet until it
     /// changes or the refresh window elapses, so she doesn't re-narrate the same
@@ -267,6 +396,7 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
     /// Installed elapsed evidence only. Tests and alternate runtimes remain
     /// off unless they inject a generated-evidence recorder explicitly.
     let physiologySoakRecorder: InstalledPhysiologySoakRecorder?  // internal for actor extensions (move-only Wave C)
+    let physiologySoakEnablement: InstalledPhysiologySoakEnablement  // internal for actor extensions (move-only Wave C)
     var pendingPhysiologySubmissions = 0  // internal for actor extensions (move-only Wave C)
     var physiologySubmissionGeneration: UInt64 = 0  // internal for actor extensions (move-only Wave C)
     /// Off-path submissions form one serial tail. Separate unstructured tasks
@@ -356,6 +486,10 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
     var organismPersistenceLastResult = true  // internal for actor extensions (move-only Wave C)
     let organismPersistenceWriterOverride:  // internal for actor extensions (move-only Wave C)
         (@Sendable (OrganismPersistentState, URL) async throws -> Void)?
+    /// Test seam for the required cognition-side half of a reflex review.
+    /// Production uses CognitiveSubstrate.recordReceiptChecked.
+    let organismReflexReceiptRecorderOverride:  // internal for actor extensions
+        (@Sendable (UUID, String, JSONValue) async throws -> Void)?
     var pendingDebugReplySessionIds: Set<String> = []
     /// Sessions whose whole conversation is treated as debug traffic.
     ///
@@ -410,6 +544,9 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
     init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         configurationOverride: CognitiveConfiguration? = nil,
+        preferenceDefaults: NativeCognitionPreferenceDefaults = .standard,
+        configurationEnvironment: [String: String] = ProcessInfo.processInfo.environment,
+        allowsReflectionSelectionMutationForTesting: Bool = false,
         organismConfigurationOverride: OrganismConfiguration? = nil,
         now: @escaping @Sendable () -> Date = { Date() },
         monotonicNowNanoseconds: @escaping @Sendable () -> UInt64 = {
@@ -427,15 +564,20 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
         deadlineLogger: (@Sendable (String) -> Void)? = nil,
         pursuitStateLoaderOverride: (@Sendable () async throws -> DeskState)? = nil,
         organismPersistenceWriterOverride:
-            (@Sendable (OrganismPersistentState, URL) async throws -> Void)? = nil
+            (@Sendable (OrganismPersistentState, URL) async throws -> Void)? = nil,
+        organismReflexReceiptRecorderOverride:
+            (@Sendable (UUID, String, JSONValue) async throws -> Void)? = nil
     ) {
         self.dataRoot = dataRoot
         self.now = now
         self.monotonicNowNanoseconds = monotonicNowNanoseconds
         self.microcycleSchedulingMode = microcycleSchedulingMode
+        self.preferenceDefaults = preferenceDefaults.defaults
+        self.configurationEnvironment = configurationEnvironment
         let telemetry = CognitiveMicrocycleTelemetry.fresh(now: now())
         self.microcycleTelemetry = telemetry
         self.configurationOverride = configurationOverride
+        self.allowsReflectionSelectionMutationForTesting = allowsReflectionSelectionMutationForTesting
         self.organismConfigurationOverride = organismConfigurationOverride
         self.eventDrivenReplayTimeoutSeconds = eventDrivenReplayTimeoutSeconds.isFinite
             && eventDrivenReplayTimeoutSeconds >= 0
@@ -448,15 +590,22 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
         self.eventDrivenReplayOperationOverride = eventDrivenReplayOperationOverride
         self.eventDrivenReflectionOperationOverride = eventDrivenReflectionOperationOverride
         self.organismPersistenceWriterOverride = organismPersistenceWriterOverride
+        self.organismReflexReceiptRecorderOverride = organismReflexReceiptRecorderOverride
         self.pursuitStateLoader = pursuitStateLoaderOverride ?? {
             try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState()
         }
         self.deadlineLogger = deadlineLogger ?? { message in
             FileHandle.standardError.write(Data("[NativeCognitionRuntime] \(message)\n".utf8))
         }
-        let configuration = configurationOverride ?? Self.loadConfiguration()
+        let configuration = configurationOverride ?? Self.loadConfiguration(
+            defaults: preferenceDefaults.defaults,
+            environment: configurationEnvironment
+        )
         let organismConfiguration = organismConfigurationOverride
-            ?? Self.loadOrganismConfiguration(dataRoot: dataRoot)
+            ?? Self.loadOrganismConfiguration(
+                dataRoot: dataRoot,
+                defaults: preferenceDefaults.defaults
+            )
         let store = try? CognitiveSQLiteStore(dataRoot: dataRoot)
         self.cognitiveStore = store
         let attentionProjection = CognitiveAttentionResidentProjection()
@@ -517,11 +666,21 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
         )
         let testProcess = ProcessInfo.processInfo.processName.lowercased().contains("xctest")
             || ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
-        let shouldCollectInstalledSoak = installedPhysiologySoakEnabled
-            ?? (dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL
-                && !testProcess)
+        let automaticSoakEnablement = Self.resolveInstalledPhysiologySoakEnablement(
+            dataRoot: dataRoot,
+            isTestProcess: testProcess
+        )
+        let soakEnablement: InstalledPhysiologySoakEnablement
+        if physiologySoakRecorderOverride != nil {
+            soakEnablement = .injectedEvidence
+        } else if let installedPhysiologySoakEnabled {
+            soakEnablement = installedPhysiologySoakEnabled ? .forcedEnabled : .forcedDisabled
+        } else {
+            soakEnablement = automaticSoakEnablement
+        }
+        self.physiologySoakEnablement = soakEnablement
         self.physiologySoakRecorder = physiologySoakRecorderOverride
-            ?? (shouldCollectInstalledSoak
+            ?? (soakEnablement.createsInstalledRecorder
                 ? InstalledPhysiologySoakRecorder(
                     dataRoot: dataRoot,
                     runtimeInstanceID: telemetry.runtimeInstanceId
@@ -532,6 +691,29 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
     deinit {
         pursuitObservationTask?.cancel()
         organismPersistenceDrainTask?.cancel()
+    }
+
+    nonisolated static func shouldCollectInstalledSoak(
+        dataRoot: URL,
+        isTestProcess: Bool
+    ) -> Bool {
+        resolveInstalledPhysiologySoakEnablement(
+            dataRoot: dataRoot,
+            isTestProcess: isTestProcess
+        ).createsInstalledRecorder
+    }
+
+    /// Keep the default-root and test-process exclusions in the same owner
+    /// that constructs the recorder. The result is intentionally typed so
+    /// diagnostics/evals cannot turn an excluded recorder into a silent zero.
+    nonisolated static func resolveInstalledPhysiologySoakEnablement(
+        dataRoot: URL,
+        isTestProcess: Bool
+    ) -> InstalledPhysiologySoakEnablement {
+        guard dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL else {
+            return .disabledNonDefaultDataRoot
+        }
+        return isTestProcess ? .disabledTestProcess : .installedElapsed
     }
 
     /// Read the configured user name from `<dataRoot>/memory/profile.json`
@@ -569,6 +751,7 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
             )
         }
         await restoreOrganismContinuityIfAvailable()
+        await recoverPendingOrganismReflexReviewIfNeeded()
         await restoreProviderLifecycleEvidence()
         // The only awaited Desk replay is launch/bootstrap work, performed in
         // a detached task so its synchronous JSONL parse never occupies this
@@ -628,7 +811,10 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
     }
 
     func refreshConfiguration() async {
-        var configuration = configurationOverride ?? Self.loadConfiguration()
+        var configuration = configurationOverride ?? Self.loadConfiguration(
+            defaults: preferenceDefaults,
+            environment: configurationEnvironment
+        )
         do {
             let routing = SwiftNativeProviderRouting(dataRoot: dataRoot)
             let routingSnapshot = try await routing.checkedRoutingSnapshot()
@@ -649,7 +835,10 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
         }
         await substrate.configure(configuration)
         let organismConfiguration = organismConfigurationOverride
-            ?? Self.loadOrganismConfiguration(dataRoot: dataRoot)
+            ?? Self.loadOrganismConfiguration(
+                dataRoot: dataRoot,
+                defaults: preferenceDefaults
+            )
         await organismKernel.configure(organismConfiguration)
         await somaticSignalBus.configure(organismConfiguration)
     }
@@ -1269,6 +1458,10 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
         }
         await drainPhysiologySubmissions()
         await physiologySoakRecorder?.flush()
+        // Termination is the runtime-owned snapshot point for provider vitals.
+        // It follows lifecycle/physiology settlement so the final observed row
+        // cannot be excluded by an early snapshot.
+        await persistProviderVitalsSnapshot()
     }
 
 
@@ -1318,6 +1511,7 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
             capsulePreview = nonEmpty
             capsulePreviewInfo = nonEmpty == nil ? nil : CapsulePreviewInfo(source: .synthetic, userMessage: nil, at: nil)
         }
+        let receiptRead = await substrate.receiptReadSnapshot()
         return CognitiveObservatoryDetail(
             configuration: configuration,
             summary: await substrate.observatorySnapshot(),
@@ -1331,7 +1525,8 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
             standingViews: await substrate.standingViewSnapshot(),
             developmentalTimeline: await substrate.developmentalTimelineSnapshot(),
             reflections: await substrate.reflectionReceiptSnapshot(),
-            receipts: await substrate.receiptSnapshot(),
+            receiptRead: receiptRead,
+            receipts: receiptRead.receipts,
             facultyMeasurements: await substrate.facultyMeasurementSnapshot(),
             experiments: await substrate.researchExperimentSnapshot(),
             welfareBounds: await substrate.welfareBoundsSnapshot(),
@@ -1343,33 +1538,41 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
         )
     }
 
+    /// The observational boundary used by mounted Observatory consumers.
+    /// It retains the full live projection while making missing durable receipt
+    /// evidence explicit, so disabled or unreadable persistence never becomes
+    /// a success-shaped empty receipt list.
+    func observatoryDetailRead() async -> CognitiveObservatoryDetailRead {
+        CognitiveObservatoryDetailRead(detail: await observatoryDetail())
+    }
+
     func setEnabled(_ enabled: Bool) async {
-        UserDefaults.standard.set(enabled, forKey: Self.enabledKey)
+        preferenceDefaults.set(enabled, forKey: Self.enabledKey)
         await refreshConfiguration()
         if enabled { await bootstrap() }
         publishRuntimeChange(reason: "configuration:enabled")
     }
 
     func setCapsuleEnabled(_ enabled: Bool) async {
-        UserDefaults.standard.set(enabled, forKey: Self.capsuleKey)
+        preferenceDefaults.set(enabled, forKey: Self.capsuleKey)
         await refreshConfiguration()
         publishRuntimeChange(reason: "configuration:capsule")
     }
 
     func setBackgroundEnabled(_ enabled: Bool) async {
-        UserDefaults.standard.set(enabled, forKey: Self.backgroundKey)
+        preferenceDefaults.set(enabled, forKey: Self.backgroundKey)
         await refreshConfiguration()
         publishRuntimeChange(reason: "configuration:background")
     }
 
     func setReflectionEnabled(_ enabled: Bool) async {
-        UserDefaults.standard.set(enabled, forKey: Self.reflectionKey)
+        preferenceDefaults.set(enabled, forKey: Self.reflectionKey)
         await refreshConfiguration()
         publishRuntimeChange(reason: "configuration:reflection")
     }
 
     func setReflectionBudget(_ budget: Int) async {
-        UserDefaults.standard.set(max(0, budget), forKey: Self.reflectionBudgetKey)
+        preferenceDefaults.set(max(0, budget), forKey: Self.reflectionBudgetKey)
         await refreshConfiguration()
         publishRuntimeChange(reason: "configuration:reflection_budget")
     }
@@ -1383,12 +1586,12 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
         reflectionBudget: Int
     ) async -> NativeSubconsciousRuntimeState {
         let budget = enabled ? max(1, reflectionBudget) : 0
-        UserDefaults.standard.set(enabled, forKey: Self.enabledKey)
-        UserDefaults.standard.set(enabled, forKey: Self.capsuleKey)
-        UserDefaults.standard.set(enabled, forKey: Self.backgroundKey)
-        UserDefaults.standard.set(enabled, forKey: Self.reflectionKey)
-        UserDefaults.standard.set(budget, forKey: Self.reflectionBudgetKey)
-        UserDefaults.standard.set(enabled, forKey: Self.organismKernelEnabledKey)
+        preferenceDefaults.set(enabled, forKey: Self.enabledKey)
+        preferenceDefaults.set(enabled, forKey: Self.capsuleKey)
+        preferenceDefaults.set(enabled, forKey: Self.backgroundKey)
+        preferenceDefaults.set(enabled, forKey: Self.reflectionKey)
+        preferenceDefaults.set(budget, forKey: Self.reflectionBudgetKey)
+        preferenceDefaults.set(enabled, forKey: Self.organismKernelEnabledKey)
 
         let alreadyBootstrapped = bootstrapTask != nil
         await refreshConfiguration()
@@ -1553,10 +1756,12 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
 
     /// User's approval seam for Wave E standing views — a view she formed in reflection
     /// only reaches her capsule after this says approved.
-    func resolveStandingView(id: UUID, approved: Bool) async {
-        _ = await substrate.resolveStandingView(id: id, approved: approved)
+    func resolveStandingView(id: UUID, approved: Bool) async -> CognitiveStandingView? {
+        let resolved = await substrate.resolveStandingView(id: id, approved: approved)
+        guard resolved != nil else { return nil }
         scheduleDirtyMicrocycle(reason: "standing_view_resolution")
         publishRuntimeChange(reason: "proposal:standing_view_resolved")
+        return resolved
     }
 
     func setAblation(_ key: String, enabled: Bool) async {
@@ -1583,12 +1788,36 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
         return suggestion.text
     }
 
-    func runResearchHarness() async {
+    @discardableResult
+    func runResearchHarness() async -> CognitiveEvaluationSamplerOutcome {
         await bootstrap()
-        for kind in CognitiveExperimentKind.allCases {
-            _ = await substrate.runResearchExperiment(kind: kind, seed: "observatory")
+        if let bootstrapFailure {
+            let outcome = CognitiveEvaluationSamplerOutcome(
+                recordedKinds: [],
+                unavailableKinds: CognitiveExperimentKind.allCases,
+                failureDetail: bootstrapFailure
+            )
+            publishRuntimeChange(reason: "experiment:harness_failed")
+            return outcome
         }
-        publishRuntimeChange(reason: "experiment:harness_completed")
+        var recordedKinds: [CognitiveExperimentKind] = []
+        var unavailableKinds: [CognitiveExperimentKind] = []
+        for kind in CognitiveExperimentKind.allCases {
+            if await substrate.runResearchExperiment(kind: kind, seed: "observatory") != nil {
+                recordedKinds.append(kind)
+            } else {
+                unavailableKinds.append(kind)
+            }
+        }
+        let outcome = CognitiveEvaluationSamplerOutcome(
+            recordedKinds: recordedKinds,
+            unavailableKinds: unavailableKinds,
+            failureDetail: nil
+        )
+        publishRuntimeChange(
+            reason: outcome.isComplete ? "experiment:harness_completed" : "experiment:harness_unavailable"
+        )
+        return outcome
     }
 
     @discardableResult
@@ -1599,9 +1828,15 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
             .appendingPathComponent("cognition", isDirectory: true)
             .appendingPathComponent("exports", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let path = dir.appendingPathComponent("cognitive-research-\(Int(Date().timeIntervalSince1970)).json")
+        // Second-granularity filenames collapsed repeated Export presses onto
+        // one apparent success. Every completed export needs its own durable
+        // artifact; retention owns the resulting bounded set.
+        let path = dir.appendingPathComponent(
+            "cognitive-research-\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString.lowercased()).json"
+        )
         do {
             try await SwiftNativePersistenceCore().writeJSON(payload, to: path)
+            Self.trimResearchExports(in: dir, keeping: 20, preserving: path)
             lastResearchExportPath = path.path
             publishRuntimeChange(reason: "experiment:trace_exported")
             return path.path
@@ -1612,6 +1847,31 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
             )
             return nil
         }
+    }
+
+    nonisolated private static func trimResearchExports(
+        in directory: URL,
+        keeping limit: Int,
+        preserving freshlyWrittenPath: URL
+    ) {
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+        let preservedPath = freshlyWrittenPath.standardizedFileURL.path
+        let exports = files
+            .filter { $0.lastPathComponent.hasPrefix("cognitive-research-") && $0.pathExtension == "json" }
+            .sorted {
+                let leftIsPreserved = $0.standardizedFileURL.path == preservedPath
+                let rightIsPreserved = $1.standardizedFileURL.path == preservedPath
+                if leftIsPreserved != rightIsPreserved { return leftIsPreserved }
+                let left = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                let right = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                return left > right
+            }
+        guard exports.count > limit else { return }
+        for stale in exports.dropFirst(limit) { try? FileManager.default.removeItem(at: stale) }
     }
 
 
@@ -1675,22 +1935,25 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
     }
 
 
-    static func loadConfiguration() -> CognitiveConfiguration {  // internal for actor extensions (move-only Wave C)
-        let env = ProcessInfo.processInfo.environment
-        let enabled = UserDefaults.standard.bool(forKey: enabledKey)
+    static func loadConfiguration(  // internal for actor extensions (move-only Wave C)
+        defaults: UserDefaults = .standard,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> CognitiveConfiguration {
+        let env = environment
+        let enabled = defaults.bool(forKey: enabledKey)
             || env["NATIVE_AGENT_COGNITION_ENABLED"] == "1"
         let capsuleEnabled = enabled && (
-            UserDefaults.standard.object(forKey: capsuleKey) as? Bool ?? true
+            defaults.object(forKey: capsuleKey) as? Bool ?? true
         )
         let backgroundEnabled = enabled && (
-            UserDefaults.standard.object(forKey: backgroundKey) as? Bool ?? true
+            defaults.object(forKey: backgroundKey) as? Bool ?? true
         )
         let reflectionEnabled = enabled && (
-            UserDefaults.standard.bool(forKey: reflectionKey)
+            defaults.bool(forKey: reflectionKey)
                 || env["NATIVE_AGENT_COGNITION_REFLECTION_ENABLED"] == "1"
         )
         let budgetDefault = reflectionEnabled ? 2 : 0
-        let storedBudget = UserDefaults.standard.object(forKey: reflectionBudgetKey) as? Int
+        let storedBudget = defaults.object(forKey: reflectionBudgetKey) as? Int
         let budget = max(0, storedBudget ?? budgetDefault)
         let reflectionModel = configuredReflectionModel(env: env)
         let reflectionProvider = configuredReflectionProvider(for: reflectionModel)
@@ -1737,8 +2000,11 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
         return OrganismConfiguration(enabled: enabled)
     }
 
-    private static func loadOrganismConfiguration(dataRoot: URL) -> OrganismConfiguration {
-        reconcileOrganismPreferenceForLaunch(dataRoot: dataRoot)
+    private static func loadOrganismConfiguration(
+        dataRoot: URL,
+        defaults: UserDefaults = .standard
+    ) -> OrganismConfiguration {
+        reconcileOrganismPreferenceForLaunch(dataRoot: dataRoot, defaults: defaults)
     }
 
     /// Existing installs can predate the organism preference while already

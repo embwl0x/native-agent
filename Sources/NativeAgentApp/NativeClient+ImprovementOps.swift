@@ -68,7 +68,10 @@ extension NativeClient {
     }
 
     func createRecurringImprovement(objective: String, intervalSeconds: Int) async throws -> SchedulerJob {
-        let writer = makeSchedulerJobWriter(connectorActionIDs: Self.connectorActionIDSet())
+        let writer = makeSchedulerJobWriter(
+            connectorActionIDs: Self.connectorActionIDSet(),
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        )
         let trimmed = objective.trimmingCharacters(in: .whitespacesAndNewlines)
         let body: JSONValue = .object([
             "name": .string("Continuous Self-Improvement"),

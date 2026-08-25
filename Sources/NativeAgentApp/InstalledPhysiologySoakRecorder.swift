@@ -4,6 +4,26 @@ import Foundation
 import CognitiveSubstrate
 import PersistenceCore
 
+/// Bounded recorder-health facts for readers that interpret the physiology
+/// feed. Any drop or write failure means a quiet arm/fire count is incomplete
+/// evidence, not proof that the underlying deadline lane was inactive.
+struct InstalledPhysiologySoakRecorderDiagnostics: Sendable, Equatable {
+    let pending: Int
+    let dropped: UInt64
+    let totalDropped: UInt64
+    let consecutiveWriteFailures: Int
+    let totalWriteFailures: UInt64
+    let lastError: String?
+
+    var hasMeasurementGap: Bool {
+        // A recovered append failure is a durability-degradation episode, not
+        // lost evidence: retain totalWriteFailures for diagnosis, but clear the
+        // gap once that exact pending batch reaches storage. Backpressure drops
+        // are irreversible, while pending/error states remain incomplete now.
+        totalDropped > 0 || pending > 0 || lastError != nil
+    }
+}
+
 /// App-owned evidence recorder for real installed physiology. It owns no timer:
 /// rows are enqueued only by launch/termination, sensory events, microcycle
 /// transitions, or exact residual deadlines that already occurred.
@@ -23,7 +43,9 @@ actor InstalledPhysiologySoakRecorder {
     private var drainTask: Task<Void, Never>?
     private var drainInProgress = false
     private var droppedByBackpressure: UInt64 = 0
+    private var totalDroppedByBackpressure: UInt64 = 0
     private var consecutiveWriteFailures = 0
+    private var totalWriteFailures: UInt64 = 0
     private var lastWriteError: String?
     private var chatStartedAtByRunDigest: [String: Date] = [:]
     private var chatRunOrder: [String] = []
@@ -182,8 +204,15 @@ actor InstalledPhysiologySoakRecorder {
             : report.addingClaimBlocker("physiology recorder durability barrier did not complete")
     }
 
-    func diagnostics() -> (pending: Int, dropped: UInt64, lastError: String?) {
-        (pending.count, droppedByBackpressure, lastWriteError)
+    func diagnostics() -> InstalledPhysiologySoakRecorderDiagnostics {
+        InstalledPhysiologySoakRecorderDiagnostics(
+            pending: pending.count,
+            dropped: droppedByBackpressure,
+            totalDropped: totalDroppedByBackpressure,
+            consecutiveWriteFailures: consecutiveWriteFailures,
+            totalWriteFailures: totalWriteFailures,
+            lastError: lastWriteError
+        )
     }
 
     @discardableResult
@@ -243,6 +272,7 @@ actor InstalledPhysiologySoakRecorder {
     ) {
         guard pending.count < Self.maximumPendingRecords else {
             droppedByBackpressure &+= 1
+            totalDroppedByBackpressure &+= 1
             // The full buffer may be retained from an exhausted failure
             // budget. A new event is a meaningful signal to re-open that
             // bounded budget rather than leaving evidence wedged until exit.
@@ -334,6 +364,7 @@ actor InstalledPhysiologySoakRecorder {
             } catch {
                 appendFailed = true
                 consecutiveWriteFailures += 1
+                totalWriteFailures &+= 1
                 lastWriteError = String(String(describing: error).prefix(240))
                 // Preserve order and exact sequence across transient failures.
                 // A later event or termination flush retries the same batch.

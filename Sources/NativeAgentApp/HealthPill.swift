@@ -21,20 +21,43 @@ extension AppModel {
     }
 }
 
+/// The health pill has one navigation responsibility: take the person to the
+/// mounted Doctor diagnostics surface. A queued request is useful, but it is
+/// not the same as Doctor having already rendered.
+enum HealthPillDoctorJump {
+    static let destination: NativeAgentNavigationDestination = .sidebar(.diagnostics)
+
+    @MainActor
+    static func request(
+        using coordinator: NativeAgentAppCoordinator = .shared
+    ) -> NativeAgentNavigationRequestReceipt {
+        coordinator.request(destination)
+    }
+
+    static func help(for receipt: NativeAgentNavigationRequestReceipt?) -> String {
+        switch receipt {
+        case .some(.deliveredToMountedScene):
+            return "Doctor navigation was delivered to the app window."
+        case .some(.queuedForMainScene):
+            return "Doctor navigation is queued until the main window is ready."
+        case .none:
+            return "Open Doctor diagnostics"
+        }
+    }
+}
+
 public struct HealthPill: View {
     @Environment(AppModel.self) var appModel
-    @Binding var showingDoctor: Bool
+    @State private var doctorJumpReceipt: NativeAgentNavigationRequestReceipt?
 
-    public init(showingDoctor: Binding<Bool>) {
-        self._showingDoctor = showingDoctor
-    }
+    public init() {}
 
     public var body: some View {
         let summary = appModel.systemHealthSummary
         let label = label(for: summary)
         let statusColor = color(for: summary)
 
-        Button(action: { showingDoctor = true }) {
+        Button(action: { doctorJumpReceipt = HealthPillDoctorJump.request() }) {
             HStack(spacing: 6) {
                 Circle()
                     .fill(statusColor)
@@ -51,8 +74,10 @@ public struct HealthPill: View {
             }
         }
         .buttonStyle(.plain)
-        .help("System health")
+        .help(HealthPillDoctorJump.help(for: doctorJumpReceipt))
         .accessibilityLabel("System health: \(label)")
+        .accessibilityIdentifier("health-pill.open-doctor")
+        .accessibilityHint(HealthPillDoctorJump.help(for: doctorJumpReceipt))
     }
 
     private func label(for summary: SystemHealthSummary) -> String {

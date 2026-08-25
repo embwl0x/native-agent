@@ -662,6 +662,115 @@ extension SwiftToolDispatcher {
     ///      gate. Exempting it (so the model could always ask "do I have the
     ///      AX grant?") is a User security decision, explicitly out of scope
     ///      here — see docs/build_plans/computer-control-ax-native.md.
+    /// THE FOUR VERBS (User, 2026-08-22): screen / act / go / wait — the
+    /// agent-native surface. `screen` and `wait` are perception and gate on the
+    /// READ tier; `act` and `go` move the world and gate on app-control, the
+    /// same strength as the injection tools whose organs `act` drives.
+    /// No frame ids, no handles, no drift codes reach the caller — replies are
+    /// words plus a structured `detail` side-channel.
+    func impl_mac_four_verbs_tool(
+        tool: String,
+        input: [String: JSONValue],
+        surface: String
+    ) async throws -> JSONValue {
+        let access = await fullMacToolAccess(surface: surface)
+        switch tool {
+        case "screen", "wait":
+            guard access.accessibilityReadAllowed else {
+                throw AutonomyGateError.toolDenied(
+                    reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
+                )
+            }
+        default:
+            guard access.appControlAllowed else {
+                throw AutonomyGateError.toolDenied(
+                    reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
+                )
+            }
+        }
+        func str(_ key: String) -> String? {
+            if case .string(let value)? = input[key] {
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
+            }
+            return nil
+        }
+        func num(_ key: String) -> Double? {
+            switch input[key] {
+            case .double(let value): return value
+            case .int(let value): return Double(value)
+            default: return nil
+            }
+        }
+        let impl = makeMacControl(
+            policyProvider: SwiftToolDispatcherMacControlPolicyProvider(dataRoot: dataRoot),
+            auditAppendPath: dataRoot.appendingPathComponent("mac_control_audit.jsonl")
+        )
+        guard let host = impl as? MacFourVerbsHost else {
+            throw AutonomyGateError.toolDenied(
+                reason: "four_verbs_host_unavailable: the MacControl client in this build does not host the four verbs"
+            )
+        }
+        let verbs = MacFourVerbs(
+            host: host,
+            clock: SystemMacFourVerbsClock(),
+            supplementalSource: SwiftToolDispatcherFourVerbPerceptionSource(
+                host: host,
+                liveScene: fourVerbLiveScene
+            )
+        )
+        let reply: MacFourVerbsReply
+        switch tool {
+        case "screen":
+            reply = await verbs.screen(part: str("part"))
+        case "act":
+            guard let verb = str("verb"), let target = str("target") else {
+                throw AutonomyGateError.toolDenied(
+                    reason: "act needs `verb` and `target` — say what to do and the name of the thing"
+                )
+            }
+            let directedVerb: String = {
+                guard verb == "scroll", let direction = str("direction") else { return verb }
+                return "scroll \(direction)"
+            }()
+            reply = await verbs.act(
+                verb: directedVerb,
+                target: target,
+                text: str("text"),
+                to: str("to"),
+                seconds: num("seconds"),
+                repeat: input["repeat"].flatMap { value in
+                    if case .int(let count) = value { return Int(clamping: count) }
+                    return nil
+                },
+                interval: num("interval"),
+                holding: str("holding")
+            )
+        case "go":
+            guard let name = str("name") ?? str("target") else {
+                throw AutonomyGateError.toolDenied(
+                    reason: "go needs `name` — an app, a file or folder path, or a URL"
+                )
+            }
+            reply = await verbs.go(name)
+        case "wait":
+            reply = await verbs.wait(until: str("until"), seconds: num("seconds"))
+        default:
+            throw AutonomyGateError.toolDenied(
+                reason: "SwiftToolDispatcher: '\(tool)' is not a four-verb tool"
+            )
+        }
+        var payload: [String: JSONValue] = [
+            "ok": .bool(reply.ok),
+            "text": .string(reply.text),
+        ]
+        if let operationId = reply.detail["operationId"] { payload["operationId"] = operationId }
+        if let operationState = reply.detail["operationState"] { payload["operationState"] = operationState }
+        if let verification = reply.detail["verification"] { payload["verification"] = verification }
+        if !reply.detail.isEmpty { payload["detail"] = .object(reply.detail) }
+        return .object(payload)
+    }
+
     func impl_mac_accessibility_read_tool(
         tool: String,
         input: [String: JSONValue],
@@ -679,6 +788,7 @@ extension SwiftToolDispatcher {
         case "mac_ax_tree": action = "ax_tree"
         case "mac_ax_find": action = "ax_find"
         case "mac_view": action = "view"
+        case "mac_look": action = "look"
         case "mac_attention": action = "attention"
         default:
             throw AutonomyGateError.toolDenied(
@@ -913,6 +1023,7 @@ extension SwiftToolDispatcher {
         case "mac_scroll": action = "scroll"
         case "mac_ax_act": action = "ax_act"
         case "mac_wake": action = "wake"
+        case "mac_act": action = "act"
         default:
             throw AutonomyGateError.toolDenied(
                 reason: "SwiftToolDispatcher: '\(tool)' has no Swift Mac injection implementation"

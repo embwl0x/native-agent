@@ -38,6 +38,48 @@ public struct CognitiveSubstrateDependencies: Sendable {
     public static let live = CognitiveSubstrateDependencies()
 }
 
+/// The honest result of asking the substrate to hand replay work to its
+/// canonical Dream/REM owner. This method never runs Dream/REM itself: a
+/// `delegatedToDreamREMOwner` result means its bounded evidence receipt was
+/// durably committed, not that Dream/REM execution has completed.
+public enum CognitiveReplayRunOutcome: Sendable, Equatable {
+    case disabled
+    case unavailable(CognitiveReplayRunUnavailability)
+    case adverse(CognitiveReplayRunAdverseState)
+    case delegatedToDreamREMOwner(evidenceNodeIDs: [UUID])
+}
+
+public enum CognitiveReplayRunUnavailability: String, Sendable, Equatable {
+    case noReplayEvidence = "no_replay_evidence"
+    case persistenceDisabled = "persistence_disabled"
+    case storeUnavailable = "store_unavailable"
+}
+
+public enum CognitiveReplayRunAdverseState: String, Sendable, Equatable {
+    case persistenceWritesBlocked = "persistence_writes_blocked"
+    case receiptWriteFailed = "receipt_write_failed"
+}
+
+/// Receipt history is observational evidence, not an empty-by-default metric.
+/// The Observatory must be able to distinguish a quiet loop from a disabled or
+/// unreadable receipt lane instead of turning every failed read into `[]`.
+public enum CognitiveReceiptReadUnavailability: String, Sendable, Equatable {
+    case cognitionDisabled = "cognition_disabled"
+    case persistenceDisabled = "persistence_disabled"
+    case storeUnavailable = "store_unavailable"
+    case readFailed = "receipt_read_failed"
+}
+
+public enum CognitiveReceiptRead: Sendable, Equatable {
+    case available([CognitiveReceiptRecord])
+    case unavailable(CognitiveReceiptReadUnavailability)
+
+    public var receipts: [CognitiveReceiptRecord] {
+        guard case .available(let receipts) = self else { return [] }
+        return receipts
+    }
+}
+
 public actor CognitiveSubstrate {
     var configuration: CognitiveConfiguration
     let dependencies: CognitiveSubstrateDependencies
@@ -76,7 +118,10 @@ public actor CognitiveSubstrate {
     /// the ~20h consolidation ticks; persisted inside the disposition artifact
     /// so a same-day restart cannot re-nudge. Pruned to the current day only.
     var resolutionPatternNudgeDay: [String: String] = [:]
-    private var ablations: [String: Bool] = [:]
+    // Extensions implementing read projections must consult the same
+    // actor-isolated intervention map; it remains module-internal rather than
+    // becoming a second public configuration surface.
+    var ablations: [String: Bool] = [:]
     var dirtySince: Date?
     var dirtyRevision: UInt64 = 0
     /// Defense-in-depth single-flight at the state owner. Core normally
@@ -260,6 +305,7 @@ public actor CognitiveSubstrate {
     /// W7/P5 — consecutive negative-register echoes. See
     /// `soundEchoNegativeRunLimit`. Memory-only and live-path only.
     var negativeSoundEchoRun = 0
+    var settlingRun = 0
 
     /// W7/P6 — TELEMETRY ONLY. The delivery envelope the mechanism WOULD have
     /// chosen for this turn, stashed at live capsule compile (the one place the
@@ -301,7 +347,8 @@ public actor CognitiveSubstrate {
             fingerprintLastSurfacedAt: fingerprintFamilyRun?.lastSurfacedAt,
             lastLiveCapsuleAt: lastLiveCapsuleAt,
             lastSessionBridgeAt: lastSessionBridgeAt,
-            negativeSoundEchoRun: negativeSoundEchoRun
+            negativeSoundEchoRun: negativeSoundEchoRun,
+            settlingRun: settlingRun
         )
     }
 
@@ -952,8 +999,17 @@ public actor CognitiveSubstrate {
         try? await store.appendReceipt(kind: kind, payload: payload, at: dependencies.now())
     }
 
-    func recordReceiptChecked(kind: String, payload: JSONValue = .object([:])) async throws {
-        guard configuration.enabled, configuration.persistenceEnabled else { return }
+    /// Strict receipt write for a mutation whose durable outcome depends on the
+    /// receipt itself. Unlike best-effort diagnostics, a disabled or missing
+    /// persistence lane is a refusal rather than a quiet no-op.
+    public func recordReceiptChecked(
+        kind: String,
+        payload: JSONValue = .object([:]),
+        id: UUID? = nil
+    ) async throws {
+        guard configuration.enabled, configuration.persistenceEnabled else {
+            throw CognitivePersistenceError.storeUnavailable
+        }
         guard let store else { throw CognitivePersistenceError.storeUnavailable }
         guard !persistenceWritesBlocked else {
             throw CognitivePersistenceError.writesBlocked(
@@ -961,21 +1017,52 @@ public actor CognitiveSubstrate {
                 detail: persistenceHealth.failureDetail
             )
         }
-        try await store.appendReceipt(kind: kind, payload: payload, at: dependencies.now())
+        try await store.appendReceipt(
+            kind: kind,
+            payload: payload,
+            at: dependencies.now(),
+            id: id ?? UUID()
+        )
     }
 
-    public func runReplay(reason: String) async {
-        guard configuration.enabled, configuration.replayEnabled else { return }
+    /// Records a bounded, durable handoff request for the canonical Dream/REM owner.
+    /// This compatibility surface must not run a shadow replay in substrate:
+    /// Dream/REM owns execution and `integrateReplayChecked` owns the later
+    /// result integration. A missing receipt is therefore an unavailable or
+    /// adverse outcome, never a success-shaped silent no-op.
+    public func runReplay(reason: String) async -> CognitiveReplayRunOutcome {
+        guard configuration.enabled, configuration.replayEnabled else { return .disabled }
         let nodes = (await snapshot()).nodes.prefix(4)
-        guard !nodes.isEmpty else { return }
-        await recordReceipt(
-            kind: "replay",
-            payload: .object([
-                "reason": .string(bounded(reason, maxCharacters: 120)),
-                "evidenceNodeIds": .array(nodes.map { .string($0.id.uuidString) }),
-                "status": .string("delegated-to-dream-rem-owner"),
-            ])
-        )
+        guard !nodes.isEmpty else { return .unavailable(.noReplayEvidence) }
+        guard configuration.persistenceEnabled else { return .unavailable(.persistenceDisabled) }
+        guard store != nil else { return .unavailable(.storeUnavailable) }
+        guard !persistenceWritesBlocked else { return .adverse(.persistenceWritesBlocked) }
+
+        let evidenceNodeIDs = nodes.map(\.id)
+        do {
+            try await recordReceiptChecked(
+                kind: "replay",
+                payload: .object([
+                    "reason": .string(bounded(reason, maxCharacters: 120)),
+                    "evidenceNodeIds": .array(evidenceNodeIDs.map { .string($0.uuidString) }),
+                    "status": .string("delegated-to-dream-rem-owner"),
+                ])
+            )
+            return .delegatedToDreamREMOwner(
+                evidenceNodeIDs: evidenceNodeIDs
+            )
+        } catch let error as CognitivePersistenceError {
+            switch error {
+            case .storeUnavailable:
+                return .unavailable(.storeUnavailable)
+            case .writesBlocked:
+                return .adverse(.persistenceWritesBlocked)
+            case .invalidRestoreArtifact, .artifactWriteFailed:
+                return .adverse(.receiptWriteFailed)
+            }
+        } catch {
+            return .adverse(.receiptWriteFailed)
+        }
     }
 
     @discardableResult
@@ -1262,9 +1349,26 @@ public actor CognitiveSubstrate {
         return formatter.string(from: date)
     }
 
+    /// The honest receipt read used by observational surfaces.  Existing
+    /// callers that only need best-effort diagnostics may continue to use
+    /// `receiptSnapshot`; a UI must preserve this outcome state instead.
+    public func receiptReadSnapshot(limit: Int = 40) async -> CognitiveReceiptRead {
+        guard configuration.enabled else { return .unavailable(.cognitionDisabled) }
+        guard configuration.persistenceEnabled else { return .unavailable(.persistenceDisabled) }
+        guard let store else { return .unavailable(.storeUnavailable) }
+        do {
+            return .available(try await store.loadReceiptRecords(limit: limit))
+        } catch {
+            return .unavailable(.readFailed)
+        }
+    }
+
+    /// Compatibility best-effort projection for non-UI callers.  New
+    /// observability surfaces must use `receiptReadSnapshot` so an unavailable
+    /// store cannot be mistaken for an idle cognition loop.
     public func receiptSnapshot(limit: Int = 40) async -> [CognitiveReceiptRecord] {
-        guard configuration.enabled, configuration.persistenceEnabled, let store else { return [] }
-        return (try? await store.loadReceiptRecords(limit: limit)) ?? []
+        let read = await receiptReadSnapshot(limit: limit)
+        return read.receipts
     }
 
     public func setAblation(_ key: String, enabled: Bool) async {

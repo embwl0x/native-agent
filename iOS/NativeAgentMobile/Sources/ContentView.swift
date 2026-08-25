@@ -33,38 +33,37 @@ struct ContentView: View {
     @State private var notificationOpenRefreshTask: Task<Void, Never>? = nil
     @State private var lastNotificationOpenAt: Date = .distantPast
     @State private var suppressActivityRefreshUntil: Date = .distantPast
+    @State private var activityNavigationTarget: ActivitySection?
 
     enum Tab: Hashable {
         case chat, activity, memories, skills, more
     }
 
     private var activityBadgeCount: Int {
-        let approvalCount = max(
-            approvalsStore.pendingCount,
-            sync.approvals.filter { $0.status.lowercased() == "pending" }.count
-        )
-        let inboxCount = max(
-            inboxStore.activeCount,
-            sync.inboxItems.filter {
-                let status = $0.status.lowercased()
-                return status == "active" || status == "unread"
-            }.count
-        )
-        return approvalCount
-            + inboxCount
-            + sync.memoryProposals.filter(\.isPending).count
-            + sync.trainingProposals.filter(\.isHumanActionable).count
-            + sync.promotionCandidates.filter(\.isHumanActionable).count
+        ActivityScreenPresentation.counts(
+            storedApprovals: approvalsStore.pendingCount,
+            snapshotApprovals: sync.approvals,
+            storedInbox: inboxStore.activeCount,
+            snapshotInbox: sync.inboxItems,
+            memoryProposals: sync.memoryProposals,
+            trainingProposals: sync.trainingProposals,
+            promotionCandidates: sync.promotionCandidates
+        ).total
     }
 
     /// Parse `-initialTab <name>` from process arguments.  Legacy names route
     /// to their new homes so existing UI tests keep landing in the right place.
     private static func initialTabFromLaunchArgs() -> Tab {
-        let args = ProcessInfo.processInfo.arguments
-        guard let idx = args.firstIndex(of: "-initialTab"), idx + 1 < args.count else {
+        initialTab(fromLaunchArguments: ProcessInfo.processInfo.arguments)
+    }
+
+    /// The launch-argument router is pure so it can be verified without
+    /// mutating process-global arguments shared by parallel iOS tests.
+    static func initialTab(fromLaunchArguments arguments: [String]) -> Tab {
+        guard let idx = arguments.firstIndex(of: "-initialTab"), idx + 1 < arguments.count else {
             return .chat
         }
-        switch args[idx + 1].lowercased() {
+        switch arguments[idx + 1].lowercased() {
         case "chat": return .chat
         case "activity", "approvals", "inbox": return .activity
         case "memory", "memories": return .memories
@@ -83,7 +82,10 @@ struct ContentView: View {
                 }
                 .tag(Tab.chat)
 
-            ActivityView(skipInitialRefresh: $skipNextActivityInitialRefresh)
+            ActivityView(
+                skipInitialRefresh: $skipNextActivityInitialRefresh,
+                navigationTarget: $activityNavigationTarget
+            )
                 .environmentObject(approvalsStore)
                 .environmentObject(inboxStore)
                 .tabItem {
@@ -194,6 +196,9 @@ struct ContentView: View {
     private func openActivityFromNotification(screen: String = "activity") {
         _ = NativeAgentNotificationLaunchIntent.consumeOpenActivityPending()
         let target = tab(forNotificationScreen: screen)
+        activityNavigationTarget = target == .activity
+            ? ActivityScreenPresentation.activityDestination(for: screen)
+            : nil
         let now = Date()
         if now.timeIntervalSince(lastNotificationOpenAt) < 1.0 {
             selection = target
@@ -250,45 +255,81 @@ struct ContentView: View {
 }
 
 enum NativeAgentActivityNotificationCleaner {
+    struct DeliveredNotification {
+        let identifier: String
+        let userInfo: [AnyHashable: Any]
+    }
+
+    struct PruningResult {
+        let notificationIDsToRemove: [String]
+        let badgeCount: Int
+    }
+
     static func pruneDeliveredNotifications(activeInboxItems: [InboxItemRecord]) async {
         let activeItemIDs = Set(activeInboxItems.filter { $0.isUnread }.map(\.id))
         let center = UNUserNotificationCenter.current()
         let delivered = await center.deliveredNotifications()
+        let result = pruningResult(
+            activeItemIDs: activeItemIDs,
+            deliveredNotifications: delivered.map {
+                DeliveredNotification(
+                    identifier: $0.request.identifier,
+                    userInfo: $0.request.content.userInfo
+                )
+            }
+        )
+
+        if !result.notificationIDsToRemove.isEmpty {
+            center.removeDeliveredNotifications(withIdentifiers: result.notificationIDsToRemove)
+        }
+
+        if #available(iOS 16.0, *) {
+            try? await center.setBadgeCount(result.badgeCount)
+        } else {
+            await MainActor.run {
+                UIApplication.shared.applicationIconBadgeNumber = result.badgeCount
+            }
+        }
+    }
+
+    static func pruningResult(
+        activeInboxItems: [InboxItemRecord],
+        deliveredNotifications: [DeliveredNotification]
+    ) -> PruningResult {
+        pruningResult(
+            activeItemIDs: Set(activeInboxItems.filter { $0.isUnread }.map(\.id)),
+            deliveredNotifications: deliveredNotifications
+        )
+    }
+
+    private static func pruningResult(
+        activeItemIDs: Set<String>,
+        deliveredNotifications: [DeliveredNotification]
+    ) -> PruningResult {
         var removeIDs: [String] = []
 
-        for notification in delivered {
-            let content = notification.request.content
-            let info = normalizedNativeAgentInfo(content.userInfo)
+        for notification in deliveredNotifications {
+            let info = normalizedNativeAgentInfo(notification.userInfo)
             guard isNativeAgentActivityNotification(info) else { continue }
 
             if let itemID = infoString("itemId", in: info), !itemID.isEmpty {
                 if !activeItemIDs.contains(itemID) {
-                    removeIDs.append(notification.request.identifier)
+                    removeIDs.append(notification.identifier)
                 }
                 continue
             }
 
-            let source = infoString("source", in: info) ?? ""
-            if source == "scheduler_job_ran"
-                || source == "proactive_autonomy"
-                || source.hasPrefix("proactive_autonomy:")
-                || source.hasPrefix("autonomy_maintenance:") {
-                removeIDs.append(notification.request.identifier)
-            }
+            // A NativeAgent activity notification without an inbox identity
+            // cannot be reconciled to the current snapshot. Retaining it via a
+            // source-prefix allowlist leaks stale alerts whenever a new Mac
+            // publisher is introduced.
+            removeIDs.append(notification.identifier)
         }
 
-        if !removeIDs.isEmpty {
-            center.removeDeliveredNotifications(withIdentifiers: removeIDs)
-        }
-
-        let badgeCount = activeItemIDs.count
-        if #available(iOS 16.0, *) {
-            try? await center.setBadgeCount(badgeCount)
-        } else {
-            await MainActor.run {
-                UIApplication.shared.applicationIconBadgeNumber = badgeCount
-            }
-        }
+        return PruningResult(
+            notificationIDsToRemove: removeIDs,
+            badgeCount: activeItemIDs.count
+        )
     }
 
     private static func normalizedNativeAgentInfo(_ userInfo: [AnyHashable: Any]) -> [AnyHashable: Any] {

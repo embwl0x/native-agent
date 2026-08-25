@@ -31,6 +31,21 @@ public enum DeskStatus: String, Sendable, CaseIterable, Equatable {
     public var isTerminal: Bool { self == .done || self == .canceled }
 }
 
+public extension DeskStatus {
+    var displayLabel: String {
+        switch self {
+        case .now: "now"
+        case .next: "next"
+        case .blocked: "blocked"
+        case .flag: "needs attention"
+        case .done: "done"
+        case .todo: "to do"
+        case .watch: "watching"
+        case .canceled: "cancelled"
+        }
+    }
+}
+
 public enum CadenceMode: String, Sendable, CaseIterable, Equatable {
     case manual, on_ask, tick, event, daily, weekly, blocked_watch
 }
@@ -1225,6 +1240,9 @@ public enum DeskOpBody: Sendable, Equatable {
     case addRef(ref: DeskRef)
     case updateRef(refId: String, cachedFields: [String: JSONValue])
     case appendNote(text: String)
+    /// One atomic user veto: the pursuit becomes canceled and carries the
+    /// durable rationale in the same replayable event.
+    case vetoPursuit(note: String)
     case setCadence(cadence: Cadence)
     case setNotify(policy: NotifyPolicy)
     case closeItem(outcomeSummary: String, status: DeskStatus)   // status ∈ {done, canceled}
@@ -1251,6 +1269,7 @@ public enum DeskOpBody: Sendable, Equatable {
         case .addRef: return "add_ref"
         case .updateRef: return "update_ref"
         case .appendNote: return "append_note"
+        case .vetoPursuit: return "veto_pursuit"
         case .setCadence: return "set_cadence"
         case .setNotify: return "set_notify"
         case .closeItem: return "close_item"
@@ -1324,6 +1343,8 @@ public struct DeskOp: Sendable, Equatable {
             obj["cachedFields"] = .object(cachedFields)
         case let .appendNote(text):
             obj["text"] = .string(text)
+        case let .vetoPursuit(note):
+            obj["note"] = .string(note)
         case let .setCadence(cadence):
             obj["cadence"] = cadence.toJSON()
         case let .setNotify(policy):
@@ -1419,6 +1440,9 @@ public struct DeskOp: Sendable, Equatable {
         case "append_note":
             guard let text = jsonString(obj, "text") else { return nil }
             body = .appendNote(text: text)
+        case "veto_pursuit":
+            guard let note = jsonString(obj, "note"), !note.isEmpty else { return nil }
+            body = .vetoPursuit(note: note)
         case "set_cadence":
             guard let c = obj["cadence"] else { return nil }
             body = .setCadence(cadence: Cadence.fromJSON(c))

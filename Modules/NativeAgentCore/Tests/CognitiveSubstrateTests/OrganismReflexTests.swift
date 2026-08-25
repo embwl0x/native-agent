@@ -394,6 +394,46 @@ private func reflexSignal(
     let kernel = OrganismKernel(configuration: .enabled)
     let date = Date(timeIntervalSince1970: 5_000)
 
+    // The reviewable-reflex producer contract is scoped to canonical chat-tool
+    // outcomes carrying a checked risk class (f529676e). Everything else stays
+    // quiet: provider/Desk-style signals never compile prose proposals even
+    // with a canonical risk class attached…
+    await kernel.ingest(reflexSignal(
+        .providerFailed,
+        sourceOrgan: "provider",
+        canonicalRisk: "critical",
+        at: date
+    ))
+    // …tool outcomes with no risk metadata at all fail closed…
+    await kernel.ingest(SomaticSignal(
+        id: UUID(uuidString: "52000000-0000-0000-0000-000000000002")!,
+        kind: .toolFailed,
+        sourceOrgan: "tool.shell",
+        occurredAt: date.addingTimeInterval(1),
+        intensity: 1,
+        metadata: [:]
+    ))
+    // …and an unrecognized risk string is unclassified telemetry, not a proposal.
+    await kernel.ingest(reflexSignal(
+        .toolFailed,
+        sourceOrgan: "tool.shell",
+        canonicalRisk: "unclassified",
+        at: date.addingTimeInterval(2)
+    ))
+    let snapshot = await kernel.snapshot()
+
+    #expect(snapshot.reflexSummary == .empty)
+    #expect(snapshot.reflexCandidates.isEmpty)
+}
+
+@Test func enabledKernelCompilesCheckedRiskToolOutcomeIntoReviewCandidate() async throws {
+    // Positive control for the producer contract above: the one declared
+    // producer (a chat-tool outcome with a checked canonical risk class) DOES
+    // surface a review-gated candidate, so the Observatory review surface has
+    // something real to review.
+    let kernel = OrganismKernel(configuration: .enabled)
+    let date = Date(timeIntervalSince1970: 5_000)
+
     await kernel.ingest(reflexSignal(
         .toolFailed,
         sourceOrgan: "tool.shell",
@@ -402,6 +442,9 @@ private func reflexSignal(
     ))
     let snapshot = await kernel.snapshot()
 
-    #expect(snapshot.reflexSummary == .empty)
-    #expect(snapshot.reflexCandidates.isEmpty)
+    let candidate = try #require(snapshot.reflexCandidates.first { $0.id == "tool:tool-shell" })
+    #expect(candidate.trustClass == .highRisk)
+    #expect(candidate.reviewRequired)
+    #expect(candidate.autoActivationAllowed == false)
+    #expect(snapshot.reflexSummary.candidateCount == 1)
 }

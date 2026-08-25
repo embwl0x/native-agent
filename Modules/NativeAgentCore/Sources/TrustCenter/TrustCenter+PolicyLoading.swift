@@ -2,19 +2,37 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+/// Why a securityPolicy value is effective for one canonical authorization
+/// read. This keeps code defaults from being misreported as saved operator
+/// intent, while reserving `.unreadable` for the fail-closed nonthrowing
+/// projection when checked authority could not be validated.
+public enum TrustPolicySecurityValueProvenance: Sendable, Equatable {
+    case explicit
+    case defaultMissingKey
+    case defaultMissingBlock
+    case defaultSourceAbsent
+    case unreadable
+}
+
 /// One checked authority generation for a SecurityCenter decision. The
 /// normalized policy and raw user-only autonomy overrides are derived from the
 /// same saved bytes so an effect-time gate cannot splice concurrent policies.
 public struct TrustPolicyAuthorizationSnapshot: Sendable, Equatable {
     public let policy: [String: JSONValue]
     public let userConfiguredAutonomyOverrides: [String: JSONValue]
+    /// Per-key origin for the effective `securityPolicy` block in `policy`.
+    /// Every known default key is represented; `.unreadable` means this is a
+    /// deliberately fail-closed projection, never valid checked authority.
+    public let securityPolicyProvenance: [String: TrustPolicySecurityValueProvenance]
 
     init(
         policy: [String: JSONValue],
-        userConfiguredAutonomyOverrides: [String: JSONValue]
+        userConfiguredAutonomyOverrides: [String: JSONValue],
+        securityPolicyProvenance: [String: TrustPolicySecurityValueProvenance]
     ) {
         self.policy = policy
         self.userConfiguredAutonomyOverrides = userConfiguredAutonomyOverrides
+        self.securityPolicyProvenance = securityPolicyProvenance
     }
 }
 
@@ -170,9 +188,11 @@ extension SwiftNativeTrustCenter {
         // nested type checks the legacy spelling gets (defaults only carry the
         // wire key), making future-key reads more permissive than old-key
         // reads (review 2026-08-06 blocking #3).
+        let sourcePresent = FileManager.default.fileExists(atPath: trustPolicyURL.path)
         let saved = WorkshopPolicyBlockVocabulary.foldToWireKey(
             try Self.loadRawPolicyChecked(at: trustPolicyURL))
-        try Self.validateKnownAuthorityPolicyTypes(saved, against: defaultTrustPolicy())
+        let defaults = defaultTrustPolicy()
+        try Self.validateKnownAuthorityPolicyTypes(saved, against: defaults)
         let overrides: [String: JSONValue]
         if case .object(let value)? = saved["toolAutonomy"] {
             overrides = value
@@ -181,21 +201,63 @@ extension SwiftNativeTrustCenter {
         }
         return TrustPolicyAuthorizationSnapshot(
             policy: normalizedTrustPolicy(saved: saved),
-            userConfiguredAutonomyOverrides: overrides
+            userConfiguredAutonomyOverrides: overrides,
+            securityPolicyProvenance: Self.securityPolicyProvenance(
+                saved: saved,
+                defaults: defaults,
+                sourcePresent: sourcePresent
+            )
         )
     }
 
-    public func loadTrustPolicy() async -> [String: JSONValue] {
+    /// Compatibility snapshot for readers that cannot surface an authority
+    /// error. Unlike a bootstrap source, unreadable authority remains visible
+    /// per security key and gets the same fail-closed policy SecurityCenter
+    /// uses when its checked read rejects the bytes.
+    public func loadAuthorizationSnapshot() async -> TrustPolicyAuthorizationSnapshot {
         do {
-            return try await loadTrustPolicyChecked()
+            return try await loadAuthorizationSnapshotChecked()
         } catch {
-            // Compatibility callers cannot surface an error, but authority
-            // corruption must never look like a fresh install. Return a
-            // deliberately closed projection: SecurityCenter blocks dispatch,
-            // and autonomous/background lanes stay off until the exact saved
-            // bytes are repaired through a checked owner.
-            return failClosedTrustPolicy()
+            let closed = failClosedTrustPolicy()
+            let provenance = Self.securityPolicyUnreadableProvenance(defaults: closed)
+            return TrustPolicyAuthorizationSnapshot(
+                policy: closed,
+                userConfiguredAutonomyOverrides: [:],
+                securityPolicyProvenance: provenance
+            )
         }
+    }
+
+    public func loadTrustPolicy() async -> [String: JSONValue] {
+        await loadAuthorizationSnapshot().policy
+    }
+
+    private nonisolated static func securityPolicyProvenance(
+        saved: [String: JSONValue],
+        defaults: [String: JSONValue],
+        sourcePresent: Bool
+    ) -> [String: TrustPolicySecurityValueProvenance] {
+        guard case .object(let defaultSecurity)? = defaults["securityPolicy"] else { return [:] }
+        guard sourcePresent else {
+            return Dictionary(uniqueKeysWithValues: defaultSecurity.keys.map {
+                ($0, .defaultSourceAbsent)
+            })
+        }
+        guard case .object(let savedSecurity)? = saved["securityPolicy"] else {
+            return Dictionary(uniqueKeysWithValues: defaultSecurity.keys.map {
+                ($0, .defaultMissingBlock)
+            })
+        }
+        return Dictionary(uniqueKeysWithValues: defaultSecurity.keys.map { key in
+            (key, savedSecurity[key] == nil ? .defaultMissingKey : .explicit)
+        })
+    }
+
+    private nonisolated static func securityPolicyUnreadableProvenance(
+        defaults: [String: JSONValue]
+    ) -> [String: TrustPolicySecurityValueProvenance] {
+        guard case .object(let defaultSecurity)? = defaults["securityPolicy"] else { return [:] }
+        return Dictionary(uniqueKeysWithValues: defaultSecurity.keys.map { ($0, .unreadable) })
     }
 
     /// 2026-07-21 audit fix support: the USER-FILE-ONLY toolAutonomy

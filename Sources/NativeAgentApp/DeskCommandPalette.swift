@@ -4,17 +4,76 @@ import PersistenceCore
 // MARK: - DeskCommandPalette — ⌘K, scoped to the desk
 //
 // Sweep R4 W5. Deliberately NOT the app-wide palette (CommandPalette.swift):
-// that one jumps between tabs and chat sessions, this one only ever addresses
-// desk items, so its whole result pool is desk rows and its grammar is the
-// desk's three verbs. Two palettes with different pools beats one palette whose
-// results User has to disambiguate.
+// that one jumps between tabs and chat sessions; this one addresses Desk work
+// plus reveal-only GitHub watcher rows. Its mutation grammar remains the
+// desk's three verbs, and watcher rows never enter that grammar. Two palettes
+// with different pools beats one palette whose results User has to disambiguate.
 //
 // Lightweight by contract: a sheet, a TextField, a filtered list. No third-party
 // deps, no new mutation path — Enter hands a verb + a handle back to DeskView,
 // which fires the same `DeskQuickAction` the buttons fire.
 
+/// Resolves the one row the palette can name in its mutation banner and hand
+/// to Enter. Keeping this decision outside the view makes the empty-query
+/// selected-row fallback and the displayed target executable behavior rather
+/// than two visually similar private branches.
+enum DeskPalettePresentation {
+    /// The sole effect a palette submission may request.  It is deliberately
+    /// data rather than a closure so the selected-row fallback and verb route
+    /// are one executable decision shared by the view and its behavior proof.
+    enum Submission: Equatable, Sendable {
+        case select(handle: String)
+        case command(verb: DeskPaletteQuery.Verb, handle: String)
+    }
+
+    static func target(
+        rows: [DeskPaletteRow],
+        matches: [DeskPaletteRow],
+        selectedHandle: String?,
+        parsed: DeskPaletteQuery,
+        highlighted: Int
+    ) -> DeskPaletteRow? {
+        if parsed.verb != nil, parsed.query.isEmpty {
+            return rows.first { $0.handle == selectedHandle && $0.isActionable }
+        }
+        guard !matches.isEmpty else { return nil }
+        return matches[min(max(highlighted, 0), matches.count - 1)]
+    }
+
+    static func bannerText(
+        for verb: DeskPaletteQuery.Verb,
+        target: DeskPaletteRow?,
+        query: String
+    ) -> String {
+        guard let target else {
+            return query.isEmpty
+                ? "\(verb.actionLabel) — nothing selected yet; type part of an item's title."
+                : "\(verb.actionLabel) — no item matches \u{201C}\(query)\u{201D}."
+        }
+        switch verb {
+        case .close: return "Enter closes \u{201C}\(target.title)\u{201D}."
+        case .deferItem: return "Enter selects \u{201C}\(target.title)\u{201D} and opens the park menu."
+        case .note: return "Enter selects \u{201C}\(target.title)\u{201D} and opens the note field."
+        }
+    }
+
+    /// Converts the currently displayed target into the exact callback the
+    /// palette sends on Return. A missing target is a no-op: the sheet remains
+    /// open so the user can correct the query rather than losing their input.
+    static func submission(
+        parsed: DeskPaletteQuery,
+        target: DeskPaletteRow?
+    ) -> Submission? {
+        guard let target else { return nil }
+        if let verb = parsed.verb {
+            return .command(verb: verb, handle: target.handle)
+        }
+        return .select(handle: target.handle)
+    }
+}
+
 struct DeskCommandPaletteView: View {
-    /// Every selectable desk row, in board order.
+    /// Every searchable Desk row, including reveal-only GitHub watcher rows.
     let rows: [DeskPaletteRow]
     /// The row that is already selected, if any. An empty query after a verb
     /// ("close" ⏎) applies to THIS — never to an arbitrary first match.
@@ -31,18 +90,20 @@ struct DeskCommandPaletteView: View {
     private var parsed: DeskPaletteQuery { DeskPaletteQuery.parse(text) }
 
     private var matches: [DeskPaletteRow] {
-        DeskFuzzy.filter(rows, query: parsed.query)
+        let candidates = parsed.verb == nil ? rows : rows.filter(\.isActionable)
+        return DeskFuzzy.filter(candidates, query: parsed.query)
     }
 
     /// The row Enter would act on. With a verb and an empty query that is the
     /// current selection; otherwise the highlighted match.
     private var target: DeskPaletteRow? {
-        if parsed.verb != nil, parsed.query.isEmpty {
-            return rows.first { $0.handle == selectedHandle }
-        }
-        let list = matches
-        guard !list.isEmpty else { return nil }
-        return list[min(max(highlighted, 0), list.count - 1)]
+        DeskPalettePresentation.target(
+            rows: rows,
+            matches: matches,
+            selectedHandle: selectedHandle,
+            parsed: parsed,
+            highlighted: highlighted
+        )
     }
 
     var body: some View {
@@ -106,16 +167,11 @@ struct DeskCommandPaletteView: View {
     }
 
     private func bannerText(_ verb: DeskPaletteQuery.Verb) -> String {
-        guard let target else {
-            return parsed.query.isEmpty
-                ? "\(verb.actionLabel) — nothing selected yet; type part of an item's title."
-                : "\(verb.actionLabel) — no item matches \u{201C}\(parsed.query)\u{201D}."
-        }
-        switch verb {
-        case .close: return "Enter closes \u{201C}\(target.title)\u{201D}."
-        case .deferItem: return "Enter selects \u{201C}\(target.title)\u{201D} and opens the park menu."
-        case .note: return "Enter selects \u{201C}\(target.title)\u{201D} and opens the note field."
-        }
+        DeskPalettePresentation.bannerText(
+            for: verb,
+            target: target,
+            query: parsed.query
+        )
     }
 
     private func icon(for verb: DeskPaletteQuery.Verb) -> String {
@@ -170,6 +226,8 @@ struct DeskCommandPaletteView: View {
             Spacer(minLength: 0)
             if row.handle == selectedHandle {
                 Text("selected").capsuleTag(.accentColor)
+            } else if !row.isActionable {
+                Text("watch only").capsuleTag(.secondary)
             }
         }
         .padding(.vertical, 3)
@@ -192,12 +250,16 @@ struct DeskCommandPaletteView: View {
     }
 
     private func commit() {
-        guard let target else { return }
+        guard let submission = DeskPalettePresentation.submission(
+            parsed: parsed,
+            target: target
+        ) else { return }
         isPresented = false
-        if let verb = parsed.verb {
-            onCommand(verb, target.handle)
-        } else {
-            onSelect(target.handle)
+        switch submission {
+        case let .command(verb, handle):
+            onCommand(verb, handle)
+        case let .select(handle):
+            onSelect(handle)
         }
     }
 }

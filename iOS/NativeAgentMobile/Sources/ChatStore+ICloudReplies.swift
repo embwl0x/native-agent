@@ -71,8 +71,7 @@ extension ChatStore {
             if let correlationID = msg.correlationID,
                let placeholderId = pendingICloudPlaceholders.removeValue(forKey: correlationID) {
                 matchedActivePlaceholder = true
-                pendingTimeouts.removeValue(forKey: correlationID)?.cancel()
-                pendingPolls.removeValue(forKey: correlationID)?.cancel()
+                cancelReplyWaits(for: correlationID)
                 streamingHintsByMessageId.removeValue(forKey: placeholderId)
                 markICloudReplyResolved(correlationID)
                 if messages.contains(where: { $0.id == placeholderId }) {
@@ -105,8 +104,7 @@ extension ChatStore {
             let placeholderId = pendingICloudPlaceholders[correlationID]
             canceledPendingIds.remove(correlationID)
             pendingICloudPlaceholders.removeValue(forKey: correlationID)
-            pendingTimeouts.removeValue(forKey: correlationID)?.cancel()
-            pendingPolls.removeValue(forKey: correlationID)?.cancel()
+            cancelReplyWaits(for: correlationID)
             if let placeholderId {
                 streamingHintsByMessageId.removeValue(forKey: placeholderId)
             }
@@ -117,8 +115,7 @@ extension ChatStore {
             return
         }
         if let correlationID = msg.correlationID, let placeholderId = timedOutPendingIds.removeValue(forKey: correlationID) {
-            pendingTimeouts.removeValue(forKey: correlationID)?.cancel()
-            pendingPolls.removeValue(forKey: correlationID)?.cancel()
+            cancelReplyWaits(for: correlationID)
             streamingHintsByMessageId.removeValue(forKey: placeholderId)
             // PATCH-2026-05-30: timeout-then-late-reply finalize path. Same
             // resolve-tracking as the normal final path so the seq tracker
@@ -167,15 +164,13 @@ extension ChatStore {
         if let (pendingId, placeholderId) = match {
             if canceledPendingIds.remove(pendingId) != nil {
                 pendingICloudPlaceholders.removeValue(forKey: pendingId)
-                pendingTimeouts.removeValue(forKey: pendingId)?.cancel()
-                pendingPolls.removeValue(forKey: pendingId)?.cancel()
+                cancelReplyWaits(for: pendingId)
                 streamingHintsByMessageId.removeValue(forKey: placeholderId)
                 return
             }
             pendingICloudPlaceholders.removeValue(forKey: pendingId)
-            // Phase 14e-iCloud: cancel the timeout — the reply landed.
-            pendingTimeouts.removeValue(forKey: pendingId)?.cancel()
-            pendingPolls.removeValue(forKey: pendingId)?.cancel()
+            // Phase 14e-iCloud: retire both reply waits — the reply landed.
+            cancelReplyWaits(for: pendingId)
             streamingHintsByMessageId.removeValue(forKey: placeholderId)
             // PATCH-2026-05-30: caught by gpt-5.5 retroactive review. The
             // resolvedICloudReplyIds guard at the top of receiveICloudReply
@@ -245,8 +240,7 @@ extension ChatStore {
                 }
                 pendingSendArgs.removeValue(forKey: pendingId)
                 pendingICloudPlaceholders.removeValue(forKey: pendingId)
-                pendingTimeouts.removeValue(forKey: pendingId)?.cancel()
-                pendingPolls.removeValue(forKey: pendingId)?.cancel()
+                cancelReplyWaits(for: pendingId)
                 streamingHintsByMessageId.removeValue(forKey: placeholderId)
                 if let idx = messages.firstIndex(where: { $0.id == placeholderId }) {
                     messages.remove(at: idx)
@@ -290,8 +284,7 @@ extension ChatStore {
         retriedSignatureCorrelations.insert(rejectedId)
         pendingSendArgs.removeValue(forKey: rejectedId)
         pendingICloudPlaceholders.removeValue(forKey: rejectedId)
-        pendingTimeouts.removeValue(forKey: rejectedId)?.cancel()
-        pendingPolls.removeValue(forKey: rejectedId)?.cancel()
+        cancelReplyWaits(for: rejectedId)
         streamingHintsByMessageId.removeValue(forKey: placeholderId)
         if let idx = messages.firstIndex(where: { $0.id == placeholderId }) {
             messages.remove(at: idx)
@@ -382,10 +375,18 @@ extension ChatStore {
         armTimeout(for: correlationID, placeholderId: placeholderId)
     }
 
+    /// A terminal receipt must retire both wait tasks together.  Keeping this
+    /// paired prevents a late timeout from contradicting a reply already shown.
+    func cancelReplyWaits(for pendingId: String) {
+        pendingTimeouts.removeValue(forKey: pendingId)?.cancel()
+        pendingPolls.removeValue(forKey: pendingId)?.cancel()
+    }
+
     /// Phase 14e-iCloud: arm a per-message timeout. If no reply arrives by the
     /// timeout, surface an error banner, mark the placeholder as failed, and
     /// unblock the input.  Cancelled when receiveICloudReply lands the reply.
     func armTimeout(for pendingId: String, placeholderId: UUID) {
+        pendingTimeouts.removeValue(forKey: pendingId)?.cancel()
         let timeoutNs = iCloudReplyTimeoutSeconds * 1_000_000_000
         let task = Task { [weak self] in
             try? await Task.sleep(nanoseconds: timeoutNs)
@@ -396,7 +397,7 @@ extension ChatStore {
     }
 
     func armReplyPoll(for pendingId: String, client: MacBridgeClient) {
-        pendingPolls[pendingId]?.cancel()
+        pendingPolls.removeValue(forKey: pendingId)?.cancel()
         // Runs two iCloud-only wait paths in parallel:
         //   1. Fast iCloud nudge loop: 500ms early, then 1.2s — prods NSMetadataQuery.
         //   2. Snapshot refresh every 5s, cap 60s (12 polls max):
@@ -503,8 +504,7 @@ extension ChatStore {
             let placeholderId = pendingICloudPlaceholders[pendingId]
             markICloudReplyResolved(pendingId)
             pendingICloudPlaceholders.removeValue(forKey: pendingId)
-            pendingTimeouts.removeValue(forKey: pendingId)?.cancel()
-            pendingPolls.removeValue(forKey: pendingId)?.cancel()
+            cancelReplyWaits(for: pendingId)
             if let placeholderId {
                 streamingHintsByMessageId.removeValue(forKey: placeholderId)
             }
@@ -538,8 +538,7 @@ extension ChatStore {
         placeholderText: String,
         banner: String
     ) {
-        pendingTimeouts.removeValue(forKey: pendingId)
-        pendingPolls.removeValue(forKey: pendingId)?.cancel()
+        cancelReplyWaits(for: pendingId)
         pendingICloudPlaceholders.removeValue(forKey: pendingId)
         isPollingFallback = false
         timedOutPendingIds[pendingId] = placeholderId
@@ -593,6 +592,10 @@ extension ChatStore {
         // errors, rejections) pass success=false, and the user-stop sentinel
         // is skipped — a "success" tap on either would lie (gpt-5.5 r2 catch).
         if success && text != "(stopped)" {
+            // A dispatch receipt only means the phone handed the request to
+            // transport. Clear prior failure context only once a final reply
+            // is actually rendered for this turn.
+            errorBanner = nil
             Haptics.replyFinalized()
         }
         // Arrival stamps record FIRST appearance; a turn that streamed longer

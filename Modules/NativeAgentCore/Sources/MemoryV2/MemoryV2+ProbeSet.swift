@@ -30,9 +30,10 @@
 //                   "expect_memory_id": "...",            // optional
 //                   "expect_any_substring": ["...", ...]  // optional
 //                 }, ... ] }
-// A probe with NEITHER expectation is invalid; an override file that parses
-// to zero valid probes is rejected (built-ins win) — and the gate itself
-// fails closed on an empty effective set.
+// A probe with NEITHER expectation is invalid. The permissive background
+// loader falls back to built-ins for a broken override; the operator-facing
+// memory-eval loader instead rejects it, so a requested probe set can never
+// quietly become a different run.
 
 import Foundation
 import NativeAgentCore
@@ -94,6 +95,29 @@ public struct MemoryProbeSet: Sendable, Equatable {
             return parsed
         }
         return .builtin
+    }
+
+    /// Load the probe set for an operator-facing evaluation. Unlike the
+    /// permissive load(dataRoot:) helper, this refuses a present-but-broken
+    /// override instead of substituting built-ins: an evaluation must not
+    /// claim it ran the operator's probes when it actually ran a different set.
+    ///
+    /// The no-override case remains the canonical built-in set. A usable
+    /// evaluation therefore always has at least one probe, while an explicitly
+    /// empty or malformed override fails before an embedder or store is opened.
+    public static func loadForEvaluation(dataRoot: URL) throws -> MemoryProbeSet {
+        let path = overridePath(dataRoot: dataRoot)
+        guard FileManager.default.fileExists(atPath: path.path) else {
+            return .builtin
+        }
+        let data = try Data(contentsOf: path)
+        guard let parsed = parse(data: data) else {
+            throw MemoryProbeSetEvaluationInputError.invalidOverride(path: path.path)
+        }
+        guard !parsed.probes.isEmpty else {
+            throw MemoryProbeSetEvaluationInputError.emptyOverride(path: path.path)
+        }
+        return parsed
     }
 
     public static func overridePath(dataRoot: URL) -> URL {
@@ -196,4 +220,18 @@ public struct MemoryProbeSet: Sendable, Equatable {
         MemoryProbe(id: "p25", question: "Is confident wrongness preferred over honest self-correction?",
                     expectAnySubstring: ["honest self-correction and vulnerability"]),
     ])
+}
+
+public enum MemoryProbeSetEvaluationInputError: Error, CustomStringConvertible, Sendable {
+    case invalidOverride(path: String)
+    case emptyOverride(path: String)
+
+    public var description: String {
+        switch self {
+        case .invalidOverride(let path):
+            return "memory-eval probe override is malformed: \(path)"
+        case .emptyOverride(let path):
+            return "memory-eval probe override contains zero valid probes: \(path)"
+        }
+    }
 }

@@ -263,8 +263,19 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
 
     // MARK: - Model coercion
 
-    static func coerceToClaudeModel(_ requested: String?) -> String {
-        guard let r = requested?.trimmingCharacters(in: .whitespaces), !r.isEmpty else {
+    /// Coerce a requested model id onto the Claude wire id this adapter can
+    /// actually serve.
+    ///
+    /// NORTHSTAR clause 2 (fail loud, no silent substitution): the ONLY
+    /// rewrites are enumerated ones — an absent/empty request takes the
+    /// adapter default, and an `anthropic/claude-*` namespaced id has its
+    /// namespace stripped. Anything else (`llama-3`, `deepseek-chat`, `o3`,
+    /// a bare `gpt-*` misrouted onto this adapter) used to fall through to
+    /// `defaultClaudeModel`, so User's pick was silently replaced by
+    /// claude-opus-4-8 and the call was billed against a model he never
+    /// chose. It now throws `modelUnavailable` naming the offending id.
+    static func coerceToClaudeModel(_ requested: String?) throws -> String {
+        guard let r = requested?.trimmingCharacters(in: .whitespacesAndNewlines), !r.isEmpty else {
             return defaultClaudeModel
         }
         let lower = r.lowercased()
@@ -273,7 +284,17 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
             let suffix = String(r.dropFirst("anthropic/".count))
             if suffix.lowercased().hasPrefix("claude-") { return suffix }
         }
-        return defaultClaudeModel
+        throw LLMError.modelUnavailable(provider: "anthropic_oauth_direct", model: r)
+    }
+
+    /// The requested id when an enumerated remap actually rewrote it, else
+    /// nil. Threaded onto the `llm.call` telemetry row as `substitutedFrom`
+    /// so a surviving remap leaves a trace instead of being invisible.
+    static func substitutionTrace(requested: String?, coerced: String) -> String? {
+        guard let r = requested?.trimmingCharacters(in: .whitespacesAndNewlines), !r.isEmpty else {
+            return nil
+        }
+        return r == coerced ? nil : r
     }
 
     // MARK: - U1 item 8 (F1 lane (b)) — conversation caching + lever
@@ -740,7 +761,8 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         model: String,
         tools: [LLMToolSchema]?
     ) async throws -> String {
-        let coercedModel = Self.coerceToClaudeModel(model)
+        let coercedModel = try Self.coerceToClaudeModel(model)
+        let substitutedFrom = Self.substitutionTrace(requested: model, coerced: coercedModel)
         for attempt in 0...1 {
             try Task.checkCancellation()
             let accessToken: String
@@ -848,7 +870,8 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                 streaming: false,
                 usage: LLMUsage.fromAnthropic(obj["usage"] as? [String: Any]),
                 ttftMs: nil,
-                durationMs: durationMs
+                durationMs: durationMs,
+                substitutedFrom: substitutedFrom
             )
             return pieces.joined(separator: "\n")
         }
@@ -861,7 +884,8 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         model: String,
         tools: [LLMToolSchema]?
     ) async throws -> String {
-        let coercedModel = Self.coerceToClaudeModel(model)
+        let coercedModel = try Self.coerceToClaudeModel(model)
+        let substitutedFrom = Self.substitutionTrace(requested: model, coerced: coercedModel)
         // Two-attempt loop mirrors the OpenAI adapter: refresh inline on a
         // 401 once. Avoids the wave-27 double-rotate bug by NOT also
         // refreshing inline on the first 401 — just loops with
@@ -990,7 +1014,8 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                 streaming: false,
                 usage: LLMUsage.fromAnthropic(obj["usage"] as? [String: Any]),
                 ttftMs: nil,
-                durationMs: durationMs
+                durationMs: durationMs,
+                substitutedFrom: substitutedFrom
             )
             return pieces.joined(separator: "\n")
         }
@@ -1002,14 +1027,22 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         system: String?,
         model: String
     ) -> AsyncThrowingStream<String, Error> {
-        let coercedModel = Self.coerceToClaudeModel(model)
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
+                    // Coerce INSIDE the stream task: this is a non-throwing
+                    // factory, so an unserviceable model id has to reach the
+                    // caller as a thrown continuation finish rather than as a
+                    // silently defaulted model (NORTHSTAR clause 2).
+                    let coercedModel = try Self.coerceToClaudeModel(model)
                     try await self.runStream(
                         prompt: prompt,
                         system: system,
                         model: coercedModel,
+                        substitutedFrom: Self.substitutionTrace(
+                            requested: model,
+                            coerced: coercedModel
+                        ),
                         continuation: continuation
                     )
                 } catch let err as LLMError {
@@ -1028,6 +1061,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         prompt: String,
         system: String?,
         model: String,
+        substitutedFrom: String?,
         continuation: AsyncThrowingStream<String, Error>.Continuation
     ) async throws {
         for attempt in 0...1 {
@@ -1128,7 +1162,8 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                         streaming: true,
                         usage: usage.isEmpty ? nil : usage,
                         ttftMs: ttftMs,
-                        durationMs: durationMs
+                        durationMs: durationMs,
+                        substitutedFrom: substitutedFrom
                     )
                     if !yieldedAnyText {
                         throw FirstPartyExecutionControls.anthropicEmptyStreamError(
@@ -1179,15 +1214,20 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         model: String,
         tools: [LLMToolSchema]?
     ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
-        let coercedModel = Self.coerceToClaudeModel(model)
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
+                    // Coerce INSIDE the stream task — see stream() above.
+                    let coercedModel = try Self.coerceToClaudeModel(model)
                     try await self.runStreamMessages(
                         messages: messages,
                         system: system,
                         model: coercedModel,
                         tools: tools,
+                        substitutedFrom: Self.substitutionTrace(
+                            requested: model,
+                            coerced: coercedModel
+                        ),
                         continuation: continuation
                     )
                 } catch let err as LLMError {
@@ -1207,6 +1247,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         system: String?,
         model: String,
         tools: [LLMToolSchema]?,
+        substitutedFrom: String?,
         continuation: AsyncThrowingStream<LLMMessageStreamEvent, Error>.Continuation
     ) async throws {
         for attempt in 0...1 {
@@ -1334,7 +1375,8 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                             streaming: true,
                             usage: usage.isEmpty ? nil : usage,
                             ttftMs: ttftMs,
-                            durationMs: durationMs
+                            durationMs: durationMs,
+                            substitutedFrom: substitutedFrom
                         )
                         if !yieldedSemanticOutput {
                             throw FirstPartyExecutionControls.anthropicEmptyStreamError(

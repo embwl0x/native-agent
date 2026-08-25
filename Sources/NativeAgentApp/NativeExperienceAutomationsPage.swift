@@ -54,7 +54,10 @@ struct NativeExperienceAutomationsPage: View {
             }
 
             NativeExperienceCard(title: "Canonical schedules", icon: "clock") {
-                if appModel.jobs.isEmpty { Text("No schedules are installed.").foregroundStyle(.secondary) }
+                if appModel.jobs.isEmpty {
+                    Text("No schedules are loaded yet. Open Scheduler to inspect its source.")
+                        .foregroundStyle(.secondary)
+                }
                 ForEach(appModel.jobs) { job in
                     LabeledContent(job.name) {
                         Text(job.enabled ? "enabled" : "paused")

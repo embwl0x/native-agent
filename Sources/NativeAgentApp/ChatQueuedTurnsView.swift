@@ -1,5 +1,30 @@
 import SwiftUI
 
+enum ChatQueuePresentation {
+    struct MenuItem: Identifiable, Equatable {
+        let ordinal: Int
+        let turn: QueuedChatTurn
+
+        var id: String { turn.id }
+        var sendLabel: String { "Send \(ordinal) now: \(turn.preview)" }
+        var removeLabel: String { "Remove \(ordinal): \(turn.preview)" }
+    }
+
+    static func visibleTurns(_ turns: [QueuedChatTurn]) -> [QueuedChatTurn] {
+        turns.filter(\.shouldDisplayInSendNextQueue)
+    }
+
+    static func menuItems(_ turns: [QueuedChatTurn]) -> [MenuItem] {
+        visibleTurns(turns).enumerated().map { index, turn in
+            MenuItem(ordinal: index + 1, turn: turn)
+        }
+    }
+
+    static func countLabel(_ turns: [QueuedChatTurn]) -> String {
+        "\(visibleTurns(turns).count) queued"
+    }
+}
+
 /// Compact, session-scoped send-next chrome shared by the main and detached
 /// Mac composers. Only the next turn occupies layout space; the complete queue
 /// stays in a menu so it never pushes a meaningful portion of chat off-screen.
@@ -9,7 +34,11 @@ struct ChatQueuedTurnsView: View {
     let isBusy: Bool
 
     private var turns: [QueuedChatTurn] {
-        appModel.queuedChatTurns(for: sessionId).filter(\.shouldDisplayInSendNextQueue)
+        ChatQueuePresentation.visibleTurns(appModel.queuedChatTurns(for: sessionId))
+    }
+
+    private var menuItems: [ChatQueuePresentation.MenuItem] {
+        ChatQueuePresentation.menuItems(appModel.queuedChatTurns(for: sessionId))
     }
 
     var body: some View {
@@ -70,24 +99,24 @@ struct ChatQueuedTurnsView: View {
 
     private var queueMenu: some View {
         Menu {
-            ForEach(Array(turns.enumerated()), id: \.element.id) { index, turn in
+            ForEach(menuItems) { item in
                 Button {
-                    run(turn)
+                    run(item.turn)
                 } label: {
                     Label(
-                        "Send \(index + 1) now: \(turn.preview)",
-                        systemImage: index == 0 ? "arrow.up.to.line" : "arrow.up"
+                        item.sendLabel,
+                        systemImage: item.ordinal == 1 ? "arrow.up.to.line" : "arrow.up"
                     )
                 }
                 Button(role: .destructive) {
-                    appModel.removeQueuedChatTurn(turn.id, sessionId: sessionId)
+                    appModel.removeQueuedChatTurn(item.turn.id, sessionId: sessionId)
                 } label: {
-                    Label("Remove \(index + 1): \(turn.preview)", systemImage: "xmark")
+                    Label(item.removeLabel, systemImage: "xmark")
                 }
-                if index < turns.count - 1 { Divider() }
+                if item.ordinal < menuItems.count { Divider() }
             }
         } label: {
-            Text("\(turns.count) queued")
+            Text(ChatQueuePresentation.countLabel(appModel.queuedChatTurns(for: sessionId)))
                 .font(NativeAgentFont.tag)
                 .foregroundStyle(.secondary)
         }

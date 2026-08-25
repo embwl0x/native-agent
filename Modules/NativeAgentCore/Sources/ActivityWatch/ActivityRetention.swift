@@ -33,6 +33,16 @@ public struct ActivityRetentionRunner: Sendable {
         self.interval = interval
     }
 
+    /// Constructs the durable schedule beside the exact store it will prune.
+    /// The watcher owns a store, not an app-level data-root dependency, so this
+    /// keeps retention on the capture owner's production path rather than
+    /// depending on a UI controller to remember a separate launch-time call.
+    public init(databaseURL: URL, interval: TimeInterval = ActivityRetentionRunner.defaultInterval) {
+        self.stateURL = databaseURL.deletingLastPathComponent()
+            .appendingPathComponent("activity_retention_state.json")
+        self.interval = interval
+    }
+
     public init(stateURL: URL, interval: TimeInterval = ActivityRetentionRunner.defaultInterval) {
         self.stateURL = stateURL
         self.interval = interval

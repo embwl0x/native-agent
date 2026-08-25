@@ -98,6 +98,8 @@ struct WorkshopPumpLoopRunner: EventDeadlineLoopRunner {
         switch await pump.tick() {
         case .disabled:
             return .skipped(reason: "Desk autonomy disabled")
+        case .organismUnavailable:
+            return .skipped(reason: "organism posture unavailable")
         case .postureNotNormal:
             return .skipped(reason: "organism posture not normal")
         case .resourcePressure:

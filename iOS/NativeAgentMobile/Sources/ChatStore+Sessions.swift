@@ -9,6 +9,8 @@ import PhotosUI
 import NativeAgentShared
 
 extension ChatStore {
+    typealias SessionHistoryLoader = (String?) async throws -> [ChatMessage]?
+
     static func shouldReturnToMainSession(
         selectedSessionID: String?,
         mainSessionID: String?,
@@ -24,17 +26,35 @@ extension ChatStore {
     }
 
     func switchSession(to sessionID: String, using client: MacBridgeClient, fallbackMessages: [ChatMessage]?) {
-        guard !isLoading, !isSwitchingSession, let clean = Self.cleanSessionID(sessionID) else { return }
+        guard !isSwitchingSession, let clean = Self.cleanSessionID(sessionID) else { return }
         guard clean != selectedSessionID else {
             forceSessionRefresh(using: client, fallbackMessages: fallbackMessages)
             return
         }
         setSelectedSessionID(clean)
-        loadSelectedSession(using: client, fallbackMessages: fallbackMessages)
+        loadSelectedSession(
+            loadHistory: { sessionID in await client.refreshChatHistory(sessionID: sessionID) },
+            fallbackMessages: fallbackMessages
+        )
+    }
+
+    /// The loader stays at the session boundary so all terminal outcomes can
+    /// release the composer lock. Production supplies MacBridgeClient; the
+    /// hermetic path also proves a failed/cancelled read cannot leave the field
+    /// permanently disabled.
+    func switchSessionForEvaluation(
+        to sessionID: String,
+        loadHistory: @escaping SessionHistoryLoader,
+        fallbackMessages: [ChatMessage]?
+    ) {
+        guard !isSwitchingSession, let clean = Self.cleanSessionID(sessionID) else { return }
+        guard clean != selectedSessionID else { return }
+        setSelectedSessionID(clean)
+        loadSelectedSession(loadHistory: loadHistory, fallbackMessages: fallbackMessages)
     }
 
     func switchToMainSession(using client: MacBridgeClient, fallbackMessages: [ChatMessage]?) {
-        guard !isLoading, !isSwitchingSession else { return }
+        guard !isSwitchingSession else { return }
         if let mainSessionID {
             switchSession(to: mainSessionID, using: client, fallbackMessages: fallbackMessages)
             return
@@ -44,7 +64,10 @@ extension ChatStore {
             return
         }
         setSelectedSessionID(nil)
-        loadSelectedSession(using: client, fallbackMessages: fallbackMessages)
+        loadSelectedSession(
+            loadHistory: { sessionID in await client.refreshChatHistory(sessionID: sessionID) },
+            fallbackMessages: fallbackMessages
+        )
     }
 
     /// Start a fresh chat session from iOS. Generates a new client-side session
@@ -55,9 +78,9 @@ extension ChatStore {
     func startNewSession() {
         // Escape hatch: usable even while a turn is still "working" — that is
         // exactly when the user reaches for it (a hung iCloud round-trip leaves
-        // isLoading stuck true). Only a live session SWITCH (mid file-write) is
-        // a real reason to defer. Everything in-flight is torn down below.
-        guard !isSwitchingSession else { return }
+        // isLoading stuck true). A session history read is cancellable, so a
+        // new chat takes priority and releases the composer immediately.
+        cancelSessionSwitch()
         sendTask?.cancel()
         sendTask = nil
         // Clearing the pending maps alone makes their eventual signed replies
@@ -102,7 +125,17 @@ extension ChatStore {
         lastRefreshAt = .distantPast
     }
 
-    private func loadSelectedSession(using client: MacBridgeClient, fallbackMessages: [ChatMessage]?) {
+    func cancelSessionSwitch() {
+        sessionSwitchGeneration &+= 1
+        sessionSwitchTask?.cancel()
+        sessionSwitchTask = nil
+        isSwitchingSession = false
+    }
+
+    private func loadSelectedSession(
+        loadHistory: @escaping SessionHistoryLoader,
+        fallbackMessages: [ChatMessage]?
+    ) {
         sendTask?.cancel()
         sendTask = nil
         let retiringCorrelations = Set(pendingICloudPlaceholders.keys)
@@ -128,6 +161,8 @@ extension ChatStore {
         cancelAllTypewriters()
         isPollingFallback = false
         isSwitchingSession = true
+        sessionSwitchGeneration &+= 1
+        let switchGeneration = sessionSwitchGeneration
         errorBanner = nil
         let loadingSessionID = selectedSessionID
         let cachedMessages = fallbackMessages ?? loadCachedMessages(for: loadingSessionID)
@@ -139,39 +174,49 @@ extension ChatStore {
         // a full preserve window. Live in-session arrivals keep real stamps.
         for id in cachedMessages.map(\.id) { localArrivalDates[id] = .distantPast }
         lastRefreshAt = .distantPast
-        Task { @MainActor [weak self] in
+        sessionSwitchTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            let macMessages = await client.refreshChatHistory(sessionID: loadingSessionID)
-            guard !Task.isCancelled else { return }
-            guard self.selectedSessionID == loadingSessionID else {
-                self.isSwitchingSession = false
-                return
-            }
-            if let macMessages, !macMessages.isEmpty {
-                // Stale-snapshot guard (ff7b6657): merge instead of replace so a
-                // snapshot built before the newest turns synced can't vanish the
-                // locally-cached transcript on a session (re)load. An EMPTY
-                // snapshot is treated like nil — likely an iOS-created session
-                // the Mac hasn't written back yet, never grounds to clear cache.
-                // Only the session's OWN cache earns the merge; an explicit
-                // fallbackMessages payload (legacy/global cache) must not leak
-                // into this session — snapshot replaces it like before.
-                if fallbackMessages == nil {
-                    self.messages = self.mergedMacMessagesPreservingPending(
-                        macMessages, replyArrived: false)
-                } else {
-                    self.messages = macMessages
+            defer { self.finishSessionSwitch(generation: switchGeneration) }
+            do {
+                let macMessages = try await loadHistory(loadingSessionID)
+                guard !Task.isCancelled, self.selectedSessionID == loadingSessionID else { return }
+                if let macMessages, !macMessages.isEmpty {
+                    // Stale-snapshot guard (ff7b6657): merge instead of replace so a
+                    // snapshot built before the newest turns synced can't vanish the
+                    // locally-cached transcript on a session (re)load. An EMPTY
+                    // snapshot is treated like nil — likely an iOS-created session
+                    // the Mac hasn't written back yet, never grounds to clear cache.
+                    // Only the session's OWN cache earns the merge; an explicit
+                    // fallbackMessages payload (legacy/global cache) must not leak
+                    // into this session — snapshot replaces it like before.
+                    if fallbackMessages == nil {
+                        self.messages = self.mergedMacMessagesPreservingPending(
+                            macMessages, replyArrived: false)
+                    } else {
+                        self.messages = macMessages
+                    }
+                    self.persistMessages()
+                } else if self.messages.isEmpty, let fallbackMessages {
+                    self.messages = fallbackMessages
+                    self.persistMessages()
+                } else if !self.messages.isEmpty {
+                    self.persistMessages()
                 }
-                self.persistMessages()
-            } else if self.messages.isEmpty, let fallbackMessages {
-                self.messages = fallbackMessages
-                self.persistMessages()
-            } else if !self.messages.isEmpty {
-                self.persistMessages()
+                self.lastRefreshAt = Date()
+            } catch is CancellationError {
+                // The explicit cancellation owner clears the gate immediately;
+                // defer remains as a backstop for a cooperative loader.
+            } catch {
+                guard !Task.isCancelled, self.selectedSessionID == loadingSessionID else { return }
+                errorBanner = "Could not load this chat. Showing the cached transcript."
             }
-            self.isSwitchingSession = false
-            self.lastRefreshAt = Date()
         }
+    }
+
+    private func finishSessionSwitch(generation: UInt64) {
+        guard generation == sessionSwitchGeneration else { return }
+        sessionSwitchTask = nil
+        isSwitchingSession = false
     }
 
     private func forceSessionRefresh(using client: MacBridgeClient, fallbackMessages: [ChatMessage]?) {

@@ -8,41 +8,135 @@
 import SwiftUI
 import NativeAgentShared
 
+enum TurnInspectorPresentation {
+    enum ContentState: Equatable {
+        case unpublished
+        case emptyPublished
+        case content(truncated: Bool, visibleCount: Int, totalCount: Int)
+    }
+
+    static func contentState(for file: TurnSummaryFile?) -> ContentState {
+        guard let file else { return .unpublished }
+        let visibleCount = file.summaries.count
+        let totalCount = max(file.totalTurnsSeen, visibleCount)
+        guard visibleCount > 0 || isTruncated(
+            writerMarkedTruncated: file.truncated,
+            visibleCount: visibleCount,
+            totalCount: totalCount
+        ) else { return .emptyPublished }
+        return .content(
+            truncated: isTruncated(
+                writerMarkedTruncated: file.truncated,
+                visibleCount: visibleCount,
+                totalCount: totalCount
+            ),
+            visibleCount: visibleCount,
+            totalCount: totalCount
+        )
+    }
+
+    static func isTruncated(
+        writerMarkedTruncated: Bool,
+        visibleCount: Int,
+        totalCount: Int
+    ) -> Bool {
+        writerMarkedTruncated || totalCount > visibleCount
+    }
+
+    static func truncationNotice(visibleCount: Int, totalCount: Int) -> String {
+        "Showing \(visibleCount) of \(totalCount) turns (oldest dropped for sync size)."
+    }
+
+    static func durationText(wallMs: Int) -> String {
+        guard wallMs >= 0 else { return "Unknown" }
+        let seconds = Double(wallMs) / 1000.0
+        return seconds < 1 ? "\(wallMs) ms" : String(format: "%.1f s", seconds)
+    }
+
+    private static func nonnegativeText(_ value: Int?) -> String {
+        guard let value, value >= 0 else { return "Unknown" }
+        return String(value)
+    }
+
+    private static func millisecondsText(_ value: Int?) -> String {
+        guard let value, value >= 0 else { return "Unknown" }
+        return "\(value) ms"
+    }
+
+    static func kindsText(_ kinds: [String: Int]) -> String {
+        let ordered = kinds
+            .sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
+        let visible = ordered.prefix(6).map { "\($0.key) ×\($0.value)" }.joined(separator: " · ")
+        return ordered.count > 6 ? "\(visible) · +\(ordered.count - 6) more" : visible
+    }
+
+    static func metrics(for summary: TurnSummaryRecord) -> [(value: String, label: String)] {
+        var result: [(value: String, label: String)] = [
+            (value: nonnegativeText(summary.eventCount), label: "events"),
+            (value: durationText(wallMs: summary.wallMs), label: "wall"),
+        ]
+        result.append((value: nonnegativeText(summary.llmTokens), label: "tok"))
+        result.append((value: millisecondsText(summary.ttftMs), label: "ttft"))
+        return result
+    }
+
+}
+
 struct TurnInspectorView: View {
     @StateObject private var store = TurnInspectorStore()
     @ObservedObject private var sync = iCloudSyncEngine.shared
 
     var body: some View {
         List {
-            if let file = store.file, !file.summaries.isEmpty {
-                if file.truncated {
+            switch TurnInspectorPresentation.contentState(for: store.file) {
+            case .content(let truncated, let visibleCount, let totalCount):
+                if truncated {
                     Section {
-                        Text("Showing \(file.summaries.count) of \(file.totalTurnsSeen) turns (oldest dropped for sync size).")
+                        Text(TurnInspectorPresentation.truncationNotice(
+                            visibleCount: visibleCount,
+                            totalCount: totalCount
+                        ))
                             .font(AppFont.label)
                             .foregroundStyle(.secondary)
                             .listRowSeparator(.hidden)
                     }
                 }
                 Section {
-                    ForEach(file.summaries) { summary in
+                    ForEach(store.file?.summaries ?? []) { summary in
                         TurnSummaryRow(summary: summary)
                     }
                 } header: {
                     Label("Turns", systemImage: "list.bullet.rectangle")
                         .font(AppFont.section)
                 }
-            } else {
+            case .unpublished:
+                AppEmptyState(
+                    title: "Turn summaries unavailable",
+                    systemImage: "waveform.path.ecg",
+                    kind: .unavailable,
+                    description: "The Mac has not published a turn-summary snapshot yet."
+                )
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
+            case .emptyPublished:
                 AppEmptyState(
                     title: "No turns yet",
                     systemImage: "waveform.path.ecg",
-                    description: "Per-turn summaries appear here after \(sync.agentDisplayName) processes a turn on the Mac and syncs."
+                    kind: .empty,
+                    description: "The latest published snapshot contains no turns."
                 )
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
             }
         }
         .navigationTitle("Turn Inspector")
+        .macSyncErrorBanner()
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .navigationBarLeading) {
+                MacStatusChip()
+            }
+        }
         .onAppear { Task { await store.refresh() } }
         .refreshable { await store.refresh() }
         .onChange(of: sync.turnSummaries) { _, file in
@@ -56,23 +150,8 @@ struct TurnInspectorView: View {
 private struct TurnSummaryRow: View {
     let summary: TurnSummaryRecord
 
-    private var durationText: String {
-        let s = Double(summary.wallMs) / 1000.0
-        if s < 1 { return "\(summary.wallMs) ms" }
-        return String(format: "%.1f s", s)
-    }
-
     private var kindsText: String {
-        // Stable, compact "kind ×count" list, sorted by count desc then name.
-        summary.kinds
-            .sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
-            .map { "\(shortKind($0.key)) ×\($0.value)" }
-            .joined(separator: " · ")
-    }
-
-    private func shortKind(_ k: String) -> String {
-        if let dot = k.firstIndex(of: ".") { return String(k[k.index(after: dot)...]) }
-        return k
+        TurnInspectorPresentation.kindsText(summary.kinds)
     }
 
     var body: some View {
@@ -88,20 +167,16 @@ private struct TurnSummaryRow: View {
                 }
             }
             HStack(spacing: 12) {
-                metric("\(summary.eventCount)", "events")
-                metric(durationText, "wall")
-                if let tokens = summary.llmTokens {
-                    metric("\(tokens)", "tok")
-                }
-                if let ttft = summary.ttftMs {
-                    metric("\(ttft) ms", "ttft")
+                ForEach(TurnInspectorPresentation.metrics(for: summary), id: \.label) { metric in
+                    self.metric(metric.value, metric.label)
                 }
             }
             if !summary.kinds.isEmpty {
                 Text(kindsText)
                     .font(AppFont.mono)
                     .foregroundStyle(.tertiary)
-                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityLabel("Event kinds: \(kindsText)")
             }
         }
         .padding(.vertical, 2)

@@ -14,14 +14,16 @@ final class GlobalHotkeyManager: NSObject {
         case none, register, unregister
     }
 
+    enum VoiceReleaseAction: Equatable, Sendable {
+        case endVoice, openWindow
+    }
+
     static let shared = GlobalHotkeyManager()
 
     private var hotKeyRef: EventHotKeyRef?
     private var eventHandlerRef: EventHandlerRef?
-    private var pressStart: Date?
-    private var pressToken: UUID?
+    private var pressState = GlobalHotkeyPressState()
     private var voiceStartTask: Task<Void, Never>?
-    private var voiceHoldActive = false
     private(set) var isRegistered = false
 
     // The voice input callback — set by whoever cares (e.g. ChatView)
@@ -41,6 +43,16 @@ final class GlobalHotkeyManager: NSObject {
         case (false, true): .unregister
         case (true, true), (false, false): .none
         }
+    }
+
+    /// The release decision is deliberately value-only: press timing and the
+    /// asynchronous arm task are owned above it, while this one rule decides
+    /// whether an armed microphone is released or a tap opens chat.
+    static func voiceReleaseAction(
+        heldSeconds: TimeInterval,
+        voiceHoldActive: Bool
+    ) -> VoiceReleaseAction {
+        heldSeconds >= 0.2 && voiceHoldActive ? .endVoice : .openWindow
     }
 
     func setEnabled(_ enabled: Bool) {
@@ -80,14 +92,12 @@ final class GlobalHotkeyManager: NSObject {
         }
         voiceStartTask?.cancel()
         voiceStartTask = nil
-        pressStart = nil
-        pressToken = nil
-        voiceHoldActive = false
+        pressState.cancel()
         isRegistered = false
     }
 
     func isVoiceHoldCurrent() -> Bool {
-        pressStart != nil && pressToken != nil && voiceHoldActive
+        pressState.isVoiceHoldCurrent
     }
 
     private func installEventHandler() {
@@ -118,32 +128,66 @@ final class GlobalHotkeyManager: NSObject {
         )
     }
 
-    private func handleKeyDown() {
-        pressStart = Date()
-        let token = UUID()
-        pressToken = token
-        voiceHoldActive = false
+    func handleKeyDown() {
+        let token = pressState.keyDown(now: Date())
         voiceStartTask?.cancel()
         voiceStartTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 200_000_000)
-            guard !Task.isCancelled, self.pressToken == token, self.pressStart != nil, !self.voiceHoldActive else { return }
-            self.voiceHoldActive = true
+            guard !Task.isCancelled, self.pressState.activateVoice(for: token) else { return }
             self.onVoiceStart?()
         }
     }
 
-    private func handleKeyUp() {
-        guard let start = pressStart else { return }
-        let held = Date().timeIntervalSince(start)
-        pressStart = nil
-        pressToken = nil
+    func handleKeyUp() {
+        guard let action = pressState.keyUp(now: Date()) else { return }
         voiceStartTask?.cancel()
         voiceStartTask = nil
-        if held >= 0.2, voiceHoldActive {
+        switch action {
+        case .endVoice:
             onVoiceEnd?()
-        } else {
+        case .openWindow:
             onOpenWindow?()
         }
+    }
+}
+
+struct GlobalHotkeyPressState: Sendable {
+    enum ReleaseAction: Equatable, Sendable { case openWindow, endVoice }
+
+    private(set) var pressStart: Date?
+    private(set) var pressToken: UUID?
+    private(set) var voiceHoldActive = false
+
+    var isVoiceHoldCurrent: Bool {
+        pressStart != nil && pressToken != nil && voiceHoldActive
+    }
+
+    mutating func keyDown(now: Date) -> UUID {
+        let token = UUID()
+        pressStart = now
+        pressToken = token
+        voiceHoldActive = false
+        return token
+    }
+
+    mutating func activateVoice(for token: UUID) -> Bool {
+        guard pressToken == token, pressStart != nil, !voiceHoldActive else { return false }
+        voiceHoldActive = true
+        return true
+    }
+
+    mutating func keyUp(now: Date) -> ReleaseAction? {
+        guard let start = pressStart else { return nil }
+        let action: ReleaseAction = now.timeIntervalSince(start) >= 0.2 && voiceHoldActive
+            ? .endVoice
+            : .openWindow
+        cancel()
+        return action
+    }
+
+    mutating func cancel() {
+        pressStart = nil
+        pressToken = nil
         voiceHoldActive = false
     }
 }

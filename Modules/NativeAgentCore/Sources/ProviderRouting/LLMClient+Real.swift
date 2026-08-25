@@ -417,7 +417,38 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         self.moonshotCatalogDataRoot = moonshotCatalogDataRoot
     }
 
+    /// First-party OAuth-direct providers serve ONE model family each. When a
+    /// surface is pinned to one of them and the requested id belongs to no
+    /// family we can infer (`llama-3`, `deepseek-chat`, `o3`), the routing
+    /// family-mismatch check above cannot fire — `inferredProviderId` returns
+    /// nil — so the raw id used to reach the pinned adapter, which quietly
+    /// coerced it to its own default and billed the call. Reject it here,
+    /// BEFORE dispatch and before any token spend (NORTHSTAR clause 2). The
+    /// adapters' coercion now throws too; this is the earlier, cheaper gate.
+    private static let firstPartyOAuthDirectProviderIDs: Set<String> = [
+        "anthropic_oauth_direct",
+        "openai_oauth_direct",
+    ]
+
+    private func validateFirstPartyModelFamily(_ resolution: AdapterResolution) throws {
+        let pinned = resolution.providerId
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard Self.firstPartyOAuthDirectProviderIDs.contains(pinned) else { return }
+        let requested = resolution.model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !requested.isEmpty else { return }
+        guard inferredProviderId(forModel: requested) == nil else { return }
+        throw LLMError.modelUnavailable(provider: pinned, model: requested)
+    }
+
     private func validateCatalogAvailability(_ resolution: AdapterResolution) throws {
+        if resolution.familyMismatch {
+            throw LLMError.modelUnavailable(
+                provider: resolution.providerId,
+                model: resolution.model
+            )
+        }
+        try validateFirstPartyModelFamily(resolution)
         guard resolution.choice == .openRouter else { return }
         if OpenRouterModelCatalog.cachedAvailability(
             of: resolution.model,
@@ -491,6 +522,11 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         let choice: AdapterChoice
         let model: String
         let providerId: String
+        /// Set when the surface's active provider cannot serve the requested
+        /// model's family. Routing no longer substitutes the provider default
+        /// (User, 2026-08-21 — fail loud, the user picks models); the
+        /// validation gate throws on this before any dispatch or spend.
+        var familyMismatch: Bool = false
     }
 
     /// Single source of truth for routing. Explicit active provider wins for
@@ -527,14 +563,18 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                 // choices. The checked surface tuple already reconciles the
                 // omitted/default model with its active provider, so a family
                 // mismatch here means the caller intentionally selected a
-                // different worker model. Route that model by its own family
-                // instead of silently replacing it with the surface default.
+                // different worker model. Route that model by its own family.
+                // For every other surface a mismatch used to silently swap in
+                // the provider default; since 2026-08-21 (User-directed) it is
+                // marked here and validateCatalogAvailability throws
+                // modelUnavailable BEFORE dispatch — the last silent-swap
+                // path, closed to match the adapter-level coercion throws.
                 if surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() != "swarms" {
-                    let fallbackModel = await defaultModel(forProviderId: activeProvider) ?? model
                     return AdapterResolution(
                         choice: activeChoice,
-                        model: fallbackModel,
-                        providerId: activeProvider
+                        model: model,
+                        providerId: activeProvider,
+                        familyMismatch: true
                     )
                 }
             } else {
@@ -752,8 +792,13 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
             .trimmingCharacters(in: .whitespacesAndNewlines), !admitted.isEmpty {
             return admitted
         }
-        if let requestedModel, !requestedModel.isEmpty {
-            return requestedModel
+        // Trim BEFORE deciding whether a model was requested: a whitespace-only
+        // id must fall through to the surface preference, not reach an adapter
+        // as an "explicit" pick that silently takes the adapter default
+        // (gpt-5.5 sweep review, 2026-08-21).
+        if let requested = requestedModel?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !requested.isEmpty {
+            return requested
         }
         let model = ProviderRoutingSurfaceLookup.value(routingSnapshot.preferences, surface)?.model
             ?? routingSnapshot.preferences["chat"]?.model

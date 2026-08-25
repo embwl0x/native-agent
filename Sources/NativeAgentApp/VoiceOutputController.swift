@@ -11,20 +11,86 @@ enum VoiceOutputMode: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+/// The selected playback route plus the provenance for a local fallback.
+/// Local speech is a legitimate configured choice, but it must not hide an
+/// unread Trust policy behind the same success-shaped mode label.
+enum VoiceOutputModeResolution: Equatable {
+    case openAI
+    case localConfigured
+    case localPolicyUnavailable
+
+    var mode: VoiceOutputMode {
+        switch self {
+        case .openAI: .openai
+        case .localConfigured, .localPolicyUnavailable: .local
+        }
+    }
+
+    var notice: String? {
+        guard case .localPolicyUnavailable = self else { return nil }
+        return "Voice policy is unavailable. Reading aloud with the Mac voice instead."
+    }
+}
+
+/// Read-aloud has one selection owner: the loaded Trust Center policy.  The
+/// old `voiceUseOpenAI` AppStorage mirror could outlive a denied policy write,
+/// leaving the settings screen and either chat read site on different modes.
+enum VoiceOutputModeSelection {
+    static func resolve(for trustPolicy: TrustPolicy?) -> VoiceOutputModeResolution {
+        guard let trustPolicy else { return .localPolicyUnavailable }
+        return trustPolicy.multimodalPolicy?.tts_openai == true ? .openAI : .localConfigured
+    }
+
+    static func mode(for trustPolicy: TrustPolicy?) -> VoiceOutputMode {
+        resolve(for: trustPolicy).mode
+    }
+}
+
+/// A selected OpenAI voice is allowed to fall back only for preflight failures
+/// that make a remote request impossible. Transport and decode failures remain
+/// loud: silently changing voices after a real request is misleading.
+enum OpenAIVoiceFailureDisposition: Equatable {
+    case fallbackToLocal(message: String)
+    case surfaceFailure(message: String)
+
+    static func resolve(_ error: Error) -> Self {
+        switch error {
+        case MultimodalTTSError.trustDenied:
+            return .fallbackToLocal(
+                message: "OpenAI voice is not allowed. Reading aloud with the Mac voice instead."
+            )
+        case MultimodalTTSError.notConfigured:
+            return .fallbackToLocal(
+                message: "OpenAI voice needs an API key. Reading aloud with the Mac voice instead."
+            )
+        default:
+            return .surfaceFailure(message: error.localizedDescription)
+        }
+    }
+}
+
 @Observable
 @MainActor
 final class VoiceOutputController: NSObject {
+    typealias OpenAISynthesis = @Sendable (_ text: String) async throws -> Data
+
     var isSpeaking: Bool = false
     var errorMessage: String? = nil
 
     private let synthesizer = AVSpeechSynthesizer()
     private var audioPlayer: AVAudioPlayer?
     // Bumped on every speak()/stop() so an in-flight speakOpenAI can detect it was superseded across its network await.
-    private var speechGeneration: Int = 0
+    private(set) var speechGeneration: Int = 0
+    private let openAISynthesis: OpenAISynthesis
     // Weak back-reference for app runtime settings, set by ChatView on init.
     var nativeBaseURL: String = ""
 
-    override init() {
+    override convenience init() {
+        self.init(openAISynthesis: Self.liveOpenAISynthesis)
+    }
+
+    init(openAISynthesis: @escaping OpenAISynthesis) {
+        self.openAISynthesis = openAISynthesis
         super.init()
         synthesizer.delegate = self
     }
@@ -39,6 +105,16 @@ final class VoiceOutputController: NSObject {
             speakLocal(text: text)
         case .openai:
             await speakOpenAI(text: text)
+        }
+    }
+
+    /// Preserve the policy-read result through the playback boundary. The
+    /// actual fallback is still local AVSpeechSynthesizer, while the mounted
+    /// chat surface receives a truthful notice when policy evidence was absent.
+    func speak(text: String, resolution: VoiceOutputModeResolution) async {
+        await speak(text: text, mode: resolution.mode)
+        if let notice = resolution.notice, isSpeaking {
+            errorMessage = notice
         }
     }
 
@@ -88,8 +164,7 @@ final class VoiceOutputController: NSObject {
             // installed .app bundle reads the app-owned provider config instead
             // of a CWD-relative path.
             let audioData: Data
-            audioData = try await SwiftOpenAITTSClient()
-                .synthesize(text: text, voice: "alloy", format: "mp3")
+            audioData = try await openAISynthesis(text)
             // Superseded by a concurrent stop()/speak() while awaiting — bail without touching shared state.
             guard generation == speechGeneration else { return }
             // Detach any prior player's delegate before replacing it, so a
@@ -103,9 +178,19 @@ final class VoiceOutputController: NSObject {
         } catch {
             // Don't report/clear state if a concurrent stop()/speak() already superseded this call.
             guard generation == speechGeneration else { return }
-            errorMessage = error.localizedDescription
-            isSpeaking = false
+            switch OpenAIVoiceFailureDisposition.resolve(error) {
+            case .fallbackToLocal(let message):
+                errorMessage = message
+                speakLocal(text: text)
+            case .surfaceFailure(let message):
+                errorMessage = message
+                isSpeaking = false
+            }
         }
+    }
+
+    nonisolated private static func liveOpenAISynthesis(text: String) async throws -> Data {
+        try await SwiftOpenAITTSClient().synthesize(text: text, voice: "alloy", format: "mp3")
     }
 }
 
@@ -115,7 +200,7 @@ final class VoiceOutputController: NSObject {
 // true, making the Stop button unreachable. The synthesizer delegate can't be
 // detached per-utterance, so each utterance carries the generation it was
 // created under; the state-clear is ignored once the generation has advanced.
-private final class GenerationTaggedUtterance: AVSpeechUtterance {
+final class GenerationTaggedUtterance: AVSpeechUtterance {
     let generation: Int
     init(string: String, generation: Int) {
         self.generation = generation

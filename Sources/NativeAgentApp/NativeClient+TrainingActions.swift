@@ -65,6 +65,7 @@ extension NativeClient {
     }
 
     func runDrills(surface: String) async throws -> [String: Any] {
+        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let runID = String(UUID().uuidString.lowercased().prefix(8))
         let started = Date()
         let suite = "swift_native_runtime"
@@ -73,7 +74,7 @@ extension NativeClient {
                 try Self.codableJSON(try await self.getHealth())
             },
             await swiftDrillCheck(id: "D-02", title: "Persona source files readable") {
-                try Self.personaDrillOutput()
+                try Self.personaDrillOutput(dataRoot: dataRoot)
             },
             await swiftDrillCheck(id: "D-03", title: "MemoryV2 recall path") {
                 let response = try await SwiftNativeMemoryV2.shared.recall(
@@ -141,7 +142,13 @@ extension NativeClient {
             "must_fix_auto_caps": .array([]),
             "summary": .string(failedIDs.isEmpty ? "Swift drill checks passed." : "Failed drill checks: \(failedIDs.joined(separator: ", "))"),
         ])
-        try await Self.writeDrillRunFiles(runID: runID, run: run, graded: graded, drift: drift)
+        try await Self.writeDrillRunFiles(
+            runID: runID,
+            run: run,
+            graded: graded,
+            drift: drift,
+            dataRoot: dataRoot
+        )
         return try Self.foundationDictionary(.object([
             "ok": .bool(failedIDs.isEmpty),
             "status": .string(failedIDs.isEmpty ? "passed" : "failed"),
@@ -194,8 +201,9 @@ extension NativeClient {
         }
     }
 
-    static func personaDrillOutput() throws -> JSONValue {
-        let dataRoot = PersistenceCore.defaultDataRoot()
+    static func personaDrillOutput(
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) throws -> JSONValue {
         let repoRoot = PersistenceCore.resolveSandboxRepoRoot(dataRoot: dataRoot)
             ?? dataRoot.deletingLastPathComponent()
         let personaRoot = repoRoot.appendingPathComponent("persona", isDirectory: true)
@@ -220,9 +228,10 @@ extension NativeClient {
         runID: String,
         run: JSONValue,
         graded: JSONValue,
-        drift: JSONValue
+        drift: JSONValue,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async throws {
-        let dir = PersistenceCore.defaultDataRoot()
+        let dir = dataRoot
             .appendingPathComponent("training_journal", isDirectory: true)
             .appendingPathComponent("drill_runs", isDirectory: true)
         let persistence = SwiftNativePersistenceCore()
@@ -262,12 +271,14 @@ extension NativeClient {
     // SUBSYSTEM #17: retired Swift wrapper runPromotionSelfTest + daemon /v1/promotion/self_test route — promotion.py::PromotionEngine.self_test() preserved.
 
     func approvePromotionPending(id: String) async throws -> [String: Any] {
-        let raw = try await NativeClient._trainingPromotionActor().approvePromotionStageLocal(candidateId: id)
+        let raw = try await NativeClient._trainingPromotionActor(dataRoot: dataRootOverride)
+            .approvePromotionStageLocal(candidateId: id)
         return try NativeClient._jsonValueToDictionary(raw)
     }
 
     func rejectPromotionPending(id: String, reason: String) async throws -> [String: Any] {
-        let raw = try await NativeClient._trainingPromotionActor().rejectPromotionStageLocal(candidateId: id, reason: reason)
+        let raw = try await NativeClient._trainingPromotionActor(dataRoot: dataRootOverride)
+            .rejectPromotionStageLocal(candidateId: id, reason: reason)
         return try NativeClient._jsonValueToDictionary(raw)
     }
 }

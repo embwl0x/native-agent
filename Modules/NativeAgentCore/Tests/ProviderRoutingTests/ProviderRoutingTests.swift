@@ -115,6 +115,18 @@ import PersistenceCore
     #expect(back == prefs)
 }
 
+// Eval coverage ledger — `providers.modelPreferences.fallbackChain`.
+// A ModelPreferences response must not advertise a recovery chain unless the
+// routing owner can actually execute it. Failover lives nowhere in this owner,
+// so the computed public envelope deliberately omits the compatibility field.
+@Test func computedModelPreferences_doesNotAdvertiseUnimplementedFallbackChain() async throws {
+    let routing = try makeSN()
+    let preferences = try await routing.getModelPreferences()
+    #expect(preferences.fallbackChain == nil)
+    #expect(preferences.defaultModel != nil)
+    #expect(preferences.surfaceModels != nil)
+}
+
 @Test func ProviderTestResult_preserves_rawResponse() throws {
     let raw: JSONValue = .object([
         "ok": .bool(true),
@@ -224,6 +236,53 @@ private func makeSN(_ surfacesBody: String = "{}") throws -> SwiftNativeProvider
     #expect(snapshot.pinnedModels["dream"] == "claude-opus-4-8")
     #expect(try await routing.activeProvidersForSurfacesChecked() == snapshot.activeProviders)
     #expect(try await routing.pinnedModelStringForSurfaceChecked("dream") == "claude-opus-4-8")
+}
+
+// 2026-08-21 (User-directed fail-loud): the runtime no longer silently swaps a
+// family-mismatched model at dispatch, so a bare provider switch must resolve
+// the mismatch at the SOURCE — a stale pin from the old provider's family is
+// rewritten to the new provider's default in the same transactional update,
+// and the panel shows the truth.
+@Test func providerSwitch_rewritesIncompatibleStaleModelPin() async throws {
+    let paths = try makeProviderRoutingTestPaths(
+        surfacesBody: #"{"telegram":{"model":"gpt-5.5","reasoningEffort":"high"}}"#,
+        activeBody: #"{"telegram":"openai_oauth_direct"}"#
+    )
+    defer { try? FileManager.default.removeItem(at: paths.root) }
+    let routing = SwiftNativeProviderRouting(
+        dataRoot: paths.root,
+        surfacesPathOverride: paths.surfaces,
+        activeProviderPathOverride: paths.active
+    )
+
+    try await routing.setActiveProvider(surface: "telegram", providerId: "anthropic_oauth_direct")
+
+    let active = try await routing.activeProvidersForSurfacesChecked()
+    #expect(active["telegram"] == "anthropic_oauth_direct")
+    // The GPT pin cannot ride an Anthropic provider: it must have been
+    // rewritten to the provider default, never left stale (the runtime would
+    // fail that turn loudly) and never silently swapped at dispatch time.
+    let pinned = try await routing.pinnedModelStringForSurfaceChecked("telegram")
+    #expect(pinned == "claude-opus-4-8")
+}
+
+// A compatible pin survives a provider switch untouched.
+@Test func providerSwitch_keepsCompatibleModelPin() async throws {
+    let paths = try makeProviderRoutingTestPaths(
+        surfacesBody: #"{"telegram":{"model":"gpt-5.5","reasoningEffort":"high"}}"#,
+        activeBody: #"{"telegram":"openai"}"#
+    )
+    defer { try? FileManager.default.removeItem(at: paths.root) }
+    let routing = SwiftNativeProviderRouting(
+        dataRoot: paths.root,
+        surfacesPathOverride: paths.surfaces,
+        activeProviderPathOverride: paths.active
+    )
+
+    try await routing.setActiveProvider(surface: "telegram", providerId: "openai_oauth_direct")
+
+    #expect(try await routing.activeProvidersForSurfacesChecked()["telegram"] == "openai_oauth_direct")
+    #expect(try await routing.pinnedModelStringForSurfaceChecked("telegram") == "gpt-5.5")
 }
 
 @Test func combinedSurfaceSaveValidatesActiveStateBeforeChangingEitherProjection() async throws {
@@ -839,6 +898,7 @@ private enum ProviderSurfaceCommitTestFailure: Error {
         // `slack` is a chat-like remote surface. Unpinned, it inherits
         // chat's model/effort, but the picker can pin it independently.
         "slack": ("claude-opus-4-7", "high"),
+        "desk": ("claude-opus-4-7", "high"),
         "workshop": ("1.5", "high"),
         "autonomy": ("True", "high"),
         "swarms": (PRIMARY_MODEL, "high"),
@@ -860,15 +920,20 @@ private enum ProviderSurfaceCommitTestFailure: Error {
         // seed-to-chat rule as `memory`/`ios`.
         "heartbeat": ("claude-opus-4-7", "high"),
         "diagnostics": ("claude-opus-4-7", "high"),
-        // Cognitive reflection is the exceptional deep-cognition surface.
-        // It defaults to explicit Anthropic Opus 4.8 at the repo's Claude-safe
-        // high effort rather than inheriting chat, so provider swaps do not accidentally move
-        // the subconscious reflection model.
-        "cognition_reflection": ("claude-opus-4-8", "high"),
+        // Cognitive reflection remains high effort, but its unpinned model
+        // follows chat. A diagnostic/default path must not silently select an
+        // Anthropic-specific model that the user never chose.
+        "cognition_reflection": ("claude-opus-4-7", "high"),
         // `compaction` was added 2026-07-01 (R4 LLM-distilled autocompaction).
         // Unpinned it seeds to chat's pick (same rule as `memory`/`ios`), so
         // the distilled summary is written in Agent's current voice.
         "compaction": ("claude-opus-4-7", "high"),
+        // `self_improvement` was added 2026-08-21 (sweep): the weekly
+        // self-improvement loop already called with that surface but it was
+        // missing from the registry, so it silently followed the chat pin
+        // with no picker row. Unpinned it seeds to chat's pick (same rule as
+        // `memory`/`heartbeat`/`diagnostics`).
+        "self_improvement": ("claude-opus-4-7", "high"),
     ]
     #expect(Set(swiftPrefs.keys) == Set(expected.keys))
     for (surface, entry) in expected {

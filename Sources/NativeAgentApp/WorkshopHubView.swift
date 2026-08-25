@@ -19,15 +19,31 @@ import CloudKit
 // The Desk is the agent's one work surface. Schedule and Research are adjacent
 // views over the same mind and canonical stores; the Workshop execution engine
 // remains an implementation detail behind directed Desk runs.
-private enum DeskMode: String, CaseIterable, Identifiable {
+enum DeskMode: String, CaseIterable, Identifiable {
     case desk = "Desk"
     case schedule = "Schedule"
     case research = "Research"
     var id: String { rawValue }
 }
 
+/// A route to the Desk is a route to its root, not merely to whatever Desk
+/// subpage happened to be left open. ContentView advances this token for every
+/// Desk selection; the hub consumes it by returning to the Desk mode.
+enum DeskRootRoutePresentation {
+    static func nextRootRouteVersion(current: Int, destination: SidebarItem) -> Int {
+        destination.normalized == .desk ? current &+ 1 : current
+    }
+
+    static func mode(afterRootRequestFrom _: DeskMode) -> DeskMode { .desk }
+}
+
 struct DeskHubView: View {
+    let rootRouteVersion: Int
     @State private var mode: DeskMode = .desk
+
+    init(rootRouteVersion: Int = 0) {
+        self.rootRouteVersion = rootRouteVersion
+    }
 
     var body: some View {
         VStack(spacing: 12) {
@@ -50,6 +66,9 @@ struct DeskHubView: View {
             }
         }
         .navigationTitle("Desk")
+        .onChange(of: rootRouteVersion) { _, _ in
+            mode = DeskRootRoutePresentation.mode(afterRootRequestFrom: mode)
+        }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button("New Task", systemImage: "plus.circle") {

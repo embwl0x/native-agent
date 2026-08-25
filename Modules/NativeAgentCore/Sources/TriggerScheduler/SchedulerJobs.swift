@@ -175,8 +175,9 @@ public protocol SchedulerJobWriter: Sendable {
 
     /// Mirrors `Daemon.list_jobs` — the READ side of
     /// `/v1/scheduler/jobs` (GET) and the `scheduler.list_jobs` connector action.
-    /// Reads scheduler/jobs.json under the cross-process flock, coerces a
-    /// non-list to `[]`, and decorates each row's `nextRunAt` (float-string
+    /// Reads scheduler/jobs.json under the cross-process flock. Only a missing
+    /// file is empty; existing malformed/non-list state fails closed. It then
+    /// decorates each row's `nextRunAt` (float-string
     /// epoch → ISO-8601 UTC; adds `nextRunAtEpoch` + `nextRunAtISO`). Returns the
     /// decorated array verbatim (`[JSONValue]`).
     func listJobs() async throws -> [JSONValue]
@@ -235,9 +236,7 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
         _ = try await runSerialized { [persistence, jobsPath, activityPath, now, uuid] () async throws -> Int in
             let work: @Sendable () async throws -> Void = {
                 // read-modify-write: append the new job (matches daemon).
-                let raw = await persistence.readJSON(jobsPath, defaultValue: .array([]))
-                var jobs: [JSONValue]
-                if case .array(let arr) = raw { jobs = arr } else { jobs = [] }
+                var jobs = try Self.readJobsChecked(at: jobsPath)
                 jobs.append(job)
                 do {
                     try await persistence.writeJSON(.array(jobs), to: jobsPath)
@@ -319,9 +318,7 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
         let result: (status: String, job: JSONValue) = try await runSerialized {
             [persistence, jobsPath] () async throws -> (String, JSONValue) in
             try await persistence.withFileLock(jobsPath) {
-                let raw = await persistence.readJSON(jobsPath, defaultValue: .array([]))
-                var jobs: [JSONValue]
-                if case .array(let rows) = raw { jobs = rows } else { jobs = [] }
+                var jobs = try Self.readJobsChecked(at: jobsPath)
 
                 let index = jobs.firstIndex { row in
                     guard case .object(let object) = row,
@@ -424,9 +421,7 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
             // The R-M-W returns the updated target job. Throws on the not-found
             // path so no write happens (mirrors the daemon raising before write_json).
             let work: @Sendable () async throws -> JSONValue = {
-                let raw = await persistence.readJSON(jobsPath, defaultValue: .array([]))
-                var jobs: [JSONValue]
-                if case .array(let arr) = raw { jobs = arr } else { jobs = [] }
+                var jobs = try Self.readJobsChecked(at: jobsPath)
 
                 var matched: JSONValue? = nil
                 for (idx, job) in jobs.enumerated() {
@@ -537,13 +532,11 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
     /// so a Swift reader can't observe a torn write mid-flight from the daemon's
     /// scheduler_loop / save_jobs. Serialized Swift-side via runSerialized for
     /// the same per-actor ordering as the writes. The decoration is a pure
-    /// transform of what was read; non-list disk content coerces to `[]`.
+    /// transform of what was read; only an absent source yields an empty list.
     public func listJobs() async throws -> [JSONValue] {
         return try await runSerialized { [persistence, jobsPath] () async throws -> [JSONValue] in
             let work: @Sendable () async throws -> [JSONValue] = {
-                let raw = await persistence.readJSON(jobsPath, defaultValue: .array([]))
-                // Python: `if not isinstance(jobs, list): return []`.
-                guard case .array(let jobs) = raw else { return [] }
+                let jobs = try Self.readJobsChecked(at: jobsPath)
                 return jobs.map { SchedulerJobNormalizer.decorateNextRunAt($0) }
             }
             // Uniform locking (L7, 2026-08-01): `withFileLock` is a
@@ -558,6 +551,33 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
     /// APP constant from the daemon. Used as the
     /// notify-title / name fallback. See PARITY DIVERGENCES in the header.
     nonisolated static var displayNameFallback: String { "NativeAgent" }
+
+    /// Scheduler jobs are authority state. Only a missing file means an empty
+    /// schedule; malformed or wrongly typed existing bytes must not be
+    /// reinterpreted as a dormant empty schedule and then overwritten by the
+    /// next create/cancel mutation.
+    private nonisolated static func readJobsChecked(at path: URL) throws -> [JSONValue] {
+        let manager = FileManager.default
+        guard manager.fileExists(atPath: path.path) else { return [] }
+        do {
+            let data = try Data(contentsOf: path)
+            guard data.count <= 4 * 1_024 * 1_024 else {
+                throw TriggerSchedulerError.persistenceFailure("scheduler jobs file exceeds 4 MiB")
+            }
+            let raw = try JSONValue.parse(data)
+            guard case .array(let rows) = raw else {
+                throw TriggerSchedulerError.persistenceFailure("scheduler jobs file must contain a JSON array")
+            }
+            guard rows.count <= 1_024 else {
+                throw TriggerSchedulerError.persistenceFailure("scheduler jobs file exceeds 1024 rows")
+            }
+            return rows
+        } catch let error as TriggerSchedulerError {
+            throw error
+        } catch {
+            throw TriggerSchedulerError.persistenceFailure("scheduler jobs file is unreadable or malformed: \(error.localizedDescription)")
+        }
+    }
 }
 
 // MARK: - SchedulerJobNormalizer

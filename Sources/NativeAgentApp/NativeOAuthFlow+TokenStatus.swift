@@ -2,6 +2,12 @@ import Foundation
 import PersistenceCore
 import ProviderRouting
 
+enum AnthropicOAuthCredentialReadState: Equatable {
+    case missing
+    case ready
+    case unavailable(String)
+}
+
 extension NativeOAuthFlow {
     enum CodexCLISessionOffer: Equatable {
         case available(email: String?, alreadyDeclined: Bool)
@@ -9,7 +15,7 @@ extension NativeOAuthFlow {
     }
     /// Disk-only sign-out: remove the provider's token file. Returns true if
     /// a file was removed (or absent).
-    static func clearTokens(providerId: String) -> Bool {
+    static func clearTokens(providerId: String, dataRoot: URL? = nil) -> Bool {
         let normalized = normalizedOAuthProviderId(providerId)
         switch providerId {
         case "openai_oauth_direct":
@@ -34,7 +40,7 @@ extension NativeOAuthFlow {
             }
             return true
         case "anthropic_oauth_direct":
-            let path = anthropicTokenPath()
+            let path = anthropicTokenPath(dataRoot: dataRoot)
             if FileManager.default.fileExists(atPath: path.path) {
                 try? FileManager.default.removeItem(at: path)
             }
@@ -51,11 +57,11 @@ extension NativeOAuthFlow {
 
     /// Read the persisted `expires_at` for a provider, or nil if not
     /// signed in / no expiry persisted.
-    static func expiresAt(providerId: String) -> Date? {
+    static func expiresAt(providerId: String, dataRoot: URL? = nil) -> Date? {
         let path: URL
         switch normalizedOAuthProviderId(providerId) {
         case "openai_oauth_direct":    path = openAIActiveAuthPath() ?? openAIAuthPath()
-        case "anthropic_oauth_direct": path = anthropicTokenPath()
+        case "anthropic_oauth_direct": path = anthropicTokenPath(dataRoot: dataRoot)
         case "xai_oauth_direct":       path = XAIOAuthDirectAdapter.tokenPath()
         default: return nil
         }
@@ -91,9 +97,9 @@ extension NativeOAuthFlow {
     /// For ChatGPT, a sign-in adopted from the shared Codex CLI home is
     /// labeled as such: the reader must be able to tell WHOSE credentials
     /// are live and that they did not come from an in-app sign-in.
-    static func signInStatusDetail(providerId: String) -> String? {
-        guard isSignedIn(providerId: providerId) else { return nil }
-        let base = expiryStatusText(providerId: providerId)
+    static func signInStatusDetail(providerId: String, dataRoot: URL? = nil) -> String? {
+        guard isSignedIn(providerId: providerId, dataRoot: dataRoot) else { return nil }
+        let base = expiryStatusText(providerId: providerId, dataRoot: dataRoot)
         if normalizedOAuthProviderId(providerId) == "openai_oauth_direct",
            let adoption = openAIAdoptedCLISessionDetail() {
             return "\(base) — \(adoption)"
@@ -101,8 +107,8 @@ extension NativeOAuthFlow {
         return base
     }
 
-    private static func expiryStatusText(providerId: String) -> String {
-        guard let exp = expiresAt(providerId: providerId) else { return "Signed in" }
+    private static func expiryStatusText(providerId: String, dataRoot: URL?) -> String {
+        guard let exp = expiresAt(providerId: providerId, dataRoot: dataRoot) else { return "Signed in" }
         let now = Date()
         let remaining = exp.timeIntervalSince(now)
         if remaining <= 0 {
@@ -176,7 +182,7 @@ extension NativeOAuthFlow {
     }
 
     /// Best-effort on-disk auth check used by the UI status badge.
-    static func isSignedIn(providerId: String) -> Bool {
+    static func isSignedIn(providerId: String, dataRoot: URL? = nil) -> Bool {
         switch normalizedOAuthProviderId(providerId) {
         case "openai_oauth_direct":
             guard let path = openAIActiveAuthPath(),
@@ -188,13 +194,7 @@ extension NativeOAuthFlow {
             else { return false }
             return true
         case "anthropic_oauth_direct":
-            guard let data = try? Data(contentsOf: anthropicTokenPath()),
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            else { return false }
-            if let s = obj["access_token"] as? String, !s.isEmpty { return true }
-            if let nested = (obj["tokens"] as? [String: Any])?["access_token"] as? String,
-               !nested.isEmpty { return true }
-            return false
+            return anthropicOAuthCredentialState(dataRoot: dataRoot) == .ready
         case "xai_oauth_direct":
             guard let data = try? Data(contentsOf: XAIOAuthDirectAdapter.tokenPath()),
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -241,10 +241,94 @@ extension NativeOAuthFlow {
         return OpenAIOAuthDirectAdapter.hasUsableTokens(at: path) ? path : nil
     }
 
-    static func anthropicTokenPath() -> URL {
-        PersistenceCore.defaultDataRoot()
+    static func anthropicTokenPath(dataRoot: URL? = nil) -> URL {
+        (dataRoot ?? PersistenceCore.defaultDataRoot())
             .appendingPathComponent("providers", isDirectory: true)
             .appendingPathComponent("anthropic_oauth_direct.json")
+    }
+
+    /// Existing malformed provider credentials are unavailable authority, not
+    /// an unsigned account. The mounted OAuth panel shows this state before a
+    /// user attempts a browser flow that would otherwise fail late.
+    static func anthropicOAuthCredentialState(
+        dataRoot: URL? = nil
+    ) -> AnthropicOAuthCredentialReadState {
+        let path = anthropicTokenPath(dataRoot: dataRoot)
+        guard FileManager.default.fileExists(atPath: path.path) else { return .missing }
+        do {
+            let data = try Data(contentsOf: path)
+            let decoded = try JSONSerialization.jsonObject(with: data)
+            guard let object = decoded as? [String: Any] else {
+                return .unavailable("saved credentials are not a JSON object")
+            }
+            let access = (object["access_token"] as? String)
+                ?? ((object["tokens"] as? [String: Any])?["access_token"] as? String)
+            guard let access,
+                  !access.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return .unavailable("saved credentials contain no access token")
+            }
+            return .ready
+        } catch {
+            return .unavailable("saved credentials could not be read: \(error.localizedDescription)")
+        }
+    }
+
+    /// Persist the exact provider-file shape the Anthropic adapter reads. An
+    /// existing malformed credential file is authority evidence, not an empty
+    /// starting point: leave it byte-preserved and surface the failed OAuth
+    /// completion so Settings never claims a connection that cannot be read.
+    static func persistAnthropicOAuthTokens(
+        _ tokens: [String: Any],
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) throws {
+        guard let rawAccess = tokens["access_token"] as? String,
+              !rawAccess.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw NSError(
+                domain: "NativeOAuthFlow",
+                code: -21,
+                userInfo: [NSLocalizedDescriptionKey: "Anthropic OAuth response is missing access_token."]
+            )
+        }
+
+        let path = anthropicTokenPath(dataRoot: dataRoot)
+        var existing: [String: Any] = [:]
+        if FileManager.default.fileExists(atPath: path.path) {
+            let data = try Data(contentsOf: path)
+            let decoded = try JSONSerialization.jsonObject(with: data)
+            guard let object = decoded as? [String: Any] else {
+                throw NSError(
+                    domain: "NativeOAuthFlow",
+                    code: -22,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "Existing Anthropic OAuth credentials are malformed. Repair or remove them before signing in again."]
+                )
+            }
+            existing = object
+        }
+
+        existing["client_id"] = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+        existing["access_token"] = rawAccess
+        if let refresh = tokens["refresh_token"] as? String {
+            existing["refresh_token"] = refresh
+        } else if existing["refresh_token"] == nil {
+            existing["refresh_token"] = ""
+        }
+        let expiresIn: Int
+        if let integer = tokens["expires_in"] as? Int {
+            expiresIn = integer
+        } else if let floating = tokens["expires_in"] as? Double {
+            expiresIn = Int(floating)
+        } else if let string = tokens["expires_in"] as? String,
+                  let integer = Int(string) {
+            expiresIn = integer
+        } else {
+            expiresIn = 3_600
+        }
+        existing["expires_at"] = isoBasic(Date().addingTimeInterval(TimeInterval(expiresIn)))
+        existing["scope"] = (tokens["scope"] as? String) ?? ""
+        existing["token_type"] = (tokens["token_type"] as? String) ?? "Bearer"
+        if existing["user_info"] == nil { existing["user_info"] = [String: Any]() }
+        try writeJSONObject(existing, to: path)
     }
 
     // MARK: - Codex CLI session adoption offer

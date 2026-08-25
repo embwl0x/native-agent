@@ -2,10 +2,14 @@
 //   `chat-drive dispatch [--surface <surface>] <tool> <jsonInput>` — call SwiftToolDispatcher directly
 //     so we can verify each tool independent of the LLM tool loop.
 //   `chat-drive chat [--surface <surface>] '<message>'` — send a real chat turn through the SwiftNative
-//     path and print the full result.
+//     path and print the full result. `NATIVE_AGENT_CHAT_DRIVE_REPLY` is a
+//     guarded hermetic provider fixture for subprocess evaluation only.
+//     `NA_CHAT_SESSION` optionally supplies the durable session identity and
+//     is normalized before this CLI opens provider or persistence state.
 //   `chat-drive stream [--surface <surface>] '<message>'` — send the same turn through the streaming
 //     path the Mac UI uses.
-//   `chat-drive provider-prefs [surface]` — print Swift provider model picks.
+//   `chat-drive provider-prefs [surface]` — print checked read-only Swift
+//     provider/model picks without recovering pending picker state.
 //   `chat-drive doctor [--repair true|false] [--check-llm true|false]` — run Swift Doctor checks.
 //   `chat-drive memory-migrate <dataRoot>` — run MemoryV2 migration/repair.
 //   `chat-drive memory-recall <dataRoot> '<query>' [k]` — verify SQLite recall.
@@ -32,6 +36,7 @@ import Context
 import KnowledgeGraph
 import MemoryV2
 import PersistenceCore
+import PersonaEngine
 import ProviderRouting
 import DoctorChecks
 import TrustCenter
@@ -39,15 +44,138 @@ import WorkshopExecution
 
 @main
 struct ChatDriveMain {
+    /// One canonical command vocabulary for both the visible CLI contract and
+    /// the production router. An added help name with no router case, or a
+    /// deleted router case with a still-advertised name, is now impossible:
+    /// this `CaseIterable` enum drives usage and the exhaustive switch below.
+    private enum Command: String, CaseIterable {
+        case dispatch
+        case chat
+        case stream
+        case providerPrefs = "provider-prefs"
+        case doctor
+        case memoryMigrate = "memory-migrate"
+        case memoryRecall = "memory-recall"
+        case memoryEmbeddingEpoch = "memory-embedding-epoch"
+        case memoryEval = "memory-eval"
+        case memoryHygiene = "memory-hygiene"
+        case livingFabricEval = "living-fabric-eval"
+        case procedure
+        case physiologySoakReport = "physiology-soak-report"
+        case workshopCancel = "workshop-cancel"
+        case providerTransplantEval = "provider-transplant-eval"
+        case providerTransplantFixture = "provider-transplant-fixture"
+
+        static var usage: String {
+            "usage: chat-drive {\(Self.allCases.map(\.rawValue).joined(separator: "|"))} ..."
+        }
+    }
+
+    /// Fixture-only provider transport for the executable's hermetic stream
+    /// evaluation. It is deliberately local to ChatDrive: production routing
+    /// never sees it, and callers must opt in through the guarded environment
+    /// checked by `streamClientForCurrentProcess()`.
+    private final class ChatDriveHermeticStreamingLLM: LLMClient, StreamingLLMClient, MessagesStreamingLLMClient, @unchecked Sendable {
+        private let chunks: [String]
+
+        init(chunks: [String]) {
+            self.chunks = chunks
+        }
+
+        private var reply: String { chunks.joined() }
+
+        func complete(prompt: String, system: String?, model: String?) async throws -> String {
+            reply
+        }
+
+        func complete(
+            prompt: String,
+            system: String?,
+            model: String?,
+            surface: String
+        ) async throws -> String {
+            reply
+        }
+
+        func complete(
+            prompt: String,
+            system: String?,
+            model: String?,
+            tools: [LLMToolSchema]?
+        ) async throws -> String {
+            reply
+        }
+
+        func completeMessages(
+            messages: [LLMMessage],
+            system: String?,
+            model: String?,
+            surface: String,
+            tools: [LLMToolSchema]?
+        ) async throws -> String {
+            reply
+        }
+
+        func stream(
+            prompt: String,
+            system: String?,
+            model: String?
+        ) -> AsyncThrowingStream<String, Error> {
+            let chunks = self.chunks
+            return AsyncThrowingStream { continuation in
+                Task {
+                    for chunk in chunks { continuation.yield(chunk) }
+                    continuation.finish()
+                }
+            }
+        }
+
+        func streamMessages(
+            messages: [LLMMessage],
+            system: String?,
+            model: String?,
+            surface: String,
+            tools: [LLMToolSchema]?
+        ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
+            let chunks = self.chunks
+            return AsyncThrowingStream { continuation in
+                Task {
+                    for chunk in chunks { continuation.yield(.textDelta(chunk)) }
+                    continuation.finish()
+                }
+            }
+        }
+    }
+
+    private struct ChatDriveHermeticNoTools: ToolDispatchClient {
+        func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue { .null }
+        func listAvailableTools() async throws -> [String] { [] }
+    }
+
     static func main() async throws {
         let args = Array(CommandLine.arguments.dropFirst())
-        guard let mode = args.first else {
-            FileHandle.standardError.write(Data("usage: chat-drive {dispatch|chat|stream|provider-prefs|doctor|memory-migrate|memory-recall|memory-embedding-epoch|memory-eval|memory-hygiene|living-fabric-eval|procedure|physiology-soak-report|workshop-cancel|provider-transplant-fixture|provider-transplant-eval} ...\n".utf8))
+        guard let rawMode = args.first else {
+            FileHandle.standardError.write(Data((Command.usage + "\n").utf8))
             exit(64)
+        }
+        if ["help", "--help", "-h"].contains(rawMode) {
+            print(Command.usage)
+            return
+        }
+        guard let mode = Command(rawValue: rawMode) else {
+            FileHandle.standardError.write(Data("unknown mode: \(rawMode)\n".utf8))
+            exit(64)
+        }
+        // This is intentionally a router-level acknowledgement, not a
+        // command implementation shortcut: it lets automation probe every
+        // declared command without triggering a writer or provider call.
+        if args.dropFirst().elementsEqual(["--help"]) {
+            print("usage: chat-drive \(mode.rawValue) ...")
+            return
         }
 
         switch mode {
-        case "dispatch":
+        case .dispatch:
             let parsed = parseOptions(Array(args.dropFirst()), allowedOptions: ["surface"])
             guard parsed.positionals.count >= 1 else {
                 FileHandle.standardError.write(Data("usage: chat-drive dispatch [--surface <surface>] <tool> [<jsonInput>]\n".utf8))
@@ -61,7 +189,7 @@ struct ChatDriveMain {
                 surface: parsed.options["surface"] ?? "chat"
             )
 
-        case "chat":
+        case .chat:
             let parsed = parseOptions(Array(args.dropFirst()), allowedOptions: ["surface", "model", "effort"])
             let prompt = parsed.positionals.joined(separator: " ")
             guard !prompt.isEmpty else {
@@ -75,7 +203,7 @@ struct ChatDriveMain {
                 effortOverride: parsed.options["effort"]
             )
 
-        case "stream":
+        case .stream:
             let parsed = parseOptions(Array(args.dropFirst()), allowedOptions: ["surface", "model", "effort"])
             let prompt = parsed.positionals.joined(separator: " ")
             guard !prompt.isEmpty else {
@@ -89,25 +217,28 @@ struct ChatDriveMain {
                 effortOverride: parsed.options["effort"]
             )
 
-        case "provider-prefs":
-            let surface = args.count >= 2 ? args[1] : nil
-            try await runProviderPrefs(surface: surface)
+        case .providerPrefs:
+            let parsed = parseOptions(Array(args.dropFirst()), allowedOptions: [])
+            guard parsed.positionals.count <= 1 else {
+                commandLineUsageError("usage: chat-drive provider-prefs [surface]")
+            }
+            try await runProviderPrefs(surface: parsed.positionals.first)
 
-        case "doctor":
+        case .doctor:
             let parsed = parseOptions(Array(args.dropFirst()), allowedOptions: ["repair", "check-llm"])
             try await runDoctor(
                 repair: boolOption(parsed.options["repair"], defaultValue: false),
                 checkLLM: boolOption(parsed.options["check-llm"], defaultValue: false)
             )
 
-        case "memory-migrate":
+        case .memoryMigrate:
             guard args.count >= 2 else {
                 FileHandle.standardError.write(Data("usage: chat-drive memory-migrate <dataRoot>\n".utf8))
                 exit(64)
             }
             try await runMemoryMigrate(dataRootPath: args[1])
 
-        case "memory-recall":
+        case .memoryRecall:
             guard args.count >= 3 else {
                 FileHandle.standardError.write(Data("usage: chat-drive memory-recall <dataRoot> '<query>' [k]\n".utf8))
                 exit(64)
@@ -115,7 +246,7 @@ struct ChatDriveMain {
             let k = args.count >= 4 ? Int(args[3]) ?? 5 : 5
             try await runMemoryRecall(dataRootPath: args[1], query: args[2], k: k)
 
-        case "memory-embedding-epoch":
+        case .memoryEmbeddingEpoch:
             guard args.count >= 3 else {
                 FileHandle.standardError.write(Data(
                     "usage: chat-drive memory-embedding-epoch {status|activate|rollback} <dataRoot>\n".utf8
@@ -124,7 +255,7 @@ struct ChatDriveMain {
             }
             try await runMemoryEmbeddingEpoch(action: args[1], dataRootPath: args[2])
 
-        case "memory-eval":
+        case .memoryEval:
             let parsed = parseOptions(Array(args.dropFirst()), allowedOptions: ["query-mode"])
             guard parsed.positionals.count >= 1 else {
                 FileHandle.standardError.write(Data("usage: chat-drive memory-eval [--query-mode natural|compact] <dataRoot>\n".utf8))
@@ -135,7 +266,7 @@ struct ChatDriveMain {
                 queryMode: parsed.options["query-mode"] ?? "natural"
             )
 
-        case "memory-hygiene":
+        case .memoryHygiene:
             let parsed = parseOptions(Array(args.dropFirst()), allowedOptions: ["approve-swap", "max-passes"])
             guard parsed.positionals.count >= 1 else {
                 FileHandle.standardError.write(Data("usage: chat-drive memory-hygiene [--approve-swap true|false] [--max-passes n] <dataRoot>\n".utf8))
@@ -143,18 +274,26 @@ struct ChatDriveMain {
             }
             try await runMemoryHygiene(
                 dataRootPath: parsed.positionals[0],
-                approveSwap: boolOption(parsed.options["approve-swap"], defaultValue: false),
-                maxPasses: max(1, Int(parsed.options["max-passes"] ?? "2") ?? 2)
+                approveSwap: strictBoolOption(
+                    parsed.options["approve-swap"],
+                    defaultValue: false,
+                    optionName: "approve-swap"
+                ),
+                maxPasses: strictPositiveIntOption(
+                    parsed.options["max-passes"],
+                    defaultValue: 2,
+                    optionName: "max-passes"
+                )
             )
 
-        case "living-fabric-eval":
+        case .livingFabricEval:
             guard args.count >= 2 else {
                 FileHandle.standardError.write(Data("usage: chat-drive living-fabric-eval <dataRoot>\n".utf8))
                 exit(64)
             }
             try await runLivingFabricEval(dataRootPath: args[1])
 
-        case "procedure":
+        case .procedure:
             let parsed = parseOptions(
                 Array(args.dropFirst()),
                 allowedOptions: [
@@ -167,9 +306,24 @@ struct ChatDriveMain {
                 ))
                 exit(64)
             }
+            let action = parsed.positionals[0]
+            guard [
+                "status", "stage-review", "compile", "invoke", "stage-activation", "activate", "deactivate",
+            ].contains(action) else {
+                commandLineUsageError(
+                    "procedure action must be status, stage-review, compile, invoke, stage-activation, activate, or deactivate"
+                )
+            }
+            if let scope = parsed.options["scope"], !["manual", "canary"].contains(scope) {
+                commandLineUsageError("procedure scope must be manual or canary")
+            }
+            if action == "activate",
+               (parsed.options["approval"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) {
+                commandLineUsageError("procedure activate requires --approval <resolved-local-id>")
+            }
             do {
                 try await runProcedureOperator(
-                    action: parsed.positionals[0],
+                    action: action,
                     dataRootPath: parsed.positionals[1],
                     shapeID: parsed.positionals.count >= 3 ? parsed.positionals[2] : nil,
                     approvalID: parsed.options["approval"],
@@ -183,23 +337,31 @@ struct ChatDriveMain {
                 exit(1)
             }
 
-        case "physiology-soak-report":
+        case .physiologySoakReport:
             guard args.count >= 2 else {
                 FileHandle.standardError.write(Data("usage: chat-drive physiology-soak-report <dataRoot>\n".utf8))
                 exit(64)
             }
             try await runPhysiologySoakReport(dataRootPath: args[1])
 
-        case "workshop-cancel":
-            guard args.count >= 3 else {
+        case .workshopCancel:
+            guard args.count == 3,
+                  !args[1].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !args[2].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 FileHandle.standardError.write(Data(
                     "usage: chat-drive workshop-cancel <dataRoot> <executionId>\n".utf8
                 ))
                 exit(64)
             }
-            try await runWorkshopCancel(dataRootPath: args[1], executionID: args[2])
+            do {
+                try await runWorkshopCancel(dataRootPath: args[1], executionID: args[2])
+            } catch {
+                let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+                FileHandle.standardError.write(Data("workshop-cancel failed: \(message)\n".utf8))
+                exit(1)
+            }
 
-        case "provider-transplant-eval":
+        case .providerTransplantEval:
             let parsed = parseOptions(
                 Array(args.dropFirst()),
                 allowedOptions: ["fixture", "authorization", "public-safe", "output"]
@@ -215,15 +377,19 @@ struct ChatDriveMain {
                 ProcessInfo.processInfo.environment["NATIVEAGENT_PUBLIC_SAFE_MODE"],
                 defaultValue: false
             )
+            let effectivePublicSafe = environmentPublicSafe
+                || boolOption(parsed.options["public-safe"], defaultValue: false)
+            FileHandle.standardError.write(Data(
+                "[provider-transplant-eval] publicSafeMode=\(effectivePublicSafe) envForced=\(environmentPublicSafe)\n".utf8
+            ))
             try await runProviderTransplantEvalV2(
                 fixturePath: fixturePath,
                 authorizationPath: parsed.options["authorization"],
                 outputPath: parsed.options["output"],
-                publicSafeMode: environmentPublicSafe
-                    || boolOption(parsed.options["public-safe"], defaultValue: false)
+                publicSafeMode: effectivePublicSafe
             )
 
-        case "provider-transplant-fixture":
+        case .providerTransplantFixture:
             let parsed = parseOptions(
                 Array(args.dropFirst()),
                 allowedOptions: ["targets", "output", "mode", "lifetime-seconds"]
@@ -242,9 +408,6 @@ struct ChatDriveMain {
                 lifetimeSeconds: parsed.options["lifetime-seconds"]
             )
 
-        default:
-            FileHandle.standardError.write(Data("unknown mode: \(mode)\n".utf8))
-            exit(64)
         }
     }
 
@@ -256,10 +419,11 @@ struct ChatDriveMain {
             let arg = args[i]
             if arg.hasPrefix("--") {
                 let key = String(arg.dropFirst(2))
-                guard allowedOptions.contains(key), i + 1 < args.count else {
-                    positionals.append(arg)
-                    i += 1
-                    continue
+                guard allowedOptions.contains(key) else {
+                    commandLineUsageError("unknown option: \(arg)")
+                }
+                guard i + 1 < args.count, !args[i + 1].hasPrefix("--") else {
+                    commandLineUsageError("option \(arg) requires a value")
                 }
                 options[key] = args[i + 1]
                 i += 2
@@ -280,16 +444,44 @@ struct ChatDriveMain {
         }
     }
 
+    /// Options that control a persistent mutation must not silently turn an
+    /// unparseable value into a benign-looking default. The doctor command
+    /// deliberately retains its fail-closed default; memory hygiene instead
+    /// rejects malformed write controls before it opens a store.
+    static func strictBoolOption(_ raw: String?, defaultValue: Bool, optionName: String) -> Bool {
+        guard let raw else { return defaultValue }
+        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "1", "true", "yes", "y", "on": return true
+        case "0", "false", "no", "n", "off": return false
+        default: commandLineUsageError("option --\(optionName) must be true or false")
+        }
+    }
+
+    static func strictPositiveIntOption(_ raw: String?, defaultValue: Int, optionName: String) -> Int {
+        guard let raw else { return defaultValue }
+        guard let value = Int(raw), value > 0 else {
+            commandLineUsageError("option --\(optionName) must be a positive integer")
+        }
+        return value
+    }
+
+    static func commandLineUsageError(_ message: String) -> Never {
+        FileHandle.standardError.write(Data("chat-drive: \(message)\n".utf8))
+        exit(64)
+    }
+
     static func runDispatch(tool: String, jsonInput: String, surface: String) async throws {
         FileHandle.standardError.write(Data("[dispatch] surface=\(surface) tool=\(tool) input=\(jsonInput)\n".utf8))
-        let d = SwiftToolDispatcher()
         // Parse input JSON
-        var input: [String: JSONValue] = [:]
-        if let data = jsonInput.data(using: .utf8),
-           let parsed = try? JSONValue.parse(data),
-           case .object(let o) = parsed {
-            input = o
+        guard let data = jsonInput.data(using: .utf8),
+              let parsed = try? JSONValue.parse(data),
+              case .object(let input) = parsed else {
+            commandLineUsageError("dispatch input must be a JSON object")
         }
+        // Input validation is deliberately before dispatcher construction.
+        // `SwiftToolDispatcher` resolves the active data root and owner-backed
+        // services; a malformed diagnostic argv must not even open that seam.
+        let d = SwiftToolDispatcher(enforceLazyToolLoading: false)
         do {
             let result = try await d.dispatch(tool: tool, input: input, surface: surface)
             print("=== \(tool) returned ===")
@@ -311,17 +503,20 @@ struct ChatDriveMain {
         modelOverride: String?,
         effortOverride: String?
     ) async throws {
-        let sessionId = ProcessInfo.processInfo.environment["NA_CHAT_SESSION"]
-            ?? "drive-\(UUID().uuidString.prefix(8))"
-        let prefs = try? await SwiftNativeProviderRouting().computeModelPreferences()
-        let pick = prefs?[surface] ?? prefs?["chat"]
-        let model = modelOverride ?? pick?.model ?? "claude-opus-4-8"
-        let effort = effortOverride ?? pick?.reasoningEffort ?? "medium"
+        let sessionId = chatDriveSessionID(fallbackPrefix: "drive")
+        // Validate the guarded subprocess transport before asking the router
+        // for defaults. `computeModelPreferences()` opens (and may create)
+        // root-backed provider state, so an invalid fixture invocation must be
+        // refused before any data-root byte can exist — mirroring runStream.
+        let client = try chatClientForCurrentProcess()
+        let prefs = try await SwiftNativeProviderRouting().computeModelPreferences()
+        let pick = prefs[canonicalRoutingSurface(surface)] ?? prefs["chat"]
+        guard let pick else { throw ProviderRoutingError.unavailable }
+        let model = modelOverride ?? pick.model
+        let effort = effortOverride ?? pick.reasoningEffort
         FileHandle.standardError.write(
             Data("[chat] sessionId=\(sessionId)\n[chat] surface=\(surface) model=\(model) effort=\(effort)\n[chat] prompt=\(prompt)\n".utf8)
         )
-
-        let client = makeChatOrchestrationClient()
         let started = Date()
         do {
             let resp = try await client.chat(
@@ -335,7 +530,18 @@ struct ChatDriveMain {
                 surface: surface,
                 suppressUserAppend: false
             )
+            guard !resp.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw NSError(
+                    domain: "ChatDrive",
+                    code: -2,
+                    userInfo: [NSLocalizedDescriptionKey: "chat completed without assistant text"]
+                )
+            }
             let elapsed = Int(Date().timeIntervalSince(started) * 1000)
+            // The app process outlives its detached trace writes; this CLI
+            // exits right here. Await the trace lanes so the turn's durable
+            // receipts (turn.terminal included) cannot lose the race with exit.
+            await drainTurnTracePersistence()
             print("--- ASSISTANT REPLY ---")
             print(resp.output)
             print("--- META ---")
@@ -344,10 +550,32 @@ struct ChatDriveMain {
             print("session:", resp.sessionId ?? "(nil)")
             print("elapsed_ms:", elapsed)
         } catch {
+            // Error turns emit traces too — drain before the failure exit so
+            // a failed turn's receipts are as durable as a successful one's.
+            await drainTurnTracePersistence()
             print("--- ERROR ---")
             print("\(error)")
             exit(1)
         }
+    }
+
+    /// The ordinary CLI builds the production client. This fixture seam is
+    /// intentionally narrower than a provider setting: it replaces only the
+    /// transport after an explicit hermetic opt-in, while retaining the real
+    /// ChatDrive command, session persistence, routing admission, orchestration,
+    /// and terminal-trace path used by the non-streaming CLI.
+    static func chatClientForCurrentProcess() throws -> any ChatOrchestrationClient {
+        let environment = ProcessInfo.processInfo.environment
+        guard let reply = environment["NATIVE_AGENT_CHAT_DRIVE_REPLY"] else {
+            return makeChatOrchestrationClient()
+        }
+        guard environment["NATIVE_AGENT_CHAT_DRIVE_HERMETIC"] == "1" else {
+            commandLineUsageError("NATIVE_AGENT_CHAT_DRIVE_REPLY requires NATIVE_AGENT_CHAT_DRIVE_HERMETIC=1")
+        }
+        guard !reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            commandLineUsageError("NATIVE_AGENT_CHAT_DRIVE_REPLY must be non-empty")
+        }
+        return hermeticClient(chunks: [reply])
     }
 
     static func runStream(
@@ -356,20 +584,24 @@ struct ChatDriveMain {
         modelOverride: String?,
         effortOverride: String?
     ) async throws {
-        let sessionId = ProcessInfo.processInfo.environment["NA_CHAT_SESSION"]
-            ?? "drive-stream-\(UUID().uuidString.prefix(8))"
-        let prefs = try? await SwiftNativeProviderRouting().computeModelPreferences()
-        let pick = prefs?[surface] ?? prefs?["chat"]
-        let model = modelOverride ?? pick?.model ?? "claude-opus-4-8"
-        let effort = effortOverride ?? pick?.reasoningEffort ?? "medium"
+        let sessionId = chatDriveSessionID(fallbackPrefix: "drive-stream")
+        // Validate the guarded subprocess transport before asking the router
+        // for defaults. Invalid fixture input must not open a root-backed
+        // routing seam as a side effect of a command-line usage error.
+        let client = try streamClientForCurrentProcess()
+        let prefs = try await SwiftNativeProviderRouting().computeModelPreferences()
+        let pick = prefs[canonicalRoutingSurface(surface)] ?? prefs["chat"]
+        guard let pick else { throw ProviderRoutingError.unavailable }
+        let model = modelOverride ?? pick.model
+        let effort = effortOverride ?? pick.reasoningEffort
         FileHandle.standardError.write(
             Data("[stream] sessionId=\(sessionId)\n[stream] surface=\(surface) model=\(model) effort=\(effort)\n[stream] prompt=\(prompt)\n".utf8)
         )
 
-        let client = makeChatOrchestrationClient()
         let started = Date()
         var accumulated = ""
         var finalReply: String?
+        var deltaCount = 0
         do {
             for try await event in client.chatStream(
                 message: prompt,
@@ -385,6 +617,7 @@ struct ChatDriveMain {
                 switch event {
                 case .delta(let text):
                     accumulated += text
+                    deltaCount += 1
                     print(text, terminator: "")
                     fflush(stdout)
                 case .toolUse(let name, _):
@@ -403,31 +636,162 @@ struct ChatDriveMain {
                     )
                 }
             }
+            guard deltaCount > 0 else {
+                throw NSError(
+                    domain: "ChatDriveStream",
+                    code: -2,
+                    userInfo: [NSLocalizedDescriptionKey: "stream ended without an assistant delta"]
+                )
+            }
+            guard let finalReply else {
+                throw NSError(
+                    domain: "ChatDriveStream",
+                    code: -3,
+                    userInfo: [NSLocalizedDescriptionKey: "stream ended without a terminal event"]
+                )
+            }
+            guard finalReply == accumulated else {
+                throw NSError(
+                    domain: "ChatDriveStream",
+                    code: -4,
+                    userInfo: [NSLocalizedDescriptionKey: "stream deltas did not equal terminal reply"]
+                )
+            }
             let elapsed = Int(Date().timeIntervalSince(started) * 1000)
+            // Same process-exit drain as runChat: the stream's terminal trace
+            // is fired before the event stream finishes, but its disk append
+            // is detached and must be awaited before this short-lived process
+            // exits.
+            await drainTurnTracePersistence()
             print("\n--- STREAM META ---")
-            print("reply:", finalReply ?? accumulated)
+            print("reply:", finalReply)
+            print("delta_count:", deltaCount)
             print("session:", sessionId)
             print("elapsed_ms:", elapsed)
         } catch {
+            await drainTurnTracePersistence()
             print("\n--- STREAM ERROR ---")
             print("\(error)")
             exit(1)
         }
     }
 
+    /// The CLI's new-conversation owner. A missing environment value creates
+    /// one fresh owned session; a supplied value is normalized through the
+    /// same path-safe identity owner persistence rechecks later. Invalid
+    /// input must not turn into a fresh UUID, because that silently splits a
+    /// headless multi-turn conversation into an orphan session.
+    static func chatDriveSessionID(fallbackPrefix: String) -> String {
+        if let raw = ProcessInfo.processInfo.environment["NA_CHAT_SESSION"] {
+            guard let normalized = NativeAgentChatSessionID.normalizedPathComponent(raw) else {
+                commandLineUsageError(
+                    "NA_CHAT_SESSION must be a non-empty filesystem-safe chat session id"
+                )
+            }
+            return normalized
+        }
+        return "\(fallbackPrefix)-\(UUID().uuidString.prefix(8))"
+    }
+
+    /// Turn-trace persistence is fire-and-forget off the turn path: the plan
+    /// row rides `TurnPlanTraceWriter`'s chained writer and every bus event
+    /// (terminal receipt included) rides the emission→deliver→persist pumps.
+    /// The app stays alive so those detached writes always land; this CLI
+    /// exits immediately after one turn, so it must await the same drains the
+    /// app runs at termination. Event-driven waits only — no sleeps.
+    static func drainTurnTracePersistence() async {
+        await TurnPlanTraceWriter.shared.drain()
+        await TurnTraceBus.shared.drainForProcessExit()
+    }
+
+    /// The ordinary CLI always builds the production client.  The environment
+    /// fixture exists solely for a subprocess evaluation of this executable:
+    /// it still exercises the real chat-stream façade, persistence, and trace
+    /// writer, but replaces only the provider transport with declared chunks.
+    /// An accidentally-present chunk variable is rejected unless the explicit
+    /// hermetic opt-in accompanies it, so diagnostics cannot silently pretend
+    /// to be a live provider turn.
+    static func streamClientForCurrentProcess() throws -> any ChatOrchestrationClient {
+        let environment = ProcessInfo.processInfo.environment
+        guard let rawChunks = environment["NATIVE_AGENT_CHAT_DRIVE_STREAM_CHUNKS"] else {
+            return makeChatOrchestrationClient()
+        }
+        guard environment["NATIVE_AGENT_CHAT_DRIVE_HERMETIC"] == "1" else {
+            commandLineUsageError("NATIVE_AGENT_CHAT_DRIVE_STREAM_CHUNKS requires NATIVE_AGENT_CHAT_DRIVE_HERMETIC=1")
+        }
+        guard let data = rawChunks.data(using: .utf8),
+              let chunks = try? JSONDecoder().decode([String].self, from: data),
+              !chunks.isEmpty,
+              chunks.allSatisfy({ !$0.isEmpty }) else {
+            commandLineUsageError("NATIVE_AGENT_CHAT_DRIVE_STREAM_CHUNKS must be a non-empty JSON string array")
+        }
+
+        return hermeticClient(chunks: chunks)
+    }
+
+    /// Shared assembly for the two explicitly opt-in subprocess fixtures.
+    /// The fixture only supplies deterministic provider output; all stateful
+    /// chat owners are still bound to the caller's exact data root.
+    private static func hermeticClient(chunks: [String]) -> any ChatOrchestrationClient {
+        let dataRoot = PersistenceCore.defaultDataRoot()
+        let llm = ChatDriveHermeticStreamingLLM(chunks: chunks)
+        let tools = ChatDriveHermeticNoTools()
+        let engine = SwiftNativeTurnEngine(
+            persona: SwiftNativePersonaEngine.isolated(dataRoot: dataRoot),
+            memory: nil,
+            router: SwiftNativeProviderRouting(dataRoot: dataRoot),
+            trust: SwiftNativeTrustCenter(dataRoot: dataRoot),
+            llm: llm,
+            tools: tools,
+            remPinsDataRoot: dataRoot,
+            memoryPromoter: nil
+        )
+        return makeChatOrchestrationClient(
+            engine: engine,
+            llm: llm,
+            tools: tools,
+            dataRoot: dataRoot,
+            streamingLLM: llm
+        )
+    }
+
     static func runProviderPrefs(surface: String?) async throws {
-        let prefs = try await SwiftNativeProviderRouting().computeModelPreferences()
+        let routing = SwiftNativeProviderRouting()
+        // This is deliberately the no-recovery read: an operator's probe must
+        // never repair a partial provider-selection transaction as a side
+        // effect. Pending/corrupt authority is an explicit failed probe.
+        let snapshot = try await routing.checkedRoutingSnapshotReadOnly()
+        let prefs = snapshot.preferences
         func object(_ pref: SurfacePreference) -> JSONValue {
-            .object([
+            let activeProvider = ProviderRoutingSurfaceLookup.value(
+                snapshot.activeProviders,
+                pref.surface
+            )?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let inferredProvider = routing.inferProviderForModel(pref.model)
+            // This mirrors the LLM adapter's no-active-provider fallback: a
+            // model family chooses its provider; an unknown but valid model
+            // reaches the Codex adapter. Never emit an empty provider and
+            // never hide which branch produced the receipt.
+            let provider = (activeProvider?.isEmpty == false ? activeProvider : nil)
+                ?? inferredProvider
+                ?? "codex"
+            let providerSource = activeProvider?.isEmpty == false
+                ? "active_provider"
+                : inferredProvider == nil ? "codex_fallback" : "model_family"
+            return .object([
                 "surface": .string(pref.surface),
+                "provider": .string(provider),
+                "providerSource": .string(providerSource),
                 "model": .string(pref.model),
                 "reasoningEffort": .string(pref.reasoningEffort),
+                "serviceTier": .string(pref.serviceTier),
                 "modelKnown": pref.modelKnown.map { .bool($0) } ?? .null,
             ])
         }
         let out: JSONValue
         if let surface, !surface.isEmpty {
-            guard let pref = prefs[surface] else {
+            let canonicalSurface = canonicalRoutingSurface(surface)
+            guard let pref = prefs[canonicalSurface] else {
                 FileHandle.standardError.write(Data("unknown surface: \(surface)\n".utf8))
                 exit(64)
             }
@@ -445,6 +809,10 @@ struct ChatDriveMain {
         outputPath: String?,
         publicSafeMode: Bool
     ) async throws {
+        // Public-safe mode is a process boundary, not merely a provider-runner
+        // option. Refuse before opening artifacts, registries, or output paths
+        // so the env override is both no-egress and byte-preserving.
+        guard !publicSafeMode else { throw FrozenMindEvaluationError.publicSafeMode }
         // V2 intentionally constructs only the configured provider router and
         // LLM adapters. It never constructs ChatOrchestration, persona, memory,
         // cognition, tools, feedback, or an action dispatcher.
@@ -807,25 +1175,88 @@ struct ChatDriveMain {
 
     static func runMemoryEval(dataRootPath: String, queryMode: String) async throws {
         let dataRoot = URL(fileURLWithPath: dataRootPath).standardizedFileURL
-        let liveStorage = try MemoryStorage(dataRoot: dataRoot)
+        let embeddingMock = ProcessInfo.processInfo.environment["NATIVE_AGENT_EMBEDDING_MOCK"] == "1"
+        if embeddingMock,
+           ProcessInfo.processInfo.environment["NATIVEAGENT_RELEASE_GATE"] == "1" {
+            throw NSError(domain: "ChatDriveMemoryEval", code: 2, userInfo: [
+                NSLocalizedDescriptionKey:
+                    "memory-eval refuses NATIVE_AGENT_EMBEDDING_MOCK=1 in release-gate mode",
+            ])
+        }
+        let loadedProbeSet = try MemoryProbeSet.loadForEvaluation(dataRoot: dataRoot)
+        let probeSet = probeSetForEval(loadedProbeSet, queryMode: queryMode)
+        guard !probeSet.probes.isEmpty else {
+            throw MemoryProbeRunner.ProbeRunnerError.emptyProbeSet
+        }
+        let embedder: any EmbeddingProvider
+        if embeddingMock {
+            embedder = MockEmbeddingProvider(dimensions: 384)
+        } else if let coreML = try? CoreMLEmbeddingProvider.bundled() {
+            embedder = coreML
+        } else {
+            let out: JSONValue = .object([
+                "dataRoot": .string(dataRoot.path),
+                "embeddingMock": .bool(false),
+                "queryMode": .string(normalizedEvalQueryMode(queryMode)),
+                "total": .int(0),
+                "frozenCopy": .bool(false),
+                "liveStoreMutated": .bool(false),
+                "verdict": .object([
+                    "status": .string("unavailable"),
+                    "reason": .string(
+                        "CoreML embedding provider is unavailable; memory-eval did not execute probes"
+                    ),
+                    "probesExecuted": .int(0),
+                ]),
+            ])
+            print((try? out.serialize(pretty: true)) ?? "\(out)")
+            throw NSError(domain: "ChatDriveMemoryEval", code: 3, userInfo: [
+                NSLocalizedDescriptionKey:
+                    "memory-eval cannot score without the CoreML embedding provider",
+            ])
+        }
+        // Never open the caller's store: even a "read" open of the SQLite pool
+        // rewrites WAL/SHM sidecars and runs migrations, mutating a root this
+        // evaluation promises to leave byte-identical (liveStoreMutated=false
+        // must be a fact, not a claim). Freeze by byte-copying the memory
+        // directory into a private temp root and open ONLY the copy.
         let frozenRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("nativeagent-memory-eval-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: frozenRoot) }
-        let storage = try await liveStorage.frozenCopy(at: frozenRoot)
-        let loadedProbeSet = MemoryProbeSet.load(dataRoot: dataRoot)
-        let probeSet = probeSetForEval(loadedProbeSet, queryMode: queryMode)
-        let embedder: any EmbeddingProvider = {
-            if let coreML = try? CoreMLEmbeddingProvider.bundled() { return coreML }
-            if ProcessInfo.processInfo.environment["NATIVE_AGENT_EMBEDDING_MOCK"] == "1" {
-                return MockEmbeddingProvider(dimensions: 384)
-            }
-            return FailClosedEmbeddingProvider(dimensions: 384)
-        }()
+        try FileManager.default.createDirectory(at: frozenRoot, withIntermediateDirectories: true)
+        let sourceMemoryDirectory = dataRoot.appendingPathComponent("memory", isDirectory: true)
+        if FileManager.default.fileExists(atPath: sourceMemoryDirectory.path) {
+            try FileManager.default.copyItem(
+                at: sourceMemoryDirectory,
+                to: frozenRoot.appendingPathComponent("memory", isDirectory: true)
+            )
+        }
+        let storage = try MemoryStorage(dataRoot: frozenRoot)
         let started = Date()
-        let queryBatch = try await MemoryProbeRunner.embedQuestionsWithEpoch(
-            probeSet.probes,
-            embedder: embedder
-        )
+        let queryBatch: MemoryEmbeddingBatch
+        do {
+            queryBatch = try await MemoryProbeRunner.embedQuestionsWithEpoch(
+                probeSet.probes,
+                embedder: embedder
+            )
+        } catch {
+            let out: JSONValue = .object([
+                "dataRoot": .string(dataRoot.path),
+                "modelId": .string(embedder.modelId),
+                "embeddingMock": .bool(embeddingMock),
+                "queryMode": .string(normalizedEvalQueryMode(queryMode)),
+                "total": .int(0),
+                "frozenCopy": .bool(true),
+                "liveStoreMutated": .bool(false),
+                "verdict": .object([
+                    "status": .string("failed"),
+                    "reason": .string("embedding batch failed: \(error)"),
+                    "probesExecuted": .int(0),
+                ]),
+            ])
+            print((try? out.serialize(pretty: true)) ?? "\(out)")
+            throw error
+        }
         let score = try await MemoryProbeRunner.evaluate(
             storage: storage,
             probes: probeSet.probes,
@@ -851,6 +1282,7 @@ struct ChatDriveMain {
         let out: JSONValue = .object([
             "dataRoot": .string(dataRoot.path),
             "modelId": .string(embedder.modelId),
+            "embeddingMock": .bool(embeddingMock),
             "version": .int(Int64(probeSet.version)),
             "topK": .int(Int64(probeSet.topK)),
             "queryMode": .string(normalizedEvalQueryMode(queryMode)),
@@ -858,6 +1290,12 @@ struct ChatDriveMain {
             "hits": .int(Int64(score.hits)),
             "fraction": .double(score.fraction),
             "summary": .string(score.summary),
+            "verdict": .object([
+                "status": .string("scored"),
+                "summary": .string(score.summary),
+                "probesExecuted": .int(Int64(score.total)),
+                "allConfiguredProbesExecuted": .bool(score.total == probeSet.probes.count),
+            ]),
             "hitProbeIds": .array(score.hitProbeIds.map { .string($0) }),
             "misses": .array(missValues),
             "frozenCopy": .bool(true),
@@ -1166,16 +1604,77 @@ struct ChatDriveMain {
 
     static func runPhysiologySoakReport(dataRootPath: String) async throws {
         let dataRoot = URL(fileURLWithPath: dataRootPath, isDirectory: true).standardizedFileURL
-        let report = await InstalledPhysiologySoakStore(dataRoot: dataRoot).loadReport()
+        let loaded = await InstalledPhysiologySoakStore(dataRoot: dataRoot).loadReportWithEvidenceSource()
+        let output = PhysiologySoakReportOutput(
+            evidenceSourceState: loaded.evidenceSourceState,
+            retainedDayFileCount: loaded.retainedDayFileCount,
+            unreadableDayFileCount: loaded.unreadableDayFileCount,
+            report: loaded.report
+        )
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        print(String(decoding: try encoder.encode(report), as: UTF8.self))
+        print(String(decoding: try encoder.encode(output), as: UTF8.self))
+    }
+
+    /// CLI envelope for the real store load: keep the analyzer report intact,
+    /// while saying whether zero records came from a readable empty directory
+    /// or from an absent/unreadable evidence source.
+    private struct PhysiologySoakReportOutput: Encodable {
+        let schema = "chat-drive-physiology-soak-report.v1"
+        let evidenceSourceState: InstalledPhysiologySoakEvidenceSourceState
+        let retainedDayFileCount: Int
+        let unreadableDayFileCount: Int
+        let report: InstalledPhysiologySoakReport
+    }
+
+    /// Every Living Fabric projection carries the actual source-read result
+    /// alongside its bounded count. A zero projection has meaning only after
+    /// a source read; missing and unreadable sources must remain distinct.
+    private enum LivingFabricEvidenceSourceState: String {
+        case read
+        case sourceAbsent = "source absent"
+        case sourceUnreadable = "source unreadable"
+    }
+
+    private static func livingFabricDirectoryRead(
+        _ url: URL
+    ) -> (state: LivingFabricEvidenceSourceState, urls: [URL]) {
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            guard (attributes[.type] as? FileAttributeType) == .typeDirectory else {
+                return (.sourceUnreadable, [])
+            }
+            return (
+                .read,
+                try FileManager.default.contentsOfDirectory(
+                    at: url,
+                    includingPropertiesForKeys: [.isDirectoryKey, .contentModificationDateKey],
+                    options: [.skipsHiddenFiles]
+                )
+            )
+        } catch {
+            // Foundation reports a missing path as NSFileReadNoSuchFileError
+            // (260) from attributesOfItem/contentsOfDirectory; the legacy
+            // NSFileNoSuchFileError (4) is kept for completeness. Anything
+            // else (ENOTDIR, EACCES, ...) is a real read failure and must
+            // stay "source unreadable" — absence and unreadability are
+            // distinct receipt facts.
+            let nsError = error as NSError
+            let absent = nsError.domain == NSCocoaErrorDomain
+                && [NSFileReadNoSuchFileError, NSFileNoSuchFileError].contains(nsError.code)
+            return (absent ? .sourceAbsent : .sourceUnreadable, [])
+        }
     }
 
     private struct OperationalProcedureEvidence {
         let transitions: [CausalTransitionEvidence]
         let authoritativeOutcomes: [AuthoritativeTerminalOutcomeEvidence]
+        let githubCommandSourceState: LivingFabricEvidenceSourceState
+        let workshopExecutionSourceState: LivingFabricEvidenceSourceState
+        let workshopExecutionDirectoriesRead: Int
+        let workshopTimelineSourceState: LivingFabricEvidenceSourceState
+        let workshopTimelineFilesRead: Int
     }
 
     /// One bounded evidence reader shared by the Living Fabric report and the
@@ -1185,10 +1684,36 @@ struct ChatDriveMain {
     /// not actually admit.
     private static func collectOperationalProcedureEvidence(
         dataRoot: URL,
-        persistence: any PersistenceCoreProtocol
+        persistence: any PersistenceCoreProtocol,
+        tolerateUnreadableSources: Bool = false
     ) async throws -> OperationalProcedureEvidence {
-        var transitions = try await GitHubCommandStore(dataRoot: dataRoot)
-            .causalTransitionEvidence(limit: 2_048)
+        let fileManager = FileManager.default
+        let githubRoot = dataRoot.appendingPathComponent("workshop/github_command", isDirectory: true)
+        let githubOps = githubRoot.appendingPathComponent("ops.jsonl")
+        let githubBase = githubRoot.appendingPathComponent("ops_base.json")
+        let githubDirectoryRead = livingFabricDirectoryRead(githubRoot)
+        let githubSourceState: LivingFabricEvidenceSourceState
+        var transitions: [CausalTransitionEvidence]
+        if githubDirectoryRead.state != .read {
+            githubSourceState = githubDirectoryRead.state
+            transitions = []
+        } else if !fileManager.fileExists(atPath: githubOps.path),
+           !fileManager.fileExists(atPath: githubBase.path) {
+            githubSourceState = .sourceAbsent
+            transitions = []
+        } else {
+            do {
+                transitions = try await GitHubCommandStore(dataRoot: dataRoot)
+                    .causalTransitionEvidence(limit: 2_048)
+                githubSourceState = .read
+            } catch {
+                guard tolerateUnreadableSources else { throw error }
+                // This report is diagnostic. A bad canonical feed must not
+                // crash it into silence or become an empty transition count.
+                transitions = []
+                githubSourceState = .sourceUnreadable
+            }
+        }
         var authoritativeOutcomes: [AuthoritativeTerminalOutcomeEvidence] = []
         let workshopRunner = SwiftNativeWorkshopRunner(
             executorAvailable: false,
@@ -1198,18 +1723,21 @@ struct ChatDriveMain {
         let executionsRoot = dataRoot
             .appendingPathComponent("workshop", isDirectory: true)
             .appendingPathComponent("executions", isDirectory: true)
-        let executionDirectories = (try? FileManager.default.contentsOfDirectory(
-            at: executionsRoot,
-            includingPropertiesForKeys: [.isDirectoryKey, .contentModificationDateKey],
-            options: [.skipsHiddenFiles]
-        ))?.sorted {
+        let executionRead = livingFabricDirectoryRead(executionsRoot)
+        let executionDirectories = executionRead.urls.filter { url in
+            var isDirectory: ObjCBool = false
+            return fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory)
+                && isDirectory.boolValue
+        }.sorted {
             let lhs = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]))?
                 .contentModificationDate ?? .distantPast
             let rhs = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]))?
                 .contentModificationDate ?? .distantPast
             if lhs != rhs { return lhs < rhs }
             return $0.lastPathComponent < $1.lastPathComponent
-        } ?? []
+        }
+        var workshopTimelineFilesRead = 0
+        var workshopTimelineReadFailed = false
 
         // Builder evidence remains bounded before the final suffix so a
         // malformed/custom root cannot turn review staging into an archival
@@ -1218,11 +1746,24 @@ struct ChatDriveMain {
             let executionRecord = await workshopRunner.getWorkshopExecution(
                 directory.lastPathComponent
             )
-            let timeline = try await persistence.tailJSONL(
-                directory.appendingPathComponent("timeline.jsonl"),
-                limit: 256,
-                maxBytes: 512 * 1_024
-            )
+            let timelineURL = directory.appendingPathComponent("timeline.jsonl")
+            let timeline: [JSONValue]
+            if !fileManager.fileExists(atPath: timelineURL.path) {
+                timeline = []
+            } else {
+                do {
+                    timeline = try await persistence.tailJSONL(
+                        timelineURL,
+                        limit: 256,
+                        maxBytes: 512 * 1_024
+                    )
+                    workshopTimelineFilesRead += 1
+                } catch {
+                    guard tolerateUnreadableSources else { throw error }
+                    timeline = []
+                    workshopTimelineReadFailed = true
+                }
+            }
             transitions.append(contentsOf: SwiftNativeWorkshopRunner.causalTransitionEvidence(
                 executionId: directory.lastPathComponent,
                 timeline: timeline,
@@ -1238,9 +1779,17 @@ struct ChatDriveMain {
                 }
                 transitions = Array(transitions.suffix(20_000))
             }
-            if let action = try await workshopRunner.motorActionReadModel(
-                actionId: directory.lastPathComponent
-            ), let occurredAt = action.updatedAt {
+            let action: MotorActionReadModel?
+            do {
+                action = try await workshopRunner.motorActionReadModel(
+                    actionId: directory.lastPathComponent
+                )
+            } catch {
+                guard tolerateUnreadableSources else { throw error }
+                workshopTimelineReadFailed = true
+                action = nil
+            }
+            if let action, let occurredAt = action.updatedAt {
                 let kind: AuthoritativeTerminalOutcomeEvidence.Kind?
                 switch (action.phase, action.verification) {
                 case (.succeeded, .satisfied): kind = .verifiedSuccess
@@ -1264,9 +1813,24 @@ struct ChatDriveMain {
             if lhs != rhs { return lhs < rhs }
             return $0.operationId < $1.operationId
         }
+        let workshopTimelineSourceState: LivingFabricEvidenceSourceState
+        if workshopTimelineReadFailed {
+            workshopTimelineSourceState = .sourceUnreadable
+        } else if executionRead.state != .read {
+            workshopTimelineSourceState = executionRead.state
+        } else if !executionDirectories.isEmpty, workshopTimelineFilesRead == 0 {
+            workshopTimelineSourceState = .sourceAbsent
+        } else {
+            workshopTimelineSourceState = .read
+        }
         return OperationalProcedureEvidence(
             transitions: Array(transitions.suffix(20_000)),
-            authoritativeOutcomes: authoritativeOutcomes
+            authoritativeOutcomes: authoritativeOutcomes,
+            githubCommandSourceState: githubSourceState,
+            workshopExecutionSourceState: executionRead.state,
+            workshopExecutionDirectoriesRead: executionDirectories.count,
+            workshopTimelineSourceState: workshopTimelineSourceState,
+            workshopTimelineFilesRead: workshopTimelineFilesRead
         )
     }
 
@@ -1289,6 +1853,7 @@ struct ChatDriveMain {
                 "schema": .string("procedure.operator.status.v1"),
                 "artifactCount": .int(Int64(status.artifactCount)),
                 "corruptArtifactCount": .int(Int64(status.corruptArtifactCount)),
+                "corruptInvocationCount": .int(Int64(status.corruptInvocationCount)),
                 "invocationCount": .int(Int64(status.invocationCount)),
                 "manualInvocationCount": .int(Int64(status.manualInvocationCount)),
                 "automaticInvocationCount": .int(Int64(status.automaticInvocationCount)),
@@ -1594,7 +2159,8 @@ struct ChatDriveMain {
         let startedAt = Date()
         let dispatcher = SwiftToolDispatcher(
             dataRoot: dataRoot,
-            allowProcessGlobalTools: false
+            allowProcessGlobalTools: false,
+            enforceLazyToolLoading: false
         )
         let outcome = try await invocation.invokeManual(
             policyAllowed: {
@@ -1709,25 +2275,54 @@ struct ChatDriveMain {
         let evaluatedAt = Date()
         let persistence = SwiftNativePersistenceCore()
         let traceDirectory = dataRoot.appendingPathComponent("turn_traces", isDirectory: true)
-        let traceURLs = (try? FileManager.default.contentsOfDirectory(
-            at: traceDirectory,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        ))?
+        let traceDirectoryRead = livingFabricDirectoryRead(traceDirectory)
+        let traceURLs = traceDirectoryRead.urls
             .filter { $0.pathExtension == "jsonl" }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
-            ?? []
 
         // Turn trace retention is already bounded by the app. Keep this CLI
         // defensive as well so a malformed/custom root cannot turn a review
-        // command into an unbounded memory load.
+        // command into an unbounded memory load. The receipt is part of the
+        // report: an empty or imperfect input window must not look like an
+        // authoritative zero-recommendation result.
+        let maximumTraceFiles = 21
+        let perFileRowLimit = 20_000
+        let perFileByteLimit = 16 * 1_024 * 1_024
+        let maximumTraceEvents = 100_000
+        let selectedTraceURLs = Array(traceURLs.suffix(maximumTraceFiles))
         var traceEvents: [TurnTraceEvent] = []
         traceEvents.reserveCapacity(min(50_000, traceURLs.count * 2_000))
-        for url in traceURLs.suffix(21) {
-            let rows = try await persistence.tailJSONL(url, limit: 20_000, maxBytes: 16 * 1_024 * 1_024)
-            traceEvents.append(contentsOf: rows.compactMap(TurnTraceEvent.init(jsonRow:)))
-            if traceEvents.count > 100_000 {
-                traceEvents.removeFirst(traceEvents.count - 100_000)
+        var physicalTraceRowsScanned = 0
+        var malformedJSONTraceRows = 0
+        var rejectedTraceEventRows = 0
+        var byteWindowTruncatedFileCount = 0
+        var globallyDiscardedTraceEventCount = 0
+        var traceSourceState = traceDirectoryRead.state
+        var traceFilesRead = 0
+        for url in selectedTraceURLs {
+            do {
+                let receipt = try await persistence.tailJSONLReadReceipt(
+                    url,
+                    limit: perFileRowLimit,
+                    maxBytes: perFileByteLimit
+                )
+                traceFilesRead += 1
+                physicalTraceRowsScanned += receipt.physicalRowsScanned
+                malformedJSONTraceRows += receipt.malformedJSONRowCount
+                if receipt.truncatedToByteWindow {
+                    byteWindowTruncatedFileCount += 1
+                }
+                let decoded = receipt.rows.compactMap(TurnTraceEvent.init(jsonRow:))
+                rejectedTraceEventRows += receipt.rows.count - decoded.count
+                traceEvents.append(contentsOf: decoded)
+                if traceEvents.count > maximumTraceEvents {
+                    let discarded = traceEvents.count - maximumTraceEvents
+                    traceEvents.removeFirst(discarded)
+                    globallyDiscardedTraceEventCount += discarded
+                }
+            } catch {
+                traceSourceState = .sourceUnreadable
+                continue
             }
         }
         let shadow = MetacognitiveShadowEvaluation.evaluate(events: traceEvents)
@@ -1735,7 +2330,8 @@ struct ChatDriveMain {
 
         let operationalEvidence = try await collectOperationalProcedureEvidence(
             dataRoot: dataRoot,
-            persistence: persistence
+            persistence: persistence,
+            tolerateUnreadableSources: true
         )
         let transitions = operationalEvidence.transitions
         let authoritativeOutcomes = operationalEvidence.authoritativeOutcomes
@@ -1747,6 +2343,10 @@ struct ChatDriveMain {
         let procedureCandidates = ProcedureCandidateCompiler.evaluate(
             trajectories: procedureExtraction.trajectories
         )
+        let procedureRoot = dataRoot
+            .appendingPathComponent("living_fabric", isDirectory: true)
+            .appendingPathComponent("procedures", isDirectory: true)
+        let procedureSourceRead = livingFabricDirectoryRead(procedureRoot)
         let procedureArtifacts = await ProcedureArtifactStore(dataRoot: dataRoot).statusSnapshot()
         let outcomeReport = CausalTerminalOutcomeClassifier.classify(
             transitions: transitions,
@@ -1790,6 +2390,13 @@ struct ChatDriveMain {
                 return (nil, "malformed")
             }
         }()
+        func artifactSourceState(_ status: String) -> LivingFabricEvidenceSourceState {
+            switch status {
+            case "valid": return .read
+            case AdaptiveCausalArtifactError.missing.rawValue: return .sourceAbsent
+            default: return .sourceUnreadable
+            }
+        }
         let gate = AdaptiveCausalLearningGate.evaluate(AdaptiveCausalLearningEvidence(
             firstTransitionAt: transitionDates.min(),
             lastTransitionAt: transitionDates.max(),
@@ -1819,6 +2426,10 @@ struct ChatDriveMain {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let shadowValue: JSONValue = .object([
+            "schema": .string("metacognition.shadow-evaluation.v1"),
+            "recommendationEmission": .string(
+                shadow.turns.isEmpty ? "no recommendations emitted" : "recommendations emitted"
+            ),
             "recommendations": .int(Int64(shadow.turns.count)),
             "legacyExcludedRecommendations": .int(Int64(shadow.legacyExcludedRecommendationCount)),
             "correlatedTurns": .int(Int64(shadow.correlatedTurnCount)),
@@ -1953,9 +2564,76 @@ struct ChatDriveMain {
             "generatedEvidenceCanQualify": .bool(false),
             "payloadFree": .bool(true),
         ])
+        let evidenceSourcesValue: JSONValue = .object([
+            "turnTraces": .object([
+                "source": .string("turn_traces/*.jsonl"),
+                "state": .string(traceSourceState.rawValue),
+                "filesDiscovered": .int(Int64(traceURLs.count)),
+                "filesRead": .int(Int64(traceFilesRead)),
+            ]),
+            "githubCommand": .object([
+                "source": .string("workshop/github_command/{ops.jsonl,ops_base.json}"),
+                "state": .string(operationalEvidence.githubCommandSourceState.rawValue),
+                "transitionsRead": .int(Int64(transitions.count)),
+            ]),
+            "workshopExecutions": .object([
+                "source": .string("workshop/executions/*/{execution.json,timeline.jsonl}"),
+                "state": .string(operationalEvidence.workshopExecutionSourceState.rawValue),
+                "executionDirectoriesRead": .int(
+                    Int64(operationalEvidence.workshopExecutionDirectoriesRead)
+                ),
+                "timelineState": .string(operationalEvidence.workshopTimelineSourceState.rawValue),
+                "timelineFilesRead": .int(Int64(operationalEvidence.workshopTimelineFilesRead)),
+            ]),
+            "procedureArtifacts": .object([
+                "source": .string("living_fabric/procedures/"),
+                "state": .string(procedureSourceRead.state.rawValue),
+                "artifactsRead": .int(Int64(procedureArtifacts.artifactCount)),
+                "invocationsRead": .int(Int64(procedureArtifacts.invocationCount)),
+            ]),
+            "privacyClassification": .object([
+                "source": .string("living_fabric/review/privacy-classification.json"),
+                "state": .string(artifactSourceState(privacyLoad.status).rawValue),
+                "validationStatus": .string(privacyLoad.status),
+            ]),
+            "rollbackManifest": .object([
+                "source": .string("living_fabric/shadow/{rollback-manifest.json,models/}"),
+                "state": .string(artifactSourceState(rollbackLoad.status).rawValue),
+                "validationStatus": .string(rollbackLoad.status),
+            ]),
+        ])
         let out: JSONValue = .object([
             "schema": .string("living-fabric-evidence.v1"),
             "generatedAt": .string(formatter.string(from: evaluatedAt)),
+            // The actual selected window is evidence too. It makes the 21-file
+            // and 100k-event safety bounds visible to operators, and separates
+            // malformed input from an honest no-recommendations finding.
+            "traceWindow": .object([
+                "schema": .string("living-fabric.trace-window.v1"),
+                "inputStatus": .string(
+                    traceSourceState == .sourceUnreadable ? "source unreadable"
+                        : (traceURLs.isEmpty ? "no trace files found" : "trace files evaluated")
+                ),
+                "filesDiscovered": .int(Int64(traceURLs.count)),
+                "filesScanned": .int(Int64(selectedTraceURLs.count)),
+                "filesOmittedBy21DayWindow": .int(
+                    Int64(max(0, traceURLs.count - selectedTraceURLs.count))
+                ),
+                "physicalRowsScanned": .int(Int64(physicalTraceRowsScanned)),
+                "malformedJSONRows": .int(Int64(malformedJSONTraceRows)),
+                "rejectedEventRows": .int(Int64(rejectedTraceEventRows)),
+                "eventsRetained": .int(Int64(traceEvents.count)),
+                "eventsDiscardedByGlobalCap": .int(Int64(globallyDiscardedTraceEventCount)),
+                "filesTruncatedByByteWindow": .int(Int64(byteWindowTruncatedFileCount)),
+                "perFileRowLimit": .int(Int64(perFileRowLimit)),
+                "perFileByteLimit": .int(Int64(perFileByteLimit)),
+                "globalEventLimit": .int(Int64(maximumTraceEvents)),
+            ]),
+            "evidenceSources": evidenceSourcesValue,
+            "metacognition": .object([
+                "shadowEvaluation": shadowValue,
+                "outcomeCalibration": outcomeCalibration.traceValue,
+            ]),
             "wave5": shadowValue,
             "wave6": readinessValue,
             "procedureCompilation": procedureValue,

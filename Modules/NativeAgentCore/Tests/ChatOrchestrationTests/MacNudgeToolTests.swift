@@ -59,6 +59,7 @@ private struct _NudgeActSource: MacAXActSource, Sendable {
     let trusted: Bool
     func isTrusted() -> Bool { trusted }
     func resolve(path: [Int]) -> MacAXActTarget? { nil }
+    func resolve(path: [Int], inAppPid pid: Int32) -> MacAXPidResolution { .pathNotFound }
     func perform(_ target: MacAXActTarget, action: String) -> MacAXActOutcome { .invalidTarget }
     func setValue(_ target: MacAXActTarget, value: String) -> MacAXActOutcome { .invalidTarget }
     func reread(_ target: MacAXActTarget) -> MacAXActTarget? { nil }

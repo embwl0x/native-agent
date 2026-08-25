@@ -304,10 +304,49 @@ public struct ProviderRoutingSnapshot: Sendable, Equatable {
 /// `canonicalRoutingSurface`, and `providers/surfaces.json` / `active.json` keys
 /// are folded at their single read seam (`reconciledPickerState`). A 0.3.x
 /// install whose picker files still say `missions` therefore keeps its pin.
+/// `self_improvement` was added 2026-08-21: WeeklySelfImprovementLoop already
+/// called with that surface, but absent from this registry it silently fell
+/// through to the chat pin — unpinnable and invisible in Providers.
 public let MODEL_SURFACES: [String] = [
-    "chat", "ios", "telegram", "slack", "workshop", "autonomy", "swarms", "dream", "rem", "training",
-    "memory", "heartbeat", "diagnostics", "cognition_reflection", "compaction",
+    "chat", "ios", "telegram", "slack", "desk", "workshop", "autonomy", "swarms", "dream", "rem", "training",
+    "memory", "heartbeat", "diagnostics", "cognition_reflection", "compaction", "self_improvement",
 ]
+
+/// Persisted picker keys that deliberately no longer have a routed surface.
+/// Keep the retirement date and reason beside the key so a missing Provider
+/// Settings row is an intentional compatibility decision, never a silent
+/// omission. Entries leave this allowlist only after their saved keys have
+/// been migrated away from real installations.
+public let RETIRED_MODEL_SURFACE_KEYS: [String: String] = [
+    "cognition_cue": "retired 2026-08-24: cue authoring no longer has a routed LLM consumer",
+]
+
+/// One auditable answer to the Provider Settings row-set question. The picker
+/// renders `visibleSurfaces`; persisted keys outside it must be named either by
+/// the dated retirement allowlist or by `unsupportedStoredKeys`, which the UI
+/// renders as an adverse configuration state.
+public struct ProviderSurfaceRowSet: Sendable, Equatable {
+    public let visibleSurfaces: [String]
+    public let retiredStoredKeys: [String]
+    public let unsupportedStoredKeys: [String]
+
+    public init(
+        surfacePreferenceKeys: Set<String>,
+        activeProviderKeys: Set<String>
+    ) {
+        let stored = Set(surfacePreferenceKeys
+            .union(activeProviderKeys)
+            .map(canonicalRoutingSurface))
+        let visible = Set(MODEL_SURFACES)
+        let retired = Set(RETIRED_MODEL_SURFACE_KEYS.keys)
+        self.visibleSurfaces = MODEL_SURFACES
+        self.retiredStoredKeys = stored.intersection(retired).sorted()
+        self.unsupportedStoredKeys = stored
+            .subtracting(visible)
+            .subtracting(retired)
+            .sorted()
+    }
+}
 
 /// The ONE bridge every routing entry point runs its `surface` argument
 /// through. Callers on 0.3.x wire vocabulary (`missions`) and callers on the
@@ -921,7 +960,8 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         serviceTier: String?,
         providerId: String?,
         seedMissingControls: Bool = false,
-        overwriteExisting: Bool = true
+        overwriteExisting: Bool = true,
+        reconcilePinnedModelWithProvider: Bool = false
     ) async throws {
         let surface = canonicalRoutingSurface(surface)
         guard MODEL_SURFACES.contains(surface) else { throw ProviderRoutingError.invalidRequest }
@@ -947,7 +987,28 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             )
             _ = try Self.loadActiveProviderObjectChecked(activeRoot)
 
-            let intendedSurfaces = Self.updatedSurfaceRoot(
+            // Bare provider switch (setActiveProvider): decide INSIDE this
+            // lock whether the currently pinned model can ride the new
+            // provider — a pre-lock read could race a concurrent explicit
+            // model pick and overwrite it with the provider default. When the
+            // pin is compatible (or absent) the surfaces file is left
+            // byte-identical; only a genuinely incompatible pin is rewritten.
+            var model = model
+            var surfacesUntouched = false
+            if reconcilePinnedModelWithProvider, model == nil, let providerId {
+                let folded = Self.canonicalizeRootForWrite(surfaceRoot, surface: surface)
+                if case .object(let entry)? = folded[surface],
+                   case .string(let pinned)? = entry["model"],
+                   let inferred = self.inferProviderForModel(pinned),
+                   !Self.providerCanServeModel(providerId, inferredProvider: inferred),
+                   let replacement = self.defaultModelForProvider(providerId) {
+                    model = replacement
+                } else {
+                    surfacesUntouched = true
+                }
+            }
+
+            let intendedSurfaces = surfacesUntouched ? surfaceRoot : Self.updatedSurfaceRoot(
                 surfaceRoot,
                 surface: surface,
                 model: model,
@@ -1064,7 +1125,21 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
               !providerId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw ProviderRoutingError.invalidRequest
         }
-        try await writeActiveProvider(surface: surface, providerId: providerId)
+        // Provider switches must not strand a stale model pin from the old
+        // provider's family: the router no longer silently substitutes at
+        // dispatch (it fails loud, 2026-08-21), so the mismatch has to be
+        // resolved HERE, where the user made the change and the panel shows
+        // the result. The pin check and the rewrite happen INSIDE the same
+        // surface-transaction lock (a pre-read across an await could race a
+        // concurrent explicit model pick — gpt-5.5 review).
+        try await saveSurfaceConfiguration(
+            surface: surface,
+            model: nil,
+            reasoningEffort: nil,
+            serviceTier: nil,
+            providerId: providerId,
+            reconcilePinnedModelWithProvider: true
+        )
     }
 
     private var providersDir: URL {
@@ -1342,7 +1417,11 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         return ModelPreferences(
             surfaceModels: .object(current),
             defaultModel: prefs["chat"]?.model,
-            fallbackChain: ["openai_oauth_direct", "anthropic_oauth_direct", "xai_oauth_direct", "moonshot", "codex", "openrouter", "local"],
+            // This envelope has no failover executor. Returning a plausible
+            // non-empty chain invited readers to present it as a live recovery
+            // policy even though no turn could consume it. Keep the Codable
+            // field for older callers, but do not manufacture dead policy.
+            fallbackChain: nil,
             extras: .object([
                 "current": .object(current),
                 "status": .string("ok"),
@@ -1393,6 +1472,19 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         try await checkedRoutingSnapshot().preferences
     }
 
+    /// Read the two picker stores through their canonical reconciliation seam
+    /// and classify every persisted key against the visible Provider Settings
+    /// row set. This does not invent rows for unknown keys: callers must show
+    /// those as a repair-needed state until a runtime owner is registered or a
+    /// dated retirement is declared above.
+    public func providerSurfaceRowSet() async throws -> ProviderSurfaceRowSet {
+        let pickerState = try await reconciledPickerState()
+        return ProviderSurfaceRowSet(
+            surfacePreferenceKeys: Set(pickerState.surfaces.keys),
+            activeProviderKeys: Set(pickerState.active.keys)
+        )
+    }
+
     /// Preferences, active-provider hints, and explicit pins derived from one
     /// recovered tuple while the common transaction lock is held by
     /// `reconciledPickerState()`. No caller can observe a model from one picker
@@ -1402,6 +1494,39 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         return routingSnapshot(
             surfaces: pickerState.surfaces,
             activeProviders: pickerState.active,
+            soleConnectedProvider: soleConnectedProviderFamily()
+        )
+    }
+
+    /// Checked diagnostic view of the picker that never repairs or writes its
+    /// authority files. A pending two-file selection is intentionally adverse
+    /// here: execution may resume its exact recovery transaction, but a
+    /// read-only CLI must not turn a request to inspect routing into a write.
+    ///
+    /// The before/after marker reads make an unlocked read coherent: a marker
+    /// covers every interval in which the two picker files can differ. A
+    /// stable absence therefore means this read observed either the complete
+    /// old tuple or the complete new tuple, never a fabricated combination.
+    public func checkedRoutingSnapshotReadOnly() async throws -> ProviderRoutingSnapshot {
+        let fileManager = FileManager.default
+        guard !fileManager.fileExists(atPath: surfaceTransactionPath.path) else {
+            throw ProviderRoutingError.underlying(
+                "provider selection is pending recovery; the read-only preference probe will not reconcile it"
+            )
+        }
+        let surfaces = try Self.loadProviderStateObjectChecked(
+            at: surfacesPath,
+            description: "surface preference"
+        )
+        let active = try Self.loadActiveProviderStateChecked(at: activeProviderPath)
+        guard !fileManager.fileExists(atPath: surfaceTransactionPath.path) else {
+            throw ProviderRoutingError.underlying(
+                "provider selection changed while being read; retry after recovery completes"
+            )
+        }
+        return routingSnapshot(
+            surfaces: WorkshopSurfaceVocabulary.canonicalizeSurfaceKeys(surfaces),
+            activeProviders: WorkshopSurfaceVocabulary.canonicalizeSurfaceKeys(active),
             soleConnectedProvider: soleConnectedProviderFamily()
         )
     }
@@ -1472,13 +1597,17 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             "chat": chatModel,
             "ios": chatModel,
             "telegram": telegramModel,
+            "desk": chatModel,
             "workshop": PRIMARY_MODEL,
             "autonomy": PRIMARY_MODEL,
             "swarms": PRIMARY_MODEL,
             "dream": "gpt-5.4-mini",
             "rem": "gpt-5.4-mini",
             "training": "gpt-5.4",
-            "cognition_reflection": "claude-opus-4-8",
+            // Reflection is a normal agent surface, not an implicit
+            // Anthropic escape hatch. It follows the active chat voice until
+            // the user explicitly pins a separate model in Providers.
+            "cognition_reflection": chatModel,
         ]
         let seedEffort: [String: String] = [
             "chat": chatEffort,

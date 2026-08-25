@@ -18,12 +18,57 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 GENERATE="$ROOT/script/generate_appcast.sh"
+# shellcheck source=../../script/lib/appcast_publish_verify.sh
+source "$ROOT/script/lib/appcast_publish_verify.sh"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/nativeagent sparkle publish.XXXXXX")"
 cleanup() { rm -rf "$TMP_ROOT"; }
 trap cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# 0. Publish verification cannot be conditional on Sparkle being installed.
+#    The full generator fixture below remains valuable, but it skips before it
+#    can reach the publish step on a fresh checkout. This drives the exact
+#    production publish+verify helper with the canonical false-success command:
+#    `true` exits zero and uploads nothing. The curl double is deliberately a
+#    404 host and records calls, proving both the bounded loop and the fetch.
+# ---------------------------------------------------------------------------
+VERIFY_ROOT="$TMP_ROOT/publish verify without Sparkle"
+mkdir -p "$VERIFY_ROOT/bin" "$VERIFY_ROOT/scratch"
+printf 'local appcast bytes\n' > "$VERIFY_ROOT/appcast.xml"
+printf 'local dmg bytes\n' > "$VERIFY_ROOT/NativeAgent.dmg"
+cat > "$VERIFY_ROOT/bin/curl" <<'SHIM'
+#!/usr/bin/env bash
+printf 'fetch\n' >> "${NATIVEAGENT_TEST_VERIFY_FETCH_LOG:?}"
+echo 'curl: (22) The requested URL returned error: 404' >&2
+exit 22
+SHIM
+chmod +x "$VERIFY_ROOT/bin/curl"
+VERIFY_DMG_LEN="$(stat -f%z "$VERIFY_ROOT/NativeAgent.dmg")"
+VERIFY_ORIGINAL_PATH="$PATH"
+PATH="$VERIFY_ROOT/bin:$PATH"
+export NATIVEAGENT_TEST_VERIFY_FETCH_LOG="$VERIFY_ROOT/fetches.log"
+NATIVEAGENT_APPCAST_VERIFY_ATTEMPTS=2
+NATIVEAGENT_APPCAST_VERIFY_DELAY=0
+set +e
+nativeagent_publish_appcast_and_verify \
+  'true' "$VERIFY_ROOT/appcast.xml" "$VERIFY_ROOT/NativeAgent.dmg" \
+  'https://updates.nativeagent.test/appcast.xml' \
+  'https://dl.nativeagent.test/NativeAgent.dmg' \
+  '9.9.9' false "$VERIFY_DMG_LEN" "$VERIFY_ROOT/scratch"
+VERIFY_RC=$?
+set -e
+PATH="$VERIFY_ORIGINAL_PATH"
+[[ $VERIFY_RC -eq 1 ]] \
+  || fail "a no-op publish must fail live verification (got exit $VERIFY_RC)"
+[[ "$NATIVEAGENT_APPCAST_PUBLISH_VERIFY_REASON" == *'could not fetch https://updates.nativeagent.test/appcast.xml'* ]] \
+  || fail "the no-op publish did not report the missing feed: $NATIVEAGENT_APPCAST_PUBLISH_VERIFY_REASON"
+[[ "$NATIVEAGENT_APPCAST_PUBLISH_VERIFY_ATTEMPTS" == "2" ]] \
+  || fail "the verification result did not report both bounded attempts"
+[[ "$(wc -l < "$VERIFY_ROOT/fetches.log" | tr -d '[:space:]')" == "2" ]] \
+  || fail "a no-op publish was not fetched exactly twice before rejection"
 
 # ---------------------------------------------------------------------------
 # 1. Quarantine: a failed publish leaves no shippable artifact.
@@ -525,5 +570,295 @@ grep -q 'sparkle:edSignature' "$WORK/out/h/appcast/appcast.xml" \
   || fail "the signed enclosure did not survive the notes insertion"
 [[ ! -e "$WORK/out/h/appcast/.release-notes.fragment" ]] \
   || fail "the notes fragment was left in the publishable output directory"
+
+# ---------------------------------------------------------------------------
+# 4b. Notes BRANCH SELECTION (2026-08-21). The old branch test was a substring
+#     grep for '<html\|<p>\|<ul>\|<h[1-6]>' over the whole notes file, so a
+#     markdown note that merely MENTIONS `<p>` in backticks was routed to the
+#     raw-HTML branch: raw markdown markers shipped into the dialog, unescaped
+#     and unstyled, and every structural guard still passed because the payload
+#     lives inside CDATA where xmllint cannot see it.
+# ---------------------------------------------------------------------------
+run_notes() { # $1 = out subdir, $2 = notes file; echoes combined output, never aborts
+  local outdir="$WORK/out/$1"
+  mkdir -p "$outdir"
+  set +e
+  ( cd "$ROOT" && env -u NATIVE_AGENT_SPARKLE_ED_PRIV_KEY -u NATIVE_AGENT_APPCAST_URL \
+      -u NATIVE_AGENT_DMG_DOWNLOAD_URL -u NATIVE_AGENT_RELEASE_PAGE_URL \
+      -u NATIVEAGENT_RELEASE_PAGE_URL \
+    NATIVEAGENT_SPARKLE_ED_PRIV_KEY="$WORK/priv.key" \
+    NATIVEAGENT_APPCAST_URL="$APPCAST_URL" NATIVEAGENT_DMG_DOWNLOAD_URL="$DMG_URL" \
+    bash "$GENERATE" --dmg "$TEST_DMG" --version "$FIXTURE_VERSION" --notes "$2" \
+         --out "$outdir/appcast" 2>&1 )
+  set -e
+}
+
+# (h2) THE REGRESSION: markdown that quotes a tag in backticks must still take
+#      the CONVERTER branch — styled wrapper present, the quoted tag escaped,
+#      and no raw markdown markers left in the rendered description.
+BACKTICK_NOTES="$WORK/backtick-notes.md"
+cat > "$BACKTICK_NOTES" <<'MD'
+# NativeAgent 9.9.9
+
+- Update dialog now wraps each paragraph in a `<p>` element.
+- Lists use `<ul>`; headings use `<h1>` through `<h6>`.
+
+Nothing here is real HTML.
+MD
+out="$(run_notes h2 "$BACKTICK_NOTES")"
+grep -q 'Appcast generated and verified' <<<"$out" \
+  || fail "markdown notes mentioning <p> in backticks were rejected outright: $out"
+grep -q 'notes mode: converted' <<<"$out" \
+  || fail "a .md file quoting \`<p>\` did NOT take the converter branch: $out"
+H2_XML="$WORK/out/h2/appcast/appcast.xml"
+grep -q 'class="release-notes"' "$H2_XML" \
+  || fail "the backtick-quoting markdown note was not converted to styled HTML"
+grep -q '&lt;p&gt;' "$H2_XML" \
+  || fail "the backticked <p> mention was not escaped — it went out as live HTML"
+grep -q '<h1>NativeAgent 9.9.9</h1>' "$H2_XML" \
+  || fail "the markdown heading was not converted (raw '#' would have shipped)"
+grep -q '<li>' "$H2_XML" \
+  || fail "the markdown list was not converted to list items"
+# The payload guard's own subject: no line-leading markdown markers survive.
+awk '/<description[[:space:]]/ { inside = 1; next }
+     inside && /^[[:space:]]*\]\]><\/description>/ { inside = 0 }
+     inside' "$H2_XML" | grep -Eq '^[[:space:]]*(#{1,6}[[:space:]]|[-*+][[:space:]])' \
+  && fail "raw markdown markers survived into the rendered description"
+
+# (h3) THE RAW BRANCH, which had zero coverage: a real HTML fragment (line-leading
+#      <p>, no .md extension) must be embedded verbatim, NOT run through the
+#      markdown converter.
+RAW_NOTES="$WORK/raw-notes.html"
+cat > "$RAW_NOTES" <<'HTML'
+<p>Hand-authored release note.</p>
+<ul><li>Embedded as-is.</li></ul>
+HTML
+out="$(run_notes h3 "$RAW_NOTES")"
+grep -q 'Appcast generated and verified' <<<"$out" \
+  || fail "a hand-authored HTML notes file was rejected: $out"
+grep -q 'notes mode: raw-html' <<<"$out" \
+  || fail "an .html notes file did NOT take the raw-HTML branch: $out"
+H3_XML="$WORK/out/h3/appcast/appcast.xml"
+grep -Fq '<p>Hand-authored release note.</p>' "$H3_XML" \
+  || fail "the raw HTML fragment was not embedded verbatim"
+grep -q 'class="release-notes"' "$H3_XML" \
+  && fail "the raw-HTML branch was routed through the markdown converter"
+
+# (h3b) Extensionless raw HTML: the sniff fallback must still find a LINE-LEADING
+#       tag and take the raw branch.
+RAW_NOEXT="$WORK/raw-notes-noext"
+cp "$RAW_NOTES" "$RAW_NOEXT"
+out="$(run_notes h3b "$RAW_NOEXT")"
+grep -q 'notes mode: raw-html' <<<"$out" \
+  || fail "an extensionless raw-HTML notes file did not take the raw branch: $out"
+grep -Fq '<p>Hand-authored release note.</p>' "$WORK/out/h3b/appcast/appcast.xml" \
+  || fail "the extensionless raw HTML fragment was not embedded verbatim"
+
+# (h3c) Extensionless MARKDOWN whose prose quotes tags in backtick spans: the
+#       spans are stripped before sniffing, so this must take the converter.
+INLINE_NOEXT="$WORK/inline-notes-noext"
+cat > "$INLINE_NOEXT" <<'MD'
+# Release
+
+Paragraphs are wrapped in `<p>`, lists in `<ul>`, headings in `<h2>`.
+
+- Still markdown.
+MD
+out="$(run_notes h3c "$INLINE_NOEXT")"
+grep -q 'notes mode: converted' <<<"$out" \
+  || fail "backtick spans hijacked the branch for an extensionless markdown file: $out"
+grep -q 'Appcast generated and verified' <<<"$out" \
+  || fail "the extensionless markdown note was rejected: $out"
+grep -q 'class="release-notes"' "$WORK/out/h3c/appcast/appcast.xml" \
+  || fail "the extensionless markdown note was not converted"
+grep -q '&lt;ul&gt;' "$WORK/out/h3c/appcast/appcast.xml" \
+  || fail "the backticked <ul> mention was not escaped"
+
+# (h3d) Extensionless markdown whose FENCED CODE BLOCK contains a line-leading
+#       <p>: the fence must be stripped before sniffing, so branch selection is
+#       still the converter. (The converter's own fence handling is pinned by
+#       h3e below — since 2026-08-21 fences render as escaped <pre><code>.)
+FENCED_NOEXT="$WORK/fenced-notes-noext"
+cat > "$FENCED_NOEXT" <<'MD'
+# Release
+
+```html
+<p>example markup shown to the reader</p>
+```
+
+- Still markdown.
+MD
+out="$(run_notes h3d "$FENCED_NOEXT")"
+grep -q 'notes mode: converted' <<<"$out" \
+  || fail "fenced code containing <p> hijacked the branch for an extensionless md file: $out"
+
+# (h3e) Ordered lists + fenced code end to end (gpt-5.5 sweep review
+#       2026-08-21): a .md file with "1." items must render <ol> (raw "1."
+#       markers previously slipped past the payload guard as paragraph text),
+#       and a fence whose BODY contains line-leading '#'/'-' markers must not
+#       false-fail the guard — fence bodies are excluded from the marker scan.
+ORDERED_MD="$WORK/ordered-notes.md"
+cat > "$ORDERED_MD" <<'MD'
+# Release
+
+1. First step
+2. Second step
+
+```
+# comment inside code
+- flag inside code
+```
+MD
+out="$(run_notes h3e "$ORDERED_MD")"
+grep -q 'Appcast generated and verified' <<<"$out" \
+  || fail "ordered-list + fenced notes were rejected: $out"
+grep -q '<ol>' "$WORK/out/h3e/appcast/appcast.xml" \
+  || fail "ordered-list markdown did not convert to <ol>"
+grep -q '<pre><code>' "$WORK/out/h3e/appcast/appcast.xml" \
+  || fail "fenced code did not convert to <pre><code>"
+grep -q '1\. First step' "$WORK/out/h3e/appcast/appcast.xml" \
+  && fail "raw ordered-list markers survived conversion"
+
+# ---------------------------------------------------------------------------
+# 5. internal-build-seat-hygiene item 1 (2026-08-21): non-publish lanes stamp
+#    CFBundleShortVersionString with -dev.<short8sha>[.dirty]; CFBundleVersion
+#    stays bare (Sparkle's comparator reads it). generate_appcast must ACCEPT
+#    that marker on a local/rehearsal run and REFUSE it on --publish.
+# ---------------------------------------------------------------------------
+DEV_SHORT="$FIXTURE_VERSION-dev.deadbeef"
+mkdir -p "$WORK/dev stage/NativeAgent.app/Contents/MacOS" "$WORK/dev dmg" "$WORK/out/i"
+sed -e "s@<key>CFBundleShortVersionString</key><string>$FIXTURE_VERSION</string>@<key>CFBundleShortVersionString</key><string>$DEV_SHORT</string>@" \
+  "$WORK/stage/NativeAgent.app/Contents/Info.plist" > "$WORK/dev stage/NativeAgent.app/Contents/Info.plist"
+grep -Fq "$DEV_SHORT" "$WORK/dev stage/NativeAgent.app/Contents/Info.plist" \
+  || fail "could not build the internal-build fixture plist"
+grep -Fq "<key>CFBundleVersion</key><string>$FIXTURE_VERSION</string>" "$WORK/dev stage/NativeAgent.app/Contents/Info.plist" \
+  || fail "the internal-build fixture must keep CFBundleVersion bare"
+printf '#!/bin/sh\nexit 0\n' > "$WORK/dev stage/NativeAgent.app/Contents/MacOS/NativeAgentApp"
+chmod +x "$WORK/dev stage/NativeAgent.app/Contents/MacOS/NativeAgentApp"
+DEV_DMG="$WORK/dev dmg/NativeAgent-$FIXTURE_VERSION.dmg"
+hdiutil create -quiet -srcfolder "$WORK/dev stage" -volname NativeAgent -format UDZO -ov "$DEV_DMG" \
+  || fail "could not build the internal-build test DMG"
+
+run_dev() { # $@ extra generate args; echoes combined output, never aborts
+  set +e
+  ( cd "$ROOT" && PATH="$WORK/bin:$PATH" NATIVEAGENT_TEST_HOST_DIR="$WORK/host" \
+      env -u NATIVE_AGENT_SPARKLE_ED_PRIV_KEY -u NATIVE_AGENT_APPCAST_URL \
+          -u NATIVE_AGENT_DMG_DOWNLOAD_URL -u NATIVE_AGENT_RELEASE_PAGE_URL \
+          -u NATIVEAGENT_RELEASE_PAGE_URL \
+      NATIVEAGENT_SPARKLE_ED_PRIV_KEY="$WORK/priv.key" \
+      NATIVEAGENT_APPCAST_URL="$APPCAST_URL" NATIVEAGENT_DMG_DOWNLOAD_URL="$DMG_URL" \
+      NATIVEAGENT_APPCAST_PUBLISH_CMD='cp "$NATIVEAGENT_PUBLISH_APPCAST" "$NATIVEAGENT_TEST_HOST_DIR/appcast.xml"; cp "$NATIVEAGENT_PUBLISH_DMG" "$NATIVEAGENT_TEST_HOST_DIR/dmg"' \
+      NATIVEAGENT_APPCAST_VERIFY_ATTEMPTS=1 NATIVEAGENT_APPCAST_VERIFY_DELAY=0 \
+      bash "$GENERATE" --dmg "$DEV_DMG" --version "$FIXTURE_VERSION" "$@" 2>&1 )
+  set -e
+}
+
+# (i) local/rehearsal run: the internal marker is allowed and reported.
+out="$(run_dev --rehearsal --out "$WORK/out/i/local")"
+grep -q 'Appcast generated and verified' <<<"$out" \
+  || fail "a non-publish run refused an internal -dev build: $out"
+grep -q 'Internal build: CFBundleShortVersionString' <<<"$out" \
+  || fail "the internal build was not reported as such on a non-publish run: $out"
+grep -Fq "short_version=$DEV_SHORT" "$WORK/out/i/local/appcast.manifest.txt" \
+  || fail "the manifest does not record the internal short version"
+grep -Fq 'internal_build=true' "$WORK/out/i/local/appcast.manifest.txt" \
+  || fail "the manifest does not flag the artifact as an internal build"
+
+# (i2) --publish with the same DMG must FAIL LOUD. This is the Nova-seat clobber:
+#      an internal build going out as the release.
+out="$(run_dev --publish --out "$WORK/out/i/publish")"
+grep -q 'PUBLISH REFUSED' <<<"$out" \
+  || fail "an internal -dev build was accepted for publication: $out"
+grep -q 'Published and VERIFIED live' <<<"$out" \
+  && fail "an internal -dev build printed the publish success line: $out"
+
+# (i3) a short version that is NOT the sanctioned marker is still a hard mismatch
+#      (the split must not have become "any suffix goes").
+BOGUS_SHORT="$FIXTURE_VERSION-nightly"
+mkdir -p "$WORK/bogus stage/NativeAgent.app/Contents/MacOS" "$WORK/bogus dmg"
+sed -e "s@<key>CFBundleShortVersionString</key><string>$FIXTURE_VERSION</string>@<key>CFBundleShortVersionString</key><string>$BOGUS_SHORT</string>@" \
+  "$WORK/stage/NativeAgent.app/Contents/Info.plist" > "$WORK/bogus stage/NativeAgent.app/Contents/Info.plist"
+printf '#!/bin/sh\nexit 0\n' > "$WORK/bogus stage/NativeAgent.app/Contents/MacOS/NativeAgentApp"
+chmod +x "$WORK/bogus stage/NativeAgent.app/Contents/MacOS/NativeAgentApp"
+BOGUS_DMG="$WORK/bogus dmg/NativeAgent-$FIXTURE_VERSION.dmg"
+hdiutil create -quiet -srcfolder "$WORK/bogus stage" -volname NativeAgent -format UDZO -ov "$BOGUS_DMG" \
+  || fail "could not build the bogus-short-version test DMG"
+set +e
+out="$( cd "$ROOT" && env -u NATIVE_AGENT_SPARKLE_ED_PRIV_KEY -u NATIVE_AGENT_APPCAST_URL \
+      -u NATIVE_AGENT_DMG_DOWNLOAD_URL -u NATIVE_AGENT_RELEASE_PAGE_URL -u NATIVEAGENT_RELEASE_PAGE_URL \
+  NATIVEAGENT_SPARKLE_ED_PRIV_KEY="$WORK/priv.key" \
+  NATIVEAGENT_APPCAST_URL="$APPCAST_URL" NATIVEAGENT_DMG_DOWNLOAD_URL="$DMG_URL" \
+  bash "$GENERATE" --dmg "$BOGUS_DMG" --version "$FIXTURE_VERSION" --rehearsal \
+       --out "$WORK/out/i/bogus" 2>&1 )"
+set -e
+grep -q 'version mismatch' <<<"$out" \
+  || fail "an arbitrary CFBundleShortVersionString suffix was accepted: $out"
+
+# (i4) the three stamping lanes must all compute the SAME suffix. The helper is
+#      duplicated (no shared lib in this fence), so pin the duplication.
+for stamper in build_and_run.sh install_app.sh release.sh; do
+  grep -Fq 'nativeagent_internal_version_suffix() {' "$ROOT/script/$stamper" \
+    || fail "script/$stamper no longer computes the internal build suffix"
+  grep -Fq 'rev-parse --short=8 HEAD' "$ROOT/script/$stamper" \
+    || fail "script/$stamper does not derive the short8 sha for the internal marker"
+done
+# The lanes with no publish mode must ALWAYS stamp the marker.
+grep -Fq 'NATIVEAGENT_BUILD_SHORT_VERSION="$NATIVEAGENT_BUILD_VERSION$(nativeagent_internal_version_suffix "$ROOT")"' \
+  "$ROOT/script/build_and_run.sh" \
+  || fail "build_and_run.sh no longer stamps the internal marker unconditionally"
+grep -Fq 'INSTALL_SHORT_VERSION="$INSTALL_VERSION$(nativeagent_internal_version_suffix "$ROOT")"' \
+  "$ROOT/script/install_app.sh" \
+  || fail "install_app.sh no longer stamps the internal marker unconditionally"
+# ...and CFBundleVersion must stay bare in all three (Sparkle's comparator).
+grep -Fq '<string>$NATIVEAGENT_BUILD_SHORT_VERSION</string>' "$ROOT/script/build_and_run.sh" \
+  || fail "build_and_run.sh does not put the internal marker in CFBundleShortVersionString"
+grep -Fq 'Set :CFBundleVersion $INSTALL_VERSION' "$ROOT/script/install_app.sh" \
+  || fail "install_app.sh no longer keeps CFBundleVersion bare"
+grep -Fq 'Set :CFBundleShortVersionString $INSTALL_SHORT_VERSION' "$ROOT/script/install_app.sh" \
+  || fail "install_app.sh no longer stamps the internal short version"
+# release.sh: publish lane bare, non-publish suffixed, and both asserted post-stamp.
+grep -Fq 'if [[ "$PUBLISH_APPCAST" != "true" && "$INTERNAL_BUILD_STAMP" != "0" ]]; then' "$ROOT/script/release.sh" \
+  || fail "release.sh no longer restricts the internal marker to non-publish lanes"
+grep -Fq 'a --publish-appcast build carries the internal marker' "$ROOT/script/release.sh" \
+  || fail "release.sh no longer refuses a published build carrying the internal marker"
+# The publisher must refuse an attestation describing an internal build.
+grep -Fq '.internal_build != true' "$ROOT/script/publish_github_release.sh" \
+  || fail "publish_github_release.sh no longer refuses an internal-build attestation"
+grep -Fq 'short_version: $short_version' "$ROOT/script/create_release_attestation.sh" \
+  || fail "create_release_attestation.sh no longer records the human-visible short version"
+
+# (i5) the attestation writer itself: it must record the marker and reject a
+#      short version that is neither bare nor the sanctioned internal shape.
+ATT_RECEIPT="$WORK/att-receipt.json"
+cat > "$ATT_RECEIPT" <<JSON
+{"schema_version":1,"source_revision":"$(printf '0%.0s' {1..40})","source_dirty":false,
+ "canonical_gate":"script/test.sh","ios_required":true,"ios_result":"passed",
+ "completed_at":"2026-08-21T00:00:00Z"}
+JSON
+run_attestation() { # $1 = short version, $2 = out; echoes output, never aborts
+  set +e
+  bash "$ROOT/script/create_release_attestation.sh" \
+    --dmg "$TEST_DMG" --test-receipt "$ATT_RECEIPT" \
+    --source-revision "$(printf '0%.0s' {1..40})" \
+    --version "$FIXTURE_VERSION" --short-version "$1" \
+    --dmg-signature-required true --dmg-notarized true --dmg-stapled true \
+    --out "$2" 2>&1
+  set -e
+}
+ATT_DEV="$WORK/att-dev.json"
+run_attestation "$DEV_SHORT" "$ATT_DEV" >/dev/null
+[[ "$(jq -r '.internal_build' "$ATT_DEV")" == "true" ]] \
+  || fail "the attestation does not flag an internal build"
+[[ "$(jq -r '.short_version' "$ATT_DEV")" == "$DEV_SHORT" ]] \
+  || fail "the attestation does not record the internal short version"
+[[ "$(jq -r '.version' "$ATT_DEV")" == "$FIXTURE_VERSION" ]] \
+  || fail "the attestation's bare version was contaminated by the internal marker"
+ATT_REL="$WORK/att-release.json"
+run_attestation "$FIXTURE_VERSION" "$ATT_REL" >/dev/null
+[[ "$(jq -r '.internal_build' "$ATT_REL")" == "false" ]] \
+  || fail "a bare release attestation was flagged as an internal build"
+out="$(run_attestation "$FIXTURE_VERSION-nightly" "$WORK/att-bogus.json")"
+grep -q 'is neither' <<<"$out" \
+  || fail "the attestation writer accepted an arbitrary short-version suffix: $out"
 
 echo "[test] sparkle publish ordering + verification guards OK"

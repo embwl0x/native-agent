@@ -2,6 +2,66 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+/// Closed production vocabulary for stages emitted by bare turn-context
+/// assembly. The replay speed budget imports this type rather than restating
+/// stage strings, while the engine emits these cases directly.
+enum ContextStageName: String, CaseIterable, Sendable {
+    case contextFlowAttention = "contextFlow.attention"
+    case contextFlowPrepare = "contextFlow.prepare"
+    case providerPreferences = "provider.preferences"
+    case personaCompile = "persona.compile"
+    case remPinsRead = "rem_pins.read"
+    case memoryRecall = "memory.recall"
+    case toolsNames = "tools.names"
+    case toolsSchemas = "tools.schemas"
+    case promptRender = "prompt.render"
+    case contextClockRuntime = "context.clock_runtime"
+    case contextFlowAttentionActorAdmission = "contextFlow.attention.actorAdmission"
+    case contextFlowAttentionBootstrap = "contextFlow.attention.bootstrap"
+    case contextFlowAttentionSubstrate = "contextFlow.attention.substrate"
+    case contextFlowAttentionOrganism = "contextFlow.attention.organism"
+    case contextFlowAttentionPursuit = "contextFlow.attention.pursuit"
+}
+
+/// Closed vocabulary for the session-history wrapper. The clock has a typed
+/// entry in both wrapper registries because each receipt has its own budget.
+enum ContextHistoryStageName: String, CaseIterable, Sendable {
+    case promptRead = "history.prompt_read"
+    case middleSample = "history.middle_sample"
+    case recallQuery = "history.recall_query"
+    case contextBase = "context.base"
+    case digest = "history.digest"
+    case render = "history.render"
+    case contextClockRuntime = "context.clock_runtime"
+}
+
+/// Closed vocabulary for the out-of-band `context.stage` feed. This feed is
+/// intentionally separate from the per-turn context summary, so an arbitrary
+/// string here would make a second producer indistinguishable from the memory
+/// promotion lane that currently owns it.
+enum ContextStageEmissionName: String, CaseIterable, Sendable {
+    case memoryPromotion = "memory.promotion"
+}
+
+/// The only attention sub-stages cognition may add to a context trace.
+enum CognitiveAttentionStage: String, CaseIterable, Sendable {
+    case actorAdmission
+    case bootstrap
+    case substrate
+    case organism
+    case pursuit
+
+    var contextStage: ContextStageName {
+        switch self {
+        case .actorAdmission: .contextFlowAttentionActorAdmission
+        case .bootstrap: .contextFlowAttentionBootstrap
+        case .substrate: .contextFlowAttentionSubstrate
+        case .organism: .contextFlowAttentionOrganism
+        case .pursuit: .contextFlowAttentionPursuit
+        }
+    }
+}
+
 /// Turn-local, payload-free timing collector for the cognition attention read.
 ///
 /// The turn engine owns the collector and installs it with a task-local value;
@@ -16,13 +76,7 @@ public final class CognitiveAttentionTraceRecorder: @unchecked Sendable {
         public let totalMilliseconds: Int64
     }
 
-    private static let permittedStages: Set<String> = [
-        "actorAdmission",
-        "bootstrap",
-        "substrate",
-        "organism",
-        "pursuit",
-    ]
+    private static let permittedStages = Set(CognitiveAttentionStage.allCases)
 
     private let lock = NSLock()
     private let startedNs = DispatchTime.now().uptimeNanoseconds
@@ -33,15 +87,17 @@ public final class CognitiveAttentionTraceRecorder: @unchecked Sendable {
     public init() {}
 
     public func recordAdmission() {
-        recordElapsed("actorAdmission", since: startedNs)
+        recordElapsed(CognitiveAttentionStage.actorAdmission.rawValue, since: startedNs)
     }
 
     public func recordElapsed(_ stage: String, since startNs: UInt64) {
-        guard Self.permittedStages.contains(stage) else { return }
+        guard let stage = CognitiveAttentionStage(rawValue: stage),
+              Self.permittedStages.contains(stage)
+        else { return }
         let nowNs = DispatchTime.now().uptimeNanoseconds
         let elapsed = nowNs >= startNs ? Int64((nowNs - startNs) / 1_000_000) : 0
         lock.lock()
-        stagesMilliseconds[stage] = max(0, elapsed)
+        stagesMilliseconds[stage.rawValue] = max(0, elapsed)
         lock.unlock()
     }
 
@@ -186,6 +242,20 @@ struct ContextStageTrace: Sendable {
     }
 
     mutating func measure<T>(
+        _ name: ContextStageName,
+        _ work: () async throws -> T
+    ) async rethrows -> T {
+        return try await measure(name.rawValue, work)
+    }
+
+    mutating func measure<T>(
+        _ name: ContextHistoryStageName,
+        _ work: () async throws -> T
+    ) async rethrows -> T {
+        return try await measure(name.rawValue, work)
+    }
+
+    private mutating func measure<T>(
         _ name: String,
         _ work: () async throws -> T
     ) async rethrows -> T {
@@ -200,14 +270,22 @@ struct ContextStageTrace: Sendable {
         }
     }
 
-    mutating func record(_ name: String, since startNs: UInt64) {
+    mutating func record(_ name: ContextStageName, since startNs: UInt64) {
+        record(name.rawValue, since: startNs)
+    }
+
+    mutating func record(_ name: ContextHistoryStageName, since startNs: UInt64) {
+        record(name.rawValue, since: startNs)
+    }
+
+    private mutating func record(_ name: String, since startNs: UInt64) {
         let elapsed = Int64((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000)
         timings.append(Timing(name: name, elapsedMs: elapsed))
     }
 
-    mutating func setTiming(_ name: String, milliseconds: Int64) {
-        timings.removeAll { $0.name == name }
-        timings.append(Timing(name: name, elapsedMs: max(0, milliseconds)))
+    mutating func setTiming(_ name: ContextStageName, milliseconds: Int64) {
+        timings.removeAll { $0.name == name.rawValue }
+        timings.append(Timing(name: name.rawValue, elapsedMs: max(0, milliseconds)))
     }
 
     mutating func setCount(_ key: String, _ value: Int) {
@@ -257,6 +335,9 @@ struct ContextStageTrace: Sendable {
             "stageCount": .int(Int64(timings.count)),
         ]
         if let memoryRecallOutcome {
+            // `memory.recallHits` is the RESOLVED lane (legacy ∪ packet
+            // provenance) since 2026-08-21; `memory.recallHits.legacy` is the
+            // legacy-only count. Injected means what reached the turn.
             payload["memoryRecall"] = memoryRecallOutcome.payload(
                 injectedHitCount: Int(counts["memory.recallHits"] ?? 0)
             )
@@ -269,7 +350,7 @@ struct ContextStageTrace: Sendable {
     }
 
     static func emitStage(
-        name: String,
+        name: ContextStageEmissionName,
         elapsedMs: Int64,
         surface: String,
         counts: [String: Int64] = [:],
@@ -287,7 +368,8 @@ struct ContextStageTrace: Sendable {
             kind: "context.stage",
             surface: surface,
             payload: .object([
-                "stage": .string(name),
+                "schema": .string("context.stage.v1"),
+                "stage": .string(name.rawValue),
                 "elapsedMs": .int(max(0, elapsedMs)),
                 "counts": .object(countObject),
                 "flags": .object(flagObject),

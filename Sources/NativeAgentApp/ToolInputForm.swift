@@ -1,4 +1,105 @@
+import Foundation
 import SwiftUI
+
+/// The schema-owned conversion boundary between the visual form controls and
+/// the dispatch transport. Every accepted value is JSON-shaped, so a sheet
+/// cannot close and accidentally turn a malformed complex field into `{}`.
+enum ToolInputFormInput {
+    enum ValidationError: LocalizedError, Equatable {
+        case missingRequiredField(String)
+        case missingSchemaForRequiredField(String)
+        case invalidJSON(field: String, expected: String)
+        case serializationFailed
+
+        var errorDescription: String? {
+            switch self {
+            case .missingRequiredField(let field):
+                return "Field \"\(field)\" is required."
+            case .missingSchemaForRequiredField(let field):
+                return "Required field \"\(field)\" has no usable schema."
+            case .invalidJSON(let field, let expected):
+                return "Field \"\(field)\" must be valid JSON \(expected)."
+            case .serializationFailed:
+                return "Tool input could not be encoded for dispatch."
+            }
+        }
+    }
+
+    static func serializedInput(
+        schema: ToolInputSchema?,
+        stringValues: [String: String],
+        boolValues: [String: Bool],
+        intValues: [String: Int]
+    ) throws -> Data {
+        guard let schema else {
+            return try JSONSerialization.data(withJSONObject: [:])
+        }
+        guard let properties = schema.properties else {
+            if let required = schema.required, let field = required.first {
+                throw ValidationError.missingSchemaForRequiredField(field)
+            }
+            return try JSONSerialization.data(withJSONObject: [:])
+        }
+
+        let required = Set(schema.required ?? [])
+        for field in required where properties[field] == nil {
+            throw ValidationError.missingSchemaForRequiredField(field)
+        }
+
+        var collected: [String: Any] = [:]
+        for (name, prop) in properties {
+            let type = (prop.type ?? "string").lowercased()
+            switch type {
+            case "boolean":
+                if required.contains(name) || boolValues[name] != nil {
+                    collected[name] = boolValues[name] ?? false
+                }
+            case "integer":
+                if let value = intValues[name] {
+                    collected[name] = value
+                } else if let raw = stringValues[name]?.trimmingCharacters(in: .whitespacesAndNewlines),
+                          let value = Int(raw) {
+                    collected[name] = value
+                }
+            case "object", "array":
+                guard let raw = nonblank(stringValues[name]) else { continue }
+                guard let data = raw.data(using: .utf8),
+                      let decoded = try? JSONSerialization.jsonObject(with: data) else {
+                    throw ValidationError.invalidJSON(field: name, expected: "\(type) text")
+                }
+                if type == "object", let object = decoded as? [String: Any] {
+                    collected[name] = object
+                } else if type == "array", let array = decoded as? [Any] {
+                    collected[name] = array
+                } else {
+                    throw ValidationError.invalidJSON(field: name, expected: "\(type) text")
+                }
+            default:
+                if let value = nonblank(stringValues[name]) {
+                    collected[name] = value
+                }
+            }
+        }
+
+        for field in required where collected[field] == nil {
+            throw ValidationError.missingRequiredField(field)
+        }
+        guard JSONSerialization.isValidJSONObject(collected) else {
+            throw ValidationError.serializationFailed
+        }
+        do {
+            return try JSONSerialization.data(withJSONObject: collected)
+        } catch {
+            throw ValidationError.serializationFailed
+        }
+    }
+
+    private static func nonblank(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+}
 
 // PATCH-Phase7b: ToolInputForm — shown when a slash-command tool needs multiple
 // or non-string fields that can't be satisfied by free-text alone.
@@ -12,11 +113,11 @@ import SwiftUI
 
 struct ToolInputForm: View {
     let plan: DispatchArgPlan
-    /// Called on "Run" with the collected values.
-    let onSubmit: ([String: Any]) -> Void
+    /// Called on "Run" with a validated, JSON-shaped dispatch body.
+    let onSubmit: (Data) -> Void
     let onCancel: () -> Void
 
-    // Per-field text storage (all fields start as strings; we coerce on submit).
+    // Per-field control values, validated and converted at the dispatch boundary.
     @State private var stringValues: [String: String] = [:]
     @State private var boolValues:   [String: Bool]   = [:]
     @State private var intValues:    [String: Int]     = [:]
@@ -85,6 +186,7 @@ struct ToolInputForm: View {
                         Text(err)
                             .font(.caption)
                             .foregroundStyle(Color.red)
+                            .accessibilityIdentifier("tool-input-form-validation-error")
                     }
                 }
                 .padding(NativeAgentSpacing.lg)
@@ -97,9 +199,11 @@ struct ToolInputForm: View {
                 Spacer()
                 Button("Cancel") { onCancel() }
                     .keyboardShortcut(.escape, modifiers: [])
+                    .accessibilityIdentifier("tool-input-form-cancel")
                 Button("Run") { attemptSubmit() }
                     .keyboardShortcut(.return, modifiers: [.command])
                     .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("tool-input-form-run")
             }
             .padding(.horizontal, NativeAgentSpacing.lg)
             .padding(.vertical, NativeAgentSpacing.md)
@@ -121,48 +225,17 @@ struct ToolInputForm: View {
 
     private func attemptSubmit() {
         validationError = nil
-        var collected: [String: Any] = [:]
-
-        guard let props = schema?.properties else {
-            onSubmit([:])
-            return
+        do {
+            let inputData = try ToolInputFormInput.serializedInput(
+                schema: schema,
+                stringValues: stringValues,
+                boolValues: boolValues,
+                intValues: intValues
+            )
+            onSubmit(inputData)
+        } catch {
+            validationError = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
         }
-
-        for (name, prop) in props {
-            switch prop.type ?? "string" {
-            case "boolean":
-                collected[name] = boolValues[name] ?? false
-            case "integer":
-                if let v = intValues[name] {
-                    collected[name] = v
-                }
-                // Fallback: try parsing the string value if present.
-                else if let s = stringValues[name], let i = Int(s) {
-                    collected[name] = i
-                }
-            default: // "string", "object", "array", unknown → string
-                if let s = stringValues[name], !s.isEmpty {
-                    collected[name] = s
-                }
-            }
-        }
-
-        // Validate required fields are present and non-empty.
-        for field in schema?.required ?? [] {
-            let missing: Bool
-            switch props[field]?.type ?? "string" {
-            case "boolean": missing = false // booleans always have a value
-            case "integer": missing = collected[field] == nil
-            default:        missing = (collected[field] as? String)?.isEmpty != false
-                                      && collected[field] == nil
-            }
-            if missing {
-                validationError = "Field \"\(field)\" is required."
-                return
-            }
-        }
-
-        onSubmit(collected)
     }
 }
 
@@ -178,7 +251,7 @@ private struct ToolFieldRow: View {
     @Binding var boolValues:   [String: Bool]
     @Binding var intValues:    [String: Int]
 
-    private var fieldType: String { prop.type ?? "string" }
+    private var fieldType: String { (prop.type ?? "string").lowercased() }
 
     var body: some View {
         VStack(alignment: .leading, spacing: NativeAgentSpacing.xs) {
@@ -215,6 +288,7 @@ private struct ToolFieldRow: View {
                 }
                 .toggleStyle(.switch)
                 .controlSize(.small)
+                .accessibilityIdentifier("tool-input-field-\(name)")
 
             case "integer":
                 Stepper(
@@ -228,6 +302,7 @@ private struct ToolFieldRow: View {
                         .font(.caption)
                         .monospacedDigit()
                 }
+                .accessibilityIdentifier("tool-input-field-\(name)")
 
             case "object", "array":
                 // Free-form JSON string input with placeholder hint.
@@ -249,6 +324,7 @@ private struct ToolFieldRow: View {
                         RoundedRectangle(cornerRadius: 5)
                             .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
                     )
+                    .accessibilityIdentifier("tool-input-field-\(name)")
                 }
 
             default: // "string"
@@ -258,6 +334,7 @@ private struct ToolFieldRow: View {
                 ))
                 .textFieldStyle(.roundedBorder)
                 .font(.caption)
+                .accessibilityIdentifier("tool-input-field-\(name)")
             }
         }
     }

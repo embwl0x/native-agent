@@ -3,6 +3,7 @@ import MacControl
 import MCPDispatcher
 import NativeAgentCore
 import PersistenceCore
+import TrustCenter
 
 // MARK: - Tool-output failure-shape heuristic
 
@@ -31,7 +32,19 @@ enum ChatToolOutcome {
             return false
         }
         guard case .object(let obj) = output else { return true }
-        if obj["error"] != nil { return false }
+        // A PRESENT key holding JSON `null` is "no error", not an error.
+        // `MacControlResult.toJSON()` always emits `"error": null` on success,
+        // and `obj["error"] != nil` is true for `.some(.null)` — so every
+        // Full-Mac tool (view/click/ax_find/…) traced as failed AND reached
+        // the model as `is_error:true` for months (root-caused 2026-08-21
+        // from the 08-18 "mac_ax_find 12/12 failed" burst: MacControl's op
+        // store had all 12 `completed`). Mirrors `exactResultClass`.
+        if let error = obj["error"], error != .null { return false }
+        // An explicit boolean failure beside a null error is still a failure
+        // (gpt-5.5 review 2026-08-21: `{ok:false, error:null}` must not flip
+        // to ok once null stops counting). Mirrors `exactResultClass`.
+        if case .bool(false)? = obj["ok"] { return false }
+        if case .bool(false)? = obj["success"] { return false }
         // Most non-throwing failures on this surface use status:"failed"/
         // "denied" envelopes with NO "error" key (builder tools, Full-Mac
         // gates, lazy-load misses) — without this they persisted as ok:true
@@ -132,6 +145,78 @@ enum ChatToolOutcome {
         }
     }
 
+    /// Bounded, secret-redacted, single-line failure detail for a
+    /// failure-shaped envelope — the text a receipt may carry so the NEXT
+    /// failure burst is diagnosable from `events.jsonl` alone. Composed ONLY
+    /// from error-shaped fields (`error`/`message`/`reason`/`detail`/
+    /// `error_code`/`status`), never the result body; `ChatSecretRedactor`
+    /// runs BEFORE the cap so a short secret cannot ride through under it.
+    /// Returns nil when no such field is set (ok envelopes, bare objects).
+    static let failureDetailLimit = 200
+
+    static func failureDetail(_ output: JSONValue) -> String? {
+        guard case .object(let object) = output else {
+            if case .string(let text) = output { return boundedDetail(text) }
+            return nil
+        }
+        var parts: [String] = []
+        func take(_ key: String, label: String? = nil) {
+            guard let value = object[key], value != .null else { return }
+            let text: String
+            switch value {
+            case .string(let s): text = s
+            case .bool(let b): text = String(b)
+            case .int(let i): text = String(i)
+            case .double(let d): text = String(d)
+            default: return // nested bodies are never summarised
+            }
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            // The tool loop's projected-error envelope repeats one message
+            // under `error` AND `reason`; keep each distinct text once.
+            let rendered = label.map { "\($0)=\(trimmed)" } ?? trimmed
+            guard !parts.contains(rendered), !parts.contains(trimmed) else { return }
+            parts.append(rendered)
+        }
+        take("error_code", label: "code")
+        take("errorCode", label: "code")
+        take("status", label: "status")
+        take("error")
+        take("message")
+        take("reason")
+        take("detail")
+        guard !parts.isEmpty else { return nil }
+        return boundedDetail(parts.joined(separator: " | "))
+    }
+
+    /// Thrown-error variant: the error's description, same redaction + cap.
+    static func failureDetail(error: any Error) -> String {
+        boundedDetail(String(describing: error)) ?? "error"
+    }
+
+    /// Receipt classification describes the evidence source, not an invented
+    /// root cause. A thrown dispatch and a returned failure envelope are
+    /// materially different failure paths for investigation.
+    static func receiptFailureClass(_ output: JSONValue) -> String {
+        switch exactResultClass(output) {
+        case .cancelled: return "result_cancelled"
+        case .timeout: return "result_timeout"
+        case .failed: return "result_failed"
+        case .succeeded, .unknown: return "result_failure_envelope"
+        }
+    }
+
+    private static func boundedDetail(_ raw: String) -> String? {
+        let collapsed = raw
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        guard !collapsed.isEmpty else { return nil }
+        let redacted = ChatSecretRedactor.redactText(collapsed)
+        guard redacted.count > failureDetailLimit else { return redacted }
+        return String(redacted.prefix(failureDetailLimit)) + "…"
+    }
+
     private static func isDeterministicRefusal(_ output: JSONValue) -> Bool {
         guard case .object(let object) = output else { return false }
         if case .bool(true)? = object["requires_approval"] ?? object["requiresApproval"] {
@@ -226,6 +311,7 @@ final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Sendable {
     nonisolated(unsafe) private static var appendCounter = 0
 
     private let inner: any ToolDispatchClient
+    private let dataRoot: URL
     private let tracesPath: URL
     private let persistence = SwiftNativePersistenceCore()
     private let trimCheckInterval: Int
@@ -236,6 +322,7 @@ final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Sendable {
         trimCheckInterval: Int = ChatToolDispatchTracer.defaultTrimCheckInterval
     ) {
         self.inner = inner
+        self.dataRoot = dataRoot
         self.tracesPath = dataRoot
             .appendingPathComponent("traces", isDirectory: true)
             .appendingPathComponent("events.jsonl")
@@ -264,11 +351,14 @@ final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Sendable {
             )
             await appendTraceRow(
                 tool: tool, input: input, surface: surface,
-                status: "failed", startNs: startNs
+                status: "failed", startNs: startNs,
+                errorClass: "dispatch_threw",
+                errorDetail: ChatToolOutcome.failureDetail(error: error)
             )
             throw error
         }
-        let status = ChatToolOutcome.outputLooksSuccessful(result) ? "ok" : "failed"
+        let ok = ChatToolOutcome.outputLooksSuccessful(result)
+        let status = ok ? "ok" : "failed"
         let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000)
         Self.fireBusEvent(
             tool: tool, input: input, surface: surface,
@@ -276,7 +366,10 @@ final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Sendable {
         )
         await appendTraceRow(
             tool: tool, input: input, surface: surface,
-            status: status, startNs: startNs
+            status: status, startNs: startNs,
+            errorClass: ok ? nil : ChatToolOutcome.receiptFailureClass(result),
+            // Failure-shaped envelope only: an ok row carries no detail.
+            errorDetail: ok ? nil : ChatToolOutcome.failureDetail(result)
         )
         return result
     }
@@ -453,16 +546,26 @@ final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Sendable {
         input: [String: JSONValue],
         surface: String,
         status: String,
-        startNs: UInt64
+        startNs: UInt64,
+        errorClass: String? = nil,
+        errorDetail: String? = nil
     ) async {
         let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000)
         let argKeys = input.keys.sorted()
+        let risk = SwiftNativeSecurityCenter.canonicalToolRisk(
+            tool: tool,
+            input: input,
+            dataRoot: dataRoot
+        )
         let receipt = CompactActionReceipt.toolDispatch(
             tool: tool,
             surface: surface,
             status: status,
             durationMs: durationMs,
-            argKeyCount: argKeys.count
+            argKeyCount: argKeys.count,
+            risk: risk.rawValue,
+            errorClass: errorClass,
+            errorDetail: errorDetail
         )
         let row: JSONValue = .object([
             "id": .string(UUID().uuidString.lowercased()),

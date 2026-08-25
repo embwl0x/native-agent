@@ -7,83 +7,50 @@ import PersistenceCore
 
 extension CognitionObservatoryView {
 
+    @ViewBuilder
     func organism(_ snapshot: OrganismSnapshot) -> some View {
-        VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-            HStack {
-                StatusBadge(text: snapshot.enabled ? "Enabled" : "Off", status: snapshot.enabled ? "ok" : "warn")
-                if let lastSignalAt = snapshot.lastSignalAt {
-                    Text("last signal \(lastSignalAt.formatted(date: .omitted, time: .shortened))")
+        let presentation = CognitionObservatoryOrganismPresentation(snapshot: snapshot)
+        switch presentation.state {
+        case .live:
+            VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
+                HStack {
+                    StatusBadge(text: presentation.statusText, status: presentation.statusKind)
+                    Text(presentation.sampledAtText)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text(presentation.signalCountText)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
-                Spacer()
-                Text("\(snapshot.signalCount) signals")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-            if let line = snapshot.projectedBodyLine, !line.isEmpty {
+                labeledRow("Last signal", presentation.lastSignalText)
+            if let line = presentation.bodyLine, !line.isEmpty {
                 Text(line)
                     .font(.caption)
                     .textSelection(.enabled)
             }
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 190), spacing: NativeAgentSpacing.md)], spacing: NativeAgentSpacing.sm) {
-                labeledValue("Warmth", snapshot.chemicalState.warmth)
-                labeledValue("Vigilance", snapshot.chemicalState.vigilance)
-                labeledValue("Coherence", snapshot.chemicalState.coherence)
-                labeledValue("Confidence", snapshot.chemicalState.confidence)
-                labeledValue("Fatigue", snapshot.chemicalState.fatigue)
-                labeledValue("Agency", snapshot.chemicalState.agency)
+                organismRows(presentation.chemicalRows)
             }
             Divider()
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 190), spacing: NativeAgentSpacing.md)], spacing: NativeAgentSpacing.sm) {
-                labeledRow("Field nodes", "\(snapshot.fieldSummary.nodeCount)")
-                labeledRow("Field edges", "\(snapshot.fieldSummary.edgeCount)")
-                labeledValue("Strongest link", snapshot.fieldSummary.strongestEdgeWeight)
-                labeledValue("Total charge", snapshot.fieldSummary.totalCharge)
-                labeledValue("Uncertainty", snapshot.fieldSummary.averageUncertainty)
+                organismRows(presentation.fieldRows)
             }
             Divider()
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 190), spacing: NativeAgentSpacing.md)], spacing: NativeAgentSpacing.sm) {
-                labeledRow("Predictions pending", "\(snapshot.predictionSummary.pendingCount)")
-                labeledRow("Prediction errors", "\(snapshot.predictionSummary.violatedCount)")
-                labeledRow("Expired predictions", "\(snapshot.predictionSummary.expiredCount)")
-                labeledValue("Peripheral uncertainty", snapshot.predictionSummary.peripheralUncertainty)
-                labeledValue("Strategy caution", snapshot.predictionSummary.strategyCaution)
-                labeledValue("Tool confidence", snapshot.predictionSummary.bodyConfidence.toolPath)
-                labeledValue("Provider confidence", snapshot.predictionSummary.bodyConfidence.providerPath)
-                labeledValue("Phone confidence", snapshot.predictionSummary.bodyConfidence.phonePath)
-                if let providerBelief = snapshot.bodySchema.providerPathBelief {
-                    labeledRow("Provider belief", providerBelief.state.rawValue)
-                    labeledValue("Provider belief estimate", providerBelief.estimate)
-                    labeledValue("Provider belief uncertainty", providerBelief.uncertainty)
-                    labeledValue("Provider evidence freshness", providerBelief.freshness)
-                }
+                organismRows(presentation.predictionRows)
             }
             Divider()
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 190), spacing: NativeAgentSpacing.md)], spacing: NativeAgentSpacing.sm) {
-                labeledRow("Dream repairs", "\(snapshot.dreamRepairSummary.receiptCount)")
-                labeledRow("Last repair ops", "\(snapshot.dreamRepairSummary.lastOperationCount)")
-                labeledRow("Softened nodes", "\(snapshot.dreamRepairSummary.softenedNodes)")
-                labeledRow("Warm links", "\(snapshot.dreamRepairSummary.strengthenedEdges)")
-                labeledRow("Noisy links", "\(snapshot.dreamRepairSummary.weakenedEdges)")
-                labeledRow("Flags", "\(snapshot.dreamRepairSummary.flaggedContradictions)")
-                labeledRow("View proposals", "\(snapshot.dreamRepairSummary.proposedStandingViews)")
-                labeledValue("Residual repair pressure", snapshot.residualRepairOpportunity.pressure)
-                labeledRow("Residual evidence", "\(snapshot.residualRepairOpportunity.evidenceCount)")
-                labeledRow("Residual repair ready", snapshot.residualRepairOpportunity.ready ? "yes" : "no")
+                organismRows(presentation.dreamRepairRows)
             }
             Divider()
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 190), spacing: NativeAgentSpacing.md)], spacing: NativeAgentSpacing.sm) {
-                labeledRow("Reflex candidates", "\(snapshot.reflexSummary.candidateCount)")
-                labeledRow("Need review", "\(snapshot.reflexSummary.reviewRequiredCount)")
-                labeledRow("Low risk", "\(snapshot.reflexSummary.lowRiskCount)")
-                labeledRow("Confirm", "\(snapshot.reflexSummary.confirmRequiredCount)")
-                labeledRow("High risk", "\(snapshot.reflexSummary.highRiskCount)")
-                labeledValue("Highest confidence", snapshot.reflexSummary.highestConfidence)
+                organismRows(presentation.reflexRows)
             }
-            if !snapshot.reflexCandidates.isEmpty {
+            if !presentation.reflexCandidates.isEmpty {
                 VStack(alignment: .leading, spacing: NativeAgentSpacing.xs) {
-                    ForEach(snapshot.reflexCandidates.prefix(4)) { candidate in
+                    ForEach(presentation.reflexCandidates.prefix(4)) { candidate in
                         VStack(alignment: .leading, spacing: 2) {
                             HStack(spacing: NativeAgentSpacing.xs) {
                                 StatusBadge(
@@ -105,30 +72,39 @@ extension CognitionObservatoryView {
                             HStack(spacing: NativeAgentSpacing.xs) {
                                 if candidate.reviewRequired {
                                     Button("Approve", systemImage: "checkmark.circle") {
+                                        guard reflexReviewsInFlight.insert(candidate.id).inserted else { return }
                                         Task {
-                                            _ = await NativeCognitionRuntime.shared.reviewOrganismReflexCandidate(
+                                            defer { reflexReviewsInFlight.remove(candidate.id) }
+                                            let result = await CognitionObservatoryActions.reviewReflex(
+                                                runtime: runtime,
                                                 id: candidate.id,
                                                 decision: .approve,
                                                 note: "Approved from Cognition Observatory",
                                                 reviewedBy: "operator",
                                                 source: "mac_observatory"
                                             )
+                                            reportReflexReview(result.outcome, action: "Approve")
                                             await refresh()
                                         }
                                     }
-                                    .disabled(candidate.trustClass != .lowRisk)
+                                    .disabled(candidate.trustClass != .lowRisk || reflexReviewsInFlight.contains(candidate.id))
                                     Button("Retire", systemImage: "xmark.circle") {
+                                        guard reflexReviewsInFlight.insert(candidate.id).inserted else { return }
                                         Task {
-                                            _ = await NativeCognitionRuntime.shared.reviewOrganismReflexCandidate(
+                                            defer { reflexReviewsInFlight.remove(candidate.id) }
+                                            let result = await CognitionObservatoryActions.reviewReflex(
+                                                runtime: runtime,
                                                 id: candidate.id,
                                                 decision: .retire,
                                                 note: "Retired from Cognition Observatory",
                                                 reviewedBy: "operator",
                                                 source: "mac_observatory"
                                             )
+                                            reportReflexReview(result.outcome, action: "Retire")
                                             await refresh()
                                         }
                                     }
+                                    .disabled(reflexReviewsInFlight.contains(candidate.id))
                                 } else if candidate.autoActivationAllowed {
                                     Label("Approved low-risk", systemImage: "checkmark.seal")
                                         .font(.caption2)
@@ -142,24 +118,31 @@ extension CognitionObservatoryView {
             }
             Divider()
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 190), spacing: NativeAgentSpacing.md)], spacing: NativeAgentSpacing.sm) {
-                labeledRow("Mac awake", yesNo(snapshot.bodySchema.macAwake))
-                labeledRow("iPhone reachable", yesNo(snapshot.bodySchema.iPhoneReachable))
-                labeledRow("Providers", health(snapshot.bodySchema.providersHealthy))
-                labeledRow("Memory", health(snapshot.bodySchema.memoryHealthy))
-                labeledRow("Dreams", health(snapshot.bodySchema.dreamHealthy))
-                labeledRow("Tools", snapshot.bodySchema.toolHandsAvailable ? "available" : "unavailable")
-                labeledRow("Approvals", snapshot.bodySchema.approvalChannelsOpen ? "open" : "closed")
-                labeledRow("Notifications", health(snapshot.bodySchema.notificationPathHealthy))
-                labeledRow("Resource pressure", snapshot.bodySchema.resourcePressure.rawValue)
+                organismRows(presentation.bodyRows)
             }
+            }
+        case .disabled, .unavailable, .absent:
+            ObservatoryNoticeRow(
+                icon: "eye.slash",
+                tint: .secondary,
+                title: "Organism body readout unavailable",
+                detail: presentation.unavailableReason ?? "No organism body readout is available."
+            )
         }
     }
 
-    private func yesNo(_ value: Bool) -> String {
-        value ? "yes" : "no"
+    @ViewBuilder
+    private func organismRows(_ rows: [CognitionObservatoryOrganismPresentation.Row]) -> some View {
+        ForEach(rows) { row in
+            labeledRow(row.label, row.value)
+        }
     }
 
-    private func health(_ value: Bool) -> String {
-        value ? "healthy" : "attention"
+    private func reportReflexReview(_ outcome: OrganismReflexReviewApplyOutcome, action: String) {
+        if outcome.applied {
+            dependencies.systemToasts.push(success: "\(action) reflex review saved.")
+        } else {
+            dependencies.systemToasts.push(error: "\(action) reflex review failed: \(outcome.error ?? outcome.status.rawValue)")
+        }
     }
 }

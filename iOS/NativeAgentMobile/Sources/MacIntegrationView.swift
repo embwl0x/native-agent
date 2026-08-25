@@ -61,6 +61,18 @@ struct MacIntegrationView: View {
                     .font(AppFont.section)
             }
 
+            if let projectionError = sync.projectionError {
+                Section {
+                    Text(projectionError)
+                        .font(AppFont.label)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                } header: {
+                    Label("Mac Permission Sync Unavailable", systemImage: "exclamationmark.triangle")
+                        .font(AppFont.section)
+                }
+            }
+
             ForEach(MacIntegrationCatalog.rows) { row in
                 Section {
                     MacIntegrationRowView(row: row, sync: sync)
@@ -79,6 +91,23 @@ struct MacIntegrationView: View {
         }
         .navigationTitle("Mac Integration")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .navigationBarLeading) {
+                MacStatusChip()
+            }
+        }
+        .macSyncErrorBanner()
+        .refreshable {
+            await refreshMacIntegrationProjection()
+        }
+        .task {
+            await refreshMacIntegrationProjection()
+        }
+    }
+
+    private func refreshMacIntegrationProjection() async {
+        sync.refreshProjection()
+        await identity.refreshTrustSnapshot()
     }
 }
 

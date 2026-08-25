@@ -58,7 +58,7 @@ struct NoAutomaticChatGreetingTests {
         let root = try AppSourceScraping.appSourcesRoot()
         let welcome = root.appendingPathComponent("AppModel+FirstRunWelcome.swift")
         let source = try String(contentsOf: welcome, encoding: .utf8)
-        let gate = "guard NativeAgentPaths.isPublicReleaseBundle else { return }"
+        let gate = "guard NativeAgentPaths.isPublicReleaseBundle else {"
 
         for function in ["markFirstRunWelcomePending", "maybeSendFirstRunGreeting"] {
             let body = try #require(

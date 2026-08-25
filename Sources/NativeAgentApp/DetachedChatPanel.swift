@@ -29,6 +29,31 @@
 import SwiftUI
 import AppKit
 
+enum DetachedChatFramePlacement {
+    static func place(
+        _ frame: NSRect,
+        near point: NSPoint,
+        visibleFrames: [NSRect],
+        fallbackFrame: NSRect?
+    ) -> NSRect {
+        let usable = visibleFrames.filter { $0.width > 1 && $0.height > 1 }
+        let fallback = fallbackFrame.flatMap { $0.width > 1 && $0.height > 1 ? $0 : nil }
+        guard let visibleFrame = usable.first(where: { $0.contains(point) }) ?? fallback ?? usable.first else {
+            return frame
+        }
+        return clamp(frame, within: visibleFrame)
+    }
+
+    static func clamp(_ frame: NSRect, within visibleFrame: NSRect) -> NSRect {
+        var clamped = frame
+        if clamped.maxX > visibleFrame.maxX { clamped.origin.x = visibleFrame.maxX - clamped.width }
+        if clamped.minX < visibleFrame.minX { clamped.origin.x = visibleFrame.minX }
+        if clamped.maxY > visibleFrame.maxY { clamped.origin.y = visibleFrame.maxY - clamped.height }
+        if clamped.minY < visibleFrame.minY { clamped.origin.y = visibleFrame.minY }
+        return clamped
+    }
+}
+
 /// NSPanel subclass mirroring SpotlightOverlay's key-window override.
 /// Detached chat panels are normal app windows (not non-activating HUDs),
 /// so they take key/main focus — but using NSPanel keeps them out of the
@@ -75,6 +100,78 @@ final class DetachedChatPanel: NSPanel {
     override var acceptsFirstResponder: Bool { true }
 }
 
+@MainActor
+protocol DetachedChatPanelHandle: AnyObject {
+    var appearance: NSAppearance? { get set }
+    func center()
+    func show()
+    func close()
+}
+
+@MainActor
+struct DetachedChatPanelBuildRequest {
+    let sessionId: String
+    let title: String
+    let initialFrame: NSRect
+    let appModel: AppModel
+    let appearance: NSAppearance?
+    let onClose: () -> Void
+}
+
+typealias DetachedChatPanelBuilder = (DetachedChatPanelBuildRequest) -> any DetachedChatPanelHandle
+
+typealias DetachedChatSessionPinner = (AppModel, String) -> Void
+
+/// The real AppKit handle used by the production controller. Keeping it
+/// behind the small handle protocol lets the lifecycle owner be evaluated
+/// without manufacturing an NSPanel in a test process.
+@MainActor
+private final class LiveDetachedChatPanelHandle: NSObject, DetachedChatPanelHandle {
+    private let panel: DetachedChatPanel
+    private let hosting: NSHostingController<AnyView>
+    private let delegate: PanelDelegate
+
+    init(request: DetachedChatPanelBuildRequest) {
+        let panel = DetachedChatPanel(
+            sessionId: request.sessionId,
+            contentRect: request.initialFrame
+        )
+        let view = DetachedChatPanelView(sessionId: request.sessionId)
+            .environment(request.appModel)
+        let hosting = NSHostingController(rootView: AnyView(view))
+        let delegate = PanelDelegate()
+        delegate.onWillClose = request.onClose
+
+        self.panel = panel
+        self.hosting = hosting
+        self.delegate = delegate
+
+        super.init()
+
+        panel.title = request.title
+        panel.appearance = request.appearance
+        panel.contentViewController = hosting
+        panel.delegate = delegate
+    }
+
+    var appearance: NSAppearance? {
+        get { panel.appearance }
+        set { panel.appearance = newValue }
+    }
+
+    func center() {
+        panel.center()
+    }
+
+    func show() {
+        panel.makeKeyAndOrderFront(nil)
+    }
+
+    func close() {
+        panel.close()
+    }
+}
+
 // MARK: - Controller
 
 /// One-per-app coordinator for detached chat panels. Owns the panel
@@ -85,15 +182,43 @@ final class DetachedChatPanel: NSPanel {
 final class DetachedChatWindowController {
     static let shared = DetachedChatWindowController()
 
-    private var panels: [String: DetachedChatPanel] = [:]
-    private var hostingControllers: [String: NSHostingController<AnyView>] = [:]
+    private var panels: [String: any DetachedChatPanelHandle] = [:]
     private weak var appModel: AppModel?
+    private let defaults: UserDefaults
+    private let panelBuilder: DetachedChatPanelBuilder
+    private let pinSession: DetachedChatSessionPinner
+    private let appearanceObserver: DarkModePreferenceObserver
 
     /// UserDefaults key for the persisted open-set (comma-separated
     /// sessionIds). AppDelegate reads this on launch and replays open().
-    private static let persistKey = "NativeAgent.detachedChatSessionIds"
+    static let persistKey = "NativeAgent.detachedChatSessionIds"
 
-    private init() {}
+    private init() {
+        defaults = .standard
+        appearanceObserver = DarkModePreferenceObserver(object: defaults)
+        panelBuilder = { request in
+            LiveDetachedChatPanelHandle(request: request)
+        }
+        pinSession = { appModel, sessionId in
+            appModel.pinChatSessionForDetachedWindow(sessionId)
+        }
+    }
+
+    /// Injection is intentionally narrow: production always builds the real
+    /// AppKit panel above, while an executable lifecycle eval supplies a
+    /// close-capable in-memory handle.
+    init(
+        defaults: UserDefaults,
+        panelBuilder: @escaping DetachedChatPanelBuilder,
+        pinSession: @escaping DetachedChatSessionPinner,
+        appearanceObserver: DarkModePreferenceObserver? = nil
+    ) {
+        self.defaults = defaults
+        self.panelBuilder = panelBuilder
+        self.pinSession = pinSession
+        self.appearanceObserver = appearanceObserver
+            ?? DarkModePreferenceObserver(object: defaults)
+    }
 
     /// Inject the AppModel after it constructs (mirrors SpotlightOverlay's
     /// attach pattern — the controller is a singleton that predates the
@@ -109,33 +234,28 @@ final class DetachedChatWindowController {
     /// the hosted view styles the CONTENT only — the panel's titlebar is AppKit
     /// chrome and needs the window's own appearance set, or a dark panel wears a
     /// light title bar (User, 2026-07-25).
-    private static var preferredAppearance: NSAppearance? {
-        UserDefaults.standard.bool(forKey: "nativeagent.darkMode")
-            ? NSAppearance(named: .darkAqua)
-            : nil  // nil = follow the system, matching the main Window scene
+    /// Maps the one persisted preference into AppKit chrome. Keeping this
+    /// small reader injectable lets a hermetic evaluation prove that an open
+    /// detached panel follows the same authority as the main SwiftUI window.
+    static func preferredAppearance(defaults: UserDefaults = .standard) -> NSAppearance? {
+        // `bool(forKey:)` coerces arbitrary legacy values, including strings.
+        // Treat anything except a real persisted Bool(true) as system
+        // appearance so malformed preferences never force unexpected chrome.
+        guard let preferDark = defaults.object(forKey: "nativeagent.darkMode") as? Bool,
+              preferDark
+        else { return nil }
+        return NSAppearance(named: .darkAqua)
     }
-
-    private var appearanceObserver: NSObjectProtocol?
 
     /// Keep open panels in sync when the preference flips while they are up.
     private func observeAppearancePreference() {
-        guard appearanceObserver == nil else { return }
-        appearanceObserver = NotificationCenter.default.addObserver(
-            forName: UserDefaults.didChangeNotification,
-            object: UserDefaults.standard,
-            queue: .main
-        ) { _ in
-            // Task rather than MainActor.assumeIsolated: queue: .main makes
-            // main-thread delivery likely, not guaranteed by the type system,
-            // and assumeIsolated would trap if that ever changed.
-            Task { @MainActor in
-                DetachedChatWindowController.shared.applyAppearanceToOpenPanels()
-            }
+        appearanceObserver.start { [weak self] in
+            self?.applyAppearanceToOpenPanels()
         }
     }
 
     private func applyAppearanceToOpenPanels() {
-        let appearance = Self.preferredAppearance
+        let appearance = Self.preferredAppearance(defaults: defaults)
         for panel in panels.values where panel.appearance != appearance {
             panel.appearance = appearance
         }
@@ -150,16 +270,12 @@ final class DetachedChatWindowController {
     /// screen containing `near` (the drop point) when possible, else the
     /// main screen, and nudges the frame inside that screen's visibleFrame.
     private static func clampFrameToScreen(_ frame: NSRect, near point: NSPoint) -> NSRect {
-        let screen = NSScreen.screens.first(where: { $0.frame.contains(point) })
-            ?? NSScreen.main
-            ?? NSScreen.screens.first
-        guard let vis = screen?.visibleFrame else { return frame }
-        var f = frame
-        if f.maxX > vis.maxX { f.origin.x = vis.maxX - f.width }
-        if f.minX < vis.minX { f.origin.x = vis.minX }
-        if f.maxY > vis.maxY { f.origin.y = vis.maxY - f.height }
-        if f.minY < vis.minY { f.origin.y = vis.minY }
-        return f
+        DetachedChatFramePlacement.place(
+            frame,
+            near: point,
+            visibleFrames: NSScreen.screens.map(\.visibleFrame),
+            fallbackFrame: NSScreen.main?.visibleFrame
+        )
     }
 
     /// Open (or focus, if already open) a detached panel for `sessionId`.
@@ -170,7 +286,7 @@ final class DetachedChatWindowController {
     func open(sessionId: String, origin: NSPoint? = nil) {
         // One-per-sessionId guard — also the focus path for re-detach.
         if let existing = panels[sessionId] {
-            existing.makeKeyAndOrderFront(nil)
+            existing.show()
             return
         }
         guard let appModel else {
@@ -213,15 +329,16 @@ final class DetachedChatWindowController {
             initialFrame = NSRect(origin: .zero, size: size)
         }
 
-        let panel = DetachedChatPanel(sessionId: sessionId, contentRect: initialFrame)
-        panel.title = title
-        panel.delegate = panelDelegate
-        panel.appearance = Self.preferredAppearance
-
-        let view = DetachedChatPanelView(sessionId: sessionId)
-            .environment(appModel)
-        let hosting = NSHostingController(rootView: AnyView(view))
-        panel.contentViewController = hosting
+        let panel = panelBuilder(.init(
+            sessionId: sessionId,
+            title: title,
+            initialFrame: initialFrame,
+            appModel: appModel,
+            appearance: Self.preferredAppearance(),
+            onClose: { [weak self] in
+                self?.handleWillClose(sessionId: sessionId)
+            }
+        ))
 
         // Center only a brand-new no-origin window. If a saved frame was
         // restored in init (setFrameUsingName), keep its position —
@@ -229,16 +346,15 @@ final class DetachedChatWindowController {
         if origin == nil, !DetachedChatPanel.hasSavedFrame(sessionId: sessionId) {
             panel.center()
         }
-        panel.makeKeyAndOrderFront(nil)
 
         panels[sessionId] = panel
-        hostingControllers[sessionId] = hosting
 
         // Auto-pin BEFORE persisting so a crash between the two leaves a
         // pinned session without a detached panel (recoverable), not the
         // reverse.
-        appModel.pinChatSessionForDetachedWindow(sessionId)
+        pinSession(appModel, sessionId)
         addToPersist(sessionId)
+        panel.show()
     }
 
     /// Close the panel for `sessionId` if open. The windowWillClose
@@ -250,7 +366,7 @@ final class DetachedChatWindowController {
     /// Focus the existing panel for `sessionId` (used when the user clicks
     /// a detached session's sidebar row — W1.5).
     func focus(sessionId: String) {
-        panels[sessionId]?.makeKeyAndOrderFront(nil)
+        panels[sessionId]?.show()
     }
 
     /// Restore detached panels on launch from the persisted set. Waits up
@@ -276,7 +392,7 @@ final class DetachedChatWindowController {
     // MARK: - Persist set
 
     private func persistedSet() -> [String] {
-        let raw = UserDefaults.standard.string(forKey: Self.persistKey) ?? ""
+        let raw = defaults.string(forKey: Self.persistKey) ?? ""
         var seen = Set<String>()
         return raw.split(separator: ",")
             .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -284,7 +400,11 @@ final class DetachedChatWindowController {
     }
 
     private func saveSet(_ ids: [String]) {
-        UserDefaults.standard.set(ids.joined(separator: ","), forKey: Self.persistKey)
+        if ids.isEmpty {
+            defaults.removeObject(forKey: Self.persistKey)
+        } else {
+            defaults.set(ids.joined(separator: ","), forKey: Self.persistKey)
+        }
     }
 
     private func addToPersist(_ sessionId: String) {
@@ -299,19 +419,8 @@ final class DetachedChatWindowController {
         saveSet(ids)
     }
 
-    // MARK: - Delegate forwarder
-
-    private lazy var panelDelegate: PanelDelegate = {
-        let d = PanelDelegate()
-        d.onWillClose = { [weak self] sessionId in
-            self?.handleWillClose(sessionId: sessionId)
-        }
-        return d
-    }()
-
     private func handleWillClose(sessionId: String) {
         panels.removeValue(forKey: sessionId)
-        hostingControllers.removeValue(forKey: sessionId)
         removeFromPersist(sessionId)
         // Do NOT auto-unpin — the user wants the pinned-strip entry to stick
         // around even after the floating window is dismissed.
@@ -319,10 +428,10 @@ final class DetachedChatWindowController {
 }
 
 private final class PanelDelegate: NSObject, NSWindowDelegate {
-    var onWillClose: ((String) -> Void)?
+    var onWillClose: (() -> Void)?
 
     func windowWillClose(_ notification: Notification) {
         guard let panel = notification.object as? DetachedChatPanel else { return }
-        onWillClose?(panel.sessionId)
+        onWillClose?()
     }
 }

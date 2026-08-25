@@ -556,15 +556,60 @@ extension NativeClient {
             } else {
                 // No token: honor the honest-disconnected freeze if set.
                 if existingAuth == "connected_unverified" || existingHealth == "needs_probe" {
-                    return out
+                    // Slack's credential state remains frozen, but its
+                    // separately-owned Socket Mode feed still has to be
+                    // surfaced below. Other token-backed connectors have no
+                    // such runtime feed.
+                    if id != "slack" { return out }
                 }
-                out["authState"] = .string("not_connected")
-                if existingHealth == nil || existingHealth == "ok" || existingHealth == "ready" || existingHealth == "connected" {
-                    out["healthStatus"] = .string("needs_auth")
+                if existingAuth != "connected_unverified" && existingHealth != "needs_probe" {
+                    out["authState"] = .string("not_connected")
+                    if existingHealth == nil || existingHealth == "ok" || existingHealth == "ready" || existingHealth == "connected" {
+                        out["healthStatus"] = .string("needs_auth")
+                    }
                 }
             }
         }
+        if id == "slack" {
+            applySlackRuntimeStateFeed(to: &out, root: root)
+        }
         return out
+    }
+
+    /// Keep credential readiness and Socket Mode evidence separate. Slack can
+    /// post with a valid bot token while inbound Socket Mode has not started;
+    /// conversely, a stale runtime feed must be displayed as stale rather than
+    /// silently changing the credential claim to disconnected.
+    private static func applySlackRuntimeStateFeed(
+        to row: inout [String: JSONValue],
+        root: URL
+    ) {
+        switch SlackRuntimeStateFeed.read(dataRoot: root) {
+        case .absent:
+            row["runtimeStatus"] = .string("unobserved")
+            row["runtimeDetail"] = .string("Socket Mode has not produced runtime state yet.")
+            row["runtimeUpdatedAt"] = .null
+        case .current(let snapshot):
+            row["runtimeUpdatedAt"] = .string(snapshot.updatedAt)
+            if snapshot.hasReportedError {
+                row["runtimeStatus"] = .string("degraded")
+                row["runtimeDetail"] = .string("Socket Mode reported a runtime error.")
+            } else if snapshot.connected {
+                row["runtimeStatus"] = .string("connected")
+                row["runtimeDetail"] = .string("Socket Mode heartbeat is current.")
+            } else {
+                row["runtimeStatus"] = .string("disconnected")
+                row["runtimeDetail"] = .string("Socket Mode last reported a disconnected state.")
+            }
+        case .stale(let snapshot):
+            row["runtimeStatus"] = .string("stale")
+            row["runtimeDetail"] = .string("Socket Mode state has not refreshed within its heartbeat window.")
+            row["runtimeUpdatedAt"] = .string(snapshot.updatedAt)
+        case .unavailable:
+            row["runtimeStatus"] = .string("unavailable")
+            row["runtimeDetail"] = .string("Socket Mode runtime state could not be read safely.")
+            row["runtimeUpdatedAt"] = .null
+        }
     }
 
     /// Registry connector id → (client-id env var, OAuth-flow canonical id,

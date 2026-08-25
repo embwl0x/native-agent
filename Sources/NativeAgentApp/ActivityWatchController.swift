@@ -3,6 +3,51 @@ import Observation
 import ActivityWatch
 import PersistenceCore
 
+struct ActivityCaptureIssue: Identifiable, Equatable {
+    enum Severity: Int, Comparable, Equatable {
+        case notice = 0
+        case warning = 1
+        case critical = 2
+
+        static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
+
+        var title: String {
+            switch self {
+            case .notice: "Notice"
+            case .warning: "Warning"
+            case .critical: "Action needed"
+            }
+        }
+
+        var systemImage: String {
+            switch self {
+            case .notice: "info.circle.fill"
+            case .warning: "exclamationmark.circle.fill"
+            case .critical: "exclamationmark.triangle.fill"
+            }
+        }
+    }
+
+    let id: UUID
+    let occurredAt: Date
+    let severity: Severity
+    let message: String
+}
+
+/// Critical Activity Capture failures need an out-of-panel signal, but the
+/// OS notification must not copy possibly-sensitive bundle IDs, paths, or
+/// storage errors onto the lock screen. The retained issue remains the detail
+/// authority in Trust Center; this is the immediate, privacy-safe escalation.
+enum ActivityCaptureIssueNotificationPresentation {
+    static func notification(for issue: ActivityCaptureIssue) -> (title: String, body: String)? {
+        guard issue.severity == .critical else { return nil }
+        return (
+            title: "Activity capture needs attention",
+            body: "A capture-stop or data-retention failure was recorded. Open Trust Center → Activity Capture to review it."
+        )
+    }
+}
+
 /// W8 — the app-side owner of the ambient activity watcher's lifecycle.
 ///
 /// One object holds the policy, the store, the watcher and the retention
@@ -20,7 +65,11 @@ import PersistenceCore
 @MainActor
 @Observable
 final class ActivityWatchController {
-    static let shared = ActivityWatchController()
+    static let shared = ActivityWatchController(
+        criticalIssueNotifier: { title, body in
+            NativeAgentNotifications.post(title: title, body: body)
+        }
+    )
 
     /// The live policy. Every mutation goes through `apply(_:)`, which writes
     /// to disk FIRST and only then tells the watcher — so a crash between the
@@ -32,10 +81,25 @@ final class ActivityWatchController {
     /// menu-bar indicator.
     private(set) var isCapturing = false
 
-    /// Last error surfaced to the UI (store open failure, policy write
-    /// failure). Never a silent swallow: a capture toggle that fails to save
-    /// and says nothing is the worst possible outcome for this feature.
-    private(set) var lastError: String?
+    /// Bounded, ordered failure history. A benign later failure must not erase
+    /// the more consequential capture-stop or failed-purge evidence.
+    private(set) var issues: [ActivityCaptureIssue] = []
+
+    var lastError: String? { primaryIssue?.message }
+    var primaryIssue: ActivityCaptureIssue? {
+        presentationIssues.first
+    }
+
+    /// Highest impact first, then newest within one severity. This is the
+    /// user-facing order and makes a later harmless notice unable to bury a
+    /// capture-stop or failed-purge failure.
+    var presentationIssues: [ActivityCaptureIssue] {
+        issues.sorted {
+            $0.severity == $1.severity
+                ? $0.occurredAt > $1.occurredAt
+                : $0.severity > $1.severity
+        }
+    }
 
     /// Rows purged by the most recent retro-delete or wipe, for the UI to
     /// report honestly ("removed 412 recorded spans").
@@ -43,18 +107,27 @@ final class ActivityWatchController {
 
     private let dataRoot: URL
     private let policyStore: ActivityPolicyStore
+    private let watcherPolicySource: @Sendable (URL) -> any ActivityPolicySource
+    private let criticalIssueNotifier: @MainActor (String, String) -> Void
     private var spanStore: ActivitySpanStore?
     private var watcher: ActivityWatcher?
 
-    init(dataRoot: URL = NativeAgentPaths.dataRoot) {
+    init(
+        dataRoot: URL = NativeAgentPaths.dataRoot,
+        watcherPolicySource: @escaping @Sendable (URL) -> any ActivityPolicySource = {
+            ActivityPolicyFileSource(dataRoot: $0)
+        },
+        criticalIssueNotifier: @escaping @MainActor (String, String) -> Void = { _, _ in }
+    ) {
         self.dataRoot = dataRoot
         self.policyStore = ActivityPolicyStore(dataRoot: dataRoot)
+        self.watcherPolicySource = watcherPolicySource
+        self.criticalIssueNotifier = criticalIssueNotifier
         do {
             self.policy = try policyStore.loadChecked()
-            self.lastError = nil
         } catch {
             self.policy = ActivityPolicy()
-            self.lastError = error.localizedDescription
+            recordIssue(error.localizedDescription, severity: .critical)
         }
     }
 
@@ -86,7 +159,7 @@ final class ActivityWatchController {
         Task { @MainActor [weak self, weak watcher] in
             guard let self, let watcher else { return }
             if !(await watcher.startBounded()) {
-                self.lastError = "Activity capture could not start cleanly. Its partial startup was rolled back."
+                self.recordIssue("Activity capture could not start cleanly. Its partial startup was rolled back.", severity: .critical)
             }
             self.refreshCapturingFlag()
         }
@@ -108,12 +181,12 @@ final class ActivityWatchController {
             let created = ActivityWatcher(
                 store: store,
                 policy: policy,
-                policySource: ActivityPolicyFileSource(dataRoot: dataRoot),
+                policySource: watcherPolicySource(dataRoot),
                 lifecycleChanged: { [weak self] state in
                     Task { @MainActor [weak self] in
                         self?.refreshCapturingFlag()
                         if state == .degraded {
-                            self?.lastError = "Activity capture stopped because its live watcher became unavailable."
+                            self?.recordIssue("Activity capture stopped because its live watcher became unavailable.", severity: .critical)
                         }
                     }
                 },
@@ -124,17 +197,16 @@ final class ActivityWatchController {
                         do {
                             _ = try self.policyStore.loadChecked()
                         } catch {
-                            self.lastError = error.localizedDescription
+                            self.recordIssue(error.localizedDescription, severity: .critical)
                         }
                     }
                 }
             )
             spanStore = store
             watcher = created
-            lastError = nil
             return created
         } catch {
-            lastError = "Could not open the activity store: \(error.localizedDescription)"
+            recordIssue("Could not open the activity store: \(error.localizedDescription)", severity: .critical)
             return nil
         }
     }
@@ -177,10 +249,9 @@ final class ActivityWatchController {
         do {
             try policyStore.save(next)
         } catch {
-            lastError = "Could not save the activity policy: \(error.localizedDescription)"
+            recordIssue("Could not save the activity policy: \(error.localizedDescription)", severity: .critical)
             return false
         }
-        lastError = nil
         policy = next
 
         if next.captureEnabled {
@@ -261,7 +332,7 @@ final class ActivityWatchController {
         do {
             lastPurgedRowCount = try await store.purge(bundleID: trimmed)
         } catch {
-            lastError = "Excluded \(trimmed), but could not delete its recorded rows: \(error.localizedDescription)"
+            recordIssue("Excluded \(trimmed), but could not delete its recorded rows: \(error.localizedDescription)", severity: .critical)
         }
     }
 
@@ -294,17 +365,37 @@ final class ActivityWatchController {
         do {
             lastPurgedRowCount = try await store.wipeAll()
         } catch {
-            lastError = "Wipe failed: \(error.localizedDescription)"
+            recordIssue("Wipe failed: \(error.localizedDescription)", severity: .critical)
         }
     }
 
     func runRetention() async {
         guard let store = spanStore else { return }
         let runner = ActivityRetentionRunner(dataRoot: dataRoot)
-        _ = try? await runner.runIfDue(
-            store: store,
-            policy: policy,
-            now: Date().timeIntervalSince1970
-        )
+        do {
+            _ = try await runner.runIfDue(
+                store: store,
+                policy: policy,
+                now: Date().timeIntervalSince1970
+            )
+        } catch {
+            // Retention failure does not expand collection authority, but it
+            // does leave older local rows in place and must stay visible.
+            recordIssue(
+                "Activity retention could not remove expired rows: \(error.localizedDescription)",
+                severity: .warning
+            )
+        }
+    }
+
+    func recordIssue(_ message: String, severity: ActivityCaptureIssue.Severity) {
+        let issue = ActivityCaptureIssue(id: UUID(), occurredAt: Date(), severity: severity, message: message)
+        issues.append(issue)
+        // Discard least-consequential/oldest evidence first. A later benign
+        // notice must not evict a serious capture authority failure.
+        if issues.count > 12 { issues = Array(presentationIssues.prefix(12)) }
+        if let notification = ActivityCaptureIssueNotificationPresentation.notification(for: issue) {
+            criticalIssueNotifier(notification.title, notification.body)
+        }
     }
 }

@@ -1,12 +1,69 @@
 import SwiftUI
 
+/// The configuration page deliberately keeps its mutation boundary out of the
+/// SwiftUI tree.  A remote node is an effect target, so the UI can only present
+/// the result of the canonical `NativeClient` write; it must not infer that a
+/// button press changed the executor store.
+enum RemoteNodeConfigurationAction {
+    enum SaveOutcome: Equatable {
+        case saved(ExperienceRemoteNode)
+        case failed(String)
+
+        var errorMessage: String? {
+            guard case let .failed(message) = self else { return nil }
+            return message
+        }
+    }
+
+    enum DeleteOutcome: Equatable {
+        case deleted
+        case noSelection
+        case failed(String)
+
+        var errorMessage: String? {
+            guard case let .failed(message) = self else { return nil }
+            return message
+        }
+    }
+
+    static func save(
+        draft: RemoteNodeDraft,
+        selectedID: String?,
+        client: NativeClient
+    ) async -> SaveOutcome {
+        do {
+            return .saved(try await client.saveTrustedRemoteNode(draft.node(id: selectedID)))
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+    }
+
+    static func delete(selectedID: String?, client: NativeClient) async -> DeleteOutcome {
+        guard let selectedID else { return .noSelection }
+        do {
+            try await client.removeTrustedRemoteNode(id: selectedID)
+            return .deleted
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+    }
+
+    static func nodeStateText(enabled: Bool) -> String {
+        enabled ? "Enabled" : "Disabled"
+    }
+}
+
 struct NativeExperienceRemoteNodesPage: View {
     @Environment(AppModel.self) private var appModel
     @State private var nodes: [ExperienceRemoteNode] = []
     @State private var selectedID: String?
-    @State private var draft = RemoteNodeDraft()
+    @State private var draft: RemoteNodeDraft
     @State private var error: String?
     @State private var deleteRequested = false
+
+    init(initialDraft: RemoteNodeDraft = RemoteNodeDraft()) {
+        _draft = State(initialValue: initialDraft)
+    }
 
     var body: some View {
         HSplitView {
@@ -15,6 +72,9 @@ struct NativeExperienceRemoteNodesPage: View {
                     VStack(alignment: .leading, spacing: 2) {
                         HStack { Text(node.name); if node.enabled { Circle().fill(.green).frame(width: 7, height: 7) } }
                         Text("\(node.user)@\(node.host):\(node.port)").font(.caption.monospaced()).foregroundStyle(.secondary)
+                        Text(RemoteNodeConfigurationAction.nodeStateText(enabled: node.enabled))
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(node.enabled ? .green : .secondary)
                     }.tag(node.id)
                 }
                 Divider()
@@ -76,22 +136,33 @@ struct NativeExperienceRemoteNodesPage: View {
     }
 
     @MainActor private func save() async {
-        do {
-            let saved = try await appModel.client.saveTrustedRemoteNode(draft.node(id: selectedID))
+        switch await RemoteNodeConfigurationAction.save(
+            draft: draft,
+            selectedID: selectedID,
+            client: appModel.client
+        ) {
+        case .saved(let saved):
+            error = nil
             await load(); selectedID = saved.id; draft = RemoteNodeDraft(saved)
-        } catch { self.error = error.localizedDescription }
+        case .failed(let message):
+            error = message
+        }
     }
 
     @MainActor private func remove() async {
-        guard let selectedID else { return }
-        do {
-            try await appModel.client.removeTrustedRemoteNode(id: selectedID)
+        switch await RemoteNodeConfigurationAction.delete(selectedID: selectedID, client: appModel.client) {
+        case .deleted:
+            error = nil
             self.selectedID = nil; draft = RemoteNodeDraft(); await load()
-        } catch { self.error = error.localizedDescription }
+        case .noSelection:
+            break
+        case .failed(let message):
+            error = message
+        }
     }
 }
 
-private struct RemoteNodeDraft {
+struct RemoteNodeDraft {
     var name = ""
     var host = ""
     var port = 22
@@ -102,6 +173,25 @@ private struct RemoteNodeDraft {
     var enabled = false
 
     init() {}
+    init(
+        name: String,
+        host: String,
+        port: Int = 22,
+        user: String,
+        hostKeyAlgorithm: String = "ssh-ed25519",
+        hostKey: String,
+        allowedExecutables: String,
+        enabled: Bool
+    ) {
+        self.name = name
+        self.host = host
+        self.port = port
+        self.user = user
+        self.hostKeyAlgorithm = hostKeyAlgorithm
+        self.hostKey = hostKey
+        self.allowedExecutables = allowedExecutables
+        self.enabled = enabled
+    }
     init(_ node: ExperienceRemoteNode) {
         name = node.name; host = node.host; port = node.port; user = node.user
         hostKeyAlgorithm = node.hostKeyAlgorithm; hostKey = node.hostKey

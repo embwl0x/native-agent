@@ -1022,3 +1022,73 @@ private func readJSONLFile(_ url: URL) -> [JSONValue] {
     // 0 -> 5; search returns 10, lab clamps to 5.
     #expect(run.sources.count == 5)
 }
+
+// MARK: - fetch caps (eval ledger: research.fetch.textCaps / research.fetchURL.byteCaps)
+
+// Research+SearchFetch.swift:95 caps the DOWNLOAD at 1MB and :106 caps the
+// stored text at 40_000 characters. Neither cap leaves a marker: a 40k-clipped
+// page is indistinguishable from a short one, so a brief built on the first
+// 40k characters of a long document reads as a complete reading of it. These
+// pin the bound and, just as importantly, pin that a SHORT page is NOT clipped
+// — a regression that truncated everything would otherwise look identical.
+
+@Test func fetchClipsLongTextAtTheCharacterCapAndKeepsThePrefix() async throws {
+    let tmp = makeTempDir()
+    let receiptsDir = tmp.appendingPathComponent("research")
+    let http = _ResearchHTTPStub()
+    // 60k characters: "HEAD" + filler + a sentinel that sits past the 40k cap.
+    let body = "HEAD" + String(repeating: "a", count: 59_000) + "TAILSENTINEL"
+        + String(repeating: "b", count: 1_000)
+    await http.set("https://long.example/doc", status: 200,
+                   body: Data(body.utf8), contentType: "text/plain")
+    let client = makeHermeticClient(
+        in: tmp, http: http, docker: _DockerStub(nil),
+        receiptsDirOverride: receiptsDir,
+        receiptIDFactory: { "cap-1" }
+    )
+
+    let record = try await client.fetchURL("https://long.example/doc")
+    #expect(record.text.count == 40_000)
+    #expect(record.text.hasPrefix("HEAD"))
+    #expect(!record.text.contains("TAILSENTINEL"))
+
+    // The receipt is what a later brief reads — it carries the same clipped
+    // text and NO truncation marker (recorded gap, see the ledger row).
+    guard let receipt = readJSONFile(receiptsDir.appendingPathComponent("source-cap-1.json")),
+          case .object(let object) = receipt,
+          case .string(let stored)? = object["text"] else {
+        Issue.record("source receipt missing")
+        return
+    }
+    #expect(stored.count == 40_000)
+    #expect(stored == record.text)
+}
+
+@Test func fetchLeavesAShortPageWhole() async throws {
+    let tmp = makeTempDir()
+    let http = _ResearchHTTPStub()
+    let body = String(repeating: "c", count: 1_234)
+    await http.set("https://short.example/doc", status: 200,
+                   body: Data(body.utf8), contentType: "text/plain")
+    let client = makeHermeticClient(
+        in: tmp, http: http, docker: _DockerStub(nil), receiptIDFactory: { "cap-2" }
+    )
+    let record = try await client.fetchURL("https://short.example/doc")
+    #expect(record.text == body)
+}
+
+// A body far larger than the 1MB download cap must still terminate with a
+// bounded record — and nothing from beyond the cap can reach the text.
+@Test func fetchStaysBoundedOnABodyLargerThanTheDownloadCap() async throws {
+    let tmp = makeTempDir()
+    let http = _ResearchHTTPStub()
+    let body = String(repeating: "d", count: 1_500_000) + "PASTTHEBYTECAP"
+    await http.set("https://huge.example/doc", status: 200,
+                   body: Data(body.utf8), contentType: "text/plain")
+    let client = makeHermeticClient(
+        in: tmp, http: http, docker: _DockerStub(nil), receiptIDFactory: { "cap-3" }
+    )
+    let record = try await client.fetchURL("https://huge.example/doc")
+    #expect(record.text.count == 40_000)
+    #expect(!record.text.contains("PASTTHEBYTECAP"))
+}

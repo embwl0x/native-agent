@@ -745,9 +745,24 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         if trimmed.isEmpty {
             throw WorkshopExecutionError.invalidRequest("empty missionId")
         }
+        // Execution ids become a single directory component below the
+        // selected Workshop root. Refuse path syntax at the canonical owner,
+        // not only at a CLI wrapper, so every cancel caller stays root-bound.
+        guard trimmed != ".", trimmed != "..",
+              !trimmed.contains("/"), !trimmed.contains("\\"), !trimmed.contains("\0") else {
+            throw WorkshopExecutionError.invalidRequest("executionId must be a single path component")
+        }
         let executionRecordJSON = executionRecordPath(trimmed)
         let timeline = timelinePath(trimmed)
         let nowStr = Self.isoTimestamp(now())
+
+        // Reject a missing execution before acquiring its lock. File-lock
+        // acquisition creates the lock's parent directory on some backends;
+        // without this preflight, a typo in a cancel command could leave an
+        // empty Workshop execution directory and lock artifact behind.
+        guard FileManager.default.fileExists(atPath: executionRecordJSON.path) else {
+            throw WorkshopExecutionError.invalidRequest("Workshop execution not found: \(trimmed)")
+        }
 
         // Mutate-under-flock. Returns the post-cancel record AND whether a
         // timeline event needs appending (skip the append on the idempotent

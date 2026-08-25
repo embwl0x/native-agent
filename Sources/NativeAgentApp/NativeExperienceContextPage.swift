@@ -1,11 +1,19 @@
 import SwiftUI
 import PersistenceCore
 
+/// Kept outside the view so the loss wording is a testable contract, not an
+/// incidental Text literal that can quietly disappear during a layout edit.
+func liveDiagnosticDropWarning(_ count: Int) -> String? {
+    guard count > 0 else { return nil }
+    return "Live observer omitted \(count) event(s) under backpressure; use the canonical Turn Inspector for the durable trace."
+}
+
 struct NativeExperienceContextPage: View {
     @Environment(AppModel.self) private var appModel
     let showDiagnostics: Bool
     @State private var events: [TurnTraceEvent] = []
     @State private var live: [ExperienceDiagnosticEvent] = []
+    @State private var liveDiagnosticDrops = 0
     @State private var filter: ExperienceDiagnosticKind?
 
     var body: some View {
@@ -79,6 +87,10 @@ struct NativeExperienceContextPage: View {
                     }
                     Text("Observer access is projection-only: no prompts, tool arguments, approvals, or dispatch controls.")
                         .font(.caption).foregroundStyle(.tertiary)
+                    if let warning = liveDiagnosticDropWarning(liveDiagnosticDrops) {
+                        Text(warning)
+                            .font(.caption).foregroundStyle(.orange)
+                    }
                 }
             }
         }
@@ -86,6 +98,16 @@ struct NativeExperienceContextPage: View {
             events = NativeExperienceReadModels.recentTurnEvents()
             guard showDiagnostics else { return }
             let subscription = await NativeDiagnosticObserver.shared.subscribe()
+            // Poll independently of received events: the final event of a
+            // burst can be the one the projection dropped, so an event-driven
+            // refresh would leave the omission warning at zero forever.
+            let dropMonitor = Task {
+                while !Task.isCancelled {
+                    liveDiagnosticDrops = await subscription.dropCount()
+                    try? await Task.sleep(for: .milliseconds(250))
+                }
+            }
+            defer { dropMonitor.cancel() }
             for await event in subscription.stream {
                 live.insert(event, at: 0)
                 if live.count > 256 { live.removeLast(live.count - 256) }

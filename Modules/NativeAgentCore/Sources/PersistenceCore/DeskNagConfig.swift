@@ -113,6 +113,49 @@ public struct DeskNagObservation: Sendable, Equatable {
     }
 }
 
+/// The persisted shape of `desk/nag_config.json`. Keeping this vocabulary in
+/// the production owner lets diagnostics distinguish a valid preference from a
+/// writer that quietly started emitting fields this reader does not own.
+public enum DeskNagConfigSchema {
+    public static let version = 1
+    public static let rootKeys: Set<String> = [
+        "version", "enabled", "scopes", "mutedUntil", "windowId", "ledger", "observed",
+    ]
+    public static let scopeKeys: Set<String> = ["kind", "id", "enabled"]
+    public static let observationKeys: Set<String> = [
+        "updatedAt", "effectiveBlockerCount", "deferElapsed",
+    ]
+
+    /// Every emitted key outside the persisted config schema, including
+    /// nested scope/observation records. Values remain tolerant at load time;
+    /// this is an inspection contract so a writer drift is observable rather
+    /// than silently becoming a defaulted preference later.
+    public static func unexpectedKeys(in value: JSONValue) -> [String] {
+        guard case .object(let object) = value else { return [] }
+        var unexpected = object.keys
+            .filter { !rootKeys.contains($0) }
+            .map { "root.\($0)" }
+
+        if case .array(let scopes)? = object["scopes"] {
+            for (index, scope) in scopes.enumerated() {
+                guard case .object(let row) = scope else { continue }
+                unexpected += row.keys
+                    .filter { !scopeKeys.contains($0) }
+                    .map { "scopes[\(index)].\($0)" }
+            }
+        }
+        if case .object(let observed)? = object["observed"] {
+            for (handle, observation) in observed {
+                guard case .object(let row) = observation else { continue }
+                unexpected += row.keys
+                    .filter { !observationKeys.contains($0) }
+                    .map { "observed.\(handle).\($0)" }
+            }
+        }
+        return unexpected.sorted()
+    }
+}
+
 public struct DeskNagConfig: Sendable, Equatable {
     /// GLOBAL master switch. Default false — User opts IN.
     public var enabled: Bool
@@ -237,7 +280,7 @@ public struct DeskNagConfig: Sendable, Equatable {
     /// file stays readable by a human deciding whether the machine is nagging.
     public func toJSON() -> JSONValue {
         var obj: [String: JSONValue] = [
-            "version": .int(1),
+            "version": .int(Int64(DeskNagConfigSchema.version)),
             "enabled": .bool(enabled),
             "windowId": .int(Int64(windowId)),
         ]

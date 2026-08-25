@@ -387,6 +387,7 @@ struct NativeEmptyState: View {
     var systemImage: String
     var actionTitle: String?
     var actionImage: String?
+    var actionIsDisabled = false
     var action: (() -> Void)?
 
     var body: some View {
@@ -415,6 +416,7 @@ struct NativeEmptyState: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.accentColor)
+                .disabled(actionIsDisabled)
             }
         }
         .padding(NativeAgentSpacing.xl)

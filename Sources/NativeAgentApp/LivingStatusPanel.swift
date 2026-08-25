@@ -261,16 +261,25 @@ struct LivingStatusPanel: View {
     @Environment(AppModel.self) private var appModel
     @Environment(\.scenePhase) private var scenePhase
     @State private var snapshot: LivingStatusSnapshot?
-    @State private var isRefreshing = false
-    @State private var refreshRequestedWhileLoading = false
+    @State private var refreshCoalescer = LivingStatusRefreshCoalescer()
     @State private var refreshStatus: AppModel.PanelRefreshStatus?
+    @State private var fileWatchAvailability: LivingStatusFileWatch.Availability?
 
-    private var store: SwiftNativeDeskStore {
-        SwiftNativeDeskStore(dataRoot: PersistenceCore.defaultDataRoot())
+    private var isRefreshing: Bool { refreshCoalescer.isRefreshing }
+
+    private var dataRoot: URL {
+        appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
     }
 
     private var refreshPresentation: AppModel.CompactReadPresentationState {
         AppModel.compactReadPresentationState(hasContent: snapshot != nil, status: refreshStatus)
+    }
+
+    private var livingRefreshPresentation: LivingStatusRefreshPresentation {
+        LivingStatusRefreshPresentation.resolve(
+            hasSnapshot: snapshot != nil,
+            status: refreshStatus
+        )
     }
 
     var body: some View {
@@ -328,19 +337,20 @@ struct LivingStatusPanel: View {
                     livingRow("Approvals", snapshot.approvalsSummary, icon: "checkmark.shield")
                     livingRow("Dream", snapshot.lastDreamSummary, icon: "moon.stars")
                 }
-                if refreshPresentation == .stale {
+                if livingRefreshPresentation == .retainedFailure,
+                   let message = livingRefreshPresentation.adverseMessage {
                     // Endpoint names are internal vocabulary — plain headline,
                     // technical detail demoted to a tooltip (same pattern as
                     // DetachedChatLoadFailureCopy).
-                    Label("Some of this couldn't refresh — showing the last known state.", systemImage: "exclamationmark.triangle.fill")
+                    Label(message, systemImage: "exclamationmark.triangle.fill")
                         .font(.caption2)
                         .foregroundStyle(.yellow)
                         .help((refreshStatus?.failedEndpoints.isEmpty == false)
                             ? "Did not respond: " + (refreshStatus?.failedEndpoints.joined(separator: ", ") ?? "")
                             : "The status sources did not respond.")
                 }
-            } else if refreshPresentation == .unavailable {
-                Label("\(appModel.agentDisplayName)'s current state is unavailable; no calm or needs-nothing state was inferred.", systemImage: "exclamationmark.triangle.fill")
+            } else if let message = livingRefreshPresentation.adverseMessage {
+                Label(message, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundStyle(.yellow)
             } else {
@@ -351,6 +361,13 @@ struct LivingStatusPanel: View {
                         .foregroundStyle(.secondary)
                 }
             }
+
+            if let message = fileWatchAvailability?.unavailableMessage {
+                Label(message, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.yellow)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(10)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -359,8 +376,13 @@ struct LivingStatusPanel: View {
                 .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
         }
         .task(id: scenePhase) {
-            guard scenePhase == .active else { return }
-            await ViewFileRefreshTask.run(paths: livingStatePaths) {
+            guard scenePhase == .active else {
+                fileWatchAvailability = nil
+                return
+            }
+            await LivingStatusFileWatch.observe(dataRoot: dataRoot, availabilityDidChange: { availability in
+                fileWatchAvailability = availability
+            }) {
                 await refresh()
             }
         }
@@ -398,95 +420,25 @@ struct LivingStatusPanel: View {
 
     @MainActor
     private func refresh() async {
-        if isRefreshing {
-            // File and runtime edges can arrive together. Preserve one
-            // trailing refresh instead of dropping whichever source lost the
-            // race with the in-flight read.
-            refreshRequestedWhileLoading = true
-            return
-        }
-        repeat {
-            isRefreshing = true
-            refreshRequestedWhileLoading = false
+        guard refreshCoalescer.requestRefresh() else { return }
+        while true {
             await refreshOnce()
-            isRefreshing = false
-        } while refreshRequestedWhileLoading && !Task.isCancelled
+            guard !Task.isCancelled else {
+                refreshCoalescer.cancel()
+                return
+            }
+            guard refreshCoalescer.completePass() else { return }
+        }
     }
 
     @MainActor
     private func refreshOnce() async {
-        let organism = await NativeCognitionRuntime.shared.organismSnapshot()
-        var failedEndpoints: [String] = []
-        let deskItems: [DeskItem]
-        do {
-            deskItems = try await store.liveState().items
-        } catch {
-            deskItems = []
-            failedEndpoints.append("Desk")
-        }
-        let activeDeskCount = deskItems.filter { !$0.status.isTerminal }.count
-        let blockedDeskCount = deskItems.filter { $0.status == .blocked }.count
-        let ownerDecisionDeskCount = LivingAttentionPolicy.ownerDecisionDeskCount(in: deskItems)
-        let dreamDiary = await appModel.fetchDreamDiary(limit: 1)
-        if dreamDiary == nil { failedEndpoints.append("Dream diary") }
-        let latestDream = dreamDiary?.entries.first
-        let approvalRows: [ApprovalRequest]
-        do {
-            approvalRows = try await appModel.getApprovals()
-        } catch {
-            approvalRows = []
-            failedEndpoints.append("Approvals")
-        }
-        guard failedEndpoints.isEmpty else {
-            refreshStatus = AppModel.nextRefreshStatus(
-                previous: refreshStatus,
-                failedEndpoints: failedEndpoints,
-                at: Date()
-            )
-            return
-        }
-        let pendingApprovals = approvalRows.filter { $0.status.lowercased() == "pending" }.count
-        let requiredApprovals = LivingAttentionPolicy.requiredApprovalCount(in: approvalRows)
-        snapshot = LivingStatusSnapshot.make(
-            organism: organism,
-            activeDeskCount: activeDeskCount,
-            blockedDeskCount: blockedDeskCount,
-            ownerDecisionDeskCount: ownerDecisionDeskCount,
-            pendingApprovals: pendingApprovals,
-            requiredApprovals: requiredApprovals,
-            latestDream: latestDream,
-            agentDisplayName: appModel.agentDisplayName
+        let outcome = await LivingStatusRefreshOperation.run(
+            appModel: appModel,
+            dataRoot: dataRoot
         )
-        refreshStatus = AppModel.nextRefreshStatus(
-            previous: refreshStatus,
-            failedEndpoints: [],
-            at: Date()
-        )
+        snapshot = outcome.applying(to: snapshot)
+        refreshStatus = outcome.status(previous: refreshStatus)
     }
 
-    private var livingStatePaths: [URL] {
-        let root = PersistenceCore.defaultDataRoot()
-        let memory = root.appendingPathComponent("memory", isDirectory: true)
-        return [
-            root.appendingPathComponent("cognition/organism_state.json"),
-            root.appendingPathComponent("desk/desk_ops.jsonl"),
-            root.appendingPathComponent("desk/desk_state.json"),
-            root.appendingPathComponent("workflows/approvals/requests.json"),
-            root.appendingPathComponent("dream_diary", isDirectory: true),
-            root.appendingPathComponent("mobile/signed_peer_evidence.json"),
-            root.appendingPathComponent("mobile_push/receipts.jsonl"),
-            root.appendingPathComponent("mobile_push/tokens.json"),
-            root.appendingPathComponent("notifications/push_tokens.json"),
-            memory.appendingPathComponent("memory.sqlite"),
-            memory.appendingPathComponent("memory.sqlite-wal"),
-            memory.appendingPathComponent("profile.json"),
-            memory.appendingPathComponent("knowledge_graph.json"),
-            memory.appendingPathComponent("hygiene_last_run.json"),
-            root.appendingPathComponent("mcp/servers.json"),
-            root.appendingPathComponent("mcp/cache/tools.json"),
-            root.appendingPathComponent("tools/active", isDirectory: true),
-            root.appendingPathComponent("traces/events.jsonl"),
-            root.appendingPathComponent("providers", isDirectory: true),
-        ]
-    }
 }

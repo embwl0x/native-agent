@@ -98,11 +98,11 @@ enum BridgeCore {
     static func endpointIsLoopback(_ endpoint: NWEndpoint) -> Bool {
         guard case let .hostPort(host, _) = endpoint else { return true }
         let value = "\(host)".lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
         return value == "localhost"
             || value == "127.0.0.1"
             || value == "::1"
-            || value.contains("127.0.0.1")
-            || value.contains("::1")
+            || value.hasPrefix("::1%")
     }
 
     // MARK: - Token

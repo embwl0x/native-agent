@@ -44,13 +44,16 @@ import Browser
 // process helpers shared with the git/backup paths that stay there):
 // runProcess, processDetail.
 extension NativeClient {
-    func runImprovementGauntlet() async throws -> ImprovementGauntletRun {
+    func runImprovementGauntlet(
+        processRunner: GauntletProcessRunner? = nil
+    ) async throws -> ImprovementGauntletRun {
         // Swift-only manual gauntlet. This keeps the existing
         // improvements/gauntlet/runs.json contract that getImprovementGauntlet()
         // reads, but executes the "swift" promotion class checks locally instead
         // of routing through the retired daemon endpoint.
         let startedAt = Date()
-        let repoRoot = PersistenceCore.defaultDataRoot().deletingLastPathComponent()
+        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let repoRoot = dataRoot.deletingLastPathComponent()
         let appPath = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Applications", isDirectory: true)
             .appendingPathComponent("NativeAgent.app", isDirectory: true)
@@ -65,7 +68,8 @@ extension NativeClient {
                 executable: "/usr/bin/swift",
                 arguments: ["build"],
                 currentDirectory: repoRoot,
-                timeout: 180
+                timeout: 180,
+                processRunner: processRunner
             ),
             try await Self.runGauntletProcessCheck(
                 id: "isolated_smoke",
@@ -73,7 +77,8 @@ extension NativeClient {
                 executable: "/bin/zsh",
                 arguments: [smokeScript.path],
                 currentDirectory: repoRoot,
-                timeout: 240
+                timeout: 240,
+                processRunner: processRunner
             ),
             try await Self.runGauntletProcessCheck(
                 id: "app_verify",
@@ -81,7 +86,8 @@ extension NativeClient {
                 executable: "/usr/bin/codesign",
                 arguments: ["--verify", "--deep", "--strict", appPath.path],
                 currentDirectory: repoRoot,
-                timeout: 60
+                timeout: 60,
+                processRunner: processRunner
             ),
         ]
 
@@ -95,7 +101,7 @@ extension NativeClient {
             checks: checks,
             createdAt: ISO8601DateFormatter().string(from: startedAt)
         )
-        try await Self.persistImprovementGauntletRun(run)
+        try await Self.persistImprovementGauntletRun(run, dataRoot: dataRoot)
         return run
     }
 
@@ -105,14 +111,20 @@ extension NativeClient {
         executable: String,
         arguments: [String],
         currentDirectory: URL,
-        timeout: TimeInterval
+        timeout: TimeInterval,
+        processRunner: GauntletProcessRunner?
     ) async throws -> GauntletCheck {
-        let result = try await runProcess(
-            executable: executable,
-            arguments: arguments,
-            currentDirectory: currentDirectory,
-            timeout: timeout
-        )
+        let result: (status: Int32, stdout: String, stderr: String)
+        if let processRunner {
+            result = try await processRunner(executable, arguments, currentDirectory, timeout)
+        } else {
+            result = try await runProcess(
+                executable: executable,
+                arguments: arguments,
+                currentDirectory: currentDirectory,
+                timeout: timeout
+            )
+        }
         return GauntletCheck(
             id: id,
             title: title,
@@ -121,10 +133,13 @@ extension NativeClient {
         )
     }
 
-    private static func persistImprovementGauntletRun(_ run: ImprovementGauntletRun) async throws {
+    private static func persistImprovementGauntletRun(
+        _ run: ImprovementGauntletRun,
+        dataRoot: URL
+    ) async throws {
         let data = try JSONEncoder().encode(run)
         let row = try JSONValue.parse(data)
-        let path = PersistenceCore.defaultDataRoot()
+        let path = dataRoot
             .appendingPathComponent("improvements", isDirectory: true)
             .appendingPathComponent("gauntlet", isDirectory: true)
             .appendingPathComponent("runs.json")
@@ -146,27 +161,23 @@ extension NativeClient {
     }
 
     func installDemoCapabilityPack() async throws -> CapabilityPackInstall {
-        let root = PersistenceCore.defaultDataRoot()
+        let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let persistence = SwiftNativePersistenceCore()
         let nowISO = SwiftNativeManifestSigner.isoTimestamp(Date())
         let signer = SwiftNativeCapabilityPackSigner(dataRoot: root, persistence: persistence)
         let signed = try await signer.sign(Self.demoCapabilityPack(nowISO: nowISO))
-        let validation = try await signer.validate(signed)
-        guard case .bool(true)? = validation["valid"] else {
-            let errors: String = {
-                if case .array(let rows)? = validation["errors"] {
-                    return rows.compactMap {
-                        if case .string(let s) = $0 { return s }
-                        return nil
-                    }.joined(separator: "; ")
-                }
-                return "unknown validation failure"
-            }()
-            throw NSError(domain: "NativeAgentSwiftOnly", code: -422, userInfo: [
-                NSLocalizedDescriptionKey: "Demo capability pack failed validation: \(errors)"
-            ])
-        }
-        let receipt = try await Self.installCapabilityPack(signed, root: root, persistence: persistence, nowISO: nowISO)
+        return try await installCapabilityPack(signed)
+    }
+
+    /// Installs an acquired catalog pack only after the canonical signer has
+    /// verified its signature and trusted signing identity. This is the same
+    /// boundary used by the visible signed-demo action, and validation happens
+    /// before any pack, catalog item, or install receipt is persisted.
+    func installCapabilityPack(_ pack: [String: JSONValue]) async throws -> CapabilityPackInstall {
+        let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let persistence = SwiftNativePersistenceCore()
+        let nowISO = SwiftNativeManifestSigner.isoTimestamp(Date())
+        let receipt = try await Self.installCapabilityPack(pack, root: root, persistence: persistence, nowISO: nowISO)
         let data = try JSONValue.object(receipt).serializedData(pretty: false)
         return try JSONDecoder().decode(CapabilityPackInstall.self, from: data)
     }
@@ -178,7 +189,7 @@ extension NativeClient {
                 NSLocalizedDescriptionKey: "rollbackCapabilityPack: empty install id"
             ])
         }
-        let root = PersistenceCore.defaultDataRoot()
+        let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let persistence = SwiftNativePersistenceCore()
         let rolledBack = try await Self.rollbackCapabilityPackInstall(id: trimmed, root: root, persistence: persistence)
         let data = try JSONValue.object(rolledBack).serializedData(pretty: false)
@@ -253,6 +264,24 @@ extension NativeClient {
         persistence: SwiftNativePersistenceCore,
         nowISO: String
     ) async throws -> [String: JSONValue] {
+        let signer = SwiftNativeCapabilityPackSigner(dataRoot: root, persistence: persistence)
+        let validation = try await signer.validate(pack)
+        guard case .bool(true)? = validation["valid"] else {
+            let errors: String = {
+                if case .array(let rows)? = validation["errors"] {
+                    let messages = rows.compactMap { value -> String? in
+                        if case .string(let message) = value { return message }
+                        return nil
+                    }
+                    if !messages.isEmpty { return messages.joined(separator: "; ") }
+                }
+                return "unknown validation failure"
+            }()
+            throw NSError(domain: "NativeAgentSwiftOnly", code: -422, userInfo: [
+                NSLocalizedDescriptionKey: "Capability pack validation failed: \(errors)"
+            ])
+        }
+
         let packID = jsonString(pack, "id")
         guard !packID.isEmpty else {
             throw NSError(domain: "NativeAgentSwiftOnly", code: -422, userInfo: [

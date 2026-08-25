@@ -148,9 +148,22 @@ extension View {
 
 // MARK: - AppEmptyState — animated replacement for ContentUnavailableView
 
+enum AppEmptyStateKind: Equatable {
+    case empty
+    case unavailable
+
+    var statusLabel: String {
+        switch self {
+        case .empty: "No current items"
+        case .unavailable: "Data unavailable"
+        }
+    }
+}
+
 struct AppEmptyState: View {
     let title: String
     let systemImage: String
+    let kind: AppEmptyStateKind
     var description: String? = nil
     var tint: Color = NativeAgentPalette.agentAccent
     var action: (title: String, systemImage: String, handler: () -> Void)? = nil
@@ -197,6 +210,9 @@ struct AppEmptyState: View {
                     .shadow(color: tint.opacity(0.55), radius: 10, y: 2)
             }
             VStack(spacing: 6) {
+                Text(kind.statusLabel)
+                    .font(AppFont.tag)
+                    .foregroundStyle(kind == .unavailable ? .orange : .secondary)
                 Text(title).font(AppFont.title)
                 if let description {
                     Text(description)
@@ -218,6 +234,8 @@ struct AppEmptyState: View {
         }
         .padding(32)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(kind.statusLabel): \(title)")
         .onAppear {
             guard !reduceMotion else { return }
             withAnimation(.linear(duration: 14).repeatForever(autoreverses: false)) {

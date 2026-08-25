@@ -62,6 +62,70 @@ private func msgLine(
 
 // MARK: - SessionHistoryReader
 
+private actor RecallQueryRecorder: MemoryRecalling {
+    private var values: [String] = []
+
+    func recall(_ query: String, k: Int) async throws -> [MemoryRecallHit] {
+        values.append(query)
+        return []
+    }
+
+    func recordedQueries() -> [String] { values }
+}
+
+// EVAL FENCE: turn.contract
+// Ledger row: turn.ingredient.recallQuerySignalLines
+//
+// The default 1,200-character recall cap must retain correction and unfinished
+// work after a real JSONL history read and through the actual engine memory
+// call. The oversized current message is the adverse case that previously
+// yielded a long but compositionally blind recall query.
+@Test
+func buildTurnContextWithHistory_passesHardCappedCorrectionAndOpenLoopQueryToMemory() async throws {
+    let root = try makeTempRoot("recall-query-signals")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let sessionID = "recall-signal-session"
+    try writeMessagesJSONL(root: root, sessionId: sessionID, lines: [
+        msgLine(
+            role: "user",
+            content: "Actually, do not use the old deployment path. " + String(repeating: "correction ", count: 40),
+            createdAt: "2026-08-11T00:00:00Z"
+        ),
+        msgLine(
+            role: "assistant",
+            content: "Should I continue with the safe migration plan? " + String(repeating: "open-loop ", count: 40),
+            createdAt: "2026-08-11T00:00:01Z"
+        ),
+    ])
+    let recorder = RecallQueryRecorder()
+    let personaRoot = try makeTempRoot("recall-query-persona")
+    defer { try? FileManager.default.removeItem(at: personaRoot) }
+    let engine = makeEngine2(
+        personaRoot: personaRoot,
+        llm: MockLLMClient(scriptedResponses: ["unused"]),
+        memory: recorder
+    )
+    _ = try await engine.buildTurnContextWithHistory(
+        surface: "chat",
+        userMessage: String(repeating: "current-context ", count: 80),
+        sessionId: sessionID,
+        historyLimit: 20,
+        historyReader: SessionHistoryReader(dataRoot: root)
+    )
+    let queries = await recorder.recordedQueries()
+    #expect(queries.count == 1)
+    let query = try #require(queries.first)
+
+    #expect(query.count <= SessionHistoryPromptRenderer.recallQueryCharCap)
+    #expect(query.contains("Recent correction:"))
+    #expect(query.contains("Open loop:"))
+    #expect(query.contains("Actually, do not use the old deployment path."))
+    #expect(query.contains("Should I continue with the safe migration plan?"))
+    let correction = try #require(query.range(of: "Recent correction:"))
+    let openLoop = try #require(query.range(of: "Open loop:"))
+    #expect(correction.lowerBound < openLoop.lowerBound)
+}
+
 @Test
 func SessionHistoryReader_messages_returns_chronological_order() async throws {
     let root = try makeTempRoot("chrono")

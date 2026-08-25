@@ -197,6 +197,33 @@ private final class SuspendedAdapter: LLMAdapter, @unchecked Sendable {
     #expect(box.value?.environment == environment)
 }
 
+// Eval coverage ledger — `llm.adapter.codexCLI.binaryResolution`.
+// The app's GUI PATH can omit Homebrew/npm locations. The real invocation must
+// receive a deterministic augmented PATH, while a caller-supplied environment
+// remains exact for controlled launches and tests.
+@Test func codex_adapter_augmentsMinimalGUIPathBeforeDispatch() async throws {
+    final class Box: @unchecked Sendable { var value: CodexProcessInvocation? }
+    let box = Box()
+    let minimalGUIEnvironment = ["PATH": "/usr/bin:/bin", "LANG": "en_US"]
+    let adapter = CodexAdapter(
+        runner: { invocation in
+            box.value = invocation
+            return CodexProcessResult(exitCode: 0, stdout: "ok", stderr: "")
+        },
+        processEnvironmentOverride: CodexAdapter.augmentedProcessEnvironment(base: minimalGUIEnvironment)
+    )
+
+    _ = try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.6-sol")
+    let path = box.value?.environment?["PATH"]?.split(separator: ":").map(String.init) ?? []
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    #expect(path.prefix(9) == [
+        "\(home)/.local/bin", "\(home)/bin", "\(home)/.cargo/bin",
+        "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+    ])
+    #expect(path.filter { $0 == "/usr/bin" }.count == 1)
+    #expect(box.value?.environment?["LANG"] == "en_US")
+}
+
 @Test func codex_adapter_forwardsGPT56ReasoningAndFastControls() async throws {
     final class Box: @unchecked Sendable { var value: CodexProcessInvocation? }
     let box = Box()
@@ -807,7 +834,14 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
     #expect(anthropic.lastModel == "claude-3-haiku")
 }
 
-@Test func swiftNativeLLMClient_activeProviderOverridesStaleModelForSurface() async throws {
+// Rebaselined 2026-08-21 (User-directed): the router used to silently swap a
+// family-mismatched model for the active provider's default. Silent
+// substitution violates NORTHSTAR clause 2 — the mismatch now throws
+// modelUnavailable BEFORE any adapter dispatch, and the reconciliation moved
+// to the source: setActiveProvider rewrites an incompatible stale pin at
+// switch time (pinned by providerSwitch_rewritesIncompatibleStaleModelPin in
+// ProviderRoutingTests).
+@Test func swiftNativeLLMClient_staleModelFamilyMismatchFailsLoudInsteadOfSwapping() async throws {
     let anthropic = SpyAdapter(providerId: "anthropic", response: "A")
     let openAI = SpyAdapter(providerId: "openai", response: "O")
     let codex = SpyAdapter(providerId: "codex")
@@ -826,15 +860,30 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
         codex: codex, anthropic: anthropic, openAI: openAI,
         moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
     )
-    let out = try await client.completeMessages(
-        messages: [.user("p")],
-        system: nil,
-        model: "gpt-5.5",
-        surface: "telegram",
-        tools: nil
-    )
-    #expect(out == "A")
-    #expect(anthropic.lastModel == "claude-opus-4-8")
+    let caught: LLMError? = await {
+        do {
+            _ = try await client.completeMessages(
+                messages: [.user("p")],
+                system: nil,
+                model: "gpt-5.5",
+                surface: "telegram",
+                tools: nil
+            )
+            return nil
+        } catch let error as LLMError {
+            return error
+        } catch {
+            return nil
+        }
+    }()
+    guard case .modelUnavailable(let provider, let model)? = caught else {
+        Issue.record("expected modelUnavailable, got \(String(describing: caught))")
+        return
+    }
+    #expect(provider == "anthropic")
+    #expect(model == "gpt-5.5")
+    // Fail-loud means NOTHING dispatched — no adapter saw the call.
+    #expect(anthropic.lastModel == nil)
     #expect(openAI.lastModel == nil)
     #expect(codex.lastModel == nil)
 }
@@ -957,7 +1006,9 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
     #expect(apiKey.lastModel == nil)
 }
 
-@Test func swiftNativeLLMClient_activeXAIProviderOverridesStaleModelForSurface() async throws {
+// Rebaselined 2026-08-21: same fail-loud contract as the Anthropic twin above,
+// through the xai_oauth_direct lane.
+@Test func swiftNativeLLMClient_staleModelXAIFamilyMismatchFailsLoud() async throws {
     let anthropic = SpyAdapter(providerId: "anthropic", response: "A")
     let openAI = SpyAdapter(providerId: "openai", response: "O")
     let xai = SpyAdapter(providerId: "xai_oauth_direct", response: "X")
@@ -980,15 +1031,29 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
         xaiOAuthDirect: xai,
         moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
     )
-    let out = try await client.completeMessages(
-        messages: [.user("p")],
-        system: nil,
-        model: "gpt-5.5",
-        surface: "telegram",
-        tools: nil
-    )
-    #expect(out == "X")
-    #expect(xai.lastModel == "grok-4.3")
+    let caught: LLMError? = await {
+        do {
+            _ = try await client.completeMessages(
+                messages: [.user("p")],
+                system: nil,
+                model: "gpt-5.5",
+                surface: "telegram",
+                tools: nil
+            )
+            return nil
+        } catch let error as LLMError {
+            return error
+        } catch {
+            return nil
+        }
+    }()
+    guard case .modelUnavailable(let provider, let model)? = caught else {
+        Issue.record("expected modelUnavailable, got \(String(describing: caught))")
+        return
+    }
+    #expect(provider == "xai_oauth_direct")
+    #expect(model == "gpt-5.5")
+    #expect(xai.lastModel == nil)
     #expect(openAI.lastModel == nil)
     #expect(anthropic.lastModel == nil)
     #expect(codex.lastModel == nil)

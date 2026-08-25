@@ -131,8 +131,21 @@ extension BackgroundLoopsAssembly {
                         continue
                     }
                     var replacement = row
+                    // The signature names job AND outcome. A row carrying the
+                    // bare job key is a legacy card (pre outcome-signature); it
+                    // counts as the same outcome ONLY when its severity agrees
+                    // with the new card's (info ⇔ succeeded, actionable ⇔ the
+                    // rest) — the cheapest proxy the legacy row offers. A
+                    // legacy "finished" row met by an "unconfirmed" upsert is an
+                    // upgrade and must resurface (gpt-5.5 round 2, MED); a
+                    // legacy row retried under the same outcome must not.
                     let signatureMatches: Bool = {
-                        if case .string(let old)? = obj["error_signature"] { return old == card.jobKey }
+                        guard case .string(let old)? = obj["error_signature"] else { return false }
+                        if old == card.signature { return true }
+                        guard old == card.jobKey else { return false }
+                        if case .string(let oldSeverity)? = obj["severity"] {
+                            return oldSeverity == card.severity
+                        }
                         return false
                     }()
                     if signatureMatches,
@@ -144,9 +157,13 @@ extension BackgroundLoopsAssembly {
                         replacement = .object(newObj)
                     }
                     // The durable card id is also the push identity. If the
-                    // inbox row already exists, a lost cursor write may retry
-                    // the upsert but must never send a second push.
-                    pushWorthy = false
+                    // inbox row already exists WITH THE SAME SIGNATURE, a lost
+                    // cursor write may retry the upsert but must never send a
+                    // second push. A CHANGED signature is new information —
+                    // the job's outcome worsened (finished → unconfirmed) or
+                    // the backlog moved — and lands as a fresh unread row that
+                    // may push (the severity gate downstream still applies).
+                    pushWorthy = !signatureMatches
                     mutated.append(Data(try replacement.serialize(pretty: false).utf8))
                     found = true
                 }

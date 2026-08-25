@@ -16,8 +16,51 @@ import CoreSpotlight
 import CloudKit
 #endif
 
+enum StatusActivityPresentation {
+    enum State: Equatable {
+        case loading
+        case unavailable
+        case empty
+        case current([ActivityEvent])
+        case stale([ActivityEvent])
+    }
+
+    /// The activity ledger is chronological. Status intentionally shows the
+    /// latest eight in reverse chronological order, never the oldest entries
+    /// in its retained tail.
+    static func recentEvents(from events: [ActivityEvent], limit: Int = 8) -> [ActivityEvent] {
+        Array(events.suffix(limit).reversed())
+    }
+
+    static func state(
+        events: [ActivityEvent],
+        refresh: AppModel.PanelRefreshStatus?
+    ) -> State {
+        let activityReadFailed = refresh?.failedEndpoints.contains {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "activity"
+        } ?? false
+        if activityReadFailed {
+            return events.isEmpty ? .unavailable : .stale(events)
+        }
+        guard refresh != nil else { return .loading }
+        return events.isEmpty ? .empty : .current(events)
+    }
+
+    /// Status exposes the ledger's time through the shared user formatter.
+    /// A malformed timestamp deliberately remains visible as raw evidence
+    /// rather than becoming a plausible relative time.
+    static func timestamp(for event: ActivityEvent) -> String {
+        UserDisplayFormatters.humanizeISOTimestamp(event.createdAt)
+    }
+}
+
 struct StatusView: View {
     @Environment(AppModel.self) private var appModel
+    private let loadsOnAppear: Bool
+
+    init(loadsOnAppear: Bool = true) {
+        self.loadsOnAppear = loadsOnAppear
+    }
 
     var body: some View {
         ScrollView {
@@ -62,16 +105,34 @@ struct StatusView: View {
                 }
 
                 NativePanel(title: "Recent Activity", systemImage: "clock.arrow.circlepath") {
-                    if appModel.activityEvents.isEmpty {
+                    switch StatusActivityPresentation.state(
+                        events: appModel.activityEvents,
+                        refresh: appModel.panelRefreshStatus[.diagnostics]
+                    ) {
+                    case .loading:
+                        ProgressView("Loading activity…")
+                            .font(.caption)
+                    case .unavailable:
+                        Label("Activity history is unavailable. Refresh to retry.", systemImage: "exclamationmark.triangle")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    case .empty:
                         Text("No activity recorded yet.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                    } else {
+                    case .current(let events):
                         // NEWEST first. `getActivity` returns the tail of events.jsonl in
                         // file (chronological) order, so `.prefix` showed the OLDEST 8 of
                         // the last 200 — on a 5,400-event feed that was a week stale while
                         // today's entries sat just below (2026-08-02).
-                        ForEach(appModel.activityEvents.suffix(8).reversed()) { event in
+                        ForEach(StatusActivityPresentation.recentEvents(from: events)) { event in
+                            ActivityRow(event: event)
+                        }
+                    case .stale(let events):
+                        Label("Showing previously loaded activity; refresh could not reach the ledger.", systemImage: "clock.badge.exclamationmark")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                        ForEach(StatusActivityPresentation.recentEvents(from: events)) { event in
                             ActivityRow(event: event)
                         }
                     }
@@ -84,6 +145,9 @@ struct StatusView: View {
             .padding()
         }
         .navigationTitle("Status")
-        .task { await appModel.refreshForSidebarItem(.diagnostics) }
+        .task {
+            guard loadsOnAppear else { return }
+            await appModel.refreshForSidebarItem(.diagnostics)
+        }
     }
 }

@@ -137,19 +137,7 @@ struct ProviderOAuthConfig: @unchecked Sendable {
         extraAuthParams: ["code": "true"],   // pi-ai-required extra
         tokenBodyFormat: .json,
         persistTokens: { tokens in
-            var existing = (try? loadJSONObject(NativeOAuthFlow.anthropicTokenPath())) ?? [:]
-            existing["client_id"] = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-            if let access = tokens["access_token"] as? String { existing["access_token"] = access }
-            if let refresh = tokens["refresh_token"] as? String { existing["refresh_token"] = refresh }
-            else if existing["refresh_token"] == nil { existing["refresh_token"] = "" }
-            let expiresIn = (tokens["expires_in"] as? Int)
-                         ?? Int(tokens["expires_in"] as? Double ?? 3600)
-            let exp = Date().addingTimeInterval(TimeInterval(expiresIn))
-            existing["expires_at"] = isoBasic(exp)
-            existing["scope"] = (tokens["scope"] as? String) ?? ""
-            existing["token_type"] = (tokens["token_type"] as? String) ?? "Bearer"
-            if existing["user_info"] == nil { existing["user_info"] = [String: Any]() }
-            try writeJSONObject(existing, to: NativeOAuthFlow.anthropicTokenPath())
+            try NativeOAuthFlow.persistAnthropicOAuthTokens(tokens)
         },
         extraTokenParams: { state in ["state": state] }
     )

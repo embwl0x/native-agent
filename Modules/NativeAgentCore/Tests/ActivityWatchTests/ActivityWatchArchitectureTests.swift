@@ -668,3 +668,396 @@ func httpBridgesAreRefused() throws {
         #expect(!ConversationSurfaceProfileShim(surface).isRemote)
     }
 }
+
+// MARK: - Source-conformance guards for the surfaces only source can reach
+//
+// Ledger fence `core.activity`. Each of these covers a surface whose failure is
+// invisible at runtime and whose only cheap witness is the source itself —
+// exactly the technique already used above for `kAXTitle` and the title-field
+// conformance. They live in this file so they reuse `repositoryRoot`,
+// `strippingComments`, `activityWatchSources` and `sources(under:)` rather than
+// standing up a second copy of a source scanner.
+
+/// One named file's code, comments stripped.
+private func watchSource(_ relativePath: String) throws -> String {
+    let root = try #require(repositoryRoot())
+    let url = root.appendingPathComponent(relativePath)
+    let raw = try String(contentsOf: url, encoding: .utf8)
+    return strippingComments(raw)
+}
+
+/// The body of `func <name>`, by brace matching from its opening `{`.
+private func functionBody(_ source: String, named name: String) -> String? {
+    guard let signature = source.range(of: "func \(name)(") else { return nil }
+    guard let open = source[signature.upperBound...].firstIndex(of: "{") else { return nil }
+    var depth = 0
+    var index = open
+    while index < source.endIndex {
+        if source[index] == "{" { depth += 1 }
+        if source[index] == "}" {
+            depth -= 1
+            if depth == 0 { return String(source[source.index(after: open)..<index]) }
+        }
+        index = source.index(after: index)
+    }
+    return nil
+}
+
+// MARK: activity.watcher.commandPump
+
+@Test("PUMP: the command stream is UNBOUNDED — a dropped close leaks an open row")
+func commandStreamIsUnbounded() throws {
+    // The AsyncStream carrying open/touch/close into the store is deliberately
+    // unbounded: these are span CONTROL commands arriving at human app-switch
+    // rate, not a firehose. A future switch to `bufferingNewest` would DROP
+    // silently — dropping a `.close` leaks an open row whose duration then grows
+    // on the next reconcile, dropping an `.open` turns every later touch and
+    // close into a no-op. Neither raises anything.
+    let source = try watchSource(
+        "Modules/NativeAgentCore/Sources/ActivityWatch/ActivityWatcher.swift"
+    )
+    let makeStream = try #require(
+        source.range(of: "AsyncStream<ActivityStoreCommand>.makeStream("),
+        "the command stream construction moved — this guard is now blind"
+    )
+    let tail = source[makeStream.upperBound...].prefix(200)
+    #expect(
+        tail.contains("bufferingPolicy: .unbounded"),
+        Comment(rawValue: """
+        THE COMMAND STREAM IS NO LONGER UNBOUNDED. A bounded buffering policy DROPS \
+        commands with no error at all: a dropped `.close` leaks an open row, a dropped \
+        `.open` makes every later command for that span a silent no-op, and the only \
+        witness in either case is one stderr line.
+        """)
+    )
+    for policy in ["bufferingNewest", "bufferingOldest"] {
+        #expect(
+            !source.contains(policy),
+            Comment(rawValue: "ActivityWatcher names `\(policy)` — a dropping buffer policy")
+        )
+    }
+}
+
+// MARK: activity.watcher.axMessagingTimeoutGlobal
+
+@Test("AX TIMEOUT: the process-global retune is set once, bounded, and only here")
+func axMessagingTimeoutIsSetOnceAndBounded() throws {
+    // A PROCESS-GLOBAL SIDE EFFECT ON A NEIGHBOURING ORGAN. Per AXUIElement.h,
+    // passing the SYSTEM-WIDE element sets the messaging timeout for the WHOLE
+    // PROCESS — so the capture thread retunes every AX call in NativeAgent,
+    // MacControl's perception lane included, and only for users who turned
+    // activity capture on. Remove it and the capture thread's AX reads become
+    // unbounded, wedging its run loop; raise it and the same wedge arrives
+    // slower. Neither is visible at runtime, so the presence, the bound and the
+    // uniqueness are pinned here.
+    let watcher = try watchSource(
+        "Modules/NativeAgentCore/Sources/ActivityWatch/ActivityWatcher.swift"
+    )
+    #expect(
+        watcher.contains("AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide()"),
+        "the process-global AX messaging timeout is gone — the capture thread's reads are unbounded"
+    )
+
+    // Bounded, and bounded SMALL. An AX read on the capture thread blocks the
+    // run loop for exactly this long.
+    let call = try #require(
+        watcher.range(of: "AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide()")
+    )
+    let arguments = String(watcher[call.upperBound...].prefix(40))
+    let seconds = arguments
+        .split(whereSeparator: { !$0.isNumber && $0 != "." })
+        .compactMap { Double($0) }
+        .first
+    let bound = try #require(seconds, "could not read the timeout literal from \(arguments)")
+    #expect(
+        bound > 0 && bound <= 1.0,
+        Comment(rawValue: """
+        THE PROCESS-GLOBAL AX TIMEOUT IS \(bound) s. It applies to every AX call in the \
+        app, not just this fence's, and it is the only thing bounding a capture-thread \
+        read. Anything above a second is a run-loop stall the user experiences as the \
+        whole app hitching.
+        """)
+    )
+
+    // EXACTLY ONE organ may retune the process. A second system-wide call
+    // anywhere means two subsystems silently fighting over a global.
+    var systemWideCallers: [String] = []
+    for tree in [
+        "Modules/NativeAgentCore/Sources",
+        "Sources/NativeAgentApp",
+    ] {
+        for file in try sources(under: tree)
+        where file.source.contains("AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(") {
+            systemWideCallers.append(file.path)
+        }
+    }
+    #expect(
+        systemWideCallers == ["ActivityWatcher.swift"],
+        Comment(rawValue: """
+        MORE THAN ONE SUBSYSTEM SETS THE PROCESS-GLOBAL AX TIMEOUT: \(systemWideCallers.sorted()). \
+        Whichever runs last wins, for the whole app, and neither one can tell.
+        """)
+    )
+}
+
+// MARK: activity.watcher.nativeAgentBundleIDs
+
+@Test("DEAD API: nativeAgentBundleIDs has no callers and is NOT the exclusion authority")
+func nativeAgentBundleIDsIsNotTheExclusionAuthority() throws {
+    // DEAD PUBLIC API THAT MISREPRESENTS ITS OWN NAME. It is documented as kept
+    // for source compatibility and it returns `alwaysExcludedBundleIDs` MINUS
+    // loginwindow — so the one obvious future use, "the set of ids we never
+    // record", is wrong by exactly the lock signal. A caller who trusted it
+    // would start recording loginwindow, which is the P0 case the whole lock
+    // gate exists to prevent.
+    #expect(
+        ActivityWatcher.nativeAgentBundleIDs
+            .contains(ActivityWatcher.loginWindowBundleID) == false,
+        "the trap this guard describes is gone — re-read the surface before deleting the test"
+    )
+    #expect(
+        ActivityPolicy.alwaysExcludedBundleIDs
+            .contains(ActivityWatcher.loginWindowBundleID),
+        "loginwindow left the NON-OVERRIDABLE exclusion set — a lock signal can now become a span"
+    )
+    #expect(
+        ActivityWatcher.nativeAgentBundleIDs != ActivityPolicy.alwaysExcludedBundleIDs,
+        "the two sets converged — if that is deliberate, delete this surface instead"
+    )
+
+    // ZERO CALLERS, repo-wide. The moment one appears, this test names it and
+    // whoever added it has to decide which set they actually meant.
+    var callers: [String] = []
+    for tree in [
+        "Modules/NativeAgentCore/Sources",
+        "Sources/NativeAgentApp",
+        "Modules/NativeAgentShared/Sources",
+    ] {
+        for file in (try? sources(under: tree)) ?? []
+        where file.source.contains("nativeAgentBundleIDs")
+            && !file.source.contains("public static var nativeAgentBundleIDs") {
+            callers.append(file.path)
+        }
+    }
+    #expect(
+        callers.isEmpty,
+        Comment(rawValue: """
+        SOMETHING NOW CALLS ActivityWatcher.nativeAgentBundleIDs: \(callers.sorted()).
+
+        It is NOT the exclusion authority — it is alwaysExcludedBundleIDs minus \
+        com.apple.loginwindow, so using it as "the ids we never record" starts \
+        recording the lock screen. Use ActivityPolicy.alwaysExcludedBundleIDs, or \
+        delete this surface.
+        """)
+    )
+}
+
+// MARK: activity.watcher.unknownFrontmostAndSelfPidGap + activity.watcher.motorEpochGate
+
+@Test("ANTI-MISATTRIBUTION: no path out of handleActivation leaves the engine untold")
+func handleActivationAlwaysFeedsBeforeReturning() throws {
+    // THE FIX, UNPINNED. Four branches inside `handleActivation` synthesize a
+    // feed rather than returning early: the motor-epoch gate, the lock signal,
+    // an unknown frontmost (nil bundle id or pid), and our own pid. The comment
+    // records why — an early `return` left the prior span OPEN, so a transient
+    // bundle-less process silently donated its dwell time to whatever the human
+    // was in before it. Delete any one of those feeds and the misattribution
+    // comes back as a perfectly well-formed LONGER row: no error, no
+    // zero-length artefact, nothing an existing guard would catch. The method
+    // is private, so source is the cheap witness.
+    let watcher = try watchSource(
+        "Modules/NativeAgentCore/Sources/ActivityWatch/ActivityWatcher.swift"
+    )
+    let body = try #require(
+        functionBody(watcher, named: "handleActivation"),
+        "handleActivation was renamed or restructured — this guard is now blind"
+    )
+
+    // The three capture GATES at the top return without feeding, correctly:
+    // capture is off, or we are stopping, or paused. Everything after the
+    // motor-epoch gate is a real activation the engine has to hear about.
+    let gateEnd = try #require(
+        body.range(of: "motorEpochIsAgentDriven()"),
+        "the motor-epoch gate moved — re-anchor this guard before trusting it"
+    )
+    let guarded = String(body[gateEnd.upperBound...])
+
+    var feedsSinceLastReturn = 0
+    var returnsWithoutFeed: [String] = []
+    var returnSites = 0
+    for rawLine in guarded.components(separatedBy: .newlines) {
+        let line = rawLine.trimmingCharacters(in: .whitespaces)
+        if line.contains("feed(") { feedsSinceLastReturn += 1 }
+        guard line == "return" || line.hasPrefix("return ") else { continue }
+        returnSites += 1
+        if feedsSinceLastReturn == 0 { returnsWithoutFeed.append(line) }
+        feedsSinceLastReturn = 0
+    }
+
+    #expect(
+        returnSites >= 5,
+        "found only \(returnSites) return sites after the gates — the guard lost its target"
+    )
+    #expect(
+        returnsWithoutFeed.isEmpty,
+        Comment(rawValue: """
+        \(returnsWithoutFeed.count) EARLY RETURN(S) IN handleActivation TELL THE ENGINE NOTHING. \
+        An activation that returns without a feed leaves the previous span OPEN, so the \
+        next process to take the foreground donates its dwell time to whatever the human \
+        was in before it — one longer, perfectly well-formed row that no guard catches.
+        """)
+    )
+
+    // The two named synthesis sites, by their payloads. A rename that made
+    // either of them feed the REAL bundle id would put the agent's own browsing
+    // (or a bundle-less process's time) into the human's top_apps.
+    let flattened = guarded
+        .components(separatedBy: .whitespacesAndNewlines)
+        .filter { !$0.isEmpty }
+        .joined(separator: " ")
+    for marker in [
+        "bundleId: ActivityPolicy.selfProcessBundleID, appName: \"unknown\"",
+        "bundleId: ActivityPolicy.selfProcessBundleID, appName: \"self\"",
+    ] {
+        #expect(
+            flattened.contains(marker),
+            Comment(rawValue: "handleActivation no longer synthesizes `\(marker)`")
+        )
+    }
+    // The motor-epoch branch feeds the SENTINEL, never the app the agent drove.
+    #expect(
+        String(guarded.prefix(500)).contains("ActivityPolicy.selfProcessBundleID"),
+        """
+        the agent-driven branch no longer attributes to the self sentinel. Apps the \
+        AGENT opened would be recorded as the human choosing them, inflating his time \
+        in whatever NativeAgent browsed on his behalf.
+        """
+    )
+}
+
+// MARK: activity.watcher.pauseResume (the dead-control half)
+
+@Test("DEAD CONTROL: pause()/resume() are still uncalled, so the indicator path is unproven")
+func pauseAndResumeCallerInventory() throws {
+    // Recorded as an inventory, not a prohibition. `pause()` and `resume()` are
+    // public and have no caller in the app: the capture indicator's paused state
+    // is therefore only ever exercised by tests. If a caller appears, that is
+    // the moment the live detach/re-seed path starts mattering and this fence
+    // needs a real lifecycle eval, not just the flag assertions in
+    // ActivityWatcherContractTests.
+    //
+    // The receiver has to be watcher-shaped or this counts every DispatchSource
+    // in the tree: `activity-probe run` calls `.resume()` on three of them, and
+    // a scan that matched those would be a guard that is always red and
+    // therefore always ignored.
+    var callers: [String] = []
+    for tree in ["Sources/NativeAgentApp", "Modules/NativeAgentCore/Sources"] {
+        for file in (try? sources(under: tree)) ?? [] {
+            guard file.path != "ActivityWatcher.swift" else { continue }
+            guard file.source.contains("ActivityWatcher") else { continue }
+            for call in [".pause()", ".resume()"] {
+                var cursor = Substring(file.source)
+                while let hit = cursor.range(of: call) {
+                    let receiver = cursor[..<hit.lowerBound]
+                        .suffix(40)
+                        .split(whereSeparator: { !$0.isLetter && !$0.isNumber && $0 != "_" })
+                        .last
+                        .map(String.init) ?? ""
+                    if receiver.lowercased().contains("watcher") {
+                        callers.append("\(file.path) (\(receiver)\(call))")
+                    }
+                    cursor = cursor[hit.upperBound...]
+                }
+            }
+        }
+    }
+    #expect(
+        callers.isEmpty,
+        Comment(rawValue: """
+        ActivityWatcher.pause()/resume() now has a caller: \(callers.sorted()).
+
+        That is fine — but the detach-on-pause and re-seed-on-resume behaviour has never \
+        been proven against a running capture thread. Add a lifecycle eval before relying \
+        on the indicator these calls drive.
+        """)
+    )
+}
+
+// MARK: activity.cli.simulateScratchRootGuard + activity.cli.destructive
+
+@Test("PROBE CLI: the scratch-root diversion is decided BEFORE the subcommand dispatch")
+func simulateScratchRootGuardIsDecidedBeforeDispatch() throws {
+    // THE GUARD BETWEEN A DEV COMMAND AND THE REAL RECORD. `simulate` writes
+    // synthetic spans, runs startup reconciliation, then PRINTS EVERY SPAN IN
+    // THE STORE to stdout. Without --data-root it diverts to a scratch temp
+    // store. If that diversion ever regresses — `isExplicitDataRoot` computed
+    // after the option is consumed, a default value slipping into
+    // `extractOption`, a `var` someone reassigns — a bare
+    // `activity-probe simulate --script foo.json` both corrupts the live store
+    // with fabricated rows AND dumps days of the human's real window titles to a
+    // terminal, in one command, exiting 0. Today the guard is held up entirely
+    // by a code comment.
+    let cli = try watchSource("Modules/NativeAgentCore/Sources/ActivityProbeCLI/main.swift")
+
+    let extract = try #require(
+        cli.range(of: "extractOption(\"--data-root\", from: &arguments)"),
+        "the --data-root extraction moved — this ordering guard is blind"
+    )
+    let flag = try #require(
+        cli.range(of: "let isExplicitDataRoot = probeDataRootOption != nil"),
+        Comment(rawValue: """
+        `isExplicitDataRoot` is no longer derived directly from the presence of the \
+        --data-root option. Whatever replaced it decides whether `simulate` writes into \
+        the user's real activity history.
+        """)
+    )
+    let commandLet = try #require(cli.range(of: "let command = arguments.first"))
+    let dispatch = try #require(
+        cli.range(of: "switch command {"), "the subcommand dispatch moved"
+    )
+
+    #expect(
+        extract.upperBound <= flag.lowerBound,
+        "isExplicitDataRoot is computed BEFORE --data-root is read — it can only be wrong"
+    )
+    #expect(
+        flag.upperBound < commandLet.lowerBound && commandLet.upperBound < dispatch.lowerBound,
+        """
+        THE SCRATCH-ROOT DECISION NOW HAPPENS AT OR AFTER SUBCOMMAND DISPATCH. It must be \
+        settled from the raw argument list before any command can run, or `simulate` \
+        reaches the live store first and asks afterwards.
+        """
+    )
+    // A `let`, so nothing downstream can flip it.
+    #expect(
+        !cli.contains("var isExplicitDataRoot"),
+        "isExplicitDataRoot became mutable — a later reassignment fails the guard OPEN"
+    )
+
+    // The diversion itself: the non-explicit branch must build a temp path, not
+    // fall through to the resolved data root.
+    let simulateBody = try #require(functionBody(cli, named: "commandSimulate"))
+    #expect(simulateBody.contains("if isExplicitDataRoot"))
+    #expect(
+        simulateBody.contains("FileManager.default.temporaryDirectory"),
+        "commandSimulate no longer builds a scratch store — synthetic spans land in the real one"
+    )
+    #expect(
+        simulateBody.contains("standardError"),
+        "the scratch-root diversion no longer says so on stderr — a silent redirect is its own trap"
+    )
+
+    // And the one destructive command that is guarded stays guarded: `wipe`
+    // must refuse before it opens a store, not after.
+    let wipeBody = try #require(functionBody(cli, named: "commandWipe"))
+    let yesGuard = try #require(
+        wipeBody.range(of: "extractFlag(\"--yes\""),
+        "`wipe` no longer requires --yes — a bare `activity-probe wipe` now destroys real history"
+    )
+    let opensStore = try #require(wipeBody.range(of: "ActivitySpanStore(dataRoot:"))
+    #expect(
+        yesGuard.upperBound < opensStore.lowerBound,
+        "`wipe` opens the store before checking --yes"
+    )
+    #expect(wipeBody.contains("return 64"), "`wipe` without --yes no longer exits non-zero")
+}

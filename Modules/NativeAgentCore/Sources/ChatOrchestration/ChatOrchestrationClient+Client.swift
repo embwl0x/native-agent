@@ -238,10 +238,11 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
                 attachments: attachments,
                 persona: persona,
                 surface: surface,
-                suppressUserAppend: suppressUserAppend,
-                persistToolMessages: false,
-                progress: progress
-            )
+                    suppressUserAppend: suppressUserAppend,
+                    persistToolMessages: false,
+                    progress: progress,
+                    noticeSink: { kind, text in await progress?(.notice(kind: kind, text: text)) }
+                )
             var response = execution.response
             let requested = model.trimmingCharacters(in: .whitespacesAndNewlines)
             response.requestedModel = requested.isEmpty ? nil : requested

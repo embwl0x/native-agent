@@ -104,6 +104,12 @@ is_placeholder_identifier() {
      "$value" == *"placeholder"* || "$value" == *"changeme"* ]]
 }
 
+is_final_public_https_url() {
+  local value="$1"
+  [[ "$value" =~ ^https://[^[:space:]/?#]+([/?#][^[:space:]]*)?$ ]] &&
+    ! is_placeholder_identifier "$value"
+}
+
 version_is_clean() {
   [[ "$1" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]]
 }
@@ -373,12 +379,10 @@ run_preflight() {
   if [[ "$source_key" != "mobile_app" ]]; then
     local_fail "NativeAgentMobileSourceKey must resolve to the neutral key 'mobile_app'."
   fi
-  if [[ "$PRIVACY_POLICY_URL" != https://* ]] ||
-     is_placeholder_identifier "$PRIVACY_POLICY_URL"; then
+  if ! is_final_public_https_url "$PRIVACY_POLICY_URL"; then
     local_fail "NATIVEAGENT_PRIVACY_POLICY_URL must be a final public HTTPS URL."
   fi
-  if [[ "$SUPPORT_URL" != https://* ]] ||
-     is_placeholder_identifier "$SUPPORT_URL"; then
+  if ! is_final_public_https_url "$SUPPORT_URL"; then
     local_fail "NATIVEAGENT_SUPPORT_URL must be a final public HTTPS URL."
   fi
   if [[ "$LOCAL_FAILURES" == "0" ]]; then
@@ -475,9 +479,11 @@ validate_signed_app() {
     local_fail "$context does not contain the neutral mobile source key."
   [[ "$actual_version" == "$MARKETING_VERSION" && "$actual_build" == "$BUILD_NUMBER" ]] ||
     local_fail "$context version/build changed from $MARKETING_VERSION ($BUILD_NUMBER) to $actual_version ($actual_build)."
-  [[ "$actual_privacy_url" == "$PRIVACY_POLICY_URL" && "$actual_privacy_url" == https://* ]] ||
+  [[ "$actual_privacy_url" == "$PRIVACY_POLICY_URL" ]] &&
+    is_final_public_https_url "$actual_privacy_url" ||
     local_fail "$context privacy-policy URL is missing or changed."
-  [[ "$actual_support_url" == "$SUPPORT_URL" && "$actual_support_url" == https://* ]] ||
+  [[ "$actual_support_url" == "$SUPPORT_URL" ]] &&
+    is_final_public_https_url "$actual_support_url" ||
     local_fail "$context support URL is missing or changed."
   [[ "$application_identifier" == "$TEAM_ID.$BUNDLE_ID" ]] ||
     local_fail "$context application identifier does not match the release team and bundle."

@@ -47,6 +47,8 @@ struct InstalledPhysiologySoakRecorderTests {
         let beforeFlush = await recorder.diagnostics()
         #expect(beforeFlush.pending == InstalledPhysiologySoakRecorder.maximumPendingRecords)
         #expect(beforeFlush.dropped == 20)
+        #expect(beforeFlush.totalDropped == 20)
+        #expect(beforeFlush.hasMeasurementGap)
 
         await recorder.flush()
         let report = await recorder.report()
@@ -54,6 +56,68 @@ struct InstalledPhysiologySoakRecorderTests {
         #expect(report.recorderDroppedRecordCount == 20)
         #expect(report.sequenceGapCount == 0)
         #expect(report.claimBlockers.contains("recorder backpressure dropped evidence"))
+    }
+
+    // EVAL FENCE: core.substrate.organism
+    // Ledger row: telemetry.residualDeadlineArmedFired
+    //
+    // This drives the real recorder and persisted soak store. Repeated arms for
+    // one exact deadline collapse to one row, while a fire clears that dedupe
+    // key so the next arm remains observable. A full bounded buffer exposes a
+    // durable measurement gap instead of thinning deadline evidence silently.
+    @Test("residual deadline telemetry deduplicates arms and exposes bounded loss")
+    func residualDeadlineTelemetryIsDedupeSafeAndMeasurementGapHonest() async throws {
+        let root = try temporaryRoot("residual-deadline-telemetry")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let clock = PhysiologyTestClock(Date(timeIntervalSince1970: 2_150_000_000))
+        let recorder = makeRecorder(root: root, runtime: "residual-runtime", clock: clock)
+        let deadline = clock.now().addingTimeInterval(90)
+        let opportunity = OrganismResidualRepairOpportunity(
+            generatedAt: clock.now(),
+            evidenceGeneration: "deadline-proof",
+            nextWakeAt: deadline
+        )
+
+        await recorder.recordResidualDeadlineArmed(deadline: deadline, opportunity: opportunity)
+        await recorder.recordResidualDeadlineArmed(deadline: deadline, opportunity: opportunity)
+        await recorder.recordResidualDeadlineFired(
+            scheduledAt: deadline,
+            firedAt: deadline,
+            wasDue: true,
+            localRepairPerformed: true,
+            operationalConsolidationPerformed: false
+        )
+        // Firing clears the dedupe key: a legitimate re-arm at the same exact
+        // date must be observable as a new lifecycle attempt.
+        await recorder.recordResidualDeadlineArmed(deadline: deadline, opportunity: opportunity)
+        let pending = await recorder.diagnostics()
+        #expect(pending.pending == 3)
+        #expect(pending.hasMeasurementGap)
+        #expect(await recorder.flush())
+        #expect((await recorder.diagnostics()).hasMeasurementGap == false)
+
+        let records = try persistedRecords(root: root, runtime: "residual-runtime")
+        #expect(records.filter { $0.kind == .residualDeadlineArmed }.count == 2)
+        #expect(records.filter { $0.kind == .residualDeadlineFired }.count == 1)
+
+        let lossRecorder = makeRecorder(root: root, runtime: "residual-loss", clock: clock)
+        for index in 0...InstalledPhysiologySoakRecorder.maximumPendingRecords {
+            await lossRecorder.recordResidualDeadlineFired(
+                scheduledAt: deadline.addingTimeInterval(Double(index)),
+                firedAt: deadline.addingTimeInterval(Double(index)),
+                wasDue: true,
+                localRepairPerformed: false,
+                operationalConsolidationPerformed: false
+            )
+        }
+        let loss = await lossRecorder.diagnostics()
+        #expect(loss.dropped == 1)
+        #expect(loss.totalDropped == 1)
+        #expect(loss.hasMeasurementGap)
+        _ = await lossRecorder.flush()
+        let lossReport = await lossRecorder.report()
+        #expect(lossReport.recorderDroppedRecordCount == 1)
+        #expect(lossReport.claimBlockers.contains("recorder backpressure dropped evidence"))
     }
 
     @Test("termination flush and later launch distinguish clean stop from crash")
@@ -120,7 +184,11 @@ struct InstalledPhysiologySoakRecorderTests {
         try await waitUntil { await persistence.attemptCount() == 5 }
         try await Task.sleep(nanoseconds: 20_000_000)
         #expect(await persistence.attemptCount() == 5)
-        #expect(await recorder.diagnostics().pending == 1)
+        let failedDiagnostics = await recorder.diagnostics()
+        #expect(failedDiagnostics.pending == 1)
+        #expect(failedDiagnostics.consecutiveWriteFailures == InstalledPhysiologySoakRecorder.maximumAutomaticWriteRetries)
+        #expect(failedDiagnostics.totalWriteFailures >= UInt64(InstalledPhysiologySoakRecorder.maximumAutomaticWriteRetries))
+        #expect(failedDiagnostics.hasMeasurementGap)
 
         // No retry heartbeat remains after the bounded budget. A real new
         // event re-opens recovery; attempt six fails and the bounded retry
@@ -132,7 +200,11 @@ struct InstalledPhysiologySoakRecorderTests {
         )
         try await waitUntil { await persistence.attemptCount() >= 7 }
         try await waitUntil { await recorder.diagnostics().pending == 0 }
-        #expect(await recorder.diagnostics().lastError == nil)
+        let recoveredDiagnostics = await recorder.diagnostics()
+        #expect(recoveredDiagnostics.lastError == nil)
+        #expect(recoveredDiagnostics.consecutiveWriteFailures == 0)
+        #expect(recoveredDiagnostics.totalWriteFailures > 0)
+        #expect(!recoveredDiagnostics.hasMeasurementGap)
     }
 
     @Test("duplicate ingress and provider retry preserve end-to-end chat latency")
@@ -326,6 +398,29 @@ struct InstalledPhysiologySoakRecorderTests {
             .appendingPathComponent("installed-physiology-\(label)-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         return root
+    }
+
+    private func persistedRecords(
+        root: URL,
+        runtime: String
+    ) throws -> [InstalledPhysiologySoakRecord] {
+        let directory = root
+            .appendingPathComponent("evals", isDirectory: true)
+            .appendingPathComponent("installed_physiology_soak", isDirectory: true)
+        let decoder = JSONDecoder()
+        let files = try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        )
+        return try files
+            .filter { $0.pathExtension == "jsonl" }
+            .flatMap { file in
+                try String(decoding: Data(contentsOf: file), as: UTF8.self)
+                    .split(separator: "\n")
+                    .map { try decoder.decode(InstalledPhysiologySoakRecord.self, from: Data($0.utf8)) }
+            }
+            .filter { $0.runtimeInstanceID == runtime }
+            .sorted { $0.sequence < $1.sequence }
     }
 
     // 10s deadline, not 2s: positive steps only need the deadline to exceed

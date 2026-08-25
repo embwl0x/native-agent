@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-enum TelegramUpdateClaimPhase: String, Sendable, Equatable {
+enum TelegramUpdateClaimPhase: String, Sendable, Equatable, Codable {
     case pending
     case processing
     case completed
@@ -39,6 +39,14 @@ struct TelegramUpdateInbox: Sendable {
     let directory: URL
     private let persistence = SwiftNativePersistenceCore()
 
+    enum ClaimReadKind: Sendable, Equatable, Hashable {
+        case recovery
+        case mutation
+        case diagnosticSnapshot
+    }
+
+    @TaskLocal static var claimReadObserver: (@Sendable (ClaimReadKind) -> Void)?
+
     init(offsetURL: URL) {
         let parent = offsetURL.deletingLastPathComponent()
         if parent.lastPathComponent == "telegram" {
@@ -60,12 +68,13 @@ struct TelegramUpdateInbox: Sendable {
         )
         var claims: [TelegramUpdateClaim] = []
         var seenUpdateIDs: Set<Int> = []
-        for url in urls where url.pathExtension == "json" {
+        for url in urls where url.pathExtension == "json"
+            && Int(url.deletingPathExtension().lastPathComponent) != nil {
             let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
             guard values.isRegularFile == true, values.isSymbolicLink != true else {
                 throw TelegramUpdateInboxError.malformedClaim(url.lastPathComponent)
             }
-            let claim = try decodeClaim(at: url)
+            let claim = try decodeClaim(at: url, kind: .diagnosticSnapshot)
             guard url.deletingPathExtension().lastPathComponent == String(claim.updateId),
                   seenUpdateIDs.insert(claim.updateId).inserted else {
                 throw TelegramUpdateInboxError.malformedClaim(url.lastPathComponent)
@@ -80,7 +89,9 @@ struct TelegramUpdateInbox: Sendable {
         let path = claimPath(updateId: update.updateId)
         return try await persistence.withFileLock(path) {
             if FileManager.default.fileExists(atPath: path.path) {
-                return try decodeClaim(at: path)
+                let existing = try decodeClaim(at: path, kind: .mutation)
+                try await upsertIndex(existing)
+                return existing
             }
             let now = _tgNowString()
             let claim = TelegramUpdateClaim(
@@ -91,6 +102,7 @@ struct TelegramUpdateInbox: Sendable {
                 updatedAt: now
             )
             try await write(claim, to: path)
+            try await upsertIndex(claim)
             return claim
         }
     }
@@ -103,7 +115,7 @@ struct TelegramUpdateInbox: Sendable {
     ) async throws -> TelegramUpdateClaim {
         let path = claimPath(updateId: updateId)
         return try await persistence.withFileLock(path) {
-            let current = try decodeClaim(at: path)
+            let current = try decodeClaim(at: path, kind: .mutation)
             guard allowed.contains(current.phase) else { return current }
             let next = TelegramUpdateClaim(
                 updateId: current.updateId,
@@ -113,24 +125,62 @@ struct TelegramUpdateInbox: Sendable {
                 updatedAt: _tgNowString()
             )
             try await write(next, to: path)
+            try await upsertIndex(next)
             return next
         }
     }
 
-    func pruneTerminalClaims(keepingNewest keep: Int = 256) async {
-        guard let claims = try? await snapshots() else { return }
-        let terminal = claims.filter { $0.phase == .completed || $0.phase == .outcomeUnknown }
-        guard terminal.count > keep else { return }
-        for claim in terminal.prefix(terminal.count - keep) {
-            try? FileManager.default.removeItem(at: claimPath(updateId: claim.updateId))
+    /// Recovery reads the maintained index, then opens only pending or
+    /// processing claim files. Terminal retention never makes an idle Telegram
+    /// tick reread hundreds of historical update payloads.
+    func recoverableClaims() async throws -> [TelegramUpdateClaim] {
+        var index = try await loadIndex()
+        var recovered: [TelegramUpdateClaim] = []
+        var repairedIndex = false
+        for entry in index.entries.values.sorted(by: { $0.updateId < $1.updateId })
+        where entry.phase == .pending || entry.phase == .processing {
+            let claim = try decodeClaim(at: claimPath(updateId: entry.updateId), kind: .recovery)
+            recovered.append(claim)
+            if claim.phase != entry.phase {
+                index.entries[entry.updateId] = InboxClaimIndex.Entry(
+                    updateId: claim.updateId,
+                    phase: claim.phase
+                )
+                repairedIndex = true
+            }
         }
+        if repairedIndex { try await writeIndex(index) }
+        return recovered
+    }
+
+    func pruneTerminalClaims(keepingNewest keep: Int = 256) async {
+        guard var index = try? await loadIndex() else { return }
+        let terminal = index.entries.values
+            .filter { $0.phase == .completed || $0.phase == .outcomeUnknown }
+            .sorted { $0.updateId < $1.updateId }
+        guard terminal.count > keep else { return }
+        var changed = false
+        for entry in terminal.prefix(terminal.count - keep) {
+            let path = claimPath(updateId: entry.updateId)
+            try? FileManager.default.removeItem(at: path)
+            if !FileManager.default.fileExists(atPath: path.path) {
+                index.entries.removeValue(forKey: entry.updateId)
+                changed = true
+            }
+        }
+        if changed { try? await writeIndex(index) }
     }
 
     private func claimPath(updateId: Int) -> URL {
         directory.appendingPathComponent("\(updateId).json", isDirectory: false)
     }
 
-    private func decodeClaim(at path: URL) throws -> TelegramUpdateClaim {
+    private var indexPath: URL {
+        directory.appendingPathComponent("claims_index.json", isDirectory: false)
+    }
+
+    private func decodeClaim(at path: URL, kind: ClaimReadKind) throws -> TelegramUpdateClaim {
+        Self.claimReadObserver?(kind)
         let data: Data
         do {
             data = try Data(contentsOf: path)
@@ -177,6 +227,66 @@ struct TelegramUpdateInbox: Sendable {
             value.serializedData(pretty: true),
             to: path
         )
+    }
+
+    private func loadIndex() async throws -> InboxClaimIndex {
+        guard FileManager.default.fileExists(atPath: indexPath.path) else {
+            // One-time migration for pre-index installs. This may scan retained
+            // claims once, but every later tick reads this bounded index first.
+            let migrated = InboxClaimIndex(claims: try await snapshots())
+            try await writeIndex(migrated)
+            return migrated
+        }
+        let data: Data
+        do {
+            data = try Data(contentsOf: indexPath)
+        } catch {
+            throw TelegramUpdateInboxError.malformedClaim(indexPath.lastPathComponent)
+        }
+        guard let index = try? JSONDecoder().decode(InboxClaimIndex.self, from: data),
+              index.isValid else {
+            throw TelegramUpdateInboxError.malformedClaim(indexPath.lastPathComponent)
+        }
+        return index
+    }
+
+    private func writeIndex(_ index: InboxClaimIndex) async throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try await persistence.writeDataAtomicDurable(
+            JSONEncoder().encode(index),
+            to: indexPath
+        )
+    }
+
+    private func upsertIndex(_ claim: TelegramUpdateClaim) async throws {
+        var index = try await loadIndex()
+        index.entries[claim.updateId] = InboxClaimIndex.Entry(
+            updateId: claim.updateId,
+            phase: claim.phase
+        )
+        try await writeIndex(index)
+    }
+}
+
+private struct InboxClaimIndex: Codable, Sendable {
+    struct Entry: Codable, Sendable {
+        let updateId: Int
+        let phase: TelegramUpdateClaimPhase
+    }
+
+    let schemaVersion: Int
+    var entries: [Int: Entry]
+
+    init(claims: [TelegramUpdateClaim] = []) {
+        self.schemaVersion = 1
+        self.entries = Dictionary(uniqueKeysWithValues: claims.map {
+            ($0.updateId, Entry(updateId: $0.updateId, phase: $0.phase))
+        })
+    }
+
+    var isValid: Bool {
+        schemaVersion == 1
+            && entries.allSatisfy { id, entry in id == entry.updateId }
     }
 }
 
@@ -298,9 +408,23 @@ extension TelegramPollLoop {
         // Both the raw form (bot123:secret) and the percent-encoded form a
         // URLSession error can carry (bot123%3Asecret) — the encoded colon
         // slipped the original pattern (gpt-5.5 review, telegram-vision-in).
-        guard let regex = try? NSRegularExpression(pattern: #"bot\d+(?::|%3[Aa])[A-Za-z0-9_\-]+"#) else { return s }
-        return regex.stringByReplacingMatches(
-            in: s, range: NSRange(s.startIndex..., in: s), withTemplate: "bot<redacted>"
+        guard let botRegex = try? NSRegularExpression(pattern: #"bot\d+(?::|%3[Aa])[A-Za-z0-9_\-]+"#),
+              let bareRegex = try? NSRegularExpression(pattern: #"\b\d{6,}(?::|%3[Aa])[A-Za-z0-9_\-]+"#)
+        else { return s }
+        // ONE redaction vocabulary across every layer that scrubs a Telegram
+        // token (this upstream scrub fires before TelegramRichMessage.sanitize's
+        // typed regex, so an ad-hoc "<redacted>" here would shadow the typed
+        // marker downstream and make evidence undiagnosable — 0.4.3 gauntlet).
+        let botRedacted = botRegex.stringByReplacingMatches(
+            in: s, range: NSRange(s.startIndex..., in: s), withTemplate: "[REDACTED_TELEGRAM_TOKEN]"
+        )
+        // Status, model, session and persona values can carry a token without
+        // a URL's `bot` prefix. Treat the Bot API's numeric-id form as secret
+        // in those assembled UI strings too.
+        return bareRegex.stringByReplacingMatches(
+            in: botRedacted,
+            range: NSRange(botRedacted.startIndex..., in: botRedacted),
+            withTemplate: "[REDACTED_TELEGRAM_TOKEN]"
         )
     }
 
@@ -387,14 +511,13 @@ extension TelegramPollLoop {
     }
 
     @discardableResult
-    func persistOffset(_ nextOffset: Int, store: SwiftNativePersistenceCore) async -> Bool {
+    func persistOffset(_ nextOffset: Int, cursor: TelegramOffsetCursor) async -> Int? {
         do {
-            try await store.writeJSON(.object(["offset": .int(Int64(nextOffset))]), to: offsetURL)
-            return true
+            return try await cursor.advance(to: nextOffset)
         } catch {
             FileHandle.standardError.write(Data("TelegramPollLoop: persist offset failed: \(Self._tgRedactToken(String(describing: error)))\n".utf8))
             await recordError(context: "persist_offset", error: String(describing: error))
-            return false
+            return nil
         }
     }
 

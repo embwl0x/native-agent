@@ -70,23 +70,45 @@ public final class SystemDockerPSExecutor: DockerPSExecutor {
             return nil
         }
         // 8s deadline matches Python's `timeout=8`.
+        //
+        // HANG-PROOFING (2026-08-25): the previous shape parked this
+        // continuation on `DispatchQueue.global().async { waitUntilExit() }`
+        // with a separate 8s Task that only ever called `terminate()`. Under
+        // full-suite subprocess churn the shared GCD pool starves — the queued
+        // block never STARTS, so the continuation is never resumed even though
+        // the child exited long ago (release-gauntlet wedge: 75+ min at 0% CPU
+        // with no child process). Same landmine ToolExecution+RunSandbox
+        // documents; same cure: a dedicated reap Thread that polls under the
+        // deadline, escalates SIGTERM → grace → SIGKILL, and resumes the
+        // continuation UNCONDITIONALLY. Worst case is bounded (~10s), never a
+        // hang, with zero dependence on GCD scheduling.
         let pidRef = process
-        let deadlineTask = Task<Void, Never> {
-            try? await Task.sleep(nanoseconds: 8_000_000_000)
-            if pidRef.isRunning {
-                pidRef.terminate()
-            }
-        }
-        // waitUntilExit on a global queue via continuation — blocking the
-        // cooperative-pool thread here would starve other tasks for the full
-        // run (up to 8s on a hung docker).
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            DispatchQueue.global().async {
-                pidRef.waitUntilExit()
+            let reaper = Thread {
+                let deadline = Date().addingTimeInterval(8)
+                while pidRef.isRunning && Date() < deadline {
+                    Thread.sleep(forTimeInterval: 0.02)
+                }
+                if pidRef.isRunning {
+                    pidRef.terminate() // SIGTERM
+                    let grace = Date().addingTimeInterval(2)
+                    while pidRef.isRunning && Date() < grace {
+                        Thread.sleep(forTimeInterval: 0.02)
+                    }
+                    if pidRef.isRunning {
+                        // SIGKILL by pid is reuse-safe HERE: the child is not
+                        // yet reaped (waitUntilExit below is the reap), so the
+                        // pid cannot be recycled. waitUntilExit after an
+                        // unignorable SIGKILL returns promptly.
+                        kill(pidRef.processIdentifier, SIGKILL)
+                        pidRef.waitUntilExit()
+                    }
+                }
                 cont.resume()
             }
+            reaper.qualityOfService = .userInitiated
+            reaper.start()
         }
-        deadlineTask.cancel()
 
         // Final drain: nil the handlers, then grab whatever is still buffered
         // WITHOUT blocking — a grandchild holding an inherited write end would

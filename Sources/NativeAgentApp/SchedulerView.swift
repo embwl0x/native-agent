@@ -16,12 +16,29 @@ import CoreSpotlight
 import CloudKit
 #endif
 
+/// The mounted Scheduler's canonical jobs-feed lifecycle. The stream arms
+/// before its first read, so a job mutation racing view appearance is replayed
+/// instead of leaving an enabled/paused row stale until the screen is reopened.
+enum SchedulerJobsLiveRefresh {
+    @MainActor
+    static func observe(
+        path: URL,
+        refresh: @escaping @MainActor @Sendable () async -> Void
+    ) async {
+        await ViewFileRefreshTask.run(
+            paths: [path],
+            debounceDelay: .milliseconds(100),
+            refresh: refresh
+        )
+    }
+}
+
 struct SchedulerView: View {
     @Environment(AppModel.self) private var appModel
     @State private var isLoadingJobs = true
     @State private var isAddingReflection = false
     @State private var reflectionOutcome: NightlyReflectionJobOutcome?
-    @State private var jobsLoadError: String?
+    @State private var jobsLoadResult: SchedulerJobsRefreshResult?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -48,30 +65,38 @@ struct SchedulerView: View {
             if isLoadingJobs {
                 ProgressView("Loading schedule")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if let jobsLoadError {
+            } else if let detail = jobsLoadResult?.failureDetail, appModel.jobs.isEmpty {
                 NativeEmptyState(
                     title: "Schedule unavailable",
-                    detail: jobsLoadError,
+                    detail: detail,
                     systemImage: "exclamationmark.triangle",
                     actionTitle: "Retry",
                     actionImage: "arrow.clockwise",
                     action: { Task { await loadJobs() } }
                 )
             } else {
-                List(appModel.jobs) { job in
-                    VStack(alignment: .leading) {
-                        Text(job.name)
-                        Text("\(job.kind) · \(job.enabled ? "enabled" : "paused")")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 8) {
+                    if let detail = jobsLoadResult?.failureDetail {
+                        StalePanelNotice(text: detail)
+                    }
+                    List(appModel.jobs) { job in
+                        VStack(alignment: .leading) {
+                            Text(job.name)
+                            Text("\(job.kind) · \(job.enabled ? "enabled" : "paused")")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
             }
         }
         .padding()
         .navigationTitle("Scheduler")
-        .task {
-            await loadJobs()
+        .task(id: appModel.client.schedulerJobsPath) {
+            let jobsPath = appModel.client.schedulerJobsPath
+            await SchedulerJobsLiveRefresh.observe(path: jobsPath) {
+                await loadJobs()
+            }
         }
     }
 
@@ -88,10 +113,8 @@ struct SchedulerView: View {
     @MainActor
     private func loadJobs() async {
         isLoadingJobs = true
-        jobsLoadError = nil
-        if !(await appModel.refreshSchedulerJobs()) {
-            jobsLoadError = appModel.statusText
-        }
+        jobsLoadResult = nil
+        jobsLoadResult = await appModel.refreshSchedulerJobs()
         isLoadingJobs = false
     }
 }

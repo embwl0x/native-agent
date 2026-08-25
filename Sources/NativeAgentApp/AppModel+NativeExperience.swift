@@ -44,7 +44,10 @@ extension NativeClient {
         _ blueprint: ExperienceAutomationBlueprint,
         projectSpaceId: String? = nil
     ) async throws -> JSONValue {
-        let writer = makeSchedulerJobWriter(connectorActionIDs: Self.connectorActionIDSet())
+        let writer = makeSchedulerJobWriter(
+            connectorActionIDs: Self.connectorActionIDSet(),
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        )
         return try await writer.installBlueprintJob(
             body: .object(NativeExperienceCatalogs.schedulerBody(
                 for: blueprint,
@@ -54,15 +57,15 @@ extension NativeClient {
     }
 
     func trustedRemoteNodes() async throws -> [ExperienceRemoteNode] {
-        try await TrustedRemoteEffectNodeStore(root: PersistenceCore.defaultDataRoot()).list()
+        try await TrustedRemoteEffectNodeStore(root: dataRootOverride ?? PersistenceCore.defaultDataRoot()).list()
     }
 
     func saveTrustedRemoteNode(_ node: ExperienceRemoteNode) async throws -> ExperienceRemoteNode {
-        try await TrustedRemoteEffectNodeStore(root: PersistenceCore.defaultDataRoot()).upsert(node)
+        try await TrustedRemoteEffectNodeStore(root: dataRootOverride ?? PersistenceCore.defaultDataRoot()).upsert(node)
     }
 
     func removeTrustedRemoteNode(id: String) async throws {
-        try await TrustedRemoteEffectNodeStore(root: PersistenceCore.defaultDataRoot()).remove(id: id)
+        try await TrustedRemoteEffectNodeStore(root: dataRootOverride ?? PersistenceCore.defaultDataRoot()).remove(id: id)
     }
 }
 

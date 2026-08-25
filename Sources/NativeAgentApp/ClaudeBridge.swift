@@ -166,6 +166,106 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         }
     }
 
+    /// Canonical SSE framing for both a live fan-out and a reconnect backfill.
+    /// Keeping this at the route owner prevents a valid bridge event from being
+    /// silently emitted in one format and replayed in another.
+    static func eventStreamFrame(for event: BridgeEvent) -> Data {
+        let json = (try? JSONSerialization.data(withJSONObject: event.asJSON))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        return Data("data: \(json)\n\n".utf8)
+    }
+
+    func eventRouteSnapshot() -> (connectionCount: Int, subscriberCount: Int, latestSequence: UInt64) {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return (connections.count, eventSubscribers.count, eventSeq)
+    }
+
+    /// The compact, auditable event emitted for every organism reflex review
+    /// request that reaches the runtime.  This deliberately excludes the
+    /// candidate pattern and operator note: the SSE ring is a diagnostic
+    /// surface, not another owner of reflex content.  A successful event names
+    /// the durable receipt so a reviewer can correlate it with
+    /// `organism_state.json`; an unsuccessful event is explicitly not a
+    /// mutation.
+    struct OrganismReflexReviewTelemetry: Sendable, Equatable {
+        static let source = "organism_debug_bridge"
+        static let maximumCandidateIDCharacters = 120
+        static let maximumFailureDetailCharacters = 240
+
+        let candidateID: String
+        let decision: String
+        let status: String
+        let mutationRecorded: Bool
+        let receiptID: String?
+        let reviewedAt: Date?
+        let failureDetail: String?
+
+        init(
+            candidateID: String,
+            decision: OrganismReflexReviewDecision,
+            status: OrganismReflexReviewApplyStatus,
+            receiptID: String? = nil,
+            reviewedAt: Date? = nil,
+            failureDetail: String? = nil
+        ) {
+            let boundedReceiptID = receiptID.map {
+                Self.bounded($0, maximum: Self.maximumCandidateIDCharacters)
+            }
+            self.candidateID = Self.bounded(candidateID, maximum: Self.maximumCandidateIDCharacters)
+            self.decision = decision.rawValue
+            self.status = status.rawValue
+            self.mutationRecorded = status == .applied
+                && boundedReceiptID?.isEmpty == false
+                && reviewedAt != nil
+            self.receiptID = self.mutationRecorded
+                ? boundedReceiptID
+                : nil
+            self.reviewedAt = self.mutationRecorded ? reviewedAt : nil
+            self.failureDetail = self.mutationRecorded
+                ? nil
+                : Self.boundedOptional(failureDetail, maximum: Self.maximumFailureDetailCharacters)
+        }
+
+        init(
+            candidateID: String,
+            decision: OrganismReflexReviewDecision,
+            outcome: OrganismReflexReviewApplyOutcome
+        ) {
+            self.init(
+                candidateID: candidateID,
+                decision: decision,
+                status: outcome.status,
+                receiptID: outcome.receipt?.id,
+                reviewedAt: outcome.receipt?.reviewedAt,
+                failureDetail: outcome.error
+            )
+        }
+
+        var payload: [String: Any] {
+            let iso = ISO8601DateFormatter()
+            return [
+                "candidateId": candidateID,
+                "decision": decision,
+                "status": status,
+                "mutationRecorded": mutationRecorded,
+                "receiptId": receiptID ?? NSNull(),
+                "reviewedAt": reviewedAt.map { iso.string(from: $0) } ?? NSNull(),
+                "failureDetail": failureDetail ?? NSNull(),
+                "source": Self.source,
+            ]
+        }
+
+        private static func bounded(_ value: String, maximum: Int) -> String {
+            String(value.trimmingCharacters(in: .whitespacesAndNewlines).prefix(max(0, maximum)))
+        }
+
+        private static func boundedOptional(_ value: String?, maximum: Int) -> String? {
+            guard let value else { return nil }
+            let clipped = bounded(value, maximum: maximum)
+            return clipped.isEmpty ? nil : clipped
+        }
+    }
+
     var token: String { stateLock.lock(); defer { stateLock.unlock() }; return _token }
     var activePort: UInt16 { stateLock.lock(); defer { stateLock.unlock() }; return _activePort }
 
@@ -665,6 +765,26 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         ]
     }
 
+    /// HTTP is only the immediate operator feedback. The telemetry record is
+    /// emitted first and remains the audit surface even when this response is
+    /// not delivered before the bridge deadline.
+    static func organismReflexReviewHTTPStatus(for status: OrganismReflexReviewApplyStatus) -> Int {
+        switch status {
+        case .applied:
+            // An `applied` outcome without its required receipt is an internal
+            // consistency failure, not a successful review.
+            return 500
+        case .organismDisabled, .persistenceFailed:
+            return 503
+        case .candidateNotFound:
+            return 404
+        case .reviewInFlight, .notAwaitingReview:
+            return 409
+        case .approvalRequiresLowRisk:
+            return 422
+        }
+    }
+
     static func contextFlowHealthJSON(
         mode: ContextFlowMode,
         health: ContextFlowCoordinatorHealth?
@@ -1002,22 +1122,39 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                     return
                 }
                 let decision: OrganismReflexReviewDecision = action == "approve_reflex" ? .approve : .retire
-                let snapshot = await runtime.reviewOrganismReflexCandidate(
+                let outcome = await runtime.applyOrganismReflexReview(
                     id: candidateId,
                     decision: decision,
                     note: reviewNote,
                     reviewedBy: "bridge_operator",
-                    source: "organism_debug_bridge"
+                    source: OrganismReflexReviewTelemetry.source
                 )
-                self.publishEvent(kind: "organism_reflex_review", payload: [
-                    "candidateId": candidateId,
-                    "decision": decision.rawValue,
-                ])
+                let telemetry = OrganismReflexReviewTelemetry(
+                    candidateID: candidateId,
+                    decision: decision,
+                    outcome: outcome
+                )
+                self.publishEvent(kind: "organism_reflex_review", payload: telemetry.payload)
+
+                guard telemetry.mutationRecorded else {
+                    respond(Self.organismReflexReviewHTTPStatus(for: outcome.status), [
+                        "status": "not_reviewed",
+                        "reason": telemetry.status,
+                        "detail": telemetry.failureDetail ?? "The reflex review did not produce a durable receipt.",
+                        "candidateId": telemetry.candidateID,
+                        "decision": telemetry.decision,
+                        "organism": Self.organismSnapshotJSON(outcome.snapshot),
+                        "debug": NSNull(),
+                    ])
+                    return
+                }
                 respond(200, [
                     "status": "reviewed",
-                    "candidateId": candidateId,
-                    "decision": decision.rawValue,
-                    "organism": Self.organismSnapshotJSON(snapshot),
+                    "candidateId": telemetry.candidateID,
+                    "decision": telemetry.decision,
+                    "receiptId": telemetry.receiptID ?? NSNull(),
+                    "reviewedAt": telemetry.reviewedAt.map { ISO8601DateFormatter().string(from: $0) } ?? NSNull(),
+                    "organism": Self.organismSnapshotJSON(outcome.snapshot),
                     "debug": NSNull(),
                 ])
                 return
@@ -2050,7 +2187,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
     /// Thread-safe. Holds stateLock briefly to mutate buffer + snapshot
     /// subscriber set; the actual writes to subscriber connections happen
     /// OUTSIDE the lock so a slow consumer can't stall publishers.
-    fileprivate func publishEvent(kind: String, payload: [String: Any]) {
+    func publishEvent(kind: String, payload: [String: Any]) {
         stateLock.lock()
         eventSeq += 1
         let event = BridgeEvent(seq: eventSeq, timestamp: Date(), kind: kind, payload: payload)
@@ -2063,9 +2200,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
 
         guard !subs.isEmpty else { return }
         // SSE wire format: `data: <json>\n\n`. One push per subscriber.
-        let json = (try? JSONSerialization.data(withJSONObject: event.asJSON)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-        let frame = "data: \(json)\n\n"
-        let chunk = Data(frame.utf8)
+        let chunk = Self.eventStreamFrame(for: event)
         for sub in subs {
             sub.send(content: chunk, completion: .contentProcessed { _ in })
         }
@@ -2091,9 +2226,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         stateLock.unlock()
 
         for e in backfill {
-            let json = (try? JSONSerialization.data(withJSONObject: e.asJSON)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-            let frame = "data: \(json)\n\n"
-            conn.send(content: Data(frame.utf8), completion: .contentProcessed { _ in })
+            conn.send(content: Self.eventStreamFrame(for: e), completion: .contentProcessed { _ in })
         }
 
         // Drop on close. accept()'s stateUpdateHandler already removes

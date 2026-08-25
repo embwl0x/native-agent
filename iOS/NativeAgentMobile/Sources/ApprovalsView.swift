@@ -15,6 +15,87 @@ import UserNotifications
 /// `ApprovalRequest` in Models.swift covers most fields; this alias reuses it.
 typealias PendingApproval = ApprovalRequest
 
+/// Closed translation from visible card verbs to the signed Mac action.
+/// Unknown input must fail before a card can accidentally take a privileged
+/// affirmative path.
+enum ApprovalDecisionRoute: Equatable {
+    case approve
+    case reject
+    case cancel
+
+    var action: String {
+        switch self {
+        case .approve: return "approve"
+        case .reject: return "reject"
+        case .cancel: return "cancel"
+        }
+    }
+
+    var finalDecision: String {
+        switch self {
+        case .approve: return "approved"
+        case .reject: return "denied"
+        case .cancel: return "canceled"
+        }
+    }
+
+    static func resolve(_ value: String) -> ApprovalDecisionRoute? {
+        switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "approve", "approved": return .approve
+        case "deny", "denied", "reject", "rejected": return .reject
+        case "cancel", "canceled": return .cancel
+        default: return nil
+        }
+    }
+}
+
+/// The warning slot is reserved for a real asynchronous handoff. A healthy
+/// snapshot does not need a persistent warning just because it arrived through
+/// iCloud.
+enum ApprovalBannerPresentation {
+    static let pendingDecisionMessage =
+        "Decision sent. The Mac is still running it; this list will clear when iCloud publishes the result."
+
+    static func warning(hasPendingLocalDecision: Bool) -> String? {
+        hasPendingLocalDecision ? pendingDecisionMessage : nil
+    }
+}
+
+/// Pure notification policy for approval snapshots. Keeping the policy apart
+/// from `UNUserNotificationCenter` makes the cold-load, visibility, and burst
+/// rules executable without asking the system to present a notification.
+enum ApprovalPendingNotificationPresentation {
+    static let individualNotificationLimit = 3
+
+    struct Plan: Equatable {
+        let individualApprovalIDs: [String]
+        let summaryCount: Int?
+
+        static let none = Plan(individualApprovalIDs: [], summaryCount: nil)
+    }
+
+    static func plan(
+        hasLoadedApprovals: Bool,
+        isVisible: Bool,
+        pendingIDs: [String],
+        notifiedIDs: Set<String>
+    ) -> Plan {
+        guard hasLoadedApprovals, !isVisible else { return .none }
+
+        var newIDs: [String] = []
+        var seenIDs = Set<String>()
+        for id in pendingIDs where !notifiedIDs.contains(id) && seenIDs.insert(id).inserted {
+            newIDs.append(id)
+        }
+
+        guard !newIDs.isEmpty else { return .none }
+        if newIDs.count > individualNotificationLimit {
+            return Plan(individualApprovalIDs: [], summaryCount: newIDs.count)
+        }
+        return Plan(individualApprovalIDs: newIDs, summaryCount: nil)
+    }
+}
+
 // MARK: - Store
 
 @MainActor
@@ -62,7 +143,9 @@ final class ApprovalsStore: ObservableObject {
         } else {
             approvals = merged
         }
-        bannerWarning = "Approvals are syncing through iCloud. Decisions run when the Mac app receives them."
+        bannerWarning = ApprovalBannerPresentation.warning(
+            hasPendingLocalDecision: !locallyFinalizedApprovals.isEmpty
+        )
         bannerError = nil
     }
 
@@ -78,23 +161,14 @@ final class ApprovalsStore: ObservableObject {
         }
         let previousApprovals = approvals
         do {
-            let normalized = decision.lowercased()
-            let action: String
-            let finalDecision: String
-            if normalized == "approve" || normalized == "approved" {
-                action = "approve"
-                finalDecision = "approved"
-            } else if normalized == "cancel" {
-                action = "cancel"
-                finalDecision = "canceled"
-            } else {
-                action = "reject"
-                finalDecision = "denied"
+            guard let route = ApprovalDecisionRoute.resolve(decision) else {
+                bannerError = "Unsupported approval decision."
+                return
             }
-            markApprovalFinal(id: id, decision: finalDecision)
-            if action == "approve" {
+            markApprovalFinal(id: id, decision: route.finalDecision)
+            if route == .approve {
                 _ = try await iCloudSyncEngine.shared.approveApproval(id: id)
-            } else if action == "cancel" {
+            } else if route == .cancel {
                 _ = try await iCloudSyncEngine.shared.cancelApproval(id: id)
             } else {
                 _ = try await iCloudSyncEngine.shared.rejectApproval(id: id)
@@ -103,18 +177,21 @@ final class ApprovalsStore: ObservableObject {
         } catch {
             if iCloudSyncEngine.isMacResponseTimeout(error) {
                 await refresh(client: client, pairingStore: pairingStore)
-                bannerWarning = "Decision sent. The Mac is still running it; this list will clear when iCloud publishes the result."
+                bannerWarning = ApprovalBannerPresentation.pendingDecisionMessage
                 bannerError = nil
             } else {
                 locallyFinalizedApprovals.removeValue(forKey: id)
                 withAnimation(AppMotion.snappy) { approvals = previousApprovals }
                 iCloudSyncEngine.shared.approvals = previousApprovals
+                bannerWarning = nil
                 bannerError = "Failed to record decision: \(error.localizedDescription)"
             }
         }
     }
 
-    private func markApprovalFinal(id: String, decision: String) {
+    /// Hold a confirmed local final decision until the Mac snapshot reflects
+    /// it, so a card cannot be offered again in the handoff window.
+    func markApprovalFinal(id: String, decision: String) {
         let resolvedAt = ISO8601DateFormatter().string(from: Date())
         locallyFinalizedApprovals[id] = (decision: decision, resolvedAt: resolvedAt)
         notifiedPendingIDs.insert(id)
@@ -146,19 +223,24 @@ final class ApprovalsStore: ObservableObject {
 
     private func notifyForNewPendingApprovals(_ next: [PendingApproval]) {
         let pending = next.filter { $0.status.lowercased() == "pending" }
-        let pendingIDs = Set(pending.map(\.id))
+        let pendingIDs = pending.map(\.id)
         defer {
             notifiedPendingIDs.formUnion(pendingIDs)
             hasLoadedApprovals = true
         }
-        guard hasLoadedApprovals else { return }
-        guard !isVisible else { return }
-        let newPending = pending.filter { !notifiedPendingIDs.contains($0.id) }
-        for approval in newPending.prefix(3) {
+
+        let plan = ApprovalPendingNotificationPresentation.plan(
+            hasLoadedApprovals: hasLoadedApprovals,
+            isVisible: isVisible,
+            pendingIDs: pendingIDs,
+            notifiedIDs: notifiedPendingIDs
+        )
+        for id in plan.individualApprovalIDs {
+            guard let approval = pending.first(where: { $0.id == id }) else { continue }
             fireApprovalNotification(approval)
         }
-        if newPending.count > 3 {
-            fireApprovalSummaryNotification(count: newPending.count)
+        if let summaryCount = plan.summaryCount {
+            fireApprovalSummaryNotification(count: summaryCount)
         }
     }
 
@@ -254,6 +336,9 @@ struct ApprovalsView: View {
         // exactly the case where a silent sync failure hurts most.
         .macSyncErrorBanner()
         .toolbar {
+            ToolbarItem(placement: .navigationBarLeading) {
+                MacStatusChip()
+            }
             ToolbarItem(placement: .navigationBarTrailing) {
                 if store.isLoading {
                     ProgressView().scaleEffect(0.8)
@@ -283,6 +368,7 @@ struct ApprovalsView: View {
             AppEmptyState(
                 title: "No actions need approval",
                 systemImage: "checkmark.shield",
+                kind: .empty,
                 description: "Tool calls, memory changes, Mac control, connector writes, Workshop tasks, and harness improvements show up here when they need a decision."
             )
         } else {
@@ -445,22 +531,21 @@ struct PayloadPreview: View {
     @Binding var expanded: Bool
 
     // Build a pretty-printed JSON string from the approval for display
-    private var payloadText: String {
+    var payloadText: String {
         if let preview = approval.payloadPreview, !preview.isEmpty {
             return preview
         }
-        // Encode the approval's action + title as a rough preview dict
-        // (the real payload dict isn't decoded separately — the Mac can add it as
-        //  a top-level "payload" key; for now we show the fields we have)
+        // This is context inferred from the approval envelope, not the real
+        // Mac-side payload. Never render it as though it were canonical.
         var dict: [String: Any] = [
             "action": approval.action,
         ]
         if let r = approval.reason { dict["reason"] = r }
         if let json = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]),
            let str = String(data: json, encoding: .utf8) {
-            return str
+            return "Preview generated from action/reason — Mac did not publish the real payload.\n\n\(str)"
         }
-        return "{ \"action\": \"\(approval.action)\" }"
+        return "Preview generated from action/reason — Mac did not publish the real payload.\n\n{ \"action\": \"\(approval.action)\" }"
     }
 
     private let maxLines = 6

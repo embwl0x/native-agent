@@ -76,6 +76,9 @@ extension NativeCognitionRuntime {
         }
     }
 
+    /// Bounded projection proof only; production never consults this count.
+    func pursuitCandidateCountForProof() -> Int { pursuitCandidates.count }
+
     private func finishPursuitRefresh(state: DeskState?, generation: UInt64) {
         pursuitRefreshInFlight = false
         if generation == pursuitProjectionGeneration {

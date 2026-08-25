@@ -16,9 +16,312 @@ import CoreSpotlight
 import CloudKit
 #endif
 
+/// The bottom-of-report summary is a receipt view: it describes the checks we
+/// have and when their full Doctor pass completed. It intentionally derives
+/// severity from the individual check rows, not the report's free-form status
+/// string, which can be stale after live-coverage reconciliation.
+enum DoctorReportFooterPresentation {
+    struct State: Equatable {
+        let title: String
+        let detail: String
+        let status: String
+    }
+
+    static let maximumClockSkew: TimeInterval = 60
+
+    static func resolve(
+        report: DoctorReport?,
+        completedAt: Date?,
+        isRunning: Bool,
+        now: Date
+    ) -> State? {
+        guard let report else { return nil }
+        let summary = DoctorPlainCopy.summarize(report.checks)
+
+        if isRunning {
+            return State(
+                title: "Refreshing Doctor report",
+                detail: "The results above are from before this run and are not current until it finishes.",
+                status: "warn"
+            )
+        }
+        guard let completedAt else {
+            return State(
+                title: "Doctor report time unavailable",
+                detail: "This report has \(summary.total) \(summary.total == 1 ? "check" : "checks"), but its completion time is unavailable. Run Doctor to refresh it.",
+                status: "warn"
+            )
+        }
+
+        let age = now.timeIntervalSince(completedAt)
+        guard age >= -maximumClockSkew else {
+            return State(
+                title: "Doctor report time is invalid",
+                detail: "The report completion time is ahead of this Mac's clock. Run Doctor again after checking the clock.",
+                status: "warn"
+            )
+        }
+
+        let observedStatus = summary.statusText
+        let ageText = relativeAge(max(0, age))
+        if age > AppModel.supportSnapshotDoctorReuseTTL {
+            return State(
+                title: "Doctor report is older than \(Int(AppModel.supportSnapshotDoctorReuseTTL)) seconds",
+                detail: "Completed \(ageText). \(DoctorPlainCopy.detail(for: summary)) Run Doctor again for a current report.",
+                status: observedStatus == "failed" ? "failed" : "warn"
+            )
+        }
+        return State(
+            title: "Doctor report completed \(ageText)",
+            detail: DoctorPlainCopy.detail(for: summary),
+            status: observedStatus
+        )
+    }
+
+    private static func relativeAge(_ seconds: TimeInterval) -> String {
+        if seconds < 5 { return "just now" }
+        if seconds < 60 { return "\(Int(seconds)) seconds ago" }
+        let minutes = Int(seconds / 60)
+        if minutes < 60 { return "\(minutes) minute\(minutes == 1 ? "" : "s") ago" }
+        let hours = Int(seconds / 3_600)
+        if hours < 24 { return "\(hours) hour\(hours == 1 ? "" : "s") ago" }
+        let days = Int(seconds / 86_400)
+        return "\(days) day\(days == 1 ? "" : "s") ago"
+    }
+}
+
+/// The toolbar action must acknowledge both a completed report and the less
+/// common case where Doctor could not produce one. `statusText` is shared with
+/// other surfaces, so it cannot be the only place that a button failure lands.
+enum DoctorRunButtonPresentation {
+    struct Notice: Equatable {
+        let detail: String
+        let status: String
+    }
+
+    static func notice(for outcome: AppModel.DoctorRunOutcome, repair: Bool) -> Notice {
+        switch outcome {
+        case .unavailable(let reason):
+            return Notice(
+                detail: "Doctor could not run: \(reason)",
+                status: "failed"
+            )
+        case .completed(let status, let failingChecks):
+            let verb = repair ? "Doctor repair finished" : "Doctor finished"
+            if !failingChecks.isEmpty {
+                let count = failingChecks.count
+                return Notice(
+                    detail: "\(verb), but \(count) \(count == 1 ? "check is" : "checks are") still failing. Review the report below.",
+                    status: "failed"
+                )
+            }
+            let statusBucket = DoctorPlainCopy.bucket(for: status)
+            if statusBucket == "failing" {
+                return Notice(
+                    detail: "\(verb), but the report is failing. Review the report below.",
+                    status: "failed"
+                )
+            }
+            return Notice(
+                detail: statusBucket == "warning"
+                    ? "\(verb) with items that need attention. Review the report below."
+                    : "\(verb). Review the current report below.",
+                status: statusBucket == "warning" ? "warn" : "ok"
+            )
+        }
+    }
+}
+
+enum DoctorSupportSnapshotPresentation {
+    struct Notice: Equatable {
+        let detail: String
+        let status: String
+    }
+
+    static func notice(for outcome: AppModel.SupportDiagnosticsLoadOutcome) -> Notice {
+        switch outcome {
+        case .unavailable(let reason):
+            return Notice(detail: "Support Snapshot is unavailable: \(reason)", status: "warn")
+        case .failed(let reason):
+            return Notice(detail: "Support Snapshot failed: \(reason)", status: "failed")
+        case .loaded(let diagnostics, let reusedDoctorReport):
+            let source = reusedDoctorReport ? "using the recent Doctor report" : "with a fresh diagnostics pass"
+            let status = diagnostics.doctorStatus?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let suffix = (status?.isEmpty == false) ? " Status: \(status!)." : ""
+            let tone: String
+            switch DoctorPlainCopy.bucket(for: status ?? "") {
+            case "failing": tone = "failed"
+            case "warning": tone = "warn"
+            default: tone = "ok"
+            }
+            return Notice(detail: "Support Snapshot is ready \(source).\(suffix)", status: tone)
+        }
+    }
+}
+
+enum DoctorOAuthLoginButtonPresentation {
+    enum Tone: Equatable {
+        case progress
+        case success
+        case failure
+    }
+
+    struct Notice: Equatable {
+        let detail: String
+        let tone: Tone
+    }
+
+    static func notice(for outcome: CodexOAuthLoginLaunchOutcome) -> Notice {
+        switch outcome {
+        case .failed(let detail):
+            return Notice(
+                detail: "Could not start Codex OAuth login: \(nonempty(detail, fallback: "no error detail was returned"))",
+                tone: .failure
+            )
+        case .started(let login):
+            if login.running != true {
+                return Notice(
+                    detail: "Codex OAuth login ended before it produced a usable device code. \(nonempty(login.detail, fallback: "Check the Codex OAuth panel for details."))",
+                    tone: .failure
+                )
+            }
+            if login.url != nil, login.code != nil {
+                return Notice(
+                    detail: login.openedBrowser == true
+                        ? "Codex OAuth is ready; its browser page was opened. Enter the code shown below."
+                        : "Codex OAuth is ready. Open the link shown below and enter the code.",
+                    tone: .success
+                )
+            }
+            if login.url != nil {
+                return Notice(
+                    detail: login.openedBrowser == true
+                        ? "Codex OAuth opened its browser page and is waiting for the device code."
+                        : "Codex OAuth is waiting for the device code. Open the link shown below.",
+                    tone: .progress
+                )
+            }
+            return Notice(
+                detail: "Codex OAuth login process started; waiting for device-login instructions.",
+                tone: .progress
+            )
+        }
+    }
+
+    private static func nonempty(_ value: String?, fallback: String) -> String {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? fallback : trimmed
+    }
+}
+
+/// The Doctor core marks only app-owned, conservative repairs with this
+/// instruction. Other repair text is a human next step (for example provider
+/// authentication) and must never make the local repair button runnable.
+enum DoctorSafeRepairIssuesPresentation {
+    struct Plan: Equatable {
+        let checkIDs: [String]
+
+        var count: Int { checkIDs.count }
+        var canRun: Bool { !checkIDs.isEmpty }
+    }
+
+    enum State: Equatable {
+        case needsDoctorReport
+        case noSafeIssues
+        case ready(Plan)
+        case running
+
+        var canRun: Bool {
+            if case .ready(let plan) = self { return plan.canRun }
+            return false
+        }
+
+        var detail: String {
+            switch self {
+            case .needsDoctorReport:
+                return "Run Doctor first to identify app-owned issues that can be repaired safely."
+            case .noSafeIssues:
+                return "The current Doctor report has no safe repairs to run."
+            case .ready(let plan):
+                return "\(plan.count) reported app-owned issue\(plan.count == 1 ? " can" : "s can") be repaired safely."
+            case .running:
+                return "Doctor is already running."
+            }
+        }
+
+        var systemImage: String {
+            switch self {
+            case .ready: "cross.case.fill"
+            case .needsDoctorReport, .noSafeIssues: "checkmark.circle"
+            case .running: "hourglass"
+            }
+        }
+
+        var status: String {
+            switch self {
+            case .ready: "warn"
+            case .needsDoctorReport, .noSafeIssues, .running: "info"
+            }
+        }
+    }
+
+    static func state(report: DoctorReport?, isRunning: Bool) -> State {
+        if isRunning { return .running }
+        guard let report else { return .needsDoctorReport }
+        let plan = plan(for: report.checks)
+        return plan.canRun ? .ready(plan) : .noSafeIssues
+    }
+
+    static func plan(for checks: [DoctorCheck]) -> Plan {
+        Plan(checkIDs: checks.compactMap { check in
+            guard isAdverse(check.status), isSafeRepairInstruction(check.repair) else { return nil }
+            let id = check.id.trimmingCharacters(in: .whitespacesAndNewlines)
+            return id.isEmpty ? nil : id
+        })
+    }
+
+    /// The post-action `repair` field is a receipt, not a generic instruction.
+    /// These verbs are emitted only after app-owned state was changed.
+    static func appliedRepairCount(in checks: [DoctorCheck]) -> Int {
+        checks.filter { check in
+            let receipt = normalized(check.repair)
+            return ["completed:", "created ", "repaired:", "backed up", "seeded ", "reset ", "wiped "]
+                .contains(where: { receipt.hasPrefix($0) })
+        }.count
+    }
+
+    static func completionMessage(report: DoctorReport) -> String {
+        let remaining = report.checks.filter { isAdverse($0.status) }.count
+        if report.repaired {
+            return remaining == 0
+                ? "Doctor repair applied safe fixes."
+                : "Doctor repair applied safe fixes, but \(remaining) issue\(remaining == 1 ? " remains" : "s remain")."
+        }
+        return remaining == 0
+            ? "Doctor repair finished; no changes were needed."
+            : "Doctor repair finished, but no safe fixes were applied."
+    }
+
+    private static func isAdverse(_ status: String) -> Bool {
+        ["warn", "warning", "fail", "failed", "error"].contains(normalized(status))
+    }
+
+    private static func isSafeRepairInstruction(_ value: String?) -> Bool {
+        normalized(value).hasPrefix("run repair safe issues")
+    }
+
+    private static func normalized(_ value: String?) -> String {
+        (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+}
+
 struct DoctorView: View {
     @Environment(AppModel.self) private var appModel
     @State private var loopVerdicts: [LoopHealthVerdict] = []
+    @State private var runNotice: DoctorRunButtonPresentation.Notice?
+    @State private var snapshotNotice: DoctorSupportSnapshotPresentation.Notice?
+    @State private var oauthLoginNotice: DoctorOAuthLoginButtonPresentation.Notice?
+    @State private var isOpeningOAuthLogin = false
 
     private var unhealthyLoops: [LoopHealthVerdict] {
         loopVerdicts.filter { $0.level != .ok }
@@ -52,23 +355,45 @@ struct DoctorView: View {
         DoctorPlainCopy.summarize(appModel.doctorReport?.checks ?? [])
     }
 
+    private var reportFooter: DoctorReportFooterPresentation.State? {
+        DoctorReportFooterPresentation.resolve(
+            report: appModel.doctorReport,
+            completedAt: appModel.doctorReportCompletedAt,
+            isRunning: appModel.doctorRunning,
+            now: Date()
+        )
+    }
+
+    private var safeRepairState: DoctorSafeRepairIssuesPresentation.State {
+        DoctorSafeRepairIssuesPresentation.state(
+            report: appModel.doctorReport,
+            isRunning: appModel.doctorRunning
+        )
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Button("Run Doctor", systemImage: "stethoscope") {
-                    Task { await appModel.runDoctor(repair: false) }
+                Button(appModel.doctorRunning ? "Running Doctor…" : "Run Doctor", systemImage: "stethoscope") {
+                    beginDoctorRun(repair: false)
                 }
                 .disabled(appModel.doctorRunning)
+                .accessibilityIdentifier("doctor.run")
                 Button("Repair Safe Issues", systemImage: "cross.case.fill") {
-                    Task { await appModel.runDoctor(repair: true) }
+                    beginDoctorRun(repair: true)
                 }
-                .disabled(appModel.doctorRunning)
-                Button("Open OAuth Login", systemImage: "safari") {
-                    Task { await appModel.openCodexLoginInBrowser() }
+                .disabled(!safeRepairState.canRun)
+                .help(safeRepairState.detail)
+                Button(isOpeningOAuthLogin ? "Opening OAuth Login…" : "Open OAuth Login", systemImage: "safari") {
+                    Task { await openOAuthLogin() }
                 }
-                Button("Support Snapshot", systemImage: "shippingbox") {
-                    Task { await appModel.loadSupportDiagnostics() }
+                .disabled(isOpeningOAuthLogin)
+                .accessibilityIdentifier("doctor.openOAuthLogin")
+                Button(appModel.supportDiagnosticsLoading ? "Preparing Snapshot…" : "Support Snapshot", systemImage: "shippingbox") {
+                    beginSupportSnapshot()
                 }
+                .disabled(appModel.supportDiagnosticsLoading || appModel.doctorRunning)
+                .accessibilityIdentifier("doctor.supportSnapshot")
                 // PATCH-2026-05-30: in-flight indicator so the user sees the
                 // Doctor is working during the ~7-15s probe. Previously the
                 // UI looked frozen and people thought it wasn't running.
@@ -92,6 +417,34 @@ struct DoctorView: View {
                     }
                     .padding(.leading, 8)
                 }
+            }
+
+            Label(safeRepairState.detail, systemImage: safeRepairState.systemImage)
+                .font(.caption)
+                .foregroundStyle(NativeAgentTheme.statusColor(safeRepairState.status))
+
+            if let oauthLoginNotice {
+                Label(
+                    oauthLoginNotice.detail,
+                    systemImage: oauthLoginNotice.tone == .failure ? "exclamationmark.triangle.fill" : "key.fill"
+                )
+                .font(.callout)
+                .foregroundStyle(oauthLoginColor(for: oauthLoginNotice.tone))
+                .accessibilityIdentifier("doctor.oauth-login.notice")
+            }
+
+            if let runNotice {
+                Label(runNotice.detail, systemImage: runNotice.status == "failed" ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                    .font(.callout)
+                    .foregroundStyle(NativeAgentTheme.statusColor(runNotice.status))
+                    .accessibilityIdentifier("doctor.run.notice")
+            }
+
+            if let snapshotNotice {
+                Label(snapshotNotice.detail, systemImage: snapshotNotice.status == "failed" ? "exclamationmark.triangle.fill" : "shippingbox.fill")
+                    .font(.callout)
+                    .foregroundStyle(NativeAgentTheme.statusColor(snapshotNotice.status))
+                    .accessibilityIdentifier("doctor.supportSnapshot.notice")
             }
 
             // Watchdog readout lives in Diagnostics ▸ Status (the canonical
@@ -220,15 +573,31 @@ struct DoctorView: View {
                         }
                     }
                 }
+                if let reportFooter {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        InlineStatusDot(status: reportFooter.status)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(reportFooter.title)
+                                .font(NativeAgentFont.label)
+                            Text(reportFooter.detail)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 0)
+                        StatusBadge(text: reportFooter.status.uppercased(), status: reportFooter.status)
+                    }
+                    .padding(.horizontal, 4)
+                    .accessibilityIdentifier("doctor.report.footer")
+                }
             } else {
                 NativeEmptyState(
                     title: "Doctor",
                     detail: "Run diagnostics to check the native runtime, provider routing, SearXNG, Telegram, sessions, tools, and autonomy.",
                     systemImage: "cross.case",
-                    actionTitle: "Run Doctor",
-                    actionImage: "stethoscope"
+                actionTitle: "Run Doctor",
+                actionImage: "stethoscope"
                 ) {
-                    Task { await appModel.runDoctor(repair: false) }
+                    beginDoctorRun(repair: false)
                 }
             }
         }
@@ -236,6 +605,42 @@ struct DoctorView: View {
         .navigationTitle("Doctor")
         .task {
             await appModel.refreshLiveDoctorCoverage()
+        }
+    }
+
+    private func beginDoctorRun(repair: Bool) {
+        runNotice = nil
+        Task {
+            let outcome = repair
+                ? await appModel.repairSafeDoctorIssues()
+                : await appModel.runDoctor(repair: false)
+            runNotice = DoctorRunButtonPresentation.notice(for: outcome, repair: repair)
+        }
+    }
+
+    private func beginSupportSnapshot() {
+        snapshotNotice = nil
+        Task {
+            let outcome = await appModel.loadSupportDiagnostics()
+            snapshotNotice = DoctorSupportSnapshotPresentation.notice(for: outcome)
+        }
+    }
+
+    @MainActor
+    private func openOAuthLogin() async {
+        guard !isOpeningOAuthLogin else { return }
+        isOpeningOAuthLogin = true
+        defer { isOpeningOAuthLogin = false }
+        oauthLoginNotice = DoctorOAuthLoginButtonPresentation.notice(
+            for: await appModel.openCodexLoginInBrowser()
+        )
+    }
+
+    private func oauthLoginColor(for tone: DoctorOAuthLoginButtonPresentation.Tone) -> Color {
+        switch tone {
+        case .progress: return .secondary
+        case .success: return NativeAgentTheme.ok
+        case .failure: return NativeAgentTheme.warn
         }
     }
 

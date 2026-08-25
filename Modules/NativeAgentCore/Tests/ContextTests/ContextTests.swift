@@ -454,6 +454,120 @@ private func seedReceipt(root: URL, runId: String, json: String) {
     #expect(result == .object(["startupContext": .bool(true)]))
 }
 
+// MARK: - Legacy receipt feed retention and provenance
+
+@Test func latestRejectsMismatchedReceiptRunIDWithoutFallingBack() async {
+    let root = makeTempDataRoot()
+    let sid = "sess_receipt_provenance"
+    seedSession(
+        root: root, sessionId: sid, sessionFields: "",
+        messagesJSONL: """
+        {"id":"older","runId":"older_run"}
+        {"id":"newest","runId":"expected_run"}
+        """
+    )
+    seedReceipt(root: root, runId: "older_run", json: "{\"runId\":\"older_run\",\"mode\":\"minimal\"}")
+    // A misplaced legacy file must not be represented as the newest run's
+    // context, nor permit an older receipt to be mislabeled as current.
+    seedReceipt(root: root, runId: "expected_run", json: "{\"runId\":\"other_run\",\"mode\":\"capability\"}")
+
+    let client = SwiftNativeContextClient(now: fixedNow, dataRoot: root)
+    #expect(await client.latestContextReceipt(sessionId: sid) == .object([:]))
+}
+
+@Test func latestRejectsMismatchedStartupReceiptWithoutStartupClaim() async {
+    let root = makeTempDataRoot()
+    let sid = "sess_startup_receipt_provenance"
+    seedSession(
+        root: root, sessionId: sid,
+        sessionFields: ",\"startupContextRunId\":\"expected_startup\"",
+        messagesJSONL: "{\"id\":\"message\",\"content\":\"no run id\"}"
+    )
+    seedReceipt(root: root, runId: "expected_startup", json: "{\"runId\":\"other_startup\"}")
+
+    let client = SwiftNativeContextClient(now: fixedNow, dataRoot: root)
+    #expect(await client.latestContextReceipt(sessionId: sid) == .object([:]))
+}
+
+@Test func latestRejectsUnsafeRunIDWithoutTouchingOutsideSentinel() async {
+    let root = makeTempDataRoot()
+    let sid = "sess_unsafe_receipt_path"
+    let sentinel = root.appendingPathComponent("outside-sentinel.json")
+    let sentinelJSON = "{\"runId\":\"../outside-sentinel\",\"mode\":\"must-not-read\"}"
+    writeFile(sentinelJSON, to: sentinel)
+    seedSession(
+        root: root, sessionId: sid, sessionFields: "",
+        messagesJSONL: "{\"id\":\"message\",\"runId\":\"../outside-sentinel\"}"
+    )
+
+    let client = SwiftNativeContextClient(now: fixedNow, dataRoot: root)
+    #expect(await client.latestContextReceipt(sessionId: sid) == .object([:]))
+    #expect(FileManager.default.fileExists(atPath: sentinel.path))
+    #expect((try? String(contentsOf: sentinel, encoding: .utf8)) == sentinelJSON)
+
+    // Keep ordinary historical names compatible while refusing every route-like
+    // or hidden-dot spelling before it can name a receipt file.
+    #expect(LegacyContextReceiptFeed.receiptPath(dataRoot: root, runID: "run.2026-08") != nil)
+    for unsafe in ["../outside-sentinel", "nested/run", "nested\\run", ".hidden", ".."] {
+        #expect(LegacyContextReceiptFeed.receiptPath(dataRoot: root, runID: unsafe) == nil)
+    }
+}
+
+@Test func legacyReceiptRetentionProtectsReferencedRunsAndBoundsFossils() async {
+    let root = makeTempDataRoot()
+    let now = Date(timeIntervalSince1970: 1_717_000_000)
+    let old = now.addingTimeInterval(-LegacyContextReceiptFeed.maximumUnprotectedAge - 1)
+    let contextDirectory = root.appendingPathComponent("context", isDirectory: true)
+
+    seedSession(
+        root: root, sessionId: "sess_retention",
+        sessionFields: "",
+        messagesJSONL: "{\"id\":\"message\",\"runId\":\"protected_old\"}"
+    )
+    seedReceipt(root: root, runId: "protected_old", json: "{\"runId\":\"protected_old\"}")
+    seedReceipt(root: root, runId: "expired", json: "{\"runId\":\"expired\"}")
+    for index in 0...LegacyContextReceiptFeed.maximumUnprotectedFiles {
+        let runID = "fossil_\(index)"
+        seedReceipt(root: root, runId: runID, json: "{\"runId\":\"\(runID)\"}")
+        let modified = now.addingTimeInterval(-Double(index + 1))
+        guard let path = LegacyContextReceiptFeed.receiptPath(dataRoot: root, runID: runID) else {
+            Issue.record("fixture run ID should resolve")
+            return
+        }
+        try? FileManager.default.setAttributes(
+            [.modificationDate: modified],
+            ofItemAtPath: path.path
+        )
+    }
+    for runID in ["protected_old", "expired"] {
+        guard let path = LegacyContextReceiptFeed.receiptPath(dataRoot: root, runID: runID) else {
+            Issue.record("fixture run ID should resolve")
+            return
+        }
+        try? FileManager.default.setAttributes(
+            [.modificationDate: old],
+            ofItemAtPath: path.path
+        )
+    }
+
+    // Exercise retention through the actual compatibility reader: the session
+    // reference protects its old receipt while the reader removes fossils.
+    let client = SwiftNativeContextClient(now: { now }, dataRoot: root)
+    guard case .object(let current)? = await client.latestContextReceipt(sessionId: "sess_retention") else {
+        Issue.record("expected protected receipt from the real legacy reader")
+        return
+    }
+    #expect(str(current["runId"]) == "protected_old")
+    #expect(FileManager.default.fileExists(atPath: contextDirectory.appendingPathComponent("protected_old.json").path))
+    #expect(!FileManager.default.fileExists(atPath: contextDirectory.appendingPathComponent("expired.json").path))
+
+    let remainingUnprotected = (try? FileManager.default.contentsOfDirectory(
+        at: contextDirectory,
+        includingPropertiesForKeys: nil
+    ).filter { $0.pathExtension == "json" && $0.deletingPathExtension().lastPathComponent != "protected_old" }.count) ?? 0
+    #expect(remainingUnprotected <= LegacyContextReceiptFeed.maximumUnprotectedFiles)
+}
+
 // MARK: - WAVE 37 W01 §6.159 gap #2: now_iso() microsecond + timezone parity
 
 @Test func isoTimestampWholeSecondOmitsFraction() {

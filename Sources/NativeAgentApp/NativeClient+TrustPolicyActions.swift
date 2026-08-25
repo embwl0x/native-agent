@@ -320,67 +320,11 @@ extension NativeClient {
     }
 
     static func macControlPolicyForAccessMode(_ mode: String, remoteFromIosAllowed: Bool = false, developerMode: Bool = false) -> [String: Any] {
-        let approvals = ["shell", "file_ops", "applescript", "jxa", "accessibility"]
-        let riskGate: [String: Any] = [
-            "low": "auto",
-            "medium": "approve_each",
-            "high": "approve_each",
-            "critical": "deny",
-        ]
-        if mode == "read_only" {
-            return [
-                "enabled": false,
-                "applescript_allowed": false,
-                "jxa_allowed": false,
-                "shortcuts_allowed": false,
-                "accessibility_allowed": false,
-                "system_control_allowed": false,
-                "file_ops_allowed": false,
-                "shell_allowed": false,
-                "notifications_allowed": false,
-                "spotlight_allowed": false,
-                "remote_from_ios_allowed": false,
-                "approval_required_for": approvals,
-                "riskGatePolicy": riskGate,
-            ]
-        }
-        if mode == "full" {
-            return [
-                "enabled": true,
-                "applescript_allowed": true,
-                "jxa_allowed": true,
-                "shortcuts_allowed": true,
-                "accessibility_allowed": true,
-                "system_control_allowed": developerMode,
-                "file_ops_allowed": true,
-                "shell_allowed": developerMode,
-                "notifications_allowed": true,
-                "spotlight_allowed": true,
-                "remote_from_ios_allowed": true,
-                "approval_required_for": [],
-                "riskGatePolicy": [
-                    "low": "auto",
-                    "medium": "auto",
-                    "high": "auto",
-                    "critical": developerMode ? "auto" : "deny",
-                ],
-            ]
-        }
-        return [
-            "enabled": true,
-            "applescript_allowed": false,
-            "jxa_allowed": false,
-            "shortcuts_allowed": true,
-            "accessibility_allowed": false,
-            "system_control_allowed": false,
-            "file_ops_allowed": true,
-            "shell_allowed": false,
-            "notifications_allowed": true,
-            "spotlight_allowed": true,
-            "remote_from_ios_allowed": remoteFromIosAllowed,
-            "approval_required_for": approvals,
-            "riskGatePolicy": riskGate,
-        ]
+        TrustAccessModeCapabilityCatalog.macControlWireValue(
+            for: mode,
+            remoteFromIosAllowed: remoteFromIosAllowed,
+            developerMode: developerMode
+        )
     }
 
     func saveTrustPolicyFull(

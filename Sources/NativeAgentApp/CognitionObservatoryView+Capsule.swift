@@ -103,7 +103,7 @@ extension CognitionObservatoryView {
                             Text("\(receipt.request.model) via \(receipt.provider)")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
-                            Text("tokens \(receipt.estimatedPromptTokens + receipt.estimatedResultTokens), cost units \(String(format: "%.2f", receipt.estimatedCostUnits)), proposals \(receipt.proposalIds.count), yield \(String(format: "%.2f", receipt.proposalYieldScore))")
+                            Text("estimated tokens \(receipt.estimatedPromptTokens + receipt.estimatedResultTokens), estimated cost units \(String(format: "%.2f", receipt.estimatedCostUnits)), proposals \(receipt.proposalIds.count), yield \(String(format: "%.2f", receipt.proposalYieldScore))")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }

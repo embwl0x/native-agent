@@ -9,13 +9,12 @@ import SwiftUI
 import PersistenceCore
 
 struct DeskDebugPanels: View {
-    @Environment(AppModel.self) private var appModel
+    let dataRoot: URL
+    let agentDisplayName: String
     @State private var items: [DeskItem] = []
     @State private var projection: String = ""
     @State private var showAgentView = false
     @State private var showAllItems = false
-
-    private var dataRoot: URL { PersistenceCore.defaultDataRoot() }
 
     var body: some View {
         NativePanel(title: "Desk (debug)", systemImage: "tablecells", tint: .gray) {
@@ -41,7 +40,7 @@ struct DeskDebugPanels: View {
                 .padding(10)
                 .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
         } label: {
-            Label("\(appModel.agentDisplayName)'s view (the compact projection used in context)", systemImage: "eye")
+            Label("\(agentDisplayName)'s view (the compact projection used in context)", systemImage: "eye")
                 .font(.callout).foregroundStyle(.secondary)
                 .togglesDisclosure($showAgentView)
         }

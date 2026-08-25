@@ -44,7 +44,7 @@ import Browser
 
 extension NativeClient {
     func runDream(force: Bool = false) async throws -> [String: Any] {
-        let root = PersistenceCore.defaultDataRoot()
+        let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         // 2026-06-05 dream-design-restore (pass 2): wire the same
         // MemoryV2-backed Self-half provider the BackgroundLoopsAssembly
         // path uses, so the scheduled nightly run + the manual run-now
@@ -93,11 +93,36 @@ extension NativeClient {
     // sourced from SwiftNativeTrustCenter to match the daemon's `is_enabled()`.
     // See CUTOVER_PLAN.md §6.96.
     func getDreamDiary(limit: Int = 30) async throws -> DreamDiaryResponse {
-        let impl = makeDreamREMCycle(root: PersistenceCore.defaultDataRoot())
+        let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let diary = root.appendingPathComponent("dream_diary", isDirectory: true)
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: diary.path, isDirectory: &isDirectory), !isDirectory.boolValue {
+            throw DreamREMCycleError.underlying("dream_diary is not a directory")
+        }
+        let impl = makeDreamREMCycle(root: root)
         let moduleEntries = try await impl.listDreamDiary(limit: limit)
         let entries = try Self.decodeDreamEntries(moduleEntries)
+        let diaryNames = isDirectory.boolValue
+            ? try FileManager.default.contentsOfDirectory(atPath: diary.path)
+                .filter { $0.hasSuffix(".md") }
+                .sorted(by: >)
+            : []
+        let totalEntries: Int? = diaryNames.count
+        // FileBackedDreamDiary intentionally skips individual unreadable files
+        // so one damaged entry does not hide readable ones. Carry that evidence
+        // forward: an all-unreadable window must not become "No dreams yet."
+        let boundedCount = min(max(1, min(limit, 365)), diaryNames.count)
+        let visibleNames = Set(entries.compactMap(\.filename))
+        let unreadableEntries = diaryNames.prefix(boundedCount).count {
+            !visibleNames.contains($0)
+        }
         let enabled = await swiftDreamCompositeEnabled()
-        return DreamDiaryResponse(entries: entries, enabled: enabled)
+        return DreamDiaryResponse(
+            entries: entries,
+            enabled: enabled,
+            totalEntries: totalEntries,
+            unreadableEntries: unreadableEntries
+        )
     }
 
     // PATCH-2026-05-29: dreams-tab GET /v1/dream/<YYYY-MM-DD> -> a single DreamEntry (404 if missing).
@@ -107,7 +132,7 @@ extension NativeClient {
     // not-found shape to keep the caller contract identical
     // (AppModel.fetchDreamEntry maps any throw to nil). See CUTOVER_PLAN.md §6.96.
     func getDreamEntry(date: String) async throws -> DreamEntry {
-        let impl = makeDreamREMCycle(root: PersistenceCore.defaultDataRoot())
+        let impl = makeDreamREMCycle(root: dataRootOverride ?? PersistenceCore.defaultDataRoot())
         guard let moduleEntry = try await impl.getDreamForDate(date) else {
             // Mirror the daemon's JSON 404 contract (Wave 32 W07 set this
             // precedent for SwiftNative reads). AppModel.fetchDreamEntry
@@ -155,7 +180,23 @@ extension NativeClient {
     /// conservative for the dream composite (a Dreams tab can't claim "enabled"
     /// without proof) and matches the daemon default for REM.
     func swiftDreamREMGate() async -> DreamREMGatePolicy {
-        let policy = await SwiftNativeTrustCenter().loadTrustPolicy()
+        let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let policy = await SwiftNativeTrustCenter(dataRoot: root).loadTrustPolicy()
+        return Self.dreamREMGate(from: policy)
+    }
+
+    /// Manual REM changes persistent, approval-gated state. Unlike a passive
+    /// compatibility read, its effect-time policy check must expose damaged
+    /// authority bytes rather than turn a fail-closed projection into an
+    /// apparently enabled REM cycle.
+    func swiftREMGateChecked(root: URL) async throws -> DreamREMGatePolicy {
+        let policy = try await SwiftNativeTrustCenter(dataRoot: root).loadTrustPolicyChecked()
+        return Self.dreamREMGate(from: policy)
+    }
+
+    private static func dreamREMGate(
+        from policy: [String: JSONValue]
+    ) -> DreamREMGatePolicy {
         func boolAt(_ section: String, _ key: String, default def: Bool) -> Bool {
             guard case .object(let sec)? = policy[section] else { return def }
             if case .bool(let b)? = sec[key] { return b }
@@ -175,10 +216,10 @@ extension NativeClient {
         // remStageApproval: the manual run must stage approvals like the
         // background loop — otherwise "Run REM now" appends proposals that
         // never reach the inbox (the W6 dead-end).
-        let root = PersistenceCore.defaultDataRoot()
+        let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let impl = makeDreamREMCycle(
             root: root,
-            gate: await swiftDreamREMGate(),
+            gate: try await swiftREMGateChecked(root: root),
             remStageApproval: BackgroundLoopsAssembly.makeREMProposalStager(dataRoot: root),
             lifecycleObserver: NativeCognitionRuntime.shared
         )

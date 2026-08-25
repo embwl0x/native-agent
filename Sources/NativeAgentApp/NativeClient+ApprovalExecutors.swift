@@ -1182,7 +1182,9 @@ extension NativeClient {
         // — a different file from the one the LIST path (ApprovalInbox + the
         // list helper at L9637) reads from, so resolve writes never landed
         // where the UI was looking.
-        let inbox = SwiftNativeApprovalInbox(root: SwiftNativeApprovalInbox.defaultDataRoot())
+        let inbox = SwiftNativeApprovalInbox(
+            root: dataRootOverride ?? SwiftNativeApprovalInbox.defaultDataRoot()
+        )
         let decisionEnum: ApprovalDecision
         switch decision {
         case "approve", "approved": decisionEnum = .approved
@@ -1256,7 +1258,10 @@ extension NativeClient {
             // human resolve (no auto-approve path consults evolution cards).
             await Self.applyResolvedSelfEvolution(from: rec, deps: .production())
         } else if rec.action == SwiftNativeApprovalInbox.procedureExactActivationApprovalAction {
-            await Self.applyResolvedProcedureExactActivation(from: rec)
+            await Self.applyResolvedProcedureExactActivation(
+                from: rec,
+                dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+            )
         } else if rec.action == ExternalSendApprovalRequest.approvalAction {
             let outcome = await Self.applyResolvedExternalSend(from: rec)
             shouldArchiveVisibleCard = outcome.shouldArchiveVisibleCard

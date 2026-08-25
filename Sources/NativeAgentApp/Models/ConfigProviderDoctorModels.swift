@@ -47,10 +47,16 @@ struct TelegramStatus: Codable, Hashable {
     /// to zero in the canonical Telegram state file.
     var pollBackoffFailures: Int?
     var lastPollAt: String?
+    var lastDiagnosticsClearedAt: String?
     var voiceTranscription: TelegramVoiceTranscriptionStatus?
     var receipts: [TelegramReceipt]
     var blocked: [TelegramBlockedEvent]
     var errors: [TelegramErrorEvent]
+    /// Existing diagnostic bytes that cannot be decoded are unavailable, not an
+    /// empty feed. The settings page renders these separately from empty state.
+    var receiptsIssue: String? = nil
+    var blockedIssue: String? = nil
+    var errorsIssue: String? = nil
 }
 
 extension TelegramStatus {
@@ -276,6 +282,13 @@ struct TelegramTestResponse: Codable, Hashable {
     var chatId: String
     var messageId: Int?
     var receipt: TelegramReceipt?
+    /// A successful outgoing reply proves the saved credential can send, but
+    /// it does not prove the inbound long-poll lane is alive.  These fields
+    /// are attached by NativeClient after the transport reply, from the live
+    /// BackgroundLoops owner.
+    var tokenConfigured: Bool?
+    var pollerRegistered: Bool?
+    var pollerTicking: Bool?
 }
 
 struct DetectSearXNGResponse: Codable, Hashable {
@@ -533,7 +546,17 @@ struct TrainingProposalSummary: Codable, Identifiable, Equatable {
     var expected_drift_addressed: String?
     var status: String        // "pending" | "approved" | "rejected"
     var reviewed_at: String?
+    /// The persisted training proposal schema uses `rejection_reason`.
+    /// Keep the app-facing spelling while decoding the canonical record key,
+    /// otherwise a successfully rejected proposal reloads without the reason
+    /// that justified the decision.
     var reject_reason: String?
+
+    enum CodingKeys: String, CodingKey {
+        case proposal_id, staged_at, source_run_id, target_doc, change_type
+        case current, proposed, rationale, expected_drift_addressed, status, reviewed_at
+        case reject_reason = "rejection_reason"
+    }
 }
 
 struct PromotionHarnessResult: Codable, Hashable {

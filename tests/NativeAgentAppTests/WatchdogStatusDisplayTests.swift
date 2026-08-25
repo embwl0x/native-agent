@@ -1,6 +1,38 @@
 import Foundation
 import Testing
 @testable import NativeAgentApp
+import BackgroundLoops
+import protocol BackgroundLoops.LoopRunner
+import enum BackgroundLoops.LoopTickOutcome
+
+private typealias CoreBackgroundLoopsManager = BackgroundLoops.BackgroundLoopsManager
+// Importing the whole BackgroundLoops module would shadow this app-side
+// composition facade with the core manager.  The scoped imports above leave
+// the app target's internal type unambiguous to this @testable test target.
+private typealias AppBackgroundLoopsManager = NativeAppBackgroundLoopsManager
+
+private struct FailingWatchdogLoop: LoopRunner {
+    let loopId = "watchdog_failure_probe"
+    let interval: TimeInterval = 86_400
+
+    func tickOutcome() async -> LoopTickOutcome { .failed(error: "deliberate watchdog failure") }
+}
+
+private func isolatedWatchdogManager() -> (
+    core: CoreBackgroundLoopsManager,
+    app: AppBackgroundLoopsManager
+) {
+    let core = CoreBackgroundLoopsManager()
+    return (
+        core,
+        AppBackgroundLoopsManager(
+            coreManager: core,
+            assembleLoops: { [] },
+            runAutoDoctorAtLaunch: { false },
+            runHeartbeatAtLaunch: { false }
+        )
+    )
+}
 
 @Test
 func watchdogStatus_decodesSwiftLifecycleSeparatelyFromLegacyLaunchAgent() throws {
@@ -18,7 +50,7 @@ func watchdogStatus_decodesSwiftLifecycleSeparatelyFromLegacyLaunchAgent() throw
     }
     """.utf8)
 
-    let status = try JSONDecoder().decode(WatchdogStatus.self, from: data)
+    let status = try JSONDecoder().decode(NativeAppWatchdogStatus.self, from: data)
 
     #expect(status.daemon == "swift")
     #expect(status.daemonLifecycleStatus == "ok")
@@ -39,7 +71,7 @@ func watchdogStatus_legacySwiftNotApplicableDoesNotDisplayAsPrimaryLifecycle() t
     }
     """.utf8)
 
-    let status = try JSONDecoder().decode(WatchdogStatus.self, from: data)
+    let status = try JSONDecoder().decode(NativeAppWatchdogStatus.self, from: data)
 
     #expect(status.runtimeBadgeStatus == "ok")
     #expect(status.runtimeLifecycleStatus == "ok")
@@ -48,14 +80,37 @@ func watchdogStatus_legacySwiftNotApplicableDoesNotDisplayAsPrimaryLifecycle() t
 }
 
 @Test
-func nativeClientGetWatchdogReadsAppBackgroundLoopManager() async throws {
-    await BackgroundLoopsManager.shared.stop()
-    defer { Task { await BackgroundLoopsManager.shared.stop() } }
+func nativeClientGetWatchdogReadsButDoesNotStartAnInjectedManager() async throws {
+    let manager = isolatedWatchdogManager()
+    let client = NativeClient(baseURL: "", backgroundLoopsManager: manager.app)
 
-    let status = try await NativeClient(baseURL: "").getWatchdog()
+    let status = try await client.getWatchdog()
 
     #expect(status.daemon == "swift")
-    #expect(status.runtimeLifecycleStatus == "ok")
-    #expect(status.runtimeLifecycleDetail == "Swift background loops are running in NativeAgent.app.")
+    #expect(status.runtimeLifecycleStatus == "stopped")
+    #expect(status.runtimeLifecycleDetail == "Swift background loops are not running.")
     #expect(status.launchAgentStatus == "not_applicable")
+    #expect(status.lastActivity == nil)
+    await manager.app.stop()
+}
+
+@Test
+func nativeClientGetWatchdogPublishesAFailingLoopAsDegraded() async throws {
+    let manager = isolatedWatchdogManager()
+    let loop = FailingWatchdogLoop()
+    _ = await manager.core.start(loops: [loop])
+    guard case .failed(let error) = await manager.core.runTickOnce(loopId: loop.loopId) else {
+        Issue.record("the injected watchdog loop did not fail")
+        await manager.app.stop()
+        return
+    }
+    #expect(error == "deliberate watchdog failure")
+
+    let status = try await NativeClient(baseURL: "", backgroundLoopsManager: manager.app).getWatchdog()
+    #expect(status.runtimeLifecycleStatus == "degraded")
+    #expect(status.runtimeBadgeStatus == "warn")
+    #expect(status.runtimeLifecycleDetail.contains(loop.loopId))
+    #expect(status.lastActivity?.kind == "background_loops")
+    #expect(status.repairAvailable)
+    await manager.app.stop()
 }

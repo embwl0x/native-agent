@@ -64,6 +64,9 @@ public struct ResponseOutcomeMotorReference: Codable, Sendable, Equatable {
 /// Later reactions, delivery, and motor settlement remain append-only receipts.
 public struct ResponseOutcomeObservationV2: Codable, Sendable, Equatable {
     public static let schema = "response.outcome-observation.v2"
+    public static let requiredDimensionKeys: Set<String> = [
+        "responsePersistence", "context", "provider", "tools", "motor", "reaction",
+    ]
 
     public let schema: String
     public let turnID: String
@@ -74,6 +77,10 @@ public struct ResponseOutcomeObservationV2: Codable, Sendable, Equatable {
     public let responsePersistence: String
     public let contextGenerationID: Int64?
     public let contextSelectionReceiptID: String?
+    /// The provider route admitted with the turn context. This is not
+    /// inferred from a model name: callers that do not retain the admitted
+    /// context leave it absent and the provider evidence remains unknown.
+    public let providerID: String?
     public let providerModel: String?
     public let reasoningEffort: String?
     public let turnElapsedMs: Int?
@@ -91,6 +98,7 @@ public struct ResponseOutcomeObservationV2: Codable, Sendable, Equatable {
         responsePersistence: String,
         contextGenerationID: Int64?,
         contextSelectionReceiptID: String?,
+        providerID: String? = nil,
         providerModel: String?,
         reasoningEffort: String?,
         turnElapsedMs: Int?,
@@ -108,6 +116,7 @@ public struct ResponseOutcomeObservationV2: Codable, Sendable, Equatable {
         self.responsePersistence = responsePersistence
         self.contextGenerationID = contextGenerationID
         self.contextSelectionReceiptID = contextSelectionReceiptID
+        self.providerID = providerID
         self.providerModel = providerModel
         self.reasoningEffort = reasoningEffort
         self.turnElapsedMs = turnElapsedMs
@@ -136,6 +145,9 @@ public struct ResponseOutcomeObservationV2: Codable, Sendable, Equatable {
               decoded.motorActions.count <= 64,
               decoded.turnElapsedMs.map({ (0...(24 * 60 * 60 * 1_000)).contains($0) }) ?? true,
               decoded.contextGenerationID.map({ $0 >= 0 }) ?? true,
+              decoded.providerID.map({ Self.closedToken($0, maximum: 128) != nil }) ?? true,
+              decoded.providerModel.map({ Self.closedToken($0, maximum: 256) != nil }) ?? true,
+              Set(decoded.dimensionStates.keys) == Self.requiredDimensionKeys,
               decoded.dimensionStates.keys.allSatisfy({ Self.closedToken($0, maximum: 64) != nil }),
               decoded.tools.allSatisfy(Self.validTool),
               decoded.motorActions.allSatisfy(Self.validMotor),
@@ -187,10 +199,13 @@ public struct ResponseOutcomeObservationV2: Codable, Sendable, Equatable {
         var states: [String: OutcomeEvidenceState] = [
             "responsePersistence": .observed,
             "context": packet == nil ? .censored : .observed,
-            // The response result proves the model string, not the exact
-            // provider transport. The historical join promotes this only
-            // after it finds the canonical llm.call receipt for the turn.
-            "provider": result == nil ? .censored : .unknown,
+            // A model string alone cannot name a transport. A production
+            // context does carry the admitted provider route, however, so
+            // preserve that pre-dispatch fact on the canonical assistant row
+            // instead of leaving a permanently unwired historical join.
+            "provider": context?.providerId == nil
+                ? (result == nil ? .censored : .unknown)
+                : .observed,
             "tools": result == nil
                 ? .censored
                 : (toolReferences.isEmpty
@@ -216,6 +231,7 @@ public struct ResponseOutcomeObservationV2: Codable, Sendable, Equatable {
             contextSelectionReceiptID: packet.flatMap {
                 closedToken($0.receipt.id, maximum: 128)
             },
+            providerID: context.flatMap { closedToken($0.providerId, maximum: 128) },
             providerModel: result.flatMap { closedToken($0.modelUsed, maximum: 256) },
             reasoningEffort: observation.flatMap { closedToken($0.reasoningEffort, maximum: 64) },
             turnElapsedMs: result.map { min(24 * 60 * 60 * 1_000, max(0, $0.elapsedMs)) },
@@ -400,5 +416,160 @@ public struct ResponseOutcomeObservationV2: Codable, Sendable, Equatable {
         let fractional = ISO8601DateFormatter()
         fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return fractional.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
+    }
+}
+
+/// Population-level health for the six closed outcome dimensions. A missing
+/// observation is counted separately rather than becoming six zero buckets,
+/// and a dimension dominated by one non-terminal state remains visible as a
+/// wiring lead instead of looking like measured negative evidence.
+public struct OutcomeDimensionStateAudit: Sendable, Equatable {
+    public let sourceStatus: String
+    public let totalRows: Int
+    public let absentObservations: Int
+    public let distributions: [String: [OutcomeEvidenceState: Int]]
+    public let permanentlyNonterminalDimensions: [String]
+    public let rankedLeads: [String]
+
+    public var jsonValue: JSONValue {
+        let stateRows = distributions.mapValues { counts in
+            JSONValue.object(Dictionary(uniqueKeysWithValues: counts.map {
+                ($0.key.rawValue, .int(Int64($0.value)))
+            }))
+        }
+        return .object([
+            "status": .string(
+                sourceStatus != "measured"
+                    ? sourceStatus
+                    : (absentObservations > 0 || !permanentlyNonterminalDimensions.isEmpty
+                        ? "degraded" : "ok")
+            ),
+            "source_status": .string(sourceStatus),
+            "assistant_rows": .int(Int64(totalRows)),
+            "valid_observations": .int(Int64(totalRows - absentObservations)),
+            "absent_observations": .int(Int64(absentObservations)),
+            "absent_is_zero": .bool(false),
+            "distributions": .object(stateRows),
+            "permanently_nonterminal_dimensions": .array(
+                permanentlyNonterminalDimensions.map { .string($0) }
+            ),
+            "ranked_leads": .array(rankedLeads.map { .string($0) }),
+        ])
+    }
+
+    public static func make(
+        _ observations: [ResponseOutcomeObservationV2?],
+        sourceStatus: String = "measured"
+    ) -> OutcomeDimensionStateAudit {
+        var distributions = Dictionary(
+            uniqueKeysWithValues: ResponseOutcomeObservationV2.requiredDimensionKeys.map {
+                ($0, [OutcomeEvidenceState: Int]())
+            }
+        )
+        var present = 0
+        for observation in observations {
+            guard let observation else { continue }
+            present += 1
+            for dimension in ResponseOutcomeObservationV2.requiredDimensionKeys {
+                guard let state = observation.dimensionStates[dimension] else { continue }
+                distributions[dimension, default: [:]][state, default: 0] += 1
+            }
+        }
+        let dark = distributions.compactMap { dimension, counts -> String? in
+            guard present > 0 else { return nil }
+            let dominant = max(counts[.unknown, default: 0], counts[.censored, default: 0])
+            return Double(dominant) / Double(present) > 0.95 ? dimension : nil
+        }.sorted()
+        let absent = observations.count - present
+        var leads = dark.map { "\($0): this dimension has no promoter wired" }
+        if absent > 0 {
+            leads.insert(
+                "outcome observation absent on \(absent) of \(observations.count) assistant rows",
+                at: 0
+            )
+        }
+        return OutcomeDimensionStateAudit(
+            sourceStatus: sourceStatus,
+            totalRows: observations.count,
+            absentObservations: absent,
+            distributions: distributions,
+            permanentlyNonterminalDimensions: dark,
+            rankedLeads: leads
+        )
+    }
+}
+
+/// Bounded reader for the canonical persisted assistant population. It reuses
+/// `SessionHistoryReader`, so transcript framing, malformed-row handling and
+/// session identity rules cannot drift into a second parser. Legacy/corrupt
+/// assistant rows with no decodable outcome become explicit absent
+/// observations in the audit rather than disappearing from its denominator.
+public struct OutcomeDimensionStatePopulationReader: Sendable {
+    private let dataRoot: URL
+    private let since: Date?
+
+    public init(
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        since: Date? = nil
+    ) {
+        self.dataRoot = dataRoot
+        self.since = since
+    }
+
+    public func read() async throws -> OutcomeDimensionStateAudit {
+        let directory = dataRoot
+            .appendingPathComponent("chat", isDirectory: true)
+            .appendingPathComponent("messages", isDirectory: true)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory) else {
+            return .make([], sourceStatus: "absent")
+        }
+        guard isDirectory.boolValue else {
+            throw PersistenceCoreError.ioFailure(
+                "chat messages population path is not a directory: \(directory.path)"
+            )
+        }
+
+        let candidates = try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ).compactMap { url -> (URL, Date)? in
+            guard url.pathExtension == "jsonl",
+                  let values = try? url.resourceValues(
+                    forKeys: [.isRegularFileKey, .contentModificationDateKey]
+                  ),
+                  values.isRegularFile == true else { return nil }
+            return (url, values.contentModificationDate ?? .distantPast)
+        }.sorted { lhs, rhs in
+            if lhs.1 != rhs.1 { return lhs.1 > rhs.1 }
+            return lhs.0.lastPathComponent < rhs.0.lastPathComponent
+        }
+
+        let history = SessionHistoryReader(dataRoot: dataRoot)
+        var observations: [ResponseOutcomeObservationV2?] = []
+        for (url, _) in candidates {
+            let sessionID = url.deletingPathExtension().lastPathComponent
+            let messages = try await history.messages(
+                forSessionId: sessionID
+            )
+            for message in messages where message.role == "assistant" {
+                if let since {
+                    let formatter = ISO8601DateFormatter()
+                    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                    let timestamp = formatter.date(from: message.timestamp)
+                        ?? ISO8601DateFormatter().date(from: message.timestamp)
+                    guard let timestamp, timestamp >= since else { continue }
+                }
+                guard case .object(let row)? = message.extras,
+                      case .object(let metadata)? = row["metadata"],
+                      let raw = metadata["outcomeObservation"] else {
+                    observations.append(nil)
+                    continue
+                }
+                observations.append(ResponseOutcomeObservationV2(jsonValue: raw))
+            }
+        }
+        return .make(observations)
     }
 }

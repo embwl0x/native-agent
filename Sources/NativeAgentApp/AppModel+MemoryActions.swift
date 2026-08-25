@@ -41,9 +41,157 @@ import Skills
 import Connectors
 import Browser
 
+/// The Memory actions menu has one explicit receipt vocabulary. A completed
+/// maintenance run, a staged approval, a refusal, and an unavailable writer
+/// must not collapse into the generic application status line.
+enum MemoryMenuActionFeedback: Equatable {
+    case completed(String)
+    case pendingApproval(String)
+    case unavailable(String)
+    case refused(String)
+    case failed(String)
+
+    var message: String {
+        switch self {
+        case let .completed(message), let .pendingApproval(message),
+             let .unavailable(message), let .refused(message), let .failed(message):
+            return message
+        }
+    }
+
+    var isAdverse: Bool {
+        switch self {
+        case .unavailable, .refused, .failed:
+            return true
+        case .completed, .pendingApproval:
+            return false
+        }
+    }
+}
+
+/// Maps the consolidation owner's raw envelope to the only outcomes MemoryView
+/// may present. A deliberately disabled implementation is not a successful
+/// no-op and must not trigger a refresh that can overwrite its warning badge.
+struct MemoryConsolidationPresentation: Equatable {
+    let disabledMessage: String?
+    let statusText: String
+    let shouldRefresh: Bool
+    let feedback: MemoryMenuActionFeedback
+
+    static func resolve(result: [String: Any]) -> Self {
+        if (result["panelDisabled"] as? Bool == true)
+            || (result["code"] as? String) == "not_implemented" {
+            let reason = (result["reason"] as? String) ?? "feature not yet available"
+            let message = "Consolidate disabled — \(reason)"
+            return Self(
+                disabledMessage: message,
+                statusText: message,
+                shouldRefresh: false,
+                feedback: .unavailable(message)
+            )
+        }
+
+        let errors = (result["errors"] as? [String]) ?? []
+        let status: String
+        let feedback: MemoryMenuActionFeedback
+        if (result["status"] as? String) == "pending_approval" {
+            status = "Memory consolidation queued for approval"
+            feedback = .pendingApproval(status)
+        } else if (result["status"] as? String) == "refused" {
+            status = "Memory consolidation refused: candidate scored below live on the probe set"
+            feedback = .refused(status)
+        } else if !errors.isEmpty {
+            status = "Memory consolidation finished with errors: \(errors.prefix(2).joined(separator: "; "))"
+            feedback = .failed(status)
+        } else {
+            status = "Memory consolidation: no changes needed"
+            feedback = .completed(status)
+        }
+        return Self(
+            disabledMessage: nil,
+            statusText: status,
+            shouldRefresh: true,
+            feedback: feedback
+        )
+    }
+}
+
+/// Translates the durable memory writer's receipt into the exact claim the row
+/// editor is allowed to make. In particular, an unknown or refused response is
+/// not permission to show a completed pin state.
+enum MemoryRowEditorPinOutcome: Equatable {
+    case applied(pinned: Bool)
+    case pendingApproval(pinned: Bool)
+    case refused(String)
+    case failed(String)
+
+    var message: String {
+        switch self {
+        case let .applied(pinned):
+            return pinned ? "Memory pinned" : "Memory unpinned"
+        case let .pendingApproval(pinned):
+            return pinned ? "Pin queued for approval" : "Unpin queued for approval"
+        case let .refused(detail):
+            return "Memory pin change refused: \(detail)"
+        case let .failed(detail):
+            return "Memory update failed: \(detail)"
+        }
+    }
+
+    var shouldRefresh: Bool {
+        if case .applied = self { return true }
+        return false
+    }
+
+    var isAdverse: Bool {
+        switch self {
+        case .refused, .failed: return true
+        case .applied, .pendingApproval: return false
+        }
+    }
+
+    var isPendingApproval: Bool {
+        if case .pendingApproval = self { return true }
+        return false
+    }
+
+    var systemImage: String {
+        switch self {
+        case .applied: return "checkmark.circle"
+        case .pendingApproval: return "clock"
+        case .refused, .failed: return "exclamationmark.triangle.fill"
+        }
+    }
+
+    static func resolve(result: [String: Any], pinned: Bool) -> Self {
+        let status = (result["status"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        switch status {
+        case "ok":
+            return .applied(pinned: pinned)
+        case "pending_approval":
+            return .pendingApproval(pinned: pinned)
+        case "refused", "denied":
+            return .refused(detail(in: result) ?? "the writer did not authorize this change")
+        default:
+            return .failed(detail(in: result) ?? "the memory writer returned an unrecognized outcome")
+        }
+    }
+
+    private static func detail(in result: [String: Any]) -> String? {
+        for key in ["reason", "message", "error"] {
+            guard let raw = result[key] as? String else { continue }
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        return nil
+    }
+}
+
 @MainActor
 extension AppModel {
-    /// F2: run a semantic recall via SwiftNativeMemoryV2.shared and project
+    /// F2: run a semantic recall via the root-resolved SwiftNativeMemoryV2 and project
     /// hits onto the UI's MemoryRecord set (matched by id). Empty/trivial
     /// queries clear the search and revert to `memories`. Falls back to a
     /// substring filter if the embedder is unavailable (Mock) so callers still
@@ -52,11 +200,26 @@ extension AppModel {
     func runMemorySemanticSearch(query: String) async {
         let requestToken = memorySearchGate.begin()
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        memorySearchResultQuery = trimmed
+        memorySearchIsLoading = trimmed.count >= 3
+        memorySearchResults = nil
+        memorySearchError = nil
         if trimmed.count < 3 {
-            memorySearchResults = nil
-            memorySearchError = nil
+            memorySearchIsLoading = false
             return
         }
+        // Debounce at the request-owner boundary. This lets the view invalidate
+        // a prior result immediately, while the generation gate prevents a
+        // canceled older query from landing after the newest keystroke.
+        do {
+            try await Task.sleep(nanoseconds: 150_000_000)
+        } catch {
+            if memorySearchGate.accepts(requestToken) {
+                memorySearchIsLoading = false
+            }
+            return
+        }
+        guard !Task.isCancelled, memorySearchGate.accepts(requestToken) else { return }
         // Always seed with a substring filter as a safety net — semantic recall
         // can return zero hits even when an obvious lexical match exists.
         let lower = trimmed.lowercased()
@@ -64,7 +227,8 @@ extension AppModel {
             $0.text.lowercased().contains(lower) || $0.layer.lowercased().contains(lower)
         }
         do {
-            let response = try await SwiftNativeMemoryV2.shared.recall(
+            let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+            let response = try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: root).recall(
                 MemoryV2RecallRequest(text: trimmed, topK: 50, persona: nil)
             )
             // Map each recall hit's id back onto the UI's MemoryRecord. Hits
@@ -93,25 +257,33 @@ extension AppModel {
             guard !Task.isCancelled, memorySearchGate.accepts(requestToken) else { return }
             memorySearchResults = ordered
             memorySearchError = nil
+            memorySearchIsLoading = false
         } catch {
             guard !Task.isCancelled, memorySearchGate.accepts(requestToken) else { return }
             memorySearchResults = lexical
             memorySearchError = "Semantic memory is unavailable; showing text matches only."
+            memorySearchIsLoading = false
         }
     }
 
     @MainActor
-    func pinMemory(_ memory: MemoryRecord, pinned: Bool) async {
+    func pinMemory(_ memory: MemoryRecord, pinned: Bool) async -> MemoryRowEditorPinOutcome {
         do {
             let result = try await client.updateMemory(id: memory.id, pinned: pinned)
-            if (result["status"] as? String) == "pending_approval" {
-                statusText = pinned ? "Pin queued for approval" : "Unpin queued for approval"
-            } else {
-                statusText = pinned ? "Memory pinned" : "Memory unpinned"
+            let outcome = MemoryRowEditorPinOutcome.resolve(result: result, pinned: pinned)
+            statusText = outcome.message
+            if outcome.shouldRefresh {
+                await refreshAll()
             }
-            await refreshAll()
+            if outcome.isAdverse {
+                systemToasts.push(error: outcome.message)
+            }
+            return outcome
         } catch {
-            statusText = "Memory update failed: \(error.localizedDescription)"
+            let outcome = MemoryRowEditorPinOutcome.failed(error.localizedDescription)
+            statusText = outcome.message
+            systemToasts.push(error: statusText)
+            return outcome
         }
     }
 
@@ -127,45 +299,39 @@ extension AppModel {
     }
 
     @MainActor
-    func consolidateMemory() async {
+    @discardableResult
+    func consolidateMemory() async -> MemoryMenuActionFeedback {
         do {
             let result = try await client.consolidateMemory()
-            // F2: honour the `panelDisabled / code:"not_implemented"` envelope so the
-            // UI shows a "feature disabled" badge instead of a fake success toast.
-            if (result["panelDisabled"] as? Bool == true)
-                || (result["code"] as? String) == "not_implemented" {
-                let reason = (result["reason"] as? String) ?? "feature not yet available"
-                memoryFeatureDisabledMessage = "Consolidate disabled — \(reason)"
-                statusText = memoryFeatureDisabledMessage ?? "Consolidate disabled"
-                return
-            }
-            memoryFeatureDisabledMessage = nil
-            let errors = (result["errors"] as? [String]) ?? []
-            if (result["status"] as? String) == "pending_approval" {
-                statusText = "Memory consolidation queued for approval"
-            } else if (result["status"] as? String) == "refused" {
-                // gpt-5.5 review (2026-07-24 MED): a probe-gate refusal fell
-                // into the success branch and read "removed 0".
-                statusText = "Memory consolidation refused: candidate scored below live on the probe set"
-            } else if !errors.isEmpty {
-                statusText = "Memory consolidation finished with errors: \(errors.prefix(2).joined(separator: "; "))"
-            } else {
-                // Only the gate's .noChanges outcome reaches here (staged and
-                // refused take the branches above), so say that plainly.
-                statusText = "Memory consolidation: no changes needed"
-            }
-            await refreshAll()
+            return await applyMemoryConsolidationResult(result)
         } catch let err as NSError where (err.userInfo["code"] as? String) == "not_implemented" {
             let reason = (err.userInfo["reason"] as? String) ?? "feature not yet available"
             memoryFeatureDisabledMessage = "Consolidate disabled — \(reason)"
             statusText = memoryFeatureDisabledMessage ?? "Consolidate disabled"
+            return .unavailable(statusText)
         } catch {
             statusText = "Memory consolidation failed: \(error.localizedDescription)"
+            return .failed(statusText)
         }
     }
 
+    /// Shared result application used by the mounted Consolidate command and
+    /// by the runtime evaluation seam. Keeping disabled handling here prevents
+    /// a raw envelope from being rendered as a successful maintenance run.
+    @discardableResult
+    func applyMemoryConsolidationResult(_ result: [String: Any]) async -> MemoryMenuActionFeedback {
+        let presentation = MemoryConsolidationPresentation.resolve(result: result)
+        memoryFeatureDisabledMessage = presentation.disabledMessage
+        statusText = presentation.statusText
+        if presentation.shouldRefresh {
+            await refreshForSidebarItem(.memories)
+        }
+        return presentation.feedback
+    }
+
     @MainActor
-    func runMemoryHygiene(dryRun: Bool = false) async {
+    @discardableResult
+    func runMemoryHygiene(dryRun: Bool = false) async -> MemoryMenuActionFeedback {
         do {
             let result = try await client.runMemoryHygiene(dryRun: dryRun)
             latestMemoryHygiene = result
@@ -181,14 +347,24 @@ extension AppModel {
                 systemToasts.push(success: summary, autoDismissAfter: 5)
             }
             await refreshForSidebarItem(.memories)
+            switch result.status {
+            case "staged":
+                return .pendingApproval(summary)
+            case "refused":
+                return .refused(summary)
+            default:
+                return .completed(summary)
+            }
         } catch let err as NSError where (err.userInfo["code"] as? String) == "not_implemented" {
             let reason = (err.userInfo["reason"] as? String) ?? "feature not yet available"
             memoryFeatureDisabledMessage = "Hygiene disabled — \(reason)"
             statusText = memoryFeatureDisabledMessage ?? "Hygiene disabled"
             systemToasts.push(warn: statusText, autoDismissAfter: 6)
+            return .unavailable(statusText)
         } catch {
             statusText = "Memory hygiene failed: \(error.localizedDescription)"
             systemToasts.push(error: statusText)
+            return .failed(statusText)
         }
     }
 

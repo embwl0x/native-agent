@@ -18,6 +18,40 @@ import CloudKit
 
 // PATCH-2026-05-06: ui-consolidation — default selection chat, 5 visible + Advanced disclosure sidebar
 // PATCH-2026-05-10: startup-tour-gate — tour is manual only; startup must not block chat.
+enum SidebarAdvancedDisclosurePresentation {
+    static let preferenceKey = "sidebarShowAdvanced"
+    static let developerSurfacesPreferenceKey = "showDeveloperSurfaces"
+
+    static func isExpanded(in defaults: UserDefaults) -> Bool {
+        defaults.bool(forKey: preferenceKey)
+    }
+
+    static func setExpanded(_ isExpanded: Bool, in defaults: UserDefaults) {
+        defaults.set(isExpanded, forKey: preferenceKey)
+    }
+
+    @discardableResult
+    static func toggle(in defaults: UserDefaults) -> Bool {
+        let isExpanded = !isExpanded(in: defaults)
+        setExpanded(isExpanded, in: defaults)
+        return isExpanded
+    }
+
+    static func accessibilityValue(isExpanded: Bool) -> String {
+        isExpanded ? "Expanded" : "Collapsed"
+    }
+
+    static func visibleRows(
+        isExpanded: Bool,
+        developerSurfacesEnabled: Bool
+    ) -> [SidebarItem] {
+        guard isExpanded else { return [] }
+        return SidebarItem.visibleAdvancedItems(
+            developerSurfacesEnabled: developerSurfacesEnabled
+        )
+    }
+}
+
 struct ContentView: View {
     // Liquid Feel W4: page-switch transition respects Reduce Motion.
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -25,18 +59,21 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @SceneStorage("selection") private var selectionRaw = SidebarItem.chat.rawValue
     @SceneStorage("skillsToolsSection") private var skillsToolsSectionRaw = SkillsToolsSection.skills.rawValue
-    @AppStorage("sidebarShowAdvanced") private var showAdvanced = false
+    @AppStorage(SidebarAdvancedDisclosurePresentation.preferenceKey) private var showAdvanced = false
     // B2.2: developer/internal surfaces (Turn Inspector, MCP, Cognition, …)
     // render only when this UI-visibility preference is on. Fresh installs
     // default OFF so a stranger cannot reach raw internals in one click.
     // Surfaced as one toggle in Settings; NOT coupled to Trust's developerMode.
-    @AppStorage("showDeveloperSurfaces") private var showDeveloperSurfaces = false
+    @AppStorage(SidebarAdvancedDisclosurePresentation.developerSurfacesPreferenceKey) private var showDeveloperSurfaces = false
     @AppStorage("nativeagent.showTour") private var showTour = false
+    @State private var tourReplayCoordinator = OnboardingTourReplayCoordinator.shared
     @State private var didCheckFirstRunOnboarding = false
     @State private var showFirstRunOnboarding = false
-    @State private var showingDoctor = false
     // PATCH-2026-06-06: command-palette — Cmd+K modal sheet flag.
     @State private var showCommandPalette = false
+    /// A route to Desk must reset its local DeskHub mode even when Desk is
+    /// already selected (for example, when the user is viewing Schedule).
+    @State private var deskRootRouteVersion = 0
     // B2.3 follow-up: Desk's New Task sheet is presented HERE, not in
     // DeskHubView — a sheet attached to NavigationSplitView detail content
     // presents only once per app run on macOS (the bridge never releases the
@@ -55,7 +92,7 @@ struct ContentView: View {
             // (gpt-5.5 review MED, 2026-07-03 dead-weight sweep).
             (SidebarItem(rawValue: selectionRaw) ?? .chat).normalized
         } set: {
-            selectionRaw = $0.normalized.rawValue
+            selectSidebarItem($0.normalized)
         }
     }
 
@@ -80,8 +117,21 @@ struct ContentView: View {
     private var primaryItems: [SidebarItem] { SidebarItem.primaryItems }
     // B2.2: the Advanced disclosure shows consumer-only rows by default and the
     // full set (incl. developer surfaces) once showDeveloperSurfaces is on.
+    private var advancedDisclosureBinding: Binding<Bool> {
+        Binding(
+            get: { showAdvanced },
+            set: { isExpanded in
+                SidebarAdvancedDisclosurePresentation.setExpanded(isExpanded, in: .standard)
+                showAdvanced = isExpanded
+            }
+        )
+    }
+
     private var advancedItems: [SidebarItem] {
-        SidebarItem.visibleAdvancedItems(developerSurfacesEnabled: showDeveloperSurfaces)
+        SidebarAdvancedDisclosurePresentation.visibleRows(
+            isExpanded: showAdvanced,
+            developerSurfacesEnabled: showDeveloperSurfaces
+        )
     }
 
     var body: some View {
@@ -116,7 +166,7 @@ struct ContentView: View {
                     }
 
                     Section {
-                        DisclosureGroup(isExpanded: $showAdvanced) {
+                        DisclosureGroup(isExpanded: advancedDisclosureBinding) {
                             ForEach(advancedItems) { item in
                                 SidebarItemLabel(
                                     item: item,
@@ -128,10 +178,16 @@ struct ContentView: View {
                         } label: {
                             Label("Advanced", systemImage: "chevron.right.2")
                                 .foregroundStyle(.secondary)
-                                .togglesDisclosure($showAdvanced)
+                                .togglesDisclosure(advancedDisclosureBinding)
                                 .padding(.vertical, 2)
                                 .contentShape(Rectangle())
                                 .naInteractive(radius: NativeAgentRadius.control)
+                                .accessibilityIdentifier("sidebar.advanced.disclosure")
+                                .accessibilityValue(
+                                    SidebarAdvancedDisclosurePresentation.accessibilityValue(
+                                        isExpanded: showAdvanced
+                                    )
+                                )
                         }
                     }
                 }
@@ -179,7 +235,7 @@ struct ContentView: View {
                     case .activity: ActivityView()
                     case .memories: MemoryView()
                     case .skills: SkillsToolsView(selection: skillsToolsSection)
-                    case .desk: DeskHubView()
+                    case .desk: DeskHubView(rootRouteVersion: deskRootRouteVersion)
                     case .personality: PersonalityView()
                     case .connectors: ConnectorsView()
                     case .trust: TrustCenterView()
@@ -234,7 +290,12 @@ struct ContentView: View {
                 .task(id: "\(selectionRaw)|\(skillsToolsSectionRaw)") {
                     let item = activeContentItem
                     if item.normalized == .activity {
-                        await appModel.refreshSidebarActivityBadge()
+                        // Activity's five queue rows must distinguish an
+                        // empty, fully-read set from a failed backing read.
+                        // Its complete refresh records that receipt; the
+                        // sidebar's smaller file-watch refresh remains the
+                        // low-cost owner between Activity visits.
+                        await appModel.refreshForSidebarItem(.activity)
                     } else {
                         await appModel.refreshForSidebarItem(item)
                     }
@@ -243,7 +304,7 @@ struct ContentView: View {
             }
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
-                    HealthPill(showingDoctor: $showingDoctor)
+                    HealthPill()
                 }
             }
             // S.5: hide NavigationSplitView from VoiceOver while onboarding overlay is active
@@ -269,7 +330,11 @@ struct ContentView: View {
             SystemToastBar(center: appModel.systemToasts)
         }
         .animation(.easeInOut(duration: 0.35), value: showTour)
+        .onChange(of: tourReplayCoordinator.requestID) { _, requestID in
+            presentTourReplayIfNeeded(requestID: requestID)
+        }
         .onAppear {
+            presentTourReplayIfNeeded(requestID: tourReplayCoordinator.requestID)
             if selectionRaw == SidebarItem.tools.rawValue {
                 skillsToolsSectionRaw = SkillsToolsSection.tools.rawValue
                 selectionRaw = SidebarItem.skills.rawValue
@@ -308,13 +373,15 @@ struct ContentView: View {
         .sheet(isPresented: $showFirstRunOnboarding) {
             OnboardingWizard {
                 showFirstRunOnboarding = false
-                selectionRaw = SidebarItem.chat.rawValue
                 Task {
-                    await appModel.refreshForSidebarItem(.chat)
-                    // Fire the first-run welcome right when onboarding finishes and
-                    // chat is loaded — the most reliable trigger (ChatView's .task
-                    // is timing-fragile after a sheet dismiss).
-                    await appModel.maybeSendFirstRunGreeting()
+                    await OnboardingWizardCompletionRoute.complete(
+                        selectChat: { selectionRaw = SidebarItem.chat.rawValue },
+                        refreshChat: { await appModel.refreshForSidebarItem(.chat) },
+                        // Fire the first-run welcome right when onboarding finishes
+                        // and chat is loaded — ChatView's .task is only a backup.
+                        sendGreeting: { await appModel.maybeSendFirstRunGreeting() },
+                        record: { appModel.recordOnboardingWizardCompletion($0) }
+                    )
                 }
             }
             .interactiveDismissDisabled(true)
@@ -333,31 +400,22 @@ struct ContentView: View {
             showNewWorkshopTask = true
         }
         .onReceive(NotificationCenter.default.publisher(for: .iCloudInboxDidProcess)) { _ in
+            let route = ICloudInboxDidProcessRoute.resolve(selectionRaw: selectionRaw)
             Task {
-                if selectionRaw == SidebarItem.activity.rawValue {
-                    await appModel.refreshForSidebarItem(.activity)
-                } else {
-                    await appModel.refreshSidebarActivityBadge()
-                }
+                _ = await appModel.refreshAfterICloudInboxDidProcess(route: route)
             }
         }
-        .onChange(of: showingDoctor) { _, new in
-            if new {
-                showAdvanced = true
-                selectionRaw = SidebarItem.diagnostics.rawValue
-                showingDoctor = false
-            }
-        }
-        // S.6: wire "Build a Skill" button — switch to Chat tab and prefill draft
+        // Build-in-Chat writes through AppModel first. This receiver owns only
+        // routing and the first-session recovery; it never writes a second
+        // draft over the one the action already prepared.
         .onReceive(NotificationCenter.default.publisher(for: .skillBuildRequest)) { note in
             selectionRaw = SidebarItem.chat.rawValue
             let starter = (note.object as? String) ?? "Create a skill from this conversation:"
-            if appModel.activeChatSessionId.isEmpty { return }
-            // Only prefill if the draft is currently empty. H5: go through
-            // injectChatDraft so ChatView's view-local composer state picks the
-            // starter up — a bare `chatDrafts` write is invisible to it now.
-            if appModel.chatDrafts[appModel.activeChatSessionId]?.isEmpty != false {
-                appModel.injectChatDraft(starter, sessionId: appModel.activeChatSessionId)
+            guard appModel.activeChatSessionId.isEmpty else { return }
+            Task {
+                await appModel.newChatSession()
+                guard !appModel.activeChatSessionId.isEmpty else { return }
+                _ = appModel.requestSkillBuild(starter: starter)
             }
         }
         // Inbox "Act" on a chat-shaped item — same shape as skillBuildRequest
@@ -382,6 +440,12 @@ struct ContentView: View {
             guard !sessionId.isEmpty else { return }
             Task { await appModel.refreshChatMessagesAfterTurn(sessionId: sessionId) }
         }
+    }
+
+    private func presentTourReplayIfNeeded(requestID: Int) {
+        guard tourReplayCoordinator.claim(requestID) else { return }
+        showFirstRunOnboarding = false
+        showTour = true
     }
 
     @MainActor
@@ -474,8 +538,15 @@ struct ContentView: View {
             if target.isAdvanced {
                 showAdvanced = true
             }
-            selectionRaw = target.rawValue
+            selectSidebarItem(target)
         }
+    }
+
+    private func selectSidebarItem(_ target: SidebarItem) {
+        deskRootRouteVersion = DeskRootRoutePresentation.nextRootRouteVersion(
+            current: deskRootRouteVersion,
+            destination: target)
+        selectionRaw = target.normalized.rawValue
     }
 
     private func openActivitySection(_ section: ActivitySection) {
@@ -537,6 +608,7 @@ private struct SidebarItemLabel: View {
         .padding(.vertical, 2)
         .contentShape(Rectangle())
         .naInteractive(radius: NativeAgentRadius.control)
+        .accessibilityIdentifier("sidebar.item.\(item.rawValue)")
     }
 }
 
@@ -629,7 +701,7 @@ struct ActivityRow: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
                 }
-                Text(UserDisplayFormatters.humanizeISOTimestamp(event.createdAt))
+                Text(StatusActivityPresentation.timestamp(for: event))
                     .font(NativeAgentFont.tag)
                     .foregroundStyle(.tertiary)
             }
@@ -688,28 +760,24 @@ enum NativeScreenCapture {
         }
     }
 
-    private static let maxCaptureDimension = 1600
-    private static let maxCaptureBytes = 6 * 1024 * 1024
+    static let maxCaptureDimension = 1600
+    static let maxCaptureBytes = 6 * 1024 * 1024
 
     static func requestAccessIfNeeded() -> Bool {
         guard !CGPreflightScreenCaptureAccess() else { return true }
         return CGRequestScreenCaptureAccess()
     }
 
-    static func captureImageBase64(preferredDisplayID: CGDirectDisplayID? = nil) async throws -> (base64: String, mime: String, name: String, byteSize: Int) {
+    static func captureImageBase64() async throws -> (base64: String, mime: String, name: String, byteSize: Int) {
         // v1 vision pipeline (2026-06-06): the capture itself is delegated to
         // the Swift-native ScreenVision module. The size-cap / re-encode path
         // below stays here because ScreenVision returns raw PNG bytes; the
         // chat surface still wants a JPEG-with-quality-ladder fallback for
         // anything that would exceed `maxCaptureBytes`.
         //
-        // NOTE: ScreenVision v1 captures ONLY the primary display, so
-        // `preferredDisplayID` is silently ignored in this pass. Multi-display
-        // selection is deferred to v2. The parameter is retained with a nil
-        // default for source-compatibility with any future caller that hasn't
-        // been updated yet; today the composer's `captureScreen()` handler
-        // calls this with no argument.
-        _ = preferredDisplayID
+        // ScreenVision v1 captures the primary display only. There is no
+        // display-selection argument here because accepting one we cannot
+        // honor would silently send the wrong screen on a multi-display Mac.
 
         let png: Data
         do {
@@ -761,22 +829,35 @@ enum NativeScreenCapture {
         return nil
     }
 
-    private static func encodeForChat(_ source: CGImage) throws -> (data: Data, mime: String, name: String) {
+    static func encodeForChat(_ source: CGImage) throws -> (data: Data, mime: String, name: String) {
         let image = resizedForChat(source)
         let bitmap = NSBitmapImageRep(cgImage: image)
+        return try fittingEncodedPayload(
+            maxBytes: maxCaptureBytes,
+            jpegData: { quality in
+                bitmap.representation(using: .jpeg, properties: [.compressionFactor: quality])
+            },
+            pngData: { bitmap.representation(using: .png, properties: [:]) }
+        )
+    }
+
+    static func fittingEncodedPayload(
+        maxBytes: Int,
+        jpegData: (Double) -> Data?,
+        pngData: () -> Data?
+    ) throws -> (data: Data, mime: String, name: String) {
         for quality in [0.78, 0.65, 0.52, 0.40] {
-            if let jpeg = bitmap.representation(using: .jpeg, properties: [.compressionFactor: quality]),
-               jpeg.count <= maxCaptureBytes {
+            if let jpeg = jpegData(quality), jpeg.count <= maxBytes {
                 return (jpeg, "image/jpeg", "screen.jpg")
             }
         }
-        if let png = bitmap.representation(using: .png, properties: [:]), png.count <= maxCaptureBytes {
+        if let png = pngData(), png.count <= maxBytes {
             return (png, "image/png", "screen.png")
         }
         throw CaptureError.tooLarge
     }
 
-    private static func resizedForChat(_ source: CGImage) -> CGImage {
+    static func resizedForChat(_ source: CGImage) -> CGImage {
         let width = source.width
         let height = source.height
         let largest = max(width, height)

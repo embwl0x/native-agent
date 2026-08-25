@@ -65,7 +65,9 @@ extension NativeClient {
             "captureSource": .bool(false),
             "captureScreenshot": .bool(false),
         ])
-        let writer = makeBrowserWriter()
+        let writer = makeBrowserWriter(
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        )
         // `try`: nil means declined before any side effect; a THROW means a
         // native write already began, so the error propagates.
         if let envelope = try await writer.runBrowserAction(body: bodyValue) {
@@ -584,7 +586,9 @@ extension NativeClient {
         if let id, !id.isEmpty {
             swiftBody["id"] = .string(id)
         }
-        let writer = makeBrowserWriter()
+        let writer = makeBrowserWriter(
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        )
         // `try`: a THROW means the cancel already persisted to runs.json. nil
         // only occurs for a non-object body.
         if let envelope = try await writer.cancelBrowserRun(body: .object(swiftBody)) {

@@ -83,6 +83,48 @@ public struct MacScreenShot: @unchecked Sendable {
     #endif
 }
 
+#if canImport(CoreGraphics)
+extension MacScreenShot {
+    /// Crop in global AX points before image encoding. The returned bounds are
+    /// derived back from the integer pixel edges actually cropped, keeping the
+    /// image-to-screen transform exact even on fractional display scales.
+    public func cropped(to requested: MacAXFrame) -> MacScreenShot? {
+        guard bounds.w > 0, bounds.h > 0, pixelWidth > 0, pixelHeight > 0 else { return nil }
+        let x0 = max(bounds.x, requested.x)
+        let y0 = max(bounds.y, requested.y)
+        let x1 = min(bounds.x + bounds.w, requested.x + requested.w)
+        let y1 = min(bounds.y + bounds.h, requested.y + requested.h)
+        guard x1 > x0, y1 > y0 else { return nil }
+
+        let scaleX = Double(pixelWidth) / bounds.w
+        let scaleY = Double(pixelHeight) / bounds.h
+        let px0 = max(0, min(pixelWidth, Int(((x0 - bounds.x) * scaleX).rounded(.down))))
+        let py0 = max(0, min(pixelHeight, Int(((y0 - bounds.y) * scaleY).rounded(.down))))
+        let px1 = max(px0 + 1, min(pixelWidth, Int(((x1 - bounds.x) * scaleX).rounded(.up))))
+        let py1 = max(py0 + 1, min(pixelHeight, Int(((y1 - bounds.y) * scaleY).rounded(.up))))
+        let pixelRect = CGRect(x: px0, y: py0, width: px1 - px0, height: py1 - py0)
+        let croppedImage: CGImage?
+        if let cgImage {
+            guard let value = cgImage.cropping(to: pixelRect) else { return nil }
+            croppedImage = value
+        } else {
+            croppedImage = nil
+        }
+        return MacScreenShot(
+            bounds: MacAXFrame(
+                x: bounds.x + Double(px0) / scaleX,
+                y: bounds.y + Double(py0) / scaleY,
+                w: Double(px1 - px0) / scaleX,
+                h: Double(py1 - py0) / scaleY
+            ),
+            pixelWidth: px1 - px0,
+            pixelHeight: py1 - py0,
+            cgImage: croppedImage
+        )
+    }
+}
+#endif
+
 /// Why no image came back. Always REPORTED, never silently swallowed — "I need
 /// Screen Recording permission" is a true and actionable answer; a missing
 /// `image` key with no reason is not.
@@ -470,6 +512,31 @@ public enum MacScreenViewBuilder {
     /// of static-text nodes, and an unbounded dump would drown the legend it
     /// exists to complete.
     public static let hardMaxTextItems = 80
+    public static let visualSurfaceRoles: Set<String> = ["AXImage", "AXCanvas"]
+
+    /// The largest real visual surface worth giving its own pixel budget.
+    /// Small icons are deliberately excluded: focusing them would discard the
+    /// surrounding UI while adding no useful canvas/game perception.
+    public static func dominantVisualSurface(
+        nodes: [MacAXNode],
+        geometry: MacScreenViewGeometry,
+        minimumAreaFraction: Double = 0.03
+    ) -> MacAXFrame? {
+        let captureArea = geometry.bounds.w * geometry.bounds.h
+        guard captureArea > 0 else { return nil }
+        return nodes.compactMap { node -> MacAXFrame? in
+            guard visualSurfaceRoles.contains(node.attributes.role),
+                  let frame = node.attributes.frame,
+                  frame.w > 0, frame.h > 0,
+                  geometry.intersects(frame) else { return nil }
+            let clippedW = max(0, min(frame.x + frame.w, geometry.bounds.x + geometry.bounds.w)
+                - max(frame.x, geometry.bounds.x))
+            let clippedH = max(0, min(frame.y + frame.h, geometry.bounds.y + geometry.bounds.h)
+                - max(frame.y, geometry.bounds.y))
+            guard clippedW * clippedH / captureArea >= minimumAreaFraction else { return nil }
+            return frame
+        }.max { lhs, rhs in lhs.w * lhs.h < rhs.w * rhs.h }
+    }
 
     /// Roles that are worth a number even when the app advertises no AX action
     /// for them. Two families:
@@ -482,6 +549,9 @@ public enum MacScreenViewBuilder {
         "AXSecureTextField", "AXSearchField", "AXComboBox", "AXSlider",
         "AXIncrementor", "AXStepper", "AXDisclosureTriangle", "AXTabButton",
         "AXToolbarButton", "AXColorWell", "AXSegmentedControl",
+        // Content rows are what a person points at in sidebars, outlines and
+        // lists even when the app advertises no AX action on the container.
+        "AXRow", "AXOutlineRow", "AXListItem",
     ]
 
     public static let scrollableRoles: Set<String> = [
@@ -624,6 +694,30 @@ public enum MacScreenViewBuilder {
            let value = node.attributes.value?.trimmingCharacters(in: .whitespacesAndNewlines),
            !value.isEmpty, value.count <= 60 {
             return (value, "value")
+        }
+        // Finder and many source-list controls name the ROW only through a
+        // child: AXRow > AXCell > AXStaticText("Screenshots"). Treat that text
+        // as the row's inferred name, bounded to the same two levels/three
+        // descendants as the look compiler's identity pass.
+        if MacLookHandle.contentIdentityRoles.contains(node.attributes.role) {
+            var budget = 3
+            func descendantText(path: [Int], depth: Int) -> String? {
+                guard depth < 2 else { return nil }
+                for child in nodes where child.path.count == path.count + 1
+                    && Array(child.path.dropLast()) == path {
+                    guard budget > 0 else { return nil }
+                    budget -= 1
+                    if let text = child.attributes.title ?? child.attributes.value {
+                        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !trimmed.isEmpty { return trimmed }
+                    }
+                    if let deeper = descendantText(path: child.path, depth: depth + 1) { return deeper }
+                }
+                return nil
+            }
+            if let text = descendantText(path: node.path, depth: 0) {
+                return (text, "descendant_text")
+            }
         }
         var best: (text: String, distance: Double, path: [Int])?
         for candidate in nodes {
@@ -994,7 +1088,7 @@ public enum MacScreenViewTextRedaction {
             if isRecoveryPhrase(item.text, minWords: labeledSeedMinWords), near(seedLabels, item) {
                 return darkened("labeled_recovery_phrase")
             }
-            guard looksLikeRedactableValue(item.text) else { return item }
+            guard isLabeledSecretValue(item.text) else { return item }
             guard near(labels, item) else { return item }
             return darkened("labeled_secret_nearby")
         }
@@ -1031,7 +1125,7 @@ public enum MacScreenViewTextRedaction {
             if isSeedPhraseLabel(label), isRecoveryPhrase(text, minWords: labeledSeedMinWords) {
                 return redactedText(text, reason: "labeled_recovery_phrase")
             }
-            if looksLikeSecretLabel(label), looksLikeRedactableValue(text) {
+            if looksLikeSecretLabel(label), isLabeledSecretValue(text) {
                 return redactedText(text, reason: "labeled_secret_nearby")
             }
         }
@@ -1170,7 +1264,7 @@ public enum MacScreenViewTextRedaction {
             if isSeedPhraseLabel(label), isRecoveryPhrase(text, minWords: labeledSeedMinWords) {
                 return redactedText(text, reason: "labeled_recovery_phrase")
             }
-            if looksLikeSecretLabel(label), looksLikeRedactableValue(text) {
+            if looksLikeSecretLabel(label), isLabeledSecretValue(text) {
                 return redactedText(text, reason: "labeled_secret_nearby")
             }
         }
@@ -1184,7 +1278,7 @@ public enum MacScreenViewTextRedaction {
             if isRecoveryPhrase(text, minWords: labeledSeedMinWords), near(context.seedLabelFrames) {
                 return redactedText(text, reason: "labeled_recovery_phrase")
             }
-            if looksLikeRedactableValue(text), near(context.secretLabelFrames) {
+            if isLabeledSecretValue(text), near(context.secretLabelFrames) {
                 return redactedText(text, reason: "labeled_secret_nearby")
             }
         }
@@ -1482,6 +1576,42 @@ public enum MacScreenViewTextRedaction {
         let hasDigit = text.contains { $0.isNumber }
         let allCaps = text.allSatisfy { !$0.isLowercase } && text.contains { $0.isLetter }
         return hasDigit || allCaps || text.count >= 12
+    }
+
+    /// Agent acceptance round 1, finding B — a FILENAME is not a secret value.
+    ///
+    /// A look at her home folder darkened ~4 dotfile names as
+    /// `labeled_secret_nearby`, and inconsistently: `.claude.json.backup` was
+    /// visible while a sibling three rows down was not. The mechanism is the
+    /// positional test doing its job on the wrong subject — a row named
+    /// `.vscode` IS a "code"-shaped caption by `looksLikeSecretLabel`, so its
+    /// neighbours in the list became "the value beside a secret caption".
+    ///
+    /// The narrowing is deliberately the SMALLEST one that fixes it: a
+    /// leading-dot, whitespace-free, filename-charactered token is not itself a
+    /// redactable VALUE for the POSITIONAL (`labeled_secret_nearby`) test. It
+    /// changes nothing about:
+    ///   • the standalone shape tests — a real key, card, OTP or entropy blob
+    ///     is caught before this is ever consulted, leading dot or not;
+    ///   • `labeled_cvv` / `labeled_recovery_phrase` — different value shapes;
+    ///   • `labeled_inline_secret` — `token: .foo` on one line still darkens.
+    /// Over-redaction is the safe failure, so nothing else is loosened.
+    static func isFilenameShapedToken(_ raw: String) -> Bool {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard text.count >= 2, text.count <= maxValueChars else { return false }
+        guard text.hasPrefix(".") else { return false }
+        guard !text.contains(where: { $0.isWhitespace }) else { return false }
+        return text.dropFirst().allSatisfy {
+            $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" || $0 == "_"
+        }
+    }
+
+    /// `looksLikeRedactableValue`, minus the shapes that are not values at all.
+    /// The ONE gate every `labeled_secret_nearby` decision goes through, so the
+    /// prose channel, the legend and the perception compiler cannot disagree
+    /// about the same filename (they did — that was half of Agent's report).
+    static func isLabeledSecretValue(_ text: String) -> Bool {
+        looksLikeRedactableValue(text) && !isFilenameShapedToken(text)
     }
 
     static func isMaskedRun(_ text: String) -> Bool {

@@ -67,6 +67,41 @@ struct IntentRoutePlan: Identifiable, Codable, Hashable {
     var createdAt: String?
 }
 
+/// Mounted Intent Router state. A successful plan with no matching
+/// capabilities is useful evidence; it must never look like the router did
+/// not run or that it failed before producing a plan.
+enum IntentRoutePresentation: Equatable {
+    case idle
+    case planning
+    case plan(IntentRoutePlan)
+    case failed(String)
+
+    enum CapabilityMatchState: Equatable {
+        case matches([CapabilityRecord])
+        case noMatches
+    }
+
+    var capabilityMatchState: CapabilityMatchState? {
+        guard case let .plan(plan) = self else { return nil }
+        return plan.matchedCapabilities.isEmpty
+            ? .noMatches
+            : .matches(plan.matchedCapabilities)
+    }
+
+    var isPlanning: Bool {
+        if case .planning = self { return true }
+        return false
+    }
+
+    static func boundedFailure(_ error: Error) -> String {
+        let normalized = error.localizedDescription
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+        guard !normalized.isEmpty else { return "The router did not return an error description." }
+        return normalized.count > 240 ? String(normalized.prefix(240)) + "…" : normalized
+    }
+}
+
 struct WorkflowStep: Identifiable, Codable, Hashable {
     var id: String
     var title: String
@@ -107,6 +142,17 @@ struct WorkflowRun: Identifiable, Codable, Hashable {
     var completedAt: String?
     var currentStepIndex: Int?
     var approvalId: String?
+
+    /// Uses the same Core projection enforced by the workflow state owner.
+    /// The caller supplies the current approval decision from the already
+    /// mounted ApprovalInbox read, so a waiting run never advertises Resume
+    /// merely because its stale status string happens to say waiting.
+    func controlAvailability(approvalDecision: String? = nil) -> WorkflowRunControlAvailability {
+        WorkflowRunControlPreflight.evaluate(
+            status: status,
+            approvalDecision: approvalDecision
+        )
+    }
 }
 
 // ApprovalRequest moved to NativeAgentShared.

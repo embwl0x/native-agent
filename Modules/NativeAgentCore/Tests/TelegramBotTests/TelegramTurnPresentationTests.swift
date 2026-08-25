@@ -205,7 +205,7 @@ struct TelegramTurnPresentationTests {
         #expect(!action.contains(telegramSecret))
         #expect(!delegate.contains(namedSecret))
         #expect(action.contains("[REDACTED_OPENAI_KEY]"))
-        #expect(action.contains("bot<redacted>"))
+        #expect(action.contains("[REDACTED_TELEGRAM_TOKEN]"))
         #expect(delegate.contains("[REDACTED_NAMED_SECRET]"))
         #expect(action.count <= TelegramTurnPresentationReducer.textLimit)
         #expect(delegate.count <= TelegramTurnPresentationReducer.textLimit)

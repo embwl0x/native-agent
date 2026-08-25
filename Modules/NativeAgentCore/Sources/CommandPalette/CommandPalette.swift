@@ -89,7 +89,8 @@ public struct CommandPaletteResponse: Codable, Sendable, Hashable {
 ///
 /// Each field maps 1:1 to a Python expression that the daemon's
 /// `command_palette_entries()` evaluates at render time. Callers that have a
-/// live Swift source-of-truth (PersonaCompiler, ApprovalInbox, TrustCenter)
+/// live Swift source-of-truth (PersonaCompiler, ApprovalInbox, TrustCenter,
+/// MacAssistantStatus)
 /// populate the field from that source. Callers without a live runtime at
 /// all should use `.wave2NeutralBaseline` (the zero-state baseline);
 /// callers with a live runtime but no dynamic-status pipeline should use
@@ -201,8 +202,8 @@ public struct CommandPaletteContext: Sendable, Equatable {
     /// Everything else stays live (persona name, autonomy.counts.* quad,
     /// trust.enableAutonomy, telegram healthStatus) because the daemon's
     /// lightweight branch still computes them unconditionally at L5797-5805.
-    /// Use this from callers that have a live runtime but no Swift port of
-    /// the connector / mac-assistant / multimodal subsystems.
+    /// Use this from callers that have a live runtime but no dynamic status
+    /// reader for connector, Mac Assistant, or multimodal state.
     public static func lightweight(
         personaName: String,
         telegramHealthStatus: String = "optional",

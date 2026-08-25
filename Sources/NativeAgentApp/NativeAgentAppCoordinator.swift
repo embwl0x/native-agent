@@ -88,6 +88,14 @@ enum NativeAgentNavigationDestination: Equatable, Sendable {
     }
 }
 
+/// Receipt for accepting a navigation request. Delivery means that the mounted
+/// scene received the destination; it deliberately does not claim that the
+/// destination's UI has finished rendering or completed any work.
+enum NativeAgentNavigationRequestReceipt: Equatable, Sendable {
+    case deliveredToMountedScene
+    case queuedForMainScene
+}
+
 @MainActor
 final class NativeAgentAppCoordinator {
     struct ProcessBootstrapDependencies {
@@ -189,7 +197,7 @@ final class NativeAgentAppCoordinator {
     ) -> UUID {
         let id = UUID()
         mountedScene = (id, deliver)
-        drainPendingDestinations()
+        _ = drainPendingDestinations()
         return id
     }
 
@@ -198,11 +206,14 @@ final class NativeAgentAppCoordinator {
         mountedScene = nil
     }
 
-    func request(_ destination: NativeAgentNavigationDestination) {
+    @discardableResult
+    func request(_ destination: NativeAgentNavigationDestination) -> NativeAgentNavigationRequestReceipt {
         pendingDestinations.append(destination)
         windowActions.activateApplication()
         windowActions.openMainWindow()
-        drainPendingDestinations()
+        return drainPendingDestinations()
+            ? .deliveredToMountedScene
+            : .queuedForMainScene
     }
 
     func request(commandEntry: CoordinationCommandEntry) {
@@ -223,13 +234,15 @@ final class NativeAgentAppCoordinator {
         processDependencies.runInitialDoctor()
     }
 
-    private func drainPendingDestinations() {
-        guard let deliver = mountedScene?.deliver, !pendingDestinations.isEmpty else { return }
+    @discardableResult
+    private func drainPendingDestinations() -> Bool {
+        guard let deliver = mountedScene?.deliver, !pendingDestinations.isEmpty else { return false }
         let destinations = pendingDestinations
         pendingDestinations.removeAll(keepingCapacity: true)
         for destination in destinations {
             deliver(destination)
         }
+        return true
     }
 
     private func installLegacyRouteObservers() {

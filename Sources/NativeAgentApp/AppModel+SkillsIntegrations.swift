@@ -41,6 +41,60 @@ import Skills
 import Connectors
 import Browser
 
+enum ToolApprovalEligibility {
+    /// The mounted control only offers activation for an actual proposal that
+    /// the last validator pass marked valid. SwiftNativeToolExecution repeats
+    /// these checks at promotion time; this UI/app-model gate prevents known
+    /// terminal or unloaded records from looking actionable in the meantime.
+    static func refusal(for tool: ToolRecord) -> String? {
+        let status = (tool.status ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard ["proposed", "draft", "drafted"].contains(status) else {
+            if status == "quarantined" {
+                return "Quarantined tools must be reviewed before they can be approved."
+            }
+            if status.isEmpty {
+                return "This tool has no loaded proposal status. Refresh before approving it."
+            }
+            return "Only proposed tools can be approved."
+        }
+        guard tool.validationStatus?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "valid" else {
+            return "This proposal has not passed validation."
+        }
+        return nil
+    }
+}
+
+/// The authored-tools row is a projection of the same promotion boundary the
+/// action repeats. Keeping its enabled state and refusal copy here prevents a
+/// mounted SwiftUI control from becoming a second, untested eligibility rule.
+enum ToolApprovalPresentation {
+    struct Control: Equatable {
+        let accessibilityIdentifier: String
+        let isEnabled: Bool
+        let help: String
+        let refusal: String?
+    }
+
+    static func control(for tool: ToolRecord) -> Control {
+        let refusal = ToolApprovalEligibility.refusal(for: tool)
+        return Control(
+            accessibilityIdentifier: "tools.authored.approve.\(tool.id)",
+            isEnabled: refusal == nil,
+            help: refusal ?? "Approve this validated proposal and activate it.",
+            refusal: refusal
+        )
+    }
+}
+
+/// The result of one SearXNG discovery attempt. Research owns presentation of
+/// this result so an incidental discovery cannot replace the app-wide status
+/// message used by other mounted surfaces.
+enum SearXNGAutodetectOutcome: Equatable {
+    case found(String)
+    case notFound(String)
+    case failed(String)
+}
+
 @MainActor
 extension AppModel {
     @MainActor
@@ -71,11 +125,24 @@ extension AppModel {
     @MainActor
     func loadSkillManifests() async {
         isLoadingSkillManifests = true
-        skillManifestError = nil
-        async let registryEntriesTask = try? client.readSkillRegistry()
-        async let learnedSkillsTask = try? client.getSkills()
-        let entries = await registryEntriesTask ?? []
-        let learnedSkills = await learnedSkillsTask ?? []
+        let api = client
+        async let registryEntriesTask: [SkillRegistryEntry] = try await api.readSkillRegistry()
+        async let learnedSkillsTask: [SkillRecord] = try await api.getSkills()
+        var failures: [String] = []
+        let entries: [SkillRegistryEntry]
+        do {
+            entries = try await registryEntriesTask
+        } catch {
+            entries = []
+            failures.append("manifest registry: \(error.localizedDescription)")
+        }
+        let learnedSkills: [SkillRecord]
+        do {
+            learnedSkills = try await learnedSkillsTask
+        } catch {
+            learnedSkills = []
+            failures.append("learned skills: \(error.localizedDescription)")
+        }
         // mainactor_icloud: the per-skill manifest/README reads below use synchronous
         // Data(contentsOf:)/String(contentsOf:) disk I/O. Run them off the main thread
         // (awaited to preserve ordering), then hop back to @MainActor for state below.
@@ -102,33 +169,48 @@ extension AppModel {
             return infos
         }.value
         skillManifests = infos
-        if infos.isEmpty {
-            skillManifestError = "No skills were returned."
+        if !failures.isEmpty {
+            recordSkillManifestFailure("Skill catalog unavailable: \(failures.joined(separator: "; "))")
+        } else if skillLifecycleFeedback?.kind == .failure {
+            dismissSkillManifestFeedback()
         }
         isLoadingSkillManifests = false
     }
 
     @MainActor
     @discardableResult
-    func enableSkillManifest(name: String) async -> Bool {
+    func installReviewedSkill(_ info: SkillInfo) async -> SkillReviewInstallOutcome {
+        if let refusal = SkillReviewInstallPresentation.preflight(for: info) {
+            return .refused(detail: refusal)
+        }
+        let requestedName = info.registry.name
         do {
-            try await client.enableSkill(name: name)
+            try await client.enableSkill(name: requestedName)
             await loadSkillManifests()
-            let key = name.lowercased()
+            let key = requestedName.lowercased()
             let recovered = skillManifests.first { info in
                 info.id.lowercased() == key || info.manifest.name.lowercased() == key
             }
             guard let recovered,
                   ["installed", "active"].contains(recovered.registry.state.lowercased()) else {
-                skillManifestError = "Install could not be verified after the registry refresh."
-                return false
+                let detail = "Install could not be verified after the registry refresh."
+                recordSkillManifestFailure(detail)
+                return .failed(detail: detail)
             }
             Task.detached(priority: .utility) { await syncSkillPointerIndex() }
-            statusText = "Skill installed and available to recall"
-            return true
+            let receipt = SkillReviewInstallReceipt(
+                requestedName: requestedName,
+                confirmedName: recovered.manifest.name,
+                confirmedState: recovered.registry.state.lowercased()
+            )
+            statusText = receipt.confirmedState == "active"
+                ? "Skill active and available to recall"
+                : "Skill installed and available to recall"
+            return .installed(receipt)
         } catch {
-            skillManifestError = "Enable failed: \(error.localizedDescription)"
-            return false
+            let detail = "Install failed: \(error.localizedDescription)"
+            recordSkillManifestFailure(detail)
+            return .failed(detail: detail)
         }
     }
 
@@ -139,40 +221,81 @@ extension AppModel {
             await loadSkillManifests()
             Task.detached(priority: .utility) { await syncSkillPointerIndex() }
         } catch {
-            skillManifestError = "Disable failed: \(error.localizedDescription)"
+            recordSkillManifestFailure("Disable failed: \(error.localizedDescription)")
         }
     }
 
     @MainActor
     func setToolAutoRun(_ tool: ToolRecord, autoRun: Bool) async {
         do {
-            _ = try await client.updateTool(id: tool.id, autoRun: autoRun)
-            statusText = autoRun ? "Tool auto-run enabled" : "Tool auto-run disabled"
-            await refreshAll()
+            let updated = try await client.updateTool(id: tool.id, autoRun: autoRun)
+            let reloaded = try await client.getTools()
+            guard let confirmed = reloaded.first(where: { $0.id == updated.id }),
+                  confirmed.autoRun == autoRun else {
+                recordToolOperationStatus(
+                    "Tool auto-run update could not be confirmed after reloading the registry.",
+                    outcome: .failed
+                )
+                return
+            }
+            tools = reloaded
+            recordToolOperationStatus(
+                autoRun ? "Tool auto-run enabled" : "Tool auto-run disabled",
+                outcome: .succeeded
+            )
         } catch {
-            statusText = "Tool update failed: \(error.localizedDescription)"
+            recordToolOperationStatus("Tool update failed: \(error.localizedDescription)", outcome: .failed)
         }
     }
 
     @MainActor
     func quarantineTool(_ tool: ToolRecord) async {
         do {
-            _ = try await client.quarantineTool(id: tool.id, reason: "User quarantined from NativeAgent UI.")
-            statusText = "Tool quarantined"
-            await refreshAll()
+            let updated = try await client.quarantineTool(
+                id: tool.id,
+                reason: "User quarantined from NativeAgent UI."
+            )
+            let reloaded = try await client.getTools()
+            guard let confirmed = reloaded.first(where: { $0.id == updated.id }),
+                  confirmed.status == "quarantined" else {
+                recordToolOperationStatus(
+                    "Tool quarantine could not be confirmed after reloading the registry.",
+                    outcome: .failed
+                )
+                return
+            }
+            tools = reloaded
+            recordToolOperationStatus("Tool quarantined", outcome: .succeeded)
         } catch {
-            statusText = "Tool quarantine failed: \(error.localizedDescription)"
+            recordToolOperationStatus("Tool quarantine failed: \(error.localizedDescription)", outcome: .failed)
         }
     }
 
     @MainActor
     func promoteTool(_ tool: ToolRecord, userRequested: Bool = true) async {
+        if let refusal = ToolApprovalEligibility.refusal(for: tool) {
+            recordToolOperationStatus("Tool activation unavailable: \(refusal)", outcome: .failed)
+            return
+        }
         do {
-            _ = try await client.promoteTool(id: tool.id, allowRisky: userRequested, userRequested: userRequested)
-            statusText = "Tool activated"
-            await refreshAll()
+            let updated = try await client.promoteTool(
+                id: tool.id,
+                allowRisky: userRequested,
+                userRequested: userRequested
+            )
+            let reloaded = try await client.getTools()
+            guard let confirmed = reloaded.first(where: { $0.id == updated.id }),
+                  confirmed.status == "active" else {
+                recordToolOperationStatus(
+                    "Tool activation could not be confirmed after reloading the registry.",
+                    outcome: .failed
+                )
+                return
+            }
+            tools = reloaded
+            recordToolOperationStatus("Tool activated", outcome: .succeeded)
         } catch {
-            statusText = "Tool activation failed: \(error.localizedDescription)"
+            recordToolOperationStatus("Tool activation failed: \(error.localizedDescription)", outcome: .failed)
         }
     }
 
@@ -193,14 +316,29 @@ extension AppModel {
 
     @MainActor
     func addWorkspace(name: String, path: String, writable: Bool) async -> Bool {
-        do {
-            _ = try await client.addWorkspace(name: name, path: path, permissions: writable ? ["read", "write"] : ["read"])
-            statusText = "Workspace added"
-            await refreshAll()
+        if case .verified = await addWorkspaceWithReceipt(name: name, path: path, writable: writable) {
             return true
+        }
+        return false
+    }
+
+    @MainActor
+    func addWorkspaceWithReceipt(name: String, path: String, writable: Bool) async -> WorkspaceAddOutcome {
+        do {
+            let added = try await client.addWorkspace(name: name, path: path, permissions: writable ? ["read", "write"] : ["read"])
+            let refreshed = try await client.getWorkspaces()
+            guard refreshed.contains(where: { $0.id == added.id }) else {
+                let detail = "The workspace registry did not confirm the saved workspace."
+                statusText = "Workspace add failed: \(detail)"
+                return .failed(detail)
+            }
+            workspaces = refreshed
+            statusText = "Workspace added and verified"
+            return .verified(added)
         } catch {
-            statusText = "Workspace add failed: \(error.localizedDescription)"
-            return false
+            let detail = error.localizedDescription
+            statusText = "Workspace add failed: \(detail)"
+            return .failed(detail)
         }
     }
 
@@ -216,52 +354,125 @@ extension AppModel {
     }
 
     @MainActor
-    func updateConnector(_ connector: ConnectorRecord, enabled: Bool) async {
+    func updateConnector(_ connector: ConnectorRecord, enabled: Bool) async -> ConnectorUpdateOutcome {
         do {
-            _ = try await client.updateConnector(id: connector.id, enabled: enabled)
-            statusText = "Connector updated"
-            await refreshAll()
+            let updated = try await client.updateConnector(id: connector.id, enabled: enabled)
+            let refreshed = try await client.getConnectors()
+            guard let confirmed = refreshed.first(where: { $0.id == updated.id }),
+                  confirmed.enabled == enabled else {
+                let detail = "The registry did not confirm the requested \(enabled ? "enable" : "disable") change."
+                statusText = "Connector update failed: \(detail)"
+                return .failed(detail)
+            }
+            connectors = refreshed
+            statusText = "Connector \(confirmed.enabled ? "enabled" : "disabled") and verified"
+            return .verified(confirmed)
         } catch {
-            statusText = "Connector update failed: \(error.localizedDescription)"
+            let detail = error.localizedDescription
+            statusText = "Connector update failed: \(detail)"
+            return .failed(detail)
         }
     }
 
     @MainActor
-    func autodetectSearXNG() async {
+    func autodetectSearXNG() async -> SearXNGAutodetectOutcome {
         do {
             let detected = try await client.autodetectSearXNG()
-            if let baseURL = detected.baseURL {
-                searxngBaseURL = baseURL
-                statusText = "SearXNG found: \(baseURL)"
-            } else {
-                statusText = detected.error ?? "SearXNG not found"
-            }
+            return applySearXNGAutodetect(detected)
         } catch {
-            statusText = "SearXNG detection failed: \(error.localizedDescription)"
+            return .failed(error.localizedDescription)
+        }
+    }
+
+    /// Applies only a usable discovery response. The UI deliberately receives
+    /// the typed outcome instead of consulting or replacing `statusText`, which
+    /// belongs to cross-app work such as doctor, settings, and tool actions.
+    func applySearXNGAutodetect(_ detected: DetectSearXNGResponse) -> SearXNGAutodetectOutcome {
+        guard detected.found else {
+            let detail = detected.error?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let detail, !detail.isEmpty {
+                return .notFound(detail)
+            }
+            return .notFound("No reachable local instance was found.")
+        }
+        guard let baseURL = detected.baseURL,
+              !baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .failed("SearXNG detection returned no usable URL.")
+        }
+        do {
+            let normalized = try NativeClient.normalizedSearXNGBaseURL(baseURL)
+            searxngBaseURL = normalized
+            return .found(normalized)
+        } catch {
+            return .failed("SearXNG detection returned an invalid URL: \(error.localizedDescription)")
         }
     }
 
     @MainActor
-    func saveTelegram() async {
+    @discardableResult
+    func saveTelegram() async -> TelegramSettingsSaveOutcome {
         isSavingTelegram = true
+        telegramSettingsSaveOutcome = nil
         statusText = "Saving Telegram settings..."
         defer { isSavingTelegram = false }
 
+        if let tokenError = TelegramBotTokenPresentation.validationMessage(for: telegramToken) {
+            statusText = "Telegram save failed: \(tokenError)"
+            let outcome = TelegramSettingsSaveOutcome.rejected(detail: tokenError)
+            telegramSettingsSaveOutcome = outcome
+            return outcome
+        }
+        guard TelegramBotTokenPresentation.canSave(
+            draft: telegramToken,
+            tokenConfigured: telegramTokenConfigured
+        ) else {
+            let detail = "Add a bot token before saving settings."
+            statusText = "Telegram save failed: \(detail)"
+            let outcome = TelegramSettingsSaveOutcome.rejected(detail: detail)
+            telegramSettingsSaveOutcome = outcome
+            return outcome
+        }
+        let chats = parseTelegramNumericIDs(telegramAllowedChats)
+        let users = parseTelegramNumericIDs(telegramAllowedUsers)
+        let invalid = chats.invalidTokens + users.invalidTokens
+        guard invalid.isEmpty else {
+            let detail = "Invalid numeric ID(s): \(invalid.joined(separator: ", "))."
+            statusText = "Telegram save failed: \(detail)"
+            let outcome = TelegramSettingsSaveOutcome.rejected(detail: detail)
+            telegramSettingsSaveOutcome = outcome
+            return outcome
+        }
+        let normalizedEffort = normalizedReasoningEffort(
+            from: modelCatalog,
+            model: telegramModel,
+            selected: telegramReasoningEffort
+        )
+        telegramReasoningEffort = normalizedEffort
         do {
             try await client.configureTelegram(
                 token: telegramToken,
-                allowedChatIds: splitIDs(telegramAllowedChats),
-                allowedUserIds: splitIDs(telegramAllowedUsers),
+                allowedChatIds: chats.canonicalIDs,
+                allowedUserIds: users.canonicalIDs,
                 requireMention: telegramRequireMention,
                 model: telegramModel,
-                reasoningEffort: telegramReasoningEffort,
+                reasoningEffort: normalizedEffort,
                 enabled: telegramEnabled
             )
             telegramToken = ""
             await refreshAll()
             statusText = telegramTokenConfigured ? "Telegram settings saved" : "Telegram settings saved. Add a bot token to enable Telegram."
+            let outcome = TelegramSettingsSaveOutcome.saved(
+                tokenConfigured: telegramTokenConfigured,
+                enabled: telegramEnabled,
+                allowlistCount: Set(chats.canonicalIDs + users.canonicalIDs).count
+            )
+            telegramSettingsSaveOutcome = outcome
+            return outcome
         } catch {
             statusText = "Telegram save failed: \(error.localizedDescription)"
+            let outcome = TelegramSettingsSaveOutcome.failed(detail: error.localizedDescription)
+            telegramSettingsSaveOutcome = outcome
+            return outcome
         }
     }
 
@@ -291,12 +502,14 @@ extension AppModel {
 
     @MainActor
     func refreshTelegram() async {
+        telegramStatusRefreshError = nil
         do {
             telegramStatus = try await client.getTelegramStatus()
             telegramTokenConfigured = telegramStatus?.tokenConfigured ?? telegramTokenConfigured
             telegramEnabled = telegramStatus?.enabled ?? telegramEnabled
             statusText = "Telegram status refreshed"
         } catch {
+            telegramStatusRefreshError = error.localizedDescription
             statusText = "Telegram refresh failed: \(error.localizedDescription)"
         }
     }
@@ -311,7 +524,7 @@ extension AppModel {
             let chatId = splitIDs(telegramAllowedChats).first ?? splitIDs(telegramAllowedUsers).first
             let result = try await client.testTelegram(chatId: chatId)
             await refreshAll()
-            statusText = "Telegram test sent to \(result.chatId)"
+            statusText = TelegramTestReplyPresentation.summary(for: result)
         } catch {
             statusText = "Telegram test failed: \(error.localizedDescription)"
         }
@@ -319,11 +532,21 @@ extension AppModel {
 
     @MainActor
     func clearTelegramLogs() async {
+        guard !isClearingTelegramLogs else { return }
+        isClearingTelegramLogs = true
+        telegramClearLogsOutcome = nil
+        statusText = "Clearing Telegram diagnostics…"
+        defer { isClearingTelegramLogs = false }
         do {
-            telegramStatus = try await client.clearTelegramLogs()
-            statusText = "Telegram diagnostics cleared"
+            let receipt = try await client.clearTelegramLogs()
+            telegramStatus = receipt.status
+            telegramStatusRefreshError = nil
+            telegramClearLogsOutcome = .completed(receipt)
+            statusText = TelegramClearLogsPresentation.summary(for: receipt)
         } catch {
-            statusText = "Clear Telegram logs failed: \(error.localizedDescription)"
+            let detail = error.localizedDescription
+            telegramClearLogsOutcome = .failed(detail: detail)
+            statusText = "Clear Telegram logs failed: \(detail)"
         }
     }
 
@@ -395,7 +618,9 @@ extension AppModel {
             let report = try await client.runDoctor(repair: repair)
             doctorReport = report
             doctorReportCompletedAt = Date()
-            statusText = repair ? "Doctor repair finished" : "Doctor check finished"
+            statusText = repair
+                ? DoctorSafeRepairIssuesPresentation.completionMessage(report: report)
+                : "Doctor check finished"
             await refreshAll()
             let failing = report.checks.filter {
                 ["fail", "error"].contains($0.status.lowercased())
@@ -405,6 +630,23 @@ extension AppModel {
             statusText = "Doctor failed: \(error.localizedDescription)"
             return .unavailable(error.localizedDescription)
         }
+    }
+
+    /// The Diagnostics button may run only repairs that the currently shown
+    /// report explicitly offered. Onboarding calls `runDoctor(repair:)`
+    /// directly because fresh-install scaffold repair has no prior report.
+    @MainActor
+    @discardableResult
+    func repairSafeDoctorIssues() async -> DoctorRunOutcome {
+        let state = DoctorSafeRepairIssuesPresentation.state(
+            report: doctorReport,
+            isRunning: doctorRunning
+        )
+        guard state.canRun else {
+            statusText = state.detail
+            return .unavailable(state.detail)
+        }
+        return await runDoctor(repair: true)
     }
 
     /// Reconcile the cheap live-owner rows in an existing Doctor report.

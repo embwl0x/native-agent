@@ -191,11 +191,14 @@ struct OpLogPhysicalRowThresholdTests {
         #expect(try await ledger.feedIntegrity().undecodableRowCount == 25)
     }
 
-    // MARK: - 4. GitHubCommandStore: malformed LINES count toward the threshold
+    // MARK: - 4. GitHubCommandStore: valid operations still reach the refusal gate
 
-    /// This store throws on an undecodable op, so its exposure is the malformed
-    /// LINE that `readJSONL` drops silently. Padding the feed with those used to
-    /// shrink the measured feed below the threshold.
+    /// GitHub Command now fails closed before appending into a malformed feed,
+    /// which is correct: replaying only the parseable prefix would invent a
+    /// plausible work state. Its diagnostic read still decodes the valid
+    /// operations and reports the damaged physical rows. Pin the shared
+    /// compaction boundary directly: those physical rows must take the gate to
+    /// its refusal, rather than letting the small decoded-op count bypass it.
     @Test func gitHubCommandThresholdCountsPhysicalRowsSoTheRefusalIsReached() async throws {
         let dir = try root("ghc")
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -208,21 +211,29 @@ struct OpLogPhysicalRowThresholdTests {
             observedVersion: "observed-1", actionableEventVersion: nil,
             signals: [], headSHA: "abc123", waitingKind: .review
         )
-        _ = try await store.observe([observation])
+        _ = try await store.observe([observation, observation])
 
         for index in 0..<20 {
             try appendRawLine("torn garbage row \(index) {", to: store.opsPath)
         }
         let integrity = try await store.opLogIntegrity()
         #expect(integrity.malformedLineCount == 20)
-        #expect(integrity.physicalRowCount == 21)
+        #expect(integrity.undecodableRowCount == 0)
+        #expect(integrity.physicalRowCount == 22)
 
         let before = physicalLines(store.opsPath)
+        // The two valid operations are below the threshold by themselves. The
+        // physical feed is not, so compaction must reach the shared refusal.
+        #expect(integrity.feedRowCount(decodedCount: 2) == before)
+        #expect(integrity.feedRowCount(decodedCount: 2) >= 8)
         let stderr = try await capturingStderr {
-            _ = try await store.observe([observation])
+            #expect(!SnapshotTailOpLog.mayCompact(
+                integrity, feed: "GitHubCommandStore", path: store.opsPath
+            ))
         }
         #expect(stderr.contains("REFUSING to compact"))
-        #expect(physicalLines(store.opsPath) == before + 1)
+        #expect(stderr.contains(store.opsPath.path))
+        #expect(physicalLines(store.opsPath) == before)
     }
 
     // MARK: - 5. A clean feed still compacts, and replay is deterministic

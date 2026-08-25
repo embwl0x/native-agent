@@ -117,6 +117,7 @@ public actor SwiftNativeMacControl: MacControlClient {
     private let processAdapter: ProcessAdapter
     private let fileManagerAdapter: FileManagerAdapter
     private let appControlAdapter: AppControlAdapter
+    private let openTargetAdapter: OpenTargetAdapter
     /// Read-only accessibility perception seam (W1). Production reads live
     /// AXUIElement state; tests inject a synthetic tree so the caps and the
     /// ranking are pinned without a window server.
@@ -130,6 +131,13 @@ public actor SwiftNativeMacControl: MacControlClient {
     /// again separate from the read seam so perception stays provably
     /// injection-free.
     private let accessibilityActSource: any MacAXActSource
+    /// native-look item 3 — the CLOSED LOOP's effect seam. Production installs
+    /// a real `AXObserver` on the target app's pid, sourced on the main run
+    /// loop; tests inject a fake that emits scripted notifications and counts
+    /// installs/removals, so "the observer is always removed" is pinned rather
+    /// than assumed. Separate from every seam above for the same reason they
+    /// are separate from each other: this one only LISTENS.
+    private let effectObserverSource: any MacAXEffectObserverSource
     /// W3.5 — the picture half of the fused view. Screen Recording is its OWN
     /// TCC permission; this seam only ever PREFLIGHTS it (never prompts, never
     /// toggles) and reports the answer honestly.
@@ -140,6 +148,10 @@ public actor SwiftNativeMacControl: MacControlClient {
     /// W3.5 — the latest fused view, so a later `mark` resolves to a real
     /// element. A mark is a REFERENCE ONLY: every injection gate still runs.
     private let screenViewStore: MacScreenViewStore
+    /// native-look item 2 — the latest look's task-scoped perceptual frame, so
+    /// item 3's verbs can resolve a handle back to a path. Like a mark, a
+    /// handle is a REFERENCE ONLY and grants no authority.
+    private let lookFrameStore: MacLookFrameStore
     /// Explicit, bounded continuity over fused views. The source installs no
     /// observers until `mac_attention start`; the store is shared because the
     /// dispatcher constructs a short-lived MacControl client per tool call.
@@ -176,12 +188,15 @@ public actor SwiftNativeMacControl: MacControlClient {
         processAdapter: ProcessAdapter = SystemProcessAdapter(),
         fileManagerAdapter: FileManagerAdapter = SystemFileManagerAdapter(),
         appControlAdapter: AppControlAdapter = SystemAppControlAdapter(),
+        openTargetAdapter: OpenTargetAdapter = SystemOpenTargetAdapter(),
         accessibilitySource: any MacAXElementSource = defaultMacAXElementSource(),
         eventSink: any MacEventSink = defaultMacEventSink(),
         accessibilityActSource: any MacAXActSource = defaultMacAXActSource(),
+        effectObserverSource: any MacAXEffectObserverSource = defaultMacAXEffectObserverSource(),
         screenCaptureSource: any MacScreenCaptureSource = defaultMacScreenCaptureSource(),
         screenImageRenderer: any MacScreenImageRenderer = defaultMacScreenImageRenderer(),
         screenViewStore: MacScreenViewStore = .shared,
+        lookFrameStore: MacLookFrameStore = .shared,
         attentionEventSource: any MacAttentionEventSource = defaultMacAttentionEventSource(),
         attentionStore: MacAttentionSessionStore = .shared,
         sessionStateSource: any MacSessionStateSource = defaultMacSessionStateSource(),
@@ -196,12 +211,15 @@ public actor SwiftNativeMacControl: MacControlClient {
         self.processAdapter = processAdapter
         self.fileManagerAdapter = fileManagerAdapter
         self.appControlAdapter = appControlAdapter
+        self.openTargetAdapter = openTargetAdapter
         self.accessibilitySource = accessibilitySource
         self.eventSink = eventSink
         self.accessibilityActSource = accessibilityActSource
+        self.effectObserverSource = effectObserverSource
         self.screenCaptureSource = screenCaptureSource
         self.screenImageRenderer = screenImageRenderer
         self.screenViewStore = screenViewStore
+        self.lookFrameStore = lookFrameStore
         self.attentionEventSource = attentionEventSource
         self.attentionStore = attentionStore
         self.sessionStateSource = sessionStateSource
@@ -533,11 +551,16 @@ public actor SwiftNativeMacControl: MacControlClient {
         case "applescript": return try await handleAppleScript(body)
         case "focus_app":   return try await handleFocusApp(body)
         case "quit_app":    return try await handleQuitApp(body)
+        case "open_target": return try await handleOpenTarget(body)
         case "spotlight":   return try await handleSpotlight(body)
         case "shell":       return try await handleShell(body)
         case "ax_status":   return handleAXStatus()
         case "ax_tree":     return handleAXTree(body)
         case "ax_find":     return try handleAXFind(body)
+        // native-look item 2 — THE PERCEPTION COMPILER. Read tier like the
+        // three above and for the same reason: it walks the same AX tree
+        // through the same read organ and changes no UI state.
+        case "look":        return await handleLook(body)
         // W3.5 — THE FUSED VIEW. Read tier like the three above: it looks at
         // the screen (AX structure + pixels) and changes nothing.
         case "view":        return await handleView(body)
@@ -549,8 +572,14 @@ public actor SwiftNativeMacControl: MacControlClient {
         case "click":       return await handleClick(body)
         case "scroll":      return await handleScroll(body)
         case "ax_act":      return await handleAXAct(body)
+        // native-look item 3 — THE CLOSED LOOP. Injection like the four above
+        // (it performs through the same actuator); the percept it returns
+        // afterwards is evidence of the effect, not a lower tier.
+        case "act":         return await handleAct(body)
+        case "hand":        return await handleHand(body)
         // W6 — the nudge + re-capture. Injection like the four above (it posts
-        // HID events), with one extra refusal of its own: a real password lock.
+        // HID events). The nudge itself is never pre-refused (User, 2026-08-22);
+        // only the capture refuses, while the saver/login layer is still up.
         case "wake":        return await handleWake(body)
         // W7 — the NUDGE. Reached through the unprivileged `dispatch` like the
         // reads above, not through `dispatchApprovedInjection`: it emits one
@@ -578,13 +607,19 @@ public actor SwiftNativeMacControl: MacControlClient {
         case "spotlight": return 10
         // In-process AX reads; nothing here waits on another process.
         case "ax_status", "ax_tree", "ax_find": return 15
+        // One AX walk, plus (Chromium/Electron only) a bounded ≤4s settle and
+        // exactly ONE re-walk. Nothing here waits on another process otherwise.
+        case "look": return 25
         // W3.5 — one AX walk plus one ScreenCaptureKit screenshot + encode.
         // Still in-process, but the capture is the slowest read here.
         case "view": return 20
         // Event-driven wait is caller-bounded to 15s, followed by one view.
         case "attention": return 40
         // In-process CGEvent / AX act; nothing here waits on another process.
-        case "keystroke", "click", "scroll", "ax_act": return 15
+        case "keystroke", "click", "scroll", "ax_act", "hand": return 15
+        // native-look item 3 — one act, a bounded ≤2s effect wait, then one AX
+        // walk (which on a Chromium window may add a ≤4s settle + one re-walk).
+        case "act": return 30
         // W7 — one CGEvent post, in-process, nothing awaited.
         case "nudge": return 15
         // W6 — a nudge, a bounded settle wait, then a full `view` capture.
@@ -861,7 +896,7 @@ public actor SwiftNativeMacControl: MacControlClient {
             return verified ? .satisfied : .unverified
         }
         switch action {
-        case "file/read", "file/list", "spotlight", "ax_status", "ax_tree", "ax_find", "view":
+        case "file/read", "file/list", "spotlight", "ax_status", "ax_tree", "ax_find", "view", "look":
             return .satisfied
         case "notify", "file/write", "file/move", "file/trash", "focus_app", "quit_app", "applescript", "shell":
             return .unverified
@@ -870,7 +905,15 @@ public actor SwiftNativeMacControl: MacControlClient {
         // but "I read the element again" is not proof the app's handler ran or
         // that the intended consequence happened. Claiming `satisfied` here
         // would manufacture settlement evidence out of a second read.
-        case "keystroke", "click", "scroll", "ax_act":
+        case "keystroke", "click", "scroll", "ax_act", "hand":
+            return .unverified
+        // native-look item 3 — `act` publishes `verified: false` above, so this
+        // never decides it. Listed so the intent survives a refactor: the
+        // closed loop OBSERVES an effect (a notification fired, the percept
+        // changed) which is real evidence, but it is not proof the INTENDED
+        // consequence happened — the caller judges the diff. Claiming
+        // `satisfied` would manufacture settlement out of a re-look.
+        case "act":
             return .unverified
         // W6 `wake` never reaches here: it always publishes its own `verified`
         // flag above, decided by RE-READING the session after the nudge rather
@@ -1083,6 +1126,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         case "shortcut",
              "shortcut/run":  return "run_shortcut"
         case "focus_app":     return "focus_app"
+        case "open_target":   return "open_target"
         case "quit_app":      return "quit_app"
         case "keystroke":     return "keystroke"
         // No daemon ancestor (W1 Swift-native reads). The audit row still
@@ -1090,11 +1134,14 @@ public actor SwiftNativeMacControl: MacControlClient {
         case "ax_status":     return "ax_status"
         case "ax_tree":       return "ax_tree"
         case "ax_find":       return "ax_find"
+        case "look":          return "look"
         case "view":          return "view"
         case "wake":          return "wake"
         case "nudge":         return "nudge"
         case "scroll":        return "scroll"
         case "ax_act":        return "ax_act"
+        case "act":           return "act"
+        case "hand":          return "hand"
         case "click":         return "click_at"
         case "system":        return systemMethodName(body: body)
         case "file/read":     return "read_file"
@@ -1299,8 +1346,9 @@ public actor SwiftNativeMacControl: MacControlClient {
             throw MacControlError.missingField("title or message")
         }
         let started = now()
+        let receipt: NotificationPostReceipt
         do {
-            try await notificationCenterAdapter.postNotification(
+            receipt = try await notificationCenterAdapter.postNotificationReceipt(
                 title: title,
                 message: message,
                 soundName: sound
@@ -1316,14 +1364,27 @@ public actor SwiftNativeMacControl: MacControlClient {
             )
         }
         let durationMs = Int(now().timeIntervalSince(started) * 1000)
+        let receiptFields: [String: JSONValue] = [
+            "submission": .string(receipt.disposition.rawValue),
+            "authorization": .string(receipt.authorization.rawValue),
+            "request_id": receipt.requestIdentifier.map { .string($0) } ?? .null,
+            "delivery_observed": .bool(false),
+        ]
+        let outputFields: [String: JSONValue] = [
+            "title": .string(title),
+            "message": .string(message),
+            "sound": sound.map { .string($0) } ?? .null,
+            // `UNUserNotificationCenter.add` acknowledges only that the
+            // request was accepted. It cannot prove a banner appeared,
+            // sound played, or a person received it; keep the terminal
+            // operation receipt explicitly unverified until a distinct
+            // observer supplies that evidence.
+            "receipt": .object(receiptFields),
+        ]
         return MacControlResult(
             ok: true,
             action: "notify",
-            output: .object([
-                "title": .string(title),
-                "message": .string(message),
-                "sound": sound.map { .string($0) } ?? .null,
-            ]),
+            output: .object(outputFields),
             error: nil,
             durationMs: durationMs,
             viaSwift: true
@@ -1679,6 +1740,32 @@ public actor SwiftNativeMacControl: MacControlClient {
         }
     }
 
+    /// Launch Services acceptance is transport evidence, not settlement. The
+    /// result stays explicitly unverified; the four-verb surface follows this
+    /// operation with a fresh screen and speaks only what that read shows.
+    private func handleOpenTarget(_ body: [String: JSONValue]) async throws -> MacControlResult {
+        guard let raw = body.stringValue("url")?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty,
+              let url = URL(string: raw),
+              let scheme = url.scheme?.lowercased(),
+              (scheme == "file" || (["http", "https"].contains(scheme) && url.host != nil)) else {
+            throw MacControlError.missingField("url")
+        }
+        let started = now()
+        let accepted = await openTargetAdapter.requestOpen(url)
+        return MacControlResult(
+            ok: accepted,
+            action: "open_target",
+            output: .object([
+                "status": .string(accepted ? "requested" : "request_refused"),
+                "verified": .bool(false),
+            ]),
+            error: accepted ? nil : "Launch Services did not accept the open request",
+            durationMs: Int(now().timeIntervalSince(started) * 1000),
+            viaSwift: true
+        )
+    }
+
     private func handleQuitApp(_ body: [String: JSONValue]) async throws -> MacControlResult {
         let app = try requestedAppName(body)
         let started = now()
@@ -1800,16 +1887,237 @@ public actor SwiftNativeMacControl: MacControlClient {
         )
     }
 
+    /// One read EPOCH: the root, its walk, and the focused element's path
+    /// anchored to THAT root — never a focus fetched later against whatever
+    /// window is frontmost by then (gpt-5.5 BLOCKING 2026-08-22: a focus path
+    /// from a different tree that happens to exist in the old snapshot makes a
+    /// look lie about where the cursor is). If the focus is not under this
+    /// root, `focusPath` is nil and the percept says "focus unknown".
+    /// - Parameter pid: when given, the window is taken from THAT process
+    ///   instead of from whatever is frontmost — `mac_act`'s identity guard
+    ///   (B3) must re-read the app the frame came from, or a background act
+    ///   would be refused as drift the moment another app took focus.
     private func axSnapshot(
-        limits: MacAXLimits
-    ) -> (snapshot: MacAXTreeSnapshot, app: MacAXAppInfo?, rootTitle: String?)? {
-        guard let root = accessibilitySource.frontmostWindowRoot() else { return nil }
+        limits: MacAXLimits,
+        pid: Int32? = nil
+    ) -> MacAXRead? {
+        guard case .read(let read) = anchoredSnapshot(limits: limits, pid: pid, window: nil) else {
+            return nil
+        }
+        return read
+    }
+
+    /// The outcome of a WINDOW-ANCHORED read (gpt-5.5 round-3 B1/B2).
+    ///
+    /// "No window" is three different facts and the caller has to tell them
+    /// apart: the app is gone, the app is there but the window she looked at is
+    /// not, or several windows are equally plausible and picking one would be a
+    /// coin flip.
+    private enum MacAnchoredRead {
+        case read(MacAXRead)
+        case appGone
+        case windowGone
+        case windowDrifted(String)
+    }
+
+    /// One read epoch, optionally anchored to a NAMED WINDOW of a named process.
+    ///
+    /// - `pid` nil ⇒ the frontmost window of the frontmost app (`mac_ax_tree`,
+    ///   `mac_ax_find`, the first look).
+    /// - `pid` given, `window` nil ⇒ that process's first window, as before.
+    /// - `pid` AND `window` given ⇒ the window whose composite identity matches,
+    ///   or a refusal. Never "focused, else main, else first" inside the pid:
+    ///   with two windows of one app, a focus change between the look and the
+    ///   act silently re-points the read at the other one, and the pid claim
+    ///   still passes (round-2 B2 was necessary, not sufficient).
+    private func anchoredSnapshot(
+        limits: MacAXLimits,
+        pid: Int32?,
+        window: MacAXWindowIdentity?
+    ) -> MacAnchoredRead {
+        let root: MacAXElementRef
+        var identity: MacAXWindowIdentity?
+        if let pid {
+            let candidates = accessibilitySource.windowRoots(pid: pid)
+            guard !candidates.isEmpty else { return .appGone }
+            if let window {
+                switch MacAXWindowIdentity.match(
+                    window,
+                    among: candidates.map { (handle: $0, identity: $0.identity) }
+                ) {
+                case .matched(let hit, _):
+                    root = hit.ref
+                    identity = hit.identity
+                case .gone:
+                    return .windowGone
+                case .ambiguous(let reason):
+                    return .windowDrifted(reason)
+                }
+            } else {
+                root = candidates[0].ref
+                identity = candidates[0].identity
+            }
+        } else {
+            guard let frontmost = accessibilitySource.frontmostWindowRoot() else { return .appGone }
+            root = frontmost
+            // The frontmost read still names its window, so the FRAME it mints
+            // can be re-found later — that is what makes the first look
+            // anchorable at all. The window's INDEX is unknown on this path
+            // (`frontmostWindowRoot()` answers with a window, not a position),
+            // and `nil` is how the identity says so: an index it guessed at
+            // would score a wrong candidate up.
+            if let app = accessibilitySource.frontmostApp(),
+               let attributes = accessibilitySource.attributes(of: root) {
+                identity = MacAXWindowIdentity(
+                    pid: app.processIdentifier,
+                    index: nil,
+                    role: attributes.role,
+                    subrole: attributes.subrole,
+                    title: attributes.title,
+                    frame: attributes.frame
+                )
+            }
+        }
         let snapshot = MacAccessibilityReader.walk(
             source: accessibilitySource,
             root: root,
             limits: limits
         )
-        return (snapshot, accessibilitySource.frontmostApp(), snapshot.nodes.first?.attributes.title)
+        let focusPath = accessibilitySource.focusedElementPath(relativeTo: root)
+        return .read(MacAXRead(
+            snapshot: snapshot,
+            // S7 — a pid-anchored read reports THAT process, never
+            // `frontmostApp()`. When the source cannot name it, the pid itself
+            // is still the truth and stays carried (the frame's whole anchor
+            // hangs off it); the NAME is not invented from another app's.
+            app: pid.map { anchored in
+                accessibilitySource.appInfo(pid: anchored)
+                    ?? MacAXAppInfo(
+                        name: "pid \(anchored)",
+                        bundleIdentifier: nil,
+                        processIdentifier: anchored
+                    )
+            } ?? accessibilitySource.frontmostApp(),
+            rootTitle: snapshot.nodes.first?.attributes.title,
+            focusPath: focusPath,
+            root: root,
+            windowIdentity: identity
+        ))
+    }
+
+    /// Agent round 2, her #1-ranked gap — PAGE-FIRST perception for a
+    /// Chromium/Electron window.
+    ///
+    /// The ordinary walk starts at the window and spends its 400 nodes and 12
+    /// levels on the toolbar and the bookmarks bar, hitting `depth_cap` before
+    /// it reaches the `AXWebArea` at all: her Chrome look was blind to the page
+    /// she was looking at. So when the frontmost window is chromium-family and
+    /// a web area can be FOUND (bounded, read-only, same seam), the percept is
+    /// compiled from the PAGE, and the browser chrome collapses to one line.
+    ///
+    /// Paths stay WINDOW-RELATIVE: the page walk is re-based onto the web
+    /// area's own path, because `mac_act` resolves a child-index chain from the
+    /// window root and a page-relative path would address a different element
+    /// entirely.
+    private func pageScoped(
+        _ windowRead: MacAXRead,
+        limits: MacAXLimits,
+        scope: MacLookScope
+    ) -> (read: MacAXRead, seam: [String: JSONValue]) {
+        var seam: [String: JSONValue] = [:]
+        let chromiumFamily = MacChromiumAccessibility.looksChromium(
+            bundleId: windowRead.app?.bundleIdentifier,
+            snapshot: windowRead.snapshot
+        ) || MacChromiumAccessibility.hasWebArea(windowRead.snapshot)
+        guard scope != .chrome, chromiumFamily else {
+            seam["scope"] = .string(scope == .page && !chromiumFamily ? "chrome" : scope.rawValue)
+            if scope == .page, !chromiumFamily {
+                seam["scope_reason"] = .string("not_a_chromium_window")
+            }
+            return (windowRead, seam)
+        }
+        let search = MacAccessibilityReader.findFirst(
+            role: "AXWebArea",
+            source: accessibilitySource,
+            root: windowRead.root
+        )
+        guard let web = search.hit else {
+            // gpt-5.5 round-3 S5 — the fallback to chrome scope is right; the
+            // REASON was not. A deep or wide Chromium shell can spend the
+            // 160-node search budget before reaching the page, and reporting
+            // that as `no_web_area_found` claims the page does not exist on the
+            // authority of a search that never got there.
+            seam["scope"] = .string("chrome")
+            if let reason = search.truncationReason {
+                seam["scope_reason"] = .string("web_area_search_truncated")
+                seam["web_area_search_limit"] = .string(reason)
+                seam["web_area_search_budget"] = .object([
+                    "max_depth": .int(Int64(MacAccessibilityReader.findFirstMaxDepth)),
+                    "node_budget": .int(Int64(MacAccessibilityReader.findFirstNodeBudget)),
+                ])
+                seam["scope_note"] = .string(
+                    "the search for the page ran out of \(reason == "node_cap" ? "nodes" : "depth") "
+                    + "before finding it — this is the browser chrome, and the page may still be "
+                    + "there unseen"
+                )
+            } else {
+                seam["scope_reason"] = .string("no_web_area_found")
+            }
+            return (windowRead, seam)
+        }
+        if scope == .both {
+            // The whole window in ONE walk, page included as far as the budget
+            // reaches. Named honestly: the page COMPETES with the chrome for
+            // the node budget here, which is exactly the failure `page` exists
+            // to avoid.
+            seam["scope"] = .string("both")
+            seam["web_area_path"] = .array(web.path.map { .int(Int64($0)) })
+            seam["scope_note"] = .string(
+                "the page shares the node budget with the browser chrome in this scope — use "
+                + "scope:\"page\" to spend the whole budget on the page"
+            )
+            return (windowRead, seam)
+        }
+        let pageWalk = MacAccessibilityReader.walk(
+            source: accessibilitySource,
+            root: web.ref,
+            limits: limits
+        )
+        // Re-base every path onto the web area's own path from the window root.
+        let rebased = MacAXTreeSnapshot(
+            nodes: pageWalk.nodes.map { MacAXNode(attributes: $0.attributes, path: web.path + $0.path) },
+            truncated: pageWalk.truncated,
+            truncationReasons: pageWalk.truncationReasons,
+            skippedAtLeast: pageWalk.skippedAtLeast
+        )
+        let pageFocus = accessibilitySource.focusedElementPath(relativeTo: web.ref).map { web.path + $0 }
+        let chromeControls = windowRead.snapshot.nodes.filter { node in
+            MacPerceptionCompiler.isInteractive(node.attributes)
+                && !node.path.starts(with: web.path)
+        }.count
+        seam["scope"] = .string("page")
+        seam["web_area_path"] = .array(web.path.map { .int(Int64($0)) })
+        seam["chrome"] = .string(
+            "browser chrome: toolbar + bookmarks bar, \(chromeControls) control(s) — "
+            + "call mac_look {scope: \"chrome\"} to address them"
+        )
+        seam["chrome_controls"] = .int(Int64(chromeControls))
+        return (
+            MacAXRead(
+                snapshot: rebased,
+                app: windowRead.app,
+                // The WINDOW's title, not the web area's: it is what names the
+                // window in every other channel, and dropping it here would
+                // make the page look like it belonged to nothing.
+                rootTitle: windowRead.rootTitle,
+                focusPath: pageFocus,
+                root: web.ref,
+                // The page walk is still a walk OF THAT WINDOW — the frame it
+                // mints has to be re-findable, and the web area is not a window.
+                windowIdentity: windowRead.windowIdentity
+            ),
+            seam
+        )
     }
 
     private static func axTruncationJSON(_ snapshot: MacAXTreeSnapshot, limits: MacAXLimits) -> [String: JSONValue] {
@@ -1862,6 +2170,370 @@ public actor SwiftNativeMacControl: MacControlClient {
         return MacControlResult(
             ok: true,
             action: "ax_tree",
+            output: .object(output),
+            error: nil,
+            durationMs: Int(now().timeIntervalSince(started) * 1000),
+            viaSwift: true
+        )
+    }
+
+    // MARK: - native-look item 2: `look`
+
+    /// The Chromium/Electron live seam. Runs BEFORE the walk that matters.
+    ///
+    /// Returns the snapshot to compile from. Order:
+    ///   1. one ordinary walk;
+    ///   2. if the frontmost app looks Chromium-family (known bundle id, or a
+    ///      web-less shell-sized window), set both enhanced-AX flags on the APP
+    ///      element and read them back;
+    ///   3. if the first walk found no `AXWebArea`, poll every 500 ms for up to
+    ///      4 s and re-walk EXACTLY ONCE more.
+    ///
+    /// The flag is left set (see `MacChromiumAccessibility` for the lifetime
+    /// rule) and cleared lazily here when the frontmost app changed or the last
+    /// frame expired — never by a background timer.
+    ///
+    /// - Parameters anchorPid/anchorWindow: gpt-5.5 round-3 B2. The POST-ACT
+    ///   read must be of the window the act happened in, not of whatever is
+    ///   frontmost by then: a correct background act followed by a frontmost
+    ///   read describes — and then STORES AS THE NEW FRAME — a different app's
+    ///   window entirely. When they are given, every walk here (including the
+    ///   Chromium settle re-walk) targets that window, and the outcome carries
+    ///   the anchor failure instead of silently reading something else.
+    private func lookSnapshot(
+        limits: MacAXLimits,
+        scope: MacLookScope = .page,
+        anchorPid: Int32? = nil,
+        anchorWindow: MacAXWindowIdentity? = nil
+    ) async -> (read: MacAXRead?, seam: [String: JSONValue], anchor: MacAnchoredRead?) {
+        var seam: [String: JSONValue] = [
+            "chromium_family": .bool(false),
+            "enhanced_ax_set": .bool(false),
+            "rewalked": .bool(false),
+        ]
+        func anchoredRead() -> MacAnchoredRead {
+            anchoredSnapshot(limits: limits, pid: anchorPid, window: anchorWindow)
+        }
+        let firstAnchor = anchoredRead()
+        var read: MacAXRead? = {
+            if case .read(let hit) = firstAnchor { return hit }
+            return nil
+        }()
+        // Only the ANCHORED call reports an anchor failure; an unanchored look
+        // has no window to have lost.
+        let anchorFailure: MacAnchoredRead? = {
+            guard anchorPid != nil || anchorWindow != nil else { return nil }
+            if case .read = firstAnchor { return nil }
+            return firstAnchor
+        }()
+        if anchorFailure != nil { return (nil, seam, anchorFailure) }
+
+        /// A2 — the page-first descent, applied to whatever walk we end up
+        /// with. Outside the live-source guard below on purpose: the ENHANCED-AX
+        /// flag needs a real AX app element, but finding the web area and
+        /// walking from it is ordinary reading that any source can answer, which
+        /// is also what makes it testable against a synthetic Chromium tree.
+        func scoped(
+            _ candidate: (read: MacAXRead?, seam: [String: JSONValue])
+        ) -> (read: MacAXRead?, seam: [String: JSONValue], anchor: MacAnchoredRead?) {
+            guard let value = candidate.read else { return (nil, candidate.seam, nil) }
+            let outcome = pageScoped(value, limits: limits, scope: scope)
+            var merged = candidate.seam
+            for (key, item) in outcome.seam { merged[key] = item }
+            return (outcome.read, merged, nil)
+        }
+
+        #if canImport(ApplicationServices) && os(macOS)
+        // The seam only exists for the LIVE source. A synthetic/unavailable
+        // source has no app element to flag, and pretending otherwise would be
+        // a stub that reports work it did not do.
+        guard accessibilitySource is SystemMacAXElementSource else { return scoped((read, seam)) }
+        // B2 — the ANCHOR's pid wins. Flagging (and later clearing) enhanced-AX
+        // on whatever is frontmost while reading an anchored background window
+        // would mutate a third app's accessibility state.
+        let pid = anchorPid
+            ?? read?.app?.processIdentifier
+            ?? accessibilitySource.frontmostApp()?.processIdentifier
+        // Lazy clear: the previous app's flag stops being the frame's flag the
+        // moment the frontmost app changes or the frame dies.
+        let previous = await MacChromiumAccessibilityState.shared.current()
+        let frameExpired = await lookFrameStore.isExpired(now: now())
+        if let previous, previous != pid || frameExpired {
+            SystemMacAXElementSource.setEnhancedAccessibility(pid: previous, enabled: false)
+            await MacChromiumAccessibilityState.shared.note(pid: nil)
+            seam["enhanced_ax_cleared_pid"] = .int(Int64(previous))
+        }
+
+        guard let pid,
+              MacChromiumAccessibility.looksChromium(
+                bundleId: read?.app?.bundleIdentifier,
+                snapshot: read?.snapshot
+              )
+        else { return scoped((read, seam)) }
+
+        seam["chromium_family"] = .bool(true)
+        // Chrome's setter returns kAXErrorCannotComplete and the flag STILL
+        // takes effect, so the status is discarded and the READ-BACK is the
+        // evidence. A false read-back is reported, not treated as fatal.
+        let readsBack = SystemMacAXElementSource.setEnhancedAccessibility(pid: pid, enabled: true)
+        seam["enhanced_ax_set"] = .bool(readsBack)
+        await MacChromiumAccessibilityState.shared.note(pid: pid)
+
+        if !MacChromiumAccessibility.hasWebArea(read?.snapshot) {
+            let deadline = now().addingTimeInterval(MacChromiumAccessibility.settleSeconds)
+            while now() < deadline {
+                try? await Task.sleep(
+                    nanoseconds: UInt64(MacChromiumAccessibility.pollSeconds * 1_000_000_000)
+                )
+                if case .read(let candidate) = anchoredRead(),
+                   MacChromiumAccessibility.hasWebArea(candidate.snapshot) {
+                    read = candidate
+                    seam["rewalked"] = .bool(true)
+                    break
+                }
+            }
+            if seam["rewalked"] != .bool(true) {
+                // Exactly one re-walk even when no web area ever appeared, so a
+                // slow-but-enhanced tree is not missed and the caller learns the
+                // settle produced nothing.
+                if case .read(let candidate) = anchoredRead() {
+                    read = candidate
+                }
+                seam["rewalked"] = .bool(true)
+                seam["web_area_after_settle"] = .bool(MacChromiumAccessibility.hasWebArea(read?.snapshot))
+            }
+        }
+        #endif
+        return scoped((read, seam))
+    }
+
+    /// `mac_look` — the perception compiler's tool surface.
+    ///
+    /// Three grades of attention over ONE walk. `stare` is DELEGATED to
+    /// `handleAXTree` rather than reimplemented, so the full-tree payload can
+    /// never drift from `mac_ax_tree`'s.
+    private func handleLook(_ body: [String: JSONValue]) async -> MacControlResult {
+        let started = now()
+        let grade = (body.stringValue("grade") ?? "look").lowercased()
+        guard ["glance", "look", "stare"].contains(grade) else {
+            return MacControlResult(
+                ok: false,
+                action: "look",
+                output: .object([
+                    "error": .string("unknown_grade"),
+                    "grade": .string(grade),
+                    "message": .string("grade must be one of: glance, look, stare"),
+                ]),
+                error: "unknown_grade",
+                durationMs: Int(now().timeIntervalSince(started) * 1000),
+                viaSwift: true
+            )
+        }
+        guard accessibilitySource.isTrusted() else { return axUntrustedResult(action: "look") }
+
+        if grade == "stare" {
+            // The SAME payload mac_ax_tree returns, from the same handler.
+            let tree = handleAXTree(body)
+            var output: [String: JSONValue] = [:]
+            if case .object(let object) = tree.output { output = object }
+            output["grade"] = .string("stare")
+            return MacControlResult(
+                ok: tree.ok,
+                action: "look",
+                output: .object(output),
+                error: tree.error,
+                durationMs: Int(now().timeIntervalSince(started) * 1000),
+                viaSwift: true
+            )
+        }
+
+        guard let scope = MacLookScope.parse(body.stringValue("scope")) else {
+            return MacControlResult(
+                ok: false,
+                action: "look",
+                output: .object([
+                    "error": .string("unknown_scope"),
+                    "scope": body["scope"] ?? .null,
+                    "message": .string("scope must be one of: page, chrome, both"),
+                ]),
+                error: "unknown_scope",
+                durationMs: Int(now().timeIntervalSince(started) * 1000),
+                viaSwift: true
+            )
+        }
+        let limits = Self.axLimits(from: body)
+        let (read, seam, _) = await lookSnapshot(limits: limits, scope: scope)
+        guard let read else {
+            return MacControlResult(
+                ok: false,
+                action: "look",
+                output: .object([
+                    "trusted": .bool(true),
+                    "grade": .string(grade),
+                    "status": .string("no_frontmost_window"),
+                    "error": .string("no_frontmost_window"),
+                ]),
+                error: "no_frontmost_window",
+                durationMs: Int(now().timeIntervalSince(started) * 1000),
+                viaSwift: true
+            )
+        }
+
+        let percept = MacPerceptionCompiler.compile(
+            snapshot: read.snapshot,
+            app: read.app,
+            windowTitle: read.rootTitle,
+            // Same read epoch as the walk, anchored to the walked root.
+            focusPath: read.focusPath,
+            maxAffordances: Self.intValue(body, "max_affordances") ?? MacPerceptionCompiler.maxAffordances
+        )
+
+        // Render FIRST, so the frame mints handles only for the rows she will
+        // actually see (the byte budget may trim the tail) — "handles valid for
+        // this frame_id" means the handles in THIS payload. A glance shows no
+        // rows, so it mints every affordance and says how many are addressable.
+        let capturedAt = now()
+        let frameId = UUID().uuidString
+
+        /// Everything except the byte accounting, so the S5 loop below can
+        /// serialize the COMPLETE object — envelope, `how_to_read` and all —
+        /// rather than a percept plus a guessed reserve.
+        func envelopeJSON(_ rendering: MacLookPercept.LookRendering?) -> [String: JSONValue] {
+            var output: [String: JSONValue] = [
+                "trusted": .bool(true),
+                "grade": .string(grade),
+                "frame_id": .string(frameId),
+                "captured_at": .string(ISO8601DateFormatter().string(from: capturedAt)),
+                "frame_ttl_seconds": .int(Int64(MacLookFrameStore.ttlSeconds)),
+                "seam": .object(seam),
+                // Agent round 2 — `max_nodes`/`max_depth` read as "silently
+                // ignored" because nothing in the payload said what they
+                // resolved to. They are honored and CLAMPED (a caller may only
+                // lower them); now the payload says so out loud.
+                "limits": .object([
+                    "max_nodes": .int(Int64(limits.maxNodes)),
+                    "max_depth": .int(Int64(limits.maxDepth)),
+                    "hard_max_nodes": .int(Int64(MacAXLimits.hardMaxNodes)),
+                    "hard_max_depth": .int(Int64(MacAXLimits.hardMaxDepth)),
+                ]),
+            ]
+            if grade == "glance" {
+                output["glance"] = .string(percept.glanceLine())
+                output["addressable_handles"] = .int(Int64(percept.affordances.count))
+                output["how_to_read"] = .string(
+                    "One distilled line. Call mac_look {grade: \"look\"} for the addressable "
+                    + "affordances (\(percept.affordances.count) labeled control(s) in this frame), "
+                    + "or {grade: \"stare\"} for the full AX tree."
+                )
+            } else if let rendering {
+                if case .object(let lookObject) = rendering.json {
+                    for (key, value) in lookObject { output[key] = value }
+                }
+                output["glance"] = .string(percept.glanceLine())
+                output["percept_bytes"] = .int(Int64(rendering.bytes))
+                output["how_to_read"] = .string(
+                    "`affordances` are the things you can act on, each with a stable `handle` for "
+                    + "THIS frame_id and its `path` as the fallback. `unlabeled` counts the "
+                    + "interactive controls the app publishes no name for — they exist, they are "
+                    + "just unnamed. `readouts` are the read-only values on screen (a total, a "
+                    + "display, a status line) — what you can READ without touching anything. "
+                    + "Handles are valid only for the latest frame; take another look "
+                    + "if the screen may have changed."
+                )
+            }
+            return output
+        }
+
+        func serializedSize(_ object: [String: JSONValue]) -> Int {
+            (try? JSONValue.object(object).serializedData(pretty: false).count) ?? 0
+        }
+
+        var rendering: MacLookPercept.LookRendering? = grade == "look" ? percept.lookJSON() : nil
+        var output = envelopeJSON(rendering)
+        if grade == "look" {
+            // gpt-5.5 round-2 S5 — the EXACT final cap. The old code held back a
+            // fixed 768-byte reserve for the envelope and then measured; a
+            // window with a long title and a fat `seam` blew straight through
+            // `lookByteBudget` and the payload said `bytes: 6600` as if that
+            // were fine. Now the COMPLETE object (including its own `bytes`
+            // field, hence the slack) is serialized, and rows are trimmed until
+            // it really fits.
+            var reserve = MacPerceptionCompiler.lookEnvelopeReserve
+            var attempts = 0
+            while attempts < 8 {
+                var candidate = output
+                candidate["bytes"] = .int(Int64(MacPerceptionCompiler.lookByteBudget))
+                let size = serializedSize(candidate)
+                if size <= MacPerceptionCompiler.lookByteBudget { break }
+                let overshoot = size - MacPerceptionCompiler.lookByteBudget
+                reserve += overshoot + 64
+                let next = percept.lookJSON(envelopeReserve: reserve)
+                // The trimmer has nothing left to give: stop rather than spin.
+                if next.bytes >= (rendering?.bytes ?? Int.max) { rendering = next; output = envelopeJSON(next); break }
+                rendering = next
+                output = envelopeJSON(next)
+                attempts += 1
+            }
+        }
+
+        let renderedRows: Int? = rendering.map { rendering in
+            if case .object(let object) = rendering.json,
+               case .array(let rows)? = object["affordances"] { return rows.count }
+            return 0
+        }
+
+        // The frame is minted for BOTH structured grades: a glance that named a
+        // control she then cannot address would be a tease, and item 3's verbs
+        // resolve handles through exactly this store.
+        await lookFrameStore.record(MacLookFrame.from(
+            percept: percept,
+            frameId: frameId,
+            capturedAt: capturedAt,
+            windowTitle: read.rootTitle,
+            rendered: renderedRows,
+            // B1 — WHICH window this look was of. Without it `mac_act` can only
+            // re-find the app, and picks "focused, else main, else first"
+            // inside it.
+            windowIdentity: read.windowIdentity,
+            // Recorded so the NEXT act can tell "the window changed" from "the
+            // recompile ran under different bounds and lost rows".
+            caps: MacLookCompileCaps(
+                truncated: percept.truncated,
+                maxAffordances: Self.intValue(body, "max_affordances")
+                    ?? MacPerceptionCompiler.maxAffordances,
+                maxNodes: limits.maxNodes,
+                maxDepth: limits.maxDepth
+            )
+        ))
+
+        if grade == "look" {
+            // `bytes` is the WHOLE payload she receives, measured with the
+            // field itself in place — the number is the truth, not an estimate.
+            var measured = output
+            // Fixpoint, because the number's own digits are part of the
+            // payload: write the measured size, re-measure, repeat until it
+            // stops moving (two passes in practice, three at a digit boundary).
+            measured["bytes"] = .int(0)
+            var claimed = serializedSize(measured)
+            for _ in 0..<4 {
+                measured["bytes"] = .int(Int64(claimed))
+                let actual = serializedSize(measured)
+                if actual == claimed { break }
+                claimed = actual
+            }
+            output["bytes"] = .int(Int64(claimed))
+            let exact = serializedSize(output)
+            if exact > MacPerceptionCompiler.lookByteBudget {
+                // Never silently over budget: an envelope alone can exceed it
+                // (a pathological window title), and a caller sizing its context
+                // must be told rather than surprised.
+                output["byte_budget_exceeded"] = .bool(true)
+                output["byte_budget"] = .int(Int64(MacPerceptionCompiler.lookByteBudget))
+            }
+        }
+        return MacControlResult(
+            ok: true,
+            action: "look",
             output: .object(output),
             error: nil,
             durationMs: Int(now().timeIntervalSince(started) * 1000),
@@ -1976,6 +2648,13 @@ public actor SwiftNativeMacControl: MacControlClient {
     ///   • neither              → both flags false and how to grant them.
     private func handleView(_ body: [String: JSONValue]) async -> MacControlResult {
         let started = now()
+        // The four-verb semantic screen consumes the same frozen capture as
+        // mac_view, but its visual compiler must see the world rather than the
+        // human-facing numbered ink we draw on top of it. This is an internal
+        // rendering choice only: geometry, AX marks, redaction, permissions,
+        // view storage, and the public result contract remain unchanged.
+        let semanticRawFrame = body["semantic_raw_frame"] == .bool(true)
+        let semanticFocusVisualSurface = body["semantic_focus_visual_surface"] == .bool(true)
         let scope: MacScreenCaptureScope = {
             if case .bool(true)? = body["full_screen"] { return .fullScreen }
             if (body.stringValue("scope") ?? "").lowercased() == "full_screen" { return .fullScreen }
@@ -2080,21 +2759,56 @@ public actor SwiftNativeMacControl: MacControlClient {
             )
         }
 
-        // 4. Draw them, under the byte cap.
+        // 4. Draw them, under the byte cap. Pixel-first semantic perception
+        // gets the dominant canvas/image cropped from the native capture BEFORE
+        // PNG fitting. Otherwise a high-entropy moving canvas spends the whole
+        // window's byte budget before OCR ever sees its small status text.
         var imageDownscale: Double?
         var imageBytes: Int?
         if let shot, let geometry {
-            let placements = selection.marks.compactMap {
-                geometry.placement(mark: $0.mark, frame: $0.frame)
-            }
+            let semanticFocusFrame = semanticFocusVisualSurface
+                ? snapshot.flatMap {
+                    MacScreenViewBuilder.dominantVisualSurface(nodes: $0.nodes, geometry: geometry)
+                }
+                : nil
+            #if canImport(CoreGraphics)
+            let renderShot = semanticFocusFrame.flatMap { shot.cropped(to: $0) } ?? shot
+            #else
+            let renderShot = shot
+            #endif
+            let renderGeometry = MacScreenViewGeometry(shot: renderShot)
+            let placements = semanticRawFrame
+                ? []
+                : selection.marks.compactMap {
+                    renderGeometry.placement(mark: $0.mark, frame: $0.frame)
+                }
             let fitted = MacScreenViewBuilder.fitImage(maxBytes: maxImageBytes) { rung in
-                screenImageRenderer.renderPNG(shot: shot, placements: placements, downscale: rung)
+                screenImageRenderer.renderPNG(shot: renderShot, placements: placements, downscale: rung)
             }
             if let fitted {
                 output["image"] = .string(fitted.data.base64EncodedString())
                 output["image_format"] = .string("png")
+                output["image_annotations"] = .bool(!semanticRawFrame)
                 imageDownscale = fitted.downscale
                 imageBytes = fitted.data.count
+                output["image_origin"] = .object([
+                    "x": .double(renderGeometry.bounds.x),
+                    "y": .double(renderGeometry.bounds.y),
+                ])
+                output["image_logical_size"] = .object([
+                    "w": .double(renderGeometry.bounds.w),
+                    "h": .double(renderGeometry.bounds.h),
+                ])
+                output["image_pixel_size"] = .object([
+                    "w": .int(Int64(renderGeometry.pixelWidth)),
+                    "h": .int(Int64(renderGeometry.pixelHeight)),
+                ])
+                output["semantic_focus_frame"] = semanticFocusFrame.map { frame in
+                    .object([
+                        "x": .double(frame.x), "y": .double(frame.y),
+                        "w": .double(frame.w), "h": .double(frame.h),
+                    ])
+                } ?? .null
             } else {
                 imageFailure = .exceedsByteCap
             }
@@ -2119,10 +2833,12 @@ public actor SwiftNativeMacControl: MacControlClient {
                 "y": .double(geometry.bounds.y),
             ])
             output["scale"] = .double(geometry.reportedScale)
-            output["image_pixel_size"] = .object([
-                "w": .int(Int64(geometry.pixelWidth)),
-                "h": .int(Int64(geometry.pixelHeight)),
-            ])
+            if output["image_pixel_size"] == nil {
+                output["image_pixel_size"] = .object([
+                    "w": .int(Int64(geometry.pixelWidth)),
+                    "h": .int(Int64(geometry.pixelHeight)),
+                ])
+            }
         }
 
         // 5. Remember it, so `mark` can be resolved — and hand back its id.
@@ -3059,6 +3775,2125 @@ public actor SwiftNativeMacControl: MacControlClient {
         }
     }
 
+    // MARK: act — the CLOSED LOOP (native-look item 3)
+
+    /// The physical tier behind the model-facing `act`. The caller already
+    /// resolved a fresh named/ordinal target; this owner validates a bounded
+    /// gesture, plans it through `MacHandRepertoire`, and posts the balanced
+    /// sequence through the same gated event sink as click/keystroke/scroll.
+    private func handleHand(_ body: [String: JSONValue]) async -> MacControlResult {
+        let started = now()
+        if let refusal = injectionPreconditions(action: "hand", requiresSink: true) { return refusal }
+        if let refusal = await attentionActionRefusal(action: "hand", body: body) { return refusal }
+        guard let gesture = body.stringValue("gesture")?.lowercased(), !gesture.isEmpty else {
+            return injectionRefusal(action: "hand", error: "missing required field: gesture", status: 400)
+        }
+
+        func point(_ xKey: String = "x", _ yKey: String = "y") -> CGPoint? {
+            guard let x = Self.doubleValue(body, xKey), let y = Self.doubleValue(body, yKey),
+                  x.isFinite, y.isFinite, abs(x) <= 100_000, abs(y) <= 100_000 else { return nil }
+            return CGPoint(x: x, y: y)
+        }
+        let waitMs = max(0, min(Int((Self.doubleValue(body, "seconds") ?? 0.6) * 1000), 10_000))
+        var plan: [MacHandStep]
+        do {
+            switch gesture {
+            case "click", "double_click", "click_type":
+                guard let at = point() else {
+                    return injectionRefusal(action: "hand", error: "gesture needs finite x/y", status: 400)
+                }
+                let count = gesture == "double_click" ? 2 : 1
+                var steps = try MacHandRepertoire.click(button: .left, at: at, count: count)
+                if gesture == "click_type" {
+                    guard let text = body.stringValue("text"), !text.isEmpty else {
+                        return injectionRefusal(action: "hand", error: "click_type needs text", status: 400)
+                    }
+                    _ = try MacKeySyntax.validateText(text)
+                    steps += MacHandRepertoire.type(text: text)
+                }
+                plan = steps
+            case "hover":
+                guard let at = point() else {
+                    return injectionRefusal(action: "hand", error: "hover needs finite x/y", status: 400)
+                }
+                plan = MacHandRepertoire.hover(at: at, dwellMs: waitMs)
+            case "move":
+                guard let at = point() else {
+                    return injectionRefusal(action: "hand", error: "move needs finite x/y", status: 400)
+                }
+                plan = MacHandRepertoire.move(to: at)
+            case "hold":
+                guard let at = point() else {
+                    return injectionRefusal(action: "hand", error: "hold needs finite x/y", status: 400)
+                }
+                plan = try MacHandRepertoire.pressAndHold(button: .left, at: at, holdMs: waitMs)
+            case "drag":
+                guard let start = point(), let end = point("to_x", "to_y") else {
+                    return injectionRefusal(action: "hand", error: "drag needs finite x/y and to_x/to_y", status: 400)
+                }
+                plan = try MacHandRepertoire.drag(
+                    from: start,
+                    to: end,
+                    steps: 18,
+                    holdMs: min(waitMs, 1_500)
+                )
+            case "scroll":
+                guard let at = point() else {
+                    return injectionRefusal(action: "hand", error: "scroll needs finite x/y", status: 400)
+                }
+                let dy = max(-120, min(Self.intValue(body, "dy") ?? -6, 120))
+                plan = MacHandRepertoire.move(to: at)
+                    + MacHandRepertoire.scroll(dx: 0, dy: Int32(dy), unit: .line)
+            case "key":
+                guard let keys = body.stringValue("keys") else {
+                    return injectionRefusal(action: "hand", error: "key needs keys", status: 400)
+                }
+                plan = try MacKeySyntax.parseChords(keys).flatMap(MacHandRepertoire.chord)
+            case "hold_key":
+                guard let keys = body.stringValue("keys") else {
+                    return injectionRefusal(action: "hand", error: "hold_key needs one key or chord", status: 400)
+                }
+                let chords = try MacKeySyntax.parseChords(keys)
+                guard chords.count == 1, let chord = chords.first else {
+                    return injectionRefusal(action: "hand", error: "hold_key accepts exactly one key or chord", status: 400)
+                }
+                plan = try MacHandRepertoire.hold(
+                    modifiers: chord.modifiers,
+                    keys: [chord.keyCode]
+                ) { [.wait(milliseconds: waitMs)] }
+            default:
+                return injectionRefusal(
+                    action: "hand",
+                    error: "unknown gesture: \(gesture)",
+                    status: 400
+                )
+            }
+
+            if let rawHolding = body.stringValue("holding")?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !rawHolding.isEmpty {
+                guard gesture != "hold", gesture != "hold_key" else {
+                    return injectionRefusal(
+                        action: "hand",
+                        error: "holding cannot wrap another hold gesture",
+                        status: 400
+                    )
+                }
+                var modifiers: MacKeyModifiers = []
+                var keyCodes: [UInt16] = []
+                for token in rawHolding.split(whereSeparator: { $0.isWhitespace }).map(String.init) {
+                    if let modifier = MacKeySyntax.modifier(token.lowercased()) {
+                        modifiers.formUnion(modifier)
+                        continue
+                    }
+                    let chords = try MacKeySyntax.parseChords(token)
+                    guard chords.count == 1, let chord = chords.first else {
+                        return injectionRefusal(
+                            action: "hand",
+                            error: "each held key must be one key or chord",
+                            status: 400
+                        )
+                    }
+                    modifiers.formUnion(chord.modifiers)
+                    if !keyCodes.contains(chord.keyCode) { keyCodes.append(chord.keyCode) }
+                }
+                guard !modifiers.isEmpty || !keyCodes.isEmpty else {
+                    return injectionRefusal(action: "hand", error: "holding was empty", status: 400)
+                }
+                let inner = plan
+                plan = try MacHandRepertoire.hold(modifiers: modifiers, keys: keyCodes) { inner }
+            }
+        } catch {
+            return injectionRefusal(action: "hand", error: "invalid gesture: \(error)", status: 400)
+        }
+
+        guard !plan.isEmpty, MacHandRepertoire.isBalanced(plan) else {
+            return injectionRefusal(action: "hand", error: "gesture plan was empty or unbalanced", status: 400)
+        }
+
+        // Capture evidence inside the same canonical operation. Browser scroll
+        // and Page Down often change pixels while the accessibility document
+        // remains structurally identical, so the fused image participates in
+        // the comparison instead of relying on AX notifications alone.
+        func visibleEvidence(_ result: MacControlResult) -> [String: JSONValue]? {
+            guard result.ok, case .object(let output) = result.output else { return nil }
+            return [
+                "app": output["app"] ?? .null,
+                "window_title": output["window_title"] ?? .null,
+                "marks": output["marks"] ?? .null,
+                "text": output["text"] ?? .null,
+                "image": output["image"] ?? .null,
+            ]
+        }
+        var heldKeys: [UInt16] = []
+        var heldButtons: [MacMouseButton] = []
+        var lastPoint = CGPoint.zero
+        func recoverNeutral() {
+            for key in heldKeys.reversed() {
+                eventSink.post(key: MacKeyEvent(keyCode: key, down: false))
+            }
+            for button in heldButtons.reversed() {
+                eventSink.post(mouse: MacMouseEvent(
+                    phase: .up, button: button, x: lastPoint.x, y: lastPoint.y
+                ))
+            }
+        }
+
+        // A targeted wheel gesture first moves the pointer into the named
+        // region. That hover can change pixels by itself; it is positioning,
+        // not proof that the subsequent scroll moved anything. Establish the
+        // evidence baseline only after that leading move so a hover highlight
+        // can never turn an inert scroll into a verified one.
+        var executionPlan = plan
+        if gesture == "scroll", case .mouse(let event)? = executionPlan.first {
+            if let refusal = await attentionActionRefusal(action: "hand", body: body) {
+                return refusal
+            }
+            lastPoint = CGPoint(x: event.x, y: event.y)
+            eventSink.post(mouse: event)
+            executionPlan.removeFirst()
+        }
+
+        let beforeView = visibleEvidence(await handleView([
+            "max_marks": .int(60),
+            "max_text_items": .int(80),
+        ]))
+
+        for step in executionPlan {
+            if let refusal = await attentionActionRefusal(action: "hand", body: body) {
+                recoverNeutral()
+                return refusal
+            }
+            switch step {
+            case .key(let event):
+                eventSink.post(key: event)
+                if event.down { heldKeys.append(event.keyCode) }
+                else { heldKeys.removeAll { $0 == event.keyCode } }
+            case .mouse(let event):
+                lastPoint = CGPoint(x: event.x, y: event.y)
+                eventSink.post(mouse: event)
+                if event.phase == .down { heldButtons.append(event.button) }
+                else if event.phase == .up { heldButtons.removeAll { $0 == event.button } }
+            case .scroll(let event):
+                eventSink.post(scroll: event)
+            case .wait(let milliseconds):
+                if milliseconds > 0 {
+                    try? await Task.sleep(nanoseconds: UInt64(milliseconds) * 1_000_000)
+                }
+            }
+        }
+
+        let afterView = visibleEvidence(await handleView([
+            "max_marks": .int(60),
+            "max_text_items": .int(80),
+        ]))
+        let visibleChanged = beforeView != nil && afterView != nil && beforeView != afterView
+
+        return MacControlResult(
+            ok: true,
+            action: "hand",
+            output: .object([
+                "status": .string(visibleChanged ? "emitted_observed" : "emitted_unobserved"),
+                "gesture": .string(gesture),
+                "steps": .int(Int64(plan.count)),
+                "visible_changed": .bool(visibleChanged),
+                "verified": .bool(visibleChanged),
+                "holding": body["holding"] ?? .null,
+                "hand_neutral": .bool(heldKeys.isEmpty && heldButtons.isEmpty),
+                "verification_evidence": visibleChanged
+                    ? .string("fresh_fused_view_change")
+                    : .null,
+            ]),
+            error: nil,
+            durationMs: Int(now().timeIntervalSince(started) * 1000),
+            viaSwift: true
+        )
+    }
+
+    /// What one verb's mechanism did, before the effect is measured.
+    private struct MacActPerformed {
+        var ok: Bool
+        /// `ax_action` | `ax_set_value` | `cgevent_click_fallback` |
+        /// `keystroke_injection` | `cgevent_scroll_fallback` | `none`
+        var method: String
+        var requestedAction: String
+        var fallbackReason: String?
+        var error: String?
+        /// The element the verb actually acted ON. For `dismiss` this is the
+        /// modal's button, not the handle she named.
+        var target: MacAXActTarget
+        var postState: MacAXActTarget?
+        var actedHandle: String
+        var extra: [String: JSONValue] = [:]
+    }
+
+    /// `act` — perceive-act-verify in ONE call.
+    ///
+    /// The whole point of native-look item 3: today a computer-use step costs
+    /// three model turns (look, act, look again) and only the middle one is a
+    /// decision. This installs an AXObserver on the target app BEFORE it acts,
+    /// performs the verb, waits for the first notification plus an 80 ms quiet
+    /// window, re-compiles the look percept and DIFFS it against the frame she
+    /// acted from — and returns what changed, plus a NEW frame, in the same
+    /// result. The model never has to look again to learn whether it landed.
+    ///
+    /// GATES: identical to `ax_act`. It is in
+    /// `macControlAccessibilityInjectionActions`, so `dispatchCore` demands a
+    /// body-bound single-use `MacInjectionCapability`; `gatePreflightOutcome`
+    /// demands the accessibility category and an ACTIVE Full Mac window; and
+    /// `injectionPreconditions` demands the macOS TCC grant. A handle grants NO
+    /// authority — it only names a better target for an act that already
+    /// cleared every one of those.
+    private func handleAct(_ body: [String: JSONValue]) async -> MacControlResult {
+        let started = now()
+
+        // 1. THE REQUEST. Every malformed field is refused, never defaulted:
+        //    an act aimed at a guessed target is the failure this whole tool
+        //    exists to prevent.
+        guard let rawVerb = body.stringValue("verb")?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawVerb.isEmpty else {
+            return injectionRefusal(
+                action: "act",
+                error: "missing required field: verb (one of \(MacActVerb.allCases.map(\.rawValue).joined(separator: ", ")))",
+                status: 400
+            )
+        }
+        guard let verb = MacActVerb(rawValue: rawVerb.lowercased()) else {
+            return injectionRefusal(
+                action: "act",
+                error: "unknown_verb: \(rawVerb) is not one of "
+                    + MacActVerb.allCases.map(\.rawValue).joined(separator: ", "),
+                status: 400
+            )
+        }
+        guard let handle = body.stringValue("handle")?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !handle.isEmpty else {
+            return injectionRefusal(
+                action: "act",
+                error: "missing required field: handle (from the latest mac_look)",
+                status: 400
+            )
+        }
+        guard let frameId = body.stringValue("frame_id")?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !frameId.isEmpty else {
+            return injectionRefusal(
+                action: "act",
+                error: "missing required field: frame_id (the frame_id mac_look returned with that handle)",
+                status: 400
+            )
+        }
+        let text = body.stringValue("text")
+        if verb == .type, (text ?? "").isEmpty {
+            return injectionRefusal(
+                action: "act",
+                error: "missing required field: text (verb \"type\" needs the characters to type)",
+                status: 400
+            )
+        }
+        let direction: MacActScrollDirection = {
+            guard let raw = body.stringValue("direction")?.lowercased() else { return .down }
+            return MacActScrollDirection(rawValue: raw) ?? .down
+        }()
+        if verb == .scroll, let raw = body.stringValue("direction")?.lowercased(),
+           MacActScrollDirection(rawValue: raw) == nil {
+            return injectionRefusal(
+                action: "act",
+                error: "unknown_direction: \(raw) — direction must be up or down",
+                status: 400
+            )
+        }
+        let waitMs = MacActClosedLoop.clampedWaitMs(Self.intValue(body, "wait_ms"))
+
+        // 2. HANDLE → PATH, through the frame store and its own failure
+        //    vocabulary. Each failure names what to do next, because "that
+        //    didn't work" with no reason is what sends a model into a retry
+        //    loop against a screen that has moved on.
+        let resolved = await lookFrameStore.resolve(handle: handle, frameId: frameId, now: started)
+        let entry: MacLookFrameEntry
+        switch resolved {
+        case .failure(let failure):
+            return injectionRefusal(
+                action: "act",
+                error: failure.rawValue,
+                status: 409,
+                extra: [
+                    "handle": .string(handle),
+                    "frame_id": .string(frameId),
+                    "guidance": .string(failure.guidance),
+                ]
+            )
+        case .success(let hit):
+            entry = hit
+        }
+        guard let frame = await lookFrameStore.frame(frameId: frameId) else {
+            return injectionRefusal(
+                action: "act",
+                error: MacLookFrameStore.ResolveFailure.noFrame.rawValue,
+                status: 409,
+                extra: ["guidance": .string(MacLookFrameStore.ResolveFailure.noFrame.guidance)]
+            )
+        }
+
+        // 3. THE SAME GATES `ax_act` clears. The TCC grant, then the human's
+        //    physical priority.
+        if let refusal = injectionPreconditions(action: "act", requiresSink: false) {
+            return refusal
+        }
+        if let refusal = await attentionActionRefusal(action: "act", body: body) {
+            return refusal
+        }
+
+        // 4. LIVE RESOLVE — through the ACTUATOR's resolver, never a second
+        //    one, and ANCHORED TO THE FRAME'S PID (gpt-5.5 round-2 B2).
+        //
+        //    The old resolve walked `NSWorkspace.frontmostApplication` while the
+        //    effect observer went on the FRAME's pid: if anything stole front
+        //    between the look and the act, the same path/role/label could name a
+        //    plausible control in the WRONG app and the verb fired there, with
+        //    an observer watching an app that never moved. The pid she looked at
+        //    is the only app this may touch.
+        guard let framePid = frame.pid else {
+            return injectionRefusal(
+                action: "act",
+                error: "frame_app_gone",
+                status: 409,
+                extra: [
+                    "handle": .string(handle),
+                    "reason": .string("frame_recorded_no_pid"),
+                    "guidance": .string(
+                        "this frame recorded no process id, so the act cannot be anchored to the app "
+                        + "you looked at — call mac_look again"
+                    ),
+                ]
+            )
+        }
+        // 4b. …AND TO THE FRAME'S WINDOW (gpt-5.5 round-3 B1).
+        //
+        //     The pid anchor was necessary and not sufficient: inside the right
+        //     app the resolve still took "focused, else main, else first", so
+        //     two windows of one app plus a focus change between the look and
+        //     the act put the verb in the WRONG window while every pid check
+        //     passed. The window she looked at is matched by an identity that
+        //     outlives the element handle — pid + role/subrole + title + rect +
+        //     window index — and no match, or an ambiguous one, REFUSES.
+        let actWindows = accessibilityActSource.windows(pid: framePid)
+        guard !actWindows.isEmpty else {
+            return injectionRefusal(
+                action: "act",
+                error: "frame_app_gone",
+                status: 409,
+                extra: [
+                    "handle": .string(handle),
+                    "pid": .int(Int64(framePid)),
+                    "reason": .string("app_publishes_no_window"),
+                    "guidance": .string(
+                        "the app this frame was captured from publishes no window any more — nothing "
+                        + "was acted on; call mac_look again"
+                    ),
+                ]
+            )
+        }
+        let actWindow: MacAXWindowRef
+        if let recorded = frame.windowIdentity {
+            switch MacAXWindowIdentity.match(
+                recorded,
+                among: actWindows.map { (handle: $0, identity: $0.identity) }
+            ) {
+            case .matched(let hit, _):
+                actWindow = hit
+            case .gone:
+                return injectionRefusal(
+                    action: "act",
+                    error: "frame_window_gone",
+                    status: 409,
+                    extra: [
+                        "handle": .string(handle),
+                        "pid": .int(Int64(framePid)),
+                        "window": recorded.toJSON(),
+                        "windows_now": .int(Int64(actWindows.count)),
+                        "guidance": .string(
+                            "the window you looked at is not there any more (it closed, or the app "
+                            + "replaced it) — NOTHING was acted on; call mac_look at whatever is up now"
+                        ),
+                    ]
+                )
+            case .ambiguous(let reason):
+                return injectionRefusal(
+                    action: "act",
+                    error: "window_drifted",
+                    status: 409,
+                    extra: [
+                        "handle": .string(handle),
+                        "pid": .int(Int64(framePid)),
+                        "drifted_on": .string(reason),
+                        "window": recorded.toJSON(),
+                        "windows_now": .int(Int64(actWindows.count)),
+                        "guidance": .string(
+                            "this app now has more than one window that could be the one you looked at, "
+                            + "and acting on the wrong one is not recoverable — NOTHING was acted on; "
+                            + "call mac_look to re-anchor"
+                        ),
+                    ]
+                )
+            }
+        } else {
+            // A frame recorded before the window anchor existed, or by a source
+            // that cannot name a window. The pid anchor still holds and the act
+            // proceeds; it is not silently claimed to be window-anchored.
+            actWindow = actWindows[0]
+        }
+
+        let target: MacAXActTarget
+        switch accessibilityActSource.resolve(path: entry.path, inWindow: actWindow) {
+        case .resolved(let hit):
+            target = hit
+        case .windowGone:
+            return injectionRefusal(
+                action: "act",
+                error: "frame_window_gone",
+                status: 409,
+                extra: [
+                    "handle": .string(handle),
+                    "pid": .int(Int64(framePid)),
+                    "guidance": .string(
+                        "the window you looked at went away between matching it and resolving that "
+                        + "handle — NOTHING was acted on; call mac_look again"
+                    ),
+                ]
+            )
+        case .windowDrifted(let reason):
+            return injectionRefusal(
+                action: "act",
+                error: "window_drifted",
+                status: 409,
+                extra: [
+                    "handle": .string(handle),
+                    "pid": .int(Int64(framePid)),
+                    "drifted_on": .string(reason),
+                    "guidance": .string(
+                        "that app's windows can no longer be told apart — NOTHING was acted on; call "
+                        + "mac_look to re-anchor"
+                    ),
+                ]
+            )
+        case .appGone:
+            return injectionRefusal(
+                action: "act",
+                error: "frame_app_gone",
+                status: 409,
+                extra: [
+                    "handle": .string(handle),
+                    "pid": .int(Int64(framePid)),
+                    "app": frame.appName.map { .string($0) } ?? .null,
+                    "guidance": .string(
+                        "the app this frame was captured from is no longer running (or publishes no "
+                        + "window any more) — nothing was acted on; call mac_look again"
+                    ),
+                ]
+            )
+        case .pathNotFound:
+            return injectionRefusal(
+                action: "act",
+                error: MacAccessibilityActuator.Failure.pathNotFound.rawValue,
+                status: 404,
+                extra: [
+                    "handle": .string(handle),
+                    "path": .array(entry.path.map { .int(Int64($0)) }),
+                    "pid": .int(Int64(framePid)),
+                    "guidance": .string("the element that handle named is gone — call mac_look again"),
+                ]
+            )
+        }
+
+        // 5. THE DRIFT GUARD. Between the look and the act the app may have
+        //    rebuilt the window, and a child-index path would then address a
+        //    DIFFERENT control. Pressing it would be "press Save" pressing
+        //    "Delete". Never act on something she did not name.
+        if let reason = MacActClosedLoop.driftReason(
+            expectedRole: entry.role,
+            expectedLabel: entry.label,
+            liveRole: target.role,
+            liveTitle: target.title,
+            liveValue: target.value
+        ) {
+            return injectionRefusal(
+                action: "act",
+                error: "handle_drifted",
+                status: 409,
+                extra: [
+                    "handle": .string(handle),
+                    "drifted_on": .string(reason),
+                    "expected": .object([
+                        "role": .string(entry.role),
+                        "label": entry.label.map {
+                            MacScreenViewTextRedaction.redactedLegendString($0, valueChars: MacAXLimits.hardValueChars)
+                        } ?? .null,
+                    ]),
+                    "found": .object([
+                        "role": .string(target.role),
+                        "label": (target.title ?? target.value).map {
+                            MacScreenViewTextRedaction.redactedLegendString($0, valueChars: MacAXLimits.hardValueChars)
+                        } ?? .null,
+                    ]),
+                    "guidance": .string(
+                        "that handle no longer names the control it did — the window changed; call mac_look again"
+                    ),
+                ]
+            )
+        }
+
+        // 5b. THE IDENTITY RE-CHECK (gpt-5.5 round-2 B3 / Agent #3b).
+        //
+        //     Role+label alone passes the worst realistic drift: two buttons
+        //     both labeled "Send", the one above disappears, and the handle she
+        //     named now addresses the OTHER one — same role, same label, wrong
+        //     control. So the live window is RE-COMPILED through the same
+        //     walker and the same compiler the look used, and the element at
+        //     her path must still render the SAME handle. For a handle that was
+        //     position-derived to begin with (`ambiguous`), the rendered handle
+        //     is by construction unable to tell the siblings apart, so the
+        //     recorded frame RECT must match too.
+        let identityLimits = Self.axLimits(from: body)
+        // B1 — re-read the FRAME'S WINDOW, not the app's focused one. Comparing
+        // the handle against a walk of the app's other window is a drift check
+        // that verifies the wrong tree: it either passes by luck or refuses
+        // every act while the real target sits there untouched.
+        let identityAnchor = anchoredSnapshot(
+            limits: identityLimits,
+            pid: framePid,
+            window: frame.windowIdentity
+        )
+        let identityRead: MacAXRead
+        switch identityAnchor {
+        case .read(let hit):
+            identityRead = hit
+        case .appGone, .windowGone, .windowDrifted:
+            // Nothing to verify against and nothing to act on: the frame is
+            // dead, so it must stop resolving handles as well.
+            await lookFrameStore.invalidate()
+            let (error, reason): (String, String) = {
+                switch identityAnchor {
+                case .windowGone: return ("frame_window_gone", "window_gone_before_verify")
+                case .windowDrifted(let why): return ("window_drifted", why)
+                default: return ("frame_app_gone", "no_window_to_verify_against")
+                }
+            }()
+            return injectionRefusal(
+                action: "act",
+                error: error,
+                status: 409,
+                extra: [
+                    "handle": .string(handle),
+                    "pid": .int(Int64(framePid)),
+                    "reason": .string(reason),
+                    "guidance": .string(
+                        "there is no window to re-check that handle against — NOTHING was acted on; "
+                        + "call mac_look again"
+                    ),
+                ]
+            )
+        }
+        // The SAME scoping the look ran under, or a page handle would be
+        // compared against a window walk that never reaches the page and every
+        // act on a web control would refuse as drift.
+        let identityScoped = pageScoped(
+            identityRead,
+            limits: identityLimits,
+            scope: MacLookScope.parse(body.stringValue("scope")) ?? .page
+        ).read
+        let identityPercept = MacPerceptionCompiler.compile(
+            snapshot: identityScoped.snapshot,
+            app: identityScoped.app,
+            windowTitle: identityScoped.rootTitle,
+            focusPath: identityScoped.focusPath,
+            maxAffordances: Self.intValue(body, "max_affordances") ?? MacPerceptionCompiler.maxAffordances
+        )
+        // The live element is looked up in the SAME channels the frame entry
+        // could have been minted from — affordances at that path, else the
+        // recompiled FOCUS when the focus sits there. An unlabeled focused
+        // control (Notes' empty note body) is never an affordance, so an
+        // affordance-only lookup refused every act on it as `element_absent`.
+        if let drift = MacActClosedLoop.identityDrift(
+            entry: entry,
+            live: MacActClosedLoop.liveIdentity(entry: entry, percept: identityPercept)
+        ) {
+            return injectionRefusal(
+                action: "act",
+                error: "handle_drifted",
+                status: 409,
+                extra: [
+                    "handle": .string(handle),
+                    "drifted_on": .string(drift.on),
+                    "expected": .object([
+                        "role": .string(entry.role),
+                        "handle": .string(entry.handle),
+                        "label": entry.labelJSON ?? entry.label.map {
+                            MacScreenViewTextRedaction.redactedLegendString($0, valueChars: MacAXLimits.hardValueChars)
+                        } ?? .null,
+                    ]),
+                    "found": drift.found,
+                    "guidance": .string(
+                        "the control at that position is no longer the one that handle named — the "
+                        + "window changed under you; call mac_look again"
+                    ),
+                ]
+            )
+        }
+
+        // 6. ARM THE OBSERVER *BEFORE* ACTING. A loop that installs after the
+        //    act races the effect and loses on a fast app (the spike measured
+        //    30 ms). The guard removes it on EVERY exit — success, error,
+        //    timeout, or an unwinding cancellation.
+        //
+        //    NO OBSERVER, NO ACT (gpt-5.5 round-2 B2). The closed loop's whole
+        //    promise is that she never has to re-look to learn whether the act
+        //    landed; firing a verb with nothing watching the app is a blind
+        //    press wearing the loop's costume. `none_observed` (the app fired
+        //    nothing) stays a real, reported outcome — this is the different
+        //    case where the subscription itself could not be made.
+        // 6b. THE KEY-WINDOW GATE (Agent round 7, envelope 173E1B08).
+        //
+        //     Every anchor up to here constrains where we READ and where we
+        //     perform AX ACTIONS. None of them constrains a CGEvent: the window
+        //     server delivers synthesized input to whatever is KEY. With Chrome
+        //     frontmost and a Finder frame, `open`'s select-then-⌘↓ posted the
+        //     chord into Chrome and the envelope still said `acted`.
+        //
+        //     Computed HERE (one pair of AX reads, before anything is performed)
+        //     and handed to `performAct`, which consults it at each site that
+        //     would synthesize input — and ONLY there. A verb that carries out
+        //     through pure AX (`AXPress`, `AXSetValue`) targets its element
+        //     directly, steals no focus and reaches no other app, and acting on
+        //     a background window that way is an established capability with a
+        //     test behind it (`pidAnchoredRead_neverReportsTheFrontmostAppsIdentity`).
+        //     Gating those too would have traded a real bug for a real
+        //     regression.
+        let focusedWindowNow = accessibilityActSource.focusedWindow(pid: framePid)
+        let inputRefusal = MacActClosedLoop.keyWindowRefusal(
+            framePid: framePid,
+            frontmostPid: accessibilitySource.frontmostApp()?.processIdentifier,
+            frontmostName: accessibilitySource.frontmostApp()?.name,
+            // `actWindow` is the window this frame was already matched to, so
+            // the key question is plain handle equality against the focused one
+            // — and since round 9 the live source mints ONE handle per element,
+            // so that equality answers about the window rather than about two
+            // counter values (`SystemMacAXActSource.mint`).
+            frameWindowHandle: actWindow.handle,
+            focusedWindowHandle: focusedWindowNow?.handle,
+            frameWindowTitle: actWindow.identity.title,
+            focusedWindowTitle: focusedWindowNow?.identity.title,
+            appWindowCount: focusedWindowNow == nil ? actWindows.count : nil
+        )
+
+        let collector = MacAXEffectCollector()
+        let observerGuard = MacAXEffectObserverGuard(
+            effectObserverSource.install(
+                pid: framePid,
+                kinds: MacActClosedLoop.notificationKinds,
+                onNotification: { [collector] notification in collector.record(notification) }
+            )
+        )
+        defer { observerGuard.stop() }
+        let observerInstalled = observerGuard.isInstalled
+        guard observerInstalled else {
+            return injectionRefusal(
+                action: "act",
+                error: "observer_unavailable",
+                status: 409,
+                extra: [
+                    "handle": .string(handle),
+                    "pid": .int(Int64(framePid)),
+                    "guidance": .string(
+                        "no accessibility notification could be subscribed on that app, so the effect "
+                        + "of this act could not be observed — NOTHING WAS ACTED ON. Check that the app "
+                        + "is still running and try mac_look again."
+                    ),
+                ]
+            )
+        }
+
+        // 7. PERFORM.
+        let performedAt = now()
+        let performed = performAct(
+            verb: verb,
+            handle: handle,
+            entry: entry,
+            frame: frame,
+            framePid: framePid,
+            actWindow: actWindow,
+            target: target,
+            text: text,
+            direction: direction,
+            inputRefusal: inputRefusal
+        )
+        await screenViewStore.invalidate()
+
+        guard let performed else {
+            // Only reachable for a verb whose mechanism does not exist on this
+            // element — reported by name, never as a silent no-op.
+            return injectionRefusal(
+                action: "act",
+                error: verb == .dismiss ? "no_dismiss_target" : "verb_not_supported_on_element",
+                status: 409,
+                extra: [
+                    "verb": .string(verb.rawValue),
+                    "handle": .string(handle),
+                    "element": .object([
+                        "role": .string(target.role),
+                        "actions": .array(target.actions.map { .string($0) }),
+                    ]),
+                    "guidance": .string(
+                        verb == .dismiss
+                            ? "no modal with a Cancel/Close/Dismiss/Done/OK button in this frame, and the "
+                                + "element advertises no AXCancel — look again, or act on a specific handle"
+                            : "this element exposes no mechanism for that verb"
+                    ),
+                ]
+            )
+        }
+
+        // 8. WAIT FOR THE EFFECT. Nothing arriving inside wait_ms is a REAL
+        //    outcome, not a failure: it means this app published no
+        //    notification, which the caller needs to know.
+        let clock = now
+        // A NAVIGATION verb is watched until the surface actually transitions,
+        // not until the first notification of any kind (Agent round 7, envelope
+        // 4E998341: the selection fired in milliseconds, the loop stopped
+        // watching, and Finder's retitle — the signal `navigated` is DEFINED by
+        // — arrived after the recompile had already read the old title). An
+        // explicit `wait_ms` from the caller still wins; this only raises the
+        // DEFAULT, and it is a deadline, not a sleep.
+        let navigationVerb = MacActClosedLoop.navigationVerbs.contains(verb)
+        let effectWaitMs = navigationVerb && Self.intValue(body, "wait_ms") == nil
+            ? MacActClosedLoop.clampedWaitMs(MacActClosedLoop.navigationWaitMs)
+            : waitMs
+        let wait = await MacActClosedLoop.waitForEffect(
+            collector: collector,
+            waitMs: effectWaitMs,
+            startedAt: performedAt,
+            clock: { clock() },
+            until: navigationVerb ? MacActClosedLoop.navigationNotificationKinds : []
+        )
+        observerGuard.stop()
+
+        // 9. RE-COMPILE the same look percept and DIFF it against the frame.
+        let limits = Self.axLimits(from: body)
+        // B2 — the post-act read is of the FRAME'S WINDOW, never of whatever is
+        // frontmost by now. The act itself was already pid+window anchored; a
+        // frontmost re-read would then describe another app's window as "what
+        // changed" AND store it as the new frame, so the next verb would act
+        // from a description of something she never looked at.
+        let (read, seam, postAnchor) = await lookSnapshot(
+            limits: limits,
+            scope: MacLookScope.parse(body.stringValue("scope")) ?? .page,
+            anchorPid: framePid,
+            anchorWindow: frame.windowIdentity
+        )
+        let redactValue = verb == .type
+                // Did `open` land on an ancestor of the handle she named? `acted_on`
+        // is set by performAct only for the open verb, and only it knows.
+        let actRedirected: Bool = {
+            guard case .object(let actedOn)? = performed.extra["acted_on"],
+                  case .bool(true)? = actedOn["redirected"] else { return false }
+            return true
+        }()
+var effect: [String: JSONValue] = [
+            "observed": .bool(wait.observed),
+            "observer_installed": .bool(observerInstalled),
+            "wait_ms": .int(Int64(waitMs)),
+            "notifications": .array(wait.notifications.map { .string($0) }),
+            "notification_count": .int(Int64(wait.notificationCount)),
+            "acted_element": .object([
+                "handle": .string(performed.actedHandle),
+                // REDIRECT-AWARE (gpt-5.5 round-5 review). `open` can act on an
+                // ANCESTOR of the handle, and then the frame entry's label and
+                // value belong to a DIFFERENT element than the one described
+                // here — "handle = filename cell, before = row" was readable as
+                // the row being named `.agents`. When the act was redirected the
+                // entry's label/value are withheld and the element speaks for
+                // itself; `acted_on` carries the redirect, and the redaction
+                // verdict stays the conservative one either way.
+                "before": Self.actedElementJSON(
+                    performed.target,
+                    redactingValue: redactValue || (actRedirected && entry.secret),
+                    labelJSON: actRedirected ? nil : entry.labelJSON,
+                    valueJSON: actRedirected ? nil : entry.valueJSON
+                ),
+                // The post-act read carries NO compile context, so a value the
+                // look hid would come back in the clear here. The frame's own
+                // verdict decides: secret before ⇒ secret after, digest only.
+                "after": performed.postState.map {
+                    Self.actedElementJSON(
+                        $0,
+                        redactingValue: redactValue || entry.secret,
+                        labelJSON: (entry.secret && !actRedirected) ? entry.labelJSON : nil
+                    )
+                } ?? .null,
+            ]),
+        ]
+        if let firstMs = wait.firstNotificationMs {
+            effect["first_notification_ms"] = .int(Int64(firstMs))
+        }
+        if wait.dropped > 0 { effect["notifications_dropped"] = .int(Int64(wait.dropped)) }
+        // An observer that could not be installed never gets here: B2 refuses
+        // the act outright rather than pressing with nothing watching. The only
+        // remaining "no evidence" case is the honest one — the app fired
+        // nothing inside wait_ms, which is itself an answer.
+        if !wait.observed {
+            effect["reason"] = .string("none_observed")
+        }
+
+        var output: [String: JSONValue] = [
+            "ok": .bool(performed.ok),
+            // Agent acceptance round 2, Finder `open` — the event WAS delivered
+            // (AXOpen refused, the CGEvent double-click fallback ran) and the
+            // app published nothing, the title did not move and the glance was
+            // identical. Reporting that as `acted` calls an unobserved act a
+            // success. `ok`/`performed` keep their meaning — the event went out;
+            // the STATUS says whether anything was seen to happen. `verified`
+            // stays false either way: observation is evidence, not settlement.
+            // Round 4, Finder `open`: one AXRowCountChanged was enough to call
+            // an act that navigated NOWHERE `acted`. The classifier below is
+            // the single place that verdict is made; this seeds it with the
+            // no-diff-yet answer (correct for the window-died early return
+            // just past this point) and the post-diff recompute overrides it
+            // once there is a percept to weigh.
+            "status": .string(MacActClosedLoop.classify(
+                performedOK: performed.ok,
+                verb: verb,
+                notificationObserved: wait.observed,
+                diff: nil
+            ).status),
+            "verb": .string(verb.rawValue),
+            "handle": .string(handle),
+            "performed": .bool(performed.ok),
+            "method": .string(performed.method),
+            "requested_action": .string(performed.requestedAction),
+            "path": .array(entry.path.map { .int(Int64($0)) }),
+            "seam": .object(seam),
+            // The closed loop OBSERVES; it does not claim the intended
+            // consequence happened. `effect.observed` is the evidence, and it
+            // is the caller's to judge — same honesty line `ax_act` holds.
+            "verified": .bool(false),
+            "value_redacted": .bool(redactValue),
+        ]
+        output["fallback_reason"] = performed.fallbackReason.map { .string($0) } ?? .null
+        // Agent acceptance round 1, finding B — the act is NOT refused for an
+        // ordinal handle (that would make Finder unusable), but a caller must be
+        // able to see that it acted on a POSITION rather than on an identity.
+        if entry.ambiguous {
+            output["handle_ambiguous"] = .bool(true)
+            output["handle_ambiguity"] = .string(
+                "that handle was a position-derived ordinal among identical elements — it names "
+                + "whatever now sits at that position; re-look if the container may have reordered"
+            )
+        }
+        for (key, value) in performed.extra { output[key] = value }
+        if let error = performed.error { output["error"] = .string(error) }
+
+        guard let read else {
+            // The window went away under the act (she closed it, or dismissed
+            // the last sheet, or the act itself closed it). That is a real
+            // outcome and the frame must die with it — a handle from a window
+            // that no longer exists must never resolve.
+            //
+            // B2 — and it is NAMED. "no_frontmost_window" was the only answer
+            // when the post-act read was frontmost-anchored; an anchored read
+            // can distinguish the app exiting from the window closing from two
+            // windows now being indistinguishable, and the caller acts
+            // differently on each.
+            await lookFrameStore.invalidate()
+            let (percept, note): (String, String) = {
+                switch postAnchor {
+                case .appGone?:
+                    return (
+                        "frame_app_gone",
+                        "the act ran, but the app you looked at no longer publishes a window — the old "
+                        + "frame is discarded; call mac_look when it is back"
+                    )
+                case .windowGone?:
+                    return (
+                        "frame_window_gone",
+                        "the act ran, and the window you looked at is gone (it closed, or the act closed "
+                        + "it) — the old frame is discarded; call mac_look at whatever is up now"
+                    )
+                case .windowDrifted(let reason)?:
+                    return (
+                        "window_drifted:\(reason)",
+                        "the act ran, but that app now has more than one window that could be the one "
+                        + "you looked at, so nothing was re-read — the old frame is discarded; call "
+                        + "mac_look to re-anchor"
+                    )
+                case .read?, nil:
+                    return (
+                        "no_frontmost_window",
+                        "the act ran, but there is no window to look at afterwards — the old frame is "
+                        + "discarded; call mac_look when a window is up again"
+                    )
+                }
+            }()
+            effect["percept"] = .string(percept)
+            output["effect"] = .object(effect)
+            output["frame_id"] = .null
+            output["frame_invalidated"] = .bool(true)
+            output["glance"] = .null
+            output["how_to_read"] = .string(note)
+            return MacControlResult(
+                ok: performed.ok,
+                action: "act",
+                output: .object(output),
+                error: performed.error,
+                durationMs: Int(now().timeIntervalSince(started) * 1000),
+                viaSwift: true
+            )
+        }
+
+        let after = MacPerceptionCompiler.compile(
+            snapshot: read.snapshot,
+            app: read.app,
+            windowTitle: read.rootTitle,
+            // Same read epoch as the post-act walk, anchored to its root.
+            focusPath: read.focusPath,
+            maxAffordances: Self.intValue(body, "max_affordances") ?? MacPerceptionCompiler.maxAffordances
+        )
+        // The bounds THIS compile ran under, so the diff can say whether its
+        // added/removed census is comparable with the look's (Agent round 2:
+        // 29 added / 1 removed was a capped recompile, not navigation).
+        let afterCaps = MacLookCompileCaps(
+            truncated: after.truncated,
+            maxAffordances: Self.intValue(body, "max_affordances") ?? MacPerceptionCompiler.maxAffordances,
+            maxNodes: limits.maxNodes,
+            maxDepth: limits.maxDepth
+        )
+        let diff = MacActClosedLoop.diff(
+            before: frame,
+            after: after,
+            afterWindowTitle: read.rootTitle,
+            afterCaps: afterCaps
+        )
+        for (key, value) in Self.effectDiffJSON(diff, valueChars: limits.valueChars) {
+            effect[key] = value
+        }
+        // THE VERDICT, now that there is evidence to weigh. A navigation verb
+        // whose window did not move is `acted_unobserved` even though the app
+        // published something — see `MacActClosedLoop.classify`.
+        let classification = MacActClosedLoop.classify(
+            performedOK: performed.ok,
+            verb: verb,
+            notificationObserved: wait.observed,
+            diff: diff,
+            // The label she NAMED — Finder retitles to the opened folder, so
+            // this is what the destination is checked against.
+            intendedTarget: entry.label,
+            // VERB-SEMANTIC for `type`: the text we tried to land, the acted
+            // element's value BEFORE (from the pre-act resolve — without it, a
+            // pre-existing substring reads as a landed edit), and what the
+            // field reads back after. Compared in memory only — none of these
+            // are ever echoed into a payload, so a secret stays a secret.
+            // A secure field reads back a MASK — a non-empty string that can
+            // never contain the typed text — so comparing against it would
+            // call a landed edit "not in field". The SAME breadth the look
+            // lane uses to redact (role + label hints; subrole is not carried
+            // on MacAXActTarget) gates it to the honest `edit_unverifiable`
+            // branch instead.
+            typedText: verb == .type ? body.stringValue("text") : nil,
+            valueBefore: MacScreenViewBuilder.isSecretField(
+                role: performed.target.role, subrole: nil, label: entry.label
+            ) ? nil : performed.target.value,
+            valueAfter: MacScreenViewBuilder.isSecretField(
+                role: performed.target.role, subrole: nil, label: entry.label
+            ) ? nil : performed.postState?.value
+        )
+        output["status"] = .string(classification.status)
+        if let reason = classification.reason {
+            output["status_reason"] = .string(reason)
+            // Same value as the `none_observed` written above when nothing was
+            // published, so this is a no-op there rather than a clobber. A
+            // `failed` classification carries no reason and writes nothing —
+            // an earlier `none_observed` on a failed act is still TRUE (the app
+            // published nothing) and stays.
+            effect["reason"] = .string(reason)
+        }
+        if let note = classification.note { output["status_note"] = .string(note) }
+        // Agent round 2 — a Finder view switch dropped 222 notifications and
+        // showed 10 of 44 additions. A truncated list of a bulk change is not a
+        // description of it, so past the cap the payload also carries a
+        // SEMANTIC summary: what appeared and vanished by role, and what the
+        // focus is now inside.
+        if diff.addedTotal > MacActClosedLoop.maxDiffRows || wait.dropped > 0 {
+            effect["summary"] = Self.denseEffectSummaryJSON(
+                diff: diff,
+                after: after,
+                snapshot: read.snapshot,
+                valueChars: limits.valueChars
+            )
+        }
+        output["effect"] = .object(effect)
+
+        // 10. A NEW FRAME, so the next verb continues from the state the act
+        //     produced instead of from a description of the screen before it.
+        let capturedAt = now()
+        let newFrameId = UUID().uuidString
+        await lookFrameStore.record(MacLookFrame.from(
+            percept: after,
+            frameId: newFrameId,
+            capturedAt: capturedAt,
+            windowTitle: read.rootTitle,
+            // The new frame is anchored to the window the ACT happened in —
+            // the same window the read above was anchored to, re-read fresh so
+            // a moved or retitled window carries its new identity forward.
+            windowIdentity: read.windowIdentity ?? frame.windowIdentity,
+            caps: afterCaps
+        ))
+        output["frame_id"] = .string(newFrameId)
+        output["captured_at"] = .string(ISO8601DateFormatter().string(from: capturedAt))
+        output["frame_ttl_seconds"] = .int(Int64(MacLookFrameStore.ttlSeconds))
+        // The ACT's glance leads with the readout THIS act moved, not with the
+        // top-ranked one (Agent round 2: Equals produced "42" and the glance
+        // still opened with the expression "7×6", so she had to re-look for the
+        // one number she pressed Equals to get). `mac_look`'s ranking is
+        // untouched — a look has no act to describe.
+        output["glance"] = .string(after.glanceLine(leading: Self.actedReadout(diff: diff, after: after)))
+        output["how_to_read"] = .string(
+            "`effect` is what changed: the notifications the app fired, the acted element before/after, "
+            + "`readouts_changed` (the read-only values — a total, a display, a status line — that moved, "
+            + "which is where the ANSWER to what you just did usually is), and "
+            + "the affordances added/removed/changed by handle. `frame_id` is a FRESH frame compiled after "
+            + "the act — keep acting on handles from it. Handles from the previous frame are dead. You do "
+            + "NOT need to call mac_look to find out whether this landed."
+        )
+
+        return MacControlResult(
+            ok: performed.ok,
+            action: "act",
+            output: .object(output),
+            error: performed.error,
+            durationMs: Int(now().timeIntervalSince(started) * 1000),
+            viaSwift: true
+        )
+    }
+
+    /// The readout THIS act moved: the first one that CHANGED, else the first
+    /// one it ADDED, else nil (nothing moved ⇒ the glance falls back to the
+    /// ranked readout, which is the honest description of a screen the act did
+    /// not change).
+    ///
+    /// Resolved back to the post-act percept's own `MacLookReadout` so the
+    /// glance prints COMPILE-TIME-redacted text — a diff row's text re-rendered
+    /// here would have no node context and could print what the look withheld.
+    private static func actedReadout(
+        diff: MacActClosedLoop.EffectDiff,
+        after: MacLookPercept
+    ) -> MacLookReadout? {
+        func lookup(path: [Int], role: String) -> MacLookReadout? {
+            after.readouts.first { $0.path == path && $0.role == role }
+        }
+        if let changed = diff.readoutsChanged.first,
+           let readout = lookup(path: changed.path, role: changed.role) {
+            return readout
+        }
+        if let added = diff.readoutsAdded.first,
+           let readout = lookup(path: added.path, role: added.role) {
+            return readout
+        }
+        return nil
+    }
+
+    /// Redacted before/after snapshot of the element the verb acted on.
+    /// - Parameters:
+    ///   - labelJSON/valueJSON: gpt-5.5 round-2 B4 — the text as a COMPILE saw
+    ///     it, with the enclosing-caption context (the group titled "CVV" two
+    ///     rows up) that a re-redaction of the stored string cannot recover.
+    ///     `acted_element` is the third way a hidden value could leave, after
+    ///     `changed` and `affordances_removed`.
+    private static func actedElementJSON(
+        _ target: MacAXActTarget,
+        redactingValue: Bool,
+        labelJSON: JSONValue? = nil,
+        valueJSON: JSONValue? = nil
+    ) -> JSONValue {
+        var object: [String: JSONValue] = ["role": .string(target.role)]
+        object["label"] = labelJSON ?? (target.title ?? target.value).map {
+            MacScreenViewTextRedaction.redactedLegendString($0, valueChars: MacAXLimits.hardValueChars)
+        } ?? .null
+        if redactingValue {
+            object["value"] = target.value.map { MacInjectionResultRedaction.redactedSecret($0) } ?? .null
+        } else if let valueJSON {
+            object["value"] = valueJSON
+        } else {
+            object["value"] = target.value.map {
+                MacScreenViewTextRedaction.redactedLegendString(
+                    $0,
+                    valueChars: MacAXLimits.hardValueChars,
+                    under: target.title
+                )
+            } ?? .null
+        }
+        object["enabled"] = .bool(target.enabled)
+        return .object(object)
+    }
+
+    /// Agent round 2 — the semantic summary of a BULK change.
+    ///
+    /// Alongside (never instead of) the capped lists: counts by role, so "44
+    /// added" is legible as "40 AXRow, 3 AXButton, 1 AXImage", and the container
+    /// the focus now sits in with its first children named, which is what
+    /// "Finder switched to list view" actually looks like from the inside.
+    private static func denseEffectSummaryJSON(
+        diff: MacActClosedLoop.EffectDiff,
+        after: MacLookPercept,
+        snapshot: MacAXTreeSnapshot,
+        valueChars: Int
+    ) -> JSONValue {
+        func census(_ byRole: [String: Int]) -> JSONValue {
+            .object(byRole.mapValues { .int(Int64($0)) })
+        }
+        var summary: [String: JSONValue] = [
+            "added_by_role": census(diff.addedByRole),
+            "removed_by_role": census(diff.removedByRole),
+        ]
+        // gpt-5.5 round-3 B4 — the summary describes nodes the percept does not
+        // carry as affordances (the focus container, its first children), and
+        // it was redacting their RAW attributes with the standalone shape test
+        // only. That test cannot see the group titled "CVV" two rows up, so a
+        // child labeled with a card code sailed through `first_children` while
+        // the affordance list correctly withheld it. This is the SAME
+        // full-context pass the compile ran, over the same snapshot: the
+        // summary can no longer disagree with the percept it summarizes.
+        let redactedText = MacPerceptionCompiler.redactedNodeTextMap(snapshot)
+        if let focusPath = after.focus?.path, !focusPath.isEmpty {
+            let containerPath = Array(focusPath.dropLast())
+            let children = snapshot.nodes.filter { $0.path.count == containerPath.count + 1
+                && Array($0.path.dropLast()) == containerPath }
+            let container = snapshot.nodes.first { $0.path == containerPath }
+            var block: [String: JSONValue] = [
+                "role": container.map { .string($0.attributes.role) } ?? .null,
+                "child_count": .int(Int64(children.count)),
+                "path": .array(containerPath.map { .int(Int64($0)) }),
+            ]
+            block["label"] = container?.attributes.title == nil
+                ? .null
+                : (redactedText[containerPath] ?? MacInjectionResultRedaction.redactedSecret(
+                    container?.attributes.title ?? ""
+                ))
+            block["first_children"] = .array(
+                children.prefix(10).map { child in
+                    guard (child.attributes.title ?? child.attributes.value) != nil else {
+                        return .string(child.attributes.role)
+                    }
+                    // Fail closed: a node the map has no verdict for is a node
+                    // nothing judged in context, and the context-free second
+                    // opinion is the hole itself.
+                    return redactedText[child.path]
+                        ?? MacInjectionResultRedaction.redactedSecret(
+                            child.attributes.title ?? child.attributes.value ?? ""
+                        )
+                }
+            )
+            summary["new_focus_container"] = .object(block)
+        }
+        return .object(summary)
+    }
+
+    private static func effectDiffJSON(
+        _ diff: MacActClosedLoop.EffectDiff,
+        valueChars: Int
+    ) -> [String: JSONValue] {
+        var out: [String: JSONValue] = [
+            "affordances_added": .array(diff.added.map { $0.toJSON(valueChars: valueChars) }),
+            "affordances_removed": .array(diff.removed.map { entry in
+                .object([
+                    "handle": .string(entry.handle),
+                    "role": .string(entry.role),
+                    // B4: the entry's COMPILE-TIME redaction, not a fresh
+                    // context-free pass over the stored string.
+                    "label": entry.labelJSON ?? entry.label.map {
+                        MacScreenViewTextRedaction.redactedLegendString($0, valueChars: valueChars)
+                    } ?? .null,
+                ])
+            }),
+            "changed": .array(diff.changed.map { $0.toJSON(valueChars: valueChars) }),
+            "affordances_added_total": .int(Int64(diff.addedTotal)),
+            "affordances_removed_total": .int(Int64(diff.removedTotal)),
+            "changed_total": .int(Int64(diff.changedTotal)),
+            "focus_changed": .bool(diff.focusChanged),
+            // `window_changed` NAMES ITS EVIDENCE (Agent round 2). It is exactly
+            // `!change_reasons.isEmpty`, so a true with nothing behind it cannot
+            // be emitted.
+            "window_changed": .bool(diff.windowChanged),
+            "change_reasons": .array(diff.changeReasons.map { .string($0) }),
+            // …and when the two compiles ran under different bounds, the
+            // added/removed census is EXCLUDED from those reasons and the
+            // payload says so rather than dropping it silently.
+            "diff_comparable": .bool(diff.diffComparable),
+            // Agent acceptance round 1, finding A — the READ-ONLY values that
+            // moved. Pressing Equals changes no affordance label; without this
+            // the answer she acted for was nowhere in the result.
+            "readouts_changed": .array(diff.readoutsChanged.map { $0.toJSON(valueChars: valueChars) }),
+            "readouts_changed_total": .int(Int64(diff.readoutsChangedTotal)),
+            "readouts_added_total": .int(Int64(diff.readoutsAddedTotal)),
+            "readouts_removed_total": .int(Int64(diff.readoutsRemovedTotal)),
+            // The ROWS, not just the totals: `readouts_added_total: 2` does not
+            // contain "42", and that number was the whole reason she acted.
+            "readouts_added": .array(diff.readoutsAdded.map { $0.toJSON(valueChars: valueChars) }),
+            "readouts_removed": .array(diff.readoutsRemoved.map { $0.toJSON(valueChars: valueChars) }),
+        ]
+        if let reason = diff.diffIncomparableReason {
+            out["diff_incomparable_reason"] = .string(reason)
+            out["diff_incomparable_note"] = .string(
+                "the affordances added/removed census is NOT counted as evidence of change here — "
+                + "the two compiles did not see the same window. The rows are still listed; the "
+                + "identity-keyed channels (changed, focus, modal, window title, readouts) are unaffected."
+            )
+        }
+        if diff.focusChanged {
+            var focus: [String: JSONValue] = [:]
+            focus["handle"] = diff.focusHandleAfter.map { .string($0) } ?? .null
+            focus["role"] = diff.focusRoleAfter.map { .string($0) } ?? .null
+            focus["label"] = diff.focusLabelJSONAfter ?? diff.focusLabelAfter.map {
+                MacScreenViewTextRedaction.redactedLegendString($0, valueChars: valueChars)
+            } ?? .null
+            out["focus_changed_to"] = .object(focus)
+        }
+        if diff.modalAppeared || diff.modalDisappeared {
+            out["modal"] = .object([
+                "appeared": .bool(diff.modalAppeared),
+                "disappeared": .bool(diff.modalDisappeared),
+                "label": diff.modalLabelAfter.map {
+                    MacScreenViewTextRedaction.redactedLegendString($0, valueChars: valueChars)
+                } ?? .null,
+            ])
+        }
+        if diff.windowTitleChanged {
+            out["window_title"] = diff.windowTitleAfter.map {
+                MacScreenViewTextRedaction.redactedLegendString($0, valueChars: valueChars)
+            } ?? .null
+        }
+        return out
+    }
+
+    /// Plan and run ONE verb. Every mechanism here is an EXISTING one:
+    /// `MacAccessibilityActuator.act` (which owns the AXPress → synthesized
+    /// click fallback), the actuator's own `perform`, and `MacEventPlanner` +
+    /// the event sink (the same path `mac_keystroke` / `mac_scroll` use).
+    /// Nothing new posts events and nothing new mutates AX.
+    ///
+    /// Returns nil when the element exposes NO mechanism for the verb — the
+    /// caller turns that into a named refusal, never a silent no-op.
+    /// Did the pointer end where it started? Computed from the two READS, so a
+    /// nudge that failed to return the cursor cannot report success — and a
+    /// null (either position unreadable) stays null rather than collapsing to
+    /// `true`.
+    ///
+    /// SUB-PIXEL tolerance, not one pixel. The nudge's displacement IS one
+    /// pixel, so a 1.0 slack would call "moved one pixel and stayed there" a
+    /// successful restore — the precise failure this exists to catch. Only
+    /// float noise is forgiven; any real displacement, including the user's own
+    /// hand during the settle wait, reads `false`, which is the truth.
+    static func pointerRestoredJSON(before: MacSessionState, after: MacSessionState) -> JSONValue {
+        guard let bx = before.cursorX, let by = before.cursorY,
+              let ax = after.cursorX, let ay = after.cursorY else { return .null }
+        return .bool(abs(ax - bx) < 0.5 && abs(ay - by) < 0.5)
+    }
+
+    private func performAct(
+        verb: MacActVerb,
+        handle: String,
+        entry: MacLookFrameEntry,
+        frame: MacLookFrame,
+        /// B2 — the pid the frame was captured from. Every resolve this function
+        /// still has to make (the dismiss button) is anchored to it, so no verb
+        /// can reach into whatever app is frontmost by now.
+        framePid: Int32,
+        /// B1 — and to the WINDOW the frame was captured from. The dismiss
+        /// button is looked up by path, and a path resolved in the app's other
+        /// window presses whatever sits at that position there.
+        actWindow: MacAXWindowRef,
+        target: MacAXActTarget,
+        text: String?,
+        direction: MacActScrollDirection,
+        /// Round 7 — non-nil when the frame's window is NOT key, i.e. when any
+        /// synthesized event would land somewhere other than the window she
+        /// looked at. Consulted at every posting site; pure-AX paths ignore it.
+        inputRefusal: MacActClosedLoop.KeyWindowRefusal?
+    ) -> MacActPerformed? {
+        /// Every synthesized-input site calls this FIRST. Non-nil ⇒ return it:
+        /// nothing posted, nothing selected, nothing pressed. The AX paths above
+        /// each site are untouched — this gates the window server, not the API.
+        /// Has this call already INVOKED an actuation on the app?
+        ///
+        /// Agent round 8, envelope 70DA30C4 — the lying receipt. `AXOpen` on a
+        /// .json filename LAUNCHED Xcode (the same envelope carries
+        /// `AXWindowCreated` at 139 ms and the file was on screen), and the
+        /// AX call still reported a status other than `.performed`, so step 1
+        /// fell through. The chord branch then re-read the frontmost app, saw
+        /// XCODE — the window the act had just opened — and returned
+        /// `window_not_key, performed: false, method: none, posted_events: 0`.
+        /// A successful open reported as "nothing was posted".
+        ///
+        /// AN AX ACTION'S RETURN STATUS IS NOT EVIDENCE THAT IT DID NOTHING.
+        /// Once an action has been delivered, a later focus change is EVIDENCE
+        /// OF SUCCESS, not grounds for a pre-emission refusal. So the gate is
+        /// strictly pre-actuation: after this flips, `refuseInput` may still
+        /// stop us POSTING (an event into the wrong app is never right), but it
+        /// may never again describe the call as having done nothing.
+        /// The ENTRY-TIME verdict, mutable because a successful raise makes it
+        /// obsolete. Its own doc calls a stale verdict "a memory, not a gate" —
+        /// so once we have RAISED the window and a fresh read says it is key,
+        /// the memory must not veto the live fact.
+        var entryRefusal = inputRefusal
+        /// One raise per call. A second attempt after the first failed to take
+        /// would be a retry loop against the window server, and the window
+        /// server wins.
+        var raiseAttempted = false
+        var didActuate = false
+        var actuationsAttempted: [String] = []
+        func noteActuation(_ action: String) {
+            didActuate = true
+            if !actuationsAttempted.contains(action) { actuationsAttempted.append(action) }
+        }
+
+        // ROUND 9, envelope 62D093EB — THE LEDGER MUST COVER EVERY MUTATION.
+        //
+        // Round 8 bought the rule "an AX action's return status is not evidence
+        // that it did nothing" and paid for it with `noteActuation`. It was then
+        // applied to the actuation sites the round-8 receipt happened to name,
+        // and the FIRST actuation in `open` — the handle's own `AXOpen`, which
+        // runs above the verb gate — was left outside the ledger. Agent's
+        // round-9 Finder receipt is the same lie by the same mechanism: that
+        // AXOpen navigated window-a into TargetFolder (title change, sentinel
+        // visible, 34 notifications) and returned something other than
+        // `.performed`, so the code fell through to the gate, `didActuate` was
+        // still false, and the envelope said `performed: false, posted_events:
+        // 0` about an act that had already happened.
+        //
+        // The defence is structural, not another remembered call site: every AX
+        // mutation this function makes goes through one of these wrappers, and
+        // each ledgers BEFORE it reads a status. Adding an AX mutation without
+        // a wrapper is now the visible thing to review for.
+        func ledgeredPerform(_ actTarget: MacAXActTarget, action: String) -> MacAXActOutcome {
+            noteActuation(action)
+            return accessibilityActSource.perform(actTarget, action: action)
+        }
+        func ledgeredSetSelected(_ actTarget: MacAXActTarget) -> MacAXActOutcome {
+            noteActuation("AXSelected")
+            return accessibilityActSource.setSelected(actTarget)
+        }
+        func ledgeredSetFocused(_ actTarget: MacAXActTarget) -> MacAXActOutcome {
+            noteActuation("AXFocused")
+            return accessibilityActSource.setFocused(actTarget)
+        }
+        func ledgeredActuatorAct(
+            action: String?,
+            value: String?,
+            resolved: MacAXActTarget
+        ) -> Result<MacAccessibilityActuator.ActResult, MacAccessibilityActuator.Failure> {
+            noteActuation(value != nil ? "AXSetValue" : (action ?? MacAccessibilityActuator.defaultAction))
+            return MacAccessibilityActuator.act(
+                source: accessibilityActSource,
+                sink: eventSink,
+                path: [],
+                action: action,
+                value: value,
+                resolved: resolved
+            )
+        }
+
+        /// The LIVE key-window verdict — one pair of AX reads, both windows
+        /// named. Round 9 second finding: the two call sites below each built
+        /// this by hand, called `frontmostApp()` twice, and passed
+        /// `focusedWindowTitle: nil`, so every wrong-window refusal Agent ever
+        /// received said "key: untitled" no matter what the key window was
+        /// actually called. The refusal names the window she has to deal with;
+        /// it cannot be a placeholder.
+        func liveKeyWindowRefusal() -> MacActClosedLoop.KeyWindowRefusal? {
+            let frontmost = accessibilitySource.frontmostApp()
+            let focused = accessibilityActSource.focusedWindow(pid: framePid)
+            return MacActClosedLoop.keyWindowRefusal(
+                framePid: framePid,
+                frontmostPid: frontmost?.processIdentifier,
+                frontmostName: frontmost?.name,
+                frameWindowHandle: actWindow.handle,
+                focusedWindowHandle: focused?.handle,
+                frameWindowTitle: actWindow.identity.title,
+                focusedWindowTitle: focused?.identity.title,
+                // Counted ONLY when the focused window could not be named —
+                // that is the single branch that consults it, and enumerating
+                // an app's windows is several AX round-trips at a gate that
+                // runs more than once per act.
+                appWindowCount: focused == nil
+                    ? accessibilityActSource.windows(pid: framePid).count
+                    : nil
+            )
+        }
+
+        func refuseInput(_ requestedAction: String) -> MacActPerformed? {
+            // RE-READ at the emission boundary, never trust the entry-time
+            // verdict alone (gpt-5.5 round-7 BLOCKING). Between the gate in
+            // `handleAct` and this line the verb has done real AX work — an
+            // AXOpen attempt, an ancestor re-resolve — and the front can move
+            // under it. The residual race is one AX read wide and no lock can
+            // close it (the window server owns focus), but a stale verdict from
+            // hundreds of milliseconds ago is not a gate, it is a memory.
+            let live = liveKeyWindowRefusal()
+            guard var inputRefusal = live ?? entryRefusal else { return nil }
+
+            // HANDS, NOT HOMEWORK (User, 2026-08-22: "a live screen with hands
+            // she can use"). The window she is acting in is not key. Every
+            // previous round answered that by refusing and telling her to bring
+            // it forward and look again — bookkeeping handed back to the caller
+            // for something this tool can simply DO. So do it: raise THAT
+            // window (AXRaise + activate, since either alone leaves the wrong
+            // thing key), then re-ask. Only a raise that fails to make it key
+            // is a refusal.
+            //
+            // Not attempted once an actuation has been delivered: raising after
+            // the fact cannot un-deliver it, and the honest report of what
+            // already happened (below) is the right answer there.
+            /// Did the raise actually LAND? Agent's 7FCDC92E receipt is what
+            /// this exists for. Two live measurements, background process,
+            /// Chrome frontmost, 2026-08-22:
+            ///
+            ///   * `NSRunningApplication.activate()` returns `true` and the
+            ///     front does not move. The Bool is a receipt for the REQUEST.
+            ///   * activation, when it is honoured at all, is ASYNCHRONOUS —
+            ///     the call returns before the window server has moved
+            ///     anything.
+            ///
+            /// So one read immediately after the raise decides nothing, and it
+            /// can decide it in the dangerous direction: a single matching
+            /// answer cleared the gate and a coordinate click went out while
+            /// Chrome still owned the screen. The verdict has to HOLD — two
+            /// consecutive clear reads — and it is given a bounded budget to
+            /// become true rather than being asked once and abandoned.
+            func raiseSettled() -> Bool {
+                /// ~500 ms of budget in 20 ms steps. Deliberately short: this
+                /// blocks the act, and an app switch the window server has not
+                /// made in half a second is not being made.
+                let reads = 25
+                let stepSeconds = 0.02
+                /// One matching read is the optimistic answer; two in a row is
+                /// a state.
+                let clearReadsRequired = 2
+                var consecutiveClear = 0
+                for attempt in 0..<reads {
+                    if attempt > 0 { Thread.sleep(forTimeInterval: stepSeconds) }
+                    if liveKeyWindowRefusal() == nil {
+                        consecutiveClear += 1
+                        if consecutiveClear >= clearReadsRequired { return true }
+                    } else {
+                        // A flicker back is a failed switch, not progress.
+                        consecutiveClear = 0
+                    }
+                }
+                return false
+            }
+
+            if !didActuate, !raiseAttempted {
+                raiseAttempted = true
+                let outcome = accessibilityActSource.raise(actWindow)
+                if outcome == .performed, raiseSettled() {
+                    // It is key now. Retire the stale entry verdict so the NEXT
+                    // gate call in this same act (step 1 and the chord branch
+                    // each consult it) does not refuse on a fact that stopped
+                    // being true when we raised the window.
+                    entryRefusal = nil
+                    return nil
+                }
+                // Raise did not take. Say so in the refusal rather than
+                // repeating advice she already followed.
+                inputRefusal = MacActClosedLoop.KeyWindowRefusal(
+                    reason: inputRefusal.reason,
+                    note: inputRefusal.note
+                        + " This call also tried to RAISE that window itself (raise outcome: "
+                        + "\(outcome.rawValue)) and then WAITED up to half a second for the window "
+                        + "server to honour it; the window never became key and stayed key, so the "
+                        + "block is real rather than a matter of ordering. A raise that reports "
+                        + "success and does not move the front is what an activation request looks "
+                        + "like from a background process — the front app itself has to yield."
+                        // The one raise failure with a fixable cause, when the
+                        // source knows it: a missing Automation grant. Silence
+                        // here would report "could not raise" for "you were
+                        // never allowed to."
+                        + (accessibilityActSource.raiseDiagnostic.map { " \($0)" } ?? "")
+                )
+            }
+            // ALREADY ACTUATED. We still refuse to POST — an event into the app
+            // that is key now is never what she asked for — but the envelope
+            // must describe what this call actually did. `performed: false` and
+            // "nothing was posted" here would be the round-8 lie.
+            guard !didActuate else {
+                return MacActPerformed(
+                    ok: true,
+                    method: "ax_action",
+                    requestedAction: requestedAction,
+                    fallbackReason: "key_window_changed_after_actuation",
+                    error: nil,
+                    target: target,
+                    postState: accessibilityActSource.reread(target),
+                    actedHandle: handle,
+                    extra: [
+                        "posted_events": .int(0),
+                        "actuations_attempted": .array(actuationsAttempted.map { .string($0) }),
+                        "key_window_changed_after_actuation": .bool(true),
+                        "guidance": .string(
+                            "an accessibility action was DELIVERED to the element and the key window "
+                            + "was not (or is no longer) the one this frame describes — which is also "
+                            + "what a successful open or launch looks like from here. No synthesized "
+                            + "event was posted (that would have gone to the key window). Read "
+                            + "`effect` for what was actually observed; this call does not claim the "
+                            + "result is what you asked for, only that something was delivered."
+                        ),
+                    ]
+                )
+            }
+            return MacActPerformed(
+                ok: false,
+                method: "none",
+                requestedAction: requestedAction,
+                fallbackReason: inputRefusal.reason,
+                error: inputRefusal.reason,
+                target: target,
+                postState: nil,
+                actedHandle: handle,
+                extra: [
+                    "posted_events": .int(0),
+                    "guidance": .string(inputRefusal.note),
+                ]
+            )
+        }
+
+        func summarize(
+            _ result: MacAccessibilityActuator.ActResult,
+            target: MacAXActTarget,
+            actedHandle: String,
+            extra: [String: JSONValue] = [:]
+        ) -> MacActPerformed {
+            MacActPerformed(
+                ok: result.ok,
+                method: result.method,
+                requestedAction: result.requestedAction,
+                fallbackReason: result.fallbackReason,
+                error: result.error,
+                target: target,
+                postState: result.postState,
+                actedHandle: actedHandle,
+                extra: extra
+            )
+        }
+
+        /// AXPress with the actuator's own synthesized-click fallback — the
+        /// shared mechanism behind click / select / toggle, and behind the
+        /// dismiss button once it has been found.
+        func press(_ pressTarget: MacAXActTarget, actedHandle: String, extra: [String: JSONValue] = [:]) -> MacActPerformed? {
+            // AXPress itself is pure AX and stays ungated — acting on a
+            // background window that way is an established capability. But the
+            // actuator's own SYNTHESIZED-CLICK fallback is window-server input,
+            // and until round 9 it was the one CGEvent emitter in this file the
+            // key-window gate never saw. Gate it where it happens.
+            var gateRefusal: MacActPerformed?
+            let outcome = MacAccessibilityActuator.act(
+                source: accessibilityActSource,
+                sink: eventSink,
+                path: [],
+                action: MacAccessibilityActuator.defaultAction,
+                value: nil,
+                resolved: pressTarget,
+                syntheticFallbackGate: { reason in
+                    // `ax_action_*` means the AX action was DELIVERED and only
+                    // its status disappointed us — round 8's rule. Ledger it
+                    // before the gate can describe this call as having done
+                    // nothing.
+                    // …but NOT `invalidTarget`, which the actuator returns
+                    // when the element handle no longer resolves — that path
+                    // returns BEFORE AXUIElementPerformAction, so nothing was
+                    // delivered and ledgering it would let a refusal claim an
+                    // actuation that never happened (gpt-5.5 round-9 BLOCKING).
+                    if reason.hasPrefix("ax_action_"), reason != "ax_action_invalidTarget" {
+                        noteActuation(MacAccessibilityActuator.defaultAction)
+                    }
+                    if let refusal = refuseInput(MacAccessibilityActuator.defaultAction) {
+                        gateRefusal = refusal
+                        return false
+                    }
+                    return true
+                }
+            )
+            if let gateRefusal { return gateRefusal }
+            switch outcome {
+            case .failure:
+                return nil
+            case .success(let result):
+                return summarize(result, target: pressTarget, actedHandle: actedHandle, extra: extra)
+            }
+        }
+
+        switch verb {
+        case .click, .select, .toggle:
+            // One mechanism, three intentions. AXPress runs the app's OWN
+            // handler — which is what "select this row" and "toggle this
+            // checkbox" mean to the app — and the actuator falls back to a
+            // synthesized click at the element's frame centre when the control
+            // advertises no action, saying which one fired.
+            return press(target, actedHandle: handle)
+
+        case .open:
+            // Agent round 2 — navigating Finder by handle needs the DOUBLE
+            // click, and there was no verb for it. `AXOpen` is the semantic
+            // form; when the element does not advertise it, the fallback is the
+            // EXISTING click injection path with a click count of two. No new
+            // event poster, no new AX mutator.
+            //
+            // Round 4, finding 1(a) — and this is what made Finder `open` a
+            // no-op: the verb was aimed at the handle SHE HELD. Her handle was
+            // the filename `AXTextField` (a cell); AXOpen was refused there and
+            // the double-click landed on the text, which is Finder's RENAME
+            // gesture. Resolve to the element that actually opens FIRST, then
+            // run the same two mechanisms against it.
+            // ORDER IS THE FIX. Try the handle's own AXOpen FIRST — and only
+            // escalate when it did not PERFORM. Her cell advertised AXOpen and
+            // refused it (`fallback_reason=ax_action_refused`), so a redirect
+            // gated on "does not advertise AXOpen" would never have fired for
+            // the case it was written for. Advertising is not doing.
+            //
+            // ROUND 9: THE GATE IS HERE, ABOVE THE FIRST ACTUATION. It used to
+            // sit below this attempt, under a comment claiming it ran "BEFORE
+            // THE FIRST ACTUATION" — it did not, and the handle's own AXOpen
+            // therefore fired on a window that was not key AND outside the
+            // actuation ledger. Both halves of Agent's round-9 receipt come
+            // from those two lines of distance.
+            if let refusal = refuseInput("AXOpen") { return refusal }
+
+            if target.actions.contains("AXOpen"),
+               ledgeredPerform(target, action: "AXOpen") == .performed {
+                return MacActPerformed(
+                    ok: true,
+                    method: "ax_action",
+                    requestedAction: "AXOpen",
+                    fallbackReason: nil,
+                    error: nil,
+                    target: target,
+                    postState: accessibilityActSource.reread(target),
+                    actedHandle: handle,
+                    extra: ["acted_on": MacActClosedLoop.OpenTargetResolution(
+                        path: entry.path,
+                        hops: 0,
+                        role: target.role,
+                        advertisesOpen: true,
+                        reason: "handle_opened"
+                    ).toJSON()]
+                )
+            }
+            // The handle would not open. Climb to the element that will.
+            let openPlan = MacActClosedLoop.planOpenFallback(
+                path: entry.path
+            ) { ancestorPath in
+                // The SAME window-anchored resolve the act itself used, so the
+                // walk cannot reach another window or another app.
+                guard case .resolved(let hit) = accessibilityActSource.resolve(
+                    path: ancestorPath, inWindow: actWindow
+                ) else { return nil }
+                return (role: hit.role, actions: hit.actions)
+            }
+
+            /// Re-resolve a chosen ancestor and prove it is STILL what the walk
+            /// chose. The named handle's drift guard ran before this function;
+            /// an ancestor we climbed to has no guard of its own, so it gets one
+            /// here. Nil ⇒ do not act on it.
+            enum LiveAncestor {
+                case live(MacAXActTarget)
+                /// The path no longer resolves at all.
+                case vanished
+                /// It resolves, but is not the thing the walk chose.
+                case drifted(found: String)
+
+                var target: MacAXActTarget? {
+                    if case .live(let hit) = self { return hit }
+                    return nil
+                }
+                var refusalReason: String? {
+                    switch self {
+                    case .live: return nil
+                    case .vanished: return "openable_ancestor_vanished"
+                    case .drifted: return "openable_ancestor_drifted"
+                    }
+                }
+            }
+            func liveAncestor(_ choice: MacActClosedLoop.OpenTargetResolution) -> LiveAncestor {
+                guard case .resolved(let hit) = accessibilityActSource.resolve(
+                    path: choice.path, inWindow: actWindow
+                ) else { return .vanished }
+                guard hit.role == choice.role else { return .drifted(found: hit.role) }
+                return .live(hit)
+            }
+
+            // RE-CHECK before the escalated attempt. The whole-verb gate now
+            // runs above the handle's own AXOpen (Agent round 8: "emission gate
+            // strictly before selection/event"; round 9: it has to be above the
+            // FIRST one, not the second). This call is the emission-boundary
+            // re-read the fallback path is entitled to — and if the first
+            // AXOpen already delivered, the ledger makes this report what
+            // happened instead of claiming nothing did.
+            if let refusal = refuseInput("AXOpen") { return refusal }
+
+            // 1. THE SEMANTIC PATH, any role. `AXUIElementPerformAction` does
+            //    what the app says it does; it cannot land somewhere else, so a
+            //    cell is a fine target for it.
+            if let semantic = openPlan.semantic, let live = liveAncestor(semantic).target {
+                // NOTE THE ATTEMPT BEFORE READING THE STATUS. Round 8 proved the
+                // status is not a verdict on the effect: this exact call opened
+                // a .json in Xcode and did NOT come back `.performed`.
+                let semanticOutcome: MacAXActOutcome? = live.actions.contains("AXOpen")
+                    ? ledgeredPerform(live, action: "AXOpen")
+                    : nil
+                if semanticOutcome == .performed {
+                    return MacActPerformed(
+                        ok: true,
+                        method: "ax_action",
+                        requestedAction: "AXOpen",
+                        fallbackReason: nil,
+                        error: nil,
+                        target: live,
+                        postState: accessibilityActSource.reread(live),
+                        actedHandle: handle,
+                        extra: ["acted_on": semantic.toJSON()]
+                    )
+                }
+            }
+
+            // 2. THE CLICK PATH, ROWS ONLY. A synthesized double-click is a
+            //    POSITION on User's screen. The semantic candidate above is NOT
+            //    reused here: if a cell's AXOpen refused, double-clicking that
+            //    same cell is the rename gesture — the original bug by a new
+            //    route (gpt-5.5 round-5 review, second pass).
+            var openTarget = target
+            var openResolutionReported = MacActClosedLoop.OpenTargetResolution(
+                path: entry.path,
+                hops: 0,
+                role: target.role,
+                advertisesOpen: target.actions.contains("AXOpen"),
+                reason: openPlan.click == nil && openPlan.semantic == nil
+                    ? "no_openable_ancestor"
+                    : "fell_back_to_handle"
+            )
+            if let click = openPlan.click {
+                let live = liveAncestor(click)
+                guard let hit = live.target else {
+                    // REFUSE, never revert. Falling back to the handle here
+                    // would re-run the exact rename gesture this resolution
+                    // exists to avoid, on a window that just changed under us.
+                    // Nothing is performed and nothing is posted.
+                    let reason = live.refusalReason ?? "openable_ancestor_vanished"
+                    // NOT `acted_on` — nothing was performed and nothing was
+                    // posted. It names what the redirect was AIMING at when the
+                    // window moved under it (gpt-5.5 round-5, third pass).
+                    var extra: [String: JSONValue] = ["attempted_on": click.toJSON()]
+                    if case .drifted(let found) = live {
+                        extra["openable_ancestor_drift"] = .object([
+                            "expected_role": .string(click.role),
+                            "found_role": .string(found),
+                        ])
+                    }
+                    return MacActPerformed(
+                        ok: false,
+                        method: "none",
+                        requestedAction: "AXOpen",
+                        fallbackReason: reason,
+                        error: reason,
+                        target: target,
+                        postState: accessibilityActSource.reread(target),
+                        actedHandle: handle,
+                        extra: extra
+                    )
+                }
+                openTarget = hit
+                openResolutionReported = click
+            }
+            // ALWAYS reported, redirect or not: an act that lands somewhere
+            // other than the handle she named must never be silent.
+            let openTargetJSON = openResolutionReported.toJSON()
+
+            // 3. SELECT + THE APP'S OPEN COMMAND — the only mechanism round 6
+            //    measured as actually navigating. Finder advertises AXOpen on
+            //    the filename and returns kAXErrorActionUnsupported for it,
+            //    AXConfirm reports success and does nothing, and a synthesized
+            //    double-click is inert at BOTH the row centre and the filename.
+            //    Selecting the row and pressing the app's Open chord works.
+            //    Only fires for apps whose chord is PROVEN (see the table).
+            if let chord = MacActClosedLoop.openCommandChord(forBundleId: frame.bundleId),
+               eventSink.isAvailable {
+                // ONLY a live, still-verified ROW may be selected-and-opened.
+                // gpt-5.5 round-7 review: `?? target` let a Finder element with
+                // settable AXSelected but NO openable row ancestor reach the
+                // chord — Cmd-Down would then open whatever Finder had selected,
+                // which is not what the caller named. No row ⇒ no chord.
+                // Before the SELECTION, not just before the chord: selecting a
+                // row is a visible mutation whose only purpose is to feed a
+                // chord we are about to refuse to post. Zero input means zero
+                // side effects.
+                if let refusal = refuseInput("AXOpen") { return refusal }
+                let selectTarget = openPlan.click.flatMap { liveAncestor($0).target }
+                let selectable = selectTarget.map {
+                    MacActClosedLoop.openableAncestorRoles.contains($0.role)
+                } ?? false
+                let selected = selectable && selectTarget != nil
+                    ? ledgeredSetSelected(selectTarget!)
+                    : MacAXActOutcome.unsupported
+                if let selectTarget, selected == .performed {
+                    // THE EMISSION BOUNDARY IS THE POST, NOT THE PRE-SELECTION
+                    // CHECK (gpt-5.5 round-9 BLOCKING). Selecting the row is
+                    // itself a mutation that can move focus, and an external
+                    // race has the same window it always has. Re-ask here, one
+                    // line above the chord — and because the selection IS in
+                    // the ledger, a refusal at this point reports what was
+                    // already done instead of claiming nothing was.
+                    if let refusal = refuseInput("AXOpen") { return refusal }
+                    for event in MacEventPlanner.chord(chord) { eventSink.post(key: event) }
+                    return MacActPerformed(
+                        ok: true,
+                        method: "select_and_open_command",
+                        requestedAction: "AXOpen",
+                        fallbackReason: "ax_open_unsupported_by_app",
+                        error: nil,
+                        target: selectTarget,
+                        postState: accessibilityActSource.reread(selectTarget),
+                        actedHandle: handle,
+                        extra: [
+                            "acted_on": openTargetJSON,
+                            "open_command": .string(chord.source),
+                            "selected_role": .string(selectTarget.role),
+                        ]
+                    )
+                }
+            }
+
+            let openFallbackReason = openTarget.actions.contains("AXOpen")
+                ? "ax_action_refused"
+                : "element_does_not_advertise_AXOpen"
+            guard eventSink.isAvailable else {
+                return MacActPerformed(
+                    ok: false,
+                    method: "none",
+                    requestedAction: "AXOpen",
+                    fallbackReason: openFallbackReason,
+                    error: "event_injection_unavailable",
+                    target: openTarget,
+                    postState: accessibilityActSource.reread(openTarget),
+                    actedHandle: handle,
+                    extra: ["attempted_on": openTargetJSON]
+                )
+            }
+            guard let centre = openTarget.centre else {
+                // No frame, no honest place to double-click. Refused by name
+                // rather than clicking the screen corner.
+                return MacActPerformed(
+                    ok: false,
+                    method: "none",
+                    requestedAction: "AXOpen",
+                    fallbackReason: openFallbackReason,
+                    error: "no_ax_open_and_no_frame",
+                    target: openTarget,
+                    postState: accessibilityActSource.reread(openTarget),
+                    actedHandle: handle,
+                    extra: ["attempted_on": openTargetJSON]
+                )
+            }
+            if let refusal = refuseInput("AXOpen") { return refusal }
+            for event in MacEventPlanner.click(x: centre.x, y: centre.y, button: .left, count: 2) {
+                eventSink.post(mouse: event)
+            }
+            return MacActPerformed(
+                ok: true,
+                method: "cgevent_double_click_fallback",
+                requestedAction: "AXOpen",
+                fallbackReason: openFallbackReason,
+                error: nil,
+                target: openTarget,
+                postState: accessibilityActSource.reread(openTarget),
+                actedHandle: handle,
+                extra: ["click_count": .int(2), "acted_on": openTargetJSON]
+            )
+
+        case .type:
+            guard let text, !text.isEmpty else { return nil }
+            // Editable elements ONLY. Below this line the fallback focuses the
+            // control and injects keystrokes, and the old way of "focusing" it
+            // was AXPress — which on a button is ACTIVATION: `type` aimed at
+            // Mail's Send pressed Send. A verb that cannot be carried out is
+            // refused by name (`verb_not_supported_on_element`), never
+            // approximated with a different act.
+            guard MacActClosedLoop.canType(role: target.role) else { return nil }
+            // AXSetValue first: that is how you fill a field without
+            // simulating 40 keystrokes, and it cannot be intercepted by
+            // whatever else has focus.
+            let setOutcome = ledgeredActuatorAct(action: nil, value: text, resolved: target)
+            if case .success(let result) = setOutcome, result.ok {
+                return summarize(result, target: target, actedHandle: handle)
+            }
+            // Not settable (a web input, a terminal, a rich-text view). Focus
+            // it the app's own way, then use the EXISTING keystroke injection
+            // path — the same planner + sink `mac_keystroke` runs through.
+            // Focus WITHOUT invoking the handler. Even on an editable role,
+            // AXPress runs the app's own action (a search field's press can
+            // submit); AXFocused is the attribute that means "the cursor is
+            // here" and nothing else.
+            let focusOutcome = ledgeredSetFocused(target)
+            let focusMethod = focusOutcome == .performed ? "ax_focus" : "none"
+            guard focusOutcome == .performed else {
+                // No focus, no honest keystroke target: typing now would land
+                // wherever the focus already was. Report instead of scattering
+                // text across the app.
+                return MacActPerformed(
+                    ok: false,
+                    method: "none",
+                    requestedAction: "type",
+                    fallbackReason: "value_not_settable",
+                    error: "focus_not_settable",
+                    target: target,
+                    postState: accessibilityActSource.reread(target),
+                    actedHandle: handle,
+                    extra: ["focus_method": .string(focusMethod)]
+                )
+            }
+            guard eventSink.isAvailable else {
+                return MacActPerformed(
+                    ok: false,
+                    method: "none",
+                    requestedAction: "type",
+                    fallbackReason: "value_not_settable",
+                    error: "event_injection_unavailable",
+                    target: target,
+                    postState: accessibilityActSource.reread(target),
+                    actedHandle: handle,
+                    extra: ["focus_method": .string(focusMethod)]
+                )
+            }
+            // The keystroke fallback: AXSetValue could not carry this, so the
+            // characters go through the window server and land wherever the key
+            // window is. Refuse rather than type into another app.
+            if let refusal = refuseInput("type") { return refusal }
+            for event in MacEventPlanner.typeText(text) {
+                eventSink.post(key: event)
+            }
+            return MacActPerformed(
+                ok: true,
+                method: "keystroke_injection",
+                requestedAction: "type",
+                fallbackReason: "value_not_settable",
+                error: nil,
+                target: target,
+                postState: accessibilityActSource.reread(target),
+                actedHandle: handle,
+                extra: [
+                    "focus_method": .string(focusMethod),
+                    "text_character_count": .int(Int64(text.count)),
+                ]
+            )
+
+        case .dismiss:
+            // The modal's OWN Cancel/Close/Dismiss/Done/OK button, found in the
+            // CURRENT frame and scoped by path prefix to the modal — a window
+            // behind a sheet often has its own "Close", and pressing that would
+            // act on the wrong surface entirely.
+            if let dismissEntry = MacActClosedLoop.dismissTarget(in: frame),
+               case .resolved(let dismissTarget) = accessibilityActSource.resolve(
+                   path: dismissEntry.path,
+                   inWindow: actWindow
+               ),
+               MacActClosedLoop.driftReason(
+                   expectedRole: dismissEntry.role,
+                   expectedLabel: dismissEntry.label,
+                   liveRole: dismissTarget.role,
+                   liveTitle: dismissTarget.title,
+                   liveValue: dismissTarget.value
+               ) == nil {
+                return press(
+                    dismissTarget,
+                    actedHandle: dismissEntry.handle,
+                    extra: [
+                        "dismiss_target": .object([
+                            "handle": .string(dismissEntry.handle),
+                            "label": dismissEntry.label.map {
+                                MacScreenViewTextRedaction.redactedLegendString(
+                                    $0,
+                                    valueChars: MacAXLimits.hardValueChars
+                                )
+                            } ?? .null,
+                        ]),
+                    ]
+                )
+            }
+            // No button: the element's own AXCancel, if it advertises one.
+            guard target.actions.contains("AXCancel") else { return nil }
+            let outcome = ledgeredPerform(target, action: "AXCancel")
+            return MacActPerformed(
+                ok: outcome == .performed,
+                method: outcome == .performed ? "ax_action" : "none",
+                requestedAction: "AXCancel",
+                fallbackReason: "no_dismiss_button_in_frame",
+                error: outcome == .performed ? nil : "ax_action_\(outcome.rawValue)",
+                target: target,
+                postState: accessibilityActSource.reread(target),
+                actedHandle: handle
+            )
+
+        case .scroll:
+            // AXScrollToVisible is the semantic form and needs no coordinates.
+            if target.actions.contains("AXScrollToVisible") {
+                let outcome = ledgeredPerform(target, action: "AXScrollToVisible")
+                if outcome == .performed {
+                    return MacActPerformed(
+                        ok: true,
+                        method: "ax_action",
+                        requestedAction: "AXScrollToVisible",
+                        fallbackReason: nil,
+                        error: nil,
+                        target: target,
+                        postState: accessibilityActSource.reread(target),
+                        actedHandle: handle
+                    )
+                }
+            }
+            // Otherwise the EXISTING wheel path, aimed at the element's centre
+            // so the scroll lands on the intended view rather than wherever the
+            // cursor happened to sit.
+            guard eventSink.isAvailable else {
+                return MacActPerformed(
+                    ok: false,
+                    method: "none",
+                    requestedAction: "scroll",
+                    fallbackReason: "element_does_not_advertise_AXScrollToVisible",
+                    error: "event_injection_unavailable",
+                    target: target,
+                    postState: accessibilityActSource.reread(target),
+                    actedHandle: handle
+                )
+            }
+            if let refusal = refuseInput("scroll") { return refusal }
+            if let centre = target.centre {
+                eventSink.post(mouse: MacMouseEvent(phase: .move, button: .left, x: centre.x, y: centre.y))
+            }
+            // `down` moves the CONTENT up, which is what a human means by
+            // scrolling down. Three lines: one notch of a physical wheel.
+            let deltaY: Int32 = direction == .down ? -3 : 3
+            eventSink.post(scroll: MacScrollEvent(deltaX: 0, deltaY: deltaY, unit: .line))
+            return MacActPerformed(
+                ok: true,
+                method: "cgevent_scroll_fallback",
+                requestedAction: "scroll",
+                fallbackReason: "element_does_not_advertise_AXScrollToVisible",
+                error: nil,
+                target: target,
+                postState: accessibilityActSource.reread(target),
+                actedHandle: handle,
+                extra: [
+                    "direction": .string(direction.rawValue),
+                    "dy": .int(Int64(deltaY)),
+                ]
+            )
+        }
+    }
+
     // MARK: nudge (W7)
 
     /// How far the cursor moves, in points. One point: enough for the window
@@ -3164,18 +5999,15 @@ public actor SwiftNativeMacControl: MacControlClient {
     /// of the chord grammar and must not become spellable by a model.
     static let wakeShiftKeyCode: UInt16 = 56
 
-    /// `wake` — dismiss a NON-LOCKED screensaver / wake a sleeping display with
+    /// `wake` — dismiss a screensaver / wake a sleeping display with
     /// the smallest possible HID nudge, then hand back the fresh fused view.
     ///
     /// THE SAFETY LINE, and the reason this is one tool rather than "call
     /// mac_click then mac_view": the session is probed BEFORE anything is posted,
-    /// and a locked — or unreadable — session returns a refusal with the sink
-    /// untouched. It is probed AGAIN after the settle wait and before the
-    /// capture, because "not locked" was only ever true at the instant it was
-    /// read and a screenshot of a locked screen is exactly what must not happen.
-    /// A set `CGSSessionScreenIsLocked` is refused whatever the idle password
-    /// policy says; see `MacWakeGuard` for the discriminators that were tried
-    /// and why a manual lock is indistinguishable from a saver from here.
+    /// and an unreadable/off-console session returns a refusal with the sink
+    /// untouched. It is probed AGAIN after the settle wait and before capture.
+    /// The ambiguous CoreGraphics obstruction flag never blocks the inert
+    /// nudge; it only prevents capture while the saver/login layer remains.
     ///
     /// The result is the `view` output SHAPE (flattened, not nested) plus a
     /// `wake` block. That is deliberate: every downstream sink that already
@@ -3200,7 +6032,7 @@ public actor SwiftNativeMacControl: MacControlClient {
 
         // 2. THE REFUSAL. Nothing has been posted at this point and nothing
         //    will be: this returns before the sink is touched.
-        if let reason = MacWakeGuard.refusalReason(for: before) {
+        if let reason = MacWakeGuard.nudgeRefusalReason(for: before) {
             return injectionRefusal(
                 action: "wake",
                 error: reason,
@@ -3223,7 +6055,26 @@ public actor SwiftNativeMacControl: MacControlClient {
         //    that reaches the HID tap: it cannot type, cannot click, cannot
         //    activate anything under the cursor, and it leaves the pointer
         //    exactly where it was.
-        let origin = (before.cursorX ?? 0, before.cursorY ?? 0)
+        // NEVER FABRICATE THE ORIGIN. `?? 0` used to mean "unreadable cursor ⇒
+        // move the pointer to (0,0)" — the TOP-LEFT HOT CORNER, which is a
+        // configurable trigger (Lock Screen, Mission Control, Quick Note). A
+        // nudge is supposed to be the smallest inert input there is; teleporting
+        // the pointer into a corner is neither small nor inert. An unreadable
+        // cursor now REFUSES rather than guessing a coordinate, and the same
+        // rule is what makes the relaxed nudge guard honest: the only thing we
+        // ever post is a one-pixel move from where the pointer ALREADY is.
+        guard let cursorX = before.cursorX, let cursorY = before.cursorY else {
+            return injectionRefusal(
+                action: "wake",
+                error: "cursor_position_unreadable: this Mac would not report where the pointer "
+                    + "is, and a nudge posted at a guessed origin could land in a hot corner "
+                    + "instead of nowhere, so it refuses rather than move the pointer somewhere "
+                    + "it was not",
+                status: 503,
+                extra: ["session_before": before.toJSON()]
+            )
+        }
+        let origin = (cursorX, cursorY)
         var mouseEvents = 0
         for point in [(origin.0 + 1, origin.1), origin] {
             if let refusal = await attentionActionRefusal(action: "wake", body: body) {
@@ -3238,10 +6089,12 @@ public actor SwiftNativeMacControl: MacControlClient {
             ))
             mouseEvents += 1
         }
-        // Optional, off by default: some display-sleep configurations answer a
-        // key sooner than a move. Left-shift alone types nothing in any app.
+        // ON BY DEFAULT (User, 2026-08-22; opt out with key_tap:false). Live
+        // runs C3F445B2/B94F9DCF proved a bare one-pixel move resets the idle
+        // clock and dismisses NOTHING — the saver layer wants a real gesture.
+        // Left-shift alone types nothing in any app and cannot authenticate.
         var keyEvents = 0
-        if case .bool(true)? = body["key_tap"] {
+        if body["key_tap"] != .bool(false) {
             for down in [true, false] {
                 if let refusal = await attentionActionRefusal(action: "wake", body: body) {
                     await screenViewStore.invalidate()
@@ -3277,7 +6130,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         // below is a screenshot. So the same guard runs again on the fresh read,
         // and a screen that locked mid-call is neither photographed nor
         // described: no image, no marks, no legend, no view id.
-        if let reason = MacWakeGuard.refusalReason(for: after) {
+        if let reason = MacWakeGuard.captureRefusalReason(for: after) {
             return injectionRefusal(
                 action: "wake",
                 error: reason,
@@ -3292,10 +6145,25 @@ public actor SwiftNativeMacControl: MacControlClient {
                         "settle_ms": .int(Int64(settleMs)),
                         "was_obstructed": .bool(before.obstructed),
                         "dismissed": .bool(false),
-                        "locked_after_nudge": .bool(true),
+                        "still_obstructed": .bool(true),
+                        // THE POINTER CLAIM, MADE CHECKABLE (Agent F0D81308).
+                        // The nudge posts (x+1, y) then (x, y), so restoration
+                        // is true by construction — but "by construction" is an
+                        // argument, not evidence, and she was right that the
+                        // receipt could not prove it. These are the two READ
+                        // positions; `pointer_restored` is their COMPARISON,
+                        // not a restatement of intent, and it is null when
+                        // either read failed rather than optimistically true.
+                        "nudge_origin": .object([
+                            "x": before.cursorX.map { .double(($0 * 10).rounded() / 10) } ?? .null,
+                            "y": before.cursorY.map { .double(($0 * 10).rounded() / 10) } ?? .null,
+                        ]),
+                        "pointer_restored": Self.pointerRestoredJSON(before: before, after: after),
                         "note": .string(
-                            "The screen locked between the nudge and the capture, so nothing "
-                            + "was photographed or read back."
+                            "The nudge was delivered and the saver/login layer is still covering "
+                                + "the screen, so nothing was photographed or read back. Retrying "
+                                + "can help; a screen that never clears needs a human at the "
+                                + "keyboard."
                         ),
                     ]),
                 ]
@@ -3318,15 +6186,29 @@ public actor SwiftNativeMacControl: MacControlClient {
         } else {
             output = [:]
         }
-        output["wake"] = .object([
-            "nudged": .bool(true),
-            "mouse_events": .int(Int64(mouseEvents)),
-            "key_events": .int(Int64(keyEvents)),
-            "settle_ms": .int(Int64(settleMs)),
-            "was_obstructed": .bool(before.obstructed),
-            "dismissed": .bool(dismissed),
-            "session_before": before.toJSON(),
-            "session_after": after.toJSON(),
+        // BUILT IN STEPS, not as one literal. Adding two more keys to the big
+        // dictionary literal here tipped the Swift type checker past its budget
+        // ("unable to type-check this expression in reasonable time") and hung
+        // the build for ten minutes before it was killed. Incremental
+        // construction is not a style choice; the literal form does not compile.
+        var wake: [String: JSONValue] = [:]
+        wake["nudged"] = .bool(true)
+        wake["mouse_events"] = .int(Int64(mouseEvents))
+        wake["key_events"] = .int(Int64(keyEvents))
+        wake["settle_ms"] = .int(Int64(settleMs))
+        wake["was_obstructed"] = .bool(before.obstructed)
+        wake["dismissed"] = .bool(dismissed)
+        // The pointer claim rides on EVERY wake receipt, not just refusals —
+        // the nudge moves the mouse whether or not the screen clears, so "it
+        // was put back" needs proving on the success path too.
+        wake["nudge_origin"] = .object([
+            "x": before.cursorX.map { JSONValue.double(($0 * 10).rounded() / 10) } ?? .null,
+            "y": before.cursorY.map { JSONValue.double(($0 * 10).rounded() / 10) } ?? .null,
+        ])
+        wake["pointer_restored"] = Self.pointerRestoredJSON(before: before, after: after)
+        wake["session_before"] = before.toJSON()
+        wake["session_after"] = after.toJSON()
+        let wakeTail: [String: JSONValue] = [
             // The orthogonal evidence that the nudge actually LANDED: a HID
             // post resets the system idle timer. Falling idle time across the
             // nudge is proof; a flat one means the events went nowhere (almost
@@ -3338,10 +6220,13 @@ public actor SwiftNativeMacControl: MacControlClient {
             "note": .string(
                 dismissed
                     ? "The screen is awake and showing the real desktop — the view below is it."
-                    : "The nudge was posted but the screen still reports a sleeping display or "
-                        + "the login window. Try again with key_tap:true."
+                    : "The nudge (pointer move + shift tap) was posted but the screen still "
+                        + "reports a sleeping display or the saver layer. Retry, or try a larger "
+                        + "settle_ms."
             ),
-        ])
+        ]
+        for (k, v) in wakeTail { wake[k] = v }
+        output["wake"] = .object(wake)
         // `verified` is OBSERVED, not asserted: it is the post-nudge session
         // re-read, which is what `verificationState` picks up.
         output["verified"] = .bool(dismissed)

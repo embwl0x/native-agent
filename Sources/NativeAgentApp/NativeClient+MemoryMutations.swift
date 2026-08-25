@@ -51,9 +51,8 @@ extension NativeClient {
         // F2: reuse the launch-attached shared storage so USER.md regen +
         // Spotlight/KG hooks fire on UI mutations. Live-owner failure is
         // unavailable, never permission to open a hookless second store.
-        let storage = try await SwiftNativeMemoryV2.resolvedStorage(
-            dataRoot: PersistenceCore.defaultDataRoot()
-        )
+        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
         guard let existing = try await storage.memory(id: id) else {
             throw NSError(domain: "NativeAgent", code: 404, userInfo: [
                 NSLocalizedDescriptionKey: "memory id not found: \(id)"

@@ -1,4 +1,5 @@
 import Testing
+import ProviderRouting
 
 @testable import NativeAgentApp
 
@@ -56,6 +57,45 @@ struct MacSyncSurfaceSelectionTests {
         #expect(response["model"] == "gpt-5.6-sol")
         #expect(response["reasoning_effort"] == "medium")
         #expect(response["service_tier"] == "default")
+    }
+
+    @Test
+    func surfaceModelResponseFailsClosedUntilTheCanonicalOwnerReadsItBack() {
+        let missing = MacSyncActionRouter.canonicalSurfaceModelResponse(
+            surface: "ios",
+            requestedModel: "gpt-5.6-sol",
+            recoveredPreference: nil
+        )
+        #expect(missing["ok"] == "false")
+        #expect(missing["applied"] == "false")
+
+        let stale = MacSyncActionRouter.canonicalSurfaceModelResponse(
+            surface: "ios",
+            requestedModel: "gpt-5.6-sol",
+            recoveredPreference: SurfacePreference(
+                surface: "ios",
+                model: "gpt-5.4",
+                reasoningEffort: "medium"
+            )
+        )
+        #expect(stale["status"] == "error")
+        #expect(stale["applied"] == "false")
+
+        let applied = MacSyncActionRouter.canonicalSurfaceModelResponse(
+            surface: "ios",
+            requestedModel: "gpt-5.6-sol",
+            recoveredPreference: SurfacePreference(
+                surface: "ios",
+                model: "gpt-5.6-sol",
+                reasoningEffort: "high",
+                serviceTier: "priority"
+            )
+        )
+        #expect(applied["ok"] == "true")
+        #expect(applied["applied"] == "true")
+        #expect(applied["model"] == "gpt-5.6-sol")
+        #expect(applied["reasoning_effort"] == "high")
+        #expect(applied["service_tier"] == "priority")
     }
 
     @Test

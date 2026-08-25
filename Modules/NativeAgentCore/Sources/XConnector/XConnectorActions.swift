@@ -386,16 +386,27 @@ public enum XConnectorActions {
         return "OAuth \(headerParams)"
     }
 
-    private static func loadOAuth1Secrets() throws -> [String: Any] {
-        let path = oauth1SecretsPath()
+    static func loadOAuth1Secrets(at path: URL) throws -> [String: Any] {
         guard FileManager.default.fileExists(atPath: path.path) else {
             throw XActionError("missing_oauth1_credentials", detail: "Missing X OAuth1 credentials at \(path.path).")
+        }
+        let attributes = try FileManager.default.attributesOfItem(atPath: path.path)
+        guard (attributes[.type] as? FileAttributeType) == .typeRegular else {
+            throw XActionError("invalid_oauth1_credentials", detail: "X OAuth1 credentials must be a regular file.")
+        }
+        let mode = (attributes[.posixPermissions] as? NSNumber)?.intValue ?? 0
+        guard mode & 0o077 == 0 else {
+            throw XActionError("insecure_oauth1_credentials", detail: "X OAuth1 credentials must not be group- or world-readable.")
         }
         let data = try Data(contentsOf: path)
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw XActionError("invalid_oauth1_credentials", detail: "X OAuth1 credentials file is not a JSON object: \(path.path)")
         }
         return obj
+    }
+
+    private static func loadOAuth1Secrets() throws -> [String: Any] {
+        try loadOAuth1Secrets(at: oauth1SecretsPath())
     }
 
     private static func loadOAuth1Credentials() throws -> OAuth1Credentials {
@@ -416,28 +427,37 @@ public enum XConnectorActions {
     }
 
     private static func authenticatedUserIDBearer(bearer: String) async throws -> String {
-        if let cached = await userIDCache.get() { return cached }
+        let cacheKey = credentialCacheKey(kind: "oauth2", material: bearer)
+        if let cached = await userIDCache.get(for: cacheKey) { return cached }
         let url = apiURL("/2/users/me")
         let (status, data) = try await httpGET(url, bearer: bearer, query: [("user.fields", "id")])
         guard (200..<300).contains(status) else {
             throw XActionError("me_lookup_failed", detail: "X /2/users/me HTTP \(status): \(bodyExcerpt(data))")
         }
         let id = try userID(from: data)
-        await userIDCache.set(id)
+        await userIDCache.set(id, for: cacheKey)
         return id
     }
 
     private static func authenticatedUserIDOAuth1() async throws -> String {
-        if let cached = await userIDCache.get() { return cached }
+        let credentials = try loadOAuth1Credentials()
+        let cacheKey = credentialCacheKey(
+            kind: "oauth1", material: "\(credentials.apiKey):\(credentials.accessToken)"
+        )
+        if let cached = await userIDCache.get(for: cacheKey) { return cached }
         let url = apiURL("/2/users/me")
         let query = [("user.fields", "id")]
-        let auth = try await oauth1AuthHeader(method: "GET", url: url, query: query)
+        let auth = oauth1AuthHeader(
+            method: "GET", url: url, query: query, credentials: credentials,
+            nonce: UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased(),
+            timestamp: Int(Date().timeIntervalSince1970)
+        )
         let (status, data) = try await httpGET(url, headers: ["Authorization": auth], query: query)
         guard (200..<300).contains(status) else {
             throw XActionError("me_lookup_failed", detail: "X /2/users/me OAuth1 HTTP \(status): \(bodyExcerpt(data))")
         }
         let id = try userID(from: data)
-        await userIDCache.set(id)
+        await userIDCache.set(id, for: cacheKey)
         return id
     }
 
@@ -570,7 +590,7 @@ public enum XConnectorActions {
         var obj = baseEnvelope(actionId: actionId, status: "failed")
         obj["error"] = .string(short)
         obj["detail"] = .string(detail)
-        return .object(obj)
+        return XConnectorSecretRedactor.redactValue(.object(obj))
     }
 
     static func httpFailureEnvelope(actionId: String, statusCode: Int, data: Data) -> JSONValue {
@@ -582,9 +602,9 @@ public enum XConnectorActions {
         // Carry the code as a typed field too — consumers (the chat-side
         // OAuth1 fallback) were matching obj["statusCode"], which this
         // envelope never had, making the fallback dead code (audit 2026-06-09).
-        guard case .object(var obj) = envelope else { return envelope }
+        guard case .object(var obj) = envelope else { return XConnectorSecretRedactor.redactValue(envelope) }
         obj["statusCode"] = .int(Int64(statusCode))
-        return .object(obj)
+        return XConnectorSecretRedactor.redactValue(.object(obj))
     }
 
     static func appendQuery(_ query: [(String, String)], to url: URL) -> URL {
@@ -640,11 +660,11 @@ public enum XConnectorActions {
     /// (parallel to the Swift-owned `auth.json` written by NativeOAuthFlow).
     /// Retired runtime `config/config.json` is intentionally NOT consulted —
     /// Swift owns its own config locations.
-    private static func resolveClientID() -> String? {
-        let env = ProcessInfo.processInfo.environment["NATIVE_AGENT_X_CLIENT_ID"]?
+    static func resolveClientID(environment: [String: String], dataRoot: URL) -> String? {
+        let env = environment["NATIVE_AGENT_X_CLIENT_ID"]?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !env.isEmpty { return env }
-        let appPath = PersistenceCore.defaultDataRoot()
+        let appPath = dataRoot
             .appendingPathComponent("connectors", isDirectory: true)
             .appendingPathComponent("x", isDirectory: true)
             .appendingPathComponent("oauth_app.json")
@@ -654,6 +674,13 @@ public enum XConnectorActions {
         else { return nil }
         let trimmed = cid.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func resolveClientID() -> String? {
+        resolveClientID(
+            environment: ProcessInfo.processInfo.environment,
+            dataRoot: PersistenceCore.defaultDataRoot()
+        )
     }
 
     private static func oauth1SecretsPath() -> URL {
@@ -714,8 +741,13 @@ public enum XConnectorActions {
         return formatter.string(from: date)
     }
 
-    private static func mask(_ value: String) -> String {
+    static func mask(_ value: String) -> String {
         "\(value.prefix(4))...\(value.suffix(4))"
+    }
+
+    static func credentialCacheKey(kind: String, material: String) -> String {
+        let digest = SHA256.hash(data: Data(material.utf8))
+        return "\(kind):\(digest.map { String(format: "%02x", $0) }.joined())"
     }
 
     struct OAuth1Credentials {
@@ -742,15 +774,43 @@ public enum XConnectorActions {
         var errorDescription: String? { detail }
     }
 
-    private actor UserIDCache {
-        private var value: String?
+    actor UserIDCache {
+        private var values: [String: String] = [:]
 
-        func get() -> String? {
-            value
+        func get(for key: String) -> String? {
+            values[key]
         }
 
-        func set(_ value: String) {
-            self.value = value
+        func set(_ value: String, for key: String) {
+            values[key] = value
+        }
+    }
+}
+
+/// Connector errors may include provider-produced response text. Redact shaped
+/// credentials before an error envelope leaves the X connector.
+private enum XConnectorSecretRedactor {
+    private static let token = try! NSRegularExpression(
+        pattern: "\\b(?:xox[baprs]-[A-Za-z0-9-]{20,}|xapp-[A-Za-z0-9-]{20,}|Bearer\\s+[A-Za-z0-9._-]{16,})\\b",
+        options: [.caseInsensitive]
+    )
+
+    static func redactValue(_ value: JSONValue) -> JSONValue {
+        switch value {
+        case .string(let raw):
+            let range = NSRange(location: 0, length: (raw as NSString).length)
+            return .string(token.stringByReplacingMatches(
+                in: raw,
+                options: [],
+                range: range,
+                withTemplate: "[REDACTED_CONNECTOR_SECRET]"
+            ))
+        case .array(let items):
+            return .array(items.map(redactValue))
+        case .object(let object):
+            return .object(object.mapValues(redactValue))
+        default:
+            return value
         }
     }
 }

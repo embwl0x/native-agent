@@ -59,6 +59,7 @@ public struct MacAXAttributes: Sendable, Equatable {
     public let title: String?
     public let value: String?
     public let enabled: Bool
+    public let selected: Bool?
     public let frame: MacAXFrame?
     public let actions: [String]
 
@@ -68,6 +69,7 @@ public struct MacAXAttributes: Sendable, Equatable {
         title: String? = nil,
         value: String? = nil,
         enabled: Bool = true,
+        selected: Bool? = nil,
         frame: MacAXFrame? = nil,
         actions: [String] = []
     ) {
@@ -76,6 +78,7 @@ public struct MacAXAttributes: Sendable, Equatable {
         self.title = title
         self.value = value
         self.enabled = enabled
+        self.selected = selected
         self.frame = frame
         self.actions = actions
     }
@@ -107,6 +110,7 @@ public struct MacAXNode: Sendable, Equatable {
         if let value = attributes.value {
             object["value"] = .string(MacAccessibilityReader.truncate(value, to: valueChars))
         }
+        if let selected = attributes.selected { object["selected"] = .bool(selected) }
         if let frame = attributes.frame { object["frame"] = frame.toJSON() }
         return .object(object)
     }
@@ -129,6 +133,184 @@ public struct MacAXAppInfo: Sendable, Equatable {
             "bundle_id": bundleIdentifier.map { .string($0) } ?? .null,
             "pid": .int(Int64(processIdentifier)),
         ])
+    }
+}
+
+// MARK: - Window identity (gpt-5.5 round-3 B1)
+
+/// WHICH WINDOW a look was taken of, in terms that survive a new
+/// `AXUIElement` instance.
+///
+/// The reader and the actuator each mint their OWN element handles, per
+/// instance, into their own tables — so "the window root the look walked"
+/// cannot be handed to the act path as a reference. And `AXUIElement` itself
+/// is not a durable identity across processes/queries in any way this code may
+/// rely on: `CFHash` is documented only for use with `CFEqual` on live
+/// references, and the one genuinely durable id — the CGWindowID behind
+/// `_AXUIElementGetWindow` — is PRIVATE API this app does not call. There is
+/// no public, read-only, stable window id on macOS.
+///
+/// So the identity is a COMPOSITE of read-only public attributes:
+///
+///   • `pid`      — the process. Already anchored (round-2 B2).
+///   • `role` / `subrole` — `AXWindow` + `AXStandardWindow`/`AXDialog`/…,
+///     which separates a sheet from the document window behind it.
+///   • `title`    — `AXTitle`. The strongest signal, and the one that MOVES
+///     (a dirty marker, a tab switch), so it is never required on its own.
+///   • `frame`    — `AXPosition`+`AXSize`. Survives a retitle; moves when the
+///     user drags the window.
+///   • `index`    — position in the app's `AXWindows` array at look time. The
+///     weakest signal (z-order reshuffles it) and never decisive alone.
+///
+/// Matching is therefore a SCORE with an explicit ambiguity answer, not an
+/// equality test: see `MacAXWindowIdentity.match`.
+public struct MacAXWindowIdentity: Sendable, Equatable {
+    public let pid: Int32
+    /// Position in the app's `AXWindows` array when the look was taken, or nil
+    /// when the source answered with a window but not with a position. nil
+    /// never scores — an index guessed at would rank a wrong candidate up.
+    public let index: Int?
+    public let role: String
+    public let subrole: String?
+    public let title: String?
+    public let frame: MacAXFrame?
+
+    public init(
+        pid: Int32,
+        index: Int?,
+        role: String,
+        subrole: String? = nil,
+        title: String? = nil,
+        frame: MacAXFrame? = nil
+    ) {
+        self.pid = pid
+        self.index = index
+        self.role = role
+        self.subrole = subrole
+        self.title = title
+        self.frame = frame
+    }
+
+    /// Rects drift by a point under a re-layout; two DIFFERENT windows are
+    /// never a point apart in both origin and size.
+    public static let rectTolerance = 2.0
+
+    static func rectsMatch(_ lhs: MacAXFrame?, _ rhs: MacAXFrame?) -> Bool {
+        guard let lhs, let rhs else { return false }
+        return abs(lhs.x - rhs.x) <= rectTolerance
+            && abs(lhs.y - rhs.y) <= rectTolerance
+            && abs(lhs.w - rhs.w) <= rectTolerance
+            && abs(lhs.h - rhs.h) <= rectTolerance
+    }
+
+    /// How strongly `candidate` looks like THIS window. nil ⇒ it cannot be:
+    /// a different process or a different kind of window is disqualifying, not
+    /// merely unlikely.
+    public func score(against candidate: MacAXWindowIdentity) -> Int? {
+        guard candidate.pid == pid else { return nil }
+        guard candidate.role == role else { return nil }
+        if let subrole, let other = candidate.subrole, subrole != other { return nil }
+        // DISQUALIFYING contradiction: both signals are known on both sides and
+        // both disagree. One of them moving is ordinary (a retitle, a drag);
+        // both moving at once means this is a different window. Without this
+        // the sole-window rule below would happily match the ONE window an app
+        // has left after the window she looked at closed and a different one
+        // replaced it.
+        let titleContradicts = title != nil && candidate.title != nil && title != candidate.title
+        let rectContradicts = frame != nil && candidate.frame != nil
+            && !Self.rectsMatch(frame, candidate.frame)
+        if titleContradicts && rectContradicts { return nil }
+        var score = 0
+        if let title, let other = candidate.title, title == other { score += 4 }
+        if title == nil, candidate.title == nil { score += 1 }
+        if Self.rectsMatch(frame, candidate.frame) { score += 3 }
+        if let index, let other = candidate.index, index == other { score += 1 }
+        return score
+    }
+
+    /// A title or rect hit. Below this a candidate is only "the right app and
+    /// the right kind of window", which two documents of one app both are.
+    static let decisiveScore = 3
+
+    public enum Match<Handle>: Sendable where Handle: Sendable {
+        /// Exactly one window is this window.
+        case matched(Handle, reason: String)
+        /// The app is alive but nothing there is the window that was looked at.
+        case gone
+        /// Two or more candidates are equally plausible. Refusing is the whole
+        /// point: acting on a coin-flip between two windows of the same app is
+        /// the bug this identity exists to prevent.
+        case ambiguous(String)
+    }
+
+    /// Pick the candidate that IS this window.
+    ///
+    /// - a single candidate that survives the hard filters is the window (an
+    ///   app with one window cannot be acted on in the "wrong" one, and its
+    ///   title changing is ordinary — a dirty marker, a tab switch);
+    /// - otherwise a decisive signal (matching title, or matching rect) is
+    ///   required, and the best score must be strictly better than the runner-up.
+    public static func match<Handle: Sendable>(
+        _ identity: MacAXWindowIdentity,
+        among candidates: [(handle: Handle, identity: MacAXWindowIdentity)]
+    ) -> Match<Handle> {
+        var scored: [(handle: Handle, score: Int)] = []
+        for candidate in candidates {
+            guard let score = identity.score(against: candidate.identity) else { continue }
+            scored.append((candidate.handle, score))
+        }
+        guard !scored.isEmpty else { return .gone }
+        if scored.count == 1 {
+            // Exactly one window can still be this one. Either the app has only
+            // that window (and a title that moved is ordinary — a dirty marker,
+            // a tab switch), or every other window contradicted itself out of
+            // the running above. Refusing here would refuse every act after a
+            // retitle, which is most of them.
+            return .matched(
+                scored[0].handle,
+                reason: candidates.count == 1 ? "sole_window" : "only_surviving_candidate"
+            )
+        }
+        scored.sort { $0.score > $1.score }
+        let best = scored[0]
+        guard best.score >= decisiveScore else {
+            return .gone
+        }
+        if scored.count > 1, scored[1].score == best.score {
+            return .ambiguous("\(scored.filter { $0.score == best.score }.count)_windows_match_equally")
+        }
+        return .matched(best.handle, reason: best.score >= decisiveScore + 4 ? "title_and_rect" : "title_or_rect")
+    }
+
+    public func toJSON() -> JSONValue {
+        var object: [String: JSONValue] = [
+            "pid": .int(Int64(pid)),
+            "index": index.map { .int(Int64($0)) } ?? .null,
+            "role": .string(role),
+        ]
+        if let subrole { object["subrole"] = .string(subrole) }
+        // The TITLE is window text and rides every sink this result rides, so
+        // it leaves redacted like every other text channel.
+        if let title {
+            object["title"] = MacScreenViewTextRedaction.redactedLegendString(
+                title,
+                valueChars: MacAXLimits.hardValueChars
+            )
+        }
+        if let frame { object["frame"] = frame.toJSON() }
+        return .object(object)
+    }
+}
+
+/// One of an app's windows, as the READ seam sees it: the source's own element
+/// handle plus the identity that survives the handle.
+public struct MacAXWindowHandle: Sendable {
+    public let ref: MacAXElementRef
+    public let identity: MacAXWindowIdentity
+
+    public init(ref: MacAXElementRef, identity: MacAXWindowIdentity) {
+        self.ref = ref
+        self.identity = identity
     }
 }
 
@@ -241,6 +423,41 @@ public struct MacAXElementRef: Sendable, Hashable {
     public init(id: Int) { self.id = id }
 }
 
+/// The canonical public-AX window inventory. `AXWindows` is ordinarily the
+/// complete ordered list, but Finder can omit a focused `AXSheet` from it.
+/// Keep the listed order, then append the focused and main windows only when
+/// they are not already present. The live sources supply `CFEqual`, rather
+/// than handle equality: AX returns fresh element references for one live
+/// window, and those references still compare equal by CF identity.
+///
+/// This generic seam deliberately has no AX dependency so the exact
+/// focused-sheet case is hermetically executable in tests. Both the reader and
+/// actuator call it with the same order and equality relation; an identity
+/// captured from a sheet therefore has a matching ACT candidate for that sheet
+/// rather than falling through to its document-window parent.
+enum MacAXWindowInventory {
+    static func union<Element>(
+        listed: [Element],
+        focused: Element?,
+        main: Element?,
+        equal: (Element, Element) -> Bool
+    ) -> [Element] {
+        var inventory: [Element] = []
+        for candidate in listed {
+            if !inventory.contains(where: { equal($0, candidate) }) {
+                inventory.append(candidate)
+            }
+        }
+        if let focused, !inventory.contains(where: { equal($0, focused) }) {
+            inventory.append(focused)
+        }
+        if let main, !inventory.contains(where: { equal($0, main) }) {
+            inventory.append(main)
+        }
+        return inventory
+    }
+}
+
 /// Read-only element access. Every method is failure-tolerant by contract:
 /// an element that cannot be read returns nil / empty rather than throwing,
 /// because a half-readable tree is still useful perception.
@@ -250,6 +467,30 @@ public protocol MacAXElementSource: Sendable {
     func frontmostApp() -> MacAXAppInfo?
     /// Frontmost (focused, else main, else first) window of the frontmost app.
     func frontmostWindowRoot() -> MacAXElementRef?
+    /// The same window choice inside a NAMED process, or nil when that process
+    /// has no readable window. `mac_act`'s identity guard (gpt-5.5 round-2 B3)
+    /// re-compiles the window it is about to act in, and that window belongs to
+    /// the FRAME's app — reading whatever is frontmost by then would refuse
+    /// every act the moment another app stole focus. Default: the frontmost
+    /// root, which is the truthful answer for a single-tree synthetic source.
+    func windowRoot(pid: Int32) -> MacAXElementRef?
+    /// EVERY window of a named process, in `AXWindows` order, each with the
+    /// composite identity that survives this source instance
+    /// (gpt-5.5 round-3 B1). `mac_act` re-reads the window the LOOK was taken
+    /// of, which "focused, else main, else first" cannot name: with two windows
+    /// of one app, a focus change between the look and the act silently
+    /// re-points every read at the other one.
+    ///
+    /// Default: the one window `windowRoot(pid:)` answers with, at index 0 —
+    /// truthful for a single-tree source, which is what every synthetic source
+    /// is.
+    func windowRoots(pid: Int32) -> [MacAXWindowHandle]
+    /// Metadata for a NAMED process (gpt-5.5 round-3 S7). `frontmostApp()`
+    /// describes whatever is in front, which is a lie about a pid-anchored
+    /// read; the default therefore answers only when the frontmost app IS that
+    /// pid, and nil otherwise — absence over a wrong answer, like every other
+    /// member here.
+    func appInfo(pid: Int32) -> MacAXAppInfo?
     func attributes(of ref: MacAXElementRef) -> MacAXAttributes?
     func children(of ref: MacAXElementRef) -> [MacAXElementRef]
     /// Child count WITHOUT materializing the array. Default falls back to
@@ -262,12 +503,47 @@ public protocol MacAXElementSource: Sendable {
     /// child array is never bridged when only a bounded slice can still fit
     /// under the node cap.
     func children(of ref: MacAXElementRef, limit: Int) -> [MacAXElementRef]
+    /// The child-index path of the app's focused element, relative to the same
+    /// window root `frontmostWindowRoot()` returns — or nil when this source
+    /// CANNOT TELL. The default is nil for exactly that reason: a source that
+    /// has no notion of focus must report absence, never a guess (the
+    /// perception compiler reports "focus: unknown" rather than naming "the
+    /// first text field", which is how a look starts lying about the cursor).
+    /// Read-only like every other member here.
+    func focusedElementPath() -> [Int]?
+    /// Focus path anchored to a root the caller ALREADY WALKED: nil when the
+    /// focused element is not under that root (focus moved to another window
+    /// between the walk and this call). Default defers to `focusedElementPath()`
+    /// for sources with a single tree (synthetic/test sources).
+    func focusedElementPath(relativeTo root: MacAXElementRef?) -> [Int]?
 }
 
 public extension MacAXElementSource {
     func childCount(of ref: MacAXElementRef) -> Int { children(of: ref).count }
     func children(of ref: MacAXElementRef, limit: Int) -> [MacAXElementRef] {
         limit <= 0 ? [] : Array(children(of: ref).prefix(limit))
+    }
+    func focusedElementPath() -> [Int]? { nil }
+    func focusedElementPath(relativeTo root: MacAXElementRef?) -> [Int]? { focusedElementPath() }
+    func windowRoot(pid: Int32) -> MacAXElementRef? { frontmostWindowRoot() }
+    func windowRoots(pid: Int32) -> [MacAXWindowHandle] {
+        guard let root = windowRoot(pid: pid) else { return [] }
+        let attributes = attributes(of: root)
+        return [MacAXWindowHandle(
+            ref: root,
+            identity: MacAXWindowIdentity(
+                pid: pid,
+                index: 0,
+                role: attributes?.role ?? "AXWindow",
+                subrole: attributes?.subrole,
+                title: attributes?.title,
+                frame: attributes?.frame
+            )
+        )]
+    }
+    func appInfo(pid: Int32) -> MacAXAppInfo? {
+        guard let app = frontmostApp(), app.processIdentifier == pid else { return nil }
+        return app
     }
 }
 
@@ -353,6 +629,111 @@ public enum MacAccessibilityReader {
             truncationReasons: reasons.sorted(),
             skippedAtLeast: skipped
         )
+    }
+
+    /// Agent round 2, #1-ranked gap — the TARGETED DESCENT.
+    ///
+    /// A Chromium window spends the ordinary walk's 400 nodes / 12 levels on the
+    /// toolbar and the bookmarks bar and hits `depth_cap` before it ever reaches
+    /// the page: her Chrome look came back blind to the thing she was looking
+    /// at. This finds the first element with `role` — the `AXWebArea` — under a
+    /// SEARCH depth deep enough to clear the shell (24) but on a node budget far
+    /// smaller than the walk's, and stops the instant it matches.
+    ///
+    /// READ-ONLY and the SAME seam as the walk: no second walker, no mutation,
+    /// no attribute the walk does not already read. Breadth-first, because a web
+    /// area is wide-and-shallow-ish in the shell and a depth-first descent would
+    /// burn the budget in the first bookmark folder.
+    public static let findFirstMaxDepth = 24
+    public static let findFirstNodeBudget = 160
+
+    /// gpt-5.5 round-3 S5 — the search either found it, or it RAN OUT, and
+    /// those are different facts.
+    ///
+    /// Collapsing them into `nil` made a Chrome window whose shell is deeper or
+    /// wider than the 160-node budget report `no_web_area_found`: a claim that
+    /// the page does not exist, made by a search that never got there. The
+    /// caller still falls back to chrome scope — that part was right — but it
+    /// now says WHY.
+    public enum FindFirstResult: Sendable, Equatable {
+        case found(ref: MacAXElementRef, path: [Int])
+        /// The search covered everything reachable under both budgets and the
+        /// role is genuinely not there.
+        case notFound
+        /// The search stopped at the depth ceiling with children unexamined.
+        case depthCap
+        /// The search stopped at the node budget with the queue non-empty.
+        case nodeCap
+
+        public var hit: (ref: MacAXElementRef, path: [Int])? {
+            guard case .found(let ref, let path) = self else { return nil }
+            return (ref, path)
+        }
+
+        /// The machine-readable reason a look reports when the search ended
+        /// without an answer. nil for `.found`.
+        public var truncationReason: String? {
+            switch self {
+            case .found, .notFound: return nil
+            case .depthCap: return "depth_cap"
+            case .nodeCap: return "node_cap"
+            }
+        }
+    }
+
+    public static func findFirst(
+        role: String,
+        source: any MacAXElementSource,
+        root: MacAXElementRef,
+        maxDepth: Int = MacAccessibilityReader.findFirstMaxDepth,
+        nodeBudget: Int = MacAccessibilityReader.findFirstNodeBudget
+    ) -> FindFirstResult {
+        var queue: [(ref: MacAXElementRef, path: [Int], depth: Int)] = [(root, [], 1)]
+        var visited = 0
+        var index = 0
+        // Set the moment a budget stops the search short of an element that
+        // could still have carried the role. A search that examined everything
+        // reachable leaves both false, and only then is `notFound` the truth.
+        var hitDepthCap = false
+        var hitNodeCap = false
+        while index < queue.count {
+            let item = queue[index]
+            index += 1
+            visited += 1
+            // BACKSTOP, not the primary cap. The `remaining` clamp below never
+            // queues more than the budget can pop (visited + pending + newly
+            // fetched ≤ budget by construction), so this branch is unreachable
+            // while that invariant holds — and the invariant, not this line, is
+            // what a test can pin (`findFirst_neverVisitsMoreNodesThanItsBudget`).
+            // It stays as the loop's own hard stop: a runaway search is worse
+            // than a redundant comparison.
+            if visited > max(1, nodeBudget) { return .nodeCap }
+            if let attributes = source.attributes(of: item.ref), attributes.role == role {
+                // The ROOT itself matching is a real answer — a window that IS
+                // the web area needs no descent.
+                return .found(ref: item.ref, path: item.path)
+            }
+            guard item.depth < max(1, maxDepth) else {
+                if source.childCount(of: item.ref) > 0 { hitDepthCap = true }
+                continue
+            }
+            let remaining = max(0, max(1, nodeBudget) - visited - (queue.count - index))
+            guard remaining > 0 else {
+                if source.childCount(of: item.ref) > 0 { hitNodeCap = true }
+                continue
+            }
+            let total = source.childCount(of: item.ref)
+            let children = source.children(of: item.ref, limit: remaining)
+            if total > children.count { hitNodeCap = true }
+            for (childIndex, child) in children.enumerated() {
+                queue.append((child, item.path + [childIndex], item.depth + 1))
+            }
+        }
+        // Node cap first: it is the budget that actually bit in the Chrome case
+        // the finding names, and reporting the deeper one would understate it.
+        if hitNodeCap { return .nodeCap }
+        if hitDepthCap { return .depthCap }
+        return .notFound
     }
 
     /// Rank nodes against a query. All supplied predicates must match
@@ -490,7 +871,16 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
     public func frontmostWindowRoot() -> MacAXElementRef? {
         #if canImport(AppKit)
         guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
-        let appElement = AXUIElementCreateApplication(app.processIdentifier)
+        return windowRoot(pid: app.processIdentifier)
+        #else
+        return nil
+        #endif
+    }
+
+    public func windowRoot(pid: Int32) -> MacAXElementRef? {
+        #if canImport(AppKit)
+        guard NSRunningApplication(processIdentifier: pid) != nil else { return nil }
+        let appElement = AXUIElementCreateApplication(pid)
         if let focused = copyElement(appElement, kAXFocusedWindowAttribute) {
             return mint(focused)
         }
@@ -499,6 +889,115 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         }
         if let first = copyElementArray(appElement, kAXWindowsAttribute).first {
             return mint(first)
+        }
+        return nil
+        #else
+        return nil
+        #endif
+    }
+
+    /// Round-3 B1. Every window of the process, in `AXWindows` order, each with
+    /// the composite identity — read-only, one attribute pass per window.
+    ///
+    /// `AXWindows` supplies the primary order, but Finder can omit a focused
+    /// `AXSheet`. Union focused and main after it, deduped by `CFEqual`, so the
+    /// snapshot can preserve the sheet's own identity without making an
+    /// ordinary focused/main window appear twice.
+    public func windowRoots(pid: Int32) -> [MacAXWindowHandle] {
+        #if canImport(AppKit)
+        guard NSRunningApplication(processIdentifier: pid) != nil else { return [] }
+        let appElement = AXUIElementCreateApplication(pid)
+        let windows = MacAXWindowInventory.union(
+            listed: copyElementArray(appElement, kAXWindowsAttribute),
+            focused: copyElement(appElement, kAXFocusedWindowAttribute),
+            main: copyElement(appElement, kAXMainWindowAttribute),
+            equal: { CFEqual($0, $1) }
+        )
+        return windows.enumerated().map { index, window in
+            MacAXWindowHandle(
+                ref: mint(window),
+                identity: MacAXWindowIdentity(
+                    pid: pid,
+                    index: index,
+                    role: copyString(window, kAXRoleAttribute) ?? "AXWindow",
+                    subrole: copyString(window, kAXSubroleAttribute),
+                    title: copyString(window, kAXTitleAttribute),
+                    frame: copyFrame(window)
+                )
+            )
+        }
+        #else
+        return []
+        #endif
+    }
+
+    /// Round-3 S7 — metadata for a NAMED process. `frontmostApp()` describes
+    /// whatever is in front; reporting it for another pid's root labels the
+    /// wrong app onto a correct background read.
+    public func appInfo(pid: Int32) -> MacAXAppInfo? {
+        #if canImport(AppKit)
+        guard let app = NSRunningApplication(processIdentifier: pid) else { return nil }
+        return MacAXAppInfo(
+            name: app.localizedName ?? app.bundleIdentifier ?? "unknown",
+            bundleIdentifier: app.bundleIdentifier,
+            processIdentifier: pid
+        )
+        #else
+        return nil
+        #endif
+    }
+
+    /// Walk UP from the app's focused element to the window root, recording the
+    /// index of each element in its parent's children. Cheap and exact: one
+    /// `AXParent` chain, no second tree walk — and still read-only.
+    ///
+    /// nil when there is no focused element, when the chain does not reach the
+    /// same root `frontmostWindowRoot()` returned (a focused element in another
+    /// window), or when any hop is unreadable. Absence over a wrong answer.
+    public func focusedElementPath() -> [Int]? {
+        focusedElementPath(relativeTo: nil)
+    }
+
+    /// Same walk, anchored to the ROOT THE CALLER ALREADY WALKED when one is
+    /// given: the path is only meaningful inside that snapshot, and a focus
+    /// that moved to another window between the walk and this call must read
+    /// as "no focus", never as "the node at that path in the old tree"
+    /// (gpt-5.5 BLOCKING 2026-08-22 — a look that lies about the cursor).
+    /// Runs on the AX execution lane like every other live call that can
+    /// re-enter the target app.
+    public func focusedElementPath(relativeTo rootRef: MacAXElementRef?) -> [Int]? {
+        MacAXExecutionLane.sync { focusedElementPathOnExecutionLane(relativeTo: rootRef) }
+    }
+
+    private func focusedElementPathOnExecutionLane(relativeTo rootRef: MacAXElementRef?) -> [Int]? {
+        #if canImport(AppKit)
+        guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
+        let appElement = AXUIElementCreateApplication(app.processIdentifier)
+        guard let focused = copyElement(appElement, kAXFocusedUIElementAttribute) else { return nil }
+        let root: AXUIElement
+        if let rootRef {
+            // The walked root, by handle — not whatever window is focused NOW.
+            guard let anchored = element(rootRef) else { return nil }
+            root = anchored
+        } else {
+            guard let live = copyElement(appElement, kAXFocusedWindowAttribute)
+                ?? copyElement(appElement, kAXMainWindowAttribute)
+                ?? copyElementArray(appElement, kAXWindowsAttribute).first
+            else { return nil }
+            root = live
+        }
+
+        var path: [Int] = []
+        var current = focused
+        // Bounded by the reader's own depth ceiling: a cycle or a pathological
+        // chain cannot spin here.
+        for _ in 0..<MacAXLimits.hardMaxDepth {
+            if CFEqual(current, root) { return path.reversed() }
+            guard let parent = copyElement(current, kAXParentAttribute) else { return nil }
+            let siblings = copyElementArray(parent, kAXChildrenAttribute)
+            guard let index = siblings.firstIndex(where: { CFEqual($0, current) }) else { return nil }
+            path.append(index)
+            current = parent
         }
         return nil
         #else
@@ -516,6 +1015,7 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
                 ?? copyString(element, kAXDescriptionAttribute),
             value: copyStringifiedValue(element, kAXValueAttribute),
             enabled: copyBool(element, kAXEnabledAttribute) ?? true,
+            selected: copyBool(element, kAXSelectedAttribute),
             frame: copyFrame(element),
             actions: copyActions(element)
         )

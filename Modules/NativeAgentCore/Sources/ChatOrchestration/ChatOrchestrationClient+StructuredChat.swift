@@ -113,7 +113,8 @@ extension SwiftNativeChatOrchestrationClient {
         surface: String,
         suppressUserAppend: Bool,
         persistToolMessages: Bool,
-        progress: ChatOrchestrationProgressHandler?
+        progress: ChatOrchestrationProgressHandler?,
+        noticeSink: @escaping @Sendable (String, String) async -> Void
     ) async throws -> StructuredChatExecution {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty && attachments.isEmpty {
@@ -330,7 +331,7 @@ extension SwiftNativeChatOrchestrationClient {
                             path: self.dataRoot,
                             error: error,
                             userText: "Couldn't save the receipt for tool '\(record.name)' - it won't appear in the saved transcript.",
-                            onNotice: { kind, text in await progress?(.notice(kind: kind, text: text)) }
+                            onNotice: noticeSink
                         )
                     }
                 }
@@ -499,7 +500,8 @@ extension SwiftNativeChatOrchestrationClient {
         surface: String,
         suppressUserAppend: Bool,
         persistToolMessages: Bool,
-        progress: ChatOrchestrationProgressHandler?
+        progress: ChatOrchestrationProgressHandler?,
+        noticeSink: @escaping @Sendable (String, String) async -> Void
     ) async throws -> StructuredChatExecution {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty && attachments.isEmpty {
@@ -704,7 +706,7 @@ extension SwiftNativeChatOrchestrationClient {
                             path: self.dataRoot,
                             error: error,
                             userText: "Couldn't save the receipt for tool '\(record.name)' - it won't appear in the saved transcript.",
-                            onNotice: { kind, text in await progress?(.notice(kind: kind, text: text)) }
+                            onNotice: noticeSink
                         )
                     }
                 }
@@ -770,7 +772,8 @@ extension SwiftNativeChatOrchestrationClient {
                     text: partial,
                     cancelled: false,
                     source: surface,
-                    outcomeContext: providerCtx
+                    outcomeContext: providerCtx,
+                    onNotice: noticeSink
                 )
             }
             // 2026-07-21 audit fix: a user stop carries its visible partial
@@ -784,7 +787,8 @@ extension SwiftNativeChatOrchestrationClient {
                     text: partial,
                     cancelled: true,
                     source: surface,
-                    outcomeContext: providerCtx
+                    outcomeContext: providerCtx,
+                    onNotice: noticeSink
                 )
                 throw CancellationError()
             }
@@ -884,7 +888,7 @@ extension SwiftNativeChatOrchestrationClient {
         activeTools: Set<String>
     ) -> TurnContext? {
         guard let context else { return nil }
-        let allowed = SwiftToolDispatcher.alwaysOnCoreNames.union(activeTools)
+        let allowed = SwiftToolDispatcher.normalModelToolNames(activeTools: activeTools)
         let filtered = context.toolSchemas.filter { schema in
             if allowed.contains(schema.name) { return true }
             if schema.name.hasPrefix("mcp__") { return true }

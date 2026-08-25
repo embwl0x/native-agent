@@ -1200,12 +1200,17 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
 
     /// Ops plus the accounting of what the raw scan discarded.
     ///
-    /// An UNDECODABLE row already fails LOUD here (`malformedOperation`) — this
-    /// store never had finding 1's silent-skip exposure, so `undecodableRowCount`
-    /// is structurally zero. What it DID share is finding 2: `readJSONL` drops an
-    /// unparseable LINE silently, and compaction would then rewrite the feed
-    /// without it. The gate in `compactIfNeededUnlocked` closes that.
-    private func readOpsWithIntegrityUnlocked() async throws -> (ops: [GitHubCommandOp], integrity: SnapshotTailOpLog.OpLogIntegrity) {
+    /// The command reader fails closed on a malformed physical line: replaying
+    /// only the rows that happened to parse would turn an incomplete command
+    /// history into a plausible, but false, GitHub work state. A torn final
+    /// line is different: it can be an append in flight, so it remains
+    /// readable but is carried in the integrity report for the health surface.
+    ///
+    /// `opLogIntegrity` is the one diagnostic path allowed to inspect the
+    /// dropped-line accounting without turning it into a usable replay.
+    private func readOpsWithIntegrityUnlocked(
+        allowMalformedForDiagnostics: Bool = false
+    ) async throws -> (ops: [GitHubCommandOp], integrity: SnapshotTailOpLog.OpLogIntegrity) {
         let (rows, report) = try await persistence.readJSONLReporting(opsPath)
         let ops = try rows.map { row -> GitHubCommandOp in
             guard let op: GitHubCommandOp = try? Self.decode(row) else {
@@ -1220,6 +1225,9 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
             physicalRowCount: report.physicalLineCount
         )
         SnapshotTailOpLog.noteIntegrity(integrity, feed: Self.logLabel, path: opsPath)
+        guard allowMalformedForDiagnostics || integrity.malformedLineCount == 0 else {
+            throw GitHubCommandStoreError.malformedOperation
+        }
         return (ops, integrity)
     }
 
@@ -1229,16 +1237,14 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
 
     /// The readable counter: what the GitHub-command feed currently cannot use.
     public func opLogIntegrity() async throws -> SnapshotTailOpLog.OpLogIntegrity {
-        try await readOpsWithIntegrityUnlocked().integrity
+        try await readOpsWithIntegrityUnlocked(allowMalformedForDiagnostics: true).integrity
     }
 
     /// The GitHub-command feed's health for the Doctor surface (gpt-5.5 review
     /// 2026-08-02, finding 3): unusable rows AND feed size.
     ///
-    /// This one reads through `readOpsWithIntegrityUnlocked`, which THROWS on an
-    /// undecodable op row (this store fails loud where Desk skips). The Doctor
-    /// check catches that and reports it — a feed that will not even parse is
-    /// exactly what a health surface is for.
+    /// This is deliberately diagnostic-only: it reports malformed physical
+    /// rows even though a normal command replay refuses to use the feed.
     public func opLogHealth() async throws -> SnapshotTailOpLog.OpLogHealth {
         let integrity = try await opLogIntegrity()
         return SnapshotTailOpLog.OpLogHealth(
@@ -1350,15 +1356,15 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
         integrity: SnapshotTailOpLog.OpLogIntegrity
     ) async throws {
         // PHYSICAL rows, not decoded ops (gpt-5.5 review 2026-08-02, finding 2).
-        // Undecodable ops throw upstream here, but a malformed LINE is dropped
-        // silently by the scan, so a feed padded with malformed lines measured
-        // smaller than it is — under the threshold, past the gate, never warned
-        // about, growing without bound.
+        // `readFeedUnlocked` refuses malformed lines before it can reach this
+        // point. The physical-row threshold is still required for the
+        // diagnostic/recovery paths: it prevents a future tolerant reader from
+        // measuring a damaged file as smaller than the bytes it actually holds.
         guard integrity.feedRowCount(decodedCount: fileOpCount) >= opsCompactionThreshold else { return }
         // THE UNKNOWN-ROW GATE (audit 2026-08-02, finding 1), same policy as
-        // DeskStore and TaskLedger. Undecodable ops already throw upstream here,
-        // so in practice this catches a malformed LINE that `readJSONL` dropped —
-        // rewriting the feed would delete it for good.
+        // DeskStore and TaskLedger. This remains a final guard for callers that
+        // supply an integrity report directly: rewriting a feed with unusable
+        // rows would delete evidence for good.
         guard SnapshotTailOpLog.mayCompact(integrity, feed: Self.logLabel, path: opsPath) else { return }
         // keep >= 1: the rewritten log's head op is the lock-free reader's
         // consistency proof (tailFirstOpId), so the tail must never be empty.

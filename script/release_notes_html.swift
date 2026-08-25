@@ -44,7 +44,12 @@ func inline(_ s: String) -> String {
     out = boldRE.stringByReplacingMatches(
         in: out, range: NSRange(out.startIndex..., in: out),
         withTemplate: "<strong>$1</strong>")
-    for (i, body) in codeSpans.enumerated() {
+    // Restore in REVERSE creation order: a later span's body can contain an
+    // earlier span's placeholder (e.g. "``x``" lifts twice, span 1 wrapping
+    // placeholder 0), and forward order left that inner placeholder as raw
+    // control bytes in the output — which then broke the CDATA/xmllint gate
+    // downstream (sweep 2026-08-21).
+    for (i, body) in codeSpans.enumerated().reversed() {
         out = out.replacingOccurrences(of: "\u{01}\(i)\u{02}", with: "<code>\(body)</code>")
     }
     return out
@@ -61,16 +66,23 @@ let style = """
   .release-notes h1 { font-size: 17px; margin: 0 0 10px; }
   .release-notes h2 { font-size: 14px; margin: 16px 0 6px; }
   .release-notes h3 { font-size: 13px; margin: 12px 0 4px; }
-  .release-notes ul { margin: 6px 0; padding-left: 22px; }
+  .release-notes ul, .release-notes ol { margin: 6px 0; padding-left: 22px; }
   .release-notes li { margin: 4px 0; }
   .release-notes code {
     font-family: ui-monospace, "SF Mono", Menlo, monospace;
     font-size: 12px; padding: 0 3px; border-radius: 3px;
     background: rgba(0, 0, 0, 0.06);
   }
+  .release-notes pre {
+    margin: 6px 0; padding: 8px 10px; border-radius: 6px;
+    background: rgba(0, 0, 0, 0.06); overflow-x: auto;
+  }
+  .release-notes pre code { padding: 0; background: transparent; }
   @media (prefers-color-scheme: dark) {
     .release-notes { color: #e8e8ed; }
     .release-notes code { background: rgba(255, 255, 255, 0.12); }
+    .release-notes pre { background: rgba(255, 255, 255, 0.12); }
+    .release-notes pre code { background: transparent; }
   }
 </style>
 """
@@ -83,8 +95,11 @@ guard !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
 
 var html: [String] = ["<div class=\"release-notes\">", style]
 var listOpen = false
+var olOpen = false
 var itemLines: [String] = []
 var paragraphLines: [String] = []
+var fenceOpen = false
+var fenceLines: [String] = []
 
 func flushItem() {
     guard !itemLines.isEmpty else { return }
@@ -94,6 +109,23 @@ func flushItem() {
 func flushList() {
     flushItem()
     if listOpen { html.append("</ul>"); listOpen = false }
+    if olOpen { html.append("</ol>"); olOpen = false }
+}
+
+// "1. item" / "12. item" → the body after the marker, else nil. Ordered lists
+// previously fell through to the paragraph path and shipped raw "1." markers
+// past the appcast payload guard (gpt-5.5 sweep review, 2026-08-21).
+func orderedItemBody(_ line: String) -> String? {
+    var digits = 0
+    for ch in line {
+        if ch.isNumber { digits += 1; continue }
+        if ch == "." && digits > 0 {
+            let rest = line.dropFirst(digits + 1)
+            if rest.hasPrefix(" ") { return String(rest.dropFirst()) }
+        }
+        return nil
+    }
+    return nil
 }
 func flushParagraph() {
     guard !paragraphLines.isEmpty else { return }
@@ -101,9 +133,27 @@ func flushParagraph() {
     paragraphLines = []
 }
 
+func flushFence() {
+    html.append("<pre><code>\(fenceLines.joined(separator: "\n"))</code></pre>")
+    fenceLines = []
+}
+
 for rawLine in input.components(separatedBy: "\n") {
     let line = escape(rawLine)
     let trimmed = line.trimmingCharacters(in: .whitespaces)
+    // Fenced code blocks: verbatim (already-escaped) content, no inline
+    // markdown passes. Previously a fence fell through to the paragraph path
+    // and the backtick runs collided with the code-span placeholders.
+    if trimmed.hasPrefix("```") {
+        if fenceOpen { flushFence(); fenceOpen = false } else {
+            flushList(); flushParagraph(); fenceOpen = true
+        }
+        continue
+    }
+    if fenceOpen {
+        fenceLines.append(line)
+        continue
+    }
     if trimmed.isEmpty {
         flushList(); flushParagraph()
     } else if line.hasPrefix("### ") {
@@ -117,10 +167,17 @@ for rawLine in input.components(separatedBy: "\n") {
         html.append("<h1>\(inline(String(line.dropFirst(2))))</h1>")
     } else if line.hasPrefix("- ") {
         flushParagraph()
+        if olOpen { flushList() }
         if !listOpen { html.append("<ul>"); listOpen = true }
         flushItem()
         itemLines.append(String(line.dropFirst(2)))
-    } else if listOpen && line.hasPrefix("  ") {
+    } else if let body = orderedItemBody(line) {
+        flushParagraph()
+        if listOpen { flushList() }
+        if !olOpen { html.append("<ol>"); olOpen = true }
+        flushItem()
+        itemLines.append(body)
+    } else if (listOpen || olOpen) && line.hasPrefix("  ") {
         // Continuation of the current bullet (our notes wrap list items with
         // a two-space indent).
         itemLines.append(trimmed)
@@ -129,6 +186,7 @@ for rawLine in input.components(separatedBy: "\n") {
         paragraphLines.append(trimmed)
     }
 }
+if fenceOpen { flushFence() } // unterminated fence: emit what we have
 flushList()
 flushParagraph()
 html.append("</div>")

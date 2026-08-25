@@ -1,0 +1,26 @@
+{
+  "surfaces": [
+    { "fence": "app.chat", "id": "feed.chat.inboxStrip" },
+    { "fence": "app.chat", "id": "ui.chat.header.renameControls" },
+    { "fence": "app.chat", "id": "ui.chat.queue.removeNextButton" },
+    { "fence": "app.chat", "id": "ui.chat.sidebar.archiveButton" },
+    { "fence": "app.chat", "id": "ui.chat.transcript.inlineApprovalCard" },
+    { "fence": "app.desk", "id": "desk.inbox.detailSheetAutoRead" },
+    { "fence": "app.desk", "id": "workshop.observatory.veto" },
+    { "fence": "core.chat.persistence", "id": "chat.factory.credentialRootEnvOverride" },
+    { "fence": "core.chat.persistence", "id": "chat.persistence.transcriptWriteFailureNotice" },
+    { "fence": "core.chat.tools", "id": "chat.tools.manifestSigningKey" },
+    { "fence": "core.chat.tools", "id": "chat.tools.toolPreloadTrace" },
+    { "fence": "core.context", "id": "context.runtime.memoryPressureSource" },
+    { "fence": "core.context", "id": "runtime.attachMemoryProvenance" },
+    { "fence": "core.misc", "id": "cli.deskSweep" },
+    { "fence": "core.misc", "id": "cli.deskSweep.ghReport" },
+    { "fence": "core.misc", "id": "cli.deskSweep.retireTrackerGh" },
+    { "fence": "core.persistence", "id": "core.persistence.replaceJSONL.durabilityDivergence" },
+    { "fence": "core.substrate.organism", "id": "ui.observatory.reflexApproveRetire" },
+    { "fence": "core.substrate.organism", "id": "ui.observatory.settleAndResetBody" },
+    { "fence": "core.telegram", "id": "telegram.updateInbox.perTickFullScan" },
+    { "fence": "core.telegram", "id": "telegram.voice.audioTranscodeStage" },
+    { "fence": "core.trust", "id": "core.trust.securityPolicy.blockIsUnpersisted" }
+  ]
+}

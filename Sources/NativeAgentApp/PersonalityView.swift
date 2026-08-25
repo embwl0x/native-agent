@@ -20,11 +20,120 @@ import NativeAgentShared
 //   • Persona live → the name (the one live profile field) + the documents
 //     that ARE the persona.
 
+/// Owns the picker/editor transition as one value state. In particular, a
+/// document switch may replace the visible editor text, but it must never
+/// discard the departing document's unsaved draft.
+struct PersonalityDocumentDraftState: Equatable {
+    private(set) var selectedDocumentID = ""
+    private(set) var unsavedDrafts: [String: String] = [:]
+
+    var hasUnsavedDrafts: Bool { !unsavedDrafts.isEmpty }
+
+    static func usableDocuments(in documents: [PersonalityDoc]) -> [PersonalityDoc] {
+        documents.filter { !$0.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
+    mutating func select(_ requestedID: String, documents: [PersonalityDoc]) -> String {
+        selectedDocumentID = requestedID
+        return reconcile(documents: documents)
+    }
+
+    /// Reconcile after a load/reload. A missing selection moves to the first
+    /// usable document; an empty or malformed catalog has no selected id and
+    /// no editable-looking empty fallback.
+    mutating func reconcile(documents: [PersonalityDoc]) -> String {
+        let documents = Self.usableDocuments(in: documents)
+        guard let selected = documents.first(where: { $0.id == selectedDocumentID })
+            ?? documents.first else {
+            selectedDocumentID = ""
+            return ""
+        }
+        selectedDocumentID = selected.id
+        return unsavedDrafts[selected.id] ?? selected.content
+    }
+
+    mutating func recordEdit(_ content: String, documents: [PersonalityDoc]) {
+        guard let selected = Self.usableDocuments(in: documents)
+            .first(where: { $0.id == selectedDocumentID }) else {
+            return
+        }
+        if content == selected.content {
+            unsavedDrafts.removeValue(forKey: selected.id)
+        } else {
+            unsavedDrafts[selected.id] = content
+        }
+    }
+
+    mutating func keepUnsavedDraft(_ content: String, for documentID: String) {
+        guard !documentID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        unsavedDrafts[documentID] = content
+    }
+
+    mutating func markSaved(documentID: String) {
+        unsavedDrafts.removeValue(forKey: documentID)
+    }
+}
+
+/// The starter card's durable operation. Keeping this separate from SwiftUI
+/// state means the same onboarding, document reload, and SOUL write sequence
+/// can be evaluated without treating an off-screen AppKit hierarchy as proof
+/// that the user action worked.
+@MainActor
+enum PersonalityStarterCreateAction {
+    enum Outcome: Equatable {
+        case created
+        case notesUnsaved(documentID: String, draft: String)
+        case failed(String)
+    }
+
+    static let notesUnsavedMessage =
+        "Setup notes were not saved. They are open as an unsaved SOUL.md draft below."
+
+    static func create(
+        appModel: AppModel,
+        agentName: String,
+        userName: String,
+        notes: String
+    ) async -> Outcome {
+        do {
+            let response = try await appModel.completeOnboarding(
+                agentName: agentName.trimmingCharacters(in: .whitespacesAndNewlines),
+                personaType: "ai",
+                userName: userName.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+            guard response.ok else {
+                return .failed(response.detail ?? response.error ?? "Could not create the persona.")
+            }
+            guard await appModel.loadPersonalityDocs() else {
+                return .failed(
+                    "The persona was created, but its documents could not be reloaded to save your setup notes. Retry from the Personality page before editing anything else."
+                )
+            }
+
+            let trimmedNotes = notes.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedNotes.isEmpty,
+                  let soul = appModel.personalityDocs.first(where: { $0.id.uppercased() == "SOUL" })
+            else {
+                return .created
+            }
+
+            let draft = soul.content + "\n\n## From setup\n" + trimmedNotes + "\n"
+            PersonalityStarterPanelEvaluation.beforePersistingNotes?()
+            guard await appModel.savePersonalityDoc(id: soul.id, content: draft) else {
+                return .notesUnsaved(documentID: soul.id, draft: draft)
+            }
+            return .created
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+    }
+}
+
 struct PersonalityView: View {
     @Environment(AppModel.self) private var appModel
     @State private var draft = PersonalityProfile.defaultProfile
     @State private var isLoadingProfile = true
-    @State private var selectedDocId = "SOUL"
+    @State private var documentDraftState = PersonalityDocumentDraftState()
     @State private var personalityDocDraft = ""
 
     // Starter card state (shown only while no persona exists).
@@ -33,7 +142,11 @@ struct PersonalityView: View {
     @State private var starterNotes = ""
     @State private var starterBusy = false
     @State private var starterError: String?
-    @State private var docsLoadError: String?
+    @State private var documentsLoadLatch = PersonalityDocumentsLoadLatch()
+    @State private var documentSaveError: String?
+    @State private var isReloadingDocuments = false
+    @State private var isSavingName = false
+    @State private var nameSaveFeedback: PersonalityNameSaveFeedback?
 
     /// SOUL.md is the identity marker everywhere else in the system
     /// (PersonaRootResolver, onboarding guards) — same rule here. Presence
@@ -50,6 +163,10 @@ struct PersonalityView: View {
                 && ($0.updatedAt != nil
                     || !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
+    }
+
+    private var documentsReloadPresentation: PersonalityDocumentsReloadPresentation {
+        documentsLoadLatch.presentation
     }
 
     var body: some View {
@@ -72,13 +189,13 @@ struct PersonalityView: View {
                             ResetPersonaView {
                                 await loadProfile(forceRefresh: true)
                             }
-                        } else if let docsLoadError {
+                        } else if case .unavailable(let detail) = documentsReloadPresentation {
                             // A failed docs load leaves personalityDocs empty,
                             // which must NOT masquerade as "no persona yet" —
                             // a live persona would see a false Create card
                             // (gpt-5.5 review LOW, 2026-07-03). Fail loud.
                             NativePanel(title: "Persona Unavailable", systemImage: "exclamationmark.triangle") {
-                                Text("The persona documents couldn't be read: \(docsLoadError)")
+                                Text(detail)
                                     .font(.callout)
                                     .foregroundStyle(.orange)
                                 Button("Retry", systemImage: "arrow.clockwise") {
@@ -146,31 +263,23 @@ struct PersonalityView: View {
         starterBusy = true
         starterError = nil
         defer { starterBusy = false }
-        let name = starterAgentName.trimmingCharacters(in: .whitespacesAndNewlines)
-        do {
-            let resp = try await appModel.completeOnboarding(
-                agentName: name,
-                personaType: "ai",
-                userName: starterUserName.trimmingCharacters(in: .whitespacesAndNewlines)
-            )
-            guard resp.ok else {
-                starterError = resp.detail ?? resp.error ?? "Could not create the persona."
-                return
-            }
-            await appModel.loadPersonalityDocs()
-            // Fold the starter notes into SOUL.md so they land in the real
-            // persona, not a side file nothing reads.
-            let notes = starterNotes.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !notes.isEmpty,
-               let soul = appModel.personalityDocs.first(where: { $0.id.uppercased() == "SOUL" }) {
-                await appModel.savePersonalityDoc(
-                    id: soul.id,
-                    content: soul.content + "\n\n## From setup\n" + notes + "\n"
-                )
-            }
+        let outcome = await PersonalityStarterCreateAction.create(
+            appModel: appModel,
+            agentName: starterAgentName,
+            userName: starterUserName,
+            notes: starterNotes
+        )
+        switch outcome {
+        case .created:
             await loadProfile(forceRefresh: true)
-        } catch {
-            starterError = error.localizedDescription
+        case .notesUnsaved(let documentID, let draft):
+            // Onboarding is committed, but the second SOUL write is not.
+            // Keep the exact draft in the real editor rather than discarding it.
+            documentDraftState.keepUnsavedDraft(draft, for: documentID)
+            await loadProfile(forceRefresh: false)
+            documentSaveError = PersonalityStarterCreateAction.notesUnsavedMessage
+        case .failed(let detail):
+            starterError = detail
         }
     }
 
@@ -186,23 +295,47 @@ struct PersonalityView: View {
 
             HStack {
                 Button("Save Name", systemImage: "checkmark.circle") {
-                    Task { await appModel.savePersonality(draft) }
+                    Task { await saveName() }
                 }
-                // savePersonality persists the WHOLE draft. If the profile
-                // never loaded, draft is .defaultProfile and saving would
-                // overwrite the real profile.json with defaults (gpt-5.5
-                // review MED, 2026-07-03) — so no real profile, no save.
-                .disabled(appModel.personality == nil)
+                // A name-only save cannot overwrite an unrelated stale profile
+                // draft, but it still needs a successfully loaded profile to
+                // prove this is an edit rather than an accidental initialization.
+                .disabled(appModel.personality == nil || isSavingName
+                    || draft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 Button("Reload", systemImage: "arrow.clockwise") {
                     Task { await loadProfile(forceRefresh: true) }
                 }
                 Spacer()
+                if let nameSaveFeedback {
+                    Label(nameSaveFeedback.text, systemImage: nameSaveFeedback.systemImage)
+                        .font(.caption)
+                        .foregroundStyle(nameSaveFeedback.color)
+                }
                 if let updatedAt = draft.updatedAt {
                     Text("Updated: \(updatedAt)")
                         .font(.caption)
                         .foregroundStyle(.tertiary)
                 }
             }
+        }
+    }
+
+    @MainActor
+    private func saveName() async {
+        guard !isSavingName else { return }
+        isSavingName = true
+        defer { isSavingName = false }
+        switch await appModel.savePersonalityName(draft.name) {
+        case .saved(let profile):
+            // The field reflects the writer's normalized, persisted profile;
+            // it never claims the raw input was saved when the boundary
+            // trimmed/capped it differently.
+            draft = profile
+            nameSaveFeedback = .saved(profile.name)
+        case .refused(let detail):
+            nameSaveFeedback = .refused(detail)
+        case .failed(let detail):
+            nameSaveFeedback = .failed(detail)
         }
     }
 
@@ -214,41 +347,45 @@ struct PersonalityView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-            Picker("Document", selection: $selectedDocId) {
-                ForEach(appModel.personalityDocs) { doc in
+            Picker("Document", selection: documentPickerSelection) {
+                ForEach(PersonalityDocumentDraftState.usableDocuments(in: appModel.personalityDocs)) { doc in
                     Text(doc.filename).tag(doc.id)
                 }
             }
             .pickerStyle(.segmented)
-            .onChange(of: selectedDocId) {
-                syncPersonalityDocDraft()
-            }
-
             AdvancedTextEditor(
                 title: selectedPersonalityDoc?.filename ?? "SOUL.md",
                 text: $personalityDocDraft,
                 minHeight: 320,
                 isReadOnly: selectedPersonalityDocIsMemoryOwnedUser
             )
+            .onChange(of: personalityDocDraft) { _, value in
+                documentDraftState.recordEdit(value, documents: appModel.personalityDocs)
+            }
             .help(selectedPersonalityDocIsMemoryOwnedUser ? PersonalityDocHelpCopy.memoryOwnedDocument : "")
 
             HStack {
                 Button("Save Document", systemImage: "checkmark.circle") {
-                    let docId = selectedDocId
+                    let docId = documentDraftState.selectedDocumentID
                     let content = personalityDocDraft
                     Task {
-                        await appModel.savePersonalityDoc(id: docId, content: content)
-                        syncPersonalityDocDraft()
+                        if await appModel.savePersonalityDoc(id: docId, content: content) {
+                            documentDraftState.markSaved(documentID: docId)
+                            documentSaveError = nil
+                            syncPersonalityDocDraft()
+                        } else {
+                            documentSaveError = appModel.statusText
+                        }
                     }
                 }
-                .disabled(selectedDocId.isEmpty || selectedPersonalityDocIsMemoryOwnedUser)
+                .disabled(documentDraftState.selectedDocumentID.isEmpty || selectedPersonalityDocIsMemoryOwnedUser)
 
-                Button("Reload Documents", systemImage: "arrow.clockwise") {
+                Button(isReloadingDocuments ? "Reloading…" : "Reload Documents", systemImage: "arrow.clockwise") {
                     Task {
-                        await appModel.loadPersonalityDocs()
-                        syncPersonalityDocDraft()
+                        await reloadDocuments()
                     }
                 }
+                .disabled(isReloadingDocuments)
 
                 if let path = selectedPersonalityDoc?.path {
                     Text(path)
@@ -258,6 +395,22 @@ struct PersonalityView: View {
                         .truncationMode(.middle)
                         .textSelection(.enabled)
                 }
+            }
+
+            if documentDraftState.hasUnsavedDrafts {
+                Label("Unsaved edits are kept while you switch documents.", systemImage: "pencil.line")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            if let banner = documentsReloadPresentation.banner {
+                Label(banner, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            if let documentSaveError {
+                Label(documentSaveError, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
             }
         }
     }
@@ -270,24 +423,31 @@ struct PersonalityView: View {
         if forceRefresh || appModel.personality == nil {
             await appModel.refreshForSidebarItem(.personality)
         }
-        if appModel.personalityDocs.isEmpty || forceRefresh {
-            // Load directly so a failure is distinguishable from a genuinely
-            // empty fresh install (AppModel.loadPersonalityDocs swallows the
-            // error into statusText, leaving docs empty either way).
-            docsLoadError = nil
-            do {
-                appModel.personalityDocs = try await appModel.client.getPersonalityDocs().docs
-            } catch {
-                docsLoadError = error.localizedDescription
-            }
-        }
+        // Revalidate on every appearance. A cached successful read must not
+        // impersonate the current on-disk persona after a later read fails.
+        // `reloadDocuments` retains the last good editor buffer but labels it
+        // stale, which is safer than replacing it with an empty starter card.
+        await reloadDocuments()
         draft = appModel.personality ?? .defaultProfile
         syncPersonalityDocDraft()
         isLoadingProfile = false
     }
 
     private var selectedPersonalityDoc: PersonalityDoc? {
-        appModel.personalityDocs.first { $0.id == selectedDocId } ?? appModel.personalityDocs.first
+        PersonalityDocumentDraftState.usableDocuments(in: appModel.personalityDocs)
+            .first { $0.id == documentDraftState.selectedDocumentID }
+    }
+
+    private var documentPickerSelection: Binding<String> {
+        Binding(
+            get: { documentDraftState.selectedDocumentID },
+            set: { selectedID in
+                personalityDocDraft = documentDraftState.select(
+                    selectedID,
+                    documents: appModel.personalityDocs
+                )
+            }
+        )
     }
 
     private var selectedPersonalityDocIsMemoryOwnedUser: Bool {
@@ -295,11 +455,141 @@ struct PersonalityView: View {
     }
 
     private func syncPersonalityDocDraft() {
-        if !appModel.personalityDocs.contains(where: { $0.id == selectedDocId }) {
-            selectedDocId = appModel.personalityDocs.first?.id ?? "SOUL"
-        }
-        personalityDocDraft = selectedPersonalityDoc?.content ?? ""
+        personalityDocDraft = documentDraftState.reconcile(documents: appModel.personalityDocs)
     }
+
+    @MainActor
+    private func reloadDocuments() async {
+        guard !isReloadingDocuments else { return }
+        isReloadingDocuments = true
+        defer { isReloadingDocuments = false }
+        let outcome = await appModel.reloadPersonalityDocuments()
+        documentsLoadLatch.record(outcome)
+        switch outcome {
+        case .loaded:
+            syncPersonalityDocDraft()
+        case .failed:
+            // Keep appModel.personalityDocs untouched: they are retained
+            // evidence, not a freshly read empty persona.
+            break
+        }
+    }
+}
+
+/// Owns the document-reader outcome used by `loadProfile`. A save failure is
+/// intentionally not admitted here: only the canonical reader can say the
+/// mounted document set is current, stale, or unavailable. That keeps a write
+/// error from being misreported as a reader outage and lets the next successful
+/// reader result clear the latch deterministically.
+struct PersonalityDocumentsLoadLatch: Equatable {
+    private enum State: Equatable {
+        case unattempted
+        case current
+        case failed(detail: String, retainedDocumentCount: Int)
+    }
+
+    private var state: State = .unattempted
+
+    var presentation: PersonalityDocumentsReloadPresentation {
+        switch state {
+        case .unattempted, .current:
+            return .current
+        case .failed(let detail, let retainedDocumentCount):
+            return PersonalityDocumentsReloadPresentation.resolve(
+                retainedDocumentCount: retainedDocumentCount,
+                errorDetail: detail
+            )
+        }
+    }
+
+    mutating func record(_ outcome: PersonalityDocumentsReloadOutcome) {
+        switch outcome {
+        case .loaded:
+            state = .current
+        case .failed(let detail, let retainedDocumentCount):
+            state = .failed(detail: detail, retainedDocumentCount: retainedDocumentCount)
+        }
+    }
+}
+
+/// The mounted Personality view must not use its document count as proof that
+/// the latest read succeeded. A failed refresh over prior rows is stale;
+/// failure with no prior rows is unavailable rather than a starter persona.
+enum PersonalityDocumentsReloadPresentation: Equatable {
+    case current
+    case retainedStale(documentCount: Int, detail: String)
+    case unavailable(String)
+
+    static func resolve(documents: [PersonalityDoc], errorDetail: String?) -> Self {
+        resolve(retainedDocumentCount: documents.count, errorDetail: errorDetail)
+    }
+
+    static func resolve(retainedDocumentCount: Int, errorDetail: String?) -> Self {
+        guard let errorDetail else { return .current }
+        let detail = errorDetail.trimmingCharacters(in: .whitespacesAndNewlines)
+        let message = detail.isEmpty
+            ? "The persona document reader returned no diagnostic details."
+            : detail
+        return retainedDocumentCount == 0
+            ? .unavailable("The persona documents couldn't be read: \(message)")
+            : .retainedStale(documentCount: retainedDocumentCount, detail: message)
+    }
+
+    var banner: String? {
+        switch self {
+        case .current:
+            return nil
+        case .retainedStale(let count, let detail):
+            return "Couldn't reload persona documents; showing \(count) previously loaded document\(count == 1 ? "" : "s"). \(detail)"
+        case .unavailable:
+            return nil
+        }
+    }
+}
+
+private struct PersonalityNameSaveFeedback {
+    enum Kind {
+        case saved
+        case refused
+        case failed
+    }
+
+    let kind: Kind
+    let text: String
+
+    static func saved(_ persistedName: String) -> Self {
+        .init(kind: .saved, text: "Saved as \(persistedName)")
+    }
+
+    static func refused(_ detail: String) -> Self {
+        .init(kind: .refused, text: detail)
+    }
+
+    static func failed(_ detail: String) -> Self {
+        .init(kind: .failed, text: "Could not save name: \(detail)")
+    }
+
+    var systemImage: String {
+        switch kind {
+        case .saved: return "checkmark.circle.fill"
+        case .refused, .failed: return "exclamationmark.triangle.fill"
+        }
+    }
+
+    var color: Color {
+        switch kind {
+        case .saved: return .green
+        case .refused, .failed: return .orange
+        }
+    }
+}
+
+/// Evaluation-only fault boundary for the starter panel's second, durable
+/// write. It is nil in ordinary app operation, so it cannot alter production
+/// behavior unless an executable evaluation explicitly installs it.
+@MainActor
+enum PersonalityStarterPanelEvaluation {
+    static var beforePersistingNotes: (() -> Void)?
 }
 
 // MARK: - Plain-English personality document help copy

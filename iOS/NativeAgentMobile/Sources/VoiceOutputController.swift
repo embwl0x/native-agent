@@ -3,9 +3,27 @@ import Foundation
 import SwiftUI
 import AVFoundation
 
+enum VoiceOutputPlaybackState: Equatable {
+    case idle
+    case speaking
+
+    var isSpeaking: Bool { self == .speaking }
+
+    mutating func beginIfIdle() -> Bool {
+        guard self == .idle else { return false }
+        self = .speaking
+        return true
+    }
+
+    mutating func finish() {
+        self = .idle
+    }
+}
+
 @MainActor
 final class VoiceOutputController: NSObject, ObservableObject {
     @Published var isSpeaking = false
+    @Published var error: String?
     @AppStorage("voiceOutputEnabled") var enabled = true
 
     // 2026-05-09 fix: lazy-init the synthesizer and audio session.  Eagerly
@@ -16,36 +34,82 @@ final class VoiceOutputController: NSObject, ObservableObject {
     // to first speak() call shaves seconds off cold launch.
     private var _synthesizer: AVSpeechSynthesizer?
     private var audioSessionConfigured = false
+    private let configureAudioSession: () throws -> Void
+    private let activateAudioSession: () throws -> Void
+    private var playbackState: VoiceOutputPlaybackState = .idle
+    private var interruptionObserver: NSObjectProtocol?
 
-    override init() {
+    init(
+        configureAudioSession: @escaping () throws -> Void = {
+            try AVAudioSession.sharedInstance().setCategory(
+                .playback,
+                mode: .spokenAudio,
+                options: [.mixWithOthers]
+            )
+        },
+        activateAudioSession: @escaping () throws -> Void = {
+            try AVAudioSession.sharedInstance().setActive(true)
+        }
+    ) {
+        self.configureAudioSession = configureAudioSession
+        self.activateAudioSession = activateAudioSession
         super.init()
+        interruptionObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleAudioSessionInterruption()
+            }
+        }
         // Intentionally NO synth init or AVAudioSession setup here — see comment above.
+    }
+
+    deinit {
+        if let interruptionObserver {
+            NotificationCenter.default.removeObserver(interruptionObserver)
+        }
     }
 
     // MARK: - Public API
 
     func speak(_ text: String) {
         guard enabled, !text.isEmpty else { return }
+        // A reply may arrive while the prior one is still audible. Keep that
+        // state honest: do not queue a second utterance just because the UI
+        // asked to speak again.
+        guard playbackState == .idle else { return }
         let synth = ensureSynthesizer()
-        ensureAudioSession()
-        // Cancel any in-flight speech so the new reply takes priority
-        if synth.isSpeaking {
-            synth.stopSpeaking(at: .immediate)
-        }
+        guard ensureAudioSession() else { return }
+        guard !synth.isSpeaking else { return }
         let utterance = AVSpeechUtterance(string: text)
         utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
         utterance.rate = 0.50
         utterance.pitchMultiplier = 1.0
         utterance.volume = 1.0
 
-        try? AVAudioSession.sharedInstance().setActive(true)
+        do {
+            try activateAudioSession()
+        } catch {
+            self.error = "Spoken reply could not start: \(error.localizedDescription)"
+            finishPlayback()
+            return
+        }
+        guard playbackState.beginIfIdle() else { return }
         synth.speak(utterance)
-        isSpeaking = true
+        error = nil
+        isSpeaking = playbackState.isSpeaking
     }
 
     func stop() {
         _synthesizer?.stopSpeaking(at: .immediate)
-        isSpeaking = false
+        finishPlayback()
+    }
+
+    func handleAudioSessionInterruption() {
+        _synthesizer?.stopSpeaking(at: .immediate)
+        finishPlayback()
     }
 
     // MARK: - Lazy initializers
@@ -58,16 +122,24 @@ final class VoiceOutputController: NSObject, ObservableObject {
         return s
     }
 
-    private func ensureAudioSession() {
+    private func ensureAudioSession() -> Bool {
         audioSessionConfigured = true
         // Configure playback category so TTS plays even when the phone is in
         // silent mode.  Apple's mute switch still applies at the hardware level
         // on physical devices — we intentionally do NOT override it.
-        try? AVAudioSession.sharedInstance().setCategory(
-            .playback,
-            mode: .spokenAudio,
-            options: [.mixWithOthers]
-        )
+        do {
+            try configureAudioSession()
+            return true
+        } catch {
+            self.error = "Spoken reply could not start: \(error.localizedDescription)"
+            finishPlayback()
+            return false
+        }
+    }
+
+    private func finishPlayback() {
+        playbackState.finish()
+        isSpeaking = playbackState.isSpeaking
     }
 }
 
@@ -75,10 +147,10 @@ final class VoiceOutputController: NSObject, ObservableObject {
 
 extension VoiceOutputController: AVSpeechSynthesizerDelegate {
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-        Task { @MainActor in self.isSpeaking = false }
+        Task { @MainActor in self.finishPlayback() }
     }
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-        Task { @MainActor in self.isSpeaking = false }
+        Task { @MainActor in self.finishPlayback() }
     }
 }

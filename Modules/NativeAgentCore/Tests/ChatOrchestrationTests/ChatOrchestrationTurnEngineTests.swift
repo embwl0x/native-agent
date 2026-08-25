@@ -509,7 +509,7 @@ func turnEngine_clockContext_states_quiet_hours_window_when_configured() async t
     )))
     let morningLine = SwiftNativeTurnEngine.renderClockContext(
         now: morning, localTimeZone: chicago, quietHours: window)
-    #expect(morningLine.contains("Quiet hours: 7:00 PM–3:00 AM local (right now: outside that window)."))
+    #expect(!morningLine.contains("Quiet hours:"))
 
     // 01:00 local — inside the wrapped window.
     let night = try #require(utc.date(from: DateComponents(
@@ -517,7 +517,7 @@ func turnEngine_clockContext_states_quiet_hours_window_when_configured() async t
     )))
     let nightLine = SwiftNativeTurnEngine.renderClockContext(
         now: night, localTimeZone: chicago, quietHours: window)
-    #expect(nightLine.contains("(right now: inside that window)."))
+    #expect(nightLine.contains("Quiet hours: 7:00 PM–3:00 AM local."))
 
     // The window is one line, not a second block.
     #expect(!morningLine.contains("\n"))
@@ -541,6 +541,93 @@ func turnQuietHoursWindow_reads_user_prefs_and_degrades_to_nil() throws {
         #"{"quiet_hours": {"start": 5, "end": 5}}"#
     )
     #expect(TurnQuietHoursWindow.read(dataRoot: dir) == nil)
+}
+
+// EVAL FENCE: turn.contract
+// Ledger row: turn.ingredient.quietHoursWindow
+//
+// This crosses the real preference file -> turn assembler -> context-summary
+// boundary. A configured window must reach both the dynamic prompt and its
+// receipt only while the pinned local clock is inside it; an outside-window
+// turn must persist the opposite semantic rather than mere configuration.
+@Test
+func turnEngine_quietHoursPreferenceIsRenderedAndReceiptStampedWithoutStaleState() async throws {
+    let dataRoot = try makeTempDir("quiet-hours-receipt-data")
+    defer { try? FileManager.default.removeItem(at: dataRoot) }
+    let traceRoot = try makeTempDir("quiet-hours-receipt-traces")
+    defer { try? FileManager.default.removeItem(at: traceRoot) }
+    let personaRoot = try makeTempDir("quiet-hours-receipt-persona")
+    defer { try? FileManager.default.removeItem(at: personaRoot) }
+    try writeFile(personaRoot.appendingPathComponent("SOUL.md"), "QUIET-HOURS-PERSONA")
+    try writeFile(
+        dataRoot.appendingPathComponent("user_prefs.json"),
+        #"{"quiet_hours":{"start":19,"end":3}}"#
+    )
+    var local = Calendar(identifier: .gregorian)
+    local.timeZone = .current
+    let activeNow = try #require(local.date(from: DateComponents(
+        year: 2026, month: 8, day: 11, hour: 22, minute: 0
+    )))
+    let traceBus = TurnTraceBus(
+        persistLane: TurnTracePersistLane(dataRootOverride: traceRoot)
+    )
+    func makeEngine(clock: @escaping @Sendable () -> Date) -> SwiftNativeTurnEngine {
+        SwiftNativeTurnEngine(
+            persona: hermeticPersona(root: personaRoot),
+            memory: nil,
+            router: StubRouting(prefs: [
+                "chat": SurfacePreference(surface: "chat", model: "gpt-5.5", reasoningEffort: "high"),
+            ]),
+            trust: hermeticTrust(),
+            llm: MockLLMClient(scriptedResponses: ["unused"]),
+            tools: MockToolDispatchClient(),
+            clock: clock,
+            remPinsDataRoot: dataRoot,
+            memoryPromoter: nil,
+            turnTraceBus: traceBus
+        )
+    }
+
+    func persistedSummary(for turnID: String) async throws -> TurnTraceEvent {
+        let reader = TurnTraceRecentReader(dataRootOverride: traceRoot)
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            if let event = try await reader.read().events.last(where: {
+                $0.turnId == turnID && $0.kind == "context.summary"
+            }) {
+                return event
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        throw NSError(domain: "QuietHoursReceipt", code: 1, userInfo: [
+            NSLocalizedDescriptionKey: "timed out waiting for persisted context.summary"
+        ])
+    }
+
+    let activeEngine = makeEngine(clock: { activeNow })
+    let configuredTurn = TurnTraceContext.mintTurnId()
+    try await TurnTraceContext.$bus.withValue(traceBus) {
+        try await TurnTraceContext.$turnId.withValue(configuredTurn) {
+            let context = try await activeEngine.buildTurnContext(surface: "chat", userMessage: "hello")
+            #expect(context.systemSegments?.dynamic.contains("Quiet hours: 7:00 PM–3:00 AM local") == true)
+        }
+    }
+    let configured = try await persistedSummary(for: configuredTurn)
+    #expect(try objectValue(try objectValue(configured.payload)["flags"])["clock.quietHoursActive"] == .bool(true))
+
+    let outsideNow = try #require(local.date(from: DateComponents(
+        year: 2026, month: 8, day: 11, hour: 10, minute: 0
+    )))
+    let outsideEngine = makeEngine(clock: { outsideNow })
+    let outsideTurn = TurnTraceContext.mintTurnId()
+    try await TurnTraceContext.$bus.withValue(traceBus) {
+        try await TurnTraceContext.$turnId.withValue(outsideTurn) {
+            let context = try await outsideEngine.buildTurnContext(surface: "chat", userMessage: "hello")
+            #expect(context.systemSegments?.dynamic.contains("Quiet hours:") == false)
+        }
+    }
+    let outside = try await persistedSummary(for: outsideTurn)
+    #expect(try objectValue(try objectValue(outside.payload)["flags"])["clock.quietHoursActive"] == .bool(false))
 }
 
 @Test
@@ -662,6 +749,95 @@ func turnEngine_buildTurnContext_emits_metadata_only_context_summary() async thr
     #expect(!payloadContainsString(event.payload, "SECRET-USER-MESSAGE"))
     #expect(!payloadContainsString(event.payload, "SECRET-PERSONA-CONTENT"))
     #expect(!payloadContainsString(event.payload, "SECRET-SCHEMA-DESCRIPTION"))
+}
+
+/// Ledger row `speed.rem_pins.read` (core.substrate.organism).
+///
+/// The REM index is synchronous disk I/O on the ordinary turn path.  A valid
+/// index, deletion, and malformed replacement must all pass through the real
+/// read stage, emit the stage timing, and never retain stale bytes in the
+/// prompt. Merely exercising `REMPinsReader` directly would not prove that the
+/// turn engine still performs and traces the read.
+@Test
+func turnEngine_remPinsReadStage_hasNoStaleCacheAfterDeleteOrMalformedIndex() async throws {
+    let dataRoot = try makeTempDir("rem-pins-stage")
+    defer { try? FileManager.default.removeItem(at: dataRoot) }
+    let personaRoot = try makeTempDir("rem-pins-stage-persona")
+    defer { try? FileManager.default.removeItem(at: personaRoot) }
+    try writeFile(personaRoot.appendingPathComponent("SOUL.md"), "REM-STAGE-PERSONA")
+
+    let pinsURL = dataRoot.appendingPathComponent("rem_pins.json")
+    try """
+    {"GROWTH.md":[{"id":"pin-stage","text":"REM-PIN-MARKER","createdAt":"2026-06-01T00:00:00Z"}]}
+    """.write(to: pinsURL, atomically: true, encoding: .utf8)
+
+    let engine = SwiftNativeTurnEngine(
+        persona: hermeticPersona(root: personaRoot),
+        memory: nil,
+        router: StubRouting(prefs: [
+            "chat": SurfacePreference(surface: "chat", model: "gpt-5.5", reasoningEffort: "high"),
+        ]),
+        trust: hermeticTrust(),
+        llm: MockLLMClient(scriptedResponses: ["unused"]),
+        tools: MockToolDispatchClient(),
+        remPinsDataRoot: dataRoot,
+        memoryPromoter: nil
+    )
+
+    func summaryStage(_ event: TurnTraceEvent) throws -> JSONValue? {
+        let payload = try objectValue(event.payload)
+        let stages = try objectValue(payload["stageMs"])
+        return stages["rem_pins.read"]
+    }
+
+    let healthyTurn = TurnTraceContext.mintTurnId()
+    let healthyEvents = await collectTraceEvents(kind: "context.summary", turnId: healthyTurn) {
+        await TurnTraceContext.$turnId.withValue(healthyTurn) {
+            let context = try? await engine.buildTurnContext(
+                surface: "chat", userMessage: "hello", personaOverride: nil,
+                imageBlocks: [], includeClockContext: false
+            )
+            #expect(context?.systemPrompt?.contains("REM-PIN-MARKER") == true)
+        }
+    }
+    #expect(healthyEvents.count == 1)
+    let healthyEvent = try #require(healthyEvents.first)
+    #expect(try summaryStage(healthyEvent) != nil)
+
+    // Deletion is a distinct adverse persistent state from malformed bytes:
+    // the previous valid contents must not be retained in an engine-local
+    // cache, and the ordinary timed read must still occur.
+    try FileManager.default.removeItem(at: pinsURL)
+    let deletedTurn = TurnTraceContext.mintTurnId()
+    let deletedEvents = await collectTraceEvents(kind: "context.summary", turnId: deletedTurn) {
+        await TurnTraceContext.$turnId.withValue(deletedTurn) {
+            let context = try? await engine.buildTurnContext(
+                surface: "chat", userMessage: "hello", personaOverride: nil,
+                imageBlocks: [], includeClockContext: false
+            )
+            #expect(context?.systemPrompt?.contains("REM-PIN-MARKER") == false)
+        }
+    }
+    #expect(deletedEvents.count == 1)
+    let deletedEvent = try #require(deletedEvents.first)
+    #expect(try summaryStage(deletedEvent) != nil)
+
+    // Corrupt replacement bytes are an adverse persistent state: they must
+    // fail closed (no injection) without silently bypassing the timed stage.
+    try "{not-json".write(to: pinsURL, atomically: true, encoding: .utf8)
+    let corruptTurn = TurnTraceContext.mintTurnId()
+    let corruptEvents = await collectTraceEvents(kind: "context.summary", turnId: corruptTurn) {
+        await TurnTraceContext.$turnId.withValue(corruptTurn) {
+            let context = try? await engine.buildTurnContext(
+                surface: "chat", userMessage: "hello", personaOverride: nil,
+                imageBlocks: [], includeClockContext: false
+            )
+            #expect(context?.systemPrompt?.contains("REM-PIN-MARKER") == false)
+        }
+    }
+    #expect(corruptEvents.count == 1)
+    let corruptEvent = try #require(corruptEvents.first)
+    #expect(try summaryStage(corruptEvent) != nil)
 }
 
 @Test

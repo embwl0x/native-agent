@@ -560,7 +560,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         now: String,
         fact: KnowledgeGraphMemoryFact
     ) throws -> String {
-        let id = memoryFactEntityID(memoryID)
+        let id = memoryFactEntityID(for: memoryID)
         let kind = metadataString(fact.metadata, "kind") ?? "fact"
         let compact = compactWhitespace(content)
         let title = "\(factTitleLabel(kind)): \(clip(compact, limit: 96))"
@@ -603,7 +603,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
     }
 
     private static func deleteMemoryFactEntity(_ db: Database, memoryID: String) throws {
-        let id = memoryFactEntityID(memoryID)
+        let id = memoryFactEntityID(for: memoryID)
         try db.execute(
             sql: "DELETE FROM kg_relationships WHERE from_id = ? OR to_id = ?",
             arguments: [id, id]
@@ -611,7 +611,11 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         try db.execute(sql: "DELETE FROM kg_entities WHERE id = ?", arguments: [id])
     }
 
-    private static func memoryFactEntityID(_ memoryID: String) -> String {
+    /// Stable graph identity for the source-backed node derived from one
+    /// canonical MemoryV2 row. The external memory id stays in node metadata;
+    /// this opaque graph id prevents arbitrary user ids from becoming graph
+    /// storage keys while allowing projections to prove they show that row.
+    public nonisolated static func memoryFactEntityID(for memoryID: String) -> String {
         "memfact_" + String(contentHash(memoryID).prefix(16))
     }
 

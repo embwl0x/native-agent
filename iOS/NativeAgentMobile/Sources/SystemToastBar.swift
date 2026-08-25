@@ -29,11 +29,17 @@ public struct iOSSystemToast: Identifiable, Sendable, Equatable {
 
     public enum Kind: String, Sendable { case info, warn, error, success }
 
-    public init(kind: Kind, text: String, autoDismissAfter: TimeInterval? = 3) {
-        self.id = UUID()
+    public init(
+        id: UUID = UUID(),
+        kind: Kind,
+        text: String,
+        createdAt: Date = Date(),
+        autoDismissAfter: TimeInterval? = 3
+    ) {
+        self.id = id
         self.kind = kind
         self.text = text
-        self.createdAt = Date()
+        self.createdAt = createdAt
         self.autoDismissAfter = autoDismissAfter
     }
 
@@ -52,6 +58,13 @@ public final class iOSSystemToastCenter: ObservableObject {
 
     public init() {}
 
+    static func dismissDelayNanoseconds(after: TimeInterval?) -> UInt64? {
+        guard let after, after.isFinite, after > 0 else { return nil }
+        let nanoseconds = after * 1_000_000_000
+        guard nanoseconds <= Double(UInt64.max) else { return nil }
+        return UInt64(nanoseconds)
+    }
+
     public func push(_ toast: iOSSystemToast) {
         // Replace-by-id semantics — match the Mac SystemToastCenter so a
         // re-push of the same id (rare but possible if a caller hand-stamps
@@ -61,9 +74,9 @@ public final class iOSSystemToastCenter: ObservableObject {
         queue.removeAll { $0.id == toast.id }
         queue.append(toast)
 
-        guard let after = toast.autoDismissAfter, after > 0 else { return }
+        guard let delay = Self.dismissDelayNanoseconds(after: toast.autoDismissAfter) else { return }
         dismissTasks[toast.id] = Task {
-            try? await Task.sleep(nanoseconds: UInt64(after * 1_000_000_000))
+            try? await Task.sleep(nanoseconds: delay)
             if Task.isCancelled { return }
             self.dismiss(toast.id)
         }
@@ -241,9 +254,9 @@ private struct ToastPillSurface: ViewModifier {
 // MacBridgeClient.init). No new timer, no new fetch — a second reader of a
 // value that was already being computed.
 
-/// A compact connection indicator for a navigation bar. Renders a bare dot
-/// when everything is fine and a labeled pill when it is not, so a healthy
-/// screen stays quiet and an unhealthy one is impossible to miss.
+/// A compact connection indicator for a navigation bar. Every state is named:
+/// a green dot alone makes a healthy connection look like unexplained chrome,
+/// especially when the user has no reason to know the dot is tappable.
 struct MacStatusChip: View {
     @EnvironmentObject private var bridgeClient: MacBridgeClient
     @ObservedObject private var sync = iCloudSyncEngine.shared
@@ -260,11 +273,9 @@ struct MacStatusChip: View {
                 Circle()
                     .fill(status.color)
                     .frame(width: 8, height: 8)
-                if !isHealthy {
-                    Text(shortLabel)
-                        .font(AppFont.tag)
-                        .foregroundStyle(status.color)
-                }
+                Text(shortLabel)
+                    .font(AppFont.tag)
+                    .foregroundStyle(status.color)
             }
             .padding(.horizontal, isHealthy ? 2 : 7)
             .padding(.vertical, isHealthy ? 2 : 3)
@@ -290,8 +301,15 @@ struct MacStatusChip: View {
     /// iCloud", "Last seen 4m ago") does not fit beside a title. The popover
     /// carries the full sentence.
     private var shortLabel: String {
+        MacStatusChipPresentation.shortLabel(for: status)
+    }
+}
+
+enum MacStatusChipPresentation {
+    static func shortLabel(for status: BridgeStatus) -> String {
         switch status {
         case .online: return "Live"
+        case .awaitingMacActivity: return "Waiting for Mac"
         case .offline: return "No iCloud"
         case .macUnreachable: return "Mac asleep"
         case .stale(let minutesAgo): return "\(minutesAgo)m ago"
@@ -338,6 +356,8 @@ private struct MacStatusDetail: View {
         switch status {
         case .online:
             return "The Mac is awake and picking up what you send."
+        case .awaitingMacActivity:
+            return "iCloud is available, but this phone has not received any activity from the Mac yet. Messages may wait until the Mac checks in."
         case .offline:
             return "This iPhone cannot reach iCloud right now, so nothing can be sent or received."
         case .macUnreachable:
@@ -369,8 +389,10 @@ struct MacSyncErrorBanner: View {
     @State private var isExpanded = false
 
     private var message: String? {
-        guard let error = sync.syncError, !error.isEmpty else { return nil }
-        return error == dismissedMessage ? nil : error
+        MacSyncErrorBannerPresentation.visibleMessage(
+            syncError: sync.syncError,
+            dismissedMessage: dismissedMessage
+        )
     }
 
     var body: some View {
@@ -420,8 +442,26 @@ struct MacSyncErrorBanner: View {
         // banner permanently silent — a dismissal in one situation would
         // swallow a genuinely new occurrence later.
         .onChange(of: sync.syncError) { _, newValue in
-            if newValue == nil { dismissedMessage = nil }
+            if MacSyncErrorBannerPresentation.normalizedMessage(newValue) == nil {
+                dismissedMessage = nil
+                isExpanded = false
+            }
         }
+    }
+}
+
+enum MacSyncErrorBannerPresentation {
+    static func normalizedMessage(_ syncError: String?) -> String? {
+        guard let syncError else { return nil }
+        let message = syncError.trimmingCharacters(in: .whitespacesAndNewlines)
+        return message.isEmpty ? nil : message
+    }
+
+    static func visibleMessage(syncError: String?, dismissedMessage: String?) -> String? {
+        guard let message = normalizedMessage(syncError), message != dismissedMessage else {
+            return nil
+        }
+        return message
     }
 }
 

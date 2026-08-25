@@ -17,6 +17,10 @@ struct InlineApprovalPreviewCard: View {
     @State private var isDeciding = false
     @State private var errorText: String?
 
+    private var payloadPreview: ApprovalPayloadPreviewPresentation.State {
+        ApprovalPayloadPreviewPresentation.state(for: approval)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
             HStack(alignment: .top, spacing: 8) {
@@ -40,6 +44,21 @@ struct InlineApprovalPreviewCard: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
             }
+            switch payloadPreview {
+            case .available(let preview):
+                Text(preview)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .textSelection(.enabled)
+            case .unavailable:
+                Label(
+                    ApprovalPayloadPreviewPresentation.unavailableText,
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
+            }
             if let errorText {
                 Text(errorText)
                     .font(.caption)
@@ -54,7 +73,7 @@ struct InlineApprovalPreviewCard: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
                 .tint(.green)
-                .disabled(isDeciding)
+                .disabled(isDeciding || !ApprovalPayloadPreviewPresentation.canResolve(approval))
 
                 Button {
                     decide("denied")
@@ -64,7 +83,7 @@ struct InlineApprovalPreviewCard: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .tint(.red)
-                .disabled(isDeciding)
+                .disabled(isDeciding || !ApprovalPayloadPreviewPresentation.canResolve(approval))
 
                 Button {
                     onView()
@@ -90,15 +109,14 @@ struct InlineApprovalPreviewCard: View {
         let id = approval.id
         Task {
             do {
-                _ = try await appModel.resolveApproval(id: id, decision: decision)
-                if decision == "approved" {
-                    await MainActor.run {
-                        appModel.systemToasts.push(success: "Approval approved")
-                    }
-                } else {
-                    await MainActor.run {
-                        appModel.systemToasts.push(info: "Approval denied")
-                    }
+                let resolvedApproval = try await appModel.resolveApproval(id: id, decision: decision)
+                let toast = ApprovalDecisionToastPresentation.toast(
+                    for: resolvedApproval,
+                    requestedID: id
+                )
+                await MainActor.run {
+                    ApprovalDecisionToastPresentation.publish(toast, to: appModel.systemToasts)
+                    if toast.kind == .error { errorText = toast.text }
                 }
                 // Refresh the approvals list + health card so the inline
                 // preview disappears once the decision lands.
@@ -107,8 +125,10 @@ struct InlineApprovalPreviewCard: View {
                 }
                 await appModel.loadHealthCard()
             } catch {
+                let toast = ApprovalDecisionToastPresentation.unavailable(error)
                 await MainActor.run {
-                    errorText = "Failed: \(error.localizedDescription)"
+                    errorText = toast.text
+                    ApprovalDecisionToastPresentation.publish(toast, to: appModel.systemToasts)
                 }
             }
             await MainActor.run { isDeciding = false }
@@ -128,8 +148,7 @@ struct InlineInboxPreviewCard: View {
     @State private var errorText: String?
 
     private var topActions: [InboxActionRecord] {
-        item.effectiveActions
-            .filter { $0.id != "view" && $0.id != "read" }
+        InboxVisibleActionsPresentation.actions(for: item)
             .prefix(2)
             .map { $0 }
     }

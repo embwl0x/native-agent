@@ -1,5 +1,6 @@
 import Context
 import Foundation
+import GRDB
 import Testing
 
 @Suite(.serialized)
@@ -27,6 +28,131 @@ struct ContextFlowStoreTests {
             blockAnchor: "0"
         )
         #expect(atomA == atomB)
+    }
+
+    @Test
+    func feedbackEventLogRetainsTheNewestBoundedWindowAcrossStoreReopen() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        let atomID = ContextAtomID(rawValue: "atom:feedback-window")
+
+        for index in 0 ... 4_096 {
+            try await fixture.store.recordFeedbackEvent(ContextFeedbackEvent(
+                id: "feedback-\(index)",
+                atomIDs: [atomID],
+                signal: .selection,
+                timeBucket: Int64(index),
+                evidenceIDs: ["receipt-\(index)"]
+            ))
+        }
+
+        let retained = try await fixture.store.recentFeedbackEvents()
+        #expect(retained.count == 4_096)
+        #expect(retained.first?.id == "feedback-1")
+        #expect(retained.last?.id == "feedback-4096")
+        #expect(try await fixture.store.feedbackEventOrdinalHighWaterMark() == 4_097)
+
+        let databaseURL = await fixture.store.databaseURL
+        let reopened = try ContextSQLiteStore(databaseURL: databaseURL)
+        let afterReopen = try await reopened.recentFeedbackEvents()
+        #expect(afterReopen == retained)
+        #expect(try await reopened.feedbackEventOrdinalHighWaterMark() == 4_097)
+    }
+
+    @Test
+    func feedbackEventStoreRejectsDuplicateWritesAndMalformedPersistedRows() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        let event = ContextFeedbackEvent(
+            id: "feedback-unique",
+            atomIDs: [ContextAtomID(rawValue: "atom:feedback")],
+            signal: .selection,
+            timeBucket: 1,
+            evidenceIDs: ["receipt-1"]
+        )
+        try await fixture.store.recordFeedbackEvent(event)
+
+        do {
+            try await fixture.store.recordFeedbackEvent(event)
+            Issue.record("duplicate feedback event unexpectedly overwrote the durable row")
+        } catch {
+            // The original row is still the only valid event after a rejected
+            // write; a failed persistence attempt cannot silently mint a
+            // second learning observation.
+            #expect(try await fixture.store.recentFeedbackEvents() == [event])
+        }
+
+        let databaseURL = await fixture.store.databaseURL
+        let raw = try DatabaseQueue(path: databaseURL.path)
+        try await raw.write { db in
+            try db.execute(
+                sql: """
+                INSERT INTO context_feedback_events (
+                    id, atom_ids_json, signal_json, time_bucket, evidence_ids_json, created_at
+                ) VALUES ('feedback-malformed', 'not-json', 'not-json', 2, 'not-json', 0)
+                """
+            )
+        }
+
+        do {
+            _ = try await fixture.store.recentFeedbackEvents()
+            Issue.record("malformed feedback row decoded as a healthy empty event log")
+        } catch {
+            // Existing corrupt derived state is unavailable; it is neither
+            // discarded nor replaced by an empty learning history.
+        }
+    }
+
+    @Test
+    func v1FtsRemovalMigrationPreservesTheCanonicalGenerationAndDropsOnlyTheShadowCopy() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        let source = makeSource(
+            name: "SOUL.md",
+            body: "Canonical context survives the FTS retirement.",
+            ordinal: 1
+        )
+        _ = try await fixture.store.publish(ContextGenerationDraft(
+            reason: "seed", changedSources: [source]
+        ))
+        let databaseURL = await fixture.store.databaseURL
+
+        // Recreate the exact v1-only edge: all canonical generation tables
+        // remain populated, while the unread FTS shadow exists and v2 has not
+        // yet been recorded. The reopening store must remove only the shadow.
+        let legacy = try DatabaseQueue(path: databaseURL.path)
+        try await legacy.write { db in
+            try db.execute(sql: "DROP TABLE context_feedback_events")
+            try db.execute(
+                sql: "DELETE FROM grdb_migrations WHERE identifier = 'context_feedback_events_v2'"
+            )
+            try db.execute(sql: """
+                CREATE VIRTUAL TABLE context_fts USING fts5(
+                    version_key UNINDEXED, body, summary, headings, entities, triggers
+                )
+                """)
+            try db.execute(
+                sql: """
+                INSERT INTO context_fts (version_key, body, summary, headings, entities, triggers)
+                VALUES ('shadow@1', 'shadow duplicate', '', '', '', '')
+                """
+            )
+        }
+
+        let migrated = try ContextSQLiteStore(databaseURL: databaseURL)
+        let active = try #require(await migrated.loadActiveGeneration())
+        #expect(active.generation.id == 1)
+        #expect(active.atoms.map(\.draft.body) == ["Canonical context survives the FTS retirement."])
+        #expect((try await migrated.healthSnapshot()).activeAtoms == 1)
+
+        let verified = try DatabaseQueue(path: databaseURL.path)
+        let remainingFTS = try await verified.read { db in
+            try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'context_fts'"
+            ) ?? 0
+        }
+        #expect(remainingFTS == 0)
     }
 
     @Test

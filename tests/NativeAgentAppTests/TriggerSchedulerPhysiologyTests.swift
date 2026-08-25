@@ -134,6 +134,29 @@ struct TriggerSchedulerPhysiologyTests {
         #expect(await runner.nextMeaningfulDeadline(after: now) == exact)
     }
 
+    @Test("installed due-work loop fails closed when scheduler activity evidence is unavailable")
+    func activityEvidenceFailureBecomesLoopFailureBeforeTriggerEffects() async throws {
+        let root = try triggerPhysiologyRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let scheduler = SwiftNativeTriggerScheduler(
+            root: root,
+            worklogPath: root.appendingPathComponent("no-worklog.jsonl")
+        )
+        let runner = TriggerSchedulerEventDeadlineRunner(
+            dataRoot: root,
+            schedulerJobsPath: root.appendingPathComponent("scheduler/jobs.json"),
+            triggerScheduler: scheduler,
+            runDueJobs: { [] },
+            schedulerActivityFailure: { "Scheduler activity evidence could not be written: disk unavailable" },
+            nextSchedulerJobDeadline: { _ in nil },
+            mirrorFire: { _ in true }
+        )
+
+        #expect(await runner.tickOutcome() == .failed(
+            error: "Scheduler activity evidence could not be written: disk unavailable"
+        ))
+    }
+
     @Test("source bursts coalesce and startup plus restart each reconcile once")
     func startupRestartAndCoalescing() async throws {
         let root = try triggerPhysiologyRoot()

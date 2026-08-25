@@ -56,6 +56,12 @@ final class ChatStore: ObservableObject {
     @Published var isSwitchingSession = false
     @Published var isPollingFallback = false   // true after 10s waiting — drives "still waiting…" hint
     @Published var errorBanner: String?
+
+    /// Dismisses only the currently rendered error. Future transport or reply
+    /// failures assign a new value to `errorBanner` and must remain visible.
+    func dismissErrorBanner() {
+        errorBanner = nil
+    }
     @Published var streamingHintsByMessageId: [UUID: String] = [:]
     @Published var queuedSends: [QueuedChatSend] = [] {
         didSet { persistQueuedSends() }
@@ -104,9 +110,18 @@ final class ChatStore: ObservableObject {
     let transcriptKey = "NativeAgentMobile.chatMessages"
     let transcriptPrefix = "NativeAgentMobile.chatMessages.session."
     var suppressMessagePersistence = false
+    /// One session switch owns the composer lock. The generation prevents a
+    /// cancelled/late history read from releasing a newer switch.
+    var sessionSwitchGeneration: UInt64 = 0
+    var sessionSwitchTask: Task<Void, Never>?
 
-    init(defaults: UserDefaults = .standard, restoreQueuedSends: Bool = true) {
+    init(
+        defaults: UserDefaults = .standard,
+        restoreQueuedSends: Bool = true,
+        iCloudReplyTimeoutSeconds: UInt64 = 180
+    ) {
         self.defaults = defaults
+        self.iCloudReplyTimeoutSeconds = iCloudReplyTimeoutSeconds
         if !defaults.bool(forKey: "NativeAgent.unifiedSession.v1") {
             defaults.removeObject(forKey: Self.selectedSessionIDKey)
             defaults.removeObject(forKey: Self.mainSessionIDKey)
@@ -323,5 +338,5 @@ final class ChatStore: ObservableObject {
     /// How long to wait for an iCloud reply before surfacing an error.
     /// 30s covers typical iCloud sync latency (1–10s) with comfortable margin.
     /// Tunable via DEBUG override in Settings if needed.
-    let iCloudReplyTimeoutSeconds: UInt64 = 180
+    let iCloudReplyTimeoutSeconds: UInt64
 }

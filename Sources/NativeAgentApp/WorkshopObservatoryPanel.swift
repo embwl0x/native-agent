@@ -202,6 +202,32 @@ struct WorkshopObservatoryModel: Equatable, Sendable {
 
 // MARK: - Workshop receipts reader (data/workshop/receipts.jsonl)
 
+/// The receipt feed is intentionally read as open vocabulary: legacy rows can
+/// outlive the current `WorkshopSessionStatus` enum. Unknown states therefore
+/// warn rather than falling back to neutral chrome beside a successful row.
+enum WorkshopReceiptStatusPresentation {
+    enum Tint: Sendable, Equatable {
+        case success
+        case warning
+        case failure
+    }
+
+    static func tint(for rawStatus: String) -> Tint {
+        switch rawStatus.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "completed":
+            return .success
+        case "blocked", "cancelled", "canceled":
+            return .warning
+        case "refused", "failed", "error", "errored":
+            return .failure
+        default:
+            // A new producer status is not proof of success. Keep it visibly
+            // distinct until the producer and status vocabulary are reconciled.
+            return .warning
+        }
+    }
+}
+
 /// One compact workshop session receipt row (mirrors WorkshopReceiptLog.append).
 struct WorkshopReceiptRow: Identifiable, Equatable, Sendable {
     let handle: String
@@ -321,13 +347,86 @@ struct WorkshopObservatorySnapshot: Equatable, Sendable {
     }
 }
 
+/// The owner-facing mutation behind the Observatory's Veto button. A repeated
+/// button event is held while the first durable operation is in flight; once
+/// settled, the store's idempotent veto makes retries safe across relaunches.
+actor WorkshopObservatoryVetoHandler {
+    enum Outcome: Equatable, Sendable {
+        case completed
+        case alreadyVetoed
+        case inFlight
+        case failed(String)
+    }
+
+    static let rationale = "Vetoed by the user from the Desk observatory."
+
+    private let store: SwiftNativeDeskStore
+    private var inFlightHandles: Set<String> = []
+
+    init(dataRoot: URL) {
+        self.store = SwiftNativeDeskStore(dataRoot: dataRoot)
+    }
+
+    init(store: SwiftNativeDeskStore) {
+        self.store = store
+    }
+
+    func veto(_ handle: String) async -> Outcome {
+        guard inFlightHandles.insert(handle).inserted else { return .inFlight }
+        defer { inFlightHandles.remove(handle) }
+        do {
+            return try await store.vetoPursuit(handle, note: Self.rationale) == nil
+                ? .alreadyVetoed
+                : .completed
+        } catch {
+            return .failed(String(describing: error))
+        }
+    }
+}
+
+/// Presentation-side sequencing for the mounted Veto control. The store still
+/// owns durability and cross-process idempotency; this owner prevents a second
+/// click from launching a stale refresh while the first operation is pending.
+enum WorkshopObservatoryVetoPresentation {
+    static func buttonIsDisabled(handle: String, pendingHandles: Set<String>) -> Bool {
+        pendingHandles.contains(handle)
+    }
+
+    static func shouldRefresh(after outcome: WorkshopObservatoryVetoHandler.Outcome) -> Bool {
+        switch outcome {
+        case .completed, .alreadyVetoed:
+            return true
+        case .inFlight, .failed:
+            return false
+        }
+    }
+}
+
 // MARK: - The panel
 
 struct WorkshopObservatoryPanel: View {
     let snapshot: WorkshopObservatorySnapshot?
-    /// Veto action — closes an agent pursuit (setStatus .canceled + a note). The
-    /// parent wires this to the store and refreshes.
-    var onVeto: (String) -> Void = { _ in }
+    /// Veto action — the parent owns the resolved-root handler and refresh.
+    let onVeto: (String) -> Void
+    /// Handles whose mounted action is awaiting its durable outcome.
+    let pendingVetoHandles: Set<String>
+
+    init(
+        snapshot: WorkshopObservatorySnapshot?,
+        pendingVetoHandles: Set<String> = [],
+        onVeto: @escaping (String) -> Void
+    ) {
+        self.snapshot = snapshot
+        self.pendingVetoHandles = pendingVetoHandles
+        self.onVeto = onVeto
+    }
+
+    /// The mounted button's one action seam. Requiring the closure at
+    /// construction means an enabled Veto control can never silently discard a
+    /// user decision because an embedding route omitted its handler.
+    func triggerVeto(_ handle: String) {
+        onVeto(handle)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
@@ -433,11 +532,15 @@ struct WorkshopObservatoryPanel: View {
                     .foregroundStyle(.purple)
                 Spacer()
                 Button("Veto", systemImage: "xmark.circle") {
-                    onVeto(pursuit.handle)
+                    triggerVeto(pursuit.handle)
                 }
                 .font(.caption)
                 .buttonStyle(.borderless)
                 .foregroundStyle(.red)
+                .disabled(WorkshopObservatoryVetoPresentation.buttonIsDisabled(
+                    handle: pursuit.handle,
+                    pendingHandles: pendingVetoHandles
+                ))
                 .help("Close this pursuit (canceled) with a user-vetoed note.")
             }
             if pursuit.privateName?.isEmpty == false, pursuit.title != pursuit.displayName {
@@ -633,11 +736,10 @@ struct WorkshopObservatoryPanel: View {
     }
 
     private func statusTint(_ status: String) -> Color {
-        switch status {
-        case "completed": return .green
-        case "blocked": return .orange
-        case "refused": return .red
-        default: return .secondary
+        switch WorkshopReceiptStatusPresentation.tint(for: status) {
+        case .success: return .green
+        case .warning: return .orange
+        case .failure: return .red
         }
     }
 

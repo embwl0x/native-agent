@@ -7,6 +7,35 @@ import UIKit
 import Speech
 import AVFoundation
 
+struct VoiceInputLifecycleSnapshot: Equatable {
+    let isListening: Bool
+    let isStarting: Bool
+    let tapInstalled: Bool
+    let hasRecognitionTask: Bool
+    let desiredListening: Bool
+    let waitingForFinalAfterStop: Bool
+    let generation: Int
+}
+
+enum VoiceInputAuthorizationPresentation {
+    static func speechFailureMessage(
+        for status: SFSpeechRecognizerAuthorizationStatus
+    ) -> String {
+        switch status {
+        case .notDetermined:
+            return "Speech recognition permission was not resolved. The iOS permission prompt may not be available right now; open Settings and try again."
+        case .restricted:
+            return "Speech recognition is restricted on this device. Check Screen Time restrictions and Settings."
+        case .denied:
+            return VoicePresentation.deniedSpeechMessage()
+        case .authorized:
+            return "Speech recognition permission is required. Open Settings and try again."
+        @unknown default:
+            return "Speech recognition permission could not be confirmed. Open Settings and try again."
+        }
+    }
+}
+
 // PERF-2026-08-05: was `ObservableObject` with 8 `@Published` properties, injected
 // at the app root via `.environmentObject` and subscribed by the 1454-line ChatView.
 // `objectWillChange` is whole-object, so the ~45Hz `audioLevel` write from the
@@ -41,8 +70,27 @@ final class VoiceInputController {
     @ObservationIgnored private var startGeneration = 0
     @ObservationIgnored private var waitingForFinalAfterStop = false
     @ObservationIgnored private var hasStartedAudioSession = false
+    @ObservationIgnored private let requestSpeechAuthorization: () async -> SFSpeechRecognizerAuthorizationStatus
+    @ObservationIgnored private let requestMicrophoneAuthorization: () async -> Bool
 
-    init() {
+    var lifecycleSnapshot: VoiceInputLifecycleSnapshot {
+        .init(
+            isListening: isListening,
+            isStarting: isStarting,
+            tapInstalled: tapInstalled,
+            hasRecognitionTask: recognitionTask != nil,
+            desiredListening: desiredListening,
+            waitingForFinalAfterStop: waitingForFinalAfterStop,
+            generation: startGeneration
+        )
+    }
+
+    init(
+        requestSpeechAuthorization: @escaping () async -> SFSpeechRecognizerAuthorizationStatus = { await VoiceInputController.requestSpeechAuthorization() },
+        requestMicrophoneAuthorization: @escaping () async -> Bool = { await VoiceInputController.requestMicrophonePermission() }
+    ) {
+        self.requestSpeechAuthorization = requestSpeechAuthorization
+        self.requestMicrophoneAuthorization = requestMicrophoneAuthorization
         recognizer = SFSpeechRecognizer(locale: Locale.current)
 
         // Stop cleanly when the app backgrounds (e.g. home-button press mid-hold)
@@ -71,7 +119,7 @@ final class VoiceInputController {
         waitingForFinalAfterStop = false
         hasStartedAudioSession = false
         error = nil
-        statusText = "Starting microphone..."
+        statusText = "Requesting speech recognition permission..."
         transcript = ""
         lastFinalTranscript = ""
         audioLevel = 0
@@ -83,24 +131,28 @@ final class VoiceInputController {
         }
 
         // 1. Speech recognition auth
-        let speechStatus = await Self.requestSpeechAuthorization()
+        let speechStatus = await requestSpeechAuthorization()
         guard desiredListening, generation == startGeneration else { return }
         guard speechStatus == .authorized else {
-            error = "Speech recognition permission denied. Enable it in Settings."
+            desiredListening = false
+            error = VoiceInputAuthorizationPresentation.speechFailureMessage(for: speechStatus)
             statusText = nil
             return
         }
 
         // 2. Microphone auth (required separately on iOS 17+)
-        let micGranted = await Self.requestMicrophonePermission()
+        statusText = "Requesting microphone permission..."
+        let micGranted = await requestMicrophoneAuthorization()
         guard desiredListening, generation == startGeneration else { return }
         guard micGranted else {
-            error = "Microphone permission denied. Enable it in Settings."
+            desiredListening = false
+            error = VoicePresentation.deniedMicrophoneMessage()
             statusText = nil
             return
         }
 
         guard let recognizer, recognizer.isAvailable else {
+            desiredListening = false
             error = "Speech recognition unavailable on this device or locale."
             statusText = nil
             return
@@ -118,6 +170,7 @@ final class VoiceInputController {
             try? session.setPreferredIOBufferDuration(0.02)
             try session.setActive(true, options: .notifyOthersOnDeactivation)
         } catch {
+            desiredListening = false
             self.error = "Microphone could not start: \(error.localizedDescription)"
             statusText = nil
             return

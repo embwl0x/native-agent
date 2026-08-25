@@ -47,12 +47,10 @@ struct MemoryView: View {
             .padding(.horizontal)
             .padding(.vertical, 8)
 
-            if let error = store.error, !error.isEmpty {
-                Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(AppFont.label)
-                    .foregroundStyle(.orange)
-                    .padding(.horizontal)
-                    .padding(.bottom, 6)
+            if let error = MemoryErrorLinePresentation.visibleMessage(store.error) {
+                MemoryErrorLine(message: error) {
+                    store.dismissError()
+                }
             }
 
             Group {
@@ -65,6 +63,7 @@ struct MemoryView: View {
             }
         }
         .navigationTitle("Memory")
+        .macSyncErrorBanner()
         .toolbar {
             // Sweep R4 C11.4. SyncBadge only appears once the snapshot is
             // >30s old and says nothing about the Mac itself, so the chip
@@ -87,6 +86,44 @@ struct MemoryView: View {
 
 // MARK: - Store
 
+enum MemoryErrorLinePresentation {
+    static func visibleMessage(_ error: String?) -> String? {
+        guard let error else { return nil }
+        let message = error.trimmingCharacters(in: .whitespacesAndNewlines)
+        return message.isEmpty ? nil : message
+    }
+}
+
+private struct MemoryErrorLine: View {
+    let message: String
+    let dismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .accessibilityHidden(true)
+            Text(message)
+                .font(AppFont.label)
+                .foregroundStyle(.primary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+            Button(action: dismiss) {
+                Image(systemName: "xmark")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 44, height: 24)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Dismiss memory warning")
+        }
+        .padding(.horizontal)
+        .padding(.bottom, 6)
+        .accessibilityElement(children: .contain)
+    }
+}
+
 // NOTE (2026-06-06): `MemoryStackStatus` + the `memory_stack.json` read were
 // removed — no writer for that file exists anywhere on disk, so the iOS view
 // was reading a phantom. The Memory Stack summary card came out with it.
@@ -100,26 +137,56 @@ final class MemoryStore: ObservableObject {
     @Published var isLoading = false
     @Published var error: String?
 
+    private let refreshMemorySnapshot: () async -> Void
+    private let syncErrorProvider: () -> String?
+
     private var hiddenResolvedMemoryProposalIDs: Set<String> = []
     private var hiddenDeletedMemoryIDs: Set<String> = []
 
+    init(
+        refreshMemorySnapshot: @escaping () async -> Void = {
+            await iCloudSyncEngine.shared.refreshMemorySnapshot()
+        },
+        syncErrorProvider: @escaping () -> String? = {
+            iCloudSyncEngine.shared.syncError
+        }
+    ) {
+        self.refreshMemorySnapshot = refreshMemorySnapshot
+        self.syncErrorProvider = syncErrorProvider
+    }
+
     func refresh() async {
         isLoading = true
-        await iCloudSyncEngine.shared.refreshMemorySnapshot()
+        error = nil
+        await refreshMemorySnapshot()
         let sync = iCloudSyncEngine.shared
         applySyncedState(from: sync)
+        error = MemoryErrorLinePresentation.visibleMessage(syncErrorProvider())
         isLoading = false
     }
 
+    func dismissError() {
+        error = nil
+    }
+
     func applySyncedState(from sync: iCloudSyncEngine) {
-        let memoryIDs = Set(sync.memories.map(\.id))
-        let proposalIDs = Set(sync.memoryProposals.map(\.id))
+        applySyncedState(memories: sync.memories, memoryProposals: sync.memoryProposals)
+    }
+
+    func applySyncedState(
+        memories syncedMemories: [MemoryRecord],
+        memoryProposals syncedMemoryProposals: [MemoryProposalRecord]
+    ) {
+        let memoryIDs = Set(syncedMemories.map(\.id))
+        let proposalIDs = Set(syncedMemoryProposals.map(\.id))
+        // This intersection bounds the local hide set to ids still present in
+        // the current snapshot or an active delete, including repeated swipes.
         hiddenDeletedMemoryIDs.formIntersection(memoryIDs.union(deletingMemoryIDs))
         hiddenResolvedMemoryProposalIDs.formIntersection(
             proposalIDs.union(decidingMemoryProposalIDs)
         )
-        memories = sync.memories.filter { !hiddenDeletedMemoryIDs.contains($0.id) }
-        memoryProposals = sync.memoryProposals.filter {
+        memories = syncedMemories.filter { !hiddenDeletedMemoryIDs.contains($0.id) }
+        memoryProposals = syncedMemoryProposals.filter {
             !hiddenResolvedMemoryProposalIDs.contains($0.id)
         }
     }
@@ -133,30 +200,53 @@ final class MemoryStore: ObservableObject {
     }
 
     private func decideMemoryProposal(_ proposal: MemoryProposalRecord, approve: Bool) {
+        Task { @MainActor in
+            await performMemoryProposalDecision(
+                proposal,
+                approve: approve,
+                submit: { approve, proposalID in
+                    if approve {
+                        try await iCloudSyncEngine.shared.approveMemoryProposal(proposalId: proposalID)
+                    } else {
+                        try await iCloudSyncEngine.shared.rejectMemoryProposal(proposalId: proposalID)
+                    }
+                },
+                refresh: { await self.refresh() }
+            )
+        }
+    }
+
+    /// Runs one proposal decision and then reconciles the current Mac snapshot.
+    /// It remains visible after every unconfirmed failure; only a successful
+    /// action may retain the optimistic hide while snapshot publication catches
+    /// up.
+    func performMemoryProposalDecision(
+        _ proposal: MemoryProposalRecord,
+        approve: Bool,
+        submit: (Bool, String) async throws -> Void,
+        refresh: () async -> Void
+    ) async {
         guard !decidingMemoryProposalIDs.contains(proposal.id) else { return }
         error = nil
         decidingMemoryProposalIDs.insert(proposal.id)
         hiddenResolvedMemoryProposalIDs.insert(proposal.id)
         memoryProposals.removeAll { $0.id == proposal.id }
 
-        Task {
-            do {
-                if approve {
-                    try await iCloudSyncEngine.shared.approveMemoryProposal(proposalId: proposal.id)
-                } else {
-                    try await iCloudSyncEngine.shared.rejectMemoryProposal(proposalId: proposal.id)
-                }
-            } catch {
-                if iCloudSyncEngine.isMacResponseTimeout(error) {
-                    self.error = "Decision sent; waiting for Mac/iCloud to publish the result."
-                } else {
-                    self.hiddenResolvedMemoryProposalIDs.remove(proposal.id)
-                    self.error = error.localizedDescription
-                }
+        do {
+            try await submit(approve, proposal.id)
+        } catch {
+            // A timeout only means the phone did not observe the Mac's answer.
+            // It cannot prove the action was applied, so do not leave the
+            // proposal optimistically hidden from the next snapshot.
+            hiddenResolvedMemoryProposalIDs.remove(proposal.id)
+            if iCloudSyncEngine.isMacResponseTimeout(error) {
+                self.error = "Decision sent; waiting for Mac/iCloud to publish the result."
+            } else {
+                self.error = error.localizedDescription
             }
-            self.decidingMemoryProposalIDs.remove(proposal.id)
-            await refresh()
         }
+        decidingMemoryProposalIDs.remove(proposal.id)
+        await refresh()
     }
 
     func deleteMemory(_ memory: MemoryRecord) {
@@ -167,14 +257,26 @@ final class MemoryStore: ObservableObject {
         memories.removeAll { $0.id == memory.id }
 
         Task {
+            var deleteConfirmed = false
             do {
                 try await iCloudSyncEngine.shared.deleteMemory(id: memory.id)
+                deleteConfirmed = true
             } catch {
                 self.hiddenDeletedMemoryIDs.remove(memory.id)
                 self.error = error.localizedDescription
             }
             self.deletingMemoryIDs.remove(memory.id)
+            if deleteConfirmed {
+                // The action receipt proves only that the Mac accepted the
+                // tombstone. Until its next snapshot omits this id, do not
+                // keep the row invisibly suppressed forever.
+                self.hiddenDeletedMemoryIDs.remove(memory.id)
+            }
             await refresh()
+            if deleteConfirmed,
+               iCloudSyncEngine.shared.memories.contains(where: { $0.id == memory.id }) {
+                self.error = "Delete recorded; waiting for Mac/iCloud to remove this memory."
+            }
         }
     }
 }
@@ -186,12 +288,22 @@ struct MemoryListView: View {
     @State private var selectedMemory: MemoryRecord?
     @State private var pendingDeleteMemory: MemoryRecord?
 
+    private var isDeleteConfirmationPresented: Binding<Bool> {
+        Binding(
+            get: { pendingDeleteMemory != nil },
+            set: { isPresented in
+                if !isPresented { pendingDeleteMemory = nil }
+            }
+        )
+    }
+
     var body: some View {
         List {
             if store.memories.isEmpty {
                 AppEmptyState(
                     title: "No memories",
                     systemImage: "brain.head.profile",
+                    kind: .unavailable,
                     description: "Memories will appear here after iCloud sync."
                 )
                 .listRowBackground(Color.clear)
@@ -201,6 +313,7 @@ struct MemoryListView: View {
                 ForEach(store.memories) { memory in
                     let importance = memory.importance
                     let importanceTint: Color = importance > 0.7 ? .orange : importance > 0.4 ? .blue : .secondary
+                    let isDeleting = store.deletingMemoryIDs.contains(memory.id)
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
                             Text(memory.layer.capitalized)
@@ -213,7 +326,7 @@ struct MemoryListView: View {
                             if memory.pinned == true {
                                 Image(systemName: "pin.fill").font(AppFont.tag).foregroundStyle(.orange)
                             }
-                            if store.deletingMemoryIDs.contains(memory.id) {
+                            if isDeleting {
                                 ProgressView()
                                     .controlSize(.small)
                             }
@@ -228,14 +341,7 @@ struct MemoryListView: View {
                             ScrollView(.horizontal, showsIndicators: false) {
                                 HStack(spacing: 4) {
                                     ForEach(tags, id: \.self) { tag in
-                                        Text(tag)
-                                            .font(AppFont.tag)
-                                            .padding(.horizontal, 6)
-                                            .padding(.vertical, 2)
-                                            .background(NativeAgentPalette.agentAccent.opacity(0.12))
-                                            .foregroundStyle(NativeAgentPalette.agentAccent)
-                                            .clipShape(Capsule())
-                                            .overlay(Capsule().strokeBorder(NativeAgentPalette.agentAccent.opacity(0.25), lineWidth: 0.5))
+                                        MemoryTagPill(tag: tag)
                                     }
                                 }
                             }
@@ -243,12 +349,12 @@ struct MemoryListView: View {
                     }
                     .padding(.vertical, 2)
                     .swipeActions(edge: .trailing) {
-                        Button(role: .destructive) {
-                            pendingDeleteMemory = memory
-                        } label: {
-                            Label("Delete", systemImage: "trash")
-                        }
-                        .disabled(store.deletingMemoryIDs.contains(memory.id))
+                        Button(
+                            role: ButtonRole.destructive,
+                            action: { pendingDeleteMemory = memory },
+                            label: { Label("Delete", systemImage: "trash") }
+                        )
+                        .disabled(isDeleting)
                     }
                 }
             }
@@ -256,25 +362,45 @@ struct MemoryListView: View {
         .listStyle(.insetGrouped)
         .confirmationDialog(
             "Delete memory?",
-            isPresented: Binding(
-                get: { pendingDeleteMemory != nil },
-                set: { isPresented in
-                    if !isPresented {
-                        pendingDeleteMemory = nil
-                    }
-                }
-            ),
+            isPresented: isDeleteConfirmationPresented,
             titleVisibility: .visible
         ) {
-            Button("Delete Memory", role: .destructive) {
-                if let pendingDeleteMemory {
-                    store.deleteMemory(pendingDeleteMemory)
+            if let memory = pendingDeleteMemory {
+                Button("Delete Memory", role: .destructive) {
+                    store.deleteMemory(memory)
                 }
-                pendingDeleteMemory = nil
             }
         } message: {
-            Text("This removes it from durable memory and writes a tombstone so it does not come back.")
+            if let memory = pendingDeleteMemory {
+                Text(MemoryDeleteConfirmationPresentation.message(for: memory))
+            }
         }
+    }
+}
+
+private struct MemoryTagPill: View {
+    let tag: String
+
+    var body: some View {
+        Text(tag)
+            .font(AppFont.tag)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(NativeAgentPalette.agentAccent.opacity(0.12))
+            .foregroundStyle(NativeAgentPalette.agentAccent)
+            .clipShape(Capsule())
+            .overlay(
+                Capsule().strokeBorder(
+                    NativeAgentPalette.agentAccent.opacity(0.25),
+                    lineWidth: 0.5
+                )
+            )
+    }
+}
+
+enum MemoryDeleteConfirmationPresentation {
+    static func message(for memory: MemoryRecord) -> String {
+        "Delete \u{201c}\(memory.text)\u{201d} from durable memory? This writes a tombstone so it does not come back."
     }
 }
 
@@ -302,6 +428,7 @@ struct ProposalsListView: View {
                 AppEmptyState(
                     title: "No memory proposals",
                     systemImage: "lightbulb",
+                    kind: .empty,
                     description: "Pending memory proposals will appear here."
                 )
                 .listRowBackground(Color.clear)

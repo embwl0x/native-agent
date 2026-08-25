@@ -287,7 +287,16 @@ struct TelegramApprovalFilerTests {
             "kind": .string("soul"),
             "title": .string("User-approved identity note"),
             "content": .string("Carry this bounded note forward."),
+            // Persona writes are lazy tools. The approved replay must carry
+            // the exact source session and that session's active loadout,
+            // rather than relying on a detached SwiftUI host or bypassing the
+            // dispatch gate during recovery.
+            "session_id": .string("telegram-session"),
         ]
+        try await ActiveToolsStore(dataRoot: root).addLoaded(
+            sessionId: "telegram-session",
+            names: ["persona_append_section"]
+        )
         let inbox = SwiftNativeApprovalInbox(root: root)
         let approval = try await inbox.create(.object([
             "title": .string("Approve persona update"),

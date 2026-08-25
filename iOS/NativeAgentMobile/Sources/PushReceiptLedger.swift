@@ -24,6 +24,7 @@ struct PushReceiptEntry: Codable, Identifiable {
 enum PushReceiptLedger {
     private static let key = "NativeAgentMobile.pushReceipts"
     private static let capacity = 20
+    static let didChange = Notification.Name("NativeAgentMobile.pushReceiptLedgerDidChange")
 
     @discardableResult
     static func record(userInfo: [AnyHashable: Any]) -> PushReceiptEntry {
@@ -39,6 +40,7 @@ enum PushReceiptLedger {
         if entries.count > capacity { entries = Array(entries.prefix(capacity)) }
         if let data = try? JSONEncoder().encode(entries) {
             UserDefaults.standard.set(data, forKey: key)
+            NotificationCenter.default.post(name: didChange, object: nil)
         }
         NSLog("[PushReceiptLedger] push received source=%@ itemId=%@ eventId=%@",
               entry.source, entry.itemId, entry.eventId ?? "none")

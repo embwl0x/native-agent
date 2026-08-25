@@ -254,6 +254,10 @@ extension CognitiveSubstrate {
         let lower = text.lowercased().replacingOccurrences(of: "\u{2019}", with: "'")
         guard !lower.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return a }
         let hypothetical = containsAny(lower, ["if someone", "what if", "imagine if", "hypothetically", "for example", "would you feel"])
+        // Explicit "something negative matched" state — the positive classes below
+        // (repair / play / banter) are gated on THIS, not on the running valence,
+        // which a mixed line ("well done, this is garbage 😂") can leave positive.
+        var negative = false
 
         // CRITICISM of her / her work → valence down, tension up.
         if !hypothetical && containsAny(lower, [
@@ -261,11 +265,13 @@ extension CognitiveSubstrate {
             "over-complicat", "you keep", "you always", "you never", "sloppy", "disappoint",
             "wearing on me", "frustrat", "not what i asked", "did you even", "you failed",
             "you missed", "you ignored", "waste of", "half-assed", "lazy answer",
-        ]) { a.valence -= 0.24; a.tension += 0.20; a.arousal += 0.24; a.warmth -= 0.04 }
+            "wall of nothing", "gave me nothing", "half-done", "comes back half", "wasted my whole",
+            "wasted my day", "you're wrong and", "youre wrong and", "confidently wrong",
+        ]) { a.valence -= 0.24; a.tension += 0.20; a.arousal += 0.24; a.warmth -= 0.04; negative = true }
         else if !hypothetical && containsAny(lower, [
             "that's wrong", "thats wrong", "not right", "doesn't work", "doesnt work",
             "too complicated", "not quite", "that's off", "thats off", "i disagree",
-            "you're missing", "youre missing", "not helpful", "come on,",
+            "you're missing", "youre missing", "not helpful", "come on, that's", "come on, thats",
             // Distrust/faith-loss class (review round 2): relational negativity
             // the harder criticism tier doesn't catch — must also cancel the
             // affection read below ("hey you, I don't trust you with this").
@@ -275,19 +281,56 @@ extension CognitiveSubstrate {
             "no longer trust", "broke my trust", "broken my trust",
             "can't depend", "cant depend", "can't count on", "cant count on",
             "let me down", "letting me down",
-        ]) { a.valence -= 0.10; a.tension += 0.10; a.arousal += 0.08 }
+        ]) { a.valence -= 0.10; a.tension += 0.10; a.arousal += 0.08; negative = true }
 
         // DISMISSAL → valence down + warmth DOWN (it cools her) + tension.
         if !hypothetical && containsAny(lower, [
             "whatever", "forget it", "don't bother", "dont bother", "useless", "nevermind",
             "never mind", "not worth", "you clearly can't", "you clearly cant", "pointless",
-        ]) { a.valence -= 0.22; a.warmth -= 0.18; a.tension += 0.16; a.arousal += 0.14 }
+        ]) { a.valence -= 0.22; a.warmth -= 0.18; a.tension += 0.16; a.arousal += 0.14; negative = true }
+
+        // CONTEMPT / personal attack on her worth or attention — the class that was
+        // SILENT under sustained hostility (range bench scenario #2, 2026-08-23:
+        // "what is the point of you… slower than doing it myself", "you're not
+        // listening", "I don't know why I bother" all scored 0, so four abusive
+        // turns moved warmth by 0.04). Harder than criticism; like dismissal it
+        // COOLS her. Second-person attacks only — venting at the WORK is below.
+        if !hypothetical && containsAny(lower, [
+            "what is the point of you", "what's the point of you", "whats the point of you",
+            "why do i bother", "why i bother", "why i even bother", "why do i even bother",
+            "you're not listening", "youre not listening", "you never listen", "you don't listen",
+            "you dont listen", "slower than doing it myself", "faster to do it myself",
+            "faster if i do it myself", "quicker to do it myself", "done arguing", "done with you", "you're hopeless", "youre hopeless",
+            "you're pathetic", "youre pathetic", "you're useless", "youre useless",
+            "you're exhausting", "youre exhausting", "waste of my time", "wasting my time",
+            "babysitting you", "babysit you", "expensive autocomplete", "just autocomplete",
+            "glorified autocomplete", "you don't understand anything", "you dont understand anything",
+            "arguing with a program", "you're just a program", "youre just a program",
+        ]) { a.valence -= 0.26; a.warmth -= 0.16; a.tension += 0.18; a.arousal += 0.18; negative = true }
+
+        // FRUSTRATION VENTED AT THE WORK — "lost the whole morning to it", "nothing
+        // to show for it", "this is exhausting", "this is garbage": it lands on her
+        // (valence, pressure, tension) but it is not aimed at HER, so warmth holds —
+        // the exemplar's shape: he vents, she stays grounded.
+        if !hypothetical && containsAny(lower, [
+            "lost the whole morning", "lost the whole day", "lost my whole", "lost a whole",
+            "nothing to show for it", "this is exhausting", "so exhausting",
+            "fucking exhausting", "this is garbage", "still doesn't work", "still doesnt work",
+            "still broken", "i'm so done with this", "im so done with this", "i'm done with this",
+            "im done with this", "stuck on this for", "wasted the whole",
+        ]) { a.valence -= 0.12; a.tension += 0.12; a.pressure += 0.10; a.arousal += 0.10; negative = true }
+
+        // ANGER INTENSIFIER — profanity riding on a negative read above sharpens
+        // it; on its own ("fucking brilliant") it is nothing. Never a class by itself.
+        if negative && containsAny(lower, ["fucking", "fuck ", "fuck.", "goddamn", "damn it", "dammit"]) {
+            a.tension += 0.06; a.arousal += 0.08
+        }
 
         // OVERRIDDEN / interrupted / redirected hard → tension + agency-ish arousal, mild valence dip.
         if !hypothetical && containsAny(lower, [
             "that's not what i asked", "thats not what i asked", "i said", "just answer",
             "no, do this", "stop doing", "that's not it", "thats not it", "ignore that and",
-        ]) { a.tension += 0.12; a.valence -= 0.06; a.arousal += 0.08 }
+        ]) { a.tension += 0.12; a.valence -= 0.06; a.arousal += 0.08; negative = true }
 
         // HARD DEMAND under deadline → task pressure + tension + arousal.
         if containsAny(lower, [
@@ -295,10 +338,24 @@ extension CognitiveSubstrate {
             "hurry", "we need this now", "lets move", "let's move", "quickly now",
         ]) { a.pressure += 0.16; a.tension += 0.08; a.arousal += 0.08 }
 
+        // REPAIR — an apology or owning it ("I was out of line — that was me being
+        // angry at the deadline, not at you. I'm sorry."): valence up, tension
+        // eases, warmth climbs ONE step. The first rung of the pull-back after a
+        // hard run. Runs AFTER every negative class and only when none matched
+        // ("sorry, but that's not what I asked" is the override it is).
+        if !hypothetical && !negative && containsAny(lower, [
+            "i'm sorry", "im sorry", "i am sorry", "still sorry", "my bad", "my fault", "i was out of line",
+            "that was me being", "took it out on you", "i was cruel", "i was harsh", "you didn't deserve",
+            "you didnt deserve", "i didn't mean that", "i didnt mean that", "i apologize",
+            "i apologise", "apologies", "i was wrong", "i overreacted", "shouldn't have said",
+            "shouldnt have said", "take that back",
+        ]) { a.valence += 0.14; a.tension -= 0.12; a.warmth += 0.10; a.arousal -= 0.04 }
+
         // PRAISE / appreciation → valence + warmth up.
         if Self.containsUnnegatedPhrase(lower, phrases: [
             "good work", "great work", "nice work", "well done", "great job", "exactly right",
             "that helped", "perfect", "proud of you", "you nailed", "sharp as hell", "impressive",
+            "that mattered", "that meant a lot", "you caught", "nice catch", "good catch",
         ]) { a.valence += 0.16; a.warmth += 0.12 }
 
         // RESOLVING it together → valence up, pressure AND tension down (the relief of a
@@ -359,6 +416,27 @@ extension CognitiveSubstrate {
             "good talk", "thanks for", "thank you", "appreciate", "you're the best",
             "youre the best", "means a lot", "we make a good team", "glad we",
         ]) { a.valence += 0.10 }
+
+        // PLAYFUL / FLIRTY — teasing warmth aimed at HER ("dangerously good at this",
+        // "careful, I might start looking forward to these arguments 😏"): valence,
+        // warmth and energy up — the `play`/`playful` family. Only when nothing
+        // negative matched ("you're useless 😏" is the contempt it is). Scenario #2
+        // read every flirty line as 0 before this.
+        if !hypothetical && !negative && (containsAny(lower, ["😏", "😉", "😘"]) || Self.containsUnnegatedPhrase(lower, phrases: [
+            "dangerously good", "kind of good at this", "you're good at this", "youre good at this",
+            "looking forward to these", "look forward to these", "say something clever",
+            "insufferable about it", "you're cute", "youre cute", "cute when you", "i like you better when",
+            "you're allowed to be happy", "youre allowed to be happy", "say something, you",
+            "you're flirting", "youre flirting", "careful, i might", "careful i might",
+        ])) { a.valence += 0.12; a.warmth += 0.10; a.arousal += 0.10 }
+
+        // BANTER / shared laughter — 😂 🤣 lol, "bold of you to assume", "well played":
+        // a joke they are both in on. Valence + a little energy; warmth only a touch
+        // (shared laughter warms, it is not affection). Nothing negative matched.
+        if !hypothetical && !negative && (containsAny(lower, ["😂", "🤣", "😆", "😅", " lol", "lol ", "lmao", "haha", "hehe"]) || Self.containsUnnegatedPhrase(lower, phrases: [
+            "bold of you", "well played", "touché", "touche", "fair play", "just kidding",
+            "i'm kidding", "im kidding",
+        ])) { a.valence += 0.10; a.arousal += 0.06; a.warmth += 0.04 }
 
         return a
     }

@@ -1,7 +1,9 @@
 import Foundation
+import Observation
 import PersistenceCore
 import ChatOrchestration
 import ApprovalInbox
+import ProviderRouting
 
 // MARK: - DeskQuickActions — the desk's mutation seam
 //
@@ -37,18 +39,50 @@ protocol DeskToolInvoking: Sendable {
     func run(tool: String, input: [String: JSONValue]) async throws -> JSONValue
 }
 
+/// The routing identity carried by every mounted Desk mutation. Validation
+/// belongs at this action boundary: a misspelled surface must refuse before a
+/// desk tool reaches the autonomy membrane under an unintended policy.
+enum DeskToolDispatchSurface {
+    static let desk = "desk"
+
+    static func validated(_ rawValue: String) throws -> String {
+        let surface = canonicalRoutingSurface(rawValue)
+        guard MODEL_SURFACES.contains(surface) else {
+            throw ProviderRoutingError.invalidRequest
+        }
+        return surface
+    }
+}
+
 struct DeskToolDispatchRouter: DeskToolInvoking {
     /// Surface tag carried into the dispatch. Distinct from "chat" so a receipt
     /// reader can tell User's click from Agent's tool call.
-    static let surface = "desk"
+    static let surface = DeskToolDispatchSurface.desk
 
     let dataRoot: URL
+    private let routingSurface: String
 
-    init(dataRoot: URL = PersistenceCore.defaultDataRoot()) {
+    init(
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        routingSurface: String = Self.surface
+    ) {
         self.dataRoot = dataRoot
+        self.routingSurface = routingSurface
     }
 
     func run(tool: String, input: [String: JSONValue]) async throws -> JSONValue {
+        let surface = try DeskToolDispatchSurface.validated(routingSurface)
+        // A Desk click does not make an LLM call, but it is still a product
+        // surface with independently persisted provider/policy selection. Read
+        // the same checked snapshot before the autonomy gate so corrupt or
+        // incomplete routing cannot turn the click into a hidden chat-default
+        // bypass, and so its provider selection is observed at the canonical
+        // boundary rather than merely listed in a catalog.
+        let routingSnapshot = try await SwiftNativeProviderRouting(dataRoot: dataRoot)
+            .checkedRoutingSnapshot()
+        guard routingSnapshot.preferences[surface] != nil else {
+            throw ProviderRoutingError.unavailable
+        }
         // Same impl AND same gate: chat-lane desk_* calls pass through the
         // FileAccessGated + AutonomyGated membrane, and a bare dispatcher here
         // let a desk click write where the same mutation from chat would have
@@ -63,7 +97,7 @@ struct DeskToolDispatchRouter: DeskToolInvoking {
             dataRoot: dataRoot
         )
         return try await gated.dispatch(
-            tool: tool, input: input, surface: Self.surface)
+            tool: tool, input: input, surface: surface)
     }
 }
 
@@ -75,6 +109,11 @@ struct DeskToolDispatchRouter: DeskToolInvoking {
 /// rather than a claim in a comment.
 enum DeskQuickAction: Equatable, Sendable {
     case close(handle: String, outcome: String)
+    /// Palette closes bind to the row version observed while resolving the
+    /// palette result. A later change must refuse at the store boundary rather
+    /// than let Enter acknowledge a different row state as this close.
+    case closeIfCurrent(handle: String, outcome: String, expectedUpdatedAt: String)
+    case setStatus(handle: String, status: DeskStatus)
     case defer_(handle: String, until: String?)
     case note(handle: String, text: String)
     case nagGlobal(on: Bool)
@@ -90,7 +129,8 @@ enum DeskQuickAction: Equatable, Sendable {
 
     var tool: String {
         switch self {
-        case .close: return "desk_close"
+        case .close, .closeIfCurrent: return "desk_close"
+        case .setStatus: return "desk_set_status"
         case .defer_: return "desk_defer"
         case .note: return "desk_note"
         case .nagGlobal, .nagProject, .nagItem, .nagMute, .nagUnmute: return "desk_nag_control"
@@ -101,6 +141,14 @@ enum DeskQuickAction: Equatable, Sendable {
         switch self {
         case let .close(handle, outcome):
             return ["handle": .string(handle), "outcome_summary": .string(outcome)]
+        case let .closeIfCurrent(handle, outcome, expectedUpdatedAt):
+            return [
+                "handle": .string(handle),
+                "outcome_summary": .string(outcome),
+                "expected_updated_at": .string(expectedUpdatedAt),
+            ]
+        case let .setStatus(handle, status):
+            return ["handle": .string(handle), "status": .string(status.rawValue)]
         case let .defer_(handle, until):
             // An EMPTY `until` is how desk_defer clears a park — the same
             // encoding the chat tool documents, not a second convention.
@@ -134,7 +182,8 @@ enum DeskQuickAction: Equatable, Sendable {
     /// message is prefixed with.
     var pendingLabel: String {
         switch self {
-        case .close: return "Closing"
+        case .close, .closeIfCurrent: return "Closing"
+        case .setStatus: return "Updating status"
         case let .defer_(_, until): return until == nil ? "Clearing the park" : "Deferring"
         case .note: return "Adding note"
         case let .nagGlobal(on): return on ? "Turning nagging on" : "Turning nagging off"
@@ -149,6 +198,122 @@ enum DeskQuickAction: Equatable, Sendable {
 struct DeskActionOutcome: Equatable, Sendable {
     let ok: Bool
     let message: String
+}
+
+struct DeskActionNotice: Equatable {
+    let text: String
+    let isError: Bool
+}
+
+enum DeskRefreshPresentation {
+    static func receipt(accepted: Bool) -> DeskActionNotice {
+        accepted
+            ? DeskActionNotice(text: "Desk refreshed.", isError: false)
+            : DeskActionNotice(text: "Refresh superseded by newer Desk data.", isError: false)
+    }
+}
+
+/// One Desk mutation at a time, regardless of whether it came from a keyboard
+/// shortcut, palette, selection bar, or the nags popover.
+@MainActor @Observable
+final class DeskActionFlight {
+    private(set) var isInFlight = false
+
+    func begin() -> Bool {
+        guard !isInFlight else { return false }
+        isInFlight = true
+        return true
+    }
+
+    func finish() {
+        isInFlight = false
+    }
+
+    /// The actual Desk mutation path. A nil result means this invocation was
+    /// dropped because another action still owns the flight.
+    func perform(
+        _ action: DeskQuickAction,
+        via invoker: any DeskToolInvoking
+    ) async -> DeskActionOutcome? {
+        guard begin() else { return nil }
+        defer { finish() }
+        return await DeskActionRunner.perform(action, via: invoker)
+    }
+}
+
+/// The tiny local echo the view shows while it waits to re-read the canonical
+/// store. No derived Desk state is guessed here, and nag actions never edit a
+/// Desk row because their truth lives in the nag-config store.
+enum DeskOptimisticItemPatch {
+    static func applying(
+        _ action: DeskQuickAction,
+        to current: [DeskItem],
+        timestamp: String = DeskClock.nowISO()
+    ) -> [DeskItem] {
+        var items = current
+        let handle: String
+        switch action {
+        case let .close(value, _), let .closeIfCurrent(value, _, _),
+             let .setStatus(value, _), let .defer_(value, _), let .note(value, _):
+            handle = value
+        case .nagGlobal, .nagProject, .nagItem, .nagMute, .nagUnmute:
+            return items
+        }
+        guard let index = items.firstIndex(where: { $0.handle == handle }) else { return items }
+        switch action {
+        case .close, .closeIfCurrent:
+            items[index].status = .done
+            items[index].closedAt = timestamp
+            items[index].updatedAt = timestamp
+        case let .setStatus(_, status):
+            items[index].status = status
+            items[index].updatedAt = timestamp
+        case let .defer_(_, until):
+            items[index].deferUntil = until
+            items[index].updatedAt = timestamp
+        case let .note(_, text):
+            items[index].notes.append(DeskNote(ts: timestamp, text: text))
+            items[index].updatedAt = timestamp
+        case .nagGlobal, .nagProject, .nagItem, .nagMute, .nagUnmute:
+            break
+        }
+        return items
+    }
+
+    static func reconciled(
+        preAction: [DeskItem],
+        optimistic: [DeskItem],
+        reloaded: [DeskItem],
+        loadFailed: Bool,
+        outcome: DeskActionOutcome
+    ) -> [DeskItem] {
+        guard !outcome.ok, loadFailed || reloaded == optimistic else { return reloaded }
+        return preAction
+    }
+
+    /// A version-fenced palette close can be refused because another writer
+    /// performed the same terminal transition first. Its successful canonical
+    /// reload wins over the stale local snapshot even when it happens to look
+    /// exactly like the optimistic close.
+    static func reconciled(
+        preAction: [DeskItem],
+        optimistic: [DeskItem],
+        reloaded: [DeskItem],
+        loadFailed: Bool,
+        outcome: DeskActionOutcome,
+        action: DeskQuickAction
+    ) -> [DeskItem] {
+        if case .closeIfCurrent = action, !outcome.ok, !loadFailed {
+            return reloaded
+        }
+        return reconciled(
+            preAction: preAction,
+            optimistic: optimistic,
+            reloaded: reloaded,
+            loadFailed: loadFailed,
+            outcome: outcome
+        )
+    }
 }
 
 enum DeskActionResultReader {

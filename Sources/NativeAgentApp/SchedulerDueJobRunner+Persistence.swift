@@ -141,10 +141,16 @@ extension SchedulerDueJobRunner {
         // U5 fix-round (2026-06-11, gpt-5.5 review): routed through the shared
         // capped append (PersistenceCore.appendJSONLCapped) — same flock as
         // before, plus the shared activity-feed line cap with rotation logging.
-        try await appendJSONLCapped(
-            event, to: activityPath, using: persistence,
-            logLabel: "SchedulerDueJobRunner"
-        )
+        do {
+            try await appendJSONLCapped(
+                event, to: activityPath, using: persistence,
+                logLabel: "SchedulerDueJobRunner"
+            )
+            activityFeedError = nil
+        } catch {
+            activityFeedError = "Scheduler activity evidence could not be written: \(error.localizedDescription)"
+            throw error
+        }
     }
 
     func appendNotificationInbox(
@@ -155,6 +161,7 @@ extension SchedulerDueJobRunner {
         jobId: String,
         itemId: String = "scheduled-\(UUID().uuidString.lowercased())",
         relatedPaths: [String] = [],
+        relatedGroups: [JSONValue] = [],
         detail: String? = nil,
         actions: [JSONValue] = [],
         notifyPhone: Bool = false
@@ -171,7 +178,7 @@ extension SchedulerDueJobRunner {
             "related_mission_id": .null,
             "related_approval_id": .null,
             "related_paths": .array(relatedPaths.map { .string($0) }),
-            "related_groups": .array([]),
+            "related_groups": .array(relatedGroups),
             "actions": .array(actions),
             "status": .string("unread"),
             "read_at": .null,
@@ -286,6 +293,16 @@ extension SchedulerDueJobRunner {
     }
 
     func postCycleNotification(title: String, body: String, jobId: String, source: String, itemId: String? = nil) async -> JSONValue {
+        await cycleNotificationDelivery(title, body, jobId, source, itemId)
+    }
+
+    static func deliverCycleNotification(
+        title: String,
+        body: String,
+        jobId: String,
+        source: String,
+        itemId: String? = nil
+    ) async -> JSONValue {
         var delivered: [JSONValue] = []
         var errors: [JSONValue] = []
 

@@ -74,6 +74,72 @@ private struct ContextFlowConfigurationFixture {
 
 @Suite("NativeContextFlow production configuration")
 struct NativeContextFlowRuntimeTests {
+    // EVAL FENCE: core.context
+    // Ledger row: app.personaContextFlowProvider
+    @Test("persona picker rebuilds the live ContextFlow kernel before the next chat turn")
+    func personaPickerRebuildsPreparedTurnKernel() async throws {
+        let fixture = try ContextFlowConfigurationFixture()
+        defer { fixture.cleanUp() }
+        // Isolated resolution selects the one `SOUL.md` identity directly
+        // below `<dataRoot>/persona`. Picker choices live inside that selected
+        // canonical root, exactly where PersonaCompiler resolves overrides.
+        let root = fixture.dataRoot
+            .appendingPathComponent("persona", isDirectory: true)
+            .appendingPathComponent("canonical", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try "# SOUL\ncanonical identity".write(
+            to: root.appendingPathComponent("SOUL.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "# VOICE\ncanonical voice".write(
+            to: root.appendingPathComponent("VOICE.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+        for (name, marker) in [("Alpha", "alpha identity"), ("Beta", "beta identity")] {
+            let dir = root.appendingPathComponent(name, isDirectory: true)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try "# SOUL\n\(marker)".write(to: dir.appendingPathComponent("SOUL.md"), atomically: true, encoding: .utf8)
+            try "# VOICE\n\(marker) voice".write(to: dir.appendingPathComponent("VOICE.md"), atomically: true, encoding: .utf8)
+        }
+        fixture.defaults.set("Alpha", forKey: "chatPersona")
+        let runtime = NativeContextFlowRuntime(
+            dataRoot: fixture.dataRoot,
+            configurationOverride: NativeContextFlowConfiguration(mode: .active, budget: .mib32),
+            memoryOverride: SwiftNativeMemoryV2(
+                embedder: DelayedEmbeddingProvider(gate: DelayedEmbeddingGate()),
+                storage: InMemoryMemoryStorage()
+            ),
+            defaultsOverride: SendableUserDefaults(value: fixture.defaults)
+        )
+        await runtime.start()
+        let alpha = try await runtime.prepareContextTurn(ContextTurnRequest(
+            surface: .chat,
+            origin: .localAuthenticated,
+            userMessage: "Which identity is selected?",
+            personaIDHint: "Alpha"
+        ))
+        // This is the same synchronous preference write AppModel's picker
+        // setter performs before its asynchronous UI notification. Do not
+        // send the notification here: the next real prepare must fence itself
+        // against the changed canonical picker value.
+        fixture.defaults.set("Beta", forKey: "chatPersona")
+        let beta = try await runtime.prepareContextTurn(ContextTurnRequest(
+            surface: .chat,
+            origin: .localAuthenticated,
+            userMessage: "Which identity is selected now?",
+            personaIDHint: "Beta"
+        ))
+        #expect(alpha.mirror.personaID.rawValue == "Alpha")
+        #expect(alpha.kernel.renderedPrompt.contains("alpha identity"))
+        #expect(alpha.packet.receipt.mandatoryCoverage == 1)
+        #expect(beta.mirror.personaID.rawValue == "Beta")
+        #expect(beta.kernel.renderedPrompt.contains("beta identity"))
+        #expect(!beta.kernel.renderedPrompt.contains("alpha identity"))
+        #expect(beta.packet.receipt.mandatoryCoverage == 1)
+        await runtime.stop()
+    }
     @Test("resident work re-enters relevant turns on evidence and restart without model settlement")
     func residentWorkReentryIsEventDrivenRelevantAndRestartSafe() async throws {
         let fixture = try ContextFlowConfigurationFixture()
@@ -312,6 +378,7 @@ struct NativeContextFlowRuntimeTests {
             degradedSourceCount: 0,
             arenaMetrics: arena.metrics(),
             pendingPrewarmHints: 2,
+            trackedPrewarmPlanCount: 2,
             prewarmUsefulnessReceipts: 3,
             lastReconciledAt: Date(timeIntervalSince1970: 1_000),
             lastError: nil
@@ -516,6 +583,25 @@ struct NativeContextFlowRuntimeTests {
             publicSafeMode: false
         )
         #expect(environmentConfiguration.mode == mode)
+    }
+
+    @Test("garbage environment mode falls back to the stored mode")
+    func garbageEnvironmentModeFallsBack() throws {
+        let fixture = try ContextFlowConfigurationFixture()
+        defer { fixture.cleanUp() }
+        fixture.defaults.set(
+            ContextFlowMode.active.rawValue,
+            forKey: NativeContextFlowConfiguration.modeDefaultsKey
+        )
+        let configuration = NativeContextFlowConfiguration.resolve(
+            dataRoot: fixture.dataRoot,
+            environment: [
+                NativeContextFlowConfiguration.modeEnvironmentKey: "not-a-context-mode",
+            ],
+            defaults: fixture.defaults,
+            publicSafeMode: false
+        )
+        #expect(configuration.mode == .active)
     }
 
     @Test("invalid ContextFlow RAM budget defaults to 96 MiB")

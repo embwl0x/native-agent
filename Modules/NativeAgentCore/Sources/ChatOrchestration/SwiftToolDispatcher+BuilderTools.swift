@@ -741,15 +741,26 @@ extension SwiftToolDispatcher {
     /// Create (idempotently) the shim directory and return it, or nil if it could
     /// not be built. Failing to nil is fail-SAFE: the spawn keeps its sandbox and
     /// a SwiftPM command fails loudly, rather than silently running unconfined.
-    static func builderSwiftPMShimDirectory() -> URL? {
+    static func builderSwiftPMShimDirectory(baseDirectory: URL? = nil) -> URL? {
         guard let realSwift = builderRealSwiftPath() else { return nil }
         let fm = FileManager.default
         // Per-user private temp (/var/folders/<hash>/T, mode 700) — not the
         // world-writable /tmp, so the shim cannot be pre-planted by another user.
-        let dir = fm.temporaryDirectory
+        let dir = (baseDirectory ?? fm.temporaryDirectory)
             .appendingPathComponent("nativeagent-swiftpm-shim", isDirectory: true)
         let shim = dir.appendingPathComponent("swift", isDirectory: false)
         let script = builderSwiftPMShimScript(realSwiftPath: realSwift)
+
+        do {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true,
+                                   attributes: [.posixPermissions: 0o700])
+            // createDirectory leaves an existing directory's permissions
+            // unchanged. Reassert the private boundary on every call, including
+            // the idempotent fast path.
+            try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
+        } catch {
+            return nil
+        }
 
         if let existing = try? String(contentsOf: shim, encoding: .utf8),
            existing == script,
@@ -757,8 +768,6 @@ extension SwiftToolDispatcher {
             return dir
         }
         do {
-            try fm.createDirectory(at: dir, withIntermediateDirectories: true,
-                                   attributes: [.posixPermissions: 0o700])
             // Stage under a unique name, mark executable, then atomically swap in.
             // A concurrent spawn therefore sees either the old shim or the new
             // one — never a half-written or not-yet-executable file.
@@ -770,10 +779,20 @@ extension SwiftToolDispatcher {
             } else {
                 try fm.moveItem(at: staged, to: shim)
             }
+            // replaceItemAt may preserve the destination inode's mode (for
+            // example a stale 0644 shim). Reassert the executable contract on
+            // the final path, not only on the staging file.
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: shim.path)
             return dir
         } catch {
-            // Lost a race with a sibling writer? Accept whatever landed.
-            if fm.isExecutableFile(atPath: shim.path) { return dir }
+            // Lost a race with a sibling writer? Accept only the exact expected
+            // script with the full private/executable permission contract.
+            if let landed = try? String(contentsOf: shim, encoding: .utf8),
+               landed == script,
+               fm.isExecutableFile(atPath: shim.path),
+               (try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)) != nil {
+                return dir
+            }
             return nil
         }
     }
@@ -1019,7 +1038,8 @@ extension SwiftToolDispatcher {
             return .object(env)
         }
 
-        let clampedTimeout = max(1, min(3600, timeoutSeconds))
+        let clampedTimeout = builderEffectiveTimeoutSeconds(timeoutSeconds)
+        let timedOut = AtomicFlag()
 
         // U4 Wave B: wrap the spawn in sandbox-exec (workspace-scoped writes)
         // unless the kill switch is set or the caller is a fixed-argv escape
@@ -1149,7 +1169,7 @@ extension SwiftToolDispatcher {
                     : nil
                 let exitCode = maskedExitCode ?? processExitCode
                 let durationMs = Int(Date().timeIntervalSince(started) * 1000)
-                let status = exitCode == 0 ? "completed" : "failed"
+                let status = timedOut.isSet ? "timed_out" : (exitCode == 0 ? "completed" : "failed")
 
                 // Audit truncation: 16KB out/err, 4KB payload.
                 let auditStdout = stdoutText.count > 16_384
@@ -1169,6 +1189,8 @@ extension SwiftToolDispatcher {
                     "completedAt": ISO8601DateFormatter().string(from: Date()),
                     "status": status,
                     "durationMs": durationMs,
+                    "timeoutSecondsEffective": clampedTimeout,
+                    "timedOut": timedOut.isSet,
                     "exitCode": Int(exitCode),
                     "processExitCode": Int(processExitCode),
                     "cwd": resolvedCwd,
@@ -1184,6 +1206,7 @@ extension SwiftToolDispatcher {
                     "outer_sandbox_policy": "policy",
                 ]
                 if let auditPayload { auditEntry["sourcePayload"] = auditPayload }
+                if timedOut.isSet { auditEntry["reason"] = "watchdog_timeout" }
                 if let maskedExitCode {
                     auditEntry["masked_exit_detected"] = true
                     auditEntry["masked_exit_code"] = Int(maskedExitCode)
@@ -1215,6 +1238,8 @@ extension SwiftToolDispatcher {
                     "stdout": .string(envStdout),
                     "stderr": .string(envStderr),
                     "durationMs": .int(Int64(durationMs)),
+                    "timeout_seconds_effective": .int(Int64(clampedTimeout)),
+                    "timed_out": .bool(timedOut.isSet),
                     "cwd": .string(resolvedCwd),
                     "sandboxed": .bool(sandboxed),
                     "sandbox_mode": .string(sandboxMode.rawValue),
@@ -1226,6 +1251,10 @@ extension SwiftToolDispatcher {
                     envelope["detail"] = .string("The process exited 0, but its output reported EXIT: \(maskedExitCode). Treating the tool call as failed.")
                     envelope["masked_exit_detected"] = .bool(true)
                     envelope["masked_exit_code"] = .int(Int64(maskedExitCode))
+                }
+                if timedOut.isSet {
+                    envelope["reason"] = .string("watchdog_timeout")
+                    envelope["detail"] = .string("The process exceeded the effective \(clampedTimeout)-second builder timeout and its process tree was terminated.")
                 }
                 if !resolvedCompatRewrites.isEmpty {
                     envelope["compat_rewrites"] = .array(resolvedCompatRewrites.map { .string($0) })
@@ -1279,8 +1308,19 @@ extension SwiftToolDispatcher {
                 return
             }
 
-            armSubprocessTimeout(process: process, timeoutSeconds: clampedTimeout)
+            armSubprocessTimeout(
+                process: process,
+                timeoutSeconds: clampedTimeout,
+                onTimeout: { timedOut.set() }
+            )
         }
+    }
+
+    /// The builder watchdog's actual bound. Exposing this calculation both in
+    /// receipts and as a pure seam prevents a caller-requested timeout from
+    /// being silently clamped with no way to explain the observed stop.
+    static func builderEffectiveTimeoutSeconds(_ requested: Int) -> Int {
+        max(1, min(3600, requested))
     }
 
     private static func builderDefaultCwd(dataRoot: URL) -> String {

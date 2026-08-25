@@ -1,4 +1,5 @@
 import SwiftUI
+import Observation
 import AppKit
 import CoreGraphics
 import ScreenCaptureKit
@@ -16,6 +17,31 @@ import CoreSpotlight
 import CloudKit
 #endif
 
+@MainActor
+@Observable
+final class MemoryMenuActionController {
+    enum Action: Equatable {
+        case consolidate
+        case hygiene
+    }
+
+    var runningAction: Action?
+    var feedback: MemoryMenuActionFeedback?
+
+    func run(_ action: Action, appModel: AppModel) async {
+        guard runningAction == nil else { return }
+        feedback = nil
+        runningAction = action
+        defer { runningAction = nil }
+        switch action {
+        case .consolidate:
+            feedback = await appModel.consolidateMemory()
+        case .hygiene:
+            feedback = await appModel.runMemoryHygiene()
+        }
+    }
+}
+
 struct MemoryView: View {
     @Environment(AppModel.self) private var appModel
     @State private var query = ""
@@ -26,32 +52,63 @@ struct MemoryView: View {
     // "Memory Proposals" section, the user wants to land on the pending
     // proposal queue, not the active-memory list. Default stays `.active` so
     // existing call sites are unchanged.
-    init(initialTab: MemoryViewTab = .active) {
+    init(
+        initialTab: MemoryViewTab = .active,
+        menuActionController: MemoryMenuActionController = .init()
+    ) {
         _selectedTab = State(initialValue: initialTab)
+        _menuActionController = State(initialValue: menuActionController)
     }
     @State private var spotlightStatus: String?
     @State private var cloudKitStatus: String = "checking…"
     @State private var isReindexing = false
     @State private var nativeStack: MemoryV2NativeStackSnapshot = .empty
     @State private var semanticSearchTask: Task<Void, Never>?
+    @State private var isRefreshing = false
+    @State private var refreshNotice: MemoryToolbarRefreshPresentation?
+    @State private var menuActionController: MemoryMenuActionController
 
     private var filteredMemories: [MemoryRecord] {
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        // F2: when the search box has non-trivial input, prefer the
-        // semantic-recall results AppModel populated via SwiftNativeMemoryV2.
-        // Empty/very-short queries → full list. The previous code did a plain
-        // substring scan on text/layer regardless of length.
-        if trimmed.isEmpty { return appModel.memories }
-        if let results = appModel.memorySearchResults { return results }
-        // Substring fallback for the moment between keystroke and async recall.
-        let lower = trimmed.lowercased()
-        return appModel.memories.filter {
-            $0.text.lowercased().contains(lower) || $0.layer.lowercased().contains(lower)
+        MemorySearchPresentation.displayedRecords(
+            appModel.memories,
+            query: query,
+            semanticResults: appModel.memorySearchResults,
+            resultQuery: appModel.memorySearchResultQuery
+        ) { memory, lower in
+            memory.text.lowercased().contains(lower) || memory.layer.lowercased().contains(lower)
         }
     }
 
     private var pendingMemoryProposals: [MemoryProposalRecord] {
         appModel.memoryProposals.filter { $0.status == "pending" }
+    }
+
+    private var memorySearchPresentation: MemorySearchPresentation {
+        MemorySearchPresentation.resolve(
+            query: query,
+            resultCount: filteredMemories.count,
+            isLoading: appModel.memorySearchIsLoading
+                && MemorySearchPresentation.matchesCurrentQuery(
+                    query,
+                    resultQuery: appModel.memorySearchResultQuery
+                ),
+            error: MemorySearchPresentation.matchesCurrentQuery(
+                query,
+                resultQuery: appModel.memorySearchResultQuery
+            )
+                ? appModel.memorySearchError
+                : nil
+        )
+    }
+
+    private var currentMemorySearchError: String? {
+        guard MemorySearchPresentation.matchesCurrentQuery(
+            query,
+            resultQuery: appModel.memorySearchResultQuery
+        ) else {
+            return nil
+        }
+        return appModel.memorySearchError
     }
 
     private var rejectedMemoryProposals: [MemoryProposalRecord] {
@@ -66,16 +123,24 @@ struct MemoryView: View {
                 TextField("Search your memories", text: $query)
                     .textFieldStyle(.roundedBorder)
                 Menu {
-                    Button("Consolidate memory", systemImage: "arrow.triangle.merge") {
-                        Task { await appModel.consolidateMemory() }
+                    Button(
+                        menuActionController.runningAction == .consolidate ? "Consolidating memory…" : "Consolidate memory",
+                        systemImage: "arrow.triangle.merge"
+                    ) {
+                        Task { await menuActionController.run(.consolidate, appModel: appModel) }
                     }
-                    Button("Run hygiene", systemImage: "sparkles") {
-                        Task { await appModel.runMemoryHygiene() }
+                    .disabled(menuActionController.runningAction != nil || isReindexing)
+                    Button(
+                        menuActionController.runningAction == .hygiene ? "Running hygiene…" : "Run hygiene",
+                        systemImage: "sparkles"
+                    ) {
+                        Task { await menuActionController.run(.hygiene, appModel: appModel) }
                     }
+                    .disabled(menuActionController.runningAction != nil || isReindexing)
                     Button(isReindexing ? "Reindexing Spotlight…" : "Reindex Spotlight", systemImage: "magnifyingglass") {
                         Task { await reindexSpotlight() }
                     }
-                    .disabled(isReindexing)
+                    .disabled(isReindexing || menuActionController.runningAction != nil)
                 } label: {
                     Label("Actions", systemImage: "ellipsis.circle")
                 }
@@ -112,7 +177,7 @@ struct MemoryView: View {
                     .foregroundStyle(.secondary)
             }
 
-            if let searchError = appModel.memorySearchError, !searchError.isEmpty {
+            if let searchError = currentMemorySearchError, !searchError.isEmpty {
                 Label(searchError, systemImage: "exclamationmark.triangle")
                     .font(.caption)
                     .foregroundStyle(.orange)
@@ -122,6 +187,20 @@ struct MemoryView: View {
                 Label(memoryProposalMessage, systemImage: "checkmark.circle")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+
+            if let refreshNotice {
+                Label(refreshNotice.text, systemImage: refreshNotice.systemImage)
+                    .font(.caption)
+                    .foregroundStyle(refreshNotice.isAdverse ? .orange : .secondary)
+            }
+
+            if let menuActionFeedback = menuActionController.feedback {
+                Label(menuActionFeedback.message, systemImage: menuActionFeedback.isAdverse
+                    ? "exclamationmark.triangle"
+                    : "checkmark.circle")
+                    .font(.caption)
+                    .foregroundStyle(menuActionFeedback.isAdverse ? .orange : .secondary)
             }
 
             // F2: surface the "panel disabled / not implemented" envelope so
@@ -150,8 +229,9 @@ struct MemoryView: View {
         .navigationTitle("Memory")
         .toolbar {
             Button("Refresh", systemImage: "arrow.clockwise") {
-                Task { await appModel.refreshForSidebarItem(.memories) }
+                Task { await refreshMemorySurface() }
             }
+            .disabled(isRefreshing)
         }
         .task { await refreshCloudKitStatus() }
         // 2026-06-07: the user caught Memory page showing "ready, not loaded"
@@ -172,14 +252,12 @@ struct MemoryView: View {
                 await refreshNativeEmbeddingRuntime()
             }
         }
-        // F2: kick semantic recall whenever the search query changes. The
-        // AppModel method clears `memorySearchResults` for trivial inputs so
-        // the full list comes back automatically.
+        // The owner starts its generation gate before its debounce. That makes
+        // a new keystroke immediately invalidate old results instead of showing
+        // a previous query beneath the current search text.
         .onChange(of: query) { _, newValue in
             semanticSearchTask?.cancel()
             semanticSearchTask = Task {
-                try? await Task.sleep(nanoseconds: 150_000_000)
-                guard !Task.isCancelled else { return }
                 await appModel.runMemorySemanticSearch(query: newValue)
             }
         }
@@ -190,7 +268,27 @@ struct MemoryView: View {
 
     @MainActor
     private func refreshNativeStack() async {
-        nativeStack = await MemoryV2NativeStackSnapshot.load()
+        nativeStack = await MemoryV2NativeStackSnapshot.load(
+            dataRoot: appModel.dataRootOverride ?? NativeAgentPaths.dataRoot
+        )
+    }
+
+    /// The toolbar claims to refresh the Memory page, not merely its list.
+    /// Keep the list/proposal/status reader, the native status snapshot, and
+    /// the CloudKit account status in one user-triggered transaction.
+    @MainActor
+    private func refreshMemorySurface() async {
+        guard !isRefreshing else { return }
+        isRefreshing = true
+        defer { isRefreshing = false }
+
+        let refreshed = await MemoryToolbarRefreshOperation.run(
+            appModel: appModel,
+            dataRoot: appModel.dataRootOverride ?? NativeAgentPaths.dataRoot
+        )
+        nativeStack = refreshed.nativeStack
+        await refreshCloudKitStatus()
+        refreshNotice = refreshed.presentation
     }
 
     @MainActor
@@ -213,16 +311,33 @@ struct MemoryView: View {
 
     @ViewBuilder
     private var activeTab: some View {
-        if filteredMemories.isEmpty {
+        switch memorySearchPresentation {
+        case .searching:
+            ProgressView("Searching memories…")
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        case .unavailable(let detail):
             NativeEmptyState(
-                title: query.isEmpty ? "No Memories Yet" : "No Matches",
-                detail: query.isEmpty
-                    ? "Memories appear here as the agent learns from your conversations. Start chatting and useful facts will show up."
-                    : "Nothing in memory matches \(query.isEmpty ? "" : "“\(query)”"). Clear the search box to see all memories.",
-                systemImage: query.isEmpty ? "brain" : "magnifyingglass"
+                title: "Memory search unavailable",
+                detail: "\(detail) No text matches were found either.",
+                systemImage: "exclamationmark.triangle"
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else {
+        case .allMemories, .empty:
+            if filteredMemories.isEmpty {
+                NativeEmptyState(
+                    title: query.isEmpty ? "No Memories Yet" : "No Matches",
+                    detail: query.isEmpty
+                        ? "Memories appear here as the agent learns from your conversations. Start chatting and useful facts will show up."
+                        : "Nothing in memory matches \(query.isEmpty ? "" : "“\(query)”"). Clear the search box to see all memories.",
+                    systemImage: query.isEmpty ? "brain" : "magnifyingglass"
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(filteredMemories) { memory in
+                    MemoryRowEditor(memory: memory)
+                }
+            }
+        case .results:
             List(filteredMemories) { memory in
                 MemoryRowEditor(memory: memory)
             }
@@ -276,32 +391,12 @@ struct MemoryView: View {
     private func reindexSpotlight() async {
         isReindexing = true
         defer { isReindexing = false }
-        #if canImport(CoreSpotlight)
-        let domain = "memory.nativeagent"
-        let index = CSSearchableIndex.default()
-        do {
-            try await index.deleteSearchableItems(withDomainIdentifiers: [domain])
-            let items: [CSSearchableItem] = appModel.memories.map { rec in
-                let attrs = CSSearchableItemAttributeSet(contentType: .text)
-                attrs.title = String(rec.text.prefix(80))
-                attrs.contentDescription = rec.text
-                attrs.keywords = [rec.layer]
-                return CSSearchableItem(
-                    uniqueIdentifier: rec.id,
-                    domainIdentifier: domain,
-                    attributeSet: attrs
-                )
-            }
-            if !items.isEmpty {
-                try await index.indexSearchableItems(items)
-            }
-            spotlightStatus = "Spotlight reindexed \(items.count) memories"
-        } catch {
-            spotlightStatus = "Spotlight reindex failed: \(error.localizedDescription)"
-        }
-        #else
-        spotlightStatus = "Spotlight unavailable on this platform"
-        #endif
+        let dataRoot = appModel.dataRootOverride ?? NativeAgentPaths.dataRoot
+        let outcome = await MemorySpotlightReindexOperation.run(dataRoot: dataRoot)
+        spotlightStatus = outcome.userMessage
+        // The status line and count must be read after the durable result, not
+        // retained from before a delete-and-rebuild attempt.
+        await refreshNativeStack()
     }
 
     @MainActor
@@ -426,10 +521,23 @@ private struct MemoryRowEditor: View {
     @Environment(AppModel.self) private var appModel
     @State private var showingDeleteConfirmation = false
     @State private var isDeleting = false
+    @State private var isPinning = false
+    @State private var pinFeedback: MemoryRowEditorPinOutcome?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             headerRow
+            if let pinFeedback {
+                Label(
+                    pinFeedback.message,
+                    systemImage: pinFeedback.systemImage
+                )
+                .font(.caption)
+                .foregroundStyle(
+                    pinFeedback.isAdverse || pinFeedback.isPendingApproval ? .orange : .secondary
+                )
+                .accessibilityLabel(pinFeedback.message)
+            }
             Text(memory.text)
                 .textSelection(.enabled)
                 .lineLimit(2)
@@ -460,9 +568,13 @@ private struct MemoryRowEditor: View {
                 .font(.caption)
                 .foregroundStyle(memory.pinned == true ? .orange : .secondary)
             Spacer()
-            Button(memory.pinned == true ? "Unpin" : "Pin", systemImage: memory.pinned == true ? "pin.slash" : "pin") {
-                Task { await appModel.pinMemory(memory, pinned: !(memory.pinned ?? false)) }
+            Button(
+                isPinning ? "Updating…" : (memory.pinned == true ? "Unpin" : "Pin"),
+                systemImage: isPinning ? "hourglass" : (memory.pinned == true ? "pin.slash" : "pin")
+            ) {
+                Task { await togglePin() }
             }
+            .disabled(isPinning)
             Button(isDeleting ? "Deleting\u{2026}" : "Delete", systemImage: isDeleting ? "hourglass" : "trash") {
                 showingDeleteConfirmation = true
             }
@@ -470,6 +582,14 @@ private struct MemoryRowEditor: View {
             .disabled(isDeleting)
         }
         .buttonStyle(.borderless)
+    }
+
+    @MainActor
+    private func togglePin() async {
+        guard !isPinning else { return }
+        isPinning = true
+        defer { isPinning = false }
+        pinFeedback = await appModel.pinMemory(memory, pinned: !(memory.pinned ?? false))
     }
 
     @ViewBuilder
@@ -528,6 +648,185 @@ enum MemoryDeletionPresentation {
     }
 }
 
+/// The explicit toolbar refresh has three independently-read boundaries:
+/// app-model content, the native store snapshot, and the optional CloudKit
+/// account state. A failed store probe wins over a generic successful refresh
+/// receipt because zero is meaningful only after the store was actually read.
+struct MemoryToolbarRefreshPresentation: Equatable {
+    let text: String
+    let systemImage: String
+    let isAdverse: Bool
+
+    static func resolve(staleNotice: String?, storageReadable: Bool?) -> Self {
+        if storageReadable == false {
+            return Self(
+                text: "Saved memories could not be read. Existing memory data is shown only where it was already loaded.",
+                systemImage: "exclamationmark.triangle",
+                isAdverse: true
+            )
+        }
+        if let staleNotice, !staleNotice.isEmpty {
+            return Self(
+                text: staleNotice,
+                systemImage: "exclamationmark.triangle",
+                isAdverse: true
+            )
+        }
+        return Self(
+            text: "Memory refreshed.",
+            systemImage: "arrow.clockwise",
+            isAdverse: false
+        )
+    }
+}
+
+/// The state-bearing core of MemoryView's explicit toolbar action. Keeping it
+/// separate from the SwiftUI closure makes the mounted control's real reads
+/// executable with an injected data root, without inventing an in-memory
+/// substitute for the MemoryV2 store.
+@MainActor
+struct MemoryToolbarRefreshOperation {
+    let nativeStack: MemoryV2NativeStackSnapshot
+    let presentation: MemoryToolbarRefreshPresentation
+
+    static func run(appModel: AppModel, dataRoot: URL) async -> Self {
+        await appModel.refreshForSidebarItem(.memories)
+        let nativeStack = await MemoryV2NativeStackSnapshot.load(dataRoot: dataRoot)
+        return Self(
+            nativeStack: nativeStack,
+            presentation: MemoryToolbarRefreshPresentation.resolve(
+                staleNotice: appModel.panelStaleNotice(for: .memories),
+                storageReadable: nativeStack.storageReadable
+            )
+        )
+    }
+}
+
+/// Diagnostics can identify a storage location without putting an account path
+/// into a support screenshot. This follows the Living Status privacy boundary:
+/// a value containing the home directory is evidence of a private location,
+/// not displayable path text.
+enum MemoryAdvancedDiagnosticsIdentifiers: Equatable {
+    case unavailable
+    case privateLocation
+    case visiblePath(String)
+
+    static func dataRoot(path: String, homeDirectory: String = NSHomeDirectory()) -> Self {
+        let normalizedPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedPath.isEmpty else { return .unavailable }
+
+        let normalizedHome = homeDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !normalizedHome.isEmpty,
+           normalizedPath.lowercased().contains(normalizedHome.lowercased()) {
+            return .privateLocation
+        }
+        return .visiblePath(normalizedPath)
+    }
+
+    var dataRootLabel: String {
+        switch self {
+        case .unavailable:
+            return "data root: unavailable"
+        case .privateLocation:
+            return "data root: private location hidden"
+        case let .visiblePath(path):
+            return "data root: \(path)"
+        }
+    }
+}
+
+/// Durable owner for the mounted "Reindex Spotlight" control. Its marker is
+/// proof for one exact MemoryV2 projection generation, not a sticky claim that
+/// an index rebuild happened at some unknown point in the past.
+struct MemorySpotlightReindexOperation {
+    enum Outcome: Equatable, Sendable {
+        case indexed(count: Int)
+        case changedDuringReindex
+        case failed(message: String)
+
+        var userMessage: String {
+            switch self {
+            case .indexed(let count):
+                return "Spotlight reindexed \(count) memories"
+            case .changedDuringReindex:
+                return "Memories changed while indexing. Reindex again from the latest saved state."
+            case .failed(let message):
+                return "Spotlight reindex failed: \(message)"
+            }
+        }
+    }
+
+    static func run(dataRoot: URL) async -> Outcome {
+        await run(dataRoot: dataRoot, client: liveClient(dataRoot: dataRoot))
+    }
+
+    static func run(
+        dataRoot: URL,
+        client: any SpotlightIndexClient
+    ) async -> Outcome {
+        let marker = markerURL(dataRoot: dataRoot)
+        do {
+            let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
+            let generation = try await storage.projectionGenerationFingerprint()
+            let memories = try await storage.listMemories(
+                persona: nil,
+                status: "active",
+                limit: nil
+            )
+            let batch = memories
+                .filter { !$0.id.hasPrefix(SwiftNativeMemoryV2.skillPointerIDPrefix) }
+                .map { (id: $0.id, text: $0.content, kind: $0.status as String?) }
+
+            // Delete the old proof BEFORE clearing the derived index. A crash
+            // or failure after `removeAll()` must read as unconfirmed rather
+            // than reporting the old SQLite count over an empty Spotlight
+            // domain.
+            try clearMarker(at: marker)
+
+            let indexer = SwiftNativeMemoryIndexer(client: client)
+            try await indexer.removeAll()
+            try await indexer.indexBatch(batch)
+
+            let completedGeneration = try await storage.projectionGenerationFingerprint()
+            guard completedGeneration == generation else {
+                // A concurrent canonical write makes this batch stale. There
+                // is intentionally no marker: the next reindex must start
+                // from the new source generation.
+                return .changedDuringReindex
+            }
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(
+                Data((generation + "\n").utf8),
+                to: marker
+            )
+            return .indexed(count: batch.count)
+        } catch {
+            return .failed(message: error.localizedDescription)
+        }
+    }
+
+    static func markerURL(dataRoot: URL) -> URL {
+        dataRoot
+            .appendingPathComponent("memory", isDirectory: true)
+            .appendingPathComponent(".spotlight_reindexed", isDirectory: false)
+    }
+
+    private static func clearMarker(at marker: URL) throws {
+        guard FileManager.default.fileExists(atPath: marker.path) else { return }
+        try FileManager.default.removeItem(at: marker)
+    }
+
+    private static func liveClient(dataRoot: URL) -> any SpotlightIndexClient {
+        #if canImport(CoreSpotlight) && !os(Linux)
+        if dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL {
+            return SystemSpotlightIndexClient()
+        }
+        #endif
+        // An injected/test root must not replace the user's system Spotlight
+        // domain merely because the UI is hosted in this app process.
+        return MockSpotlightIndexClient()
+    }
+}
+
 // MARK: - MemoryV2 Apple-Native Stack panel
 //
 // Surfaces the four indicators that prove the daemon-era memory backend has
@@ -536,8 +835,8 @@ enum MemoryDeletionPresentation {
 //     through MemoryV2's canonical resolved storage owner.
 //   * Core ML MiniLM (Neural Engine) embedder availability — keyed off the
 //     migration marker + the Core ML model URL probe.
-//   * CoreSpotlight indexed count — the `.spotlight_reindexed` sentinel under
-//     `<dataRoot>/memory/` plus the SQLite-row count as an upper bound.
+//   * CoreSpotlight indexed count — a current-generation confirmation under
+//     `<dataRoot>/memory/`, never a bare sentinel or inferred SQLite count.
 //   * CloudKit account status when explicitly enabled. CKContainer probes are
 //     skipped by default because this dev profile lacks the CloudKit service
 //     grant and CKContainer can trap synchronously instead of throwing.
@@ -548,6 +847,8 @@ enum MemoryDeletionPresentation {
 struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
     var sqliteRecordCount: Int
     var sqliteProposalCount: Int
+    /// `nil` before the direct store probe, `false` when it could not read.
+    var storageReadable: Bool?
     var migrated: Bool
     var coreMLReady: Bool
     var coreMLModelLabel: String
@@ -620,6 +921,7 @@ struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
     static let empty = MemoryV2NativeStackSnapshot(
         sqliteRecordCount: 0,
         sqliteProposalCount: 0,
+        storageReadable: nil,
         migrated: false,
         coreMLReady: false,
         coreMLModelLabel: "MiniLM-L6-v2 (pending .mlpackage)",
@@ -634,21 +936,32 @@ struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
         dataRootPath: ""
     )
 
-    static func load() async -> MemoryV2NativeStackSnapshot {
-        let dataRoot = NativeAgentPaths.dataRoot
+    static func load(
+        dataRoot: URL = NativeAgentPaths.dataRoot
+    ) async -> MemoryV2NativeStackSnapshot {
         var snap = MemoryV2NativeStackSnapshot.empty
         snap.dataRootPath = dataRoot.path
+        var spotlightEligibleCount = 0
+        var storageGeneration: String?
 
         // SQLite probe — open the same store MemoryV2+Storage.swift uses and
-        // list active rows. `try?` so a fresh install with no sqlite yet stays
-        // at 0 rather than vanishing the panel.
-        if let store = try? await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot) {
-            if let memories = try? await store.listMemories(persona: nil, status: nil, limit: nil) {
-                snap.sqliteRecordCount = memories.count
-            }
+        // list active rows. A clean empty store is 0; a failed read remains
+        // explicit so the panel cannot present it as an empty memory profile.
+        do {
+            let store = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
+            let memories = try await store.listMemories(persona: nil, status: nil, limit: nil)
+            snap.storageReadable = true
+            snap.sqliteRecordCount = memories.count
+            let activeMemories = try await store.listMemories(persona: nil, status: "active", limit: nil)
+            spotlightEligibleCount = activeMemories.filter {
+                !$0.id.hasPrefix(SwiftNativeMemoryV2.skillPointerIDPrefix)
+            }.count
+            storageGeneration = try await store.projectionGenerationFingerprint()
             if let proposals = try? await store.listProposals(status: "pending") {
                 snap.sqliteProposalCount = proposals.count
             }
+        } catch {
+            snap.storageReadable = false
         }
 
         // Migration marker — written by MemoryV2Migrator on a successful
@@ -693,14 +1006,16 @@ struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
 
         // Spotlight — the `.spotlight_reindexed` sentinel is written by
         // MemorySpotlightBootstrap on first launch after the
-        // cutover. When present, every active SQLite row should be in the
-        // CoreSpotlight index, so we report it as the upper-bound count.
-        let spotMarker = dataRoot
-            .appendingPathComponent("memory", isDirectory: true)
-            .appendingPathComponent(".spotlight_reindexed", isDirectory: false)
-        if FileManager.default.fileExists(atPath: spotMarker.path) {
+        // cutover. Presence alone is not proof: a failed reindex can clear the
+        // domain after a previous marker was written. The marker is valid only
+        // when it names the current canonical projection generation.
+        let spotMarker = MemorySpotlightReindexOperation.markerURL(dataRoot: dataRoot)
+        if let storageGeneration,
+           let markerData = try? Data(contentsOf: spotMarker),
+           String(data: markerData, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) == storageGeneration {
             snap.spotlightReindexed = true
-            snap.spotlightIndexedCount = snap.sqliteRecordCount
+            snap.spotlightIndexedCount = spotlightEligibleCount
         }
 
         // CloudKit memory sync is not an active launch owner. Keep even the
@@ -745,6 +1060,31 @@ struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
 // UI-5 (2026-08-01, public era): pure string helpers so the honesty copy is
 // unit-testable without a UI snapshot harness. Values in, Strings out.
 enum MemoryStatusPlainCopy {
+    enum StorageAvailability: Equatable {
+        case checking
+        case readable
+        case unavailable
+        case unknown
+    }
+
+    /// Reconcile the status reader with the direct panel probe. A failed probe
+    /// always wins over stale success data: zero is meaningful only after a
+    /// successful store read.
+    static func storageAvailability(
+        status: String?,
+        snapshotReadable: Bool?
+    ) -> StorageAvailability {
+        if snapshotReadable == false { return .unavailable }
+        switch status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "ready", "empty": return .readable
+        case "unavailable", "failed", "error": return .unavailable
+        case nil:
+            return snapshotReadable == true ? .readable : .checking
+        default:
+            return .unknown
+        }
+    }
+
     /// Prefer the v2 status counts when the app has them; fall back to the
     /// direct SQLite probe on a fresh install where status has not loaded yet.
     static func savedCount(active: Int?, sqliteRecordCount: Int) -> Int {
@@ -753,7 +1093,15 @@ enum MemoryStatusPlainCopy {
     }
 
     /// Vocabulary understood by NativeAgentTheme.statusColor / StatusBadge.
-    static func statusText(health: MemoryV2NativeStackSnapshot.EmbedderHealth) -> String {
+    static func statusText(
+        health: MemoryV2NativeStackSnapshot.EmbedderHealth,
+        storage: StorageAvailability = .readable
+    ) -> String {
+        switch storage {
+        case .unavailable: return "failed"
+        case .checking, .unknown: return "warn"
+        case .readable: break
+        }
         switch health {
         case .working: return "ok"
         case .ready: return "warn"
@@ -761,7 +1109,21 @@ enum MemoryStatusPlainCopy {
         }
     }
 
-    static func headline(savedCount: Int, health: MemoryV2NativeStackSnapshot.EmbedderHealth) -> String {
+    static func headline(
+        savedCount: Int,
+        health: MemoryV2NativeStackSnapshot.EmbedderHealth,
+        storage: StorageAvailability = .readable
+    ) -> String {
+        switch storage {
+        case .checking:
+            return "Checking saved memories…"
+        case .unavailable:
+            return "Saved memories could not be read."
+        case .unknown:
+            return "Saved-memory status is unclear."
+        case .readable:
+            break
+        }
         if health.needsAttention {
             return "Memories are being saved, but smart search is not working."
         }
@@ -771,7 +1133,22 @@ enum MemoryStatusPlainCopy {
         return "Memory is working."
     }
 
-    static func countsLine(savedCount: Int, pinned: Int, pendingProposals: Int) -> String {
+    static func countsLine(
+        savedCount: Int,
+        pinned: Int,
+        pendingProposals: Int,
+        storage: StorageAvailability = .readable
+    ) -> String {
+        switch storage {
+        case .checking:
+            return "Checking whether saved memories are available."
+        case .unavailable:
+            return "Refresh to try reading saved memories again. This does not mean none are saved."
+        case .unknown:
+            return "Refresh to confirm the saved-memory state."
+        case .readable:
+            break
+        }
         guard savedCount > 0 || pendingProposals > 0 else {
             return "Memories appear here as the agent learns from your conversations."
         }
@@ -787,7 +1164,20 @@ enum MemoryStatusPlainCopy {
 
     /// Non-nil only when the user should know something is off. The technical
     /// reason string stays in Advanced Diagnostics.
-    static func attentionDetail(health: MemoryV2NativeStackSnapshot.EmbedderHealth) -> String? {
+    static func attentionDetail(
+        health: MemoryV2NativeStackSnapshot.EmbedderHealth,
+        storage: StorageAvailability = .readable
+    ) -> String? {
+        switch storage {
+        case .checking:
+            return nil
+        case .unavailable:
+            return "Saved memories could not be read. Refresh to try again; this is not evidence that none are saved."
+        case .unknown:
+            return "The saved-memory status was not recognized. Refresh to confirm it."
+        case .readable:
+            break
+        }
         switch health {
         case .working:
             return nil
@@ -800,8 +1190,21 @@ enum MemoryStatusPlainCopy {
         }
     }
 
-    static func searchQualityLine(realSemanticAvailable: Bool) -> String {
-        realSemanticAvailable
+    static func searchQualityLine(
+        realSemanticAvailable: Bool,
+        storage: StorageAvailability = .readable
+    ) -> String {
+        switch storage {
+        case .checking:
+            return "Checking saved memories before search results are shown."
+        case .unavailable:
+            return "Saved-memory search is unavailable until the memory store can be read."
+        case .unknown:
+            return "Search availability is unclear until the saved-memory status is refreshed."
+        case .readable:
+            break
+        }
+        return realSemanticAvailable
             ? "Search finds memories by meaning, not just matching words."
             : "Search matches words for now. Meaning-based search turns on once the on-device model is ready."
     }
@@ -825,11 +1228,25 @@ private struct MemoryV2NativeStackPanel: View {
     // Core ML, CoreSpotlight, CloudKit and a data-root path. A person who did
     // not build this app has no way to read that. Plain status leads; every
     // backend row still ships inside Advanced Diagnostics.
+    private var storageAvailability: MemoryStatusPlainCopy.StorageAvailability {
+        MemoryStatusPlainCopy.storageAvailability(
+            status: summaryStatus?.status,
+            snapshotReadable: snapshot.storageReadable
+        )
+    }
+
+    private var statusText: String {
+        MemoryStatusPlainCopy.statusText(
+            health: snapshot.embedderHealth,
+            storage: storageAvailability
+        )
+    }
+
     private var healthTint: Color {
-        switch snapshot.embedderHealth {
-        case .working: return .green
-        case .ready: return .orange
-        case .broken, .missing: return .red
+        switch statusText {
+        case "ok": return .green
+        case "failed": return .red
+        default: return .orange
         }
     }
 
@@ -837,13 +1254,14 @@ private struct MemoryV2NativeStackPanel: View {
         NativePanel(title: "Memory Status", systemImage: "brain.head.profile", tint: healthTint) {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(alignment: .firstTextBaseline) {
-                    InlineStatusDot(status: MemoryStatusPlainCopy.statusText(health: snapshot.embedderHealth))
+                    InlineStatusDot(status: statusText)
                     Text(MemoryStatusPlainCopy.headline(
                         savedCount: MemoryStatusPlainCopy.savedCount(
                             active: summaryStatus?.counts?.active,
                             sqliteRecordCount: snapshot.sqliteRecordCount
                         ),
-                        health: snapshot.embedderHealth
+                        health: snapshot.embedderHealth,
+                        storage: storageAvailability
                     ))
                     .font(NativeAgentFont.section)
                     Spacer()
@@ -854,17 +1272,22 @@ private struct MemoryV2NativeStackPanel: View {
                         sqliteRecordCount: snapshot.sqliteRecordCount
                     ),
                     pinned: summaryStatus?.counts?.pinned ?? 0,
-                    pendingProposals: summaryStatus?.counts?.pendingProposals ?? snapshot.sqliteProposalCount
+                    pendingProposals: summaryStatus?.counts?.pendingProposals ?? snapshot.sqliteProposalCount,
+                    storage: storageAvailability
                 ))
                 .font(NativeAgentFont.body)
                 .foregroundStyle(.secondary)
-                if let attention = MemoryStatusPlainCopy.attentionDetail(health: snapshot.embedderHealth) {
+                if let attention = MemoryStatusPlainCopy.attentionDetail(
+                    health: snapshot.embedderHealth,
+                    storage: storageAvailability
+                ) {
                     Text(attention)
                         .font(.caption)
-                        .foregroundStyle(snapshot.embedderHealth.needsAttention ? .red : .orange)
+                        .foregroundStyle(statusText == "failed" ? .red : .orange)
                 }
                 Text(MemoryStatusPlainCopy.searchQualityLine(
-                    realSemanticAvailable: summaryStatus?.embedding?.realSemanticAvailable == true
+                    realSemanticAvailable: summaryStatus?.embedding?.realSemanticAvailable == true,
+                    storage: storageAvailability
                 ))
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -899,9 +1322,15 @@ private struct MemoryV2NativeStackPanel: View {
                 stackRow(
                     icon: "cylinder.split.1x2",
                     title: "SQLite",
-                    value: "\(snapshot.sqliteRecordCount) records",
-                    detail: snapshot.migrated ? "migrated" : "fresh",
-                    tint: snapshot.sqliteRecordCount > 0 ? .green : .secondary
+                    value: storageAvailability == .unavailable
+                        ? "unavailable"
+                        : "\(snapshot.sqliteRecordCount) records",
+                    detail: storageAvailability == .unavailable
+                        ? "could not read saved memories"
+                        : (snapshot.migrated ? "migrated" : "fresh"),
+                    tint: storageAvailability == .unavailable
+                        ? .red
+                        : (snapshot.sqliteRecordCount > 0 ? .green : .secondary)
                 )
                     // 2026-06-07: at-a-glance embedder health. the user asked
                     // for a clear "tell me if it's not working" indicator.
@@ -955,14 +1384,14 @@ private struct MemoryV2NativeStackPanel: View {
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
                 .textSelection(.enabled)
-            if !snapshot.dataRootPath.isEmpty {
-                Text("data root: \(snapshot.dataRootPath)")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                    .textSelection(.enabled)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
+            Text(MemoryAdvancedDiagnosticsIdentifiers.dataRoot(
+                path: snapshot.dataRootPath
+            ).dataRootLabel)
+            .font(.caption2)
+            .foregroundStyle(.tertiary)
+            .textSelection(.enabled)
+            .lineLimit(1)
+            .truncationMode(.middle)
             Button(isReindexing ? "Reindexing Spotlight…" : "Reindex Spotlight", systemImage: "magnifyingglass") {
                 onReindex()
             }
@@ -1044,20 +1473,33 @@ private struct MemoryV2SummaryBar: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 12) {
-                Label("Memory v\(status?.version ?? "2")", systemImage: "brain.head.profile")
+            if status?.status == "unavailable" {
+                Label("Saved memories unavailable", systemImage: "exclamationmark.triangle")
                     .font(.caption.weight(.semibold))
-                Text("\(counts?.active ?? 0) active")
-                Text("\(counts?.pinned ?? 0) pinned")
-                Text("\(counts?.pendingProposals ?? 0) proposals")
-                Spacer()
-                Text(backend)
-                    .foregroundStyle(status?.embedding?.realSemanticAvailable == true ? .green : .orange)
+                    .foregroundStyle(.red)
+                Text("The memory reader did not return counts; zero is not an empty-memory result.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else if status == nil {
+                Label("Memory status still loading", systemImage: "clock")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            } else {
+                HStack(spacing: 12) {
+                    Label("Memory v\(status?.version ?? "2")", systemImage: "brain.head.profile")
+                        .font(.caption.weight(.semibold))
+                    Text("\(counts?.active ?? 0) active")
+                    Text("\(counts?.pinned ?? 0) pinned")
+                    Text("\(counts?.pendingProposals ?? 0) proposals")
+                    Spacer()
+                    Text(backend)
+                        .foregroundStyle(status?.embedding?.realSemanticAvailable == true ? .green : .orange)
+                }
+                .font(.caption)
+                Text(hygieneText)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
-            .font(.caption)
-            Text(hygieneText)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
         }
         .padding(10)
         .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))

@@ -40,6 +40,27 @@ import Skills
 import Connectors
 import Browser
 
+/// A compatibility caller asking for only trace rows must not receive a
+/// success-shaped empty array when the canonical evidence feed was damaged or
+/// only partially readable. Mounted timeline consumers use
+/// `CapabilityTraceFeed.State` directly and can render the richer state.
+enum NativeClientRuntimeReadError: LocalizedError, Equatable {
+    case traceEvidencePartial(rejectedRows: Int)
+    case traceEvidenceUnavailable(String)
+    case unreadableFeed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .traceEvidencePartial(let rejectedRows):
+            return "Trace evidence is partial: \(rejectedRows) malformed \(rejectedRows == 1 ? "row" : "rows") were withheld."
+        case .traceEvidenceUnavailable(let detail):
+            return "Trace evidence is unavailable: \(detail)"
+        case .unreadableFeed(let detail):
+            return detail
+        }
+    }
+}
+
 extension NativeClient {
     /// When THIS runtime started. `ProcessInfo.systemUptime` measures the
     /// machine, which made Status report days of "uptime" for an app launched
@@ -49,7 +70,7 @@ extension NativeClient {
     func getHealth() async throws -> RuntimeHealth {
         // DAEMON-KILL P1: Mac process IS the runtime. Return a synthetic
         // health snapshot reflecting the in-process state.
-        let root = PersistenceCore.defaultDataRoot()
+        let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
         let payload: [String: Any] = [
             "ok": true,
@@ -71,8 +92,9 @@ extension NativeClient {
     /// dynamic per-entry values injected from live Swift subsystems
     /// (`PersonaCompiler.loadProfile()` for persona name, `SwiftNativeApprovalInbox`
     /// for pending-approval count, `SwiftNativeTrustCenter.loadTrustPolicy`
-    /// for `enableAutonomy`). Fields with no Swift source-of-truth today
-    /// (connector/multimodal/mac-assistant/foundry/skill counts) carry the
+    /// for `enableAutonomy`, and `MacAssistantStatusClient` for its watch
+    /// readiness and attention count). Fields with no Swift source-of-truth
+    /// today (connector/multimodal/foundry/skill counts) carry the
     /// documented defaults from `CommandPaletteContext.wave2NeutralBaseline` — see the
     /// caveat header in
     /// Modules/NativeAgentCore/Sources/CommandPalette/CommandPalette.swift.
@@ -134,12 +156,20 @@ extension NativeClient {
     ///                         .improvementSummaryLocal().failedCount`.
     ///                         Drives the self-improvement-scoreboard
     ///                         entry's ready/attention flip.
+    ///   - macAssistantStatus/templateAttentionCount — one lightweight read
+    ///                         from the same app-configured
+    ///                         `MacAssistantStatusClient` as the watch panel.
+    ///                         An unreadable/invalid status remains visibly
+    ///                         unavailable; it is never converted to ready.
     ///
     /// All other fields default to `CommandPaletteContext.wave2NeutralBaseline` — see
     /// the CAVEAT block in CommandPalette.swift for the per-field carve list.
-    /// Errors from the source-of-truth calls are non-fatal: we log via NSLog
-    /// and fall back to the default for that field so the palette still renders.
-    func makeCommandPaletteContext() async -> CommandPaletteContext {
+    /// Errors from the source-of-truth calls are non-fatal: we log via NSLog.
+    /// The Mac assistant's specific fallback is `unavailable`, rather than
+    /// the neutral "ready" literal, so its badge/status remain honest.
+    func makeCommandPaletteContext(
+        macAssistantStatusClient: (any MacAssistantStatusClient)? = nil
+    ) async -> CommandPaletteContext {
         // Persona name: read profile.json directly via the non-isolated static
         // so we don't need to spin up a PersonaCompiler actor + cross the
         // boundary just to grab one string.
@@ -182,12 +212,28 @@ extension NativeClient {
             NSLog("[CommandPalette] self-improvement summary failed: \(error.localizedDescription) — defaulting to 0")
         }
 
+        let macAssistant = macAssistantStatusClient ?? makeAppMacAssistantStatusClient()
+        let macAssistantProjection: (status: String, templateAttentionCount: Int)
+        do {
+            let result = try await macAssistant.macAssistantStatus(lightweight: true)
+            let status = result.status.trimmingCharacters(in: .whitespacesAndNewlines)
+            if status.isEmpty || result.templateAttentionCount < 0 {
+                NSLog("[CommandPalette] mac assistant status was invalid — presenting unavailable")
+                macAssistantProjection = ("unavailable", 0)
+            } else {
+                macAssistantProjection = (status, result.templateAttentionCount)
+            }
+        } catch {
+            NSLog("[CommandPalette] mac assistant status failed: \(error.localizedDescription) — presenting unavailable")
+            macAssistantProjection = ("unavailable", 0)
+        }
+
         return CommandPaletteContext(
             personaName: personaName,
             telegramHealthStatus: "optional",
             connectorNeedsProof: false,
-            macAssistantStatus: "ready",
-            macAssistantTemplateAttentionCount: 0,
+            macAssistantStatus: macAssistantProjection.status,
+            macAssistantTemplateAttentionCount: macAssistantProjection.templateAttentionCount,
             foundryReviewCount: 0,
             // Mirror approvalsCount into the Python autonomy.counts.pendingApprovals
             // slot so the `approvals` entry's badge stays correct even without
@@ -200,14 +246,20 @@ extension NativeClient {
         )
     }
 
-    func getMacAssistantStatus() async throws -> MacAssistantStatusResponse {
-        let impl = makeMacAssistantStatusClient(
+    /// Both the panel and palette must observe the same native status owner
+    /// and app-local PIM adapters. Callers choose only the payload depth.
+    private func makeAppMacAssistantStatusClient() -> any MacAssistantStatusClient {
+        makeMacAssistantStatusClient(
             dispatcherTools: StaticDispatcherToolAvailabilityProvider(availableTools: [
                 "calendar_list_upcoming",
                 "reminders_list_due_today",
             ]),
             localPIM: NativeAppLocalPIMStatusProvider()
         )
+    }
+
+    func getMacAssistantStatus() async throws -> MacAssistantStatusResponse {
+        let impl = makeAppMacAssistantStatusClient()
         // UI consumes the full access/template lists — request non-lightweight.
         let swiftResult = try await impl.macAssistantStatus(lightweight: false)
         let data = try swiftResult.toJSON().serializedData(pretty: false)
@@ -221,7 +273,7 @@ extension NativeClient {
         // fail-closed.
         let nowISO = SwiftNativeManifestSigner.isoTimestamp(Date())
         let rawRecords = await capabilityRecordsFull(
-            dataRoot: PersistenceCore.defaultDataRoot(),
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(),
             nowISO: nowISO
         )
         let data = try JSONValue.array(rawRecords.map { .object($0) }).serializedData(pretty: false)
@@ -253,14 +305,14 @@ extension NativeClient {
     }
 
     func getWorkflows() async throws -> [WorkflowRecord] {
-        let impl = makeWorkflowOrchestrationClient(root: PersistenceCore.defaultDataRoot())
+        let impl = makeWorkflowOrchestrationClient(root: dataRootOverride ?? PersistenceCore.defaultDataRoot())
         let rows = try await impl.listWorkflows()
         let data = try JSONValue.array(rows).serializedData(pretty: false)
         return try JSONDecoder().decode([WorkflowRecord].self, from: data)
     }
 
     func getWorkflowRuns() async throws -> [WorkflowRun] {
-        let impl = makeWorkflowOrchestrationClient(root: PersistenceCore.defaultDataRoot())
+        let impl = makeWorkflowOrchestrationClient(root: dataRootOverride ?? PersistenceCore.defaultDataRoot())
         let rows = try await impl.listWorkflowRuns()
         let data = try JSONValue.array(rows).serializedData(pretty: false)
         return try JSONDecoder().decode([WorkflowRun].self, from: data)
@@ -274,7 +326,7 @@ extension NativeClient {
     /// entry point complete for script and smoke-test callers.
     @discardableResult
     func createWorkflow(_ body: JSONValue) async throws -> WorkflowRecord {
-        let impl = makeWorkflowOrchestrationClient(root: PersistenceCore.defaultDataRoot())
+        let impl = makeWorkflowOrchestrationClient(root: dataRootOverride ?? PersistenceCore.defaultDataRoot())
         let row = try await impl.createWorkflow(body)
         let data = try row.serializedData(pretty: false)
         return try JSONDecoder().decode(WorkflowRecord.self, from: data)
@@ -319,46 +371,47 @@ extension NativeClient {
     }
 
     func getTraces() async throws -> [RuntimeTrace] {
-        // DAEMON-KILL P1: read tail of <dataRoot>/runtime/traces.jsonl.
-        let path = PersistenceCore.defaultDataRoot()
-            .appendingPathComponent("runtime", isDirectory: true)
-            .appendingPathComponent("traces.jsonl")
-        return tailJSONL(path: path, limit: 200)
+        switch getCapabilityTraceTimeline() {
+        case .current(let traces):
+            return traces
+        case .sourceAbsent, .empty:
+            // No trace source and a successfully read empty ledger are both
+            // legitimate empty histories. They remain distinct to consumers
+            // that request the stateful feed above.
+            return []
+        case .partial(_, let rejectedRows):
+            throw NativeClientRuntimeReadError.traceEvidencePartial(rejectedRows: rejectedRows)
+        case .unavailable(let detail):
+            throw NativeClientRuntimeReadError.traceEvidenceUnavailable(detail)
+        }
+    }
+
+    /// The Capabilities timeline is backed by the shared durable ledger used
+    /// by routing, workflows, catalog writes, and tool dispatch. It carries a
+    /// stateful result so its view can distinguish absent/empty/corrupt input.
+    func getCapabilityTraceTimeline() -> CapabilityTraceFeed.State {
+        CapabilityTraceFeed.read(
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        )
     }
 
     func getAgentGraph() async throws -> AgentGraph {
-        let projection = try await Self.canonicalAgentGraphProjection()
-        let nodes = projection.entities.map {
-            AgentGraphNode(id: $0.id, label: $0.name, kind: $0.kind, status: nil)
-        }
-        let executionCount = (try? await getWorkshopExecutions().count) ?? 0
-        return AgentGraph(
-            nodes: nodes,
-            edges: projection.edges,
-            summary: AgentGraphCounts(
-                nodes: nodes.count,
-                edges: projection.edges.count,
-                executions: executionCount,
-                capabilities: nil
-            ),
-            createdAt: projection.updatedAt
+        let projection = try await Self.canonicalAgentGraphProjection(
+            graphPath: knowledgeGraphPath
         )
+        let executionCount = try? await getWorkshopExecutions().count
+        return Self.agentGraph(from: projection, executionCount: executionCount)
     }
 
     func getGraphEntities() async throws -> [GraphEntity] {
-        try await Self.canonicalAgentGraphProjection().entities
+        try await Self.canonicalAgentGraphProjection(graphPath: knowledgeGraphPath).entities
     }
 
     func getGraphStatus() async throws -> GraphIndexStatus {
-        let projection = try await Self.canonicalAgentGraphProjection()
-        return GraphIndexStatus(
-            status: "ready",
-            embeddingModel: "swift-memory-v2",
-            dimensions: nil,
-            nodeCount: projection.entities.count,
-            entityCount: projection.entities.count,
-            updatedAt: projection.updatedAt
+        let projection = try await Self.canonicalAgentGraphProjection(
+            graphPath: knowledgeGraphPath
         )
+        return Self.graphIndexStatus(from: projection)
     }
 
     func searchGraph(query: String) async throws -> GraphSearchResponse {
@@ -371,7 +424,8 @@ extension NativeClient {
                 createdAt: ISO8601DateFormatter().string(from: Date())
             )
         }
-        let envelope = try await makeKnowledgeGraphReader().searchChecked(q: trimmed)
+        let envelope = try await makeKnowledgeGraphReader(graphPath: knowledgeGraphPath)
+            .searchChecked(q: trimmed)
         guard case .object(let object) = envelope,
               case .array(let rawResults)? = object["results"] else {
             throw KnowledgeGraphReadError.malformedEnvelope(
@@ -491,13 +545,44 @@ extension NativeClient {
         /// never aggregated additional spaces — there is no fan-out to port —
         /// so this is the real shape, not a stub. If/when multi-persona
         /// support lands, this aggregator is the seam to extend.
-        let path = PersistenceCore.defaultDataRoot()
+        let path = (dataRootOverride ?? PersistenceCore.defaultDataRoot())
             .appendingPathComponent("persona", isDirectory: true)
             .appendingPathComponent("profile.json")
-        var primaryName: String? = nil
-        if let data = try? Data(contentsOf: path),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            primaryName = (obj["name"] as? String) ?? (obj["active"] as? String)
+        let primaryName: String?
+        if FileManager.default.fileExists(atPath: path.path) {
+            do {
+                let data = try Data(contentsOf: path)
+                guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    throw NativeClientRuntimeReadError.unreadableFeed(
+                        "Persona profile is not a JSON object"
+                    )
+                }
+                if let name = object["name"] {
+                    guard let string = name as? String else {
+                        throw NativeClientRuntimeReadError.unreadableFeed(
+                            "Persona profile name is not text"
+                        )
+                    }
+                    primaryName = string
+                } else if let active = object["active"] {
+                    guard let string = active as? String else {
+                        throw NativeClientRuntimeReadError.unreadableFeed(
+                            "Persona profile active name is not text"
+                        )
+                    }
+                    primaryName = string
+                } else {
+                    primaryName = nil
+                }
+            } catch let error as NativeClientRuntimeReadError {
+                throw error
+            } catch {
+                throw NativeClientRuntimeReadError.unreadableFeed(
+                    "Persona profile is unreadable: \(error.localizedDescription)"
+                )
+            }
+        } else {
+            primaryName = nil
         }
         let spaces: [PersonalOSSpace]
         if let name = primaryName {
@@ -528,7 +613,7 @@ extension NativeClient {
     func getCapabilityCatalog() async throws -> [CapabilityCatalogItem] {
         let nowISO = SwiftNativeManifestSigner.isoTimestamp(Date())
         let merged = await listCapabilityCatalog(
-            dataRoot: PersistenceCore.defaultDataRoot(),
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(),
             nowISO: nowISO
         )
         let data = try JSONValue.array(merged.map { JSONValue.object($0) })
@@ -545,7 +630,7 @@ extension NativeClient {
     // semantics remain compatible on valid input.
     func getCapabilityCatalogSources() async throws -> [CapabilityCatalogSource] {
         let actor = SwiftNativeCatalogSources(
-            dataRoot: PersistenceCore.defaultDataRoot(),
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(),
             persistence: SwiftNativePersistenceCore()
         )
         let merged = try await actor.catalogSources()
@@ -563,7 +648,7 @@ extension NativeClient {
     // pure read flip with zero cross-process coordination concern.
     func getCapabilityPackInstalls() async throws -> [CapabilityPackInstall] {
         let writes = SwiftNativeCatalogWrites(
-            dataRoot: PersistenceCore.defaultDataRoot(),
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(),
             persistence: SwiftNativePersistenceCore()
         )
         let rows = try await writes.listCapabilityPackInstalls()

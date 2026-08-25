@@ -296,6 +296,11 @@ extension SwiftNativeTrustCenter {
         "mac_view": .string("auto"),
         "mac.attention": .string("auto"),
         "mac_attention": .string("auto"),
+        // native-look item 2 — the perception compiler sits with them:
+        // perception, no approval. Both spellings, for the same reason the pair
+        // above carries both.
+        "mac.look": .string("auto"),
+        "mac_look": .string("auto"),
         // W7 — mac_nudge sits with them: one bare mouse move, no click, no
         // keystroke, no app state changed, so there is nothing to approve.
         // Pinned under BOTH spellings for the same reason the injection pair
@@ -333,6 +338,12 @@ extension SwiftNativeTrustCenter {
         // follows the emission, not the payload.
         "mac.wake": .string("auto"),
         "mac_wake": .string("auto"),
+        // native-look item 3 — mac_act. Both spellings, same reason as every
+        // pair above: `autonomyForTool` matches the override key literally, and
+        // the gate is asked about `mac_act` while the connector registry and
+        // any approval card speak `mac.act`.
+        "mac.act": .string("auto"),
+        "mac_act": .string("auto"),
         // W7 — activity_query. Explicit "auto" rather than fallback, under BOTH
         // spellings for the same reason the Mac pairs above are: `autonomyForTool`
         // matches the override key LITERALLY, and the autonomy gate is asked

@@ -490,9 +490,16 @@ extension iCloudSyncEngine {
         }
         let transactionId = verified["transactionId"] ?? msgId
         let status = (verified["status"] ?? "").lowercased()
-        let state = (status == "error" || status == "failed" || verified["ok"] == "false")
-            ? "failed"
-            : (status == "pending_approval" ? "pending_approval" : "completed")
+        let state: String
+        if status == "orphaned" {
+            state = "orphaned"
+        } else if status == "error" || status == "failed" || verified["ok"] == "false" {
+            state = "failed"
+        } else if status == "pending_approval" {
+            state = "pending_approval"
+        } else {
+            state = "completed"
+        }
         do {
             try await writeTransaction(
                 id: transactionId,
@@ -600,6 +607,17 @@ extension iCloudSyncEngine {
         let status = (response["status"] ?? "").lowercased()
         let error = response["error"] ?? response["code"]
         let explicitlyUnapplied = response["applied"]?.lowercased() == "false"
+        if status == "orphaned" {
+            throw SyncError.unsupported(
+                response["message"]
+                    ?? "This privileged Mac action was orphaned before it could run. Re-run it from iPhone."
+            )
+        }
+        if status == "pending_approval" || status == "approval_required" {
+            throw SyncError.approvalRequired(
+                response["message"] ?? error ?? "This action is waiting for approval on the Mac."
+            )
+        }
         if response["ok"] == "false"
             || status == "error"
             || status == "failed"
@@ -797,7 +815,14 @@ extension iCloudSyncEngine {
     @discardableResult
     func registerPushToken(token: String, environment: String, bundleId: String, deviceId: String = "ios") async throws -> [String: String]? {
         let cleanToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanToken.isEmpty else { return ["status": "error", "message": "Missing APNS device token"] }
+        // The caller advances its registration-freshness cache only after this
+        // method returns. Returning an error-shaped dictionary here therefore
+        // made a blank token look successfully registered for the next refresh
+        // interval. Reject it through the same throwing boundary as a Mac
+        // refusal so it remains eligible for the next APNS callback.
+        guard !cleanToken.isEmpty else {
+            throw SyncError.unsupported("Missing APNS device token")
+        }
         let action = InboxAction.make(action: "registerPushToken", payload: [
             "token": cleanToken,
             "environment": environment,
@@ -812,10 +837,12 @@ extension iCloudSyncEngine {
 
     // R11-N7: Mac control helpers route through sendActionWithSignatureRetry.
     private func macControlResult(_ action: InboxAction, pollTimeoutSeconds: Double = 120) async throws -> String {
-        guard let result = await sendActionWithSignatureRetry(action, pollTimeoutSeconds: pollTimeoutSeconds) else {
-            throw SyncError.timeout(syncError ?? "Mac did not return a response.")
-        }
-        if result["ok"] == "false" || result["status"] == "error" || result["status"] == "failed" || result["blocked"] == "true" {
+        let raw = await sendActionWithSignatureRetry(action, pollTimeoutSeconds: pollTimeoutSeconds)
+        let result = try requireSuccessfulActionResponse(
+            raw,
+            timeoutMessage: "Mac did not return a response."
+        )
+        if result["blocked"] == "true" {
             throw SyncError.unsupported(result["message"] ?? result["error"] ?? result["code"] ?? "Mac control denied.")
         }
         if result["status"] == "pending_approval" {
@@ -874,6 +901,9 @@ extension iCloudSyncEngine {
     /// Set Mac output volume (0–100).
     // N7: route through sendActionWithSignatureRetry.
     func macSetVolume(percent: Int) async throws -> String {
+        guard MacVolumeControlPresentation.isValid(percent: percent) else {
+            throw SyncError.unsupported("Volume must be between 0% and 100%.")
+        }
         let action = InboxAction.make(action: "mac_control", payload: [
             "method": "system", "action": "volume", "value": "\(percent)"
         ])

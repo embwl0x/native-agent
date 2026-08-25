@@ -284,9 +284,17 @@ extension SwiftNativeChatOrchestrationClient {
         emitTextDeltas: Bool,
         continuation: AsyncThrowingStream<TurnStreamEvent, Error>.Continuation
     ) async {
-        let rawResolvedSession = sessionId ?? UUID().uuidString
-        guard let resolvedSession = NativeAgentChatSessionID.normalizedPathComponent(rawResolvedSession) else {
-            continuation.yield(.error("invalid chat session id"))
+        // Whole-turn clock, from entry (user-message persist, compaction, tool
+        // preload all happen before the loop). Each iteration's streamTurn starts
+        // its own clock, so a result's elapsedMs was the LAST segment only —
+        // turn.terminal carried 9.7 s for a 23-tool turn that ran 204 s
+        // (2026-08-23 instrument lead).
+        let turnStartNs = DispatchTime.now().uptimeNanoseconds
+        let resolvedSession: String
+        do {
+            resolvedSession = try Self.resolveSessionId(sessionId)
+        } catch {
+            continuation.yield(.error((error as? LocalizedError)?.errorDescription ?? "invalid chat session id"))
             continuation.finish()
             return
         }
@@ -495,7 +503,7 @@ extension SwiftNativeChatOrchestrationClient {
         // messages SSE with a trailing message breakpoint, so iteration N+1
         // deterministically cache-READS everything through iteration N.
         // Eligibility is fail-closed to the legacy grown-prompt wire shape
-        // (see isAppendOnlyMessagesEligible); NATIVE_AGENT_GROWN_PROMPT_
+        // (see appendOnlyMessagesEligibility); NATIVE_AGENT_GROWN_PROMPT_
         // COMPAT=1 is the same one rollback lever item 8 shipped — it
         // restores the old grown-prompt shape here AND the old breakpoint
         // layout in the adapter.
@@ -520,10 +528,15 @@ extension SwiftNativeChatOrchestrationClient {
         // provider cannot change mid-turn, and re-resolving per iteration would
         // add a routing-snapshot read to every provider call.
         let nativeLane = await usesNativeToolLane(model: effectiveModel, surface: surface)
-        var appendOnlyEligible = Self.isAppendOnlyMessagesEligible(
+        // This preflight chooses a materially different provider wire shape.
+        // It must remain visible in the per-turn trace: a missing OAuth file,
+        // an adapter regression, or the emergency rollback lever otherwise
+        // looks exactly like an ordinary (but slower and more expensive) turn.
+        let appendOnlyEligibility = Self.appendOnlyMessagesEligibility(
             streamingLLM: streamingLLM,
             dataRoot: dataRoot
         )
+        var appendOnlyEligible = appendOnlyEligibility.isEligible
         // The native lane REQUIRES the structured messages transport: tool_use
         // and tool_result are content BLOCKS, and there is no way to express
         // them in the legacy grown-prompt string. The standard eligibility
@@ -535,6 +548,14 @@ extension SwiftNativeChatOrchestrationClient {
         if nativeLane, streamingLLM is any MessagesStreamingLLMClient {
             appendOnlyEligible = true
         }
+        Self.emitAppendOnlyMessagesEligibilityTrace(
+            appendOnlyEligibility,
+            effectiveTransport: appendOnlyEligible
+                ? (nativeLane ? "native_messages" : "append_only_messages")
+                : "grown_prompt",
+            sessionId: resolvedSession,
+            surface: surface
+        )
         // Fail closed and LOUD rather than silently degrading: without the
         // messages transport the native lane would ship a tools array whose
         // results could never be returned, so the model would call the same
@@ -1051,6 +1072,7 @@ extension SwiftNativeChatOrchestrationClient {
                         replacingToolDispatchesWith: dispatches,
                         rawLLMResponse: accumulated.isEmpty ? r.rawLLMResponse : accumulated,
                         providerCallCount: providerCallCount,
+                        elapsedMs: Int((DispatchTime.now().uptimeNanoseconds &- turnStartNs) / 1_000_000),
                         replyOverride: ignoredOnly ? visibleIteration : nil
                     )
                     finalResult = finalWithDispatches
@@ -1161,7 +1183,7 @@ extension SwiftNativeChatOrchestrationClient {
                         path: self.dataRoot,
                         error: error,
                         userText: "Couldn't save the receipt for tool '\(call.name)' - it won't appear in the saved transcript.",
-                        onNotice: nil
+                        onNotice: { kind, text in continuation.yield(.notice(kind: kind, text: text)) }
                     )
                 }
                 let toolResultBlock = """
@@ -1259,7 +1281,7 @@ extension SwiftNativeChatOrchestrationClient {
                 modelUsed: finalResult?.modelUsed ?? effectiveModel,
                 recalledIds: finalResult?.recalledIds ?? lastRecalledIds,
                 toolDispatches: dispatches,
-                elapsedMs: finalResult?.elapsedMs ?? 0,
+                elapsedMs: Int((DispatchTime.now().uptimeNanoseconds &- turnStartNs) / 1_000_000),
                 rawLLMResponse: finalResult?.rawLLMResponse ?? accumulated,
                 providerCallCount: providerCallCount,
                 terminalObservation: finalResult?.terminalObservation
@@ -1354,16 +1376,69 @@ extension SwiftNativeChatOrchestrationClient {
     ///      adapter, so this preflight gates the path off instead. Preflight
     ///      the same dataRoot path the compat gate already reads
     ///      providers/active.json from.
-    private nonisolated static func isAppendOnlyMessagesEligible(
+    /// One per-turn snapshot of the three requirements for the text-compatible
+    /// append-only messages transport. This deliberately evaluates all three
+    /// checks (rather than returning at the first failure) so diagnostics can
+    /// distinguish an intentional rollback from a missing capability and a
+    /// credential-store failure. The OAuth file is reread for every new turn;
+    /// no failed result is cached across a credential repair or reload.
+    private struct AppendOnlyMessagesEligibility: Sendable {
+        let grownPromptCompatibilityEnabled: Bool
+        let messagesStreamingSupported: Bool
+        let usableAnthropicOAuthCredentials: Bool
+
+        var isEligible: Bool {
+            !grownPromptCompatibilityEnabled
+                && messagesStreamingSupported
+                && usableAnthropicOAuthCredentials
+        }
+
+        var blockers: [String] {
+            var result: [String] = []
+            if grownPromptCompatibilityEnabled { result.append("grown_prompt_compat") }
+            if !messagesStreamingSupported { result.append("messages_streaming_unsupported") }
+            if !usableAnthropicOAuthCredentials { result.append("anthropic_oauth_unavailable") }
+            return result
+        }
+    }
+
+    private nonisolated static func appendOnlyMessagesEligibility(
         streamingLLM: any StreamingLLMClient,
         dataRoot: URL
-    ) -> Bool {
-        guard !AnthropicOAuthDirectAdapter.GrownPromptCompat.effective else { return false }
-        guard streamingLLM is any MessagesStreamingLLMClient else { return false }
+    ) -> AppendOnlyMessagesEligibility {
         let authFile = dataRoot
             .appendingPathComponent("providers", isDirectory: true)
             .appendingPathComponent("anthropic_oauth_direct.json")
-        return AnthropicOAuthDirectAdapter.hasUsableOAuthCredentials(at: authFile)
+        return AppendOnlyMessagesEligibility(
+            grownPromptCompatibilityEnabled: AnthropicOAuthDirectAdapter.GrownPromptCompat.effective,
+            messagesStreamingSupported: streamingLLM is any MessagesStreamingLLMClient,
+            usableAnthropicOAuthCredentials: AnthropicOAuthDirectAdapter.hasUsableOAuthCredentials(at: authFile)
+        )
+    }
+
+    /// Emits only booleans and stable reason codes: enough to account for a
+    /// transport downgrade without disclosing credential contents, file paths,
+    /// prompt text, or provider response data.
+    private nonisolated static func emitAppendOnlyMessagesEligibilityTrace(
+        _ eligibility: AppendOnlyMessagesEligibility,
+        effectiveTransport: String,
+        sessionId: String,
+        surface: String
+    ) {
+        TurnTraceBus.fireFromContext(
+            kind: "text_compat.append_only_messages_eligibility",
+            sessionId: sessionId,
+            surface: surface,
+            payload: .object([
+                "schema": .string("text_compat.append_only_messages_eligibility.v1"),
+                "eligible": .bool(eligibility.isEligible),
+                "effectiveTransport": .string(effectiveTransport),
+                "grownPromptCompatibilityEnabled": .bool(eligibility.grownPromptCompatibilityEnabled),
+                "messagesStreamingSupported": .bool(eligibility.messagesStreamingSupported),
+                "usableAnthropicOAuthCredentials": .bool(eligibility.usableAnthropicOAuthCredentials),
+                "blockers": .array(eligibility.blockers.map(JSONValue.string)),
+            ])
+        )
     }
 
     @discardableResult
@@ -1412,6 +1487,7 @@ extension SwiftNativeChatOrchestrationClient {
         replacingToolDispatchesWith dispatches: [TurnEngineResult.ToolDispatchRecord],
         rawLLMResponse: String,
         providerCallCount: Int,
+        elapsedMs: Int,
         replyOverride: String? = nil
     ) -> TurnEngineResult {
         TurnEngineResult(
@@ -1419,7 +1495,7 @@ extension SwiftNativeChatOrchestrationClient {
             modelUsed: result.modelUsed,
             recalledIds: result.recalledIds,
             toolDispatches: dispatches,
-            elapsedMs: result.elapsedMs,
+            elapsedMs: elapsedMs,
             rawLLMResponse: rawLLMResponse,
             providerCallCount: providerCallCount,
             terminalObservation: result.terminalObservation

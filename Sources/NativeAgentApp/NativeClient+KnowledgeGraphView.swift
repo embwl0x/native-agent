@@ -1,11 +1,22 @@
 import Foundation
 import KnowledgeGraph
 import TrustCenter
+import PersistenceCore
 
 struct CanonicalAgentGraphProjection: Sendable {
     let entities: [GraphEntity]
     let edges: [AgentGraphEdge]
     let updatedAt: String?
+}
+
+/// One coherent mounted graph read. The graph canvas, entity list, and status
+/// are projections of the same checked KnowledgeGraph snapshot; a consumer
+/// must not re-read each field and accidentally compose a view from different
+/// graph generations.
+struct NativeClientKnowledgeGraphViewRead {
+    let agentGraph: AgentGraph
+    let entities: [GraphEntity]
+    let status: GraphIndexStatus
 }
 
 // ---------------------------------------------------------------------------
@@ -14,6 +25,19 @@ struct CanonicalAgentGraphProjection: Sendable {
 // ---------------------------------------------------------------------------
 
 extension NativeClient {
+    /// The mounted graph view must read from the app's injected data root as
+    /// well as the production default.  Otherwise an isolated/relaunched app
+    /// can display a healthy graph from another profile, and an error banner
+    /// cannot truthfully describe the root the user is viewing.
+    /// One root-resolved path shared by every mounted graph projection and
+    /// search route.  It is internal so the sibling graph read APIs cannot
+    /// accidentally fall back to the default profile.
+    var knowledgeGraphPath: URL {
+        (dataRootOverride ?? PersistenceCore.defaultDataRoot())
+            .appendingPathComponent("memory", isDirectory: true)
+            .appendingPathComponent("knowledge_graph.json")
+    }
+
     static func canonicalAgentGraphProjection(
         graphPath: URL = SwiftNativeKnowledgeGraphReader.defaultPath()
     ) async throws -> CanonicalAgentGraphProjection {
@@ -66,6 +90,58 @@ extension NativeClient {
         return try snapshot.serializedData(pretty: false)
     }
 
+    /// Read all graph-view projections from one checked canonical snapshot.
+    /// The workshop count is supplementary and remains nil when its separate
+    /// store is unavailable; it must not turn an unavailable read into zero or
+    /// prevent a sound graph from rendering.
+    func getKnowledgeGraphViewRead() async throws -> NativeClientKnowledgeGraphViewRead {
+        let projection = try await Self.canonicalAgentGraphProjection(
+            graphPath: knowledgeGraphPath
+        )
+        let executionCount: Int?
+        do {
+            executionCount = try await getWorkshopExecutions().count
+        } catch {
+            executionCount = nil
+        }
+        return NativeClientKnowledgeGraphViewRead(
+            agentGraph: Self.agentGraph(from: projection, executionCount: executionCount),
+            entities: projection.entities,
+            status: Self.graphIndexStatus(from: projection)
+        )
+    }
+
+    static func agentGraph(
+        from projection: CanonicalAgentGraphProjection,
+        executionCount: Int?
+    ) -> AgentGraph {
+        let nodes = projection.entities.map {
+            AgentGraphNode(id: $0.id, label: $0.name, kind: $0.kind, status: nil)
+        }
+        return AgentGraph(
+            nodes: nodes,
+            edges: projection.edges,
+            summary: AgentGraphCounts(
+                nodes: nodes.count,
+                edges: projection.edges.count,
+                executions: executionCount,
+                capabilities: nil
+            ),
+            createdAt: projection.updatedAt
+        )
+    }
+
+    static func graphIndexStatus(from projection: CanonicalAgentGraphProjection) -> GraphIndexStatus {
+        GraphIndexStatus(
+            status: "ready",
+            embeddingModel: "swift-memory-v2",
+            dimensions: nil,
+            nodeCount: projection.entities.count,
+            entityCount: projection.entities.count,
+            updatedAt: projection.updatedAt
+        )
+    }
+
     private static func canonicalKnowledgeGraphUpdatedAt(
         graphPath: URL,
         entities: [GraphEntity]
@@ -91,13 +167,13 @@ extension NativeClient {
     // JSONDecoder.nativeAgent. Checked reads throw instead of fabricating a
     // healthy empty graph for unreadable storage.
     func getKnowledgeGraph(page: Int = 0) async throws -> KGEntityResponse {
-        let reader = makeKnowledgeGraphReader()
+        let reader = makeKnowledgeGraphReader(graphPath: knowledgeGraphPath)
         let env = try await reader.allEntitiesChecked(page: page)
         let data = try env.serializedData(pretty: false)
         return try JSONDecoder.nativeAgent.decode(KGEntityResponse.self, from: data)
     }
     func getKGEntity(id: String) async throws -> KGNeighborsResponse {
-        let reader = makeKnowledgeGraphReader()
+        let reader = makeKnowledgeGraphReader(graphPath: knowledgeGraphPath)
         switch try await reader.entityChecked(id: id) {
         case .found(let env):
             let data = try env.serializedData(pretty: false)

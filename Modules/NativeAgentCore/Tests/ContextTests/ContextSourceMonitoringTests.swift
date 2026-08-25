@@ -58,6 +58,126 @@ struct ContextSourceMonitoringTests {
         }
     }
 
+    /// `replaceOwned` is the owner-scoped bulk replace — the path a projection
+    /// owner uses to say "these, and only these, are mine now". Its REMOVAL half
+    /// is what retires a persona skill body or an unregistered projection.
+    /// `register` and the symlink-escape guard above are covered; this one had
+    /// zero test references, and if the removal half regresses, retired sources
+    /// stay registered and keep being compiled into every generation — content
+    /// the user believes they deleted keeps riding into the prompt, invisibly.
+    ///
+    /// The other half of the contract is the owner FENCE: replacing one owner's
+    /// set must not disturb another's.
+    @Test
+    func replaceOwnedDropsRetiredSourcesAndLeavesOtherOwnersUntouched() async throws {
+        let root = try makeDirectory("replace-owned")
+        defer { try? FileManager.default.removeItem(at: root) }
+        for name in ["a.md", "b.md", "c.md", "other.md"] {
+            try name.write(
+                to: root.appendingPathComponent(name),
+                atomically: true,
+                encoding: .utf8
+            )
+        }
+        func file(_ name: String) -> URL { root.appendingPathComponent(name) }
+
+        let registry = try ContextSourceRegistry(allowedRoots: [root])
+        try await registry.register(registration(id: "a", file: file("a.md"), root: root, owner: "skills"))
+        try await registry.register(registration(id: "b", file: file("b.md"), root: root, owner: "skills"))
+        try await registry.register(registration(id: "c", file: file("c.md"), root: root, owner: "skills"))
+        try await registry.register(registration(id: "other", file: file("other.md"), root: root, owner: "persona"))
+        #expect(await registry.allRegistrations().count == 4)
+
+        // "skills" now claims only a and c. b is retired.
+        try await registry.replaceOwned(owner: "skills", with: [
+            registration(id: "a", file: file("a.md"), root: root, owner: "skills"),
+            registration(id: "c", file: file("c.md"), root: root, owner: "skills"),
+        ])
+
+        let remaining = await registry.allRegistrations().map(\.descriptor.id.rawValue).sorted()
+        #expect(remaining == ["a", "c", "other"])
+        #expect(await registry.registration(for: ContextSourceID(rawValue: "b")) == nil)
+        // The retired source must also stop being watched — a registration that
+        // is gone from the list but still armed keeps waking reconciliation.
+        let affected = try await registry.registrations(affectedBy: root).map(\.descriptor.id.rawValue).sorted()
+        #expect(affected == ["a", "c", "other"])
+        // The foreign owner's registration is byte-identical, not merely present.
+        let untouched = try #require(await registry.registration(for: ContextSourceID(rawValue: "other")))
+        #expect(untouched.descriptor.owner == "persona")
+        #expect(untouched.fileURL == file("other.md").resolvingSymlinksInPath())
+
+        // A replacement carrying a foreign owner is ignored rather than
+        // smuggled in under the caller's owner scope.
+        try await registry.replaceOwned(owner: "skills", with: [
+            registration(id: "a", file: file("a.md"), root: root, owner: "skills"),
+            registration(id: "smuggled", file: file("b.md"), root: root, owner: "persona"),
+        ])
+        let afterSmuggle = await registry.allRegistrations().map(\.descriptor.id.rawValue).sorted()
+        #expect(afterSmuggle == ["a", "other"])
+    }
+
+    /// `addAllowedRoot` is the MUTATING half of the containment boundary; the
+    /// `init(allowedRoots:)` half is what the symlink-escape test above uses.
+    /// It canonicalizes before inserting, and `normalizedRegistration` later
+    /// compares a canonicalized declared root against that set by equality — so
+    /// if the two canonicalizations ever disagree, every source under a
+    /// perfectly legitimate root silently fails to register with
+    /// `rootNotAllowed` and context just gets quieter.
+    ///
+    /// Asserted as an envelope on the boundary, not on any path spelling:
+    /// equivalent spellings of one directory admit the same sources, and
+    /// admitting a root never admits anything outside it.
+    @Test
+    func addAllowedRootAdmitsEquivalentSpellingsAndStillFencesOutsidePaths() async throws {
+        let parent = try makeDirectory("roots")
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let real = parent.appendingPathComponent("real", isDirectory: true)
+        let outside = parent.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: real, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let inside = real.appendingPathComponent("SOUL.md")
+        try "identity".write(to: inside, atomically: true, encoding: .utf8)
+        let outsideFile = outside.appendingPathComponent("private.md")
+        try "private".write(to: outsideFile, atomically: true, encoding: .utf8)
+        let link = parent.appendingPathComponent("linked", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: real)
+
+        let registry = try ContextSourceRegistry(allowedRoots: [])
+
+        // Before the add, the root is not allowed at all.
+        do {
+            try await registry.register(registration(id: "early", file: inside, root: real))
+            Issue.record("source registered before its root was allowed")
+        } catch let error as ContextSourceRegistryError {
+            guard case .rootNotAllowed = error else {
+                Issue.record("unexpected registry error before addAllowedRoot: \(error)")
+                return
+            }
+        }
+
+        // Add the root by its SYMLINKED spelling; register declaring the real
+        // one. Equivalent spellings have to resolve to one root or the boundary
+        // silently stops admitting legitimate sources.
+        try await registry.addAllowedRoot(link)
+        try await registry.register(registration(id: "soul", file: inside, root: real))
+        #expect(await registry.allRegistrations().map(\.descriptor.id.rawValue) == ["soul"])
+
+        // Trailing-slash spelling is the same root, not a second one.
+        try await registry.addAllowedRoot(URL(fileURLWithPath: real.path + "/", isDirectory: true))
+        #expect(await registry.allowedRootList().count == 1)
+
+        // Admitting a root admits only what is under it.
+        do {
+            try await registry.register(registration(id: "outside", file: outsideFile, root: outside))
+            Issue.record("a path outside every allowed root registered")
+        } catch let error as ContextSourceRegistryError {
+            guard case .rootNotAllowed = error else {
+                Issue.record("unexpected registry error for outside path: \(error)")
+                return
+            }
+        }
+    }
+
     @Test
     func registryReturnsAffectedSourcesAndParentWatch() async throws {
         let root = try makeDirectory("root")
@@ -155,11 +275,16 @@ struct ContextSourceMonitoringTests {
         #expect(await monitor.watchedDirectories().isEmpty)
     }
 
-    private func registration(id: String, file: URL, root: URL) -> ContextSourceRegistration {
+    private func registration(
+        id: String,
+        file: URL,
+        root: URL,
+        owner: String = "persona"
+    ) -> ContextSourceRegistration {
         ContextSourceRegistration(
             descriptor: ContextSourceDescriptor(
                 id: ContextSourceID(rawValue: id),
-                owner: "persona",
+                owner: owner,
                 kind: .persona,
                 canonicalLocator: file.path,
                 authority: .identity,

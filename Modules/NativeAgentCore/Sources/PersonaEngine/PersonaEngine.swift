@@ -581,6 +581,19 @@ public actor SwiftNativePersonaEngine: PersonaEngineProtocol, PersonaEngineWriti
             ("AGENTS", "Operating Manual", "AGENTS.md"),
         ]
 
+        // A missing root is the legitimate first-run state and therefore
+        // produces the fixed, empty document specs below. A root *file* is
+        // different: it cannot contain a persona and must not be rendered as
+        // a fresh account, because doing so would offer onboarding over a
+        // corrupted existing path. Surface that distinction to the mounted
+        // loader so it can retain a known-good document set or show an
+        // unavailable state instead of a false Create card.
+        var rootIsDirectory = ObjCBool(false)
+        if fileManager.fileExists(atPath: root.path, isDirectory: &rootIsDirectory),
+           !rootIsDirectory.boolValue {
+            throw PersonaEngineError.rootUnreadable(reason: "persona root is not a directory")
+        }
+
         // Once SOUL.md exists (the canonical "persona is initialized"
         // sentinel), missing mutable persona docs return their default content.
         // USER.md is different: it is a MemoryV2 projection. If it is missing,

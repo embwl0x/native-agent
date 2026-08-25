@@ -93,6 +93,7 @@ struct ChatRuntimeControls: Equatable, Sendable, Codable {
 
 enum BridgeStatus: Equatable {
     case online
+    case awaitingMacActivity
     case offline
     case macUnreachable
     case stale(minutesAgo: Int)
@@ -102,6 +103,8 @@ enum BridgeStatus: Equatable {
         switch self {
         case .online:
             return "Connected via iCloud"
+        case .awaitingMacActivity:
+            return "Waiting for Mac activity"
         case .offline:
             return "iCloud unreachable"
         case .macUnreachable:
@@ -119,23 +122,32 @@ enum BridgeStatus: Equatable {
             return .green
         case .offline, .macUnreachable:
             return .red
-        case .stale, .connecting:
+        case .awaitingMacActivity, .stale, .connecting:
             return .orange
         }
     }
 }
 
 @MainActor
+enum MacBridgeReconnectPolicy {
+    static func delayNanoseconds(afterAttempt attempt: Int) -> UInt64 {
+        attempt < 60 ? 500_000_000 : 5_000_000_000
+    }
+}
+
+@MainActor
 final class MacBridgeClient: ObservableObject {
+    private let bridge: iCloudBridge
     @Published var bridgeStatus: BridgeStatus = .offline
     @Published var lastSeenAt: Date? {
         didSet { refreshBridgeStatus() }
     }
 
     private var reconnectTask: Task<Void, Never>?
+    private var reconnectGeneration = 0
     private var bridgeAvailabilityCancellable: AnyCancellable?
     private var bridgeStatusPollCancellable: AnyCancellable?
-    private var connectingStartedAt: Date?
+    var connectingStartedAt: Date?
     private var bridgeUnavailableSince: Date?
     /// F4: when paired and the bridge stays unavailable >30s, status flips to
     /// `.macUnreachable` instead of the generic `.offline`.
@@ -145,8 +157,9 @@ final class MacBridgeClient: ObservableObject {
     private static let initialConnectingInterval: TimeInterval = 30
     private static let macUnreachableThreshold: TimeInterval = 30
 
-    init() {
-        bridgeAvailabilityCancellable = iCloudBridge.shared.$available
+    init(bridge: iCloudBridge = .shared) {
+        self.bridge = bridge
+        bridgeAvailabilityCancellable = bridge.$available
             .sink { [weak self] _ in
                 Task { @MainActor in self?.refreshBridgeStatus() }
             }
@@ -160,20 +173,25 @@ final class MacBridgeClient: ObservableObject {
 
     func configureICloud() {
         connectingStartedAt = Date()
-        let bridge = iCloudBridge.shared
         bridge.setup()
         refreshBridgeStatus()
+        reconnectGeneration += 1
+        let generation = reconnectGeneration
         reconnectTask?.cancel()
-        reconnectTask = Task { @MainActor in
+        reconnectTask = Task { @MainActor [weak self] in
+            guard let self else { return }
             var attempts = 0
-            while !Task.isCancelled {
-                bridge.setup()
-                refreshBridgeStatus()
-                if bridge.available { return }
+            while !Task.isCancelled, generation == self.reconnectGeneration {
+                self.bridge.setup()
+                self.refreshBridgeStatus()
+                if self.bridge.available { break }
                 attempts += 1
-                let delay: UInt64 = attempts < 60 ? 500_000_000 : 5_000_000_000
-                try? await Task.sleep(nanoseconds: delay)
+                try? await Task.sleep(
+                    nanoseconds: MacBridgeReconnectPolicy.delayNanoseconds(afterAttempt: attempts)
+                )
             }
+            guard generation == self.reconnectGeneration else { return }
+            self.reconnectTask = nil
         }
     }
 
@@ -182,9 +200,11 @@ final class MacBridgeClient: ObservableObject {
     }
 
     func disconnect() {
+        reconnectGeneration += 1
         reconnectTask?.cancel()
+        reconnectTask = nil
         connectingStartedAt = nil
-        iCloudBridge.shared.tearDown()
+        bridge.tearDown()
         refreshBridgeStatus()
     }
 
@@ -208,13 +228,12 @@ final class MacBridgeClient: ObservableObject {
             suppressRemoteUserAppend: suppressRemoteUserAppend,
             replacementAssistantMessageID: replacementAssistantMessageID
         )
-        let msg = try await iCloudBridge.shared.sendChatMessage(
+        let msg = try await bridge.sendChatMessage(
             text: text,
             sessionID: sessionID,
             metadata: metadata,
             attachments: attachments
         )
-        markBridgeActivity()
         return .queuedMessageId(msg.id)
     }
 
@@ -238,21 +257,21 @@ final class MacBridgeClient: ObservableObject {
             source: "ios_icloud",
             sourceKey: hasExplicitSession ? nil : NativeAgentICloudBridgeConstants.mobileSourceKey
         )
-        markBridgeActivity()
+        recordMacConfirmation()
     }
 
     @discardableResult
     func observeICloudReplies(onMessage: @escaping (BridgeMessage) -> Void) -> UUID? {
-        return iCloudBridge.shared.observeIncomingMessages { [weak self] msg in
-            Task { @MainActor in self?.markBridgeActivity() }
+        return bridge.observeIncomingMessages { [weak self] msg in
+            Task { @MainActor in self?.recordMacConfirmation() }
             onMessage(msg)
         }
     }
 
     @discardableResult
     func observeICloudReplyRejections(onReject: @escaping (ICloudBridgeRejectedMessage) -> Void) -> UUID? {
-        return iCloudBridge.shared.observeRejectedMessages { [weak self] rejection in
-            Task { @MainActor in self?.markBridgeActivity() }
+        return bridge.observeRejectedMessages { [weak self] rejection in
+            Task { @MainActor in self?.recordMacConfirmation() }
             onReject(rejection)
         }
     }
@@ -261,35 +280,38 @@ final class MacBridgeClient: ObservableObject {
     /// hints from Mac so ChatView can refresh + retry the most recent unACK'd send.
     @discardableResult
     func observeICloudResyncHints(onHint: @escaping (BridgeMessage) -> Void) -> UUID? {
-        return iCloudBridge.shared.observeResyncHints { [weak self] hint in
-            Task { @MainActor in self?.markBridgeActivity() }
+        return bridge.observeResyncHints { [weak self] hint in
+            Task { @MainActor in self?.recordMacConfirmation() }
             onHint(hint)
         }
     }
 
     func removeICloudResyncHintObserver(_ id: UUID?) {
-        iCloudBridge.shared.removeResyncObserver(id)
+        bridge.removeResyncObserver(id)
     }
 
     func removeICloudReplyObserver(_ id: UUID?) {
-        iCloudBridge.shared.removeIncomingObserver(id)
+        bridge.removeIncomingObserver(id)
     }
 
     func removeICloudReplyRejectionObserver(_ id: UUID?) {
-        iCloudBridge.shared.removeRejectedObserver(id)
+        bridge.removeRejectedObserver(id)
     }
 
     func pollICloudRepliesNow() async {
-        await iCloudBridge.shared.pollIncomingNow()
+        await bridge.pollIncomingNow()
         refreshBridgeStatus()
     }
 
-    private func markBridgeActivity() {
+    /// Only Mac-originated activity or a confirmed Mac action may refresh the
+    /// status chip. Queuing an iPhone message proves iCloud accepted it, not
+    /// that the Mac is awake to process it.
+    private func recordMacConfirmation() {
         connectingStartedAt = nil
         lastSeenAt = Date()
     }
 
-    private func refreshBridgeStatus(now: Date = Date()) {
+    func refreshBridgeStatus(now: Date = Date()) {
         let next = computedBridgeStatus(now: now)
         if bridgeStatus != next {
             bridgeStatus = next
@@ -297,31 +319,47 @@ final class MacBridgeClient: ObservableObject {
     }
 
     private func computedBridgeStatus(now: Date) -> BridgeStatus {
-        let bridgeAvailable = iCloudBridge.shared.available
+        let bridgeAvailable = bridge.available
         if bridgeAvailable {
             bridgeUnavailableSince = nil
         } else if bridgeUnavailableSince == nil {
             bridgeUnavailableSince = now
         }
+        return Self.bridgeStatusDecision(
+            bridgeAvailable: bridgeAvailable,
+            lastSeenAt: lastSeenAt,
+            connectingStartedAt: connectingStartedAt,
+            bridgeUnavailableSince: bridgeUnavailableSince,
+            isPaired: pairingStore?.isPaired == true,
+            now: now
+        )
+    }
+
+    /// The status surface is a compact projection of real bridge, pairing, and
+    /// recency evidence. Keeping its table value-only lets every caller use
+    /// the same boundaries; it does not create a second health owner.
+    static func bridgeStatusDecision(
+        bridgeAvailable: Bool,
+        lastSeenAt: Date?,
+        connectingStartedAt: Date?,
+        bridgeUnavailableSince: Date?,
+        isPaired: Bool,
+        now: Date
+    ) -> BridgeStatus {
         if bridgeAvailable, let lastSeenAt {
             let age = now.timeIntervalSince(lastSeenAt)
-            if age <= Self.recentLastSeenInterval {
-                return .online
-            }
-            return .stale(minutesAgo: Self.minutesAgo(since: lastSeenAt, now: now))
+            if age <= recentLastSeenInterval { return .online }
+            return .stale(minutesAgo: minutesAgo(since: lastSeenAt, now: now))
         }
         if let connectingStartedAt,
-           now.timeIntervalSince(connectingStartedAt) <= Self.initialConnectingInterval {
+           now.timeIntervalSince(connectingStartedAt) <= initialConnectingInterval {
             return .connecting
         }
-        if bridgeAvailable {
-            return .stale(minutesAgo: 1)
-        }
-        // F4: paired but bridge has been unavailable for more than 30 s → Mac
-        // process is the likely culprit (iCloud is the transport, not the agent).
-        if let pairingStore, pairingStore.isPaired,
-           let start = bridgeUnavailableSince,
-           now.timeIntervalSince(start) >= Self.macUnreachableThreshold {
+        if bridgeAvailable { return .awaitingMacActivity }
+        // Paired + unavailable means the transport is reachable enough to
+        // diagnose, but the Mac has not resumed its side of the boundary.
+        if isPaired, let start = bridgeUnavailableSince,
+           now.timeIntervalSince(start) >= macUnreachableThreshold {
             return .macUnreachable
         }
         return .offline

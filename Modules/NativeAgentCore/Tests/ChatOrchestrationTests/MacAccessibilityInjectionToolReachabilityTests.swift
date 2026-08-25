@@ -65,7 +65,15 @@ private func injFullMacPolicy(accessibilityAllowed: Bool) -> JSONValue {
 /// (`macInjectionTools_dispatchToTheMatchingMacControlAction`), which builds a
 /// production MacControl with the live CGEvent sink; wake's execution path is
 /// proven hermetically in MacControlTests/MacWakeTests.swift instead.
-private let injToolNames = ["mac_keystroke", "mac_click", "mac_scroll", "mac_ax_act", "mac_wake"]
+/// native-look item 3 adds `mac_act` here for the same reason `mac_wake` is
+/// here rather than in the read list: it returns a percept, but it PRESSES and
+/// TYPES to get it. Every property below runs over it unchanged. Like wake it
+/// is absent from the one loop that EXECUTES — its execution path is proven
+/// hermetically in MacControlTests/MacActClosedLoopTests.swift.
+// Four-verbs: `act` drives the same closed loop as `mac_act`, addressed by
+// name, while `go` activates or launches. Both therefore stay on the
+// existing injection/app-control tier.
+private let injToolNames = ["mac_keystroke", "mac_click", "mac_scroll", "mac_ax_act", "mac_wake", "mac_act", "act", "go"]
 
 // MARK: - Catalog reachability
 
@@ -163,6 +171,21 @@ func macInjectionTools_schemasSayPlainlyWhatTheyDo() async throws {
             "mac_ax_act must tell the model where a path comes from")
     #expect(axAct.contains("fall") && axAct.contains("click"),
             "mac_ax_act must disclose the synthesized-click fallback")
+    // gpt-5.5 round-3 S6 — the LIVE gate, in both AX act tools' words. There is
+    // no per-call approval on either: the gate is Trust Center Full Mac + the
+    // Accessibility category + the macOS TCC grant. "This requires approval"
+    // was approval THEATER — it told the model to expect a prompt that no
+    // longer exists, and a model that reasons "she'll be asked anyway" reasons
+    // from a false premise about who is checking.
+    for name in ["mac_act", "mac_ax_act"] {
+        let description = try schema(name).description.lowercased()
+        #expect(description.contains("no per-call approval"),
+                "\(name) must say plainly that nothing prompts per call")
+        #expect(description.contains("full mac"),
+                "\(name) must name the Trust Center gate that IS live")
+        #expect(!description.contains("this requires approval"),
+                "\(name) must not claim a per-call approval that does not exist")
+    }
 
     // Parameter shape.
     func properties(_ name: String) throws -> [String: JSONValue] {
@@ -180,6 +203,21 @@ func macInjectionTools_schemasSayPlainlyWhatTheyDo() async throws {
         == Set(["dx", "dy", "x", "y", "units"]).union(attentionTokenKeys))
     #expect(Set(try properties("mac_wake").keys)
         == Set(["key_tap", "settle_ms", "full_screen"]).union(attentionTokenKeys))
+    // native-look item 3 — mac_act. The only injection tool with REQUIRED
+    // arguments: a verb with no handle+frame has no target, and a target
+    // defaulted from thin air is exactly the wrong-element act this whole
+    // organ refuses.
+    #expect(Set(try properties("mac_act").keys)
+        == Set(["handle", "frame_id", "verb", "text", "direction", "wait_ms"]).union(attentionTokenKeys))
+    guard case .object(let actParsed) = try JSONValue.parse(try schema("mac_act").parametersJSON),
+          case .array(let actRequired)? = actParsed["required"] else {
+        Issue.record("mac_act schema has no required array")
+        return
+    }
+    #expect(actRequired.count == 3)
+    for key in ["handle", "frame_id", "verb"] {
+        #expect(actRequired.contains(.string(key)), "mac_act must REQUIRE \(key)")
+    }
     // W3.5: `mark`+`view` is the second legal way to name the target, so the
     // property set grew — and `path` stopped being schema-required, because a
     // mark is the preferred form. The handler still refuses a call that names
@@ -345,8 +383,8 @@ func macInjectionTools_resolveAutoUnderFullMac_approvalFloorRetired() async thro
         Issue.record("expected toolAutonomy in the default trust policy")
         return
     }
-    for key in ["mac.keystroke", "mac.click", "mac.scroll", "mac.ax_act",
-                "mac_keystroke", "mac_click", "mac_scroll", "mac_ax_act"] {
+    for key in ["mac.keystroke", "mac.click", "mac.scroll", "mac.ax_act", "mac.act",
+                "mac_keystroke", "mac_click", "mac_scroll", "mac_ax_act", "mac_act"] {
         #expect(autonomy[key] == .string("auto"),
                 "\(key) carries an explicit auto tier in the Trust Center defaults post-cutover")
     }
@@ -423,7 +461,7 @@ func macInjectionTools_haveACanonicalMotorOwner() {
 func macInjectionActions_areBridgeDispatchableButCannotBeApprovedThere() async throws {
     // The bridge route 404s anything outside macControlDispatchableActions, so
     // the actions must be in it…
-    for action in ["keystroke", "click", "scroll", "ax_act", "wake"] {
+    for action in ["keystroke", "click", "scroll", "ax_act", "wake", "act"] {
         #expect(macControlDispatchableActions.contains(action), "\(action)")
     }
     // …and the daemon-parity inventory stays honest about ancestry.
@@ -432,6 +470,7 @@ func macInjectionActions_areBridgeDispatchableButCannotBeApprovedThere() async t
     #expect(!macControlAllActions.contains("scroll"))
     #expect(!macControlAllActions.contains("ax_act"))
     #expect(!macControlAllActions.contains("wake"), "wake has no retired-daemon ancestor")
+    #expect(!macControlAllActions.contains("act"), "act has no retired-daemon ancestor")
 
     // YOLO cutover 2026-08-12 (9023d24d, 84fb8201): perimeter gates entry,
     // execution ungated.
@@ -493,7 +532,7 @@ func macInjectionActions_areRegisteredWithHighRiskAndApproval() {
     let byId = Dictionary(
         uniqueKeysWithValues: connectorActionDescriptors().map { ($0.id, $0) }
     )
-    for id in ["mac.keystroke", "mac.click", "mac.scroll", "mac.ax_act"] {
+    for id in ["mac.keystroke", "mac.click", "mac.scroll", "mac.ax_act", "mac.act"] {
         guard let descriptor = byId[id] else {
             Issue.record("\(id) missing from the connector actions registry")
             continue

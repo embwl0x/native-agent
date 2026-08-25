@@ -10,6 +10,12 @@ import PersistenceCore
 import ProviderRouting
 
 extension NativeCognitionRuntime {
+    /// The recorder's real enablement provenance. Consumers must not infer
+    /// that a nil report represents a healthy zero-observation installed run.
+    func installedPhysiologySoakCollectionStatus() -> InstalledPhysiologySoakEnablement {
+        physiologySoakEnablement
+    }
+
     func installedPhysiologySoakReport() async -> InstalledPhysiologySoakReport? {
         await drainPhysiologySubmissions()
         return await physiologySoakRecorder?.report()

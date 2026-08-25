@@ -528,6 +528,17 @@ public struct ContextSelectionIndexEntry: Equatable, Sendable {
     }
 }
 
+/// Where the selection latency value came from. Only a monotonic-clock value
+/// taken around the selector is an operational live-latency sample; injected
+/// values remain useful for deterministic fixtures but must never be mixed into
+/// a production latency window.
+public enum ContextSelectionLatencyProvenance: String, Codable, Equatable, Sendable {
+    case monotonicClock = "monotonic_clock"
+    case callerSupplied = "caller_supplied"
+    case unavailable
+    case invalidCallerSupplied = "invalid_caller_supplied"
+}
+
 public struct ContextSelectionReceipt: Codable, Equatable, Sendable {
     public let id: String
     public let needFingerprint: String
@@ -546,6 +557,158 @@ public struct ContextSelectionReceipt: Codable, Equatable, Sendable {
     public let degradedSources: [ContextDegradedSourceNotice]
     public let cacheState: ContextSelectionCacheState
     public let measuredSelectionMicroseconds: Int?
+    /// Optional for wire compatibility with receipts persisted before latency
+    /// provenance existed. Readers must treat nil as unavailable, never zero.
+    public let selectionLatencyProvenance: ContextSelectionLatencyProvenance?
+
+    private enum CodingKeys: String, CodingKey {
+        case id, needFingerprint, generationID, sourceFingerprint, selectionTimeBucket
+        case eligibility, candidateScores, selectedAtomIDs, pointerAtomIDs
+        case mandatoryAtomIDs, coveredMandatoryAtomIDs, mandatoryCoverage
+        case conflicts, budget, degradedSources, cacheState
+        case measuredSelectionMicroseconds, selectionLatencyProvenance
+    }
+
+    public init(
+        id: String,
+        needFingerprint: String,
+        generationID: Int64,
+        sourceFingerprint: String,
+        selectionTimeBucket: Int64,
+        eligibility: [ContextEligibilityDecision],
+        candidateScores: [ContextCandidateScore],
+        selectedAtomIDs: [ContextAtomID],
+        pointerAtomIDs: [ContextAtomID],
+        mandatoryAtomIDs: [ContextAtomID],
+        coveredMandatoryAtomIDs: [ContextAtomID],
+        mandatoryCoverage: Double,
+        conflicts: [ContextConflictSet],
+        budget: ContextBudgetUsage,
+        degradedSources: [ContextDegradedSourceNotice],
+        cacheState: ContextSelectionCacheState,
+        measuredSelectionMicroseconds: Int?,
+        selectionLatencyProvenance: ContextSelectionLatencyProvenance? = nil
+    ) {
+        self.id = id
+        self.needFingerprint = needFingerprint
+        self.generationID = generationID
+        self.sourceFingerprint = sourceFingerprint
+        self.selectionTimeBucket = selectionTimeBucket
+        self.eligibility = eligibility
+        self.candidateScores = candidateScores
+        self.selectedAtomIDs = selectedAtomIDs
+        self.pointerAtomIDs = pointerAtomIDs
+        self.mandatoryAtomIDs = mandatoryAtomIDs
+        self.coveredMandatoryAtomIDs = coveredMandatoryAtomIDs
+        self.mandatoryCoverage = mandatoryCoverage
+        self.conflicts = conflicts
+        self.budget = budget
+        self.degradedSources = degradedSources
+        self.cacheState = cacheState
+        self.measuredSelectionMicroseconds = measuredSelectionMicroseconds
+        self.selectionLatencyProvenance = selectionLatencyProvenance
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            id: try values.decode(String.self, forKey: .id),
+            needFingerprint: try values.decode(String.self, forKey: .needFingerprint),
+            generationID: try values.decode(Int64.self, forKey: .generationID),
+            sourceFingerprint: try values.decode(String.self, forKey: .sourceFingerprint),
+            selectionTimeBucket: try values.decode(Int64.self, forKey: .selectionTimeBucket),
+            eligibility: try values.decode([ContextEligibilityDecision].self, forKey: .eligibility),
+            candidateScores: try values.decode([ContextCandidateScore].self, forKey: .candidateScores),
+            selectedAtomIDs: try values.decode([ContextAtomID].self, forKey: .selectedAtomIDs),
+            pointerAtomIDs: try values.decode([ContextAtomID].self, forKey: .pointerAtomIDs),
+            mandatoryAtomIDs: try values.decode([ContextAtomID].self, forKey: .mandatoryAtomIDs),
+            coveredMandatoryAtomIDs: try values.decode([ContextAtomID].self, forKey: .coveredMandatoryAtomIDs),
+            mandatoryCoverage: try values.decode(Double.self, forKey: .mandatoryCoverage),
+            conflicts: try values.decode([ContextConflictSet].self, forKey: .conflicts),
+            budget: try values.decode(ContextBudgetUsage.self, forKey: .budget),
+            degradedSources: try values.decode([ContextDegradedSourceNotice].self, forKey: .degradedSources),
+            cacheState: try values.decode(ContextSelectionCacheState.self, forKey: .cacheState),
+            measuredSelectionMicroseconds: try values.decodeIfPresent(Int.self, forKey: .measuredSelectionMicroseconds),
+            selectionLatencyProvenance: try values.decodeIfPresent(
+                ContextSelectionLatencyProvenance.self,
+                forKey: .selectionLatencyProvenance
+            )
+        )
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(id, forKey: .id)
+        try values.encode(needFingerprint, forKey: .needFingerprint)
+        try values.encode(generationID, forKey: .generationID)
+        try values.encode(sourceFingerprint, forKey: .sourceFingerprint)
+        try values.encode(selectionTimeBucket, forKey: .selectionTimeBucket)
+        try values.encode(eligibility, forKey: .eligibility)
+        try values.encode(candidateScores, forKey: .candidateScores)
+        try values.encode(selectedAtomIDs, forKey: .selectedAtomIDs)
+        try values.encode(pointerAtomIDs, forKey: .pointerAtomIDs)
+        try values.encode(mandatoryAtomIDs, forKey: .mandatoryAtomIDs)
+        try values.encode(coveredMandatoryAtomIDs, forKey: .coveredMandatoryAtomIDs)
+        try values.encode(mandatoryCoverage, forKey: .mandatoryCoverage)
+        try values.encode(conflicts, forKey: .conflicts)
+        try values.encode(budget, forKey: .budget)
+        try values.encode(degradedSources, forKey: .degradedSources)
+        try values.encode(cacheState, forKey: .cacheState)
+        try values.encodeIfPresent(measuredSelectionMicroseconds, forKey: .measuredSelectionMicroseconds)
+        try values.encodeIfPresent(selectionLatencyProvenance, forKey: .selectionLatencyProvenance)
+    }
+}
+
+/// Interprets the durable `context_receipts(kind: selection)` fields without
+/// turning missing, replay-supplied, or malformed values into a calm zero.
+/// This is deliberately a receipt reader, not a speed gate: callers may build
+/// envelope reports from `.measured` samples without asserting a wall-clock
+/// budget in ordinary functional tests.
+public struct ContextSelectionLatencyObservation: Equatable, Sendable {
+    public enum Status: String, Equatable, Sendable {
+        case measured
+        case missing
+        case invalid
+    }
+
+    public let status: Status
+    public let microseconds: Int?
+    public let provenance: ContextSelectionLatencyProvenance?
+    public let surface: ContextSurface?
+
+    public init(receipt: ContextStoreReceipt) {
+        guard receipt.kind == .selection else {
+            status = .invalid
+            microseconds = nil
+            provenance = nil
+            surface = nil
+            return
+        }
+        surface = receipt.details["surface"].flatMap(ContextSurface.init(rawValue:))
+        let rawProvenance = receipt.details["selection_latency_provenance"]
+        let provenance = rawProvenance.flatMap(ContextSelectionLatencyProvenance.init(rawValue:))
+        self.provenance = provenance
+        guard surface != nil else {
+            status = .invalid
+            microseconds = nil
+            return
+        }
+        guard let rawMicroseconds = receipt.details["selection_microseconds"],
+              rawMicroseconds != "absent",
+              let parsed = Int(rawMicroseconds),
+              parsed >= 0 else {
+            status = rawProvenance == nil || provenance == .unavailable ? .missing : .invalid
+            microseconds = nil
+            return
+        }
+        guard provenance == .monotonicClock else {
+            status = rawProvenance == nil || provenance == .unavailable ? .missing : .invalid
+            microseconds = nil
+            return
+        }
+        status = .measured
+        microseconds = parsed
+    }
 }
 
 public struct ContextPacket: Codable, Equatable, Sendable {
@@ -741,7 +904,13 @@ public struct ContextSelector: Sendable {
         }
 
         var mandatoryIDs = need.mandatoryAtomIDs
-        mandatoryIDs.formUnion(sortedAtoms.lazy.filter {
+        // An `always` atom is mandatory inside the request's authorized
+        // source scope, not across every persona/surface represented by the
+        // shared generation.  A chat picker rebuild can deliberately retain
+        // another surface's identity mirror in that generation; demanding
+        // those excluded atoms would turn the authorization boundary itself
+        // into a false `mandatoryUnavailable` failure.
+        mandatoryIDs.formUnion(eligible.lazy.filter {
             $0.draft.injectionPolicy == .always
                 && !need.precoveredSourceIDs.contains($0.draft.sourceID)
         }.map(\.draft.id))
@@ -958,9 +1127,20 @@ public struct ContextSelector: Sendable {
             String(generation.generation.id),
             generation.generation.sourceFingerprint,
         ] + selectedIDList.map(\.rawValue) + pointerIDList.map(\.rawValue))
-        let measuredSelectionMicroseconds = selectionStarted.map {
-            Int((DispatchTime.now().uptimeNanoseconds &- $0) / 1_000)
-        } ?? need.measuredSelectionMicroseconds
+        let latency: (microseconds: Int?, provenance: ContextSelectionLatencyProvenance) = {
+            if let selectionStarted {
+                return (
+                    Int((DispatchTime.now().uptimeNanoseconds &- selectionStarted) / 1_000),
+                    .monotonicClock
+                )
+            }
+            if let supplied = need.measuredSelectionMicroseconds {
+                return supplied >= 0
+                    ? (supplied, .callerSupplied)
+                    : (nil, .invalidCallerSupplied)
+            }
+            return (nil, .unavailable)
+        }()
         let receipt = ContextSelectionReceipt(
             id: receiptID,
             needFingerprint: need.deterministicFingerprint,
@@ -980,7 +1160,8 @@ public struct ContextSelector: Sendable {
             budget: budget,
             degradedSources: degraded,
             cacheState: need.cacheState,
-            measuredSelectionMicroseconds: measuredSelectionMicroseconds
+            measuredSelectionMicroseconds: latency.microseconds,
+            selectionLatencyProvenance: latency.provenance
         )
 
         return ContextPacket(

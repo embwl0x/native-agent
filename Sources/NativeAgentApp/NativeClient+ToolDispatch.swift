@@ -101,17 +101,27 @@ extension NativeClient {
     // earlier nested `chat/sessions/<id>/messages.jsonl` carve was dead.
     // Also remove any stale nested file left over from the earlier shape.
     func clearChatMessages(sessionId: String) async throws -> EmptyResponse {
-        let trimmed = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return EmptyResponse() }
-        let root = PersistenceCore.defaultDataRoot()
+        try await Self.clearChatMessages(
+            sessionId: sessionId,
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        )
+    }
+
+    /// The app-side half of clearing a chat transcript.  Keep the root explicit
+    /// so this durable boundary can be exercised without the resident data
+    /// root; production always passes the canonical resolver above.
+    static func clearChatMessages(sessionId: String, dataRoot root: URL) async throws -> EmptyResponse {
+        guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
+            throw invalidChatSessionIDError(operation: "clear chat messages")
+        }
         let messagesPath = root
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("messages", isDirectory: true)
-            .appendingPathComponent("\(trimmed).jsonl")
+            .appendingPathComponent("\(safeSessionId).jsonl")
         let staleNestedPath = root
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("sessions", isDirectory: true)
-            .appendingPathComponent(trimmed, isDirectory: true)
+            .appendingPathComponent(safeSessionId, isDirectory: true)
             .appendingPathComponent("messages.jsonl")
         let persistence = SwiftNativePersistenceCore()
         try await persistence.withFileLock(messagesPath) {
@@ -139,8 +149,18 @@ extension NativeClient {
     // <dataRoot>/chat/sessions/<id>/cancelled.flag. The Swift streaming chat
     // path checks this marker to abort an in-flight tool loop.
     func cancelChatSession(sessionId: String) async throws -> EmptyResponse {
-        guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else { return EmptyResponse() }
-        let root = PersistenceCore.defaultDataRoot()
+        try await Self.cancelChatSession(
+            sessionId: sessionId,
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        )
+    }
+
+    /// The durable half of Stop.  See `clearChatMessages(sessionId:dataRoot:)`
+    /// for why the root is explicit at this file boundary.
+    static func cancelChatSession(sessionId: String, dataRoot root: URL) async throws -> EmptyResponse {
+        guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
+            throw invalidChatSessionIDError(operation: "cancel chat session")
+        }
         let flagPath = root
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("sessions", isDirectory: true)
@@ -154,6 +174,14 @@ extension NativeClient {
             try Data(stamp.utf8).write(to: flagPath, options: .atomic)
         }
         return EmptyResponse()
+    }
+
+    private static func invalidChatSessionIDError(operation: String) -> NSError {
+        NSError(
+            domain: "NativeAgentChatSession",
+            code: 400,
+            userInfo: [NSLocalizedDescriptionKey: "Cannot \(operation): invalid chat session id"]
+        )
     }
 
 }

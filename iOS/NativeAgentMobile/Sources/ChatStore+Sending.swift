@@ -8,6 +8,39 @@ import Speech
 import PhotosUI
 import NativeAgentShared
 
+/// Captures the queue control the user saw. The queue strip must not reread
+/// `isLoading` when its action fires: a state change between rendering and tap
+/// must not turn a visible Send into a cancellation-backed Steer (or reverse).
+enum QueuedSendStripAction: Equatable {
+    case steer(UUID)
+    case send(UUID)
+
+    static func resolve(id: UUID, isLoading: Bool) -> Self {
+        isLoading ? .steer(id) : .send(id)
+    }
+
+    var primaryTitle: String {
+        switch self {
+        case .steer: "Steer"
+        case .send: "Send"
+        }
+    }
+
+    func menuTitle(position: Int, preview: String) -> String {
+        switch self {
+        case .steer: "Steer \(position) now: \(preview)"
+        case .send: "Send \(position) now: \(preview)"
+        }
+    }
+
+    func apply(onSteer: (UUID) -> Void, onSend: (UUID) -> Void) {
+        switch self {
+        case .steer(let id): onSteer(id)
+        case .send(let id): onSend(id)
+        }
+    }
+}
+
 extension ChatStore {
     @discardableResult
     func send(
@@ -69,8 +102,6 @@ extension ChatStore {
             appendedUserId = userMsg.id
         }
         isLoading = true
-        errorBanner = nil
-
         let placeholderId: UUID
         if let reuse = reusePlaceholderId,
            let idx = messages.firstIndex(where: { $0.id == reuse }) {

@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import ChatOrchestration
 @testable import PersistenceCore
 @testable import NativeAgentApp
 
@@ -351,16 +352,44 @@ private func withTempDeskRoot<T>(_ body: (URL) async throws -> T) async throws -
     return try await body(root)
 }
 
+/// The live Desk seam intentionally traverses the same lazy-tool authority as
+/// chat: a current session id plus an active loadout. Keeping it in one fixture
+/// makes each durable-store assertion exercise the real impl instead of the
+/// dispatcher's earlier missing-session refusal.
+private struct SessionAuthorizedDeskToolRouter: DeskToolInvoking {
+    let router: DeskToolDispatchRouter
+    let sessionID: String
+
+    func run(tool: String, input: [String: JSONValue]) async throws -> JSONValue {
+        var authorizedInput = input
+        authorizedInput["session_id"] = .string(sessionID)
+        return try await router.run(tool: tool, input: authorizedInput)
+    }
+}
+
+private func sessionAuthorizedDeskRouter(dataRoot: URL) async throws -> SessionAuthorizedDeskToolRouter {
+    let sessionID = "desk-interaction-eval"
+    try await ActiveToolsStore(dataRoot: dataRoot).addLoaded(
+        sessionId: sessionID,
+        names: ["desk_close", "desk_defer", "desk_nag_control", "desk_note"]
+    )
+    return SessionAuthorizedDeskToolRouter(
+        router: DeskToolDispatchRouter(dataRoot: dataRoot),
+        sessionID: sessionID
+    )
+}
+
 @Test("desk Close lands in impl_desk_close — the live store shows the item closed")
 func deskCloseRoutesToTheRealImpl() async throws {
     try await withTempDeskRoot { root in
         let store = SwiftNativeDeskStore(dataRoot: root)
         let created = try await store.createItem(
             kind: .plan, project: "p", title: "close me", parent: nil, summary: nil)
+        let router = try await sessionAuthorizedDeskRouter(dataRoot: root)
 
         let outcome = await DeskActionRunner.perform(
             .close(handle: created.handle, outcome: DeskQuickAction.deskCloseOutcome),
-            via: DeskToolDispatchRouter(dataRoot: root))
+            via: router)
         #expect(outcome.ok, "close should land, got: \(outcome.message)")
 
         let state = try await store.liveState()
@@ -375,7 +404,7 @@ func deskDeferRoutesToTheRealImpl() async throws {
         let store = SwiftNativeDeskStore(dataRoot: root)
         let created = try await store.createItem(
             kind: .plan, project: "p", title: "park me", parent: nil, summary: nil)
-        let router = DeskToolDispatchRouter(dataRoot: root)
+        let router = try await sessionAuthorizedDeskRouter(dataRoot: root)
 
         let parked = await DeskActionRunner.perform(
             .defer_(handle: created.handle, until: "2026-12-24"), via: router)
@@ -397,10 +426,11 @@ func deskNoteRoutesToTheRealImpl() async throws {
         let store = SwiftNativeDeskStore(dataRoot: root)
         let created = try await store.createItem(
             kind: .plan, project: "p", title: "note me", parent: nil, summary: nil)
+        let router = try await sessionAuthorizedDeskRouter(dataRoot: root)
 
         let outcome = await DeskActionRunner.perform(
             .note(handle: created.handle, text: "from the desk"),
-            via: DeskToolDispatchRouter(dataRoot: root))
+            via: router)
         #expect(outcome.ok, "note should land, got: \(outcome.message)")
 
         let after = try await store.liveState().items.first { $0.handle == created.handle }
@@ -413,7 +443,7 @@ func deskNagPanelRoutesToTheRealImpl() async throws {
     try await withTempDeskRoot { root in
         let configStore = DeskNagConfigStore(dataRoot: root)
         #expect(await configStore.load().enabled == false)
-        let router = DeskToolDispatchRouter(dataRoot: root)
+        let router = try await sessionAuthorizedDeskRouter(dataRoot: root)
 
         let on = await DeskActionRunner.perform(.nagGlobal(on: true), via: router)
         #expect(on.ok, "enabling should land, got: \(on.message)")
@@ -446,9 +476,10 @@ func deskDeferBadDateSurfacesRefusal() async throws {
         let store = SwiftNativeDeskStore(dataRoot: root)
         let created = try await store.createItem(
             kind: .plan, project: "p", title: "x", parent: nil, summary: nil)
+        let router = try await sessionAuthorizedDeskRouter(dataRoot: root)
         let outcome = await DeskActionRunner.perform(
             .defer_(handle: created.handle, until: "not-a-date"),
-            via: DeskToolDispatchRouter(dataRoot: root))
+            via: router)
         #expect(outcome.ok == false)
         #expect(try await store.liveState().items
             .first { $0.handle == created.handle }?.deferUntil == nil)

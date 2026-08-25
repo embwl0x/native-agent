@@ -16,6 +16,108 @@ private func decodeInboxItem(_ value: JSONValue) throws -> InboxItemRecord {
     return try JSONDecoder().decode(InboxItemRecord.self, from: data)
 }
 
+private actor InboxRowActionGate {
+    private var entered = false
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiter: CheckedContinuation<Void, Never>?
+
+    func hold() async {
+        entered = true
+        let waiters = entryWaiters
+        entryWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        await withCheckedContinuation { releaseWaiter = $0 }
+    }
+
+    func waitUntilEntered() async {
+        guard !entered else { return }
+        await withCheckedContinuation { entryWaiters.append($0) }
+    }
+
+    func release() {
+        releaseWaiter?.resume()
+        releaseWaiter = nil
+    }
+}
+
+private enum InboxRowActionFixtureError: LocalizedError {
+    case refused
+
+    var errorDescription: String? { "the service refused this action" }
+}
+
+@Test("inline and detail inbox paths drop duplicates and never resolve a failed write")
+@MainActor
+func inboxRowActionFlightGuardsSlowAndThrowingActions() async {
+    let inlineFlight = InboxRowActionFlight()
+    let inlineGate = InboxRowActionGate()
+    let detailFlight = InboxRowActionFlight()
+    let detailGate = InboxRowActionGate()
+    var writes = 0
+    var resolved = 0
+    var markedRead = 0
+
+    let inlineFirst = Task { @MainActor in
+        await inlineFlight.perform(operation: {
+            writes += 1
+            await inlineGate.hold()
+        })
+    }
+    await inlineGate.waitUntilEntered()
+    #expect(inlineFlight.isInFlight)
+
+    let inlineDuplicate = await inlineFlight.perform(operation: { writes += 100 })
+    #expect(inlineDuplicate == .dropped)
+    #expect(writes == 1, "a second row click must not reach the transport")
+
+    await inlineGate.release()
+    let inlineSuccess = await inlineFirst.value
+    _ = InboxRowActionCompletion.apply(
+        inlineSuccess, actionID: "archive",
+        onResolved: { resolved += 1 }, onMarkedRead: { markedRead += 1 })
+    #expect(!inlineFlight.isInFlight)
+    #expect(resolved == 1)
+    let inlineFailed = await inlineFlight.perform(operation: { throw InboxRowActionFixtureError.refused })
+    _ = InboxRowActionCompletion.apply(
+        inlineFailed, actionID: "archive",
+        onResolved: { resolved += 1 }, onMarkedRead: { markedRead += 1 })
+    #expect(inlineFailed == .failed(message: "Inbox action failed: the service refused this action"))
+    #expect(resolved == 1, "a failed inline action must not call the resolution callback")
+
+    let detailFirst = Task { @MainActor in
+        await detailFlight.perform(operation: {
+            writes += 1
+            await detailGate.hold()
+        })
+    }
+    await detailGate.waitUntilEntered()
+    #expect(detailFlight.isInFlight)
+    let detailDuplicate = await detailFlight.perform(operation: { writes += 100 })
+    #expect(detailDuplicate == .dropped, "a second detail-sheet press must not reach the transport")
+    #expect(writes == 2)
+    await detailGate.release()
+    #expect(await detailFirst.value == .succeeded)
+    #expect(!detailFlight.isInFlight)
+
+    let failedAction = await detailFlight.perform(operation: { throw InboxRowActionFixtureError.refused })
+    let failedRead = await detailFlight.perform(operation: { throw InboxRowActionFixtureError.refused })
+    _ = InboxRowActionCompletion.apply(
+        failedAction, actionID: "archive",
+        onResolved: { resolved += 1 }, onMarkedRead: { markedRead += 1 })
+    _ = InboxRowActionCompletion.apply(
+        failedRead, actionID: "read",
+        onResolved: { resolved += 1 }, onMarkedRead: { markedRead += 1 })
+    #expect(failedAction == .failed(message: "Inbox action failed: the service refused this action"))
+    #expect(failedRead == .failed(message: "Inbox action failed: the service refused this action"))
+    #expect(resolved == 1, "a failed action must not call the row resolution callback")
+    #expect(markedRead == 0, "a failed action must not mark the row read")
+    #expect(!detailFlight.isInFlight, "every terminal branch re-arms the detail sheet")
+    #expect(InboxDetailActionPresentation.effect(for: failedAction, closesOnSuccess: true)
+        == .showError("Inbox action failed: the service refused this action"))
+    #expect(InboxDetailActionPresentation.effect(for: .succeeded, closesOnSuccess: true) == .dismiss)
+    #expect(InboxDetailActionPresentation.effect(for: .succeeded, closesOnSuccess: false) == .keepOpen)
+}
+
 @Test
 func archiveUpdatesVisibleNotificationInboxRow() async throws {
     let root = try makeInboxActionTempRoot()

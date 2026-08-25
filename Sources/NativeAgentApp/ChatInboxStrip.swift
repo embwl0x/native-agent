@@ -16,21 +16,34 @@ import CoreSpotlight
 import CloudKit
 #endif
 
+/// A failed inbox read is a distinct visible state, not an empty inbox. Keep
+/// this reducer at the presentation boundary so the file-refresh path cannot
+/// silently erase a previously rendered actionable item.
+enum InboxStripPresentation {
+    struct State: Equatable {
+        var items: [InboxItemRecord]
+        var loadError: String?
+    }
+
+    static func loaded(_ items: [InboxItemRecord]) -> State {
+        State(items: items, loadError: nil)
+    }
+
+    static func failed(previousItems: [InboxItemRecord], errorDescription: String) -> State {
+        State(items: previousItems, loadError: errorDescription)
+    }
+}
+
 struct InboxStripContainer: View {
     @Environment(AppModel.self) private var appModel
     @Environment(\.scenePhase) private var scenePhase
     @State private var items: [InboxItemRecord] = []
-    // error_handling fix: surface inbox-action failures instead of swallowing
-    // them with `try?` and proceeding as if the action succeeded.
-    @State private var actionError: String? = nil
     // U5 W-A item 1 (ChatView:2287): a failed inbox READ was swallowed into
     // [] — the strip rendered as "no unread items" on a corrupt/unreadable
     // inbox. Load failures now keep the last-known items and render this
     // inline error row instead of fabricating an empty strip.
     @State private var loadError: String? = nil
-
-    // R22: source the client from AppModel's canonical `client`.
-    private var client: NativeClient { appModel.client }
+    @State private var reloadGeneration = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -45,50 +58,54 @@ struct InboxStripContainer: View {
         InboxStripView(
             items: items,
             onAction: { id, actionID in
-                do {
-                    try await client.inboxAction(id, action: actionID)
-                } catch {
-                    // Do NOT mark success / reload / write snapshots on failure —
-                    // surface the failure to the user.
-                    actionError = "Inbox action failed: \(error.localizedDescription)"
-                    return
-                }
+                try await appModel.inboxAction(id, action: actionID)
                 // Every successful action changes inbox state. Reload now so
                 // a read item leaves the unread strip immediately instead of
                 // lingering until the next poll, then publish the same state
                 // to peripheral surfaces.
                 await reload()
-                await MacSyncEngine.shared.writeSnapshots()
+                if let inboxSnapshotWriterOverride = appModel.inboxSnapshotWriterOverride {
+                    await inboxSnapshotWriterOverride()
+                } else {
+                    await MacSyncEngine.shared.writeSnapshots()
+                }
             }
         )
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }
-            let inboxPath = PersistenceCore.defaultDataRoot()
+            let inboxPath = (appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
                 .appendingPathComponent("notifications", isDirectory: true)
                 .appendingPathComponent("inbox.jsonl")
             await ViewFileRefreshTask.run(paths: [inboxPath]) {
                 await reload()
             }
         }
-        .alert(
-            "Inbox action failed",
-            isPresented: Binding(get: { actionError != nil }, set: { if !$0 { actionError = nil } })
-        ) {
-            Button("OK", role: .cancel) { actionError = nil }
-        } message: {
-            Text(actionError ?? "")
+        .onChange(of: appModel.inboxReloadGeneration) { _, _ in
+            Task { await reload() }
         }
         }
     }
 
     func reload() async {
+        reloadGeneration &+= 1
+        let generation = reloadGeneration
         do {
-            items = try await client.getInboxItems(unreadOnly: true)
-            loadError = nil
+            let next = InboxStripPresentation.loaded(
+                try await appModel.getInboxItems(unreadOnly: true)
+            )
+            guard generation == reloadGeneration else { return }
+            items = next.items
+            loadError = next.loadError
         } catch {
             // Keep last-known items — never fabricate an empty strip; the
             // inline error row above renders the real failure.
-            loadError = error.localizedDescription
+            let next = InboxStripPresentation.failed(
+                previousItems: items,
+                errorDescription: error.localizedDescription
+            )
+            guard generation == reloadGeneration else { return }
+            items = next.items
+            loadError = next.loadError
         }
     }
 }

@@ -35,7 +35,8 @@ extension MacSyncEngine {
     // every snapshot file (digest map starts empty → every write looks "changed"
     // → full read-storm on iOS). Stored alongside processed_ids.json.
     private var snapshotDigestsURL: URL? {
-        let dir = NativeAgentPaths.dataRoot.appendingPathComponent("icloud", isDirectory: true)
+        let dir = (stateDataRootOverride ?? NativeAgentPaths.dataRoot)
+            .appendingPathComponent("icloud", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("snapshot_digests.json")
     }
@@ -384,12 +385,16 @@ extension MacSyncEngine {
     // Backstop ceiling kept well below the hard 1024-key KVS quota.
     // Map each key → (modificationDate of its response file, fileExists).
     // A missing file means the response was already consumed + pruned.
-    private struct InboxResponseSweepEntry { let key: String; let modified: Date?; let exists: Bool }
     func sweepInboxResponseKVSKeys() async {
         let keyPrefix = inboxResponseKeyPrefix
-        let keys = await withCKTimeout("MacSyncEngine.sweepInboxResponseKVSKeys.readKeys") {
+        let maybeKeys = await withCKTimeout("MacSyncEngine.sweepInboxResponseKVSKeys.readKeys") {
             Array(NSUbiquitousKeyValueStore.default.dictionaryRepresentation.keys.filter { $0.hasPrefix(keyPrefix) })
-        } ?? []
+        }
+        guard let keys = maybeKeys else {
+            syncError = "Could not read iCloud inbox response keys for cleanup; retrying before the next inbox scan."
+            print("[MacSyncEngine] inbox_response_* KVS sweep could not read keys; cleanup will retry.")
+            return
+        }
         guard !keys.isEmpty else { return }
         let now = Date()
         // The per-key file stats below hit the iCloud-resident responses dir and
@@ -398,9 +403,9 @@ extension MacSyncEngine {
         // NOT run on the main actor. Build the (key → exists/modified) array off
         // main, then hop back to @MainActor for the KVS mutations below.
         let keyPrefixCount = inboxResponseKeyPrefix.count
-        let entries: [InboxResponseSweepEntry] = await Task.detached(priority: .utility) { [responsesDir, keys] in
+        let entries: [MacSyncInboxResponseSweep.Entry] = await Task.detached(priority: .utility) { [responsesDir, keys] in
             let fm = FileManager.default
-            var entries: [InboxResponseSweepEntry] = []
+            var entries: [MacSyncInboxResponseSweep.Entry] = []
             for key in keys {
                 let msgId = String(key.dropFirst(keyPrefixCount))
                 var modified: Date?
@@ -415,25 +420,16 @@ extension MacSyncEngine {
                         }
                     }
                 }
-                entries.append(InboxResponseSweepEntry(key: key, modified: modified, exists: exists))
+                entries.append(MacSyncInboxResponseSweep.Entry(key: key, modified: modified, exists: exists))
             }
             return entries
         }.value
-        var keysToRemove: [String] = []
-        var survivors: [InboxResponseSweepEntry] = []
-        for entry in entries {
-            // Response file gone → consumed; safe to remove the KVS key.
-            if !entry.exists {
-                keysToRemove.append(entry.key)
-                continue
-            }
-            // File still present but older than TTL → iOS had a full day to read it.
-            if let modified = entry.modified, now.timeIntervalSince(modified) > inboxResponseKeyTTL {
-                keysToRemove.append(entry.key)
-                continue
-            }
-            survivors.append(entry)
-        }
+        let sweepPlan = MacSyncInboxResponseSweep.plan(
+            entries: entries,
+            now: now,
+            ttl: inboxResponseKeyTTL,
+            cap: inboxResponseKeyMaxCount
+        )
         // FIX (D): Hard cap backstop. After the missing-file + TTL passes, every
         // remaining survivor is by definition under-TTL AND has a present
         // response file — i.e. a still-pending, possibly-unread notification.
@@ -445,35 +441,23 @@ extension MacSyncEngine {
         // never a clean pending response. If genuine pressure remains we log it
         // (observable) rather than dropping pending responses; the missing-file +
         // TTL passes are the real quota-protection mechanism.
-        if survivors.count > inboxResponseKeyMaxCount {
-            // Only keys with no readable response file mtime (orphaned/unreadable)
-            // are eligible — never a clean under-TTL pending response.
-            let evictable = survivors.filter { !$0.exists || $0.modified == nil }
-            let overflow = survivors.count - inboxResponseKeyMaxCount
-            var evictedHere = 0
-            if !evictable.isEmpty {
-                let sorted = evictable.sorted {
-                    ($0.modified ?? .distantPast) < ($1.modified ?? .distantPast)
-                }
-                for entry in sorted.prefix(overflow) {
-                    keysToRemove.append(entry.key)
-                    evictedHere += 1
-                }
-            }
-            if evictedHere < overflow {
-                print("[MacSyncEngine] inbox_response_* KVS keys (\(survivors.count)) exceed backstop cap \(inboxResponseKeyMaxCount); \(overflow - evictedHere) under-TTL key(s) with present response files retained rather than dropping pending responses.")
-            }
+        if sweepPlan.exceedsCap {
+            print("[MacSyncEngine] inbox_response_* KVS keys (\(sweepPlan.retainedCount)) exceed backstop cap \(inboxResponseKeyMaxCount); recent readable response keys were retained rather than dropped.")
         }
-        if !keysToRemove.isEmpty {
+        if !sweepPlan.keysToRemove.isEmpty {
             // Sendable-capture: snapshot to a let so the @Sendable closure
             // doesn't capture the outer `var`.
-            let snapshot = keysToRemove
-            _ = await withCKTimeout("MacSyncEngine.sweepInboxResponseKVSKeys.removeKeys") {
+            let snapshot = sweepPlan
+            let didSynchronize = await withCKTimeout("MacSyncEngine.sweepInboxResponseKVSKeys.removeKeys") {
                 let kvs = NSUbiquitousKeyValueStore.default
-                for key in snapshot {
+                MacSyncInboxResponseSweep.apply(snapshot) { key in
                     kvs.removeObject(forKey: key)
                 }
                 return kvs.synchronize()
+            }
+            if didSynchronize != true {
+                syncError = "Could not sweep stale iCloud inbox response keys; retrying before the next inbox scan."
+                print("[MacSyncEngine] inbox_response_* KVS sweep was not synchronized; stale key cleanup will retry.")
             }
         }
     }

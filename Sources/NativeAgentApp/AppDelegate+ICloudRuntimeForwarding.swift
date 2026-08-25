@@ -33,7 +33,44 @@ private final class ICloudGeneratedAttachmentBox: @unchecked Sendable {
     }
 }
 
+/// The bounded, redacted notification request that crosses from an iCloud chat
+/// reply into the APNS provider boundary. Provider acceptance is deliberately
+/// not a claim that an iPhone displayed the notification.
+struct ICloudReplyPushNotificationRequest: Sendable, Equatable {
+    let title: String
+    let body: String
+    let userInfo: [String: String]
+    let urgency: String?
+    let eventID: String
+}
+
+/// APNS's provider-side outcome, reduced to the facts this bridge can honestly
+/// observe. `acceptedTargets` means Apple accepted the request, not that a
+/// device received or rendered it.
+struct ICloudReplyPushNotificationProviderResult: Sendable, Equatable {
+    let attemptedTargets: Int
+    let acceptedTargets: Int
+    let errors: [String]
+}
+
+enum ICloudReplyPushNotificationOutcome: Equatable {
+    case providerAccepted(attemptedTargets: Int, acceptedTargets: Int)
+    case providerNotAccepted(reason: String)
+}
+
+enum ICloudReplyPushNotificationPreparation: Equatable {
+    case ready(ICloudReplyPushNotificationRequest)
+    case rejected(reason: String)
+}
+
 extension AppDelegate {
+    /// The only file-access IDs the signed iPhone chat route admits. This is
+    /// intentionally shared with the mobile pill rather than treating its
+    /// persisted label as authority.
+    static func iCloudChatFileAccess(from remoteMetadata: [String: String]) -> String {
+        ICloudChatFileAccessPolicy.normalized(remoteMetadata["fileAccess"] ?? "")
+    }
+
     // PATCH-2026-06-02 scheduler-consolidation: registerBackgroundRefreshTasks
     // is gone. It registered status-only NSBackgroundActivityScheduler entries
     // that did no work; the bgTaskIdentifiers entries above are OS-side wake
@@ -171,11 +208,10 @@ extension AppDelegate {
         // File access remains a signed per-message request. Provider/model/
         // effort/tier metadata is UI evidence only; the central facade admits
         // those controls from Mac-owned canonical routing.
-        let metaFileAccess = remoteMetadata["fileAccess"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let replacementAssistantMessageID = ICloudChatReplacementIntent
             .decode(remoteMetadata)?.assistantMessageID
         let suppressUserAppend = replacementAssistantMessageID != nil
-        let chatFileAccess = metaFileAccess.isEmpty ? "auto" : metaFileAccess
+        let chatFileAccess = Self.iCloudChatFileAccess(from: remoteMetadata)
 
         // F7 P0 #3: cancellable stream task. We run the stream consumer in a
         // child Task and register it with MacSyncEngine by sessionID so the
@@ -488,46 +524,126 @@ extension AppDelegate {
         text: String,
         sessionID: String?,
         correlationID: String,
-        kind: String
-    ) async -> Bool {
-        let cleanText = NativeAppSecretRedactor.redactText(
-            String(text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(500))
-        )
-        guard !cleanText.isEmpty else { return false }
-        var userInfo: [String: String] = [
-            "screen": "chat",
-            "source": "icloud_chat_reply",
-            "correlationId": correlationID,
-            "kind": kind,
-        ]
-        let eventID = NativeAgentDeviceEventIdentity.notification(userInfo: userInfo)
-        userInfo["eventId"] = eventID
-        await MacSyncMobileNotificationRelay.beginDeliveryPrediction(
-            eventID: eventID,
-            source: "icloud_chat_reply"
-        )
-        if let sessionID,
-           !sessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            userInfo["sessionId"] = sessionID
-        }
-        let result = await SwiftNativeAPNSSender.shared.sendNotification(
-            title: NativeAgentNotificationDefaults.agentDisplayName(),
-            body: cleanText,
-            userInfo: userInfo,
-            urgency: kind == "error" ? "urgent" : nil
-        )
-        if result.receipts.contains(where: \.isSuccess) {
-            NSLog("[iCloudBridge] APNS chat reply notification accepted correlation=%@", correlationID)
-            return true
-        } else if !result.errors.isEmpty {
+        kind: String,
+        apnsSender: @escaping @Sendable (ICloudReplyPushNotificationRequest) async -> ICloudReplyPushNotificationProviderResult = { request in
+            let result = await SwiftNativeAPNSSender.shared.sendNotification(
+                title: request.title,
+                body: request.body,
+                userInfo: request.userInfo,
+                urgency: request.urgency
+            )
+            return ICloudReplyPushNotificationProviderResult(
+                attemptedTargets: result.receipts.count,
+                acceptedTargets: result.receipts.filter(\.isSuccess).count,
+                errors: result.errors
+            )
+        },
+        beginDeliveryPrediction: @escaping @Sendable (String) async -> Void = { eventID in
+            await MacSyncMobileNotificationRelay.beginDeliveryPrediction(
+                eventID: eventID,
+                source: "icloud_chat_reply"
+            )
+        },
+        failDeliveryPrediction: @escaping @Sendable (String) async -> Void = { eventID in
             await MacSyncMobileNotificationRelay.failDeliveryPrediction(
                 eventID: eventID,
                 source: "icloud_chat_reply"
             )
-            NSLog("[iCloudBridge] APNS chat reply notification failed correlation=%@: %@",
-                  correlationID, result.errors.joined(separator: " | "))
         }
-        return false
+    ) async -> Bool {
+        let preparation = iCloudReplyPushNotificationRequest(
+            text: text,
+            sessionID: sessionID,
+            correlationID: correlationID,
+            kind: kind
+        )
+        guard case .ready(let request) = preparation else {
+            if case .rejected(let reason) = preparation {
+                NSLog("[iCloudBridge] APNS chat reply notification refused: %@", reason)
+            }
+            return false
+        }
+
+        await beginDeliveryPrediction(request.eventID)
+        let providerResult = await apnsSender(request)
+        let outcome = iCloudReplyPushNotificationOutcome(providerResult: providerResult)
+        switch outcome {
+        case .providerAccepted:
+            NSLog("[iCloudBridge] APNS chat reply notification provider-accepted correlation=%@", correlationID)
+            return true
+        case .providerNotAccepted(let reason):
+            await failDeliveryPrediction(request.eventID)
+            NSLog("[iCloudBridge] APNS chat reply notification not accepted correlation=%@: %@",
+                  correlationID, reason)
+            return false
+        }
+    }
+
+    /// Builds the exact provider payload used by `sendICloudReplyPushNotification`.
+    /// A missing correlation/kind is not allowed to collapse unrelated replies
+    /// into one notification identity, and blank text never starts a prediction.
+    static func iCloudReplyPushNotificationRequest(
+        text: String,
+        sessionID: String?,
+        correlationID: String,
+        kind: String
+    ) -> ICloudReplyPushNotificationPreparation {
+        let cleanText = NativeAppSecretRedactor.redactText(
+            String(text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(500))
+        )
+        guard !cleanText.isEmpty else { return .rejected(reason: "empty_reply_text") }
+        let cleanCorrelationID = correlationID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanCorrelationID.isEmpty else { return .rejected(reason: "missing_correlation_id") }
+        let cleanKind = kind.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanKind.isEmpty else { return .rejected(reason: "missing_reply_kind") }
+        var userInfo: [String: String] = [
+            "screen": "chat",
+            "source": "icloud_chat_reply",
+            "correlationId": cleanCorrelationID,
+            "kind": cleanKind,
+            // `NativeAgentDeviceEventIdentity` recognizes `dedupKey`; without
+            // it reply pushes fell through to a fresh UUID each time and APNS
+            // could not collapse retry/duplicate delivery attempts.
+            "dedupKey": "icloud_chat_reply:\(cleanCorrelationID):\(cleanKind)",
+        ]
+        if let sessionID,
+           !sessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            userInfo["sessionId"] = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let eventID = NativeAgentDeviceEventIdentity.notification(userInfo: userInfo)
+        userInfo["eventId"] = eventID
+        return .ready(ICloudReplyPushNotificationRequest(
+            title: NativeAgentNotificationDefaults.agentDisplayName(),
+            body: cleanText,
+            userInfo: userInfo,
+            urgency: cleanKind == "error" ? "urgent" : nil,
+            eventID: eventID
+        ))
+    }
+
+    static func iCloudReplyPushNotificationOutcome(
+        providerResult: ICloudReplyPushNotificationProviderResult
+    ) -> ICloudReplyPushNotificationOutcome {
+        let attemptedTargets = max(0, providerResult.attemptedTargets)
+        // The live sender derives both values from the same receipt array, but
+        // normalize the boundary anyway: an inconsistent adapter result must
+        // not transform zero provider receipts into an acceptance claim.
+        let acceptedTargets = min(max(0, providerResult.acceptedTargets), attemptedTargets)
+        guard acceptedTargets > 0 else {
+            let reason: String
+            if !providerResult.errors.isEmpty {
+                reason = providerResult.errors.joined(separator: " | ")
+            } else if attemptedTargets > 0 {
+                reason = "APNS returned \(attemptedTargets) non-accepted provider receipt(s)."
+            } else {
+                reason = "APNS returned no provider receipts."
+            }
+            return .providerNotAccepted(reason: reason)
+        }
+        return .providerAccepted(
+            attemptedTargets: attemptedTargets,
+            acceptedTargets: acceptedTargets
+        )
     }
 
     private static func sendICloudTextDelta(

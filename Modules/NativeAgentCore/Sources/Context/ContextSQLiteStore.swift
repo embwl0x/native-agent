@@ -254,21 +254,6 @@ public actor ContextSQLiteStore {
                         )
                     }
 
-                    try db.execute(
-                        sql: """
-                        INSERT INTO context_fts (
-                            version_key, body, summary, headings, entities, triggers
-                        ) VALUES (?, ?, ?, ?, ?, ?)
-                        """,
-                        arguments: [
-                            versionKey,
-                            atom.body,
-                            atom.deterministicSummary ?? "",
-                            atom.headingPath.joined(separator: " / "),
-                            atom.entities.map(\.label).joined(separator: " "),
-                            atom.triggers.joined(separator: " "),
-                        ]
-                    )
                 }
             }
 
@@ -497,6 +482,64 @@ public actor ContextSQLiteStore {
         }
     }
 
+    /// Context feedback is derived, bounded state. Retaining its exact events
+    /// lets a new coordinator rebuild the same advisory ranking after restart
+    /// without turning Context into a second fact store.
+    public func recordFeedbackEvent(_ event: ContextFeedbackEvent) async throws {
+        try await dbQueue.write { db in
+            try db.execute(
+                sql: """
+                INSERT INTO context_feedback_events (
+                    id, atom_ids_json, signal_json, time_bucket, evidence_ids_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                arguments: [
+                    event.id,
+                    try Self.encodeJSON(event.atomIDs),
+                    try Self.encodeJSON(event.signal),
+                    event.timeBucket,
+                    try Self.encodeJSON(event.evidenceIDs),
+                    Date().timeIntervalSince1970,
+                ]
+            )
+            try db.execute(sql: """
+                DELETE FROM context_feedback_events
+                WHERE sequence < COALESCE((
+                    SELECT sequence FROM context_feedback_events
+                    ORDER BY sequence DESC
+                    LIMIT 1 OFFSET 4095
+                ), 0)
+                """)
+        }
+    }
+
+    public func recentFeedbackEvents(limit: Int = 4_096) async throws -> [ContextFeedbackEvent] {
+        try await dbQueue.read { db in
+            let boundedLimit = max(0, min(limit, 4_096))
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                SELECT id, atom_ids_json, signal_json, time_bucket, evidence_ids_json
+                FROM context_feedback_events
+                ORDER BY sequence ASC
+                LIMIT ?
+                """,
+                arguments: [boundedLimit]
+            )
+            return try rows.map(Self.decodeFeedbackEvent)
+        }
+    }
+
+    public func feedbackEventOrdinalHighWaterMark() async throws -> UInt64 {
+        try await dbQueue.read { db in
+            let value = try Int64.fetchOne(
+                db,
+                sql: "SELECT COALESCE(MAX(sequence), 0) FROM context_feedback_events"
+            ) ?? 0
+            return UInt64(max(0, value))
+        }
+    }
+
     public func healthSnapshot() async throws -> ContextStoreHealthSnapshot {
         try await dbQueue.read { db in
             let activeGenerationID = try Int64.fetchOne(
@@ -525,7 +568,7 @@ public actor ContextSQLiteStore {
 
     public func resetDerivedState() async throws {
         try await dbQueue.write { db in
-            try db.execute(sql: "DELETE FROM context_fts")
+            try db.execute(sql: "DELETE FROM context_feedback_events")
             try db.execute(sql: "DELETE FROM context_embeddings")
             try db.execute(sql: "DELETE FROM context_relationship_versions")
             try db.execute(sql: "DELETE FROM context_atom_versions")
@@ -571,7 +614,6 @@ public actor ContextSQLiteStore {
                 return Self.interval(start: start, end: end, intersects: kept) ? nil : key
             }
             for key in deadAtomKeys {
-                try db.execute(sql: "DELETE FROM context_fts WHERE version_key = ?", arguments: [key])
                 try db.execute(sql: "DELETE FROM context_atom_versions WHERE version_key = ?", arguments: [key])
             }
 
@@ -623,6 +665,28 @@ public actor ContextSQLiteStore {
             for id in receiptIDs {
                 try db.execute(sql: "DELETE FROM context_receipts WHERE id = ?", arguments: [id])
             }
+
+            // A removed source has no active meaning. Once every retained
+            // generation-specific version is gone, retaining its identity row
+            // only makes each incremental compile scan a growing tombstone set.
+            try db.execute(sql: """
+                DELETE FROM context_sources
+                WHERE health = 'removed'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM context_source_versions
+                    WHERE context_source_versions.source_id = context_sources.id
+                  )
+                """)
+
+            // Compile failures for a source that no longer exists cannot aid a
+            // retry and otherwise grow forever with churned sources.
+            try db.execute(sql: """
+                DELETE FROM context_compile_failures
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM context_sources
+                    WHERE context_sources.id = context_compile_failures.source_id
+                  )
+                """)
 
             return ContextStorePruneResult(
                 deletedGenerations: deadGenerations.count,
@@ -821,15 +885,25 @@ public actor ContextSQLiteStore {
                 CREATE INDEX idx_context_compile_failures_source
                     ON context_compile_failures(source_id, created_at DESC);
 
-                CREATE VIRTUAL TABLE context_fts USING fts5(
-                    version_key UNINDEXED,
-                    body,
-                    summary,
-                    headings,
-                    entities,
-                    triggers,
-                    tokenize = 'unicode61'
+                """)
+        }
+        // `context_fts` was never read by Context selection or any public
+        // query path. Drop the fossil table for existing installs instead of
+        // paying to duplicate every atom body on future publications.
+        migrator.registerMigration("context_feedback_events_v2") { db in
+            try db.execute(sql: "DROP TABLE IF EXISTS context_fts")
+            try db.execute(sql: """
+                CREATE TABLE context_feedback_events (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id TEXT NOT NULL UNIQUE,
+                    atom_ids_json TEXT NOT NULL,
+                    signal_json TEXT NOT NULL,
+                    time_bucket INTEGER NOT NULL,
+                    evidence_ids_json TEXT NOT NULL,
+                    created_at REAL NOT NULL
                 );
+                CREATE INDEX idx_context_feedback_events_sequence
+                    ON context_feedback_events(sequence);
                 """)
         }
         return migrator
@@ -986,6 +1060,23 @@ public actor ContextSQLiteStore {
             summary: summary,
             details: details,
             createdAt: Date(timeIntervalSince1970: createdAt)
+        )
+    }
+
+    private static func decodeFeedbackEvent(_ row: Row) throws -> ContextFeedbackEvent {
+        guard let id: String = row["id"],
+              let atomIDsJSON: String = row["atom_ids_json"],
+              let signalJSON: String = row["signal_json"],
+              let timeBucket: Int64 = row["time_bucket"],
+              let evidenceIDsJSON: String = row["evidence_ids_json"] else {
+            throw ContextFlowStoreError.malformedStoredValue("feedback_event")
+        }
+        return ContextFeedbackEvent(
+            id: id,
+            atomIDs: try decodeJSON(atomIDsJSON),
+            signal: try decodeJSON(signalJSON),
+            timeBucket: timeBucket,
+            evidenceIDs: try decodeJSON(evidenceIDsJSON)
         )
     }
 

@@ -151,12 +151,27 @@ extension SwiftToolDispatcher {
         let trustedRoots = await trustedWorkspaceRoots()
         let pid = ProcessInfo.processInfo.processIdentifier
         let provider = await Self.providerStamp(dataRoot: dataRoot)
+        let outcomeDimensionHealth: JSONValue
+        do {
+            let audit = try await OutcomeDimensionStatePopulationReader(
+                dataRoot: dataRoot,
+                since: Calendar.current.date(byAdding: .day, value: -7, to: Date())
+            ).read()
+            outcomeDimensionHealth = audit.jsonValue
+        } catch {
+            outcomeDimensionHealth = .object([
+                "status": .string("unavailable"),
+                "absent_is_zero": .bool(false),
+                "error_class": .string(String(describing: type(of: error))),
+            ])
+        }
         return .object([
             "status": .string("ok"),
             "invoked_as": .string(invokedAs),
             "runtime": .string("swift-native"),
             "python_daemon": .string("retired"),
             "provider": provider,
+            "outcome_dimension_health": outcomeDimensionHealth,
             "dispatch": .object([
                 "provider_tools_field": .bool(true),
                 "tool_loop": .string("SwiftNativeTurnEngine.executeTurnWithToolLoop"),

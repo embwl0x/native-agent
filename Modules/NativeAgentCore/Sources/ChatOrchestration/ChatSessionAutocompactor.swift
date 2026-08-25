@@ -31,12 +31,17 @@ public struct ChatSessionAutocompactionConfig: Sendable, Equatable {
         self.distillEnabled = distillEnabled
     }
 
-    public static func productionDefault() -> ChatSessionAutocompactionConfig {
-        let stored = UserDefaults.standard.integer(forKey: defaultsKey)
+    /// Reads the app preference at the production boundary.  The defaults
+    /// instance is injectable solely so callers can exercise the same reader
+    /// against an isolated persistent domain; production still uses `.standard`.
+    public static func productionDefault(
+        defaults: UserDefaults = .standard
+    ) -> ChatSessionAutocompactionConfig {
+        let stored = defaults.integer(forKey: defaultsKey)
         // Absent key → distill on by default; explicit false → off.
-        let distill = UserDefaults.standard.object(forKey: distillEnabledKey) == nil
+        let distill = defaults.object(forKey: distillEnabledKey) == nil
             ? true
-            : UserDefaults.standard.bool(forKey: distillEnabledKey)
+            : defaults.bool(forKey: distillEnabledKey)
         return ChatSessionAutocompactionConfig(
             enabled: true,
             thresholdTokens: stored > 0 ? stored : defaultThresholdTokens,

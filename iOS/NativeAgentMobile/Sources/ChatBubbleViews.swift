@@ -97,14 +97,11 @@ struct BubbleView: View {
     }
 
     private var imageAttachments: [ChatAttachmentSummary] {
-        message.attachments.filter { attachment in
-            attachment.type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "image"
-                && (attachment.base64?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
-        }
+        ChatAttachmentPresentation.previewableImages(in: message.attachments)
     }
 
     private var attachmentCountWithoutPreview: Int {
-        max(0, message.attachments.count - imageAttachments.count)
+        ChatAttachmentPresentation.fallbackCount(in: message.attachments)
     }
 }
 
@@ -147,10 +144,12 @@ struct ToolActivityView: View {
     @State private var toolsExpanded = false
     @State private var skillsExpanded = false
 
-    // Skill use shows up as these tool calls — split into a separate
-    // "N skills used" box, matching the Mac chat.
-    private static let skillToolNames: Set<String> = ["read_skill", "list_skills"]
-    private func isSkill(_ e: ToolEvent) -> Bool { Self.skillToolNames.contains(e.name) }
+    // Skill use is a shared remote-surface presentation taxonomy. The Mac
+    // dispatcher catalog remains executable authority; its parity eval keeps
+    // this compact iOS projection in lockstep as names evolve.
+    private func isSkill(_ e: ToolEvent) -> Bool {
+        ToolActivityPresentation.isSkillReaderTool(named: e.name)
+    }
 
     private var ordered: [ToolEvent] { events.sorted { $0.seq < $1.seq } }
     private var skills: [ToolEvent] { ordered.filter(isSkill) }

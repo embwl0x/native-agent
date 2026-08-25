@@ -5,6 +5,28 @@
 //   2) Manual base64 HMAC paste as a fallback when KVS sync is delayed.
 import SwiftUI
 
+enum ManualPairingKeyPaste {
+    enum Verdict: Equatable {
+        case verified
+        case looksLikeHex
+        case invalidFormat
+        case awaitingMacVerification
+        case doesNotMatchMac
+    }
+
+    static func verdict(base64: String, publishedMacSecret: Data?) -> Verdict {
+        if base64.count == 64,
+           base64.range(of: "^[A-Fa-f0-9]{64}$", options: .regularExpression) != nil {
+            return .looksLikeHex
+        }
+        guard let candidate = Data(base64Encoded: base64), candidate.count == 32 else {
+            return .invalidFormat
+        }
+        guard let publishedMacSecret else { return .awaitingMacVerification }
+        return candidate == publishedMacSecret ? .verified : .doesNotMatchMac
+    }
+}
+
 struct PairingView: View {
     var onSkip: (() -> Void)? = nil
     var onPaired: (() -> Void)? = nil
@@ -181,19 +203,28 @@ struct PairingView: View {
         iCloudSecretError = nil
         iCloudSecretSuccess = nil
         let trimmed = pastedSecretKey.trimmingCharacters(in: .whitespaces)
-        if trimmed.count == 64,
-           trimmed.range(of: "^[A-Fa-f0-9]{64}$", options: .regularExpression) != nil {
+        switch ManualPairingKeyPaste.verdict(
+            base64: trimmed,
+            publishedMacSecret: pairingStore.publishedICloudPairingSecretForVerification()
+        ) {
+        case .looksLikeHex:
             iCloudSecretError = "That looks like hex — use the base64 key from the Mac app."
-            return
-        }
-        if pairingStore.applyICloudSecret(base64: trimmed) {
-            iCloudSecretSuccess = "Pairing key saved. iCloud actions will now be signed."
+        case .invalidFormat:
+            iCloudSecretError = "Invalid key: must be 44-char base64 encoding of 32 bytes."
+        case .awaitingMacVerification:
+            iCloudSecretError = "The key is well formed, but the Mac pairing record has not arrived to verify it yet. Keep this screen open and try again."
+        case .doesNotMatchMac:
+            iCloudSecretError = "That key does not match the current Mac pairing key. Copy a new key from the Mac app and try again."
+        case .verified:
+            guard pairingStore.applyICloudSecret(base64: trimmed) else {
+                iCloudSecretError = "The verified key could not be stored securely. Try again after unlocking this iPhone."
+                return
+            }
+            iCloudSecretSuccess = "Pairing key verified with the Mac and saved. iCloud actions will now be signed."
             pastedSecretKey = ""
             if pairingStore.isICloudPaired {
                 onPaired?()
             }
-        } else {
-            iCloudSecretError = "Invalid key: must be 44-char base64 encoding of 32 bytes."
         }
     }
 }

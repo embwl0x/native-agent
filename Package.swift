@@ -187,6 +187,10 @@ let package = Package(
                 // reconciliation + weekly-hygiene approval staging fixtures.
                 .product(name: "ApprovalInbox", package: "NativeAgentCore"),
                 .product(name: "MemoryV2", package: "NativeAgentCore"),
+                // Coverage ledger: telegram.memoryWriterBridge must exercise
+                // the actual /remember command through the app-owned writer,
+                // not only a protocol double in the TelegramBot target.
+                .product(name: "TelegramBot", package: "NativeAgentCore"),
                 // 2026-07-21 audit: the approval-gated hygiene run now also
                 // sweeps KG orphans; the regression test seeds/sweeps through
                 // the real indexer.
@@ -202,6 +206,7 @@ let package = Package(
                 // menu-bar indicator are driven by ActivityPolicy, so the app
                 // tests need the type in scope to pin default-OFF behaviour.
                 .product(name: "ActivityWatch", package: "NativeAgentCore"),
+                .product(name: "NativeAgentShared", package: "NativeAgentShared"),
                 "NativeAgentChromeRelayCore",
             ],
             path: "tests/NativeAgentAppTests"

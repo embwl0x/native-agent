@@ -162,6 +162,51 @@ private func _bool(_ value: JSONValue?) -> Bool? {
     return nil
 }
 
+// MARK: - Window inventory
+
+@Test func focusedFinderSheetMissingFromAXWindowsIsIncludedOnceAndDoesNotSelectItsParent() {
+    // Finder can return only the document window in AXWindows while publishing
+    // its Save/Open sheet as AXFocusedWindow. Integer tokens stand in for AX
+    // references here; production passes the same shared seam `CFEqual`.
+    let parent = 10
+    let sheet = 20
+    let inventory = MacAXWindowInventory.union(
+        listed: [parent],
+        focused: sheet,
+        main: parent,
+        equal: ==
+    )
+
+    #expect(inventory == [parent, sheet],
+            "listed order is retained; the omitted focused sheet is appended once")
+    #expect(inventory.filter { $0 == sheet }.count == 1)
+
+    // This models the candidate selection the semantic click/type path makes:
+    // a focused AXSheet must resolve to its own inventory slot, never the
+    // document-window parent that Finder did list.
+    let identities = inventory.enumerated().map { index, element in
+        (
+            handle: element,
+            identity: MacAXWindowIdentity(
+                pid: 4242,
+                index: index,
+                role: element == sheet ? "AXSheet" : "AXWindow",
+                subrole: element == sheet ? nil : "AXStandardWindow",
+                title: element == sheet ? "Save" : "Documents",
+                frame: MacAXFrame(x: Double(index * 100), y: 0, w: 80, h: 40)
+            )
+        )
+    }
+    let focusedSheet = identities[1].identity
+    switch MacAXWindowIdentity.match(focusedSheet, among: identities) {
+    case .matched(let selected, _):
+        #expect(selected == sheet, "the semantic anchor remains the sheet")
+        #expect(selected != parent, "the parent must never substitute for the sheet")
+    case .gone, .ambiguous:
+        Issue.record("the focused sheet must have one unambiguous ACT candidate")
+    }
+}
+
 // MARK: - Caps
 
 @Test func axTreeNodeCapTruncatesAndSaysSo() {
@@ -444,7 +489,9 @@ private func _bool(_ value: JSONValue?) -> Bool? {
     }
     // W3.5 added the fused view at the SAME read tier: no CGEvent, no AX
     // mutation, no approval — just structure plus a picture of it.
-    #expect(macControlAccessibilityReadActions == ["ax_status", "ax_tree", "ax_find", "view", "attention"])
+    // native-look item 2 added `look` at that SAME read tier: it distills the
+    // very tree `ax_tree` returns and emits nothing.
+    #expect(macControlAccessibilityReadActions == ["ax_status", "ax_tree", "ax_find", "view", "attention", "look"])
 }
 
 @Test func injectionActionsAreImplementedAsOfW2() {

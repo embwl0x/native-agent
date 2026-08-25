@@ -16,6 +16,233 @@ import CoreSpotlight
 import CloudKit
 #endif
 
+/// The collapsed Trust Advanced header is the only visible surface for its
+/// privacy-map and backup authority reads. Keep unavailable/stale data
+/// distinguishable from a legitimately empty backup history before hiding the
+/// panels behind the disclosure.
+enum TrustCenterAdvancedDisclosurePresentation {
+    enum ReadState: Equatable {
+        case loading
+        case available
+        case stale
+        case unavailable
+    }
+
+    struct Badge: Equatable {
+        let text: String
+        let status: String
+    }
+
+    struct State: Equatable {
+        let policy: ReadState
+        let privacyMap: ReadState
+        let backups: ReadState
+        let backupBeforeWriteEnabled: Bool?
+
+        var collapsedBadge: Badge? {
+            if policy == .unavailable || privacyMap == .unavailable || backups == .unavailable {
+                return Badge(text: "Details unavailable", status: "warn")
+            }
+            if policy == .stale || privacyMap == .stale || backups == .stale {
+                return Badge(text: "Details stale", status: "warn")
+            }
+            if backupBeforeWriteEnabled == false {
+                return Badge(text: "Backups off", status: "warn")
+            }
+            if policy == .loading || privacyMap == .loading || backups == .loading {
+                return Badge(text: "Loading", status: "info")
+            }
+            return nil
+        }
+    }
+
+    static func resolve(
+        hasPolicy: Bool,
+        hasPrivacyMap: Bool,
+        backupCount: Int,
+        backupBeforeWriteEnabled: Bool?,
+        hasRefreshAttempt: Bool,
+        failedEndpoints: [String]
+    ) -> State {
+        let failures = Set(failedEndpoints.map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        })
+        return State(
+            policy: readState(
+                hasContent: hasPolicy,
+                hasRefreshAttempt: hasRefreshAttempt,
+                failed: failures.contains("trust policy")
+            ),
+            privacyMap: readState(
+                hasContent: hasPrivacyMap,
+                hasRefreshAttempt: hasRefreshAttempt,
+                failed: failures.contains("privacy map")
+            ),
+            backups: readState(
+                hasContent: backupCount > 0,
+                hasRefreshAttempt: hasRefreshAttempt,
+                failed: failures.contains("backups")
+            ),
+            backupBeforeWriteEnabled: backupBeforeWriteEnabled
+        )
+    }
+
+    private static func readState(
+        hasContent: Bool,
+        hasRefreshAttempt: Bool,
+        failed: Bool
+    ) -> ReadState {
+        if failed { return hasContent ? .stale : .unavailable }
+        if !hasContent && !hasRefreshAttempt { return .loading }
+        return .available
+    }
+}
+
+/// One Trust mutation's typed outcome. This belongs to the Trust surface,
+/// unlike `AppModel.statusText`, which is an app-wide activity line and may be
+/// replaced by unrelated work before the view redraws.
+enum TrustCenterActionOutcome: Equatable {
+    case saved(String)
+    case failed(String)
+}
+
+enum TrustCenterActionPresentation {
+    struct State: Equatable {
+        let label: String
+        let text: String
+        let badgeText: String
+        let badgeStatus: String
+        let systemImage: String
+    }
+
+    static func state(for outcome: TrustCenterActionOutcome) -> State {
+        switch outcome {
+        case .saved(let text):
+            State(
+                label: "Latest Trust action",
+                text: bounded(text),
+                badgeText: "Saved",
+                badgeStatus: "ok",
+                systemImage: "checkmark.circle.fill"
+            )
+        case .failed(let text):
+            State(
+                label: "Latest Trust action",
+                text: bounded(text),
+                badgeText: "Failed",
+                badgeStatus: "warn",
+                systemImage: "exclamationmark.triangle.fill"
+            )
+        }
+    }
+
+    private static func bounded(_ text: String) -> String {
+        let maximumVisibleCharacters = 280
+        guard text.count > maximumVisibleCharacters else { return text }
+        return String(text.prefix(maximumVisibleCharacters)) + "…"
+    }
+}
+
+/// Compatibility projection for legacy callers that still pass global app
+/// activity. The Trust Center itself renders `TrustCenterActionOutcome` above.
+enum TrustCenterStatusTextPresentation {
+    enum Scope: Equatable {
+        case trustAction
+        case appActivity
+        case runtime
+    }
+
+    enum Tone: Equatable {
+        case info
+        case success
+        case failure
+    }
+
+    struct State: Equatable {
+        let label: String
+        let text: String
+        let scope: Scope
+        let tone: Tone
+        let systemImage: String
+
+        var badgeText: String {
+            switch tone {
+            case .info: "Activity"
+            case .success: "Saved"
+            case .failure: "Failed"
+            }
+        }
+
+        var badgeStatus: String {
+            switch tone {
+            case .info: "info"
+            case .success: "ok"
+            case .failure: "warn"
+            }
+        }
+    }
+
+    static func state(for raw: String) -> State? {
+        let text = normalized(raw)
+        guard !text.isEmpty, text.lowercased() != "not checked" else { return nil }
+
+        let lower = text.lowercased()
+        if lower == "native runtime online" { return nil }
+        if lower == "native runtime unavailable" || lower == "swift runtime unavailable" {
+            return State(
+                label: "Runtime",
+                text: "Runtime is unavailable",
+                scope: .runtime,
+                tone: .failure,
+                systemImage: "xmark.octagon.fill"
+            )
+        }
+
+        let isTrustAction = trustActionPrefixes.contains { lower.hasPrefix($0) }
+        let isFailure = lower.hasPrefix("failed")
+            || lower.contains(" failed:")
+            || lower.contains(" save failed")
+            || lower.contains(" unavailable")
+            || lower.contains(" could not ")
+        let isSuccess = isTrustAction && (
+            lower.contains(" saved")
+                || lower.hasPrefix("autonomy enabled")
+                || lower.hasPrefix("autonomy disabled")
+                || lower.hasPrefix("chrome control enabled")
+                || lower.hasPrefix("chrome control disabled")
+                || lower.hasPrefix("developer mode turned off")
+                || lower.hasPrefix("policy simulation complete")
+                || lower.hasPrefix("restore validated")
+                || lower.hasPrefix("applied ")
+        )
+
+        return State(
+            label: isTrustAction ? "Latest Trust action" : "Latest app activity",
+            text: bounded(text),
+            scope: isTrustAction ? .trustAction : .appActivity,
+            tone: isFailure ? .failure : (isSuccess ? .success : .info),
+            systemImage: isFailure ? "exclamationmark.triangle.fill" : (isSuccess ? "checkmark.circle.fill" : "info.circle")
+        )
+    }
+
+    private static let trustActionPrefixes = [
+        "trust ", "agent access ", "full mac ", "developer mode ",
+        "autonomy ", "memory policy ", "multimodal policy ",
+        "chrome control ", "policy simulation ", "restore ",
+        "backup list ", "applied ", "mac control policy ",
+    ]
+
+    private static func normalized(_ raw: String) -> String {
+        raw.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+    }
+
+    private static func bounded(_ text: String) -> String {
+        let maximumVisibleCharacters = 280
+        guard text.count > maximumVisibleCharacters else { return text }
+        return String(text.prefix(maximumVisibleCharacters)) + "…"
+    }
+}
+
 struct TrustCenterView: View {
     @Environment(AppModel.self) private var appModel
     @State private var agentAccessMode = "auto"
@@ -36,7 +263,7 @@ struct TrustCenterView: View {
     @State private var restoringBackupID: String?
     // 2026-07-22 trust-tighten: disclosure state persists across visits so a
     // power user who opens the Advanced group finds it open next time.
-    @AppStorage("trustShowPolicyMap") private var showPolicyMap = false
+    @AppStorage(TrustPolicyMapDisclosurePresentation.preferenceKey) private var showPolicyMap = false
     @AppStorage("trustShowAdvanced") private var showAdvancedTrust = false
 
     var body: some View {
@@ -80,23 +307,10 @@ struct TrustCenterView: View {
                     // tallest in its row, so the four cards floated at four
                     // different heights.
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 380), spacing: 14, alignment: .top)], alignment: .leading, spacing: 14) {
-                        featureGroup(title: "Multimodal", systemImage: "sparkles", tint: .blue) {
-                            MultimodalPermissionsView()
-                        }
-                        featureGroup(title: "Chrome Control", systemImage: "globe", tint: .orange) {
-                            ChromeControlPermissionsView()
-                        }
-                        // Sweep R4 C9 — COPY ONLY. The card's own controls now
-                        // read "practice runs" / "automatic review"; the title
-                        // matched neither.
-                        featureGroup(title: "Self-Improvement", systemImage: "brain", tint: .purple) {
-                            TrainingPermissionsView()
-                        }
-                        featureGroup(title: "Desk Autonomy", systemImage: "checklist", tint: .cyan) {
-                            WorkshopPermissionsView()
-                        }
-                        featureGroup(title: "Living Memory", systemImage: "brain.filled.head.profile", tint: .green) {
-                            LivingMemoryPermissionsView()
+                        ForEach(TrustFeaturePermissionCards.all) { card in
+                            featureGroup(title: card.title, systemImage: card.systemImage, tint: card.tint) {
+                                card.content()
+                            }
                         }
                     }
                 }
@@ -127,10 +341,22 @@ struct TrustCenterView: View {
 
                 advancedSection
 
-                Text(appModel.statusText)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
+                if let outcome = appModel.trustCenterActionOutcome {
+                    let status = TrustCenterActionPresentation.state(for: outcome)
+                    HStack(alignment: .top, spacing: 8) {
+                        StatusBadge(text: status.badgeText, status: status.badgeStatus)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Label(status.label, systemImage: status.systemImage)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Text(status.text)
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    .accessibilityLabel("\(status.label): \(status.text)")
+                }
             }
             .padding()
             // Taste pass 2026-08-11 (User: "spread out... not centered with
@@ -332,6 +558,18 @@ struct TrustCenterView: View {
     // collapsed by default; styling mirrors the Advanced Mac Control
     // disclosure in MacControlPermissionsView for consistency).
 
+    private var advancedPresentation: TrustCenterAdvancedDisclosurePresentation.State {
+        let refresh = appModel.panelRefreshStatus[.trust]
+        return TrustCenterAdvancedDisclosurePresentation.resolve(
+            hasPolicy: appModel.trustPolicy != nil,
+            hasPrivacyMap: appModel.privacyMap != nil,
+            backupCount: appModel.backups.count,
+            backupBeforeWriteEnabled: appModel.trustPolicy?.filePolicy?.requireBackupBeforeWrite,
+            hasRefreshAttempt: refresh != nil,
+            failedEndpoints: refresh?.failedEndpoints ?? []
+        )
+    }
+
     private var advancedSection: some View {
         DisclosureGroup(isExpanded: $showAdvancedTrust) {
             VStack(alignment: .leading, spacing: 16) {
@@ -353,6 +591,9 @@ struct TrustCenterView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
+                if !showAdvancedTrust, let badge = advancedPresentation.collapsedBadge {
+                    StatusBadge(text: badge.text, status: badge.status)
+                }
             }
             .togglesDisclosure($showAdvancedTrust)
         }
@@ -366,51 +607,32 @@ struct TrustCenterView: View {
 
     private var safetyBoundariesPanel: some View {
         NativePanel(title: "Safety Boundaries", systemImage: "exclamationmark.shield", tint: .orange) {
-            TrustBoundaryRow(
-                title: "Self-improvement",
-                detail: "Automatic improvement writes inside NativeAgent-owned data and worktree paths. User-directed computer work uses the Trust Center workspace policy.",
-                systemImage: "wand.and.stars"
+            let state = TrustSafetyBoundariesPresentation.state(
+                policy: appModel.trustPolicy,
+                accessMode: agentAccessMode
             )
-            TrustBoundaryRow(
-                title: "Runnable tools",
-                detail: "Generated tools stay proposed until validation passes. Failed or risky tools can be quarantined without loading them into every prompt.",
-                systemImage: "hammer"
-            )
-            TrustBoundaryRow(
-                title: "Receipts",
-                detail: "Chat context, tool decisions, backups, and repair checks leave local receipts so the app can explain what happened later.",
-                systemImage: "doc.text.magnifyingglass"
-            )
+            if let unavailable = state.unavailableMessage {
+                Label(unavailable, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            } else {
+                ForEach(state.rows) { boundary in
+                    TrustBoundaryRow(
+                        title: boundary.title,
+                        detail: boundary.detail,
+                        systemImage: boundary.systemImage,
+                        tone: boundary.tone
+                    )
+                }
+            }
         }
     }
 
     private var privacyMapPanel: some View {
-        NativePanel(title: "Privacy Map", systemImage: "map") {
-            if let root = appModel.trustPolicy?.appDataRoot ?? appModel.privacyMap?.dataRoot {
-                // ui-taste-sweep 2026-06-07: was exposing the full
-                // /Users/<home>/Library/... path. Tildify it; raw
-                // path lives in tooltip for power users.
-                Text(UserDisplayFormatters.tildifyPath(root))
-                    .font(NativeAgentFont.mono)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .textSelection(.enabled)
-                    .help(root)
-            }
-            if let map = appModel.privacyMap {
-                Text("Generated \(map.generatedAt)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                ForEach(map.categories) { category in
-                    PrivacyCategoryRow(category: category)
-                }
-            } else {
-                Text("Privacy map has not loaded yet.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
+        PrivacyMapPanel(
+            trustPolicyRoot: appModel.trustPolicy?.appDataRoot,
+            privacyMap: appModel.privacyMap
+        )
     }
 
     private var simulatorPanel: some View {
@@ -422,13 +644,25 @@ struct TrustCenterView: View {
                     Task { await appModel.simulatePolicy(action: "file_write", path: simulationPath) }
                 }
             }
-            if let simulation = appModel.policySimulation {
+            if let failure = appModel.policySimulationFailure {
+                Label("Simulation Unavailable", systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.orange)
+                Text(failure)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if let simulation = appModel.policySimulation {
+                let verdict = PolicySimulationVerdict(simulation: simulation)
                 HStack {
                     Label(
-                        simulation.allowed ? (simulation.requiresApproval ? "Allowed With Approval" : "Allowed") : "Denied",
-                        systemImage: simulation.allowed ? "checkmark.circle" : "xmark.octagon"
+                        verdict.title,
+                        systemImage: verdict.systemImage
                     )
-                    .foregroundStyle(simulation.allowed ? .green : .red)
+                    .foregroundStyle(
+                        verdict == .allowed ? .green
+                            : verdict == .approvalRequired ? .orange
+                            : verdict == .unavailable ? .orange
+                            : .red
+                    )
                     StatusBadge(text: "Risk \(simulation.risk)", status: simulation.risk)
                 }
                 ForEach(simulation.reasons, id: \.self) { reason in
@@ -436,6 +670,9 @@ struct TrustCenterView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                Text("This is a saved-policy decision only. It does not execute a write or verify macOS privacy/TCC access.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -603,19 +840,21 @@ struct TrustCenterView: View {
 
     private func confirmPendingFullMacPolicy() {
         if pendingPermissionLevel == "full_mac_os" {
-            let destructiveMode = developerMode
+            isApplyingPolicy = true
             agentAccessMode = "full"
             permissionLevel = "full_mac_os"
             autonomyDefault = "workspace_autonomous"
             requireBackups = false
             outsideDefault = "allow"
-            developerMode = destructiveMode
             appModel.chatFileAccess = "full"
             Task { @MainActor in
-                await appModel.saveAgentAccessMode("full", developerMode: destructiveMode)
-                if let policy = appModel.trustPolicy {
-                    applyPolicy(policy)
-                }
+                settleTrustPreset(
+                    await TrustPolicyPresetAction.apply(
+                        .fullMac,
+                        appModel: appModel,
+                        fullMacConfirmed: true
+                    )
+                )
             }
         } else {
             Task { @MainActor in
@@ -646,65 +885,39 @@ struct TrustCenterView: View {
     }
 
     private func applyTrustPreset(_ preset: TrustPolicyPreset) {
+        let plan = preset.plan
         isApplyingPolicy = true
-        switch preset {
-        case .safe:
-            agentAccessMode = "read_only"
-            permissionLevel = "strict"
-            autonomyDefault = "supervised"
-            requireBackups = true
-            outsideDefault = "deny"
-            developerMode = false
-        case .work:
-            agentAccessMode = "workspace"
-            permissionLevel = "balanced"
-            autonomyDefault = "workspace_autonomous"
-            requireBackups = true
-            outsideDefault = "deny"
-            developerMode = false
-        case .builder:
-            agentAccessMode = "workspace"
-            permissionLevel = "balanced"
-            autonomyDefault = "workspace_autonomous"
-            requireBackups = true
-            outsideDefault = "ask"
-            developerMode = false
-        case .fullMac:
-            agentAccessMode = appModel.trustPolicy.map { accessMode(from: $0) } ?? AppModel.normalizedAgentAccessMode(appModel.chatFileAccess)
-            permissionLevel = "full_mac_os"
-            autonomyDefault = "workspace_autonomous"
-            requireBackups = false
-            outsideDefault = "allow"
-            developerMode = false
-            pendingPermissionLevel = "full_mac_os"
-            pendingOutsideDefault = "allow"
-            isApplyingPolicy = false
-            showFullMacAlert = true
-            return
-        }
-        let selectedMode = agentAccessMode
-        isApplyingPolicy = false
+        permissionLevel = plan.permissionLevel
+        autonomyDefault = plan.autonomyDefault
+        requireBackups = plan.requireBackups
+        outsideDefault = plan.outsideDefault
+        developerMode = plan.developerMode
+        pendingPermissionLevel = plan.permissionLevel
+        pendingOutsideDefault = plan.outsideDefault
+
+        agentAccessMode = plan.agentAccessMode
         Task {
-            if selectedMode == "full" || preset == .safe || preset == .work {
-                await appModel.saveAgentAccessMode(selectedMode, developerMode: false)
-            } else {
-                // W1(a) 2026-08-11 (upgrade campaign; boarded 2026-07-23 as
-                // F5-H1): .builder previously saved ONLY the trust knobs.
-                // saveTrustPolicy writes no macControlPolicy block and the
-                // server merge is deep, so Full Mac -> Builder silently kept
-                // applescript/jxa/accessibility authority and an empty
-                // approval_required_for behind a "Power tools gated" label.
-                // Write the ABSOLUTE access-mode policy for the preset's mode
-                // first, then the remaining trust knobs.
-                await appModel.saveAgentAccessMode(selectedMode, developerMode: false)
-                await appModel.saveTrustPolicy(
-                    permissionLevel: permissionLevel,
-                    autonomyDefault: autonomyDefault,
-                    requireBackups: requireBackups,
-                    outsideDefault: outsideDefault,
-                    developerMode: developerMode
+            settleTrustPreset(
+                await TrustPolicyPresetAction.apply(
+                    preset,
+                    appModel: appModel
                 )
-            }
+            )
+        }
+    }
+
+    @MainActor
+    private func settleTrustPreset(_ outcome: TrustPolicyPresetAction.Outcome) {
+        isApplyingPolicy = false
+        appModel.statusText = TrustPolicyPresetActionPresentation.statusText(for: outcome)
+        switch outcome {
+        case .confirmationRequired:
+            agentAccessMode = appModel.trustPolicy.map { accessMode(from: $0) }
+                ?? AppModel.normalizedAgentAccessMode(appModel.chatFileAccess)
+            showFullMacAlert = true
+        case .applied(let policy):
+            applyPolicy(policy)
+        case .failed:
             if let policy = appModel.trustPolicy {
                 applyPolicy(policy)
             }
@@ -712,11 +925,232 @@ struct TrustCenterView: View {
     }
 }
 
-private enum TrustPolicyPreset {
+enum TrustPolicyPreset: CaseIterable, Equatable {
     case safe
     case work
     case builder
     case fullMac
+
+    var plan: TrustPolicyPresetPlan {
+        switch self {
+        case .safe:
+            TrustPolicyPresetPlan(
+                agentAccessMode: "read_only", permissionLevel: "strict",
+                autonomyDefault: "supervised", requireBackups: true,
+                outsideDefault: "deny", developerMode: false,
+                commit: .accessModeOnly, requiresFullMacConfirmation: false
+            )
+        case .work:
+            TrustPolicyPresetPlan(
+                agentAccessMode: "workspace", permissionLevel: "balanced",
+                autonomyDefault: "workspace_autonomous", requireBackups: true,
+                outsideDefault: "deny", developerMode: false,
+                commit: .accessModeOnly, requiresFullMacConfirmation: false
+            )
+        case .builder:
+            TrustPolicyPresetPlan(
+                agentAccessMode: "workspace", permissionLevel: "balanced",
+                autonomyDefault: "workspace_autonomous", requireBackups: true,
+                outsideDefault: "ask", developerMode: false,
+                commit: .accessModeThenTrustPolicy, requiresFullMacConfirmation: false
+            )
+        case .fullMac:
+            TrustPolicyPresetPlan(
+                agentAccessMode: "full", permissionLevel: "full_mac_os",
+                autonomyDefault: "workspace_autonomous", requireBackups: false,
+                outsideDefault: "allow", developerMode: false,
+                commit: .accessModeOnly, requiresFullMacConfirmation: true
+            )
+        }
+    }
+}
+
+/// The privacy map's visible state is derived only from the root-scoped map
+/// returned by Trust's reader. It keeps a pending read distinct from a loaded
+/// map whose categories happen to be empty.
+enum PrivacyMapPanelPresentation {
+    struct Category: Identifiable, Equatable {
+        let source: PrivacyCategory
+
+        var id: String { source.id }
+        var protectionLabel: String { source.exportable ? "Exportable" : "Protected" }
+        var protectionStatus: String { source.exportable ? "ok" : "warn" }
+    }
+
+    struct Loaded: Equatable {
+        let root: String
+        let generatedAt: String
+        let categories: [Category]
+    }
+
+    enum State: Equatable {
+        case pending
+        case loaded(Loaded)
+    }
+
+    static func resolve(trustPolicyRoot: String?, privacyMap: PrivacyMap?) -> State {
+        guard let privacyMap else { return .pending }
+        return .loaded(Loaded(
+            root: trustPolicyRoot ?? privacyMap.dataRoot,
+            generatedAt: privacyMap.generatedAt,
+            categories: privacyMap.categories.map(Category.init(source:))
+        ))
+    }
+}
+
+struct PrivacyMapPanel: View {
+    let trustPolicyRoot: String?
+    let privacyMap: PrivacyMap?
+
+    private var presentation: PrivacyMapPanelPresentation.State {
+        PrivacyMapPanelPresentation.resolve(
+            trustPolicyRoot: trustPolicyRoot,
+            privacyMap: privacyMap
+        )
+    }
+
+    var body: some View {
+        NativePanel(title: "Privacy Map", systemImage: "map") {
+            switch presentation {
+            case .pending:
+                Text("Privacy map has not loaded yet.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .loaded(let map):
+                Text(UserDisplayFormatters.tildifyPath(map.root))
+                    .font(NativeAgentFont.mono)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+                    .help(map.root)
+                Text("Generated \(map.generatedAt)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                ForEach(map.categories) { category in
+                    PrivacyMapPanelCategoryRow(category: category)
+                }
+            }
+        }
+    }
+}
+
+private struct PrivacyMapPanelCategoryRow: View {
+    let category: PrivacyMapPanelPresentation.Category
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: category.source.exportable ? "square.and.arrow.up" : "lock.fill")
+                .foregroundStyle(category.source.exportable ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.orange))
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack {
+                    Text(category.source.title)
+                        .font(.subheadline.weight(.semibold))
+                    StatusBadge(text: category.protectionLabel, status: category.protectionStatus)
+                }
+                Text(category.source.contains)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text(category.source.path)
+                    .font(NativeAgentFont.mono)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer()
+        }
+        .textSelection(.enabled)
+    }
+}
+
+struct TrustPolicyPresetPlan: Equatable {
+    enum Commit: Equatable {
+        case accessModeOnly
+        case accessModeThenTrustPolicy
+    }
+
+    let agentAccessMode: String
+    let permissionLevel: String
+    let autonomyDefault: String
+    let requireBackups: Bool
+    let outsideDefault: String
+    let developerMode: Bool
+    let commit: Commit
+    let requiresFullMacConfirmation: Bool
+}
+
+enum TrustPolicyPresetTransition: Equatable {
+    case apply(TrustPolicyPresetPlan)
+    case confirmationRequired(TrustPolicyPresetPlan)
+
+    static func request(_ preset: TrustPolicyPreset) -> Self {
+        let plan = preset.plan
+        return plan.requiresFullMacConfirmation
+            ? .confirmationRequired(plan)
+            : .apply(plan)
+    }
+}
+
+/// One authoritative preset action for Trust's visible buttons. The action
+/// owns both write phases for Builder and refuses to enter Full Mac without
+/// the explicit confirmation transition.
+@MainActor
+enum TrustPolicyPresetAction {
+    enum Outcome {
+        case confirmationRequired(TrustPolicyPresetPlan)
+        case applied(TrustPolicy)
+        case failed(String)
+    }
+
+    static func apply(
+        _ preset: TrustPolicyPreset,
+        appModel: AppModel,
+        fullMacConfirmed: Bool = false
+    ) async -> Outcome {
+        let plan = preset.plan
+        if case .confirmationRequired = TrustPolicyPresetTransition.request(preset), !fullMacConfirmed {
+            return .confirmationRequired(plan)
+        }
+
+        guard await appModel.saveAgentAccessMode(
+            plan.agentAccessMode,
+            developerMode: plan.developerMode
+        ) else {
+            return .failed(appModel.statusText)
+        }
+        if plan.commit == .accessModeThenTrustPolicy {
+            let trustPolicySaved = await appModel.saveTrustPolicy(
+                permissionLevel: plan.permissionLevel,
+                autonomyDefault: plan.autonomyDefault,
+                requireBackups: plan.requireBackups,
+                outsideDefault: plan.outsideDefault,
+                developerMode: plan.developerMode
+            )
+            guard trustPolicySaved else {
+                return .failed(appModel.statusText)
+            }
+        }
+        guard let policy = appModel.trustPolicy else {
+            return .failed("The preset write completed without a readable Trust policy.")
+        }
+        return .applied(policy)
+    }
+}
+
+enum TrustPolicyPresetActionPresentation {
+    static func statusText(for outcome: TrustPolicyPresetAction.Outcome) -> String {
+        switch outcome {
+        case .confirmationRequired:
+            return "Full Mac access needs confirmation."
+        case .applied:
+            return "Trust preset applied."
+        case .failed(let detail):
+            return detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "Trust preset could not be applied."
+                : detail
+        }
+    }
 }
 
 // MARK: - Full Mac session panel (2026-06-10)
@@ -893,44 +1327,45 @@ private struct PolicyMapView: View {
     var activeMode: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            PolicyMapRow(mode: "auto", title: "Auto", activeMode: activeMode, files: "read", shell: false, macControl: policy?.macControlPolicy?.enabled == true, iosRemote: false, autonomy: "supervised")
-            PolicyMapRow(mode: "read_only", title: "Read", activeMode: activeMode, files: "read", shell: false, macControl: false, iosRemote: false, autonomy: "supervised")
-            PolicyMapRow(mode: "workspace", title: "Workspace", activeMode: activeMode, files: "workspace", shell: policy?.macControlPolicy?.shellAllowed == true, macControl: policy?.macControlPolicy?.enabled == true, iosRemote: policy?.macControlPolicy?.remoteFromIosAllowed == true, autonomy: "workspace")
-            PolicyMapRow(mode: "full", title: "Full Mac", activeMode: activeMode, files: "all", shell: policy?.macControlPolicy?.shellAllowed == true, macControl: policy?.macControlPolicy?.enabled == true, iosRemote: policy?.macControlPolicy?.remoteFromIosAllowed == true, autonomy: "full")
+        switch TrustPolicyMapPresentation.resolve(policy: policy, activeMode: activeMode) {
+        case .policyUnavailable:
+            Label(
+                "Current policy is unavailable, so NativeAgent cannot safely describe what these modes allow yet.",
+                systemImage: "exclamationmark.triangle.fill"
+            )
+            .font(.caption)
+            .foregroundStyle(.orange)
+        case let .rows(rows):
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(rows) { row in
+                    PolicyMapRow(row: row)
+                }
+            }
         }
     }
 }
 
 private struct PolicyMapRow: View {
-    var mode: String
-    var title: String
-    var activeMode: String
-    var files: String
-    var shell: Bool
-    var macControl: Bool
-    var iosRemote: Bool
-    var autonomy: String
+    let row: TrustPolicyMapRow
 
-    private var isActive: Bool { AppModel.normalizedAgentAccessMode(activeMode) == mode }
-    private var tint: Color { mode == "full" ? .red : (isActive ? .blue : .secondary) }
+    private var tint: Color { row.mode == "full" ? .red : (row.isActive ? .blue : .secondary) }
 
     var body: some View {
         Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
             GridRow {
-                Label(title, systemImage: isActive ? "largecircle.fill.circle" : "circle")
+                Label(row.title, systemImage: row.isActive ? "largecircle.fill.circle" : "circle")
                     .font(NativeAgentFont.section)
                     .foregroundStyle(tint)
                     .gridColumnAlignment(.leading)
-                policyChip(files, systemImage: "folder")
-                policyChip(shell ? "shell" : "no shell", systemImage: "terminal", enabled: shell)
-                policyChip(macControl ? "mac" : "no mac", systemImage: "macbook", enabled: macControl)
-                policyChip(iosRemote ? "iOS" : "no iOS", systemImage: "iphone", enabled: iosRemote)
-                policyChip(autonomy, systemImage: "wand.and.stars")
+                policyChip(row.files, systemImage: "folder")
+                policyChip(row.shellAllowed ? "shell" : "no shell", systemImage: "terminal", enabled: row.shellAllowed)
+                policyChip(row.macControlAllowed ? "mac" : "no mac", systemImage: "macbook", enabled: row.macControlAllowed)
+                policyChip(row.iosRemoteAllowed ? "iOS" : "no iOS", systemImage: "iphone", enabled: row.iosRemoteAllowed)
+                policyChip(row.autonomy, systemImage: "wand.and.stars")
             }
         }
         .padding(10)
-        .background(isActive ? tint.opacity(0.09) : Color.clear, in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous))
+        .background(row.isActive ? tint.opacity(0.09) : Color.clear, in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous))
     }
 
     private func policyChip(_ text: String, systemImage: String, enabled: Bool = true) -> some View {

@@ -35,7 +35,7 @@ extension iCloudSyncEngine {
         isSetUp = true
         let fm = FileManager.default
         if prefersCloudKitSnapshotCache {
-            let root = Self.cloudKitCacheRoot()
+            let root = cloudKitCacheRoot()
             snapshotDir = root.appendingPathComponent(Folder.snapshots)
             inboxDir = nil
             responsesDir = root.appendingPathComponent(Folder.responses)
@@ -99,7 +99,7 @@ extension iCloudSyncEngine {
             name: NSUbiquitousKeyValueStore.didChangeExternallyNotification,
             object: kvs
         )
-        let root = Self.cloudKitCacheRoot()
+        let root = cloudKitCacheRoot()
         let snapshots = root.appendingPathComponent("snapshots", isDirectory: true)
         let responses = root.appendingPathComponent("responses", isDirectory: true)
         let transactions = root.appendingPathComponent("transactions", isDirectory: true)
@@ -127,7 +127,7 @@ extension iCloudSyncEngine {
                 value,
                 expectedGroup: group
             )
-            let directory = Self.cloudKitSnapshotCacheDirectory()
+            let directory = cloudKitSnapshotCacheDirectory()
             try await Task.detached(priority: .utility) {
                 let fm = FileManager.default
                 try fm.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -150,11 +150,14 @@ extension iCloudSyncEngine {
         }
     }
 
-    nonisolated private static func cloudKitSnapshotCacheDirectory() -> URL {
+    private func cloudKitSnapshotCacheDirectory() -> URL {
         cloudKitCacheRoot().appendingPathComponent("snapshots", isDirectory: true)
     }
 
-    nonisolated private static func cloudKitCacheRoot() -> URL {
+    private func cloudKitCacheRoot() -> URL {
+        if let cloudKitSnapshotCacheRootOverride {
+            return cloudKitSnapshotCacheRootOverride
+        }
         let root = FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask

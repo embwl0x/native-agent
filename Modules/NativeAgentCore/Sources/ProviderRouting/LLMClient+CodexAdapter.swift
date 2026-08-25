@@ -277,7 +277,34 @@ public final class CodexAdapter: LLMAdapter {
         self.timeout = timeout
         self.runner = runner
         self.streamingRunner = streamingRunner
-        self.processEnvironmentOverride = processEnvironmentOverride
+        // GUI-launched applications inherit a minimal PATH, while the device
+        // login surface intentionally finds Codex in Homebrew/npm locations.
+        // Use the same practical resolution rule for execution so "signed in"
+        // cannot be followed by an avoidable ENOENT on the first real turn.
+        // An injected environment remains exact for tests and controlled runs.
+        self.processEnvironmentOverride = processEnvironmentOverride ?? Self.augmentedProcessEnvironment()
+    }
+
+    static func augmentedProcessEnvironment(
+        base: [String: String] = ProcessInfo.processInfo.environment
+    ) -> [String: String] {
+        var environment = base
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let additions = [
+            "\(home)/.local/bin",
+            "\(home)/bin",
+            "\(home)/.cargo/bin",
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin",
+        ]
+        let inherited = (base["PATH"] ?? "").split(separator: ":").map(String.init)
+        var seen = Set<String>()
+        environment["PATH"] = (additions + inherited).filter { seen.insert($0).inserted }.joined(separator: ":")
+        return environment
     }
 
     public func complete(prompt: String, system: String?, model: String) async throws -> String {

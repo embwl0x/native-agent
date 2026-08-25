@@ -40,7 +40,26 @@ import Skills
 import Connectors
 import Browser
 
+private enum NextGenStatusFeedAvailability: Equatable {
+    case absent
+    case measured
+    case unavailable
+}
+
 extension NativeClient {
+    /// All NextGen status projections must read the same root as the client
+    /// that mounted them. Falling back to the process default here made an
+    /// isolated panel quietly render somebody else's empty/healthy snapshot.
+    private var nextGenStatusDataRoot: URL {
+        dataRootOverride ?? PersistenceCore.defaultDataRoot()
+    }
+
+    private var nextGenPhasesPath: URL {
+        nextGenStatusDataRoot
+            .appendingPathComponent("runtime", isDirectory: true)
+            .appendingPathComponent("nextgen_phases.json")
+    }
+
     func getNextGenSummary() async throws -> NextGenSummary {
         let phases = try await getNextGenPhases()
         let receipts = try await getNextGenReceipts()
@@ -55,7 +74,11 @@ extension NativeClient {
         } ?? sortedPhases.last
         let phaseNumbers = sortedPhases.compactMap(\.phaseNumber)
         let status: String = {
-            guard !sortedPhases.isEmpty else { return "unavailable" }
+            guard !sortedPhases.isEmpty else {
+                return FileManager.default.fileExists(atPath: nextGenPhasesPath.path)
+                    ? "unavailable"
+                    : "unmeasured"
+            }
             return readyPhases.count == sortedPhases.count ? "ready" : "warn"
         }()
         var obj: [String: Any] = [
@@ -83,10 +106,9 @@ extension NativeClient {
 
     func getNextGenPhases() async throws -> [NextGenPhase] {
         // DAEMON-KILL P1: read <dataRoot>/runtime/nextgen_phases.json.
-        let path = PersistenceCore.defaultDataRoot()
-            .appendingPathComponent("runtime", isDirectory: true)
-            .appendingPathComponent("nextgen_phases.json")
-        guard let data = try? Data(contentsOf: path) else { return [] }
+        let path = nextGenPhasesPath
+        guard FileManager.default.fileExists(atPath: path.path) else { return [] }
+        let data = try Data(contentsOf: path)
         let decoder = JSONDecoder.nativeAgent
         if let response = try? decoder.decode(NextGenPhasesResponse.self, from: data) {
             return response.phases
@@ -94,11 +116,15 @@ extension NativeClient {
         if let phases = try? decoder.decode([NextGenPhase].self, from: data) {
             return phases
         }
-        return []
+        throw NSError(
+            domain: "NativeAgentNextGenStatus",
+            code: -422,
+            userInfo: [NSLocalizedDescriptionKey: "next-gen phase feed is malformed"]
+        )
     }
 
     func getNextGenReceipts() async throws -> [NextGenReceipt] {
-        let root = PersistenceCore.defaultDataRoot()
+        let root = nextGenStatusDataRoot
         let paths = [
             root
                 .appendingPathComponent("nextgen", isDirectory: true)
@@ -169,7 +195,7 @@ extension NativeClient {
         // Browser dry-run already appends here; the legacy `native_actions/`
         // path was stale and made the Native Power panel miss real Swift
         // receipts.
-        return tailJSONL(path: Self.nativeActionReceiptsPath(), limit: 50)
+        return tailJSONL(path: Self.nativeActionReceiptsPath(dataRoot: nextGenStatusDataRoot), limit: 50)
     }
 
     func getNotificationStatus() async throws -> NotificationRuntimeStatus {
@@ -182,19 +208,41 @@ extension NativeClient {
         // appends to receipts.jsonl (atomic line append) and read_json's the
         // approvals file (its R-M-W is approvals_lock-guarded + write_json is
         // tmp+os.replace atomic), so a status read never sees a torn file — no
-        // flock prereq. If the native reader has no data yet, return the empty
-        // ready envelope below.
-        let client = makeNotificationStatus()
+        // flock prereq. A root with neither authoritative feed is unmeasured,
+        // not a ready zero-count runtime.
+        let root = nextGenStatusDataRoot
+        let receiptsPath = root
+            .appendingPathComponent("native_power", isDirectory: true)
+            .appendingPathComponent("notifications", isDirectory: true)
+            .appendingPathComponent("receipts.jsonl")
+        let approvalsPath = root
+            .appendingPathComponent("workflows", isDirectory: true)
+            .appendingPathComponent("approvals", isDirectory: true)
+            .appendingPathComponent("requests.json")
+        let availability = Self.statusFeedAvailability([receiptsPath, approvalsPath])
+        guard availability == .measured else {
+            return NotificationRuntimeStatus(
+                status: availability == .absent ? "unmeasured" : "unavailable",
+                authorization: nil,
+                pendingApprovals: nil,
+                receiptCount: nil,
+                latestReceipt: nil,
+                createdAt: SwiftNativeManifestSigner.isoTimestamp(Date())
+            )
+        }
+        let client = SwiftNativeNotificationStatus(
+            receiptsPath: receiptsPath,
+            approvalsPath: approvalsPath
+        )
         if let envelope = await client.notificationStatus() {
             return try Self.decodeJSONValue(envelope, as: NotificationRuntimeStatus.self, context: "getNotificationStatus(swiftNative)")
         }
-        // Swift-native cutover sweep s3: native returned nil → degrade to a default
-        // ready envelope (matches the empty-state UI degraded by getBrowserStatus).
+        // A reader that cannot produce an envelope has not measured status.
         return NotificationRuntimeStatus(
-            status: "ready",
-            authorization: "app_requested",
-            pendingApprovals: 0,
-            receiptCount: 0,
+            status: "unmeasured",
+            authorization: nil,
+            pendingApprovals: nil,
+            receiptCount: nil,
             latestReceipt: nil,
             createdAt: SwiftNativeManifestSigner.isoTimestamp(Date())
         )
@@ -207,35 +255,68 @@ extension NativeClient {
         // approvedDomains and serves the same browser_status() envelope without
         // the HTTP round-trip. The reader is a PURE read (no write-back); the
         // daemon's run/cancel R-M-W of runs.json is flock-guarded this wave so a
-        // status read never sees a torn file. If the native reader has no data
-        // yet, return the empty idle envelope below.
-        let client = makeBrowserClient()
+        // status read never sees a torn file. A root with no browser run or
+        // receipt feed is unmeasured rather than an idle zero-count runtime.
+        let root = nextGenStatusDataRoot
+        let browserRoot = root
+            .appendingPathComponent("native_power", isDirectory: true)
+            .appendingPathComponent("browser", isDirectory: true)
+        let runsPath = browserRoot.appendingPathComponent("runs.json")
+        let receiptsPath = browserRoot.appendingPathComponent("receipts.jsonl")
+        let availability = Self.statusFeedAvailability([runsPath, receiptsPath])
+        guard availability == .measured else {
+            return BrowserRuntimeStatus(
+                status: availability == .absent ? "unmeasured" : "unavailable",
+                profilePath: nil,
+                sourcePath: nil,
+                screenshotPath: nil,
+                approvedDomains: nil,
+                domainPolicy: nil,
+                activeRuns: nil,
+                receiptCount: nil,
+                latestReceipt: nil,
+                createdAt: ISO8601DateFormatter().string(from: Date())
+            )
+        }
+        let client = makeBrowserClient(dataRoot: root)
         if let envelope = await client.browserStatus() {
             return try Self.decodeJSONValue(envelope, as: BrowserRuntimeStatus.self, context: "getBrowserStatus(swiftNative)")
         }
-        // DAEMON-KILL sweep-s1: when the native client returns nil (no
-        // browser data on disk yet), surface a clean "no activity" status
-        // so the BrowserView renders an empty state instead of an error.
+        // The read boundary could not establish browser status.
         return BrowserRuntimeStatus(
-            status: "idle",
+            status: "unmeasured",
             profilePath: nil,
             sourcePath: nil,
             screenshotPath: nil,
-            approvedDomains: [],
-            domainPolicy: "approval_risk_tiering",
-            activeRuns: [],
-            receiptCount: 0,
+            approvedDomains: nil,
+            domainPolicy: nil,
+            activeRuns: nil,
+            receiptCount: nil,
             latestReceipt: nil,
             createdAt: ISO8601DateFormatter().string(from: Date())
         )
     }
 
     func getMemoryVectorStatus() async throws -> MemoryVectorStatus {
-        // Read <dataRoot>/memory/vector_status.json if present, else return a
-        // synthetic unavailable status.
-        let path = PersistenceCore.defaultDataRoot()
+        // An absent feed is unmeasured. A present-but-unreadable feed is
+        // unavailable; neither state may impersonate a ready zero-count store.
+        let path = nextGenStatusDataRoot
             .appendingPathComponent("memory", isDirectory: true)
             .appendingPathComponent("vector_status.json")
+        guard FileManager.default.fileExists(atPath: path.path) else {
+            return MemoryVectorStatus(
+                status: "unmeasured",
+                provider: nil,
+                providerModel: nil,
+                providerConfigured: nil,
+                providerReason: "vector status has not been recorded for this data root",
+                dimensions: nil,
+                nodeCount: nil,
+                entityCount: nil,
+                updatedAt: nil,
+                createdAt: ISO8601DateFormatter().string(from: Date())
+            )
+        }
         if let data = try? Data(contentsOf: path),
            let decoded = try? JSONDecoder.nativeAgent.decode(MemoryVectorStatus.self, from: data) {
             return decoded
@@ -261,28 +342,32 @@ extension NativeClient {
         // backend reflects the live runtime snapshot — CoreML when MiniLM
         // loaded, mock when the user explicitly opted in (config or env),
         // fail-closed otherwise.
-        let dataRoot = PersistenceCore.defaultDataRoot()
+        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         var memCount = 0
         var activeCount = 0
         var pinnedCount = 0
         var pendingProposals: Int? = nil
-        if let storage = try? await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot) {
-            if let all = try? await storage.listMemories(persona: nil, status: nil, limit: nil) {
-                memCount = all.count
-                for m in all {
-                    if m.status == "active" { activeCount += 1 }
-                    // SQLite schema has no `pinned` column; updateMemory()
-                    // encodes the flag under metadata.pinned. Surface the
-                    // real count by inspecting the metadata blob.
-                    if case .object(let obj)? = m.metadata,
-                       case .bool(true)? = obj["pinned"] {
-                        pinnedCount += 1
-                    }
+        var storageReadable = false
+        do {
+            let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
+            let all = try await storage.listMemories(persona: nil, status: nil, limit: nil)
+            storageReadable = true
+            memCount = all.count
+            for m in all {
+                if m.status == "active" { activeCount += 1 }
+                // SQLite schema has no `pinned` column; updateMemory()
+                // encodes the flag under metadata.pinned. Surface the
+                // real count by inspecting the metadata blob.
+                if case .object(let obj)? = m.metadata,
+                   case .bool(true)? = obj["pinned"] {
+                    pinnedCount += 1
                 }
             }
             if let pending = try? await storage.listProposals(status: "pending") {
                 pendingProposals = pending.count
             }
+        } catch {
+            storageReadable = false
         }
         let modelId = await SwiftNativeMemoryV2.shared.embedderModelId()
         let dims = await SwiftNativeMemoryV2.shared.embedderDimensions()
@@ -312,9 +397,12 @@ extension NativeClient {
         }()
         // F2: surface hygiene_last_run.json so the UI can show "last run at X /
         // next ~24h" instead of an empty hygiene slot that reads as "never".
-        let hygieneReport = Self.readHygieneLastRun()
+        let hygieneReport = Self.readHygieneLastRun(dataRoot: dataRoot)
         return MemoryV2Status(
-            status: memCount > 0 ? "ready" : "empty",
+            // An unreadable store is not an empty store. The Memory screen
+            // uses this provenance to avoid claiming no memories are saved
+            // when the real reader could not establish a count.
+            status: storageReadable ? (memCount > 0 ? "ready" : "empty") : "unavailable",
             version: "swift-native",
             embedding: MemoryV2Embedding(
                 activeBackend: backend,
@@ -339,8 +427,8 @@ extension NativeClient {
     /// The on-disk payload varies (the audit harness writes `{"createdAt":…}`;
     /// the consolidation loop writes a fuller dict). Be tolerant: any
     /// recognizable timestamp is enough to flip the badge from empty.
-    static func readHygieneLastRun() -> MemoryHygieneReport? {
-        let path = PersistenceCore.defaultDataRoot()
+    static func readHygieneLastRun(dataRoot: URL = PersistenceCore.defaultDataRoot()) -> MemoryHygieneReport? {
+        let path = dataRoot
             .appendingPathComponent("memory")
             .appendingPathComponent("hygiene_last_run.json")
         guard let data = try? Data(contentsOf: path),
@@ -388,7 +476,7 @@ extension NativeClient {
         // DAEMON-DEAD PORT (2026-06-03): run the Swift MemoryV2 consolidator
         // as the manual hygiene path. It handles tombstones, duplicate proposal
         // merges, high-durability auto-accepts, and stale active-memory archive.
-        let root = PersistenceCore.defaultDataRoot()
+        let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
 
         if dryRun {
             let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: root)
@@ -446,7 +534,7 @@ extension NativeClient {
     }
 
     func connectorActionReceipts(limit: Int) -> [ConnectorActionReceipt] {
-        tailJSONL(path: Self.connectorActionReceiptsPath(), limit: limit)
+        tailJSONL(path: Self.connectorActionReceiptsPath(dataRoot: nextGenStatusDataRoot), limit: limit)
             .sorted { ($0.createdAt ?? "") > ($1.createdAt ?? "") }
     }
 
@@ -485,8 +573,8 @@ extension NativeClient {
         Set(connectorActionDescriptors().map(\.id))
     }
 
-    static func connectorActionReceiptsPath() -> URL {
-        PersistenceCore.defaultDataRoot()
+    static func connectorActionReceiptsPath(dataRoot: URL = PersistenceCore.defaultDataRoot()) -> URL {
+        dataRoot
             .appendingPathComponent("connectors", isDirectory: true)
             .appendingPathComponent("actions", isDirectory: true)
             .appendingPathComponent("receipts.jsonl")
@@ -501,21 +589,36 @@ extension NativeClient {
     }
 
     func getProductionHardening() async throws -> ProductionHardeningSummary {
-        // DAEMON-KILL P1: read <dataRoot>/runtime/hardening.json if present;
-        // otherwise return a neutral synthetic summary.
-        let path = PersistenceCore.defaultDataRoot()
+        // The hardening report is an operator-produced authority. A missing
+        // report means no report has been recorded; an existing unreadable or
+        // malformed report is unavailable and must never be presented as the
+        // same neutral state. Keep the report on the client's injected root so
+        // the mounted panel, export action, and reload all agree on one store.
+        let path = (dataRootOverride ?? PersistenceCore.defaultDataRoot())
             .appendingPathComponent("runtime", isDirectory: true)
             .appendingPathComponent("hardening.json")
-        if let data = try? Data(contentsOf: path),
-           let decoded = try? JSONDecoder.nativeAgent.decode(ProductionHardeningSummary.self, from: data) {
-            return decoded
+        let now = ISO8601DateFormatter().string(from: Date())
+        guard FileManager.default.fileExists(atPath: path.path) else {
+            return ProductionHardeningSummary(
+                status: "unknown",
+                release: nil,
+                doctorStatus: nil,
+                createdAt: now,
+                detail: "No production hardening report has been recorded for this data root."
+            )
         }
-        return ProductionHardeningSummary(
-            status: "unknown",
-            release: nil,
-            doctorStatus: nil,
-            createdAt: ISO8601DateFormatter().string(from: Date())
-        )
+        do {
+            let data = try Data(contentsOf: path)
+            return try JSONDecoder.nativeAgent.decode(ProductionHardeningSummary.self, from: data)
+        } catch {
+            return ProductionHardeningSummary(
+                status: "unavailable",
+                release: nil,
+                doctorStatus: nil,
+                createdAt: now,
+                detail: "Could not read production hardening report: \(error.localizedDescription)"
+            )
+        }
     }
 
     func getProductionExports() async throws -> [ProductionExport] {
@@ -525,7 +628,11 @@ extension NativeClient {
         // to a list, sorts by createdAt DESC — byte-accurate against
         // list_production_exports. READ-ONLY, so no
         // flock prereq.
-        let impl = makeProductionExportsClient()
+        let registryPath = (dataRootOverride ?? PersistenceCore.defaultDataRoot())
+            .appendingPathComponent("production", isDirectory: true)
+            .appendingPathComponent("exports", isDirectory: true)
+            .appendingPathComponent("registry.json")
+        let impl = SwiftNativeProductionExportsClient(registryPath: registryPath)
         let receipts = try await impl.listExports()
         let data = try JSONValue.array(receipts.map { $0.toJSON() }).serializedData(pretty: false)
         return try JSONDecoder().decode([ProductionExport].self, from: data)
@@ -534,11 +641,65 @@ extension NativeClient {
     // FIX: high-traffic lists use lossy decode so one malformed element doesn't
     // nuke the whole list (drops + logs the bad element instead).
     func getActivity() async throws -> [ActivityEvent] {
+        try await getActivity(root: dataRootOverride ?? PersistenceCore.defaultDataRoot())
+    }
+
+    /// Reads the exact activity ledger used by the Status screen. Keeping the
+    /// root injectable lets a hermetic caller verify the production decoder
+    /// and chronological tail without consulting personal runtime state.
+    func getActivity(root: URL) async throws -> [ActivityEvent] {
         // DAEMON-KILL P1: tail of <dataRoot>/activity/events.jsonl.
-        let path = PersistenceCore.defaultDataRoot()
+        let path = root
             .appendingPathComponent("activity", isDirectory: true)
             .appendingPathComponent("events.jsonl")
-        return tailJSONL(path: path, limit: 200)
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: path.path) else { return [] }
+        let attributes = try fileManager.attributesOfItem(atPath: path.path)
+        let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
+        guard size > 0 else { return [] }
+
+        let maximumBytes = UInt64(1_048_576)
+        let count = min(size, maximumBytes)
+        let startsMidFile = size > count
+        let handle = try FileHandle(forReadingFrom: path)
+        defer { try? handle.close() }
+        if startsMidFile {
+            try handle.seek(toOffset: size - count)
+        }
+        let data = handle.readData(ofLength: Int(count))
+        let lines = Self.decodeTailLines(data, dropFirstPartial: startsMidFile)
+        let tail = lines.suffix(200).map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+        }.filter { !$0.isEmpty }
+        guard !tail.isEmpty else { return [] }
+
+        let decoder = JSONDecoder.nativeAgent
+        let events = tail.compactMap { line -> ActivityEvent? in
+            guard let data = line.data(using: .utf8) else { return nil }
+            return try? decoder.decode(ActivityEvent.self, from: data)
+        }
+        guard !events.isEmpty else {
+            throw NSError(
+                domain: "NativeAgentActivity",
+                code: -422,
+                userInfo: [NSLocalizedDescriptionKey: "activity ledger contains no readable event records"]
+            )
+        }
+        return events
+    }
+
+    private static func statusFeedAvailability(_ paths: [URL]) -> NextGenStatusFeedAvailability {
+        let fileManager = FileManager.default
+        var foundEvidence = false
+        for path in paths where fileManager.fileExists(atPath: path.path) {
+            foundEvidence = true
+            guard let attributes = try? fileManager.attributesOfItem(atPath: path.path),
+                  (attributes[.type] as? FileAttributeType) == .typeRegular,
+                  fileManager.isReadableFile(atPath: path.path) else {
+                return .unavailable
+            }
+        }
+        return foundEvidence ? .measured : .absent
     }
 
     // WAVE 37 (2026-06-02) W20 §6.159: single construction point for the

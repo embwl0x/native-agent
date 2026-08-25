@@ -48,13 +48,40 @@ extension NativeClient {
         // coverage for the systems named by Doctor's UI; these are local state
         // reads only and never call a provider, Telegram, search, or a tool.
         let impl = makeDoctorChecks()
-        let results = try await impl.runAll(repair: repair, checkLLM: true)
+        let initialResults = try await impl.runAll(repair: false, checkLLM: true)
+        let initialChecks = initialResults.map {
+            DoctorCheck(id: $0.id, title: $0.title, status: $0.status, detail: $0.detail, repair: $0.repair)
+        }
+        var repairReceipts: [DoctorCheck] = []
+        if repair {
+            // Never call `runAll(repair: true)`: that invokes every repairable
+            // check, including maintenance with no reported issue. This path
+            // executes only rows that offered an explicit app-owned safe repair
+            // in the fresh preflight report.
+            for id in DoctorSafeRepairIssuesPresentation.plan(for: initialChecks).checkIDs {
+                if let receipt = try await impl.runCheck(id: id, repair: true) {
+                    repairReceipts.append(DoctorCheck(
+                        id: receipt.id,
+                        title: receipt.title,
+                        status: receipt.status,
+                        detail: receipt.detail,
+                        repair: receipt.repair
+                    ))
+                }
+            }
+        }
+        let results: [CheckResult]
+        if repair {
+            results = try await impl.runAll(repair: false, checkLLM: true)
+        } else {
+            results = initialResults
+        }
         let coreChecks = results.map {
             DoctorCheck(id: $0.id, title: $0.title, status: $0.status, detail: $0.detail, repair: $0.repair)
         }
         let checks = coreChecks + (await liveDoctorCoverageChecks())
         let rollup = Self.doctorRollup(checks.map(\.status))
-        let repaired = repair && checks.contains { ($0.repair ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false }
+        let repaired = repair && DoctorSafeRepairIssuesPresentation.appliedRepairCount(in: repairReceipts) > 0
         return DoctorReport(status: rollup, repaired: repaired, checks: checks)
     }
 
@@ -69,8 +96,40 @@ extension NativeClient {
 
     private func providerDoctorCoverageCheck() async -> DoctorCheck {
         do {
-            let providers = try await listProviders()
-            return Self.providerDoctorCoverageCheck(providers)
+            let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+            let providers = try await listProviders(
+                dataRoot: dataRoot,
+                authEnvironment: ProcessInfo.processInfo.environment
+            )
+            let registryCheck = Self.providerDoctorCoverageCheck(providers)
+            switch LLMProviderStatusFeed.read(dataRoot: dataRoot) {
+            case .current:
+                return registryCheck
+            case .stale(let record):
+                return DoctorCheck(
+                    id: "live.providers",
+                    title: "Providers and OAuth",
+                    status: "warn",
+                    detail: "\(registryCheck.detail) Last native provider check for \(record.providerID ?? "an unknown provider") is stale.",
+                    repair: "Open Providers and run Test Connection."
+                )
+            case .unavailable(let detail):
+                return DoctorCheck(
+                    id: "live.providers",
+                    title: "Providers and OAuth",
+                    status: "warn",
+                    detail: "\(registryCheck.detail) Reachability is unmeasured: \(Self.safeDoctorDetail(detail))",
+                    repair: "Open Providers and run Test Connection when a native probe is available."
+                )
+            case .failed(let detail):
+                return DoctorCheck(
+                    id: "live.providers",
+                    title: "Providers and OAuth",
+                    status: "fail",
+                    detail: "The last native provider check failed: \(Self.safeDoctorDetail(detail))",
+                    repair: "Open Providers, repair authentication or connectivity, then run Test Connection."
+                )
+            }
         } catch {
             return DoctorCheck(
                 id: "live.providers", title: "Providers and OAuth", status: "fail",

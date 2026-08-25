@@ -41,6 +41,14 @@ import Skills
 import Connectors
 import Browser
 
+/// A production export is successful only after the archive and its persisted
+/// registry receipt agree. Creating an archive alone is not enough for the UI
+/// to tell a person that it is ready to use.
+enum ProductionExportCreationOutcome: Equatable {
+    case verified(ProductionExport)
+    case failed(support: Bool, detail: String)
+}
+
 @MainActor
 extension AppModel {
     @MainActor
@@ -58,39 +66,121 @@ extension AppModel {
     @MainActor
     func refreshGraph() async {
         do {
-            agentGraph = try await client.getAgentGraph()
-            graphEntities = try await client.getGraphEntities()
-            graphStatus = try await client.getGraphStatus()
+            let read = try await client.getKnowledgeGraphViewRead()
+            agentGraph = read.agentGraph
+            graphEntities = read.entities
+            graphStatus = read.status
+            graphLoadError = nil
             statusText = "Knowledge graph refreshed"
         } catch {
+            graphLoadError = error.localizedDescription
             statusText = "Knowledge graph refresh failed: \(error.localizedDescription)"
         }
     }
 
     @MainActor
-    func runResearchLab(objective: String) async {
+    @discardableResult
+    func runResearchLab(objective: String) async -> ResearchLabActionOutcome {
         let trimmed = objective.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty else {
+            let outcome = ResearchLabActionOutcome.rejected("Enter a research objective before starting a run.")
+            statusText = CapabilitiesResearchLabPresentation.message(for: outcome).text
+            return outcome
+        }
         do {
-            _ = try await client.runResearchLab(objective: trimmed)
-            statusText = "Research lab run recorded"
-            await refreshAll()
+            let run = try await client.runResearchLab(objective: trimmed)
+            researchLabRuns.removeAll { $0.id == run.id }
+            researchLabRuns.insert(run, at: 0)
+            let outcome = ResearchLabActionOutcome.recorded(run)
+            statusText = CapabilitiesResearchLabPresentation.message(for: outcome).text
+            return outcome
         } catch {
-            statusText = "Research lab failed: \(error.localizedDescription)"
+            let outcome = ResearchLabActionOutcome.failed(error.localizedDescription)
+            statusText = CapabilitiesResearchLabPresentation.message(for: outcome).text
+            return outcome
+        }
+    }
+
+    /// Reads the exact persisted Research Lab receipt store. A failed read
+    /// retains prior rows rather than silently replacing them with an empty run
+    /// history, so a panel can distinguish "no runs" from "could not read".
+    func refreshResearchLabRunsForCapabilities() async -> CapabilitiesResearchLabPresentation.RunList {
+        do {
+            let rows = try await client.getResearchLabRuns()
+            researchLabRuns = rows
+            return CapabilitiesResearchLabPresentation.list(rows: rows)
+        } catch {
+            return CapabilitiesResearchLabPresentation.unavailableList(
+                detail: error.localizedDescription,
+                retained: researchLabRuns
+            )
+        }
+    }
+
+    enum CapabilityCatalogSourceSaveOutcome: Equatable {
+        case unavailable(String)
+        case refused(String)
+        case saved(CapabilityCatalogSource)
+        case savedNeedsReload(CapabilityCatalogSource, String)
+        case failed(String)
+
+        var didSave: Bool {
+            switch self {
+            case .saved, .savedNeedsReload: true
+            case .unavailable, .refused, .failed: false
+            }
+        }
+
+        var detail: String {
+            switch self {
+            case .unavailable(let detail), .refused(let detail), .failed(let detail): return detail
+            case .saved(let source): return "Saved \(source.name)."
+            case .savedNeedsReload(let source, let detail):
+                return "Saved \(source.name), but the catalog could not reload: \(detail)"
+            }
+        }
+
+        var status: String {
+            switch self {
+            case .saved: return "ok"
+            case .unavailable, .refused, .savedNeedsReload: return "warn"
+            case .failed: return "failed"
+            }
         }
     }
 
     @MainActor
-    func addCatalogSource(name: String, url: String) async {
+    @discardableResult
+    func addCatalogSource(name: String, url: String) async -> CapabilityCatalogSourceSaveOutcome {
+        guard !capabilityCatalogSourceSaveInFlight else {
+            return .unavailable("A catalog source is already being saved.")
+        }
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedURL = url.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedName.isEmpty || !trimmedURL.isEmpty else { return }
+        guard !trimmedName.isEmpty || !trimmedURL.isEmpty else {
+            return .refused("Enter a source name or URL before adding it.")
+        }
+        capabilityCatalogSourceSaveInFlight = true
+        defer { capabilityCatalogSourceSaveInFlight = false }
         do {
-            _ = try await client.upsertCatalogSource(name: trimmedName.isEmpty ? "Capability Source" : trimmedName, url: trimmedURL, kind: "local")
-            capabilityCatalogSources = (try? await client.getCapabilityCatalogSources()) ?? capabilityCatalogSources
+            let source = try await client.upsertCatalogSource(
+                name: trimmedName.isEmpty ? "Capability Source" : trimmedName,
+                url: trimmedURL,
+                kind: "local"
+            )
+            do {
+                capabilityCatalogSources = try await client.getCapabilityCatalogSources()
+            } catch {
+                let detail = error.localizedDescription
+                statusText = "Capability source saved, but catalog reload failed: \(detail)"
+                return .savedNeedsReload(source, detail)
+            }
             statusText = "Capability source saved"
+            return .saved(source)
         } catch {
-            statusText = "Source save failed: \(error.localizedDescription)"
+            let detail = error.localizedDescription
+            statusText = "Source save failed: \(detail)"
+            return .failed(detail)
         }
     }
 
@@ -231,16 +321,47 @@ extension AppModel {
 
     @MainActor
     func installDemoCapabilityPack() async {
+        guard !isInstallingDemoCapabilityPack else { return }
+        isInstallingDemoCapabilityPack = true
+        defer { isInstallingDemoCapabilityPack = false }
         do {
             let receipt = try await client.installDemoCapabilityPack()
+            let signature = receipt.signature?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard receipt.status == "installed", !signature.isEmpty else {
+                throw NSError(domain: "NativeAgent.CapabilityPack", code: -422, userInfo: [
+                    NSLocalizedDescriptionKey: "Capability pack did not return a verified installed receipt."
+                ])
+            }
             disabledFeature = nil
-            statusText = "Installed signed pack \(receipt.name ?? receipt.packId)"
+            let name = receipt.name ?? receipt.packId
+            capabilityCatalogInstallOutcome = .installed(name: name)
+            statusText = "Installed signed pack \(name)"
             await refreshAll()
         } catch let err as NSError where AppModel.isNotImplemented(err) {
             disabledFeature = AppModel.disabledBadge(for: "Demo capability pack install", error: err)
-            statusText = disabledFeature ?? "Pack install disabled"
+            capabilityCatalogInstallOutcome = .refused(
+                message: disabledFeature ?? "Demo capability pack install is disabled."
+            )
+            statusText = capabilityCatalogInstallOutcome?.message ?? "Pack install refused"
         } catch {
-            statusText = "Pack install failed: \(error.localizedDescription)"
+            capabilityCatalogInstallOutcome = .refused(message: error.localizedDescription)
+            statusText = capabilityCatalogInstallOutcome?.message ?? "Pack install refused"
+        }
+    }
+
+    /// Shared catalog action for an already-acquired pack. The client verifies
+    /// its signing identity and signature before it writes a pack or catalog record.
+    @MainActor
+    func installCapabilityPackForCatalog(_ pack: [String: JSONValue]) async {
+        do {
+            let receipt = try await client.installCapabilityPack(pack)
+            let name = receipt.name ?? receipt.packId
+            capabilityCatalogInstallOutcome = .installed(name: name)
+            statusText = "Installed signed pack \(name)"
+            await refreshAll()
+        } catch {
+            capabilityCatalogInstallOutcome = .refused(message: error.localizedDescription)
+            statusText = capabilityCatalogInstallOutcome?.message ?? "Pack install refused"
         }
     }
 
@@ -256,13 +377,36 @@ extension AppModel {
     }
 
     @MainActor
-    func createProductionExport(support: Bool = false) async {
+    func createProductionExport(support: Bool = false) async -> ProductionExportCreationOutcome {
+        let label = support ? "Support bundle" : "Export"
         do {
             let export = support ? try await client.createSupportBundle() : try await client.createProductionExport()
-            statusText = "\(support ? "Support bundle" : "Export") created: \(export.id)"
-            await refreshAll()
+            let attributes = try FileManager.default.attributesOfItem(atPath: export.path)
+            let actualBytes = (attributes[.size] as? NSNumber)?.intValue ?? 0
+            guard actualBytes > 0 else {
+                let detail = "the archive was empty after it was created"
+                statusText = "\(label) failed verification: \(detail)"
+                return .failed(support: support, detail: detail)
+            }
+            guard export.sizeBytes == actualBytes else {
+                let detail = "the archive size did not match its creation receipt"
+                statusText = "\(label) failed verification: \(detail)"
+                return .failed(support: support, detail: detail)
+            }
+
+            let persisted = try await client.getProductionExports()
+            guard persisted.contains(where: { $0.id == export.id && $0.path == export.path && $0.sizeBytes == actualBytes }) else {
+                let detail = "the export registry did not confirm the created archive"
+                statusText = "\(label) failed verification: \(detail)"
+                return .failed(support: support, detail: detail)
+            }
+            productionExports = persisted
+            statusText = "\(label) created and verified: \(export.id)"
+            return .verified(export)
         } catch {
-            statusText = "Export failed: \(error.localizedDescription)"
+            let detail = error.localizedDescription
+            statusText = "\(label) failed: \(detail)"
+            return .failed(support: support, detail: detail)
         }
     }
 

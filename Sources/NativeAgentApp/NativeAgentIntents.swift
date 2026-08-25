@@ -1,10 +1,41 @@
 import AppIntents
 import Foundation
 import NativeAgentCore
+import ChatOrchestration
 
 private func intentClient() -> NativeClient {
     let base = NativeBaseURLDefaults.read()
     return NativeClient(baseURL: base)
+}
+
+/// App Intents have no mounted chat tab to supply an active session identity.
+/// Keep one explicit, durable Intent-owned conversation instead of letting the
+/// persistent chat boundary mint an unobservable UUID for every shortcut run.
+/// The ID still enters Core through `resolveSessionId`, so normalization and
+/// path safety remain identical to every other transcript writer.
+enum NativeAgentIntentSession {
+    static let defaultsKey = "nativeagent.intent.chat.sessionID"
+
+    static func resolve(
+        defaults: UserDefaults = .standard,
+        newSessionID: () -> String = { "intent:\(UUID().uuidString)" }
+    ) throws -> String {
+        if let persisted = defaults.string(forKey: defaultsKey) {
+            if let normalized = NativeAgentChatSessionID.normalizedPathComponent(persisted) {
+                let resolved = try SwiftNativeChatOrchestrationClient.resolveSessionId(normalized)
+                if persisted != resolved { defaults.set(resolved, forKey: defaultsKey) }
+                return resolved
+            }
+            // This local presentation preference has no authority over a
+            // transcript. A damaged value cannot select a path, so clear it
+            // before creating a visible, retained replacement identity.
+            defaults.removeObject(forKey: defaultsKey)
+        }
+
+        let resolved = try SwiftNativeChatOrchestrationClient.resolveSessionId(newSessionID())
+        defaults.set(resolved, forKey: defaultsKey)
+        return resolved
+    }
 }
 
 struct NativeAgentStatusIntent: AppIntent {
@@ -21,7 +52,7 @@ struct NativeAgentStatusIntent: AppIntent {
 
 struct NativeAgentChatIntent: AppIntent {
     static let title: LocalizedStringResource = "Ask NativeAgent"
-    static let description = IntentDescription("Sends a message to the active NativeAgent chat session.")
+    static let description = IntentDescription("Sends a message to NativeAgent's retained Shortcuts conversation.")
     static let openAppWhenRun = false
 
     @Parameter(title: "Message")
@@ -35,7 +66,14 @@ struct NativeAgentChatIntent: AppIntent {
         let model = UserDefaults.standard.string(forKey: "chatModel") ?? nativeAgentPrimaryModel
         let reasoningEffort = UserDefaults.standard.string(forKey: "chatReasoningEffort") ?? "high"
         let fileAccess = UserDefaults.standard.string(forKey: "chatFileAccess") ?? "auto"
-        let reply = try await intentClient().chat(message: message, sessionId: nil, model: model, reasoningEffort: reasoningEffort, fileAccess: fileAccess)
+        let sessionID = try NativeAgentIntentSession.resolve()
+        let reply = try await intentClient().chat(
+            message: message,
+            sessionId: sessionID,
+            model: model,
+            reasoningEffort: reasoningEffort,
+            fileAccess: fileAccess
+        )
         return .result(dialog: "\(String(reply.output.prefix(260)))")
     }
 }

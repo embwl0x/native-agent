@@ -260,7 +260,7 @@ struct TelegramTurnProgressCardDriverTests {
         #expect(snapshot.transportFailed)
         #expect(snapshot.state.phase == .completed)
         #expect(recordedFailures.count == 1)
-        #expect(recordedFailures[0].contains("bot<redacted>"))
+        #expect(recordedFailures[0].contains("[REDACTED_TELEGRAM_TOKEN]"))
         #expect(!recordedFailures[0].contains(secret))
     }
 

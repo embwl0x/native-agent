@@ -2,6 +2,34 @@ import Foundation
 import Observation
 import PersistenceCore
 
+/// The inspector must distinguish a quiet live feed from one that lost events
+/// under its own backpressure. Keep the visible wording in the same boundary
+/// that owns the bus-derived count so zero and invalid values never render a
+/// misleading warning chip.
+enum TurnInspectorLiveDropPresentation {
+    static func label(for dropCount: Int) -> String? {
+        guard dropCount > 0 else { return nil }
+        return "\(dropCount) dropped"
+    }
+
+    static func label(for state: TurnInspectorLiveDropState) -> String? {
+        switch state {
+        case .measured(let dropCount):
+            return label(for: dropCount)
+        case .unavailable:
+            return "drop count unavailable"
+        }
+    }
+}
+
+/// The Inspector's read model must not turn a retired bus sink into a
+/// success-shaped zero. A measured count is specific to the current live
+/// subscription; unavailable means the stream ended before it could be read.
+enum TurnInspectorLiveDropState: Equatable {
+    case measured(Int)
+    case unavailable
+}
+
 // MARK: - Turn Inspector W3 — store (live subscription lifecycle + replay load)
 //
 // Owns the event buffer for the Inspector tab and the lifecycle of the live
@@ -30,6 +58,9 @@ final class TurnInspectorStore {
     private(set) var cards: [InspectorTurnCard] = []
     /// Live drop count surfaced from the bus subscription (slow-consumer signal).
     private(set) var liveDropCount: Int = 0
+    /// Availability-preserving form of `liveDropCount`. Views must render this
+    /// rather than treating the compatibility integer's zero as a receipt.
+    private(set) var liveDropCountState: TurnInspectorLiveDropState = .measured(0)
     /// Replay diagnostics.
     private(set) var replayDate: Date = Date()
     private(set) var replaySkipped: Int = 0
@@ -57,9 +88,39 @@ final class TurnInspectorStore {
     /// `dataRootOverride` → the lane resolves the live/overridden root; tests
     /// pass an explicit root.
     private let replayLane: TurnTracePersistLane
+    /// Production consumes the process-wide trace bus. A local bus and a tiny
+    /// subscription capacity let the executable eval prove the real
+    /// backpressure counter without writing into the resident trace feed.
+    private let liveBus: TurnTraceBus
+    private let liveSubscriptionCapacity: Int
+    private let beforeLiveConsumption: (@Sendable (UUID) async -> Void)?
+    /// Defaults to the production bus reader. Injection keeps the generation
+    /// boundary executable without manufacturing a trace-bus overflow.
+    private let liveDropCountReader: @Sendable (TurnTraceBus, UUID) async -> TurnTraceBus.DropCountRead
 
-    init(dataRootOverride: URL? = nil) {
+    init(
+        dataRootOverride: URL? = nil,
+        liveBus: TurnTraceBus = .shared,
+        liveSubscriptionCapacity: Int = TurnTraceBus.defaultBufferCapacity,
+        beforeLiveConsumption: (@Sendable (UUID) async -> Void)? = nil,
+        liveDropCountReader: (@Sendable (TurnTraceBus, UUID) async -> Int)? = nil,
+        liveDropCountReadReader: (@Sendable (TurnTraceBus, UUID) async -> TurnTraceBus.DropCountRead)? = nil
+    ) {
         self.replayLane = TurnTracePersistLane(dataRootOverride: dataRootOverride)
+        self.liveBus = liveBus
+        self.liveSubscriptionCapacity = max(1, liveSubscriptionCapacity)
+        self.beforeLiveConsumption = beforeLiveConsumption
+        if let liveDropCountReadReader {
+            self.liveDropCountReader = liveDropCountReadReader
+        } else if let liveDropCountReader {
+            self.liveDropCountReader = { bus, subscriptionID in
+                .available(await liveDropCountReader(bus, subscriptionID))
+            }
+        } else {
+            self.liveDropCountReader = { bus, subscriptionID in
+                await bus.dropCountRead(subscriptionID)
+            }
+        }
     }
 
     // MARK: Live subscription
@@ -79,11 +140,15 @@ final class TurnInspectorStore {
         // Inspector showed the PRIOR generation's drop count until the first
         // new event re-polled it).
         liveDropCount = 0
+        liveDropCountState = .measured(0)
         let generation = liveGeneration
-        consumeTask = Task { [weak self] in
-            let sub = await TurnTraceBus.shared.subscribe()
+        let liveBus = liveBus
+        let liveSubscriptionCapacity = liveSubscriptionCapacity
+        let beforeLiveConsumption = beforeLiveConsumption
+        consumeTask = Task { [weak self, liveBus, liveSubscriptionCapacity, beforeLiveConsumption] in
+            let sub = await liveBus.subscribe(capacity: liveSubscriptionCapacity)
             // Always release the sink on exit (the bus .finish()es the stream).
-            defer { Task { await TurnTraceBus.shared.unsubscribe(sub.id) } }
+            defer { Task { await liveBus.unsubscribe(sub.id) } }
             // Raced teardown: a stop()/restart bumped the generation (or the
             // task was cancelled) while we were awaiting subscribe(). Bail now;
             // the defer unsubscribes the just-created sink.
@@ -92,6 +157,9 @@ final class TurnInspectorStore {
                 self?.liveGeneration != generation
             }
             if stale { return }
+            if let beforeLiveConsumption {
+                await beforeLiveConsumption(sub.id)
+            }
             for await event in sub.stream {
                 if Task.isCancelled { break }
                 let keepGoing = await MainActor.run { [weak self] () -> Bool in
@@ -100,6 +168,15 @@ final class TurnInspectorStore {
                     return true
                 }
                 if !keepGoing { break }
+            }
+            // An externally retired sink ends the stream. It is not evidence
+            // of a loss-free feed, so surface the failed read instead of
+            // allowing the compatibility zero to speak for it.
+            if !Task.isCancelled {
+                await MainActor.run { [weak self] in
+                    guard let self, self.liveGeneration == generation else { return }
+                    self.applyLiveDropRead(.unavailable)
+                }
             }
         }
     }
@@ -115,6 +192,10 @@ final class TurnInspectorStore {
         // Drop any pending drop-count poll from the now-dead subscription so a
         // stale count can't be re-armed under the next generation.
         pendingDropCheck = nil
+        // An old bus query may still be suspended. Detach its latch from this
+        // generation so a newly opened Inspector can poll immediately; its
+        // eventual completion cannot clear the newer generation's latch.
+        dropRefreshInFlightGeneration = nil
         // Land whatever the debounce was holding. Dropping it instead would
         // leave `cards` missing the final events of the session AND leave
         // `cardsRefreshScheduled` latched true, so the next `start()` would
@@ -144,9 +225,15 @@ final class TurnInspectorStore {
         if mode == .live { scheduleCardsRefresh() }
     }
 
-    /// Test seam: the live-ingest path minus the bus subscription.
-    func _appendLiveForTesting(_ event: TurnTraceEvent) {
-        appendLive(event)
+    /// Test seam: the live-ingest path minus an emitted bus event. Supplying
+    /// the real subscription ID drives the same drop-count scheduling path as
+    /// a consumed event; callers without one retain the card-only helper.
+    func _appendLiveForTesting(_ event: TurnTraceEvent, subscriptionID: UUID? = nil) {
+        if let subscriptionID {
+            ingestLive(event, subscriptionId: subscriptionID)
+        } else {
+            appendLive(event)
+        }
     }
 
     /// Coalesced drop-count poll: at most one in-flight bus query regardless of
@@ -155,27 +242,44 @@ final class TurnInspectorStore {
     /// guarded so a stale count from a dead subscription never lands on the new
     /// live session.
     private var pendingDropCheck: (id: UUID, generation: Int)?
-    private var dropRefreshInFlight = false
+    private var dropRefreshInFlightGeneration: Int?
     private func scheduleDropRefresh() {
-        guard !dropRefreshInFlight, let pending = pendingDropCheck else { return }
+        guard dropRefreshInFlightGeneration == nil, let pending = pendingDropCheck else { return }
         // Stale pending (generation moved on) → discard, don't poll.
         guard pending.generation == liveGeneration else {
             pendingDropCheck = nil
             return
         }
-        dropRefreshInFlight = true
         pendingDropCheck = nil
         let generation = pending.generation
         let id = pending.id
+        dropRefreshInFlightGeneration = generation
         Task { [weak self] in
-            let drops = await TurnTraceBus.shared.dropCount(id)
+            guard let self else { return }
+            let read = await self.liveDropCountReader(self.liveBus, id)
             await MainActor.run { [weak self] in
                 guard let self else { return }
-                self.dropRefreshInFlight = false
-                if self.liveGeneration == generation { self.liveDropCount = drops }
+                if self.dropRefreshInFlightGeneration == generation {
+                    self.dropRefreshInFlightGeneration = nil
+                }
+                if self.liveGeneration == generation { self.applyLiveDropRead(read) }
                 // Pick up any drop check that arrived while this one was in flight.
                 self.scheduleDropRefresh()
             }
+        }
+    }
+
+    private func applyLiveDropRead(_ read: TurnTraceBus.DropCountRead) {
+        switch read {
+        case .available(let count):
+            let measured = max(0, count)
+            liveDropCount = measured
+            liveDropCountState = .measured(measured)
+        case .unavailable:
+            // `liveDropCount` remains a compatibility value for existing
+            // callers. The state is the authoritative rendering contract.
+            liveDropCount = 0
+            liveDropCountState = .unavailable
         }
     }
 

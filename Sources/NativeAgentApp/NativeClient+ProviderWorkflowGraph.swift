@@ -316,7 +316,7 @@ extension NativeClient {
     }
 
     func runWorkflow(id: String, objective: String, execute: Bool) async throws -> WorkflowRun {
-        let dataRoot = PersistenceCore.defaultDataRoot()
+        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let impl = makeWorkflowOrchestrationClient(root: dataRoot)
         do {
             let row = try await impl.runWorkflow(
@@ -362,7 +362,7 @@ extension NativeClient {
         id: String,
         operation: (any WorkflowOrchestrationClient) async throws -> JSONValue
     ) async throws -> WorkflowRun {
-        let dataRoot = PersistenceCore.defaultDataRoot()
+        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let impl = makeWorkflowOrchestrationClient(root: dataRoot)
         let baseline = await WorkflowResidentOutcomeProjector.snapshot(
             client: impl,
@@ -453,7 +453,10 @@ extension NativeClient {
         // So the write path through this shared flock is already exercised in
         // production; this gate adds only the upsert + the now-present trace.
         let writes = SwiftNativeCatalogWrites(
-            dataRoot: PersistenceCore.defaultDataRoot(),
+            // The paired reader already uses the injected root. Writes must
+            // share it or an isolated/recovered app sees an empty catalog after
+            // a seemingly successful add.
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(),
             persistence: SwiftNativePersistenceCore()
         )
         // Match the daemon's body keys; non-supplied fields fall through to

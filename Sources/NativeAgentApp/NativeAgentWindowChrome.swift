@@ -18,26 +18,107 @@ import SwiftUI
 // (the sh detaches), so the brief launch on the main actor is fine right before
 // we terminate.
 enum AppRelauncher {
+    /// Pure helper contract for the detached shell process. Keeping it outside
+    /// `relaunchApp` lets the app and its behavioral evals exercise the same
+    /// bounded, positional-argument script without scraping Swift source.
+    static func relaunchHelperScript() -> String {
+        let script = "i=0; while /bin/kill -0 \"$1\" >/dev/null 2>&1 && [ \"$i\" -lt 150 ]; do /bin/sleep 0.2; i=$((i+1)); done; /usr/bin/open \"$2\""
+        return script
+    }
+
+    static func relaunchHelperArguments(pid: Int32, bundlePath: String) -> [String] {
+        ["-c", relaunchHelperScript(), "relaunch", String(pid), bundlePath]
+    }
+
     @MainActor
-    static func relaunchApp() {
+    static func relaunchApp(
+        helperExecutableURL: URL = URL(fileURLWithPath: "/bin/sh"),
+        onSpawnFailure: () -> Void = {}
+    ) {
         let bundlePath = Bundle.main.bundlePath
         let pid = ProcessInfo.processInfo.processIdentifier
         // Pass pid ($1) + bundlePath ($2) as POSITIONAL args, not interpolated into
         // the script body — no shell quoting/injection risk if the bundle path ever
         // contains metacharacters. Bound the wait to ~30s (150 × 0.2s) so the helper
         // can't spin forever if termination is somehow cancelled, then open anyway.
-        let script = "i=0; while /bin/kill -0 \"$1\" >/dev/null 2>&1 && [ \"$i\" -lt 150 ]; do /bin/sleep 0.2; i=$((i+1)); done; /usr/bin/open \"$2\""
         let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/bin/sh")
-        task.arguments = ["-c", script, "relaunch", String(pid), bundlePath]
+        task.executableURL = helperExecutableURL
+        task.arguments = relaunchHelperArguments(pid: pid, bundlePath: bundlePath)
         do {
             try task.run()
         } catch {
             NSLog("[relaunch] failed to spawn relaunch helper for %@: %@", bundlePath, "\(error)")
+            onSpawnFailure()
             return
         }
         // The helper is now waiting on our PID; quitting triggers the relaunch.
         NSApplication.shared.terminate(nil)
+    }
+}
+
+enum MainWindowRestartToolbarPresentation: Equatable {
+    case ready
+    case confirming
+    case relaunching
+    case failedToStart
+
+    var showsConfirmation: Bool {
+        self == .confirming
+    }
+
+    var isActionEnabled: Bool {
+        self != .relaunching
+    }
+
+    var failureMessage: String? {
+        guard self == .failedToStart else { return nil }
+        return "Restart couldn't start. NativeAgent is still running — try again."
+    }
+
+    mutating func requestConfirmation() {
+        guard isActionEnabled else { return }
+        self = .confirming
+    }
+
+    mutating func cancelConfirmation() {
+        guard self == .confirming else { return }
+        self = .ready
+    }
+
+    mutating func beginRelaunch() {
+        guard self == .confirming else { return }
+        self = .relaunching
+    }
+
+    mutating func markStartFailure() {
+        guard self == .relaunching else { return }
+        self = .failedToStart
+    }
+}
+
+struct MainWindowRestartToolbarButton: View {
+    let presentation: MainWindowRestartToolbarPresentation
+    let requestConfirmation: () -> Void
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 3) {
+            Button(action: requestConfirmation) {
+                Label(
+                    presentation == .relaunching ? "Restarting NativeAgent…" : "Restart App",
+                    systemImage: "arrow.triangle.2.circlepath"
+                )
+            }
+            .accessibilityIdentifier("mainWindow.restartToolbarButton")
+            .help("Relaunch NativeAgent")
+            .disabled(!presentation.isActionEnabled)
+
+            if let failureMessage = presentation.failureMessage {
+                Text(failureMessage)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                    .accessibilityIdentifier("mainWindow.restartToolbarButton.failure")
+            }
+        }
     }
 }
 
@@ -49,28 +130,41 @@ enum AppRelauncher {
 struct MainWindowContent: View {
     // The Mac app process is the runtime now; the only restart control is
     // "Restart App".
-    @State private var showRestartAppConfirm = false
+    @State private var restartPresentation: MainWindowRestartToolbarPresentation = .ready
 
     var body: some View {
         ContentView()
             .toolbar {
                 ToolbarItemGroup(placement: .primaryAction) {
-                    Button {
-                        showRestartAppConfirm = true
-                    } label: {
-                        Label("Restart App", systemImage: "arrow.triangle.2.circlepath")
+                    MainWindowRestartToolbarButton(presentation: restartPresentation) {
+                        restartPresentation.requestConfirmation()
                     }
-                    .help("Relaunch NativeAgent")
                 }
             }
-            .alert("Restart NativeAgent?", isPresented: $showRestartAppConfirm) {
-                Button("Cancel", role: .cancel) {}
+            .alert("Restart NativeAgent?", isPresented: restartConfirmationBinding) {
+                Button("Cancel", role: .cancel) {
+                    restartPresentation.cancelConfirmation()
+                }
                 Button("Restart", role: .destructive) {
-                    AppRelauncher.relaunchApp()
+                    restartPresentation.beginRelaunch()
+                    AppRelauncher.relaunchApp(onSpawnFailure: {
+                        restartPresentation.markStartFailure()
+                    })
                 }
             } message: {
                 Text("This relaunches the app.")
             }
+    }
+
+    private var restartConfirmationBinding: Binding<Bool> {
+        Binding(
+            get: { restartPresentation.showsConfirmation },
+            // The alert's explicit Cancel action owns dismissal. Keeping this
+            // setter inert prevents SwiftUI's automatic `false` write from
+            // racing the destructive action and clearing `.confirming`
+            // before it can transition to `.relaunching`.
+            set: { _ in }
+        )
     }
 }
 

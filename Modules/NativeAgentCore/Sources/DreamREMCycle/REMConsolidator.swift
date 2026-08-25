@@ -89,6 +89,44 @@ public struct REMReport: Sendable, Codable, Equatable {
     }
 }
 
+/// Durable, privacy-safe summary of one invocation of `runWeeklyREM`.
+///
+/// `REMReport` is the successful-run value returned to an immediate caller.
+/// This envelope is what survives a scheduler wake, app restart, or manual
+/// debug session in the shared run ledger. It deliberately contains counters
+/// and a bounded outcome/reason only — never diary, persona, or proposal text.
+public struct REMRunReportPayload: Sendable, Codable, Equatable {
+    public enum Outcome: String, Sendable, Codable, Equatable {
+        /// The pipeline reached all commit boundaries (a zero-proposal week is
+        /// still completed and is distinguishable by its real counters).
+        case completed
+        /// The weekly reservation was already fresh, so no second LLM pass ran.
+        case skipped
+        /// Trust policy rejected the run before any REM persistence work began.
+        case disabled
+        /// A real execution error or cancellation prevented completion.
+        case failed
+    }
+
+    public static let schema = "rem.run_report.v1"
+
+    public var schemaVersion: String
+    public var outcome: Outcome
+    public var reason: String?
+    public var report: REMReport?
+
+    public init(
+        outcome: Outcome,
+        reason: String? = nil,
+        report: REMReport? = nil
+    ) {
+        self.schemaVersion = Self.schema
+        self.outcome = outcome
+        self.reason = reason
+        self.report = report
+    }
+}
+
 // MARK: - REMConsolidator (weekly cycle)
 
 /// Weekly REM consolidation cycle. Distinct from the nightly Dream cycle:
@@ -144,44 +182,61 @@ public actor REMConsolidator {
     // MARK: Public API
 
     public func runWeeklyREM(force: Bool = false) async throws -> REMReport {
+        // The run ledger is the durable operator-facing surface for this
+        // return-only report. Use wall clock for its duration while retaining
+        // the injected clock below for REM's deterministic weekly semantics.
+        let runStartedAt = Date()
+
         // (1) Trust gate.
         guard gate.remEnabled else {
-            throw DreamREMCycleError.cycleDisabled(
+            let error = DreamREMCycleError.cycleDisabled(
                 error: "rem_cycle_disabled",
                 detail: DreamREMGatePolicy.remDisabledDetail
             )
+            await persistRunReport(
+                outcome: .disabled,
+                reason: "rem_cycle_disabled",
+                error: error,
+                startedAt: runStartedAt
+            )
+            throw error
         }
 
         let now = clock()
 
-        // Cancelled-before-start (scheduler timeout/stop): commit nothing —
-        // the legacy import below WRITES into the proposal store (review
-        // finding 2026-07-01: it ran before any cancellation check).
-        try Task.checkCancellation()
-
-        // Tombstones are durable rejection state. Validate before importing,
-        // claiming the weekly marker, calling the LLM, or writing proposals so
-        // a corrupt denylist cannot be treated as empty and later overwritten.
-        let tombStore = REMTombstoneStore(dataRoot: dataRoot)
-        _ = try await tombStore.loadAll()
-
-        // (1a) Canonical store open — first open in the pipeline triggers the
-        // one-time legacy harness-file import (idempotent; NOT at app boot).
-        // Import failure is non-fatal: the legacy file just waits for the
-        // next pass.
-        let store = REMProposalStore(dataRoot: dataRoot)
+        // Only a reservation which this invocation acquired needs rollback.
+        // Keeping it optional lets pre-reservation failures become durable run
+        // records too, without manufacturing a marker mutation to undo.
+        var rollback: (@Sendable () async -> Void)?
         do {
-            let imported = try await store.importLegacyHarnessFileIfNeeded()
-            if imported > 0 {
+            // Cancelled-before-start (scheduler timeout/stop): commit nothing —
+            // the legacy import below WRITES into the proposal store (review
+            // finding 2026-07-01: it ran before any cancellation check).
+            try Task.checkCancellation()
+
+            // Tombstones are durable rejection state. Validate before importing,
+            // claiming the weekly marker, calling the LLM, or writing proposals so
+            // a corrupt denylist cannot be treated as empty and later overwritten.
+            let tombStore = REMTombstoneStore(dataRoot: dataRoot)
+            _ = try await tombStore.loadAll()
+
+            // (1a) Canonical store open — first open in the pipeline triggers the
+            // one-time legacy harness-file import (idempotent; NOT at app boot).
+            // Import failure is non-fatal: the legacy file just waits for the
+            // next pass.
+            let store = REMProposalStore(dataRoot: dataRoot)
+            do {
+                let imported = try await store.importLegacyHarnessFileIfNeeded()
+                if imported > 0 {
+                    FileHandle.standardError.write(Data(
+                        "REMConsolidator: imported \(imported) legacy proposals\n".utf8
+                    ))
+                }
+            } catch {
                 FileHandle.standardError.write(Data(
-                    "REMConsolidator: imported \(imported) legacy proposals\n".utf8
+                    "REMConsolidator: legacy proposal import failed: \(error)\n".utf8
                 ))
             }
-        } catch {
-            FileHandle.standardError.write(Data(
-                "REMConsolidator: legacy proposal import failed: \(error)\n".utf8
-            ))
-        }
 
         // (1b) Weekly idempotency — runWeeklyREM is the choke point for
         // THREE uncoordinated drivers (in-app 7d loop, NSBackgroundActivity
@@ -194,9 +249,9 @@ public actor REMConsolidator {
         // failure so a failed run doesn't suppress the retry. `force`
         // (manual /v1/rem/run) bypasses the freshness check but still
         // stamps, so a forced run resets the weekly window.
-        let markerURL = dataRoot
-            .appendingPathComponent("harness", isDirectory: true)
-            .appendingPathComponent("last_weekly_rem_run")
+            let markerURL = dataRoot
+                .appendingPathComponent("harness", isDirectory: true)
+                .appendingPathComponent("last_weekly_rem_run")
         // Unique claim token = freshness timestamp + a per-run UUID (gpt-5.5
         // review). The timestamp drives the 6-day freshness check (parse the
         // FIRST whitespace token); the UUID makes the marker a unique claim id
@@ -207,22 +262,21 @@ public actor REMConsolidator {
         // PersistenceCore reservation fails CLOSED on an unreadable marker,
         // lock failure, or stamp-write failure: weekly LLM work never runs
         // without first owning durable exclusion.
-        let claimToken = "\(ISO8601DateFormatter().string(from: now)) \(UUID().uuidString)"
-        let reservation = await reserveOncePerPeriod(at: markerURL, stamp: claimToken) { stored in
-            if force { return false }
-            guard let stored else { return false }
-            guard let firstToken = stored.split(separator: " ", maxSplits: 1).first,
-                  let priorRun = ISO8601DateFormatter().date(
-                    from: String(firstToken).trimmingCharacters(in: .whitespacesAndNewlines)
-                  ) else {
-                throw PersistenceCoreError.ioFailure(
-                    "weekly REM marker is malformed: \(markerURL.path)"
-                )
+            let claimToken = "\(ISO8601DateFormatter().string(from: now)) \(UUID().uuidString)"
+            let reservation = await reserveOncePerPeriod(at: markerURL, stamp: claimToken) { stored in
+                if force { return false }
+                guard let stored else { return false }
+                guard let firstToken = stored.split(separator: " ", maxSplits: 1).first,
+                      let priorRun = ISO8601DateFormatter().date(
+                        from: String(firstToken).trimmingCharacters(in: .whitespacesAndNewlines)
+                      ) else {
+                    throw PersistenceCoreError.ioFailure(
+                        "weekly REM marker is malformed: \(markerURL.path)"
+                    )
+                }
+                return now.timeIntervalSince(priorRun) < 6 * 86_400
             }
-            return now.timeIntervalSince(priorRun) < 6 * 86_400
-        }
-        let rollback: @Sendable () async -> Void
-        switch reservation {
+            switch reservation {
         case .alreadyReserved:
             FileHandle.standardError.write(Data(
                 "REMConsolidator: weekly REM already ran within 6 days — skipping\n".utf8
@@ -231,11 +285,18 @@ public actor REMConsolidator {
             // previously-unstaged pending rows must not wait a week for an
             // approval card.
             await stagePendingUnstagedRows(store)
-            return REMReport(
+            let report = REMReport(
                 proposalsGenerated: 0,
                 evidenceDatesMin: REMConstants._REM_MIN_EVIDENCE_DATES,
                 tombstoneSkips: 0, growthMDEvicted: 0, archivedEntries: 0
             )
+            await persistRunReport(
+                outcome: .skipped,
+                reason: "already_ran_within_weekly_window",
+                report: report,
+                startedAt: runStartedAt
+            )
+            return report
         case .failed(let error):
             FileHandle.standardError.write(Data(
                 "REMConsolidator: weekly reservation failed closed: \(error)\n".utf8
@@ -244,7 +305,6 @@ public actor REMConsolidator {
         case .reserved(_, let restore):
             rollback = restore
         }
-        do {
 
         // (2) Read last-7-day entries by mtime.
         let entries = try readRecentDiaryEntries(now: now, days: 7)
@@ -366,17 +426,77 @@ public actor REMConsolidator {
             daysOld: REMConstants._REM_ARCHIVE_DAYS, now: now
         )) ?? 0
 
-        return REMReport(
+        let report = REMReport(
             proposalsGenerated: kept.count,
             evidenceDatesMin: REMConstants._REM_MIN_EVIDENCE_DATES,
             tombstoneSkips: tombSkips,
             growthMDEvicted: evicted,
             archivedEntries: moved
         )
+        await persistRunReport(
+            outcome: .completed,
+            report: report,
+            startedAt: runStartedAt
+        )
+        return report
         } catch {
-            await rollback()
+            if let rollback {
+                await rollback()
+            }
+            await persistRunReport(
+                outcome: .failed,
+                reason: Self.runFailureReason(error),
+                error: error,
+                startedAt: runStartedAt
+            )
             throw error
         }
+    }
+
+    /// The cross-surface run ledger already supplies atomic, locked, bounded
+    /// retention (500 rows) and survives process reload. REM writes only this
+    /// compact summary so a scheduler run that makes no proposals cannot be
+    /// mistaken for a scheduler run that never happened.
+    private func persistRunReport(
+        outcome: REMRunReportPayload.Outcome,
+        reason: String? = nil,
+        report: REMReport? = nil,
+        error: (any Error)? = nil,
+        startedAt: Date
+    ) async {
+        let payload = REMRunReportPayload(
+            outcome: outcome,
+            reason: reason,
+            report: report
+        )
+        let output: String
+        if let data = try? JSONEncoder().encode(payload),
+           let encoded = String(data: data, encoding: .utf8) {
+            output = encoded
+        } else {
+            // The payload contains only Codable scalar values, but retain an
+            // honest sentinel if a future schema change breaks encoding.
+            output = "{\"schemaVersion\":\"rem.run_report.v1\",\"outcome\":\"failed\",\"reason\":\"report_encoding_failed\"}"
+        }
+        await RunLedger.append(
+            kind: "rem_weekly_consolidation",
+            status: outcome.rawValue,
+            output: output,
+            error: error.map { String(describing: $0) },
+            createdAt: startedAt,
+            durationSeconds: max(0, Date().timeIntervalSince(startedAt)),
+            dataRoot: dataRoot
+        )
+    }
+
+    private nonisolated static func runFailureReason(_ error: any Error) -> String {
+        if case DreamREMCycleError.cycleDisabled(let code, _) = error {
+            return code
+        }
+        if error is CancellationError {
+            return "cancelled"
+        }
+        return "execution_failed"
     }
 
     // MARK: Diary read (mtime-filtered)

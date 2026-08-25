@@ -58,18 +58,54 @@ enum ChatTurnNoticePresentation {
     }
 }
 
+/// The two Mac chat entry points must derive the exact same provider-facing
+/// settings. Keeping this as a value projection makes a paid tier or persona
+/// preference testable without constructing the resident client (which owns
+/// live persistence and provider state).
+struct NativeChatTurnOptions: Sendable, Equatable {
+    let persona: String?
+    let serviceTier: String?
+
+    static func resolve(
+        personaRawValue: String?,
+        fastModeEnabled: Bool,
+        surface: String
+    ) -> NativeChatTurnOptions {
+        let persona = personaRawValue.flatMap { raw -> String? in
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        return NativeChatTurnOptions(
+            persona: persona,
+            serviceTier: surface == "chat" && fastModeEnabled ? "priority" : nil
+        )
+    }
+
+    /// `AppModel.chatPersona` is what the picker displays and persists. Its
+    /// stored form must be the same value the turn carries; otherwise a padded
+    /// picker value can visibly say one persona while the provider receives a
+    /// different one. Blank input deliberately becomes the product fallback.
+    static func normalizedPickerPersona(_ raw: String?, fallback: String = "AI") -> String {
+        let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? fallback : trimmed
+    }
+
+    static func current(surface: String, defaults: UserDefaults = .standard) -> NativeChatTurnOptions {
+        resolve(
+            personaRawValue: defaults.string(forKey: "chatPersona"),
+            fastModeEnabled: defaults.bool(forKey: "chatFastMode"),
+            surface: surface
+        )
+    }
+}
+
 extension NativeClient {
     func chat(message: String, sessionId: String?, model: String, reasoningEffort: String, fileAccess: String, attachments: [MultimodalAttachment] = [], suppressUserAppend: Bool = false, surface: String = "chat", replacementAssistantMessageId: String? = nil) async throws -> ChatResponse {
         let swiftClient = Self.residentMacChatClient
-        let persona = UserDefaults.standard.string(forKey: "chatPersona").flatMap { (s: String) -> String? in
-            let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
-            return t.isEmpty ? nil : t
-        }
-        let requestedTier = surface == "chat" && UserDefaults.standard.bool(forKey: "chatFastMode")
-            ? "priority" : nil
+        let options = NativeChatTurnOptions.current(surface: surface)
         let coResp = try await ChatPersistenceContext.$replacementAssistantMessageID
             .withValue(replacementAssistantMessageId) {
-                try await LLMCallContext.$serviceTier.withValue(requestedTier) {
+                try await LLMCallContext.$serviceTier.withValue(options.serviceTier) {
                     try await swiftClient.chat(
                         message: message,
                         sessionId: sessionId,
@@ -77,7 +113,7 @@ extension NativeClient {
                         reasoningEffort: reasoningEffort,
                         fileAccess: fileAccess,
                         attachments: Self.adaptAttachments(attachments),
-                        persona: persona,
+                        persona: options.persona,
                         surface: surface,
                         suppressUserAppend: suppressUserAppend
                     )
@@ -246,13 +282,8 @@ extension NativeClient {
                 defer { metaBox.recordProducerFinished() }
                 await TurnTraceContext.$turnId.withValue(activityIdentity.turnId) {
                 let swiftClient = Self.residentMacChatClient
-                let persona = UserDefaults.standard.string(forKey: "chatPersona").flatMap { (s: String) -> String? in
-                    let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
-                    return t.isEmpty ? nil : t
-                }
-                let requestedTier = UserDefaults.standard.bool(forKey: "chatFastMode")
-                    ? "priority" : nil
-                let swiftExecution = LLMCallContext.$serviceTier.withValue(requestedTier) {
+                let options = NativeChatTurnOptions.current(surface: "chat")
+                let swiftExecution = LLMCallContext.$serviceTier.withValue(options.serviceTier) {
                     swiftClient.chatStreamExecution(
                         message: message,
                         sessionId: sessionId,
@@ -260,7 +291,7 @@ extension NativeClient {
                         reasoningEffort: reasoningEffort,
                         fileAccess: fileAccess,
                         attachments: Self.adaptAttachments(attachments),
-                        persona: persona,
+                        persona: options.persona,
                         surface: "chat",
                         suppressUserAppend: suppressUserAppend
                     )

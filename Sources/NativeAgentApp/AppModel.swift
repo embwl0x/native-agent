@@ -53,6 +53,16 @@ final class AppModel {
     /// `PollScheduler.swift` for the narrow retained-liveness contract.
     let pollScheduler = PollScheduler()
     var directInstallInFlight = false
+    private let activeChatSessionIDWriter: @MainActor (String?) -> Void
+    private let backgroundLoopsManager: BackgroundLoopsManager
+    private let chatSnapshotPublisher: @MainActor () -> Void
+    var approvalResolverOverride: (@MainActor (String, String) async throws -> ApprovalRequest)?
+    var inboxReaderOverride: (@MainActor (Bool) async throws -> [InboxItemRecord])?
+    var inboxActionOverride: (@MainActor (String, String) async throws -> Void)?
+    var inboxSnapshotWriterOverride: (@MainActor () async -> Void)?
+    var inboxReloadGeneration = 0
+    let chatRenameMutationGate = ChatRenameMutationGate()
+    var chatRenameIntentGeneration: [String: Int] = [:]
 
     // PATCH-2026-05-07: model-default-bump One-time migration: any saved
     // chatModel/telegramModel that's a stale mid/low-tier value gets
@@ -79,17 +89,28 @@ final class AppModel {
     // SwiftUI bindings never propagated and onChange never fired. Converted
     // to stored with `didSet` UserDefaults persistence so settings panels
     // (Telegram, SearXNG, native runtime setting) actually save when toggled.
-    var nativeBaseURL: String = NativeBaseURLDefaults.read() {
+    private(set) var nativeBaseURL: String = NativeBaseURLDefaults.read() {
         didSet { NativeBaseURLDefaults.write(nativeBaseURL) }
+    }
+
+    /// Commit the compatibility URL only after validation. NativeAgent's
+    /// in-process Swift runtime remains the runtime owner; this does not
+    /// establish a fallback daemon connection.
+    @discardableResult
+    func configureNativeBaseURL(_ value: String) throws -> String {
+        let normalized = try NativeBaseURLDefaults.normalized(value)
+        nativeBaseURL = normalized
+        return normalized
     }
 
     var searxngBaseURL: String = UserDefaults.standard.string(forKey: "searxngBaseURL") ?? "" {
         didSet { UserDefaults.standard.set(searxngBaseURL, forKey: "searxngBaseURL") }
     }
 
-    var telegramToken: String = UserDefaults.standard.string(forKey: "telegramToken") ?? "" {
-        didSet { UserDefaults.standard.set(telegramToken, forKey: "telegramToken") }
-    }
+    /// A credential draft belongs only in the secure field until the user
+    /// explicitly saves it through `telegram/config.json`.  In particular,
+    /// never mirror it into UserDefaults while the user is typing.
+    var telegramToken: String = ""
 
     var telegramAllowedChats: String = UserDefaults.standard.string(forKey: "telegramAllowedChats") ?? "" {
         didSet { UserDefaults.standard.set(telegramAllowedChats, forKey: "telegramAllowedChats") }
@@ -183,8 +204,17 @@ final class AppModel {
     var telegramTokenConfigured = false
     var telegramEnabled = false
     var isSavingTelegram = false
+    /// The Telegram settings surface owns this receipt. `statusText` remains
+    /// a cross-app activity line and may be replaced by an unrelated refresh.
+    var telegramSettingsSaveOutcome: TelegramSettingsSaveOutcome?
     var isTestingTelegram = false
+    var isClearingTelegramLogs = false
+    var telegramClearLogsOutcome: TelegramClearLogsPresentation.Outcome?
     var telegramStatus: TelegramStatus?
+    /// A failed status refresh does not erase the last readable Telegram
+    /// receipt snapshot. The settings surface must mark that snapshot stale
+    /// instead of presenting it as a current read.
+    var telegramStatusRefreshError: String?
     var chatSessions: [ChatSession] = []
     // PATCH-2026-05-11: unified-session-v1 — on first launch after this change, drop any
     // stale Mac-only session ID so the daemon resolves via the configured mobile source key instead.
@@ -287,27 +317,61 @@ final class AppModel {
     /// are retaining their last proven rows until the next canonical edge.
     var chatSessionIndexRefreshFailed = false
 
+    /// Session rows may be retained after either the active chat-state load or
+    /// the independent session-index refresh fails. Keep the visual projection
+    /// beside those two authoritative flags so a successful full load can
+    /// clear the same condition that the mounted sidebar reads.
+    var chatSidebarSessionListOpacity: Double {
+        chatStateLoadFailed || chatSessionIndexRefreshFailed ? 0.55 : 1
+    }
+
+    /// Called only after the full chat-state path has obtained the selected
+    /// session's messages (or deliberately preserved an in-flight turn). A
+    /// session-index-only refresh must not call this: it cannot prove that the
+    /// active transcript is current.
+    func markChatSidebarLoadSucceeded() {
+        chatStateLoadFailed = false
+        chatSessionIndexRefreshFailed = false
+    }
+
     var compiledPersonality: CompiledPersonality?
     var privacyMap: PrivacyMap?
     var supportDiagnostics: SupportDiagnostics?
+    /// Support Snapshot has its own bounded read pass. Keep its progress
+    /// separate from Doctor so its button can be honest about a snapshot that
+    /// is loading, unavailable, or failed.
+    var supportDiagnosticsLoading = false
+    var capabilityCatalogSourceSaveInFlight = false
     var health: RuntimeHealth?
     var activityEvents: [ActivityEvent] = []
     var executions: [WorkshopExecutionRecord] = []
     var runs: [RunRecord] = []
+    /// App integration tests use the same native files behind a temporary
+    /// root; production leaves this nil and resolves the ordinary data root.
+    var dataRootOverride: URL?
     var memories: [MemoryRecord] = []
     var personality: PersonalityProfile?
     var personalityDocs: [PersonalityDoc] = []
     var skills: [SkillRecord] = []
     var tools: [ToolRecord] = []
     var chatToolCatalog: ChatToolCatalogSnapshot?
+    /// Last authoritative catalog-read failure. Kept beside the last good
+    /// catalog so the Tools surface can say when it is displaying stale data
+    /// instead of presenting an old snapshot as a fresh one.
+    var chatToolCatalogLoadError: String?
     /// True after a refresh attempt has FAILED (decode error or dispatch
     /// throw). Lets the UI distinguish "still loading" (catalog == nil &&
-    /// !loadFailed) from "really empty" (catalog == nil && loadFailed),
-    /// avoiding the both-show race the empty-state UI was hitting on
-    /// initial paint. (gpt-5.5 review NEEDS_FIX 4)
+    /// !loadFailed) from an unavailable catalog (catalog == nil &&
+    /// loadFailed), without presenting the latter as an empty result.
     var chatToolCatalogLoadFailed: Bool = false
+    /// Toolbar-specific single-flight state. Navigation may still perform its
+    /// own scoped load, but repeated user taps cannot launch concurrent Tools
+    /// refreshes that race to overwrite the visible receipt.
+    var isRefreshingTools = false
+    var toolsRefreshState: ToolsRefreshPresentation.State = .idle
     var capabilitySummary: CapabilitySummaryResponse?
     var routePlan: IntentRoutePlan?
+    var routePresentation: IntentRoutePresentation = .idle
     var workflows: [WorkflowRecord] = []
     var workflowRuns: [WorkflowRun] = []
     // Render-cost audit F13: `didSet` keeps `pendingActivityCount` derived from
@@ -316,6 +380,15 @@ final class AppModel {
     var approvals: [ApprovalRequest] = [] {
         didSet { recomputePendingActivityCount() }
     }
+    /// Shared by every mounted approval surface. This is UI coordination only;
+    /// the ApprovalInbox actor remains the durable terminal-decision authority.
+    var approvalResolutionInFlightIDs: Set<String> = []
+    /// Retains the one resolver task so direct callers (chat cards included)
+    /// join an active decision instead of re-entering NativeClient's executor.
+    var approvalResolutionTasks: [String: Task<ApprovalRequest, Error>] = [:]
+    /// Last compact-Capabilities approval action outcome. This is a UI receipt
+    /// only; ApprovalInbox remains the terminal-decision authority.
+    var capabilitiesApprovalInboxOutcome: CapabilitiesApprovalInboxResolution?
     var inboxItems: [InboxItemRecord] = [] {
         didSet { recomputePendingActivityCount() }
     }
@@ -323,20 +396,32 @@ final class AppModel {
     var mcpSessions: [MCPSessionStatus] = []
     var mcpConsent: [MCPConsentRecord] = []
     var mcpTools: [MCPToolRecord] = []
+    var mcpToolReadState: MCPHubToolReadState = .notLoaded
     var mcpResources: [MCPResourceRecord] = []
+    var mcpResourceReadState: MCPHubResourceReadState = .notLoaded
     var latestMCPCall: MCPCallResult?
+    var mcpRecentCallState: MCPHubRecentCallState = .notLoaded
     var selectedMCPServerId: String?
     var researchLabRuns: [ResearchLabRun] = []
     var traces: [RuntimeTrace] = []
+    var capabilityTraceTimeline: CapabilityTraceFeed.State = .sourceAbsent
     var agentGraph: AgentGraph?
     var graphEntities: [GraphEntity] = []
     var graphStatus: GraphIndexStatus?
+    /// Nil means no failed graph read has been observed. The Capability graph
+    /// panel keeps this separate from a legitimately empty, checked graph.
+    var graphLoadError: String?
     var graphSearchResults: [GraphSearchResult] = []
     var autonomyKernel: AutonomyKernelSummary?
     var personalOS: PersonalOSSummary?
     var capabilityCatalog: [CapabilityCatalogItem] = []
     var capabilityCatalogSources: [CapabilityCatalogSource] = []
     var capabilityPackInstalls: [CapabilityPackInstall] = []
+    var capabilityCatalogInstallOutcome: CapabilityCatalogInstallOutcome?
+    /// The signed demo action performs a multi-store durable install. Keep the
+    /// mounted control single-flight so a second click cannot race the
+    /// signature gate or make two receipts look like one successful install.
+    var isInstallingDemoCapabilityPack = false
     var capabilityTrust: CapabilityTrustNetwork?
     var latestCapabilityTrustEvaluation: CapabilityTrustEvaluation?
     var latestCapabilityUpdateCheck: CapabilityUpdateCheck?
@@ -370,9 +455,16 @@ final class AppModel {
     var disabledFeature: String?
     /// F2: semantic recall results for the Memory tab search box. nil means
     /// "no search active — show appModel.memories". Populated by
-    /// `runMemorySemanticSearch(query:)` via `SwiftNativeMemoryV2.shared.recall`.
+    /// `runMemorySemanticSearch(query:)` via the root-resolved MemoryV2 owner.
     var memorySearchResults: [MemoryRecord]? = nil
     var memorySearchError: String? = nil
+    /// Normalized query that produced `memorySearchResults`. Views must compare
+    /// this before rendering a prior asynchronous response under new keystrokes.
+    var memorySearchResultQuery: String? = nil
+    /// A semantic request is in flight for `memorySearchResultQuery`. This is
+    /// distinct from an empty result so the search field never claims "No
+    /// Matches" while the canonical reader is still working.
+    var memorySearchIsLoading = false
     var memorySearchGate = LatestAsyncRequestGate()
     var connectorActionRegistry: ConnectorActionRegistry?
     var latestConnectorActionReceipt: ConnectorActionReceipt?
@@ -390,7 +482,14 @@ final class AppModel {
             }
         }
     }
+    /// The last action initiated on the Trust surface. Unlike `statusText`, it
+    /// cannot be overwritten by refreshes or work from another surface.
+    var trustCenterActionOutcome: TrustCenterActionOutcome?
     var policySimulation: PolicySimulation?
+    /// A transport/read failure is distinct from SecurityCenter's fail-closed
+    /// unavailable-policy envelope. Keeping it separate prevents an old
+    /// successful verdict from remaining visible after a later failed run.
+    var policySimulationFailure: String?
     var backups: [BackupRecord] = []
     var connectors: [ConnectorRecord] = []
     var workspaces: [WorkspaceRecord] = []
@@ -467,6 +566,9 @@ final class AppModel {
         didSet { UserDefaults.standard.set(chatProvider, forKey: "chatProvider") }
     }
     var statusText: String = "Not checked"
+    /// Bounded, non-transient receipts for mutations initiated from Tools.
+    /// Unlike `statusText`, repeated identical failures remain distinct rows.
+    var toolOperationStatusReceipts: [ToolOperationStatusReceipt] = []
     // FIX: last decode/network failure seen during refreshAll, so swallowed
     // section failures are observable instead of silently blanking the UI.
     var lastRefreshError: String? = nil
@@ -486,6 +588,17 @@ final class AppModel {
     /// the provider-refresh await so the .task + two onChange triggers can't
     /// double-greet. See AppModel+FirstRunWelcome.
     @ObservationIgnored var firstRunGreetingInFlight = false
+    /// Hermetic first-run-greeting seams. Production uses the public-release
+    /// bundle check, fresh provider read, and real chat-turn handoff below;
+    /// isolated behavior evals exercise that same durable marker owner without
+    /// touching a user's provider or transcript.
+    @ObservationIgnored var firstRunGreetingPublicReleaseOverride: Bool?
+    @ObservationIgnored var firstRunGreetingProviderReadyOverride: (@MainActor @Sendable () async -> Bool)?
+    @ObservationIgnored var firstRunGreetingSendOverride: (@MainActor @Sendable (String, String, Bool) async -> ChatTurnAcceptance)?
+    /// Completion receipt for the mounted onboarding wizard. The route records
+    /// a deferred or rejected first greeting instead of silently dismissing
+    /// into Chat as though the kickoff had happened.
+    var onboardingWizardCompletionReceipt: OnboardingWizardCompletionReceipt?
     var streamingSessions: Set<String> = []
     var chatTasks: [String: Task<Void, Never>] = [:]
     var chatTaskGenerations: [String: Int] = [:]
@@ -542,9 +655,19 @@ final class AppModel {
     /// silently suppresses the error.
     var chatPersona: String = {
         let saved = UserDefaults.standard.string(forKey: "chatPersona")
-        return saved ?? "AI"
+        return NativeChatTurnOptions.normalizedPickerPersona(saved)
     }() {
-        didSet { UserDefaults.standard.set(chatPersona, forKey: "chatPersona") }
+        didSet {
+            let normalized = NativeChatTurnOptions.normalizedPickerPersona(chatPersona)
+            if normalized != chatPersona {
+                chatPersona = normalized
+                return
+            }
+            UserDefaults.standard.set(normalized, forKey: "chatPersona")
+            Task {
+                await NativeContextFlowRuntime.shared.personaPickerDidChange()
+            }
+        }
     }
     var agentDisplayName: String {
         let profileName = personality?.name.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -555,6 +678,8 @@ final class AppModel {
     var skillManifests: [SkillInfo] = []
     var isLoadingSkillManifests = false
     var skillManifestError: String?
+    /// Event-identified feedback for the mounted Skill Lifecycle banner/toast.
+    var skillLifecycleFeedback: SkillLifecycleFeedback?
 
     // PATCH-2026-05-07: self-improvement-ui Beyond B.1/B.3 state
     var trainingRuns: [TrainingRunSummary] = []
@@ -688,12 +813,49 @@ final class AppModel {
             && candidate.source.lowercased() != "self_test"
     }
 
-    init() {
+    /// Production starts its refresh work immediately. Tests and isolated
+    /// presentation hosts can opt out so mounting a chat control never reads
+    /// the user's live root behind its injected data root.
+    init(
+        dataRootOverride: URL? = nil,
+        startBackgroundTasks: Bool = true,
+        backgroundLoopsManager: BackgroundLoopsManager = .shared,
+        activeChatSessionIDWriter: @escaping @MainActor (String?) -> Void = { id in
+            if let id { UserDefaults.standard.set(id, forKey: "activeChatSessionId") }
+            else { UserDefaults.standard.removeObject(forKey: "activeChatSessionId") }
+        },
+        chatSnapshotPublisher: @escaping @MainActor () -> Void = {
+            MacSyncEngine.shared.requestChatSnapshotPublication(includeTranscripts: false)
+        }
+    ) {
+        // Earlier builds mirrored the secure-field draft into UserDefaults.
+        // The canonical Telegram config is the sole durable credential owner;
+        // discard that legacy plaintext draft on the first current launch.
+        UserDefaults.standard.removeObject(forKey: "telegramToken")
+        self.dataRootOverride = dataRootOverride
+        self.backgroundLoopsManager = backgroundLoopsManager
+        self.activeChatSessionIDWriter = activeChatSessionIDWriter
+        self.chatSnapshotPublisher = chatSnapshotPublisher
+        guard startBackgroundTasks else { return }
         Task { @MainActor in await self.refreshSurfacePickerCache() }
         pollScheduler.bind(to: self)
     }
 
-    var client: NativeClient { NativeClient(baseURL: nativeBaseURL) }
+    var client: NativeClient {
+        NativeClient(
+            baseURL: nativeBaseURL,
+            dataRootOverride: dataRootOverride,
+            backgroundLoopsManager: backgroundLoopsManager
+        )
+    }
+
+    func persistActiveChatSessionID(_ id: String?) {
+        activeChatSessionIDWriter(id)
+    }
+
+    func publishChatSnapshot() {
+        chatSnapshotPublisher()
+    }
 
     var selectedMCPServer: MCPServerRecord? {
         if let selectedMCPServerId,
@@ -705,6 +867,11 @@ final class AppModel {
 
     var refreshAllInFlight = false
     var refreshAllQueued = false
+    // One refresh pass can lose several independent authority reads. Keep the
+    // complete bounded set until the next pass so the status surface does not
+    // turn a multi-lane outage into whichever error happened to finish last.
+    var refreshAllFailureDetails: [String] = []
+    var isRecordingRefreshAllFailures = false
     var chatStateLoadInFlight = false
     var chatStateLoadWaiters: [CheckedContinuation<Void, Never>] = []
 
@@ -719,8 +886,7 @@ final class AppModel {
         do {
             return try await fetch()
         } catch {
-            print("[NativeAgent] refreshAll/\(label) failed: \(error)")
-            lastRefreshError = "\(label): \(error.localizedDescription)"
+            recordRefreshFailure(label, error: error)
             return nil
         }
     }
@@ -730,9 +896,40 @@ final class AppModel {
         do {
             return try await fetch()
         } catch {
-            print("[NativeAgent] refreshAll/\(label) failed: \(error)")
-            lastRefreshError = "\(label): \(error.localizedDescription)"
+            recordRefreshFailure(label, error: error)
             return fallback
         }
+    }
+
+    /// Refresh-only collection/value reader. A thrown read is distinct from a
+    /// successful empty response: preserve the last confirmed projection in
+    /// the former case, while assigning `[]`/`nil` when the authoritative
+    /// reader genuinely returned it.
+    @MainActor
+    func refreshPreserving<T>(
+        _ label: String,
+        current: T,
+        _ fetch: () async throws -> T
+    ) async -> T {
+        do {
+            return try await fetch()
+        } catch {
+            recordRefreshFailure(label, error: error)
+            return current
+        }
+    }
+
+    @MainActor
+    private func recordRefreshFailure(_ label: String, error: Error) {
+        let detail = "\(label): \(error.localizedDescription)"
+        print("[NativeAgent] refreshAll/\(detail)")
+        guard isRecordingRefreshAllFailures else {
+            lastRefreshError = detail
+            return
+        }
+        if !refreshAllFailureDetails.contains(detail) {
+            refreshAllFailureDetails.append(detail)
+        }
+        lastRefreshError = refreshAllFailureDetails.joined(separator: "\n")
     }
 }

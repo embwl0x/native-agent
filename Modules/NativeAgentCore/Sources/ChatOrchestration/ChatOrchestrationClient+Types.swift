@@ -133,7 +133,9 @@ public typealias ChatOrchestrationProgressHandler = @Sendable (TurnStreamEvent) 
 /// Receipt for an ack-on-enqueue user append: the message row is durably in
 /// the session transcript, independent of any turn that later consumes it.
 public struct EnqueuedUserMessage: Sendable {
-    /// The resolved session the row landed in (minted when the caller passed nil).
+    /// The checked canonical session the row landed in. Callers must create and
+    /// retain a new session identity before enqueueing; persistence never mints
+    /// one from a missing value.
     public let sessionId: String
     /// The runId stamped on the enqueued user row.
     public let runId: String

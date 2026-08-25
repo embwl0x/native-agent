@@ -7,7 +7,7 @@ import PersistenceCore
 // MARK: - Wave 38 W15: scheduler-job LIST read port tests + pause/resume guard
 //
 // Empirically exercises the SwiftNative `listJobs()` path. Covered:
-//   * non-list disk content coerces to []
+//   * existing non-list disk content fails closed (only an absent file is [])
 //   * empty / missing file → []
 //   * nextRunAt decoration: integral epoch → ISO with NO fractional seconds;
 //     fractional epoch → microsecond ISO; both add nextRunAtEpoch (float) +
@@ -84,12 +84,13 @@ private func makeListClient(root: URL) -> SwiftNativeTriggerScheduler {
     }
 }
 
-@Test func listJobs_nonListContent_coercesToEmpty() async throws {
+@Test func listJobs_nonListContentFailsClosed() async throws {
     try await withListRoot { root in
         try seedRawJobsJSON(.object(["not": .string("a list")]), root: root)
         let client = makeListClient(root: root)
-        let jobs = try await client.listJobs()
-        #expect(jobs.isEmpty)
+        await #expect(throws: (any Error).self) {
+            _ = try await client.listJobs()
+        }
     }
 }
 

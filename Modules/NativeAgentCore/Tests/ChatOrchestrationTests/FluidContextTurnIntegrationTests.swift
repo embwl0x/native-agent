@@ -547,3 +547,77 @@ struct PacketProvenanceTests {
         #expect(memoryRecallPersonaFilter("Agent") == nil)
     }
 }
+
+// MARK: - memory.recallHits counts the RESOLVED lane (2026-08-21)
+
+/// On an `.active` turn the legacy `recall()` lane is skipped by design and
+/// memory rides the packet, so a counter over `recalled.count` read 0 on
+/// 511/511 live turns while `contextFlow.memoryRecords` averaged ~12. The
+/// trace counter must follow `resolvedRecalledIds` (legacy ∪ packet
+/// provenance) — the union the recalled-memory stamp actually consumes — and
+/// `memoryRecall.injectedHitCount` must agree with it. The legacy-only count
+/// keeps its own honest lane name.
+@Test func contextSummaryRecallHitsCountsResolvedPacketProvenanceOnActiveTurns() async throws {
+    let prepared = try fluidPreparedTurn()
+    prepared.attachMemoryRecordProvenance(["rec-c", "rec-a", "rec-b"])
+    let flow = FluidContextStub(mode: .active, prepared: prepared)
+    let memory = FluidMemoryStub()
+    let engine = fluidEngine(
+        persona: FluidPersonaStub(throwsOnRead: true),
+        flow: flow,
+        memory: memory
+    )
+
+    let traceRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("recallhits-resolved-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: traceRoot, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: traceRoot) }
+    let bus = TurnTraceBus(persistLane: TurnTracePersistLane(dataRootOverride: traceRoot))
+    let sub = await bus.subscribe()
+    let turnId = TurnTraceContext.mintTurnId()
+    let drain = Task { () -> TurnTraceEvent? in
+        for await event in sub.stream where event.kind == "context.summary" && event.turnId == turnId {
+            return event
+        }
+        return nil
+    }
+
+    let context = try await TurnTraceContext.$bus.withValue(bus) {
+        try await TurnTraceContext.$turnId.withValue(turnId) {
+            try await engine.buildTurnContext(
+                surface: "chat",
+                userMessage: "hello",
+                personaOverride: nil,
+                imageBlocks: [],
+                includeClockContext: false
+            )
+        }
+    }
+    let stopper = Task {
+        try? await Task.sleep(nanoseconds: 3_000_000_000)
+        await bus.unsubscribe(sub.id)
+    }
+    let event = try #require(await drain.value, "no context.summary receipt within 3s")
+    stopper.cancel()
+    await bus.unsubscribe(sub.id)
+
+    guard case .object(let payload) = event.payload,
+          case .object(let counts)? = payload["counts"],
+          case .object(let memoryRecall)? = payload["memoryRecall"] else {
+        Issue.record("context.summary payload missing counts/memoryRecall")
+        return
+    }
+    // Premise: this IS an active turn — legacy recall never ran, memory came
+    // via the packet. Without that the assertion below would be vacuous.
+    #expect(context.recalled.isEmpty)
+    #expect(await memory.recallCount == 0)
+    #expect(context.resolvedRecalledIds == ["rec-a", "rec-b", "rec-c"])
+
+    #expect(counts["memory.recallHits"] == .int(3),
+            "resolved lane: \(String(describing: counts["memory.recallHits"]))")
+    #expect(counts["memory.recallHits.legacy"] == .int(0))
+    #expect(counts["contextFlow.memoryRecords"] == .int(3))
+    #expect(memoryRecall["outcome"] == .string("contextFlow"))
+    #expect(memoryRecall["injectedHitCount"] == .int(3),
+            "injected must follow the resolved lane: \(String(describing: memoryRecall["injectedHitCount"]))")
+}

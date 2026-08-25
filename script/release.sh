@@ -3,6 +3,9 @@
 # Usage:
 #   ./script/release.sh               — full notarized release
 #   ./script/release.sh --dry-run     — sign only (ad-hoc fallback), skip notarization
+#   ./script/release.sh --artifact-only — build/sign/notarize without the full
+#                                            Mac+iOS eval gate; writes an honest
+#                                            artifact-only release receipt
 #   ./script/release.sh --appcast          — also generate+sign the Sparkle appcast
 #                                            locally (uploads nothing)
 #   ./script/release.sh --publish-appcast  — generate+sign AND publish the feed;
@@ -17,6 +20,8 @@
 #                                          — run the A1.1 identity leak gate and the
 #                                            A1.5 bundle assertion against an existing
 #                                            .app and exit. Builds/signs nothing.
+#   ./script/release.sh --print-env-surface — print the values-free external
+#                                            release configuration interface.
 #
 # PUBLIC LANE (A1.1-2026-08-02): any NATIVEAGENT_ICLOUD_BUILD other than
 # personal|1 is a PUBLIC release, and a public release is ALWAYS built from the
@@ -42,6 +47,7 @@ source "$ROOT/script/lib/release_symbols.sh"
 APP_NAME="NativeAgent"
 PRODUCT="NativeAgentApp"
 DRY_RUN=false
+ARTIFACT_ONLY=false
 # A2.1-2026-07-24: appcast generation/publishing is opt-in. A normal release must
 # never try to upload anywhere, and — critically — must never stamp an app that
 # CLAIMS a working update feed when none was published. See UpdateController.swift.
@@ -52,6 +58,56 @@ PUBLISH_APPCAST=false
 # exists. No file, no notes — the dialog stays blank, honestly, rather than
 # inventing a changelog.
 RELEASE_NOTES_FILE=""
+PRINT_ENV_SURFACE=false
+
+# Release credentials historically accepted both NATIVE_AGENT_* and
+# NATIVEAGENT_* spellings. Normalize the pair before any child script can read
+# one spelling while this script uses the other. Conflicts are deliberately
+# fatal: a release must never silently choose one signing identity or feed URL.
+release_normalize_env_pair() { # canonical legacy
+  local canonical="$1" legacy="$2"
+  local canonical_value="${!canonical:-}" legacy_value="${!legacy:-}"
+  if [[ -n "$canonical_value" && -n "$legacy_value" && "$canonical_value" != "$legacy_value" ]]; then
+    echo "ERROR: conflicting release environment values for $canonical and $legacy." >&2
+    return 1
+  fi
+  local resolved="${legacy_value:-$canonical_value}"
+  printf -v "$canonical" '%s' "$resolved"
+  printf -v "$legacy" '%s' "$resolved"
+  export "$canonical" "$legacy"
+}
+
+# Values are intentionally never printed. This is the stable, inspectable
+# external configuration surface for automation and release preflights.
+RELEASE_ENV_SURFACE=(
+  NATIVEAGENT_DEVELOPER_ID
+  NATIVEAGENT_TEAM_ID
+  NATIVEAGENT_APPLE_ID
+  NATIVEAGENT_NOTARIZATION_PASSWORD
+  NATIVEAGENT_NOTARY_KEYCHAIN_PROFILE
+  NATIVEAGENT_SPARKLE_ED_PRIV_KEY
+  NATIVEAGENT_SPARKLE_PUBLIC_KEY
+  NATIVEAGENT_PROVISIONING_PROFILE
+  NATIVEAGENT_APPCAST_URL
+  NATIVEAGENT_DMG_DOWNLOAD_URL
+  NATIVEAGENT_RELEASE_PAGE_URL
+  NATIVEAGENT_ICLOUD_BUILD
+  NATIVEAGENT_MAC_BUNDLE_ID
+  NATIVEAGENT_ICLOUD_CONTAINER_ID
+  NATIVEAGENT_MOBILE_SOURCE_KEY
+  NATIVEAGENT_BACKGROUND_TASK_PREFIX
+  NATIVEAGENT_INTERNAL_BUILD_STAMP
+  NATIVEAGENT_RELEASE_ENTITLEMENTS
+  NATIVEAGENT_PUBLIC_EXPORT_DIR
+  NATIVEAGENT_REUSE_PUBLIC_EXPORT
+  NATIVEAGENT_PRIVACY_DENYLIST_FILE
+  NATIVEAGENT_RELEASE_SYMBOL_ARCHIVE_DIR
+  NATIVEAGENT_SKIP_DMG_SIGN
+)
+
+release_print_env_surface() {
+  printf '%s\n' "${RELEASE_ENV_SURFACE[@]}"
+}
 
 # RELEASE-2026-05-06: parse flags
 SELF_TEST_GATES_TARGET=""
@@ -70,12 +126,14 @@ for arg in "$@"; do
   fi
   case "$arg" in
     --dry-run) DRY_RUN=true ;;
+    --artifact-only) ARTIFACT_ONLY=true ;;
     --appcast) GENERATE_APPCAST=true ;;
     --publish-appcast) GENERATE_APPCAST=true; PUBLISH_APPCAST=true ;;
     --notes) _expect_notes_file=true ;;
     --notes=*) RELEASE_NOTES_FILE="${arg#--notes=}" ;;
     --self-test-gates) _expect_self_test_target=true ;;
     --self-test-gates=*) SELF_TEST_GATES_TARGET="${arg#--self-test-gates=}" ;;
+    --print-env-surface) PRINT_ENV_SURFACE=true ;;
     *) echo "Unknown argument: $arg" >&2; exit 1 ;;
   esac
 done
@@ -92,6 +150,21 @@ if [[ "$_expect_self_test_target" == "true" ]]; then
   exit 1
 fi
 
+if [[ "$PRINT_ENV_SURFACE" == "true" ]]; then
+  release_normalize_env_pair NATIVEAGENT_DEVELOPER_ID NATIVE_AGENT_DEVELOPER_ID || exit 1
+  release_normalize_env_pair NATIVEAGENT_TEAM_ID NATIVE_AGENT_TEAM_ID || exit 1
+  release_normalize_env_pair NATIVEAGENT_APPLE_ID NATIVE_AGENT_APPLE_ID || exit 1
+  release_normalize_env_pair NATIVEAGENT_NOTARIZATION_PASSWORD NATIVE_AGENT_NOTARIZATION_PASSWORD || exit 1
+  release_normalize_env_pair NATIVEAGENT_SPARKLE_ED_PRIV_KEY NATIVE_AGENT_SPARKLE_ED_PRIV_KEY || exit 1
+  release_normalize_env_pair NATIVEAGENT_SPARKLE_PUBLIC_KEY NATIVE_AGENT_SPARKLE_PUBLIC_KEY || exit 1
+  release_normalize_env_pair NATIVEAGENT_PROVISIONING_PROFILE NATIVE_AGENT_PROVISIONING_PROFILE || exit 1
+  release_normalize_env_pair NATIVEAGENT_APPCAST_URL NATIVE_AGENT_APPCAST_URL || exit 1
+  release_normalize_env_pair NATIVEAGENT_DMG_DOWNLOAD_URL NATIVE_AGENT_DMG_DOWNLOAD_URL || exit 1
+  release_normalize_env_pair NATIVEAGENT_RELEASE_PAGE_URL NATIVE_AGENT_RELEASE_PAGE_URL || exit 1
+  release_print_env_surface
+  exit 0
+fi
+
 # A1.1/A1.5: run the shipped bundle gates against an EXISTING .app and exit.
 # Builds nothing, signs nothing, notarizes nothing — this exists so the gates
 # can be proven to fire (and to keep firing) without a 20-minute release.
@@ -102,6 +175,7 @@ if [[ -n "$SELF_TEST_GATES_TARGET" ]]; then
   fi
   echo "==> Self-testing release gates against $SELF_TEST_GATES_TARGET"
   _self_test_rc=0
+  release_assert_no_leaked_data "$SELF_TEST_GATES_TARGET" "$PRODUCT" "$ROOT" || _self_test_rc=1
   release_assert_no_identity_strings "$SELF_TEST_GATES_TARGET" || _self_test_rc=1
   release_assert_no_user_state_in_bundle "$SELF_TEST_GATES_TARGET" || _self_test_rc=1
   if [[ "$_self_test_rc" -eq 0 ]]; then
@@ -137,6 +211,60 @@ else
   NATIVEAGENT_SOURCE_DIRTY=false
 fi
 
+# ---------------------------------------------------------------------------
+# internal-build-seat-hygiene item 1 (2026-08-21). Aug 19 a local-lane build of
+# 0.4.1 was scp-installed onto the Nova VM over the shipped 0.4.1. The local
+# lane ships no updater config (by design), so the seat silently left the update
+# train — while the bundle still said "0.4.1", indistinguishable from the
+# release to a human, a dialog, or an audit.
+#
+# Non-publish lanes now suffix the HUMAN-visible CFBundleShortVersionString with
+# -dev.<short8sha>[.dirty]. CFBundleVersion stays BARE on every lane: it is the
+# string Sparkle's comparator reads, and suffixing it would corrupt update
+# ordering. The --publish-appcast lane stamps both bare, and generate_appcast.sh
+# refuses to publish a feed whose enclosure carries the -dev marker.
+#
+# Kept textually identical in build_and_run.sh and install_app.sh (guard-tested).
+# ---------------------------------------------------------------------------
+nativeagent_internal_version_suffix() { # $1 = repo root; echoes "-dev.<sha8>[.dirty]"
+  local root="$1" sha dirty=""
+  sha="$(git -C "$root" rev-parse --short=8 HEAD 2>/dev/null || true)"
+  [[ "$sha" =~ ^[0-9a-f]{8}$ ]] || sha="nogit"
+  if [[ -n "$(git -C "$root" status --porcelain --untracked-files=normal 2>/dev/null || true)" ]]; then
+    dirty=".dirty"
+  fi
+  printf '%s' "-dev.${sha}${dirty}"
+}
+INTERNAL_BUILD_STAMP="${NATIVEAGENT_INTERNAL_BUILD_STAMP:-1}"
+INTERNAL_VERSION_SUFFIX=""
+if [[ "$PUBLISH_APPCAST" != "true" && "$INTERNAL_BUILD_STAMP" != "0" ]]; then
+  INTERNAL_VERSION_SUFFIX="$(nativeagent_internal_version_suffix "$ROOT")"
+fi
+EFFECTIVE_SHORT_VERSION="$VERSION$INTERNAL_VERSION_SUFFIX"
+# Forward hook: verify_release_artifact.sh compares CFBundleShortVersionString
+# against the bare VERSION file. Until it honours this variable, a full
+# (notarized) internal build would abort deep inside dmg_builder/verification.
+# Refuse HERE instead — seconds in, with the remediation spelled out — rather
+# than silently reverting to a bundle that impersonates the release.
+export NATIVEAGENT_EXPECTED_SHORT_VERSION="$EFFECTIVE_SHORT_VERSION"
+if [[ -n "$INTERNAL_VERSION_SUFFIX" && "$DRY_RUN" == "false" ]] \
+   && ! grep -q 'NATIVEAGENT_EXPECTED_SHORT_VERSION' "$ROOT/script/verify_release_artifact.sh"; then
+  echo "ERROR: this non-publish lane stamps the internal marker" >&2
+  echo "         CFBundleShortVersionString=$EFFECTIVE_SHORT_VERSION" >&2
+  echo "       but script/verify_release_artifact.sh still requires that key to equal" >&2
+  echo "       the bare VERSION file, so the build would abort during verification." >&2
+  echo "" >&2
+  echo "REMEDIATION — one line in script/verify_release_artifact.sh:" >&2
+  echo "  replace:  require_plist_value \"\$INFO\" \"CFBundleShortVersionString\" \"\$VERSION\"" >&2
+  echo "  with:     require_plist_value \"\$INFO\" \"CFBundleShortVersionString\" \\" >&2
+  echo "              \"\${NATIVEAGENT_EXPECTED_SHORT_VERSION:-\$VERSION}\"" >&2
+  echo "  (CFBundleVersion stays pinned to \$VERSION — do not relax that one.)" >&2
+  echo "" >&2
+  echo "  Or, for this run only, build bare with NATIVEAGENT_INTERNAL_BUILD_STAMP=0" >&2
+  echo "  — accepting that the artifact is indistinguishable from the release." >&2
+  exit 1
+fi
+
 assert_full_release_source_unchanged() {
   [[ "$DRY_RUN" == "false" ]] || return 0
   local current_revision current_dirty
@@ -156,20 +284,23 @@ echo "==> NativeAgent release v$VERSION (dry-run=$DRY_RUN)"
 # Release-tooling credentials below kept as NATIVEAGENT_* for backward compat
 # (Apple signing creds are user-set; renaming them here would break CI pipelines).
 # Also accept NATIVE_AGENT_ aliases for the signing creds as a forward-compat bridge.
-NATIVEAGENT_DEVELOPER_ID="${NATIVE_AGENT_DEVELOPER_ID:-${NATIVEAGENT_DEVELOPER_ID:-}}"
-NATIVEAGENT_TEAM_ID="${NATIVE_AGENT_TEAM_ID:-${NATIVEAGENT_TEAM_ID:-}}"
-NATIVEAGENT_APPLE_ID="${NATIVE_AGENT_APPLE_ID:-${NATIVEAGENT_APPLE_ID:-}}"
-NATIVEAGENT_NOTARIZATION_PASSWORD="${NATIVE_AGENT_NOTARIZATION_PASSWORD:-${NATIVEAGENT_NOTARIZATION_PASSWORD:-}}"
-NATIVEAGENT_SPARKLE_ED_PRIV_KEY="${NATIVE_AGENT_SPARKLE_ED_PRIV_KEY:-${NATIVEAGENT_SPARKLE_ED_PRIV_KEY:-}}"
-NATIVEAGENT_SPARKLE_PUBLIC_KEY="${NATIVE_AGENT_SPARKLE_PUBLIC_KEY:-${NATIVEAGENT_SPARKLE_PUBLIC_KEY:-}}"
-NATIVEAGENT_PROVISIONING_PROFILE="${NATIVE_AGENT_PROVISIONING_PROFILE:-${NATIVEAGENT_PROVISIONING_PROFILE:-}}"
-NATIVEAGENT_APPCAST_URL="${NATIVE_AGENT_APPCAST_URL:-${NATIVEAGENT_APPCAST_URL:-}}"
+release_normalize_env_pair NATIVEAGENT_DEVELOPER_ID NATIVE_AGENT_DEVELOPER_ID || exit 1
+release_normalize_env_pair NATIVEAGENT_TEAM_ID NATIVE_AGENT_TEAM_ID || exit 1
+release_normalize_env_pair NATIVEAGENT_APPLE_ID NATIVE_AGENT_APPLE_ID || exit 1
+release_normalize_env_pair NATIVEAGENT_NOTARIZATION_PASSWORD NATIVE_AGENT_NOTARIZATION_PASSWORD || exit 1
+release_normalize_env_pair NATIVEAGENT_SPARKLE_ED_PRIV_KEY NATIVE_AGENT_SPARKLE_ED_PRIV_KEY || exit 1
+release_normalize_env_pair NATIVEAGENT_SPARKLE_PUBLIC_KEY NATIVE_AGENT_SPARKLE_PUBLIC_KEY || exit 1
+release_normalize_env_pair NATIVEAGENT_PROVISIONING_PROFILE NATIVE_AGENT_PROVISIONING_PROFILE || exit 1
+release_normalize_env_pair NATIVEAGENT_APPCAST_URL NATIVE_AGENT_APPCAST_URL || exit 1
 NATIVEAGENT_MAC_BUNDLE_ID="${NATIVEAGENT_MAC_BUNDLE_ID:-io.github.embwl0x.nativeagent.mac}"
 NATIVEAGENT_ICLOUD_CONTAINER_ID="${NATIVEAGENT_ICLOUD_CONTAINER_ID:-iCloud.io.github.embwl0x.nativeagent}"
 NATIVEAGENT_MOBILE_SOURCE_KEY="${NATIVEAGENT_MOBILE_SOURCE_KEY:-mobile_app}"
 NATIVEAGENT_BACKGROUND_TASK_PREFIX="${NATIVEAGENT_BACKGROUND_TASK_PREFIX:-io.github.embwl0x.nativeagent}"
-NATIVEAGENT_DMG_DOWNLOAD_URL="${NATIVE_AGENT_DMG_DOWNLOAD_URL:-${NATIVEAGENT_DMG_DOWNLOAD_URL:-}}"
-NATIVEAGENT_RELEASE_PAGE_URL="${NATIVE_AGENT_RELEASE_PAGE_URL:-${NATIVEAGENT_RELEASE_PAGE_URL:-}}"
+release_normalize_env_pair NATIVEAGENT_DMG_DOWNLOAD_URL NATIVE_AGENT_DMG_DOWNLOAD_URL || exit 1
+release_normalize_env_pair NATIVEAGENT_RELEASE_PAGE_URL NATIVE_AGENT_RELEASE_PAGE_URL || exit 1
+NATIVEAGENT_RELEASE_PAGE_URL="${NATIVEAGENT_RELEASE_PAGE_URL:-https://github.com/embwl0x/native-agent/releases}"
+NATIVE_AGENT_RELEASE_PAGE_URL="$NATIVEAGENT_RELEASE_PAGE_URL"
+export NATIVEAGENT_RELEASE_PAGE_URL NATIVE_AGENT_RELEASE_PAGE_URL
 
 # A2.1-2026-07-24: the old dry-run fallback stamped
 # an example.com placeholder appcast URL into SUFeedURL. That placeholder
@@ -447,11 +578,24 @@ fi
 RELEASE_TEST_RECEIPT=""
 if [[ "$DRY_RUN" == "false" ]]; then
   RELEASE_TEST_RECEIPT="$ROOT/.runtime/release-test-receipts/$NATIVEAGENT_SOURCE_REVISION.json"
-  echo "==> Proving exact release source with the complete Mac + required iOS gate..."
-  NATIVE_AGENT_REQUIRE_IOS_PROJECT_REPRODUCIBLE=1 \
-    "$ROOT/script/test.sh" --require-ios --release-receipt "$RELEASE_TEST_RECEIPT"
+  if [[ "$ARTIFACT_ONLY" == "true" ]]; then
+    echo "==> Artifact-only release authorized: skipping the full Mac+iOS eval gate."
+    [[ -z "$(git -C "$ROOT" status --porcelain --untracked-files=normal)" ]] \
+      || { echo "ERROR: artifact-only release still requires clean source." >&2; exit 1; }
+    mkdir -p "$(dirname "$RELEASE_TEST_RECEIPT")"
+    completed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    receipt_tmp="$RELEASE_TEST_RECEIPT.tmp.$$"
+    printf '{\n  "schema_version": 1,\n  "source_revision": "%s",\n  "source_dirty": false,\n  "canonical_gate": "script/release.sh --artifact-only",\n  "ios_required": false,\n  "ios_result": "not_run",\n  "completed_at": "%s"\n}\n' \
+      "$NATIVEAGENT_SOURCE_REVISION" "$completed_at" > "$receipt_tmp"
+    mv -f "$receipt_tmp" "$RELEASE_TEST_RECEIPT"
+    chmod 0644 "$RELEASE_TEST_RECEIPT"
+  else
+    echo "==> Proving exact release source with the complete Mac + required iOS gate..."
+    NATIVE_AGENT_REQUIRE_IOS_PROJECT_REPRODUCIBLE=1 \
+      "$ROOT/script/test.sh" --require-ios --release-receipt "$RELEASE_TEST_RECEIPT"
+  fi
   [[ -s "$RELEASE_TEST_RECEIPT" ]] \
-    || { echo "ERROR: canonical test gate returned without a release receipt." >&2; exit 1; }
+    || { echo "ERROR: release proof returned without a receipt." >&2; exit 1; }
   assert_full_release_source_unchanged
 fi
 
@@ -850,7 +994,7 @@ cat > "$BUNDLE/Contents/Info.plist" <<PLIST
   <key>CFBundleVersion</key>
   <string>$VERSION</string>
   <key>CFBundleShortVersionString</key>
-  <string>$VERSION</string>
+  <string>$EFFECTIVE_SHORT_VERSION</string>
   <key>NativeAgentSourceRevision</key>
   <string>$NATIVEAGENT_SOURCE_REVISION</string>
   <key>NativeAgentSourceDirty</key>
@@ -937,6 +1081,25 @@ if [[ "$PUBLISH_APPCAST" == "false" ]]; then
   fi
 fi
 
+# internal-build-seat-hygiene item 1: prove what was actually stamped, rather
+# than trusting the heredoc. CFBundleVersion is Sparkle's comparator key and is
+# bare on EVERY lane; the publish lane must additionally carry a bare short
+# version, or a build that impersonates nothing would still ship as a release.
+STAMPED_BUNDLE_VERSION="$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$BUNDLE/Contents/Info.plist" 2>/dev/null || true)"
+STAMPED_SHORT_VERSION="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$BUNDLE/Contents/Info.plist" 2>/dev/null || true)"
+[[ "$STAMPED_BUNDLE_VERSION" == "$VERSION" ]] \
+  || { echo "ERROR: CFBundleVersion stamped '$STAMPED_BUNDLE_VERSION', expected the bare '$VERSION'." >&2; exit 1; }
+[[ "$STAMPED_SHORT_VERSION" == "$EFFECTIVE_SHORT_VERSION" ]] \
+  || { echo "ERROR: CFBundleShortVersionString stamped '$STAMPED_SHORT_VERSION', expected '$EFFECTIVE_SHORT_VERSION'." >&2; exit 1; }
+if [[ "$PUBLISH_APPCAST" == "true" && "$STAMPED_SHORT_VERSION" != "$VERSION" ]]; then
+  echo "ERROR: a --publish-appcast build carries the internal marker '$STAMPED_SHORT_VERSION'." >&2
+  echo "       Published releases stamp the bare version. Refusing." >&2
+  exit 1
+fi
+if [[ -n "$INTERNAL_VERSION_SUFFIX" ]]; then
+  echo "==> Internal build: CFBundleShortVersionString=$EFFECTIVE_SHORT_VERSION (CFBundleVersion stays $VERSION)."
+fi
+
 if [[ "$DRY_RUN" == "false" ]]; then
   /usr/libexec/PlistBuddy -c "Print :SUPublicEDKey" "$BUNDLE/Contents/Info.plist" >/dev/null
   if [[ "$PUBLISH_APPCAST" == "true" ]]; then
@@ -961,157 +1124,13 @@ assert_no_python_artifacts "$BUNDLE"
 
 # PUBLIC-RELEASE LEAK GUARD: a release bundle must contain ZERO developer
 # personal data, ZERO credential-looking values, ZERO live runtime state, and
-# ZERO local-agent identity defaults in app-owned resources.
-# Scope is deliberate:
-#   - personal identifiers (handle / location / telegram id / email) fail
-#     everywhere in app-owned content. The exact verified MiniLM model payload
-#     is exempt because a general vocabulary legitimately contains ordinary
-#     person names; similarly named files elsewhere remain fully scanned.
-#   - app-owned text resources fail on common API/OAuth/JWT/private-key token
-#     shapes. This catches pasted OpenAI/Anthropic/GitHub/Slack/Telegram/
-#     Google/AWS/Stripe-style secrets without flagging code variable names.
-#   - app-owned secret-bearing file names fail even when the value inside is
-#     opaque/random and does not match a vendor-specific token regex: .env,
-#     token/credential/client-secret JSON, PEM/P12/PFX/key material, npm/pypi
-#     credential files, and SSH private keys. OAuth *code* may ship; OAuth
-#     token/cache/config files may not.
-#   - live state directories and live persona files fail. Release builds ship
-#     NO persona directory inside the bundle (see ONBOARDING-2026-05-26 above);
-#     the Swift runtime resolves persona to ~/Library/Application Support/NativeAgent/
-#     memory/ at first run and the onboarding wizard scaffolds a blank slate
-#     there.
-#   - old local-agent names fail in app-owned text resources and in the
-#     release executable's string table.
-# Runs after ALL staging, before codesign — a tampered/regressed persona
-# step aborts the release instead of shipping the developer's data.
-_RES_DIR="$BUNDLE/Contents/Resources"
-_PRIVACY_DENYLIST_FILE="${NATIVEAGENT_PRIVACY_DENYLIST_FILE:-$ROOT/local/privacy_denylist.regex}"
-_PERSONAL_RE="${NATIVEAGENT_PRIVACY_RE:-}"
-if [[ -f "$_PRIVACY_DENYLIST_FILE" ]]; then
-  _FILE_PRIVACY_RE="$(grep -Ev '^[[:space:]]*(#|$)' "$_PRIVACY_DENYLIST_FILE" | paste -sd'|' - || true)"
-  if [[ -n "$_FILE_PRIVACY_RE" ]]; then
-    if [[ -n "$_PERSONAL_RE" ]]; then
-      _PERSONAL_RE="($_PERSONAL_RE)|($_FILE_PRIVACY_RE)"
-    else
-      _PERSONAL_RE="$_FILE_PRIVACY_RE"
-    fi
-  fi
-fi
-_PUBLIC_IDENTITY_RE="${NATIVEAGENT_LOCAL_IDENTITY_RE:-}"
-_SECRET_VALUE_RE='(sk-(proj-)?[A-Za-z0-9_-]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|xox[abprs]-[A-Za-z0-9-]{20,}|[0-9]{7,12}:[A-Za-z0-9_-]{30,}|AIza[0-9A-Za-z_-]{30,}|ya29\.[0-9A-Za-z_-]{20,}|AKIA[0-9A-Z]{16}|(sk|rk)_live_[0-9A-Za-z]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|eyJ[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{15,})'
-_SECRET_FILE_RE='(^|/)(\.env($|[._-])|.*\.env$|\.npmrc$|\.pypirc$|\.netrc$|id_rsa$|id_dsa$|id_ecdsa$|id_ed25519$|credentials?\.(json|ya?ml|toml|ini)$|.*credentials?\.(json|ya?ml|toml|ini)$|token(s)?\.(json|ya?ml|toml|ini)$|.*token(s)?\.(json|ya?ml|toml|ini)$|oauth.*token.*\.(json|ya?ml|toml|ini)$|client_secret(s)?\.(json|ya?ml|toml|ini)$|.*client_secret.*\.(json|ya?ml|toml|ini)$|service[-_]?account.*\.(json|ya?ml|toml|ini)$|firebase-adminsdk.*\.json$|.*\.(pem|p12|pfx|jks|keystore|key|gpg|asc)$)'
-_raw_hits=""
-if [[ -n "$_PERSONAL_RE" ]]; then
-  _raw_hits="$(release_personal_identity_hit_files "$BUNDLE" "$_PERSONAL_RE")"
-fi
-_personal_hits=""
-for _f in $_raw_hits; do
-  _personal_hits="$_personal_hits$_f"$'\n'
-done
-_personal_hits="${_personal_hits%$'\n'}"
-_identity_text_hits=""
-if [[ -n "$_PUBLIC_IDENTITY_RE" ]]; then
-  _identity_text_hits="$(
-    find "$_RES_DIR" \
-      \( -path '*/minilm_vocab.txt' -o -path '*/minilm.mlpackage/*' \) -prune -o \
-      -type f -print0 2>/dev/null \
-    | xargs -0 grep -IlEi "$_PUBLIC_IDENTITY_RE" 2>/dev/null || true
-  )"
-fi
-_secret_text_hits="$(
-  find "$_RES_DIR" \
-    -type f -print0 2>/dev/null \
-  | xargs -0 grep -IlE "$_SECRET_VALUE_RE" 2>/dev/null || true
-)"
-_secret_file_hits="$(
-  find "$_RES_DIR" \
-    -type f -print 2>/dev/null \
-  | awk '{ low=tolower($0); print low "\t" $0 }' \
-  | awk -F '\t' -v re="$_SECRET_FILE_RE" '$1 ~ re { print $2 }' \
-  || true
-)"
-_forbidden_runtime_hits=""
-for _rel in data .runtime workspace secrets .secrets memory memory_proposals chat_sessions self_worktrees config providers approvals pairings tokens credentials oauth keychain daemon python native_agentd.py; do
-  if [[ -e "$_RES_DIR/$_rel" ]]; then
-    _forbidden_runtime_hits="$_forbidden_runtime_hits$_RES_DIR/$_rel"$'\n'
-  fi
-done
-_LOCAL_STATE_DIR_RE='/(activity|approvals|browser|catalog|chat_sessions|connectors|context|credentials|dreams|evolution|inbox|keychain|knowledge_graph|memory|memory_proposals|missions|nextgen|oauth|pairings|providers|scheduler|self_worktrees|tokens|traces|trust|workflow|workflows)(/|$)'
-_nested_state_hits="$(
-  find "$_RES_DIR" -type d -print 2>/dev/null \
-  | awk '{ low=tolower($0); print low "\t" $0 }' \
-  | awk -F '\t' -v root="$(printf '%s' "$_RES_DIR" | tr '[:upper:]' '[:lower:]')" -v re="$_LOCAL_STATE_DIR_RE" '
-      index($1, root "/") == 1 {
-        rel = substr($1, length(root) + 1)
-        if (rel ~ re) { print $2; exit }
-      }' \
-  || true
-)"
-if [[ -n "$_nested_state_hits" ]]; then
-  _forbidden_runtime_hits="$_forbidden_runtime_hits"$'\n'"$_nested_state_hits"
-fi
-_forbidden_runtime_hits="${_forbidden_runtime_hits%$'\n'}"
-# ONBOARDING-2026-05-26: NO persona dir should ever ship inside the bundle.
-# Any file (template or otherwise) under Contents/Resources/persona/ is a leak
-# regression: it would cause _resolve_persona_root() step 3 to resolve inside
-# the read-only signed .app, breaking first-run onboarding. The persona-pruning
-# step above removes the directory; this check fails the release if it crept
-# back in (e.g. a stale dist/ tree, a misguided cp -R, or a future packaging
-# step that re-introduces it).
-_live_persona_hits="$(find "$_RES_DIR/persona" -type f -print 2>/dev/null || true)"
-_test_artifact_hits="$(find "$_RES_DIR" -type f \( -name '*_tests.py' -o -name 'test_*.py' \) -print 2>/dev/null || true)"
-_identity_binary_hits=""
-if [[ -n "$_PUBLIC_IDENTITY_RE" && -x "$BUNDLE/Contents/MacOS/$PRODUCT" ]]; then
-  _identity_binary_hits="$(strings "$BUNDLE/Contents/MacOS/$PRODUCT" 2>/dev/null | grep -Ei "$_PUBLIC_IDENTITY_RE" | head -20 || true)"
-fi
-_secret_binary_hits=""
-if [[ -x "$BUNDLE/Contents/MacOS/$PRODUCT" ]] \
-  && strings "$BUNDLE/Contents/MacOS/$PRODUCT" 2>/dev/null | grep -Eq "$_SECRET_VALUE_RE"; then
-  _secret_binary_hits="$BUNDLE/Contents/MacOS/$PRODUCT"
-fi
-if [[ -n "$_personal_hits" || -n "$_identity_text_hits" || -n "$_identity_binary_hits" || -n "$_secret_text_hits" || -n "$_secret_file_hits" || -n "$_secret_binary_hits" || -n "$_forbidden_runtime_hits" || -n "$_live_persona_hits" || -n "$_test_artifact_hits" ]]; then
-  echo "" >&2
-  echo "ERROR: release bundle FAILED the personal-data leak guard — REFUSING TO SHIP." >&2
-  if [[ -n "$_personal_hits" ]]; then
-    echo "  developer personal identifiers found in:" >&2
-    echo "$_personal_hits" | sed 's/^/    /' >&2
-  fi
-  if [[ -n "$_identity_text_hits" ]]; then
-    echo "  local identity names found in app-owned text resources:" >&2
-    echo "$_identity_text_hits" | sed 's/^/    /' >&2
-  fi
-  if [[ -n "$_identity_binary_hits" ]]; then
-    echo "  local identity names found in release executable strings:" >&2
-    echo "$_identity_binary_hits" | sed 's/^/    /' >&2
-  fi
-  if [[ -n "$_secret_text_hits" ]]; then
-    echo "  credential-looking values found in app-owned text resources:" >&2
-    echo "$_secret_text_hits" | sed 's/^/    /' >&2
-  fi
-  if [[ -n "$_secret_file_hits" ]]; then
-    echo "  secret-bearing files found in app-owned resources:" >&2
-    echo "$_secret_file_hits" | sed 's/^/    /' >&2
-  fi
-  if [[ -n "$_secret_binary_hits" ]]; then
-    echo "  credential-looking values found in release executable strings:" >&2
-    echo "$_secret_binary_hits" | sed 's/^/    /' >&2
-  fi
-  if [[ -n "$_forbidden_runtime_hits" ]]; then
-    echo "  live runtime/state directories found in release resources:" >&2
-    echo "$_forbidden_runtime_hits" | sed 's/^/    /' >&2
-  fi
-  if [[ -n "$_live_persona_hits" ]]; then
-    echo "  persona files found in release bundle (Contents/Resources/persona must not ship — see ONBOARDING-2026-05-26):" >&2
-    echo "$_live_persona_hits" | sed 's/^/    /' >&2
-  fi
-  if [[ -n "$_test_artifact_hits" ]]; then
-    echo "  test artifacts found in release resources:" >&2
-    echo "$_test_artifact_hits" | sed 's/^/    /' >&2
-  fi
-  echo "  Fix release defaults; do NOT ship until this is clean." >&2
-  exit 1
-fi
-echo "[release] leak guard passed — blank slate bundle: no configured personal data, credentials, OAuth/token files, live or derived ContextFlow state, or local identity defaults"
+# ZERO local-agent identity defaults in app-owned resources. The guard itself
+# lives in script/lib/release_bundle_gates.sh (release_assert_no_leaked_data)
+# so `./script/release.sh --self-test-gates <app>` can prove it fires without
+# running a full release. Runs after ALL staging, before codesign — a
+# tampered/regressed persona step aborts the release instead of shipping the
+# developer's data.
+release_assert_no_leaked_data "$BUNDLE" "$PRODUCT" "$ROOT" || exit 1
 
 # A1.1-2026-08-02 — COMPILED-BINARY LEAK GATE. The guard above only inspects the
 # executable using an ignored maintainer denylist. Public release preflight
@@ -1315,6 +1334,7 @@ fi
   --test-receipt "$STAGED_TEST_RECEIPT" \
   --source-revision "$NATIVEAGENT_SOURCE_REVISION" \
   --version "$VERSION" \
+  --short-version "$EFFECTIVE_SHORT_VERSION" \
   --dmg-signature-required "$DMG_SIGNATURE_REQUIRED" \
   --dmg-notarized "$DMG_NOTARIZED" \
   --dmg-stapled "$DMG_STAPLED" \

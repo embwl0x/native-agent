@@ -3,6 +3,26 @@ import Testing
 @testable import NativeAgentApp
 import PersistenceCore
 
+private actor InspectorLiveConsumerGate {
+    private var released = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var subscriptionID: UUID?
+
+    func wait(subscriptionID: UUID) async {
+        self.subscriptionID = subscriptionID
+        guard !released else { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func currentSubscriptionID() -> UUID? { subscriptionID }
+
+    func release() {
+        released = true
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
 // MARK: - Turn Inspector W3 — grouping + replay-parse hermetic tests
 //
 // Covers the testable model logic the Inspector tab depends on:
@@ -261,6 +281,68 @@ struct TurnInspectorModelTests {
         }
         let after = await TurnTraceBus.shared.subscriberCount
         #expect(after <= baseline, "no sink leaked after start/stop cycling (baseline \(baseline), after \(after))")
+    }
+
+    // app.chat / ui.inspector.liveDropCount
+    @Test @MainActor func liveInspectorSurfacesItsOwnBusBackpressureCount() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("inspector-live-drop-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let bus = TurnTraceBus(persistLane: TurnTracePersistLane(dataRootOverride: root))
+        let gate = InspectorLiveConsumerGate()
+        let store = TurnInspectorStore(
+            liveBus: bus,
+            liveSubscriptionCapacity: 1,
+            beforeLiveConsumption: { id in await gate.wait(subscriptionID: id) }
+        )
+        store.start()
+
+        let subscriptionDeadline = Date().addingTimeInterval(2)
+        while await bus.subscriberCount == 0, Date() < subscriptionDeadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(await bus.subscriberCount == 1)
+
+        let gateDeadline = Date().addingTimeInterval(2)
+        var subscriptionID = await gate.currentSubscriptionID()
+        while subscriptionID == nil, Date() < gateDeadline {
+            try await Task.sleep(for: .milliseconds(5))
+            subscriptionID = await gate.currentSubscriptionID()
+        }
+        #expect(subscriptionID != nil)
+
+        // The store has subscribed but its consumer is deliberately held.
+        // These real bus emissions overflow the production capacity-one sink;
+        // no artificial count is injected into the UI store.
+        for index in 0..<8 {
+            TurnTraceBus.fire(
+                event(turn: "drop-turn", kind: "tool.dispatch", tsOffset: Double(index)),
+                on: bus
+            )
+        }
+
+        let overflowDeadline = Date().addingTimeInterval(2)
+        if let subscriptionID {
+            while await bus.dropCount(subscriptionID) == 0, Date() < overflowDeadline {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            #expect(await bus.dropCount(subscriptionID) > 0)
+        }
+        await gate.release()
+
+        let dropDeadline = Date().addingTimeInterval(2)
+        while store.liveDropCount == 0, Date() < dropDeadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(store.liveDropCount > 0)
+        #expect(TurnInspectorLiveDropPresentation.label(for: store.liveDropCount)
+            == "\(store.liveDropCount) dropped")
+        #expect(TurnInspectorLiveDropPresentation.label(for: 0) == nil)
+        #expect(TurnInspectorLiveDropPresentation.label(for: -1) == nil)
+
+        store.stop()
     }
 
     @Test func replay_read_from_temp_file_round_trips() throws {

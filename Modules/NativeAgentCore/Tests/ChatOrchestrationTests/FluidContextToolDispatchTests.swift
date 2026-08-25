@@ -91,6 +91,27 @@ struct FluidContextToolDispatchTests {
     }
 
     @Test
+    func offeredPointerExpandsFromChildTaskInsideTurnScope() async throws {
+        let dispatcher = makeDispatcher()
+        let prepared = try makePreparedTurn(offeredAtomIDs: ["atom:offered"])
+        let result = try await FluidContextToolScope.$current.withValue(prepared) {
+            try await Task {
+                try await dispatcher.dispatch(
+                    tool: "context_expand",
+                    input: ["atom_id": .string("atom:offered")],
+                    surface: "chat"
+                )
+            }.value
+        }
+        guard case .object(let object) = result else {
+            Issue.record("expected child-task expansion receipt")
+            return
+        }
+        #expect(object["status"] == .string("ok"))
+        #expect(object["receipt_id"] != nil)
+    }
+
+    @Test
     func unofferedPointerIsDeniedEvenWhenPresentInTheGeneration() async throws {
         let dispatcher = makeDispatcher()
         let prepared = try makePreparedTurn(offeredAtomIDs: ["atom:offered"])

@@ -221,6 +221,10 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
     public var lastLiveCapsuleAt: Date?
     public var lastSessionBridgeAt: Date?
     public var negativeSoundEchoRun: Int
+    /// Consecutive accepted turns the "- Settling:" line was presented. Capped
+    /// so a long warm phase over old negative nodes cannot turn the line into a
+    /// standing instruction (W4/P4).
+    public var settlingRun: Int
 
     public init(
         fingerprintFamily: String? = nil,
@@ -228,7 +232,8 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
         fingerprintLastSurfacedAt: Date? = nil,
         lastLiveCapsuleAt: Date? = nil,
         lastSessionBridgeAt: Date? = nil,
-        negativeSoundEchoRun: Int = 0
+        negativeSoundEchoRun: Int = 0,
+        settlingRun: Int = 0
     ) {
         self.fingerprintFamily = fingerprintFamily
         self.fingerprintCount = max(0, fingerprintCount)
@@ -236,6 +241,7 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
         self.lastLiveCapsuleAt = lastLiveCapsuleAt
         self.lastSessionBridgeAt = lastSessionBridgeAt
         self.negativeSoundEchoRun = max(0, negativeSoundEchoRun)
+        self.settlingRun = max(0, settlingRun)
     }
 }
 

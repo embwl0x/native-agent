@@ -333,7 +333,27 @@ extension SwiftToolDispatcher {
         default: canceled = false
         }
         let store = deskStore()
-        _ = try await store.closeItem(handle, outcomeSummary: outcome, canceled: canceled)
+        let expectedUpdatedAt = optionalString(input, "expected_updated_at")?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        if let expectedUpdatedAt, !expectedUpdatedAt.isEmpty {
+            let closed = try await store.closeItemIfUnchanged(
+                handle,
+                expectedUpdatedAt: expectedUpdatedAt,
+                outcomeSummary: outcome,
+                canceled: canceled
+            )
+            guard closed else {
+                return .object([
+                    "status": .string("refused"),
+                    "reason": .string(
+                        "desk_close: item changed or is no longer active; refresh the Desk before closing it"
+                    ),
+                ])
+            }
+        } else {
+            _ = try await store.closeItem(handle, outcomeSummary: outcome, canceled: canceled)
+        }
         return await deskConfirm(store, handle: handle, prefix: canceled ? "canceled" : "closed")
     }
 

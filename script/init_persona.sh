@@ -31,7 +31,9 @@ _atomic_cp() {
 }
 
 # 1. SOUL.md
-if [ ! -f "$PERSONA_DIR/SOUL.md" ]; then
+# A zero-byte persona is no more usable than an absent one.  Treat it as an
+# interrupted/failed first-run copy and repair it from the public template.
+if [ ! -s "$PERSONA_DIR/SOUL.md" ]; then
     if [ -f "$PERSONA_DIR/SOUL.template.md" ]; then
         _atomic_cp "$PERSONA_DIR/SOUL.template.md" "$PERSONA_DIR/SOUL.md"
         _log "Created persona/SOUL.md from template."
@@ -51,7 +53,7 @@ else
 fi
 
 # 2b. AGENTS.md (Phase 14: operating manual — personal copy, gitignored)
-if [ ! -f "$PERSONA_DIR/AGENTS.md" ]; then
+if [ ! -s "$PERSONA_DIR/AGENTS.md" ]; then
     if [ -f "$PERSONA_DIR/AGENTS.template.md" ]; then
         _atomic_cp "$PERSONA_DIR/AGENTS.template.md" "$PERSONA_DIR/AGENTS.md"
         _log "Created persona/AGENTS.md from template."
@@ -63,7 +65,7 @@ else
 fi
 
 # 2c. GROWTH.md (personal growth journal — template is public, copy is gitignored)
-if [ ! -f "$PERSONA_DIR/GROWTH.md" ]; then
+if [ ! -s "$PERSONA_DIR/GROWTH.md" ]; then
     if [ -f "$PERSONA_DIR/GROWTH.template.md" ]; then
         _atomic_cp "$PERSONA_DIR/GROWTH.template.md" "$PERSONA_DIR/GROWTH.md"
         _log "Created persona/GROWTH.md from template."

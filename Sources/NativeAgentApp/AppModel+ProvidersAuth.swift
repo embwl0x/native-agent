@@ -41,13 +41,21 @@ import Skills
 import Connectors
 import Browser
 
+/// Result of asking the Swift-owned device-login manager to start OAuth.
+/// `started` does not, by itself, claim that macOS opened a browser or that
+/// authorization has completed.
+enum CodexOAuthLoginLaunchOutcome: Equatable {
+    case started(CodexDeviceLogin)
+    case failed(String)
+}
+
 extension NativeClient {
     /// One trust-aware catalog projection for the Mac Tools page and the
     /// paired iPhone snapshot. This uses the same dispatcher composition as
     /// ordinary app chat, including Mac Integration availability.
     func getChatToolCatalogSnapshot() async throws -> ChatToolCatalogSnapshot {
         let inner = SwiftToolDispatcher(
-            dataRoot: PersistenceCore.defaultDataRoot(),
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(),
             macIntegrationBridge: MacIntegrationBridgeImpl()
         )
         let dispatcher = AppChatToolDispatcher(inner: inner)
@@ -81,23 +89,54 @@ extension AppModel {
     }
 
     @MainActor
-    func refreshChatToolCatalog() async {
+    @discardableResult
+    func refreshChatToolCatalog() async -> Bool {
         chatToolCatalogLoadFailed = false
+        chatToolCatalogLoadError = nil
         do {
             chatToolCatalog = try await client.getChatToolCatalogSnapshot()
+            return true
         } catch {
             NSLog("[ChatToolCatalog] dispatch failed: \(error.localizedDescription)")
             chatToolCatalogLoadFailed = true
+            chatToolCatalogLoadError = error.localizedDescription
+            return false
         }
     }
 
     @MainActor
-    func refreshModelCatalog() async {
+    @discardableResult
+    func refreshToolsFromToolbar() async -> ToolsRefreshPresentation.State {
+        guard !isRefreshingTools else {
+            return .alreadyRefreshing
+        }
+        isRefreshingTools = true
+        toolsRefreshState = .refreshing
+        defer { isRefreshingTools = false }
+
+        await refreshForSidebarItem(.tools)
+        let result = ToolsRefreshPresentation.completion(
+            panelRefresh: panelRefreshStatus[.tools],
+            catalogLoadFailed: chatToolCatalogLoadFailed,
+            hasCatalog: chatToolCatalog != nil
+        )
+        toolsRefreshState = result
+        if let message = ToolsRefreshPresentation.message(for: result) {
+            statusText = message
+        }
+        return result
+    }
+
+    @MainActor
+    @discardableResult
+    func refreshModelCatalog() async -> Bool {
         do {
             modelCatalog = try await client.getModelCatalog(refresh: true)
             statusText = "Model catalog refreshed"
+            return true
         } catch {
             statusText = "Model refresh failed: \(error.localizedDescription)"
+            return false
         }
     }
 
@@ -390,13 +429,20 @@ extension AppModel {
     }
 
     @MainActor
-    func openCodexLoginInBrowser() async {
+    func openCodexLoginInBrowser() async -> CodexOAuthLoginLaunchOutcome {
         do {
-            codexDeviceLogin = try await client.openCodexLoginInBrowser()
-            let code = codexDeviceLogin?.code ?? "pending"
-            statusText = "Opened Codex OAuth browser login. Code: \(code)"
+            let login = try await client.openCodexLoginInBrowser()
+            codexDeviceLogin = login
+            if login.openedBrowser == true {
+                statusText = "Codex OAuth login started and opened its browser page."
+            } else {
+                statusText = "Codex OAuth login started. Waiting for device-login instructions."
+            }
+            return .started(login)
         } catch {
-            statusText = "Could not open browser login: \(error.localizedDescription)"
+            let detail = error.localizedDescription
+            statusText = "Could not start Codex OAuth login: \(detail)"
+            return .failed(detail)
         }
     }
 

@@ -16,8 +16,14 @@ public actor ActivitySpanStore {
     public static let defaultRetention: TimeInterval =
         Double(ActivityPolicy.defaultRetentionDays) * 86_400
 
+    /// The maintenance pass must not leave a sidecar larger than this multiple
+    /// of the durable database. A bounded WAL is evidence that checkpoints are
+    /// actually happening, rather than a journal-size pragma masking a stopped
+    /// maintenance path.
+    public static let maximumWALToDatabaseMultiplier: Int64 = 4
+
     public let databaseURL: URL
-    private let dbQueue: DatabaseQueue
+    let dbQueue: DatabaseQueue
 
     public init(dataRoot: URL) throws {
         let directory = ActivityWatchPaths.directory(dataRoot: dataRoot)
@@ -236,6 +242,12 @@ public actor ActivitySpanStore {
         }
         if deleted > 0 {
             try checkpointAndVacuum()
+        } else {
+            // Retention is also the bounded, durable maintenance cadence for
+            // an otherwise healthy capture stream. Previously this path did
+            // nothing when every row was in-window, allowing the WAL to sit at
+            // its cap indefinitely even though the retention runner was firing.
+            try checkpointWAL()
         }
         return deleted
     }
@@ -301,6 +313,35 @@ public actor ActivitySpanStore {
                 order: "started_at ASC",
                 limit: limit
             )
+        }
+    }
+
+    /// Exact pre-cap count for human-facing exports. `dump` must never claim a
+    /// complete history after applying its bounded display limit.
+    public func countSpansOverlapping(
+        from: Double,
+        to: Double,
+        policy: ActivityPolicy? = nil,
+        bundleID: String? = nil
+    ) throws -> Int {
+        let excluded = policy.map { Array($0.effectiveExcludedBundleIDs) } ?? []
+        return try dbQueue.read { db in
+            var predicate = "started_at <= ? AND COALESCE(ended_at, last_seen_at) >= ?"
+            var arguments: [DatabaseValueConvertible] = [to, from]
+            if let bundleID, !bundleID.isEmpty {
+                predicate += " AND bundle_id = ?"
+                arguments.append(bundleID)
+            }
+            if !excluded.isEmpty {
+                let placeholders = Array(repeating: "?", count: excluded.count).joined(separator: ", ")
+                predicate += " AND bundle_id NOT IN (\(placeholders))"
+                arguments.append(contentsOf: excluded)
+            }
+            return try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM activity_span WHERE \(predicate)",
+                arguments: StatementArguments(arguments)
+            ) ?? 0
         }
     }
 
@@ -389,6 +430,15 @@ public actor ActivitySpanStore {
             try? db.execute(sql: "PRAGMA wal_checkpoint(TRUNCATE)")
             try db.execute(sql: "VACUUM")
             try? db.execute(sql: "PRAGMA wal_checkpoint(TRUNCATE)")
+        }
+    }
+
+    /// Folds ordinary in-window writes out of the WAL without rewriting the
+    /// main database. Called by the due retention pass when there is nothing to
+    /// delete, so capture has one durable checkpoint cadence either way.
+    public func checkpointWAL() throws {
+        try dbQueue.writeWithoutTransaction { db in
+            try db.execute(sql: "PRAGMA wal_checkpoint(TRUNCATE)")
         }
     }
 

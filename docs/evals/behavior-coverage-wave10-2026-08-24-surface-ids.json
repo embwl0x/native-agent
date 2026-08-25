@@ -1,0 +1,11 @@
+{
+  "surfaces": [
+    { "fence": "app.desk", "id": "desk.control.toolbar.refresh" },
+    { "fence": "app.desk", "id": "desk.inbox.effectiveActions" },
+    { "fence": "app.desk", "id": "desk.inbox.emptyStateCrossLanePointer" },
+    { "fence": "app.desk", "id": "desk.inbox.laneLabelCounts" },
+    { "fence": "app.desk", "id": "desk.reloader.startPathsLatch" },
+    { "fence": "app.desk", "id": "desk.reloader.watchPathDirectoryCreate" },
+    { "fence": "app.desk", "id": "desk.runs.emptyStateSilentZero" }
+  ]
+}

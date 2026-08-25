@@ -16,6 +16,30 @@ import SwarmRuns
 import MacIntegration
 import CognitiveSubstrate
 
+/// Wire vocabulary for tool receipts that have a special transcript
+/// presentation. The writer classifies a non-blocking approval result here;
+/// app surfaces consume these exact values rather than independently guessing
+/// from a result-summary string.
+public enum ChatTranscriptToolMessageKind {
+    public static let toolUse = "tool_use"
+    public static let approvalPending = "approval_pending"
+
+    /// Returns an approval identifier only for the canonical result emitted by
+    /// `NonBlockingApprovalFiler`. A malformed result, a differently named
+    /// status, or an empty identifier remains an ordinary tool receipt: it
+    /// must not surface an actionable approval card without an authority.
+    public static func pendingApprovalID(in resultSummary: String) -> String? {
+        guard let value = try? JSONValue.parse(Data(resultSummary.utf8)),
+              case .object(let object) = value,
+              case .string("waiting_approval")? = object["status"],
+              case .string(let rawID)? = object["approvalId"] ?? object["approval_id"]
+        else { return nil }
+
+        let approvalID = rawID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return approvalID.isEmpty ? nil : approvalID
+    }
+}
+
 /// Process-wide, stat-validated line count for chat transcript JSONL files.
 ///
 /// The session index needs one number per persisted message: how many rows the
@@ -350,7 +374,7 @@ extension SwiftNativeChatOrchestrationClient {
         source: String = "app",
         outcomeContext: TurnContext? = nil,
         outcomeInterventionAssignment: CausalInterventionAssignment? = nil,
-        onNotice: (@Sendable (String, String) async -> Void)? = nil
+        onNotice: @escaping @Sendable (String, String) async -> Void
     ) async {
         guard !text.isEmpty else { return }
         guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else { return }
@@ -484,13 +508,24 @@ extension SwiftNativeChatOrchestrationClient {
             "source": .string(messageSource),
         ]
         if let runId { record["runId"] = .string(runId) }
-        let metadata: [String: JSONValue] = [
-            "kind": .string("tool_use"),
+        let pendingApprovalID = ChatTranscriptToolMessageKind.pendingApprovalID(in: resultSummary)
+        var metadata: [String: JSONValue] = [
+            "kind": .string(
+                pendingApprovalID == nil
+                    ? ChatTranscriptToolMessageKind.toolUse
+                    : ChatTranscriptToolMessageKind.approvalPending
+            ),
             "toolName": .string(toolName),
             "inputJSON": .string(safeInputJSON),
             "resultSummary": .string(safeResultSummary),
             "ok": .bool(ok),
         ]
+        if let pendingApprovalID {
+            // The post-resolution writer locates and replaces this row by the
+            // same durable identifier, so the inline card never loses its
+            // transition to a settled tool receipt.
+            metadata["approvalId"] = .string(pendingApprovalID)
+        }
         record["metadata"] = .object(metadata)
         // Locked: see appendPartial — protects against the compactor/distiller
         // locked rewrite dropping a concurrent append. (Immutable binding: a
@@ -1074,8 +1109,19 @@ extension SwiftNativeChatOrchestrationClient {
         surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() != "telegram"
     }
 
-    static func resolveSessionId(_ sessionId: String?) throws -> String {
-        let raw = sessionId ?? UUID().uuidString
+    /// The one public boundary that admits an identity to durable chat state.
+    /// Mounted surfaces creating a new conversation must generate and retain an
+    /// ID before calling this; persistence itself never manufactures one.
+    public static func resolveSessionId(_ sessionId: String?) throws -> String {
+        // A transcript operation may never invent an identity. A caller that
+        // lost its session id must fail at this boundary instead of silently
+        // creating an orphan transcript and sessions.json row that no visible
+        // conversation owns. New-session creation belongs to the mounted
+        // surface before it calls into persistence, where it can retain and
+        // display the generated identity.
+        guard let raw = sessionId else {
+            throw ChatOrchestrationError.underlying("missing chat session id")
+        }
         guard let safe = NativeAgentChatSessionID.normalizedPathComponent(raw) else {
             throw ChatOrchestrationError.underlying("invalid chat session id")
         }

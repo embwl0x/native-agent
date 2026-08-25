@@ -7,6 +7,7 @@ extension TelegramPollLoop {
         String, Int, Int, TelegramInputRichMessage
     ) async throws -> Void = {
         token, chatId, draftId, richMessage in
+        try await _tgRetryAfterFloodControl {
         guard let url = _tgBuildBotURL(token: token, method: "sendRichMessageDraft") else {
             throw TelegramBotError.invalidRequest
         }
@@ -26,12 +27,14 @@ extension TelegramPollLoop {
             resultType: Bool.self,
             validateResult: { $0 }
         )
+        }
     }
 
     public static let defaultSendRichMessage: @Sendable (
         String, Int, TelegramInputRichMessage
     ) async throws -> Int = {
         token, chatId, richMessage in
+        return try await _tgRetryAfterFloodControl {
         guard let url = _tgBuildBotURL(token: token, method: "sendRichMessage") else {
             throw TelegramBotError.invalidRequest
         }
@@ -50,11 +53,13 @@ extension TelegramPollLoop {
             resultType: TelegramAPIMessageResult.self
         )
         return result.value.messageId
+        }
     }
 
     public static let defaultSendMessageWithReplyMarkupReturningId:
         @Sendable (String, Int, String, JSONValue) async throws -> Int = {
             token, chatId, text, replyMarkup in
+            return try await _tgRetryAfterFloodControl {
             guard let url = _tgBuildBotURL(token: token, method: "sendMessage") else {
                 throw TelegramBotError.invalidRequest
             }
@@ -74,12 +79,14 @@ extension TelegramPollLoop {
                 resultType: TelegramAPIMessageResult.self
             )
             return result.value.messageId
+            }
         }
 
     /// chat-smoothness phase 5: sendMessage that returns the created
     /// message_id so the growing draft can edit it. Single message only —
     /// the draft window is pre-capped to one Telegram-safe chunk.
     public static let defaultSendMessageReturningId: @Sendable (String, Int, String) async throws -> Int = { token, chatId, text in
+        return try await _tgRetryAfterFloodControl {
         guard let url = _tgBuildBotURL(token: token, method: "sendMessage") else {
             throw TelegramBotError.invalidRequest
         }
@@ -96,12 +103,14 @@ extension TelegramPollLoop {
             resultType: TelegramAPIMessageResult.self
         )
         return result.value.messageId
+        }
     }
 
     /// chat-smoothness phase 5: edit the growing draft in place. Telegram
     /// 400s "message is not modified" when text is unchanged — treated as
     /// success (the draft already shows this text).
     public static let defaultEditMessageText: @Sendable (String, Int, Int, String) async throws -> Void = { token, chatId, messageId, text in
+        try await _tgRetryAfterFloodControl {
         guard let url = _tgBuildBotURL(token: token, method: "editMessageText") else {
             throw TelegramBotError.invalidRequest
         }
@@ -118,10 +127,12 @@ extension TelegramPollLoop {
             resultType: TelegramAPIMessageResult.self,
             allowMessageNotModified: true
         )
+        }
     }
 
     public static let defaultEditMessageTextWithReplyMarkup:
         @Sendable (String, Int, Int, String, JSONValue?) async throws -> Void = { token, chatId, messageId, text, replyMarkup in
+        try await _tgRetryAfterFloodControl {
         guard let url = _tgBuildBotURL(token: token, method: "editMessageText") else {
             throw TelegramBotError.invalidRequest
         }
@@ -145,33 +156,50 @@ extension TelegramPollLoop {
             resultType: TelegramAPIMessageResult.self,
             allowMessageNotModified: true
         )
+        }
     }
 
     public static let defaultSendMessage: @Sendable (String, Int, String) async throws -> Void = { token, chatId, text in
+        try await sendMessage(token: token, chatId: chatId, text: text)
+    }
+
+    /// Concrete ordinary-reply transport.  Kept separately from the closure
+    /// default so a hermetic URLProtocol session can execute this exact request
+    /// and validator path, including flood-control retry semantics.
+    static func sendMessage(
+        token: String,
+        chatId: Int,
+        text: String,
+        session: URLSession = .shared,
+        sleep: @escaping @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) }
+    ) async throws {
         // Telegram hard-rejects messages over 4096 chars with HTTP 400 —
         // before chunking, any long Agent reply (code, lists) silently
         // died: typing indicator for the whole turn, then nothing
         // (audit 2026-06-09). Split on newline boundaries when possible.
         for chunk in _tgChunkMessage(text, limit: 4000) {
-            guard let url = _tgBuildBotURL(token: token, method: "sendMessage") else {
-                throw TelegramBotError.invalidRequest
+            try await _tgRetryAfterFloodControl(sleep: sleep) {
+                guard let url = _tgBuildBotURL(token: token, method: "sendMessage") else {
+                    throw TelegramBotError.invalidRequest
+                }
+                var req = URLRequest(url: url)
+                req.httpMethod = "POST"
+                req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                let body: [String: Any] = ["chat_id": chatId, "text": chunk]
+                req.httpBody = try JSONSerialization.data(withJSONObject: body)
+                let (data, resp) = try await session.data(for: req)
+                _ = try _tgValidateResponse(
+                    data,
+                    response: resp,
+                    operation: "sendMessage",
+                    resultType: TelegramAPIMessageResult.self
+                )
             }
-            var req = URLRequest(url: url)
-            req.httpMethod = "POST"
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            let body: [String: Any] = ["chat_id": chatId, "text": chunk]
-            req.httpBody = try JSONSerialization.data(withJSONObject: body)
-            let (data, resp) = try await URLSession.shared.data(for: req)
-            _ = try _tgValidateResponse(
-                data,
-                response: resp,
-                operation: "sendMessage",
-                resultType: TelegramAPIMessageResult.self
-            )
         }
     }
 
     public static let defaultSendPhoto: @Sendable (String, Int, String, String?) async throws -> Void = { token, chatId, imagePath, caption in
+        try await _tgRetryAfterFloodControl {
         guard let url = _tgBuildBotURL(token: token, method: "sendPhoto") else {
             throw TelegramBotError.invalidRequest
         }
@@ -213,6 +241,7 @@ extension TelegramPollLoop {
             operation: "sendPhoto",
             resultType: TelegramAPIMessageResult.self
         )
+        }
     }
 
     enum TelegramValidatedResult<Result: Sendable>: Sendable {
@@ -361,6 +390,7 @@ extension TelegramPollLoop {
     }
 
     public static let defaultSendChatAction: @Sendable (String, Int, String) async throws -> Void = { token, chatId, action in
+        try await _tgRetryAfterFloodControl {
         guard let url = _tgBuildBotURL(token: token, method: "sendChatAction") else {
             throw TelegramBotError.invalidRequest
         }
@@ -377,9 +407,11 @@ extension TelegramPollLoop {
             resultType: Bool.self,
             validateResult: { $0 }
         )
+        }
     }
 
     public static let defaultAnswerCallbackQuery: @Sendable (String, String, String) async throws -> Void = { token, callbackId, text in
+        try await _tgRetryAfterFloodControl {
         guard let url = _tgBuildBotURL(token: token, method: "answerCallbackQuery") else {
             throw TelegramBotError.invalidRequest
         }
@@ -400,10 +432,12 @@ extension TelegramPollLoop {
             resultType: Bool.self,
             validateResult: { $0 }
         )
+        }
     }
 
     public static let defaultSendMessageWithReplyMarkup:
         @Sendable (String, Int, String, JSONValue) async throws -> Void = { token, chatId, text, replyMarkup in
+        try await _tgRetryAfterFloodControl {
         guard let url = _tgBuildBotURL(token: token, method: "sendMessage") else {
             throw TelegramBotError.invalidRequest
         }
@@ -423,46 +457,63 @@ extension TelegramPollLoop {
             operation: "sendMessage",
             resultType: TelegramAPIMessageResult.self
         )
+        }
     }
 
     public static let defaultSyncCommandMenu: TelegramCommandMenuSync = { token, commands in
-        guard let url = _tgBuildBotURL(token: token, method: "setMyCommands") else {
-            throw TelegramBotError.invalidRequest
-        }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.timeoutInterval = 20
-        let payload: [String: Any] = [
-            "commands": commands.map { command in
-                [
-                    "command": command.command,
-                    "description": command.description,
-                ]
-            },
-        ]
-        req.httpBody = try JSONSerialization.data(withJSONObject: payload)
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            throw TelegramBotError.underlying("setMyCommands status \(http.statusCode)")
-        }
-        if !data.isEmpty,
-           let parsed = try? JSONValue.parse(data),
-           case .object(let obj) = parsed,
-           case .bool(false)? = obj["ok"] {
-            let description: String
-            if case .string(let value)? = obj["description"] {
-                description = value
-            } else {
-                description = "setMyCommands failed"
+        try await _tgRetryAfterFloodControl {
+            guard let url = _tgBuildBotURL(token: token, method: "setMyCommands") else {
+                throw TelegramBotError.invalidRequest
             }
-            throw TelegramBotError.underlying(description)
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.timeoutInterval = 20
+            let payload: [String: Any] = [
+                "commands": commands.map { command in
+                    [
+                        "command": command.command,
+                        "description": command.description,
+                    ]
+                },
+            ]
+            req.httpBody = try JSONSerialization.data(withJSONObject: payload)
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            _ = try _tgValidateResponse(
+                data,
+                response: resp,
+                operation: "setMyCommands",
+                resultType: Bool.self,
+                validateResult: { $0 }
+            )
+            return TelegramCommandMenuStatus(
+                commandCount: commands.count,
+                registryVersion: TelegramCommandRegistry.version,
+                syncedAt: _tgNowString()
+            )
         }
-        return TelegramCommandMenuStatus(
-            commandCount: commands.count,
-            registryVersion: TelegramCommandRegistry.version,
-            syncedAt: _tgNowString()
-        )
+    }
+}
+
+/// A Bot API 429 is a definite non-delivery, unlike a transport interruption
+/// after bytes left this process. Retry exactly once, only for that typed
+/// rejection, and honor the server's advertised retry window before rebuilding
+/// the request. This keeps a successful retry from being duplicated while
+/// refusing to invent a replay after an ambiguous transport outcome.
+func _tgRetryAfterFloodControl<T: Sendable>(
+    sleep: @escaping @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) },
+    operation: @escaping @Sendable () async throws -> T
+) async throws -> T {
+    do {
+        return try await operation()
+    } catch let error as TelegramAPIFailure {
+        // `retry_after` is meaningful only for the actual flood-control
+        // response.  Do not replay a different rejection merely because a
+        // future API error happens to carry the same-shaped field.
+        guard (error.httpStatus == 429 || error.errorCode == 429),
+              let seconds = error.parameters?.retryAfter, seconds > 0 else { throw error }
+        try await sleep(UInt64(seconds) * 1_000_000_000)
+        return try await operation()
     }
 }
 

@@ -162,16 +162,35 @@ public enum DelegationOutcome: String, Sendable, Equatable {
     /// including `unknown`, because an unconfirmed delivery is a thing User may
     /// need to act on, and grading it `info` would bury it.
     public var severity: String { self == .succeeded ? "info" : "actionable" }
+
+    /// How alarming the outcome is, for the one-way re-card rule: a job already
+    /// carded under a LOWER rank is carded again when it later presents a
+    /// higher one. The codex record is the reason this exists — it is written
+    /// with `completedExecution` BEFORE the delivery POST, so the loop first
+    /// sees it as `succeeded`; if the POST then settles 409 the job is preserved
+    /// under `reply-jobs/undelivered/` and presents as `unknown`. Without this
+    /// rank the id-only cursor kept the "finished" card forever (live
+    /// 2026-08-21: 10 of 11 preserved replies carried a "Codex finished" card).
+    /// The rule is one-way on purpose: an outcome never improves after the
+    /// fact, and a card must never quietly downgrade.
+    public var alarmRank: Int {
+        switch self {
+        case .succeeded: return 0
+        case .unknown: return 1
+        case .failed: return 2
+        case .deliveryLost: return 3
+        }
+    }
 }
 
 // MARK: - Card
 
-/// One inbox card for one terminal delegated job.
+/// One inbox card for one terminal delegated job — or, for the codex
+/// `undelivered/` backlog, one rolling aggregate card (see `makeBacklog`).
 public struct DelegationOutcomeCard: Sendable, Equatable {
     /// Stable inbox row id: `delegation-outcome:<source>:<jobId>`.
     public let cardId: String
-    /// `<source>:<jobId>` — the replay-guard signature, carried in the card's
-    /// `error_signature` field so the existing sticky-card machinery applies.
+    /// `<source>:<jobId>` — the job's identity, stable across re-cards.
     public let jobKey: String
     public let source: String
     public let agent: String
@@ -181,8 +200,24 @@ public struct DelegationOutcomeCard: Sendable, Equatable {
     public let summary: String
     public let detail: String
     public let createdAt: String
+    /// Severity override for cards whose severity is not a function of
+    /// `outcome` (the backlog aggregate is `info`: its per-job cards already
+    /// pushed, and a second push per 409 would be a storm). nil = derive.
+    public var severityOverride: String? = nil
+    /// A resolved card is written already-read: the condition it reported has
+    /// cleared and the row exists only so the board stops asserting it.
+    public var resolved: Bool = false
 
-    public var severity: String { outcome.severity }
+    public var severity: String { severityOverride ?? outcome.severity }
+
+    /// The replay-guard signature, carried in the card's `error_signature`
+    /// field so the existing sticky-card machinery applies. It names the
+    /// OUTCOME as well as the job: a re-card that upgrades a job (finished →
+    /// unconfirmed) must land as a fresh unread row and push, while a retry
+    /// of the SAME outcome (a cursor write that failed after the card landed)
+    /// must keep the user's status and never push twice. Legacy rows carry the
+    /// bare `jobKey`; the app-side upsert treats that as matching too.
+    public var signature: String { "\(jobKey):\(outcome.rawValue)" }
 
     /// Same field set and ordering conventions as `fileDiskHygieneNotice` /
     /// `fileLoopFailureNotice` — an inbox reader must not need to know which
@@ -216,9 +251,9 @@ public struct DelegationOutcomeCard: Sendable, Equatable {
             "related_groups": .array([]),
             "actions": .array(actions),
             // The replay guard, in the field the inbox already reads for it.
-            "error_signature": .string(jobKey),
-            "status": .string("unread"),
-            "read_at": .null,
+            "error_signature": .string(signature),
+            "status": .string(resolved ? "read" : "unread"),
+            "read_at": resolved ? .string(createdAt) : .null,
         ])
     }
 
@@ -298,6 +333,120 @@ public struct DelegationOutcomeCard: Sendable, Equatable {
             createdAt: DelegationOutcomeCursor.formatISO(now)
         )
     }
+
+    // MARK: Codex undelivered backlog (rolling aggregate)
+
+    /// Stable inbox row id of the ONE rolling backlog card.
+    public static let codexBacklogCardId = "delegation-outcome:codex:undelivered-backlog"
+
+    /// Where the codex bridge preserves a reply whose delivery settled
+    /// ambiguous (409 / outcome_unknown). Named in the card so the reviewer
+    /// knows where the full text is; the app never reads it for behavior.
+    public static let codexUndeliveredDirHint = "~/.config/codex-nativeagent-bridge/reply-jobs/undelivered/"
+
+    /// One rolling card over every codex job currently preserved under
+    /// `undelivered/` — the replies Agent never acknowledged. The per-job cards
+    /// say "this one"; this card says "how many, how old", and is the
+    /// deliberate-review entry point. `jobKey` carries the count and the
+    /// oldest stamp so a CHANGED backlog resurfaces as unread while an
+    /// unchanged one keeps whatever status the user gave it.
+    ///
+    /// Severity is `info` on purpose: every job in it already pushed its own
+    /// actionable "outcome is unconfirmed" card, and a second push per 409
+    /// would be the repeat-notification storm the sticky-signature lane exists
+    /// to prevent. Nothing here re-delivers: a week-old completion claim
+    /// injected into her session would mislead, which is the very ambiguity
+    /// that got these preserved instead of unlinked.
+    public static func makeBacklog(
+        jobs: [DelegationJobSnapshot], now: Date
+    ) -> DelegationOutcomeCard? {
+        let backlog = jobs.filter { $0.source == "codex" && $0.deliveryOutcome == "unknown" }
+        guard !backlog.isEmpty else { return nil }
+        let stamps = backlog.compactMap(\.completionStamp)
+        let oldest = stamps.min()
+        let oldestISO = oldest.map(DelegationOutcomeCursor.formatISO)
+        let count = backlog.count
+        let noun = count == 1 ? "reply" : "replies"
+        let ageText: String = {
+            guard let oldest else { return "age unknown" }
+            let days = now.timeIntervalSince(oldest) / 86_400
+            if days < 1 { return "oldest under a day old" }
+            return "oldest \(Int(days.rounded(.down)))d old"
+        }()
+        let title = "Codex: \(count) undelivered \(noun) preserved"
+        let summary = "\(count) completed Codex \(noun) never confirmed delivered (\(ageText)) — review and hand over deliberately"
+        var detail: [String] = [
+            "The codex bridge could not confirm whether these replies reached NativeAgent "
+                + "(delivery settled 409 / outcome_unknown). Each full reply was preserved instead of "
+                + "unlinked, and NOTHING re-delivers it automatically: a completion claim replayed days "
+                + "later would read as current, which is exactly the ambiguity that got it preserved.",
+            "Where: \(codexUndeliveredDirHint) (one JSON per reply; the text is under "
+                + "completedExecution.turnResult.message).",
+            "What to do: read each, decide whether the work was already acted on, hand the text to "
+                + "her as a NEW message if it still matters, then archive or delete the file. "
+                + "This card updates as the directory changes and marks itself read when it empties.",
+            "",
+            "Backlog (\(count)), oldest first:",
+        ]
+        let ordered = backlog.sorted {
+            ($0.completionStamp ?? .distantPast, $0.id) < ($1.completionStamp ?? .distantPast, $1.id)
+        }
+        for job in ordered.prefix(20) {
+            let topic = job.topicSlug.flatMap { $0.isEmpty ? nil : $0 } ?? "(no topic)"
+            let when = job.completedAt.map { String($0.prefix(10)) } ?? "(no completion stamp)"
+            detail.append("• \(when)  \(topic)  ·  \(job.id)")
+        }
+        if ordered.count > 20 { detail.append("… and \(ordered.count - 20) more") }
+        // The key must move whenever the SET moves, not only its size or its
+        // oldest member: one reviewed reply removed while a newer one lands
+        // keeps count and oldest identical (gpt-5.5 review MED). A stable
+        // FNV-1a over the sorted ids — never `hashValue`, which is per-process
+        // seeded and would re-file the card on every app launch.
+        let membership = stableDigest(ordered.map(\.id).sorted().joined(separator: "\n"))
+        return DelegationOutcomeCard(
+            cardId: codexBacklogCardId,
+            jobKey: "codex:undelivered-backlog:\(count):\(oldestISO ?? "-"):\(membership)",
+            source: "codex",
+            agent: "codex",
+            topicSlug: nil,
+            outcome: .unknown,
+            title: title,
+            summary: summary,
+            detail: detail.joined(separator: "\n"),
+            createdAt: DelegationOutcomeCursor.formatISO(now),
+            severityOverride: "info"
+        )
+    }
+
+    /// Process-stable 64-bit FNV-1a, hex. Deterministic across launches.
+    static func stableDigest(_ s: String) -> String {
+        var h: UInt64 = 0xcbf29ce484222325
+        for b in s.utf8 {
+            h ^= UInt64(b)
+            h = h &* 0x100000001b3
+        }
+        return String(h, radix: 16)
+    }
+
+    /// The resolved form of the backlog card: filed once when the directory
+    /// empties after a backlog card was on the board, written already-read, so
+    /// a stale "13 preserved" line cannot outlive the condition.
+    public static func makeBacklogCleared(now: Date) -> DelegationOutcomeCard {
+        DelegationOutcomeCard(
+            cardId: codexBacklogCardId,
+            jobKey: "codex:undelivered-backlog:clear",
+            source: "codex",
+            agent: "codex",
+            topicSlug: nil,
+            outcome: .succeeded,
+            title: "Codex undelivered backlog is clear",
+            summary: "No preserved Codex replies remain under reply-jobs/undelivered/",
+            detail: "Every preserved reply has been reviewed and removed. \(codexUndeliveredDirHint) is empty.",
+            createdAt: DelegationOutcomeCursor.formatISO(now),
+            severityOverride: "info",
+            resolved: true
+        )
+    }
 }
 
 // MARK: - Durable cursor
@@ -314,18 +463,30 @@ public struct DelegationOutcomeCursor: Sendable, Equatable {
         public var lastSeen: Date?
         /// Job ids already carded, newest-last. Bounded by `cardedIDLimit`.
         public var cardedIDs: [String]
+        /// The outcome each id was carded UNDER (raw `DelegationOutcome`), so a
+        /// job that later presents a more alarming outcome is carded again.
+        /// Ids recorded before this field existed have no entry and never
+        /// re-card — the cursor cannot prove what their card said.
+        public var cardedOutcomes: [String: String]
 
-        public init(lastSeen: Date? = nil, cardedIDs: [String] = []) {
+        public init(lastSeen: Date? = nil, cardedIDs: [String] = [],
+                    cardedOutcomes: [String: String] = [:]) {
             self.lastSeen = lastSeen
             self.cardedIDs = cardedIDs
+            self.cardedOutcomes = cardedOutcomes
         }
     }
 
     /// Keyed by store source id (for example "claude", "codex", or "omp").
     public var stores: [String: StoreCursor]
+    /// `jobKey` of the codex undelivered-backlog card last filed, nil when no
+    /// backlog card is on the board. Lets a tick file the aggregate only when
+    /// the backlog CHANGED, and file the cleared form exactly once.
+    public var codexBacklogKey: String?
 
-    public init(stores: [String: StoreCursor] = [:]) {
+    public init(stores: [String: StoreCursor] = [:], codexBacklogKey: String? = nil) {
         self.stores = stores
+        self.codexBacklogKey = codexBacklogKey
     }
 
     /// How many carded ids each store retains. Chosen well above the live store
@@ -337,18 +498,27 @@ public struct DelegationOutcomeCursor: Sendable, Equatable {
         stores[source] ?? StoreCursor()
     }
 
-    public mutating func record(source: String, id: String, stamp: Date?) {
+    public mutating func record(source: String, id: String, stamp: Date?,
+                                outcome: DelegationOutcome? = nil) {
         var cursor = store(source)
         if !cursor.cardedIDs.contains(id) {
             cursor.cardedIDs.append(id)
             if cursor.cardedIDs.count > Self.cardedIDLimit {
-                cursor.cardedIDs.removeFirst(cursor.cardedIDs.count - Self.cardedIDLimit)
+                let evicted = cursor.cardedIDs.prefix(cursor.cardedIDs.count - Self.cardedIDLimit)
+                for old in evicted { cursor.cardedOutcomes.removeValue(forKey: old) }
+                cursor.cardedIDs.removeFirst(evicted.count)
             }
         }
+        if let outcome { cursor.cardedOutcomes[id] = outcome.rawValue }
         if let stamp, stamp > (cursor.lastSeen ?? Date.distantPast) {
             cursor.lastSeen = stamp
         }
         stores[source] = cursor
+    }
+
+    /// The outcome `id` was carded under, when the cursor recorded one.
+    public func cardedOutcome(source: String, id: String) -> DelegationOutcome? {
+        store(source).cardedOutcomes[id].flatMap(DelegationOutcome.init(rawValue:))
     }
 
     // MARK: Codable-by-hand (the on-disk shape is snake_case JSON, and a
@@ -370,7 +540,15 @@ public struct DelegationOutcomeCursor: Sendable, Equatable {
                     return nil
                 }
             }
+            if case .object(let outcomes)? = obj["carded_outcomes"] {
+                for (id, v) in outcomes {
+                    if case .string(let s) = v { cursor.cardedOutcomes[id] = s }
+                }
+            }
             result.stores[source] = cursor
+        }
+        if case .string(let key)? = root["codex_undelivered_backlog"], !key.isEmpty {
+            result.codexBacklogKey = key
         }
         return result
     }
@@ -384,12 +562,19 @@ public struct DelegationOutcomeCursor: Sendable, Equatable {
             if let lastSeen = cursor.lastSeen {
                 obj["last_seen"] = .string(Self.formatISO(lastSeen))
             }
+            if !cursor.cardedOutcomes.isEmpty {
+                var outcomes: [String: JSONValue] = [:]
+                for (id, raw) in cursor.cardedOutcomes { outcomes[id] = .string(raw) }
+                obj["carded_outcomes"] = .object(outcomes)
+            }
             stores[source] = .object(obj)
         }
-        return .object([
+        var root: [String: JSONValue] = [
             "version": .int(1),
             "stores": .object(stores),
-        ])
+        ]
+        if let codexBacklogKey { root["codex_undelivered_backlog"] = .string(codexBacklogKey) }
+        return .object(root)
     }
 
     /// Atomic write — a torn cursor would either re-card everything or skip a
@@ -480,16 +665,33 @@ public struct DelegationOutcomeLoop: LoopRunner {
 
         // FIRST RUN: seed and file nothing. Every job visible right now predates
         // this loop's existence; carding them would be a history dump, not a
-        // notification.
+        // notification. A cursor file that EXISTS but fails to parse is not a
+        // first run — it means outcomes since the last good cursor are being
+        // skipped, so that case must be named, never laundered into an
+        // ordinary seed (sweep 2026-08-21).
         guard var cursor = DelegationOutcomeCursor.load(from: cursorPath) else {
+            let corrupt = FileManager.default.fileExists(atPath: cursorPath.path)
             var seeded = DelegationOutcomeCursor()
             for job in terminal {
-                seeded.record(source: job.source, id: job.id, stamp: job.completionStamp)
+                // The outcome is recorded at seed time too: a seeded job whose
+                // outcome later WORSENS (a reply preserved after the seed) is a
+                // new event, not history, and re-cards like any other.
+                seeded.record(source: job.source, id: job.id, stamp: job.completionStamp,
+                              outcome: job.terminalOutcome)
             }
+            // A backlog visible at seed time is not history either — it is the
+            // standing condition this card exists to name. The seeded cursor
+            // carries no backlog key, so the next tick files that card.
             do {
                 try seeded.write(to: cursorPath)
             } catch {
                 return .failed(error: "delegation outcome cursor seed failed: \(error)")
+            }
+            if corrupt {
+                return .completed(result:
+                    "RECOVERED corrupt delegation outcome cursor at \(cursorPath.lastPathComponent): "
+                    + "reseeded over \(terminal.count) terminal job(s) — any outcomes since the last "
+                    + "good cursor were skipped without cards")
             }
             return .completed(result:
                 "seeded delegation outcome cursor over \(terminal.count) pre-existing terminal job(s); no cards filed")
@@ -497,7 +699,16 @@ public struct DelegationOutcomeLoop: LoopRunner {
 
         let pending = terminal.filter { job in
             let store = cursor.store(job.source)
-            if store.cardedIDs.contains(job.id) { return false }
+            if store.cardedIDs.contains(job.id) {
+                // Already carded. It cards AGAIN only when the outcome it now
+                // presents is more alarming than the one it was carded under
+                // (finished → unconfirmed once the codex reply is preserved).
+                // An id with no recorded outcome predates that field and
+                // stays settled: the cursor cannot prove what its card said.
+                guard let recorded = cursor.cardedOutcome(source: job.source, id: job.id),
+                      let current = job.terminalOutcome else { return false }
+                return current.alarmRank > recorded.alarmRank
+            }
             // A job whose completion predates the cursor was already handled in
             // an earlier tick (or by the seed) and has simply aged out of the
             // id set. Not new.
@@ -505,9 +716,6 @@ public struct DelegationOutcomeLoop: LoopRunner {
                 return false
             }
             return true
-        }
-        guard !pending.isEmpty else {
-            return .completed(result: "no newly-terminal delegated jobs (\(terminal.count) terminal on record)")
         }
 
         // Oldest first: the inbox reads newest-last, and a burst should land in
@@ -523,7 +731,8 @@ public struct DelegationOutcomeLoop: LoopRunner {
         for job in batch {
             guard let card = DelegationOutcomeCard.make(from: job, now: now) else { continue }
             if await fileCard(card) {
-                cursor.record(source: job.source, id: job.id, stamp: job.completionStamp)
+                cursor.record(source: job.source, id: job.id, stamp: job.completionStamp,
+                              outcome: card.outcome)
                 filed += 1
             } else {
                 // Contiguous settlement: stop at the first failed card. If a
@@ -533,6 +742,38 @@ public struct DelegationOutcomeLoop: LoopRunner {
                 failed += 1
                 break
             }
+        }
+
+        // The rolling codex undelivered-backlog card rides the same tick,
+        // independent of the per-job batch: it is re-filed only when the
+        // backlog CHANGED (count or oldest), and its cleared form exactly once
+        // when the directory empties after a card was on the board. A failed
+        // write leaves the cursor key untouched so the next tick retries.
+        var backlogNote: String?
+        var backlogFailed = false
+        if let backlogCard = DelegationOutcomeCard.makeBacklog(jobs: jobs, now: now) {
+            if cursor.codexBacklogKey != backlogCard.jobKey {
+                if await fileCard(backlogCard) {
+                    cursor.codexBacklogKey = backlogCard.jobKey
+                    backlogNote = "codex undelivered backlog card updated (\(backlogCard.title))"
+                } else {
+                    backlogNote = "codex undelivered backlog card write failed; will retry next tick"
+                    backlogFailed = true
+                }
+            }
+        } else if cursor.codexBacklogKey != nil {
+            let cleared = DelegationOutcomeCard.makeBacklogCleared(now: now)
+            if await fileCard(cleared) {
+                cursor.codexBacklogKey = nil
+                backlogNote = "codex undelivered backlog cleared"
+            } else {
+                backlogNote = "codex undelivered backlog clear-card write failed; will retry next tick"
+                backlogFailed = true
+            }
+        }
+
+        if pending.isEmpty && backlogNote == nil {
+            return .completed(result: "no newly-terminal delegated jobs (\(terminal.count) terminal on record)")
         }
 
         do {
@@ -545,11 +786,13 @@ public struct DelegationOutcomeLoop: LoopRunner {
         }
 
         var result = "filed \(filed) delegation outcome card(s)"
-        if failed > 0 { result += "; \(failed) inbox write(s) failed and will retry next tick" }
+        let writeFailures = failed + (backlogFailed ? 1 : 0)
+        if writeFailures > 0 { result += "; \(writeFailures) inbox write(s) failed and will retry next tick" }
         let failureDeferred = max(0, batch.count - filed - failed)
         let totalDeferred = deferred + failureDeferred
         if totalDeferred > 0 { result += "; \(totalDeferred) more deferred for contiguous settlement" }
-        if filed == 0 && failed == 0 {
+        if let backlogNote { result += "; \(backlogNote)" }
+        if filed == 0 && failed == 0 && backlogNote == nil {
             return .skipped(reason: "no terminal outcome could be classified from \(pending.count) pending job(s)")
         }
         return .completed(result: result)

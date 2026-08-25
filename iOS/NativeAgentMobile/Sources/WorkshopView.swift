@@ -67,6 +67,7 @@ struct WorkshopView: View {
                             AppEmptyState(
                                 title: "No tasks yet",
                                 systemImage: "checklist",
+                                kind: .empty,
                                 description: "Your agent proposes tasks when high-value work is worth tracking."
                             )
                             .listRowBackground(Color.clear)
@@ -77,6 +78,7 @@ struct WorkshopView: View {
                 }
             }
             .navigationTitle("Workshop")
+            .macSyncErrorBanner()
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
                     Button { showNewWorkshopTask = true } label: {
@@ -116,11 +118,15 @@ final class WorkshopStore: ObservableObject {
     @Published var tasks: [WorkshopTaskRecord] = []
     @Published var isLoading = false
     @Published var error: String?
-    private var hasLoadedTasks = false
-    private var knownCompletedIDs = Set<String>()
 
     var activeTasks: [WorkshopTaskRecord] {
-        tasks.filter { ["active", "running", "queued", "paused"].contains($0.status.lowercased()) }
+        tasks.filter { task in
+            let status = task.status.lowercased()
+            let isAwaitingApproval = status.contains("approval")
+                || task.phase.lowercased().contains("approval")
+            return ["active", "running", "queued", "paused"].contains(status)
+                && !isAwaitingApproval
+        }
     }
 
     var pendingApprovals: [WorkshopTaskRecord] {
@@ -142,7 +148,6 @@ final class WorkshopStore: ObservableObject {
 
     func applySyncedTasks(_ next: [WorkshopTaskRecord]) {
         guard next != tasks else { return }
-        notifyForNewCompletions(next)
         tasks = next
     }
 
@@ -193,20 +198,37 @@ final class WorkshopStore: ObservableObject {
         }
     }
 
-    private func notifyForNewCompletions(_ next: [WorkshopTaskRecord]) {
+}
+
+/// Shared snapshot observer for Workshop completion alerts. It is deliberately
+/// independent of WorkshopView, because iOS receives workshop snapshots while
+/// Activity, Chat, or another tab is on screen.
+@MainActor
+final class WorkshopCompletionNotificationTracker {
+    static let shared = WorkshopCompletionNotificationTracker()
+
+    private var hasBaseline = false
+    private var knownCompletedIDs = Set<String>()
+    private let notify: (WorkshopTaskRecord) -> Void
+
+    init(notify: @escaping (WorkshopTaskRecord) -> Void = WorkshopCompletionNotificationTracker.post) {
+        self.notify = notify
+    }
+
+    func apply(_ next: [WorkshopTaskRecord]) {
         let completed = next.filter { ["done", "completed"].contains($0.status.lowercased()) }
         let completedIDs = Set(completed.map(\.id))
         defer {
             knownCompletedIDs.formUnion(completedIDs)
-            hasLoadedTasks = true
+            hasBaseline = true
         }
-        guard hasLoadedTasks else { return }
+        guard hasBaseline else { return }
         for task in completed where !knownCompletedIDs.contains(task.id) {
-            fireWorkshopTaskCompletionNotification(task)
+            notify(task)
         }
     }
 
-    private func fireWorkshopTaskCompletionNotification(_ task: WorkshopTaskRecord) {
+    private static func post(_ task: WorkshopTaskRecord) {
         Task.detached {
             let center = UNUserNotificationCenter.current()
             _ = try? await center.requestAuthorization(options: [.alert, .sound, .badge])
@@ -397,7 +419,11 @@ struct StatusBadge: View {
 struct SyncBadge: View {
     let date: Date
 
-    var isStale: Bool { Date().timeIntervalSince(date) > 30 }
+    static func isStale(date: Date, now: Date = Date()) -> Bool {
+        MobileSnapshotFreshnessPresentation.isStale(lastSyncedAt: date, now: now)
+    }
+
+    var isStale: Bool { Self.isStale(date: date) }
 
     var body: some View {
         if isStale {

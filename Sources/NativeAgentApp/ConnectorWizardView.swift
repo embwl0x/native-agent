@@ -1,6 +1,28 @@
 // PATCH-2026-05-07: oauth-registration-2 Inline OAuth wizard — ConnectorWizardView
 import SwiftUI
 import AppKit
+import TrustCenter
+
+/// The GitHub token form must describe the registered capability set, never a
+/// hand-maintained list that can call a write tool "read-only" after a catalog
+/// change.
+enum GitHubPermissionPresentation {
+    static func lines(actions: [ConnectorActionDescriptor] = connectorActionDescriptors()) -> [String] {
+        let github = actions.filter { $0.connectorId == "github" }
+        let hasVisibilityWrite = github.contains {
+            $0.id == "github.set_repo_visibility" && $0.risk == "external_write" && $0.requiresApproval
+        }
+        var result = [
+            "Repository metadata read for listing repositories",
+            "Issues read for listing repository issues",
+        ]
+        if hasVisibilityWrite {
+            result.append("Repository visibility changes use github.set_repo_visibility and require repository Administration: write (or equivalent visibility-write permission).")
+            result.append("Keep that write permission off unless you intend to change repository visibility from NativeAgent.")
+        }
+        return result
+    }
+}
 
 // MARK: - Models
 
@@ -60,6 +82,31 @@ enum ConnectorWizardSetupRoute: Equatable {
     }
 }
 
+/// The Slack setup page is an external browser handoff, not a completed
+/// connector setup. Keep the request outcome visible so a missing browser
+/// handler cannot look like a successful navigation.
+enum SlackSettingsPortal {
+    enum OpenOutcome: Equatable {
+        case requested
+        case unavailable
+
+        var message: String {
+            switch self {
+            case .requested:
+                return "Requested Slack Apps in your default browser."
+            case .unavailable:
+                return "Could not open Slack Apps. Visit api.slack.com/apps in a browser to continue."
+            }
+        }
+    }
+
+    static let url = URL(string: "https://api.slack.com/apps")!
+
+    static func open(using opener: (URL) -> Bool) -> OpenOutcome {
+        opener(url) ? .requested : .unavailable
+    }
+}
+
 // MARK: - Wizard State
 
 @Observable
@@ -111,6 +158,7 @@ struct ConnectorWizardView: View {
     @State private var slackAllowedChannels: String = ""
     @State private var slackAllowedUsers: String = ""
     @State private var slackRequireMention = true
+    @State private var slackSettingsOpenOutcome: SlackSettingsPortal.OpenOutcome?
     @State private var notionToken: String = ""
     @State private var isSavingGitHubToken = false
     @State private var isSavingSlackToken = false
@@ -139,6 +187,10 @@ struct ConnectorWizardView: View {
         case "x": "bubble.left.and.text.bubble.right"
         default: "plug"
         }
+    }
+
+    private var slackAllowlistConfigured: Bool {
+        !parseSlackIDs(slackAllowedChannels).isEmpty || !parseSlackIDs(slackAllowedUsers).isEmpty
     }
 
     // PATCH-2026-05-07: polish-ConnectorWizardView GradientText title, tinted icon
@@ -397,6 +449,12 @@ struct ConnectorWizardView: View {
                     Text("Add at least one channel or user. Inbound Slack chat stays safely off when both lists are empty; direct messages never require an @mention.")
                         .font(NativeAgentFont.label)
                         .foregroundStyle(.secondary)
+                    if !slackAllowlistConfigured {
+                        Text("Slack is not ready to save: add at least one allowed channel or user.")
+                            .font(NativeAgentFont.label)
+                            .foregroundStyle(.orange)
+                            .textSelection(.enabled)
+                    }
                 }
             }
             NativePanel(title: "Useful Slack Scopes", systemImage: "checklist") {
@@ -412,8 +470,8 @@ struct ConnectorWizardView: View {
             HStack {
                 Spacer()
                 Button("Open Slack Apps") {
-                    if let url = URL(string: "https://api.slack.com/apps") {
-                        NSWorkspace.shared.open(url)
+                    slackSettingsOpenOutcome = SlackSettingsPortal.open {
+                        NSWorkspace.shared.open($0)
                     }
                 }
                 .buttonStyle(.bordered)
@@ -422,7 +480,15 @@ struct ConnectorWizardView: View {
                     state.flowTask = Task { await saveSlackToken() }
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(isSavingSlackToken)
+                .disabled(isSavingSlackToken || !slackAllowlistConfigured)
+            }
+            if let slackSettingsOpenOutcome {
+                Text(slackSettingsOpenOutcome.message)
+                    .font(NativeAgentFont.label)
+                    .foregroundStyle(
+                        slackSettingsOpenOutcome == .requested ? Color.secondary : Color.orange
+                    )
+                    .textSelection(.enabled)
             }
         }
     }
@@ -442,9 +508,9 @@ struct ConnectorWizardView: View {
             }
             NativePanel(title: "Useful GitHub Permissions", systemImage: "checklist") {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Repository metadata read for listing repositories")
-                    Text("Issues read for listing repository issues")
-                    Text("No write permission is needed for the current GitHub read tools")
+                    ForEach(GitHubPermissionPresentation.lines(), id: \.self) { line in
+                        Text(line)
+                    }
                 }
                 .font(NativeAgentFont.label)
                 .foregroundStyle(.secondary)

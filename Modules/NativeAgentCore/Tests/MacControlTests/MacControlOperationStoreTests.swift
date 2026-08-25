@@ -322,7 +322,7 @@ private actor _UncancellableNotificationAdapter: NotificationCenterAdapter {
 @Test func nonCooperativeCancellationBecomesUnknownAndCannotReplay() async throws {
     let root = try operationTestRoot()
     defer { try? FileManager.default.removeItem(at: root) }
-    let notification = _UncancellableNotificationAdapter(delay: 0.8)
+    let notification = _UncancellableNotificationAdapter(delay: 2.0)
     let store = MacControlOperationStore(dataRoot: root)
     let runner = SwiftNativeMacControl(
         notificationCenterAdapter: notification,
@@ -339,6 +339,11 @@ private actor _UncancellableNotificationAdapter: NotificationCenterAdapter {
         if try await store.record(operationId: "unknown-cancel-effect")?.state == .started { break }
         try await Task.sleep(nanoseconds: 5_000_000)
     }
+    for _ in 0..<100 {
+        if await notification.calls == 1 { break }
+        try await Task.sleep(nanoseconds: 5_000_000)
+    }
+    #expect(await notification.calls == 1, "the effect must be in flight before cancellation")
 
     let cancellation = try await canceller.cancel(operationId: "unknown-cancel-effect")
     let result = try await dispatch.value

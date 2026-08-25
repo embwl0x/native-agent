@@ -1,0 +1,22 @@
+{
+  "surfaces": [
+    { "fence": "app.runtimes", "id": "cognition.pursuit.observation" },
+    { "fence": "app.runtimes", "id": "cognition.research.export" },
+    { "fence": "app.runtimes", "id": "tools.factory.bridgeToolDispatchClient" },
+    { "fence": "app.runtimes", "id": "tools.macIntegrationNotifyGate" },
+    { "fence": "core.context", "id": "context.coordinator.refreshDiscoveredSources" },
+    { "fence": "core.context", "id": "context.flow.mode.env" },
+    { "fence": "core.context", "id": "context.runtime.modeStatus" },
+    { "fence": "core.context", "id": "context.runtime.prepareForSleep" },
+    { "fence": "core.context", "id": "runtime.start.failsClosedSilently" },
+    { "fence": "core.context", "id": "tool.context_expand" },
+    { "fence": "core.context", "id": "ui.contextFlowObservatoryPanel" },
+    { "fence": "core.misc", "id": "cli.chatDrive.doctor" },
+    { "fence": "core.misc", "id": "env.nativeAgentDataRoot" },
+    { "fence": "core.substrate.organism", "id": "cli.organism_doctor.sh" },
+    { "fence": "feeds", "id": "feeds.turn_traces.busSubscriberDrops" },
+    { "fence": "ios.screens", "id": "ios.voice.output" },
+    { "fence": "ios.sync", "id": "ios.bridge.handleIncomingFromTransport" },
+    { "fence": "ios.sync", "id": "ios.macBridgeClient.transportRemoved" }
+  ]
+}

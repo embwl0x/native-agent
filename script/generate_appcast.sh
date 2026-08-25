@@ -21,10 +21,13 @@
 #
 # Options:
 #   --notes FILE   release notes shown in Sparkle's update dialog. Embedded in
-#                  the feed item as <description> (CDATA). Markdown-ish text is
-#                  wrapped in <pre>; a file that already looks like HTML is
-#                  embedded as-is. Added only AFTER every signature/version/URL
-#                  guard below has passed, and the feed is re-validated after.
+#                  the feed item as <description> (CDATA). Branch is chosen by
+#                  EXTENSION first (.md -> release_notes_html.swift converter,
+#                  .html -> embedded as-is); only an extensionless file is
+#                  sniffed, and then on prose with code fences/backtick spans
+#                  stripped and line-leading tags only. Added AFTER every
+#                  signature/version/URL guard has passed; the feed is then
+#                  re-validated, payload included.
 #   --allow-version-drift
 #                  permit a feed version that differs from the repo VERSION file.
 #                  For synthetic-version test runs ONLY; refused with --publish.
@@ -50,6 +53,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=lib/sparkle_tools.sh
 source "$ROOT/script/lib/sparkle_tools.sh"
+# shellcheck source=lib/appcast_publish_verify.sh
+source "$ROOT/script/lib/appcast_publish_verify.sh"
 
 DMG_PATH=""
 VERSION=""
@@ -70,7 +75,7 @@ NOTES_FILE=""
 ALLOW_VERSION_DRIFT=false
 
 usage() {
-  sed -n '2,47p' "${BASH_SOURCE[0]}" >&2
+  sed -n '2,50p' "${BASH_SOURCE[0]}" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -240,9 +245,47 @@ if [[ "$DERIVED_PUB_KEY" != "$BUNDLE_PUB_KEY" ]]; then
        the release with NATIVEAGENT_SPARKLE_PUBLIC_KEY=$DERIVED_PUB_KEY."
 fi
 echo "==> Signing key verified: its public half IS the app's SUPublicEDKey ($BUNDLE_PUB_KEY)."
-[[ "$BUNDLE_VERSION" == "$VERSION" && "$BUNDLE_SHORT_VERSION" == "$VERSION" ]] \
+
+# ---------------------------------------------------------------------------
+# 3b. Version identity (internal-build-seat-hygiene item 1, 2026-08-21).
+#
+#     CFBundleVersion is what Sparkle's comparator reads, so it must ALWAYS be
+#     the bare repo version — on every lane, without exception.
+#
+#     CFBundleShortVersionString is the HUMAN-visible string. Non-publish lanes
+#     (build_and_run.sh, install_app.sh, release.sh without --publish-appcast)
+#     now suffix it with -dev.<short8sha>[.dirty] so an internal build can never
+#     be mistaken for the shipped release by a person, an About box, an honesty
+#     dialog, or an audit. That suffix is therefore ALLOWED here on rehearsal /
+#     local runs, and FORBIDDEN with --publish: publishing a feed whose enclosure
+#     is an internal build is exactly the Nova-seat clobber this fixes.
+# ---------------------------------------------------------------------------
+INTERNAL_DEV_SUFFIX_RE='^-dev\.([0-9a-f]{8}|nogit)(\.dirty)?$'
+[[ "$BUNDLE_VERSION" == "$VERSION" ]] \
   || fail "version mismatch: VERSION=$VERSION but the bundle carries
-       CFBundleVersion=$BUNDLE_VERSION CFBundleShortVersionString=$BUNDLE_SHORT_VERSION"
+       CFBundleVersion=$BUNDLE_VERSION.
+       CFBundleVersion is Sparkle's comparison key and is never suffixed."
+BUNDLE_IS_INTERNAL=false
+if [[ "$BUNDLE_SHORT_VERSION" != "$VERSION" ]]; then
+  SHORT_SUFFIX=""
+  [[ "$BUNDLE_SHORT_VERSION" == "$VERSION"* ]] && SHORT_SUFFIX="${BUNDLE_SHORT_VERSION#"$VERSION"}"
+  if [[ -n "$SHORT_SUFFIX" && "$SHORT_SUFFIX" =~ $INTERNAL_DEV_SUFFIX_RE ]]; then
+    BUNDLE_IS_INTERNAL=true
+    [[ "$PUBLISH" != "true" ]] \
+      || fail "PUBLISH REFUSED — this DMG contains an INTERNAL build.
+       CFBundleShortVersionString=$BUNDLE_SHORT_VERSION carries the internal
+       '-dev.<sha>' marker, so it is not the artifact users are meant to receive.
+       Rebuild the release with: ./script/release.sh --publish-appcast"
+    echo "==> Internal build: CFBundleShortVersionString=$BUNDLE_SHORT_VERSION (--publish is refused for it)."
+  else
+    fail "version mismatch: VERSION=$VERSION but the bundle carries
+       CFBundleShortVersionString=$BUNDLE_SHORT_VERSION.
+       Only the internal marker '$VERSION-dev.<short8sha>[.dirty]' is accepted as
+       a difference, and only on a non-publish run."
+  fi
+fi
+# What the FEED is expected to advertise as its human-readable short version.
+EXPECTED_SHORT_VERSION="$BUNDLE_SHORT_VERSION"
 if [[ "$REHEARSAL" == "true" ]]; then
   [[ "$PUBLISH" != "true" ]] || fail "--rehearsal and --publish are mutually exclusive."
   echo "==> Rehearsal: skipping the bundle<->feed cross-checks (this app carries no feed URL)."
@@ -350,8 +393,9 @@ FEED_SHORT_VERSION="$(tag 'sparkle:shortVersionString')"
 ACTUAL_LEN="$(stat -f%z "$DMG_PATH")"
 [[ "$ENCLOSURE_LEN" == "$ACTUAL_LEN" ]] \
   || fail "enclosure length $ENCLOSURE_LEN != actual DMG size $ACTUAL_LEN"
-[[ "$FEED_VERSION" == "$VERSION" && "$FEED_SHORT_VERSION" == "$VERSION" ]] \
-  || fail "feed advertises version=$FEED_VERSION short=$FEED_SHORT_VERSION, expected $VERSION"
+[[ "$FEED_VERSION" == "$VERSION" && "$FEED_SHORT_VERSION" == "$EXPECTED_SHORT_VERSION" ]] \
+  || fail "feed advertises version=$FEED_VERSION short=$FEED_SHORT_VERSION, expected
+       version=$VERSION short=$EXPECTED_SHORT_VERSION"
 
 # Sweep R4 C1: the check above only proves the feed matches whatever --version
 # was handed in. The failure that actually shipped was a feed left advertising
@@ -398,8 +442,43 @@ fi
 #     well-formed. The EdDSA signature covers the DMG bytes, not the feed, so
 #     editing the XML here cannot invalidate it.
 # ---------------------------------------------------------------------------
+# Which branch a notes file takes must be DETERMINISTIC, not a substring lottery.
+# The old test was `grep -qi '<html\|<p>\|<ul>\|<h[1-6]>'` over the whole file, so
+# a markdown release note that merely MENTIONS a tag in backticks — "wrap it in
+# `<p>`" — was routed to the raw-HTML branch. Its markdown then shipped as raw
+# markers, unescaped and unstyled, and every downstream guard still passed
+# because the payload lives inside CDATA where xmllint cannot see it.
+#
+# Selection order:
+#   1. Extension keyed. A .md/.markdown/.txt file is markdown no matter what it
+#      quotes; a .html/.htm file is HTML no matter how plain it looks.
+#   2. Only for an extensionless/unknown file: sniff the PROSE — fenced code
+#      blocks and backtick spans stripped first, and only LINE-LEADING tags
+#      count, so a tag named inside a sentence never decides the branch.
+notes_is_raw_html() { # $1 = notes file; 0 = raw HTML branch, 1 = markdown converter
+  local f="$1" base ext
+  base="$(basename -- "$f")"
+  ext=""
+  [[ "$base" == *.* ]] && ext="$(printf '%s' "${base##*.}" | tr '[:upper:]' '[:lower:]')"
+  case "$ext" in
+    md|markdown|mdown|mkd|text|txt) return 1 ;;
+    htm|html|xhtml)                 return 0 ;;
+  esac
+  awk '
+    /^[[:space:]]*(```|~~~)/ { fence = !fence; next }
+    fence { next }
+    { gsub(/`[^`]*`/, ""); print }
+  ' "$f" | grep -Eqi '^[[:space:]]*<(html|body|p|ul|ol|div|section|h[1-6])[[:space:]>/]'
+}
+
 if [[ -n "$NOTES_FILE" ]]; then
   echo "==> Embedding release notes from $NOTES_FILE"
+  if notes_is_raw_html "$NOTES_FILE"; then
+    NOTES_MODE="raw-html"
+  else
+    NOTES_MODE="converted"
+  fi
+  echo "    notes mode: $NOTES_MODE"
   ENCLOSURE_BEFORE="$ENCLOSURE_LINE"
   NOTES_TMP="$OUT_DIR/.release-notes.fragment"
   {
@@ -407,7 +486,7 @@ if [[ -n "$NOTES_FILE" ]]; then
     # html, but this path depends on HTML rendering — say so (gpt-5.5 NIT).
     printf '        <description sparkle:descriptionFormat="html"><![CDATA[\n'
     # CDATA cannot contain the terminator; split it if the notes ever do.
-    if grep -qi '<html\|<p>\|<ul>\|<h[1-6]>' "$NOTES_FILE"; then
+    if [[ "$NOTES_MODE" == "raw-html" ]]; then
       sed 's/]]>/]]]]><![CDATA[>/g' "$NOTES_FILE"
     else
       # update-dialog-polish (2026-08-20): markdown notes render as styled,
@@ -444,7 +523,39 @@ if [[ -n "$NOTES_FILE" ]]; then
     || fail "embedding release notes altered the signed <enclosure> line. Refusing."
   [[ "$(tag 'sparkle:version')" == "$VERSION" ]] \
     || fail "embedding release notes altered the advertised feed version. Refusing."
-  echo "    notes:     embedded as <description> ($(wc -c <"$NOTES_FILE" | tr -d ' ') bytes)"
+
+  # PAYLOAD guard. Every assertion above is structural — the notes text lives
+  # inside CDATA, so a feed carrying raw markdown markers is still well-formed
+  # XML with one <item> and an untouched enclosure. That is exactly how the
+  # backtick-sniff bug shipped an unstyled, unescaped dialog past all of them.
+  # When the CONVERTER branch ran, the rendered description must actually be the
+  # converter's output: its wrapper class present, and no line-leading markdown
+  # markers left over.
+  if [[ "$NOTES_MODE" == "converted" ]]; then
+    DESC_PAYLOAD="$(awk '
+      /<description[[:space:]]/ { inside = 1; next }
+      inside && /^[[:space:]]*\]\]><\/description>/ { inside = 0 }
+      inside
+    ' "$APPCAST_XML")"
+    [[ -n "$DESC_PAYLOAD" ]] \
+      || fail "the embedded <description> payload is empty after converting $NOTES_FILE."
+    grep -q 'class="release-notes"' <<<"$DESC_PAYLOAD" \
+      || fail "the markdown converter branch ran for $NOTES_FILE but the rendered
+       description carries no class=\"release-notes\" wrapper — the notes would
+       reach Sparkle's dialog unstyled. Refusing."
+    # Exclude fenced-code bodies (<pre><code>…</code></pre>) from the marker
+    # scan: verbatim code legitimately contains line-leading '#'/'-' and must
+    # not fail the publish. Everything outside fences is rendered prose, where
+    # a surviving marker means the converter missed a construct.
+    DESC_PROSE="$(sed '/<pre><code>/,/<\/code><\/pre>/d' <<<"$DESC_PAYLOAD")"
+    if grep -Eq '^[[:space:]]*(#{1,6}[[:space:]]|[-*+][[:space:]]|[0-9]+\.[[:space:]])' <<<"$DESC_PROSE"; then
+      fail "the rendered description still contains line-leading markdown markers
+       ('#' heading, '- ' list, or '1. ' ordered list) after conversion of
+       $NOTES_FILE. The update dialog would show raw markers instead of
+       formatted notes. Refusing."
+    fi
+  fi
+  echo "    notes:     embedded as <description> ($(wc -c <"$NOTES_FILE" | tr -d ' ') bytes, $NOTES_MODE)"
 fi
 
 # Every guard passed — the feed may now survive on disk. (Set AFTER the notes
@@ -468,6 +579,8 @@ enclosure_url=$ENCLOSURE_URL
 appcast_url=$APPCAST_URL
 ed_signature=$ED_SIGNATURE
 public_key=$BUNDLE_PUB_KEY
+short_version=$BUNDLE_SHORT_VERSION
+internal_build=$BUNDLE_IS_INTERNAL
 MANIFEST
 
 echo ""
@@ -500,127 +613,18 @@ PUBLISH_CMD="${NATIVE_AGENT_APPCAST_PUBLISH_CMD:-${NATIVEAGENT_APPCAST_PUBLISH_C
 
 echo ""
 echo "==> Publishing via NATIVEAGENT_APPCAST_PUBLISH_CMD"
-NATIVEAGENT_PUBLISH_APPCAST="$APPCAST_XML" \
-NATIVEAGENT_PUBLISH_DMG="$DMG_PATH" \
-NATIVEAGENT_PUBLISH_TEST_RECEIPT="${NATIVEAGENT_PUBLISH_TEST_RECEIPT:-}" \
-NATIVEAGENT_PUBLISH_ATTESTATION="${NATIVEAGENT_PUBLISH_ATTESTATION:-}" \
-NATIVEAGENT_PUBLISH_APPCAST_URL="$APPCAST_URL" \
-NATIVEAGENT_PUBLISH_VERSION="$VERSION" \
-NATIVEAGENT_APPCAST_REHEARSAL="$REHEARSAL" \
-  bash -c "$PUBLISH_CMD" \
-  || fail "publish command failed; the feed was NOT published."
+VERIFY_STATUS=0
+nativeagent_publish_appcast_and_verify \
+  "$PUBLISH_CMD" "$APPCAST_XML" "$DMG_PATH" "$APPCAST_URL" "$DOWNLOAD_URL" \
+  "$VERSION" "$REHEARSAL" "$ENCLOSURE_LEN" "$MOUNT_BASE/verify" || VERIFY_STATUS=$?
 
-# ---------------------------------------------------------------------------
-# 7. A2.1 round 2 (gpt-5.5 BLOCKING): the publish command's EXIT CODE IS NOT
-#    EXISTENCE. `NATIVEAGENT_APPCAST_PUBLISH_CMD=true` exits 0 and uploads
-#    nothing; a DMG-only upload exits 0 with no feed; a typo'd bucket path exits
-#    0 and serves a 404 at the URL the app was just told to poll. The whole point
-#    of this task was killing the 404-poll class, so nothing prints "Published"
-#    until both artifacts have been FETCHED from their advertised URLs.
-# ---------------------------------------------------------------------------
-CURL_BIN="$(command -v curl || true)"
-[[ -n "$CURL_BIN" ]] || fail "curl is not available, so the publish cannot be VERIFIED.
-       Refusing to claim a feed is live on the strength of an exit code alone.
-       Install curl (or publish from a host that has it) and re-run."
-
-# CDN/object-store propagation is real; a bounded retry is not a bypass. Every
-# attempt must end in a successful fetch — running out of attempts is a failure.
-VERIFY_ATTEMPTS="${NATIVEAGENT_APPCAST_VERIFY_ATTEMPTS:-6}"
-VERIFY_DELAY="${NATIVEAGENT_APPCAST_VERIFY_DELAY:-5}"
-[[ "$VERIFY_ATTEMPTS" =~ ^[0-9]+$ && "$VERIFY_ATTEMPTS" -ge 1 ]] \
-  || fail "NATIVEAGENT_APPCAST_VERIFY_ATTEMPTS must be a positive integer, got '$VERIFY_ATTEMPTS'"
-[[ "$VERIFY_DELAY" =~ ^[0-9]+$ ]] \
-  || fail "NATIVEAGENT_APPCAST_VERIFY_DELAY must be a non-negative integer, got '$VERIFY_DELAY'"
-
-LOCAL_APPCAST_SHA="$(shasum -a 256 "$APPCAST_XML" | awk '{print $1}')"
-FETCH_DIR="$MOUNT_BASE/verify"
-mkdir -p "$FETCH_DIR"
-
-echo ""
-echo "==> Verifying the published feed is actually LIVE (exit 0 proves nothing)"
-
-remote_appcast_sha=""
-remote_dmg_len=""
-verify_note=""
-attempt=1
-while [[ $attempt -le $VERIFY_ATTEMPTS ]]; do
-  verify_note=""
-  # -f: HTTP errors are failures. -L: follow the redirects release hosts love.
-  if ! "$CURL_BIN" -fsSL --max-time 120 -o "$FETCH_DIR/appcast.remote.xml" "$APPCAST_URL" 2>"$FETCH_DIR/appcast.err"; then
-    verify_note="could not fetch $APPCAST_URL: $(tr -d '\n' < "$FETCH_DIR/appcast.err")"
-  else
-    remote_appcast_sha="$(shasum -a 256 "$FETCH_DIR/appcast.remote.xml" | awk '{print $1}')"
-    if [[ "$remote_appcast_sha" != "$LOCAL_APPCAST_SHA" ]]; then
-      verify_note="the appcast served at $APPCAST_URL is NOT the feed just generated
-       (remote sha256 $remote_appcast_sha != local $LOCAL_APPCAST_SHA)"
-    else
-      # The DMG must exist at the enclosure URL with the length the feed
-      # advertises, or Sparkle offers an update it cannot download.
-      remote_dmg_len=""
-      if "$CURL_BIN" -fsSLI --max-time 120 "$DOWNLOAD_URL" >"$FETCH_DIR/dmg.head" 2>"$FETCH_DIR/dmg.err"; then
-        # Header names are case-insensitive and awk's IGNORECASE is GNU-only, so
-        # the case folding happens in tr. (An IGNORECASE regex silently matched
-        # nothing on macOS awk — caught by the length-mismatch guard test.)
-        remote_dmg_len="$(
-          tr -d '\r' < "$FETCH_DIR/dmg.head" | tr '[:upper:]' '[:lower:]' \
-            | awk -F'[:[:space:]]+' '/^content-length:/ { v=$2 } END{ if (v ~ /^[0-9]+$/) print v }'
-        )"
-      fi
-      if [[ -z "$remote_dmg_len" ]]; then
-        # Some hosts refuse HEAD or omit Content-Length on it. A 1-byte ranged
-        # GET still reports the true total in Content-Range. A host that ignores
-        # Range answers 200 with the full body and a plain Content-Length — that
-        # is still a valid answer, so both headers are accepted here (parsing only
-        # Content-Range would fail a perfectly good publish). The longer timeout
-        # covers that case, where the whole image is actually transferred.
-        if "$CURL_BIN" -fsSL --max-time 600 -r 0-0 -D "$FETCH_DIR/dmg.head2" -o /dev/null "$DOWNLOAD_URL" 2>>"$FETCH_DIR/dmg.err"; then
-          remote_dmg_len="$(
-            tr -d '\r' < "$FETCH_DIR/dmg.head2" | tr '[:upper:]' '[:lower:]' \
-              | awk -F'[:[:space:]]+' '
-                  /^content-range:/ { n=split($0, p, "/"); if (n>1 && p[n] ~ /^[0-9]+$/) range=p[n] }
-                  /^content-length:/ { if ($2 ~ /^[0-9]+$/) len=$2 }
-                  END { if (range != "") print range; else if (len != "") print len }'
-          )"
-        fi
-      fi
-      if [[ -z "$remote_dmg_len" ]]; then
-        verify_note="the DMG at $DOWNLOAD_URL did not resolve to a readable size: $(tr -d '\n' < "$FETCH_DIR/dmg.err")"
-      elif [[ "$remote_dmg_len" != "$ENCLOSURE_LEN" ]]; then
-        verify_note="the DMG served at $DOWNLOAD_URL is $remote_dmg_len bytes but the feed
-       advertises $ENCLOSURE_LEN — the enclosure signature covers different bytes"
-      else
-        # Size match is NECESSARY but not SUFFICIENT (gpt-5.5 final review
-        # BLOCKING, 2026-07-25): a CDN serving a stale DMG of identical length
-        # passes the length check, then release.sh promotes the quarantined
-        # artifacts against a feed whose enclosure signature covers DIFFERENT
-        # bytes — every updater download then fails signature validation, or
-        # worse, a rollback-attack DMG ships. Publication happens once per
-        # release, so paying one full download here is cheap insurance:
-        # fetch the served DMG and require an exact SHA-256 match with the
-        # local artifact before anything is promoted.
-        if ! "$CURL_BIN" -fsSL --max-time 900 -o "$FETCH_DIR/dmg.served" "$DOWNLOAD_URL" 2>>"$FETCH_DIR/dmg.err"; then
-          verify_note="the DMG at $DOWNLOAD_URL passed the size check but could not be fetched for byte verification: $(tr -d '\n' < "$FETCH_DIR/dmg.err")"
-        else
-          remote_dmg_sha="$(shasum -a 256 "$FETCH_DIR/dmg.served" | awk '{print $1}')"
-          rm -f "$FETCH_DIR/dmg.served"
-          if [[ "$remote_dmg_sha" != "$DMG_SHA256" ]]; then
-            verify_note="the DMG served at $DOWNLOAD_URL has sha256 $remote_dmg_sha but the published artifact is $DMG_SHA256 — same length, DIFFERENT bytes (stale CDN or wrong upload)"
-          else
-            break  # both artifacts confirmed live and byte-identical
-          fi
-        fi
-      fi
-    fi
-  fi
-  if [[ $attempt -lt $VERIFY_ATTEMPTS ]]; then
-    echo "    attempt $attempt/$VERIFY_ATTEMPTS not yet verified ($verify_note)" >&2
-    echo "    retrying in ${VERIFY_DELAY}s (host propagation)..." >&2
-    sleep "$VERIFY_DELAY"
-  fi
-  attempt=$((attempt + 1))
-done
-
-if [[ -n "$verify_note" ]]; then
+if [[ $VERIFY_STATUS -eq 3 ]]; then
+  fail "$NATIVEAGENT_APPCAST_PUBLISH_VERIFY_REASON"
+elif [[ $VERIFY_STATUS -eq 2 ]]; then
+  fail "$NATIVEAGENT_APPCAST_PUBLISH_VERIFY_REASON"
+elif [[ $VERIFY_STATUS -ne 0 ]]; then
+  VERIFY_ATTEMPTS="$NATIVEAGENT_APPCAST_PUBLISH_VERIFY_ATTEMPTS"
+  verify_note="$NATIVEAGENT_APPCAST_PUBLISH_VERIFY_REASON"
   # The signed feed on disk is valid for the artifact it describes, so it is not
   # deleted — but it describes a build whose DMG is NOT live, so hand-uploading it
   # would recreate the 404. Say so where a human would find it.
@@ -641,6 +645,6 @@ TXT
        The release is NOT published."
 fi
 
-echo "    appcast: $APPCAST_URL  (sha256 $remote_appcast_sha — matches local)"
-echo "    dmg:     $DOWNLOAD_URL  ($remote_dmg_len bytes — matches the enclosure)"
+echo "    appcast: $APPCAST_URL  (sha256 $NATIVEAGENT_APPCAST_PUBLISH_VERIFY_REMOTE_APPCAST_SHA — matches local)"
+echo "    dmg:     $DOWNLOAD_URL  ($NATIVEAGENT_APPCAST_PUBLISH_VERIFY_REMOTE_DMG_LEN bytes — matches the enclosure)"
 echo "==> Published and VERIFIED live: $APPCAST_URL"

@@ -9,10 +9,11 @@ extension ChatView {
     func toggleVoice() {
         if voiceInput.isListening {
             Task { @MainActor in
-                let final = await voiceInput.stopListening()
+                let result = await voiceInput.stopListeningResult()
+                let final = result.transcriptForSubmission
                 if final.isEmpty {
                     text = voiceDraftBeforeListening
-                    showToast("No speech detected")
+                    showToast(result.userFacingFailureMessage ?? "No speech detected")
                 } else {
                     text = composeVoiceDraft(final)
                 }

@@ -170,6 +170,25 @@ fi
 INSTALL_VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION" 2>/dev/null || true)"
 INSTALL_VERSION="${INSTALL_VERSION:-0.0.0-dev}"
 INSTALL_SOURCE_REVISION="${BUILD_SHA:-unknown}"
+
+# internal-build-seat-hygiene item 1 (2026-08-21): an internal build must never
+# be mistakable for the published release. Aug 19 a locally built 0.4.1 was
+# scp-installed onto the Nova seat, carried no updater config, and still said
+# "0.4.1" — the seat silently left the update train while looking identical to
+# the shipped DMG. The HUMAN-visible string now carries the build identity;
+# CFBundleVersion stays bare because that is Sparkle's comparison key.
+# Kept textually identical in build_and_run.sh and release.sh (guard-tested).
+nativeagent_internal_version_suffix() { # $1 = repo root; echoes "-dev.<sha8>[.dirty]"
+  local root="$1" sha dirty=""
+  sha="$(git -C "$root" rev-parse --short=8 HEAD 2>/dev/null || true)"
+  [[ "$sha" =~ ^[0-9a-f]{8}$ ]] || sha="nogit"
+  if [[ -n "$(git -C "$root" status --porcelain --untracked-files=normal 2>/dev/null || true)" ]]; then
+    dirty=".dirty"
+  fi
+  printf '%s' "-dev.${sha}${dirty}"
+}
+# install_app.sh has no publish lane: every bundle it installs is internal.
+INSTALL_SHORT_VERSION="$INSTALL_VERSION$(nativeagent_internal_version_suffix "$ROOT")"
 if [[ -n "$(git -C "$ROOT" status --porcelain --untracked-files=normal 2>/dev/null || true)" ]]; then
     INSTALL_SOURCE_DIRTY=true
 else
@@ -177,8 +196,8 @@ else
 fi
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $INSTALL_VERSION" "$TEMP_BUNDLE/Contents/Info.plist" 2>/dev/null \
     || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $INSTALL_VERSION" "$TEMP_BUNDLE/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $INSTALL_VERSION" "$TEMP_BUNDLE/Contents/Info.plist" 2>/dev/null \
-    || /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $INSTALL_VERSION" "$TEMP_BUNDLE/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $INSTALL_SHORT_VERSION" "$TEMP_BUNDLE/Contents/Info.plist" 2>/dev/null \
+    || /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $INSTALL_SHORT_VERSION" "$TEMP_BUNDLE/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :NativeAgentSourceRevision $INSTALL_SOURCE_REVISION" "$TEMP_BUNDLE/Contents/Info.plist" 2>/dev/null \
     || /usr/libexec/PlistBuddy -c "Add :NativeAgentSourceRevision string $INSTALL_SOURCE_REVISION" "$TEMP_BUNDLE/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :NativeAgentSourceDirty $INSTALL_SOURCE_DIRTY" "$TEMP_BUNDLE/Contents/Info.plist" 2>/dev/null \

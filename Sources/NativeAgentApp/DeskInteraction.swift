@@ -47,9 +47,11 @@ enum DeskBoardLayout {
 
     // MARK: partition
     //
-    // Disjoint + exhaustive over the active items: pursuits claim first;
-    // watches and board both gate `!isPursuit` and board negates the exact
-    // watch predicate, so pursuits ∪ watches ∪ board == activeItems.
+    // Disjoint + exhaustive over the active items: the self-authored project
+    // lane claims first, even when its optional payload could not be decoded.
+    // That malformed row must stay visible as an integrity warning rather than
+    // silently becoming ordinary board work. Watches and board both negate the
+    // same lane predicate, so pursuits ∪ watches ∪ board == activeItems.
 
     static func isWatchShaped(_ item: DeskItem) -> Bool {
         item.kind == .watch || item.status == .watch
@@ -59,8 +61,12 @@ enum DeskBoardLayout {
         items.filter { !$0.status.isTerminal }
     }
 
+    static func isPursuitLaneItem(_ item: DeskItem) -> Bool {
+        item.origin == .agent && item.kind == .project
+    }
+
     static func pursuits(_ active: [DeskItem]) -> [DeskItem] {
-        active.filter(\.isPursuit)
+        active.filter(isPursuitLaneItem)
     }
 
     static func watches(_ active: [DeskItem]) -> [DeskItem] {
@@ -70,7 +76,7 @@ enum DeskBoardLayout {
         // visible list). Unparseable timestamps sort last; ties break on the
         // raw timestamp string, then handle, so equal-date rows can't jitter
         // between loads (gpt-5.5 MED: `sorted` is not stable).
-        active.filter { !$0.isPursuit && isWatchShaped($0) }
+        active.filter { !isPursuitLaneItem($0) && isWatchShaped($0) }
             .sorted { a, b in
                 let da = UserDisplayFormatters.parseISOTimestamp(a.updatedAt) ?? .distantFuture
                 let db = UserDisplayFormatters.parseISOTimestamp(b.updatedAt) ?? .distantFuture
@@ -81,7 +87,7 @@ enum DeskBoardLayout {
     }
 
     static func board(_ active: [DeskItem]) -> [DeskItem] {
-        active.filter { !$0.isPursuit && !isWatchShaped($0) }
+        active.filter { !isPursuitLaneItem($0) && !isWatchShaped($0) }
     }
 
     static func boardNonGh(_ board: [DeskItem]) -> [DeskItem] {
@@ -199,7 +205,7 @@ enum DeskBoardLayout {
     static func revealKeys(for handle: String, items: [DeskItem]) -> [String] {
         let active = activeItems(items)
         guard let item = active.first(where: { $0.handle == handle }) else { return [] }
-        if item.isPursuit { return [] }
+        if isPursuitLaneItem(item) { return [] }
         if isWatchShaped(item) {
             return keys(containing: item,
                         in: groups(watches(active), allItems: items),
@@ -254,6 +260,50 @@ enum DeskSelection {
 
 // MARK: - Palette rows + fuzzy match
 
+/// The collapsed GitHub waiting rollup participates in the same reveal
+/// vocabulary as the rest of Desk. Each row gets a watch-only palette target:
+/// it can open and scroll to persisted watcher state, but can never enter a
+/// Desk mutation command.
+enum DeskGitHubWaitingRollup {
+    static let toggleKey = "gh:waiting-upstream"
+    private static let palettePrefix = "ghwait:"
+
+    static func paletteRows(in items: [GitHubCommandItem]) -> [DeskPaletteRow] {
+        items.compactMap { item in
+            guard case .waitingUpstream = item.state else { return nil }
+            return DeskPaletteRow(
+                handle: paletteHandle(for: item),
+                alias: "GH",
+                title: item.title.isEmpty ? "\(item.repository) #\(item.number)" : item.title,
+                project: item.repository,
+                status: "waiting upstream",
+                isActionable: false
+            )
+        }
+    }
+
+    static func paletteHandle(for item: GitHubCommandItem) -> String {
+        palettePrefix + item.itemId
+    }
+
+    static func isPaletteHandle(_ handle: String) -> Bool {
+        handle.hasPrefix(palettePrefix)
+    }
+
+    /// Produces the sole expansion key for a currently persisted waiting row.
+    /// A stale palette result, an arbitrary string, or a row whose watcher
+    /// state advanced since the palette opened must not expand anything.
+    static func revealKeys(
+        forPaletteHandle handle: String,
+        in items: [GitHubCommandItem]
+    ) -> [String] {
+        guard let item = items.first(where: { paletteHandle(for: $0) == handle }),
+              case .waitingUpstream = item.state
+        else { return [] }
+        return [toggleKey]
+    }
+}
+
 /// One candidate in the ⌘K palette. Flattened off DeskItem so the matcher is
 /// testable without building a whole desk state.
 struct DeskPaletteRow: Identifiable, Equatable, Sendable {
@@ -262,6 +312,9 @@ struct DeskPaletteRow: Identifiable, Equatable, Sendable {
     let title: String
     let project: String
     let status: String
+    /// GitHub watcher rows are reveal-only: closing or deferring one would be
+    /// a fabricated Desk mutation instead of an action supported by its store.
+    let isActionable: Bool
 
     var id: String { handle }
 
@@ -269,12 +322,20 @@ struct DeskPaletteRow: Identifiable, Equatable, Sendable {
     /// project — everything User can actually read on the row.
     var haystack: String { "\(alias) \(title) \(project)" }
 
-    init(handle: String, alias: String, title: String, project: String, status: String) {
+    init(
+        handle: String,
+        alias: String,
+        title: String,
+        project: String,
+        status: String,
+        isActionable: Bool = true
+    ) {
         self.handle = handle
         self.alias = alias
         self.title = title
         self.project = project
         self.status = status
+        self.isActionable = isActionable
     }
 
     init(item: DeskItem) {
@@ -283,7 +344,8 @@ struct DeskPaletteRow: Identifiable, Equatable, Sendable {
             alias: item.alias,
             title: item.title,
             project: item.project,
-            status: item.status.rawValue)
+            status: item.status.rawValue,
+            isActionable: true)
     }
 }
 
@@ -374,6 +436,60 @@ struct DeskPaletteQuery: Equatable, Sendable {
             ? String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
             : ""
         return DeskPaletteQuery(verb: verb, query: rest)
+    }
+}
+
+// MARK: - Palette command application
+
+/// Resolves the command handed back by the palette against the CURRENT Desk
+/// rows. Search results are a snapshot: by the time Enter arrives a row may
+/// have been closed, moved to history, or replaced by a watch-only GitHub row.
+/// That stale handle must never become a desk_* mutation just because it was
+/// once visible in the palette.
+enum DeskPaletteCommandApplication {
+    enum Resolution: Equatable, Sendable {
+        case dispatch(DeskQuickAction)
+        case beginDefer(handle: String)
+        case beginNote(handle: String)
+        case refused(String)
+    }
+
+    static let actionInFlightMessage = "Another Desk action is still in progress."
+
+    static func resolve(
+        verb: DeskPaletteQuery.Verb,
+        handle rawHandle: String,
+        activeItems: [DeskItem]
+    ) -> Resolution {
+        let handle = rawHandle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !handle.isEmpty else {
+            return .refused("Palette command was not applied: no Desk item was selected.")
+        }
+        guard let item = activeItems.first(where: { $0.handle == handle }) else {
+            return .refused("Palette command was not applied: that item is no longer active.")
+        }
+        switch verb {
+        case .close:
+            let expectedUpdatedAt = item.updatedAt.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !expectedUpdatedAt.isEmpty else {
+                return .refused(
+                    "Palette command was not applied: the item's current version is unavailable."
+                )
+            }
+            return .dispatch(.closeIfCurrent(
+                handle: handle,
+                outcome: DeskQuickAction.deskCloseOutcome,
+                expectedUpdatedAt: expectedUpdatedAt
+            ))
+        case .deferItem:
+            // Choosing Defer only opens its date choices. It has not changed
+            // the store yet, so calling it successful here would be a lie.
+            return .beginDefer(handle: handle)
+        case .note:
+            // Likewise, the note is not an effect until non-empty text is
+            // submitted through DeskQuickAction.note.
+            return .beginNote(handle: handle)
+        }
     }
 }
 

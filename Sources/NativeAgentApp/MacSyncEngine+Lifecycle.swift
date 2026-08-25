@@ -128,11 +128,12 @@ extension MacSyncEngine {
         cognitionSnapshotObservationTask?.cancel()
         cognitionSnapshotObservationTask = nil
         if let chatTurnCompletedObserver {
-            NotificationCenter.default.removeObserver(chatTurnCompletedObserver)
+            chatTurnCompletedNotificationCenter.removeObserver(chatTurnCompletedObserver)
             self.chatTurnCompletedObserver = nil
         }
         chatTranscriptSnapshotPublicationTask?.cancel()
         chatTranscriptSnapshotPublicationTask = nil
+        chatSnapshotCoalescer.reset()
         snapshotWriteInFlight = false
         snapshotWriteQueued = false
         snapshotWriteQueuedNeedsHeavy = false
@@ -143,6 +144,14 @@ extension MacSyncEngine {
         // read-storm). Persist it instead, and keep it in memory so a same-process
         // reconnect short-circuits unchanged files immediately.
         saveSnapshotDigests()
+        // A stopped lifecycle must not retain a routable old container. Late
+        // work is already generation-gated; clearing these roots also makes a
+        // post-stop inbox/action call fail closed instead of writing to a
+        // superseded Drive or local-cache generation.
+        snapshotDir = nil
+        inboxDir = nil
+        responsesDir = nil
+        transactionDir = nil
         lastHeavySnapshotAt = nil
         pruneDeadlineTask?.cancel()
         pruneDeadlineTask = nil
@@ -159,8 +168,37 @@ extension MacSyncEngine {
             while let self, !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(15 * 60))
                 guard !Task.isCancelled, self.isActive else { return }
-                await self.writeSnapshots()
+                await self.runSnapshotIntegrityPass()
             }
+        }
+    }
+
+    /// Slow repair for a missed mutation edge or an externally modified
+    /// snapshot.  Normal publications remain event-driven; this pass merely
+    /// proves that every cached digest still matches the specific file iOS can
+    /// consume before allowing the writer to skip it.
+    private func runSnapshotIntegrityPass() async {
+        guard isActive, let snapshotDir else { return }
+        let lifecycleGeneration = snapshotLifecycleGeneration
+        let digests = snapshotFileDigests
+        let report = await Task.detached(priority: .utility) {
+            MacSyncSnapshotIntegrity.reconcile(digests: digests, in: snapshotDir)
+        }.value
+        guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
+
+        if report.retainedDigests != snapshotFileDigests {
+            snapshotFileDigests = report.retainedDigests
+            saveSnapshotDigests()
+        }
+        if report.requiresRepair {
+            syncError = "iPhone snapshot integrity check found \(report.integrityFailures.joined(separator: "; ")). Rebuilding the affected mobile snapshot groups."
+            // A mismatch can belong to a heavyweight group (catalog, graph,
+            // transcripts). A standard pass would retain that bad file forever,
+            // so the bounded 15-minute integrity owner explicitly rebuilds all
+            // active projections once.
+            await writeSnapshots(forceHeavy: true)
+        } else {
+            await writeSnapshots()
         }
     }
 
@@ -176,11 +214,14 @@ extension MacSyncEngine {
         }
     }
 
-    private func startChatTranscriptSnapshotObservation() {
+    /// Install the exact completion-edge observer that feeds the bounded chat
+    /// snapshot coalescer. Kept internal so its notification-to-write contract
+    /// can be exercised with an isolated notification center.
+    func startChatTranscriptSnapshotObservation() {
         if let chatTurnCompletedObserver {
-            NotificationCenter.default.removeObserver(chatTurnCompletedObserver)
+            chatTurnCompletedNotificationCenter.removeObserver(chatTurnCompletedObserver)
         }
-        chatTurnCompletedObserver = NotificationCenter.default.addObserver(
+        chatTurnCompletedObserver = chatTurnCompletedNotificationCenter.addObserver(
             forName: .chatTurnCompleted,
             object: nil,
             queue: .main
@@ -203,26 +244,32 @@ extension MacSyncEngine {
     /// sessions-only request without starting a second timer.
     func requestChatSnapshotPublication(includeTranscripts: Bool) {
         guard isActive else { return }
-        snapshotWriteQueuedNeedsChatTranscripts =
-            snapshotWriteQueuedNeedsChatTranscripts || includeTranscripts
-        guard chatTranscriptSnapshotPublicationTask == nil else { return }
         let generation = snapshotLifecycleGeneration
+        guard chatSnapshotCoalescer.enqueue(
+            includeTranscripts: includeTranscripts,
+            generation: generation
+        ) else { return }
         chatTranscriptSnapshotPublicationTask = Task { @MainActor [weak self] in
             do {
                 try await Task.sleep(for: .milliseconds(180))
             } catch {
                 return
             }
-            guard let self,
-                  self.isActive,
-                  generation == self.snapshotLifecycleGeneration else { return }
-            let includeTranscripts = self.snapshotWriteQueuedNeedsChatTranscripts
-            self.snapshotWriteQueuedNeedsChatTranscripts = false
+            guard let self else { return }
+            guard let includeTranscripts = self.chatSnapshotCoalescer.resolve(
+                generation: generation,
+                currentGeneration: self.snapshotLifecycleGeneration,
+                isActive: self.isActive
+            ) else { return }
             self.chatTranscriptSnapshotPublicationTask = nil
-            await self.writeSnapshots(
-                includeChatTranscripts: includeTranscripts,
-                scope: .chatSessions
-            )
+            if let chatTranscriptSnapshotWriter = self.chatTranscriptSnapshotWriter {
+                await chatTranscriptSnapshotWriter(includeTranscripts)
+            } else {
+                await self.writeSnapshots(
+                    includeChatTranscripts: includeTranscripts,
+                    scope: .chatSessions
+                )
+            }
         }
     }
 
@@ -236,10 +283,19 @@ extension MacSyncEngine {
             || change.reason == "residual_repair:completed"
     }
 
-    private func startArchiveRetentionWatcher() {
+    /// Arms retention observation only after every canonical archive directory
+    /// is a real directory. Kept internal for hermetic lifecycle proof of the
+    /// failure state; production still invokes it only from `start(docsURL:)`.
+    func startArchiveRetentionWatcher() {
         archiveRetentionWatcher?.cancel()
-        let rejected = inboxDir?.appendingPathComponent("_rejected", isDirectory: true)
-        let paths = [inboxDir, responsesDir, rejected].compactMap { $0 }
+        let paths = MacSyncArchiveRetentionWatchPaths.resolve(
+            inboxDirectory: inboxDir,
+            responsesDirectory: responsesDir
+        )
+        guard paths.count == 3 else {
+            syncError = "Archive retention watcher unavailable — iCloud inbox paths are unresolved"
+            return
+        }
         archiveRetentionWatcher = FileChangeWatcher(paths: paths) { [weak self] _ in
             Task { @MainActor in
                 self?.rescheduleArchiveRetentionDeadline()

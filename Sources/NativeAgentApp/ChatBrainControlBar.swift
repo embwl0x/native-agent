@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 import AppKit
 import CoreGraphics
@@ -17,12 +18,157 @@ import CoreSpotlight
 import CloudKit
 #endif
 
+/// State machine for the conversation header's access picker. The picker can
+/// optimistically show ordinary changes, but Full Mac is a two-step action
+/// unless the persisted policy has already granted that exact authority.
+enum ChatAccessPickerPolicy {
+    enum Action: Equatable {
+        case unchanged
+        case save(mode: String, rollbackMode: String)
+        case requiresFullMacConfirmation(previousMode: String)
+    }
+
+    static func trustPolicyAlreadyFullMac(
+        permissionLevel: String?,
+        outsideWorkspaceDefault: String?
+    ) -> Bool {
+        permissionLevel == "full_mac_os"
+            || permissionLevel == "wide_open_receipts"
+            || outsideWorkspaceDefault == "allow"
+    }
+
+    static func action(
+        requestedMode: String,
+        currentMode: String,
+        trustPolicyAlreadyFullMac: Bool
+    ) -> Action {
+        let requested = AppModel.normalizedAgentAccessMode(requestedMode)
+        let current = AppModel.normalizedAgentAccessMode(currentMode)
+        guard requested != current else { return .unchanged }
+        if requested == "full", !trustPolicyAlreadyFullMac {
+            return .requiresFullMacConfirmation(previousMode: current)
+        }
+        return .save(mode: requested, rollbackMode: current)
+    }
+
+    /// The picker must return to the last durable selection if the write fails;
+    /// a status toast alone is not enough when the selected value implies an
+    /// authority the store never granted.
+    static func visibleMode(afterSaving mode: String, rollbackMode: String, succeeded: Bool) -> String {
+        succeeded
+            ? AppModel.normalizedAgentAccessMode(mode)
+            : AppModel.normalizedAgentAccessMode(rollbackMode)
+    }
+}
+
+struct ChatConversationSettingsModelWarning: Equatable {
+    enum Kind: Equatable {
+        case unavailable
+        case staleCatalog
+    }
+
+    let kind: Kind
+    let text: String
+
+    /// A missing provider row or an empty advertised model list means the
+    /// catalog has not arrived yet. Do not call the saved selection stale from
+    /// absence alone; that would turn an unavailable refresh into a false
+    /// claim that the model has been retired.
+    static func make(
+        providerName: String,
+        selectedModel: String,
+        advertisedModelIDs: [String],
+        isExplicitlyUnavailable: Bool
+    ) -> Self? {
+        let model = selectedModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !model.isEmpty else { return nil }
+
+        if isExplicitlyUnavailable {
+            return Self(
+                kind: .unavailable,
+                text: "\(model) is no longer available. Choose a replacement before sending."
+            )
+        }
+
+        guard !advertisedModelIDs.isEmpty,
+              !advertisedModelIDs.contains(model) else {
+            return nil
+        }
+        let provider = providerName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let source = provider.isEmpty ? "the selected provider" : provider
+        return Self(
+            kind: .staleCatalog,
+            text: "\(model) is not in \(source)'s current model catalog. Choose a replacement before sending."
+        )
+    }
+}
+
+/// The conversation controls must distinguish a completed refresh from a
+/// carried-over picker. `AppModel.statusText` is global and may not be visible
+/// beside this compact control, so this is the local, user-observable receipt.
+enum ChatCatalogRefreshPresentation: Equatable {
+    case refreshed
+    case catalogUnavailable
+    case providersUnavailable
+    case catalogAndProvidersUnavailable
+
+    static func resolve(catalogRefreshed: Bool, providersFresh: Bool) -> Self {
+        switch (catalogRefreshed, providersFresh) {
+        case (true, true): return .refreshed
+        case (false, true): return .catalogUnavailable
+        case (true, false): return .providersUnavailable
+        case (false, false): return .catalogAndProvidersUnavailable
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .refreshed:
+            "Providers and model catalog refreshed."
+        case .catalogUnavailable:
+            "Model catalog could not refresh. Showing existing choices."
+        case .providersUnavailable:
+            "Providers could not refresh. Showing existing choices."
+        case .catalogAndProvidersUnavailable:
+            "Providers and model catalog could not refresh. Showing existing choices."
+        }
+    }
+
+    var isFailure: Bool {
+        self != .refreshed
+    }
+}
+
+struct ChatCatalogRefreshState: Equatable {
+    private(set) var isRefreshing = false
+    private(set) var presentation: ChatCatalogRefreshPresentation?
+
+    /// A repeated click while both production reads are in flight is a no-op;
+    /// it cannot create an older completion that overwrites the newest receipt.
+    mutating func begin() -> Bool {
+        guard !isRefreshing else { return false }
+        isRefreshing = true
+        return true
+    }
+
+    mutating func finish(catalogRefreshed: Bool, providersFresh: Bool) {
+        isRefreshing = false
+        presentation = ChatCatalogRefreshPresentation.resolve(
+            catalogRefreshed: catalogRefreshed,
+            providersFresh: providersFresh
+        )
+    }
+}
+
 struct ChatBrainControlBar: View {
     @Environment(AppModel.self) private var appModel
     @State private var showFullMacAccessConfirm = false
     @State private var previousAccessMode = "auto"
+    @State private var isSavingAccessMode = false
+    @State private var accessSaveGeneration: UInt = 0
     @State private var pendingProviderSelection: String? = nil
     @State private var isSavingProviderSelection = false
+    @State private var catalogRefresh = ChatCatalogRefreshState()
 
     /// Models for the currently-selected chat provider. Falls back to the
     /// catalog default (GPT names) for providers that don't expose a model
@@ -85,6 +231,18 @@ struct ChatBrainControlBar: View {
             ) == .unavailable
     }
 
+    private var selectedModelWarning: ChatConversationSettingsModelWarning? {
+        let provider = appModel.providersList.first {
+            $0.provider_id == appModel.chatProvider
+        }
+        return ChatConversationSettingsModelWarning.make(
+            providerName: provider?.display_name ?? appModel.chatProvider,
+            selectedModel: appModel.chatModel,
+            advertisedModelIDs: provider?.models.map(\.id) ?? [],
+            isExplicitlyUnavailable: selectedModelIsUnavailable
+        )
+    }
+
     /// Compact picker label: vendor name only ("Anthropic (OAuth /
     /// Setup-Token)" → "Anthropic"). When two listed providers share a
     /// vendor they must stay distinguishable in a Picker (closed control
@@ -122,10 +280,10 @@ struct ChatBrainControlBar: View {
     }
 
     private var trustPolicyAlreadyFullMac: Bool {
-        guard let policy = appModel.trustPolicy else { return false }
-        return policy.permissionLevel == "full_mac_os"
-            || policy.permissionLevel == "wide_open_receipts"
-            || policy.filePolicy?.outsideWorkspaceDefault == "allow"
+        ChatAccessPickerPolicy.trustPolicyAlreadyFullMac(
+            permissionLevel: appModel.trustPolicy?.permissionLevel,
+            outsideWorkspaceDefault: appModel.trustPolicy?.filePolicy?.outsideWorkspaceDefault
+        )
     }
 
     private var providerSelectionBinding: Binding<String> {
@@ -154,9 +312,13 @@ struct ChatBrainControlBar: View {
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 10) {
-                Image(systemName: "brain")
+                // This visible detail label is the evidence that the header
+                // toggle opened the real brain-control row, not merely that a
+                // local Boolean flipped on an otherwise empty container.
+                Label("Conversation settings", systemImage: "brain")
+                    .font(NativeAgentFont.tag)
                     .foregroundStyle(NativeAgentBrand.accentDeep)
-                    .accessibilityLabel("Conversation settings")
+                    .accessibilityIdentifier("chat.conversation-settings-detail")
 
             // Provider picker. If the providers list hasn't loaded yet, we
             // synthesize a single tag for the currently-selected id so the
@@ -212,11 +374,16 @@ struct ChatBrainControlBar: View {
                 Task { @MainActor in await appModel.saveChatBrainDefaults() }
             }
 
-            if selectedModelIsUnavailable {
-                Label("Choose a replacement", systemImage: "exclamationmark.triangle.fill")
+            if let warning = selectedModelWarning {
+                Label(warning.text, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundStyle(.orange)
-                    .help("OpenRouter's latest catalog no longer contains the selected model. NativeAgent will not silently use another model.")
+                    .accessibilityIdentifier("chat.conversation-settings.stale-model-warning")
+                    .accessibilityLabel("Selected model warning: \(warning.text)")
+                    .accessibilityValue(
+                        warning.kind == .unavailable ? "Unavailable" : "Stale catalog"
+                    )
+                    .help("NativeAgent will not silently substitute a different model.")
             }
 
             Text("Think")
@@ -257,10 +424,7 @@ struct ChatBrainControlBar: View {
             .help("Shared agent access policy. Full Mac maps to the Trust policy's full_mac_os mode.")
             .alert("Enable Full Mac access?", isPresented: $showFullMacAccessConfirm) {
                 Button("Enable Full Mac", role: .destructive) {
-                    appModel.chatFileAccess = "full"
-                    Task { @MainActor in
-                        await appModel.saveAgentAccessMode("full")
-                    }
+                    saveAccessModeFromPicker("full", rollbackMode: previousAccessMode)
                 }
                 Button("Cancel", role: .cancel) {
                     appModel.chatFileAccess = previousAccessMode
@@ -268,6 +432,7 @@ struct ChatBrainControlBar: View {
             } message: {
                 Text("This gives the agent outside-workspace file access and Mac app control. Shell, system control, and file move/trash still require Developer Mode.")
             }
+            .disabled(isSavingAccessMode)
 
             // PATCH-2026-05-08: wave2-chat-ux — Persona quick-switch
             Text("Voice")
@@ -284,15 +449,26 @@ struct ChatBrainControlBar: View {
             .help("Active persona for chat turns")
 
             Button {
-                Task {
-                    await appModel.refreshModelCatalog()
-                    await appModel.loadProvidersForChat()
-                }
+                Task { await refreshConversationCatalog() }
             } label: {
-                Image(systemName: "arrow.clockwise")
+                if catalogRefresh.isRefreshing {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Image(systemName: "arrow.clockwise")
+                }
             }
             .help("Refresh providers + model catalog")
             .accessibilityLabel("Refresh")
+            .accessibilityValue(catalogRefresh.isRefreshing ? "Refreshing" : "Ready")
+            .disabled(catalogRefresh.isRefreshing)
+
+            if let presentation = catalogRefresh.presentation {
+                Text(presentation.message)
+                    .font(.caption)
+                    .foregroundStyle(presentation.isFailure ? Color.orange : Color.secondary)
+                    .accessibilityIdentifier("chat.conversation-settings.catalog-refresh-status")
+            }
 
             }
         }
@@ -302,29 +478,54 @@ struct ChatBrainControlBar: View {
         }
     }
 
+    private func refreshConversationCatalog() async {
+        guard catalogRefresh.begin() else { return }
+        let catalogRefreshed = await appModel.refreshModelCatalog()
+        let providersFresh = await appModel.loadProvidersForChat()
+        catalogRefresh.finish(
+            catalogRefreshed: catalogRefreshed,
+            providersFresh: providersFresh
+        )
+    }
+
     private var chatAccessBinding: Binding<String> {
         Binding(
             get: { appModel.chatFileAccess },
             set: { newValue in
-                let normalized = AppModel.normalizedAgentAccessMode(newValue)
-                if normalized == "full", AppModel.normalizedAgentAccessMode(appModel.chatFileAccess) != "full" {
-                    if trustPolicyAlreadyFullMac {
-                        appModel.chatFileAccess = "full"
-                        Task { @MainActor in
-                            await appModel.saveAgentAccessMode("full")
-                        }
-                        return
-                    }
-                    previousAccessMode = AppModel.normalizedAgentAccessMode(appModel.chatFileAccess)
-                    showFullMacAccessConfirm = true
+                switch ChatAccessPickerPolicy.action(
+                    requestedMode: newValue,
+                    currentMode: appModel.chatFileAccess,
+                    trustPolicyAlreadyFullMac: trustPolicyAlreadyFullMac
+                ) {
+                case .unchanged:
                     return
-                }
-                appModel.chatFileAccess = normalized
-                Task { @MainActor in
-                    await appModel.saveAgentAccessMode(normalized)
+                case .requiresFullMacConfirmation(let previousMode):
+                    previousAccessMode = previousMode
+                    showFullMacAccessConfirm = true
+                case .save(let mode, let rollbackMode):
+                    saveAccessModeFromPicker(mode, rollbackMode: rollbackMode)
                 }
             }
         )
+    }
+
+    private func saveAccessModeFromPicker(_ mode: String, rollbackMode: String) {
+        let normalizedMode = AppModel.normalizedAgentAccessMode(mode)
+        let normalizedRollback = AppModel.normalizedAgentAccessMode(rollbackMode)
+        accessSaveGeneration &+= 1
+        let generation = accessSaveGeneration
+        isSavingAccessMode = true
+        appModel.chatFileAccess = normalizedMode
+        Task { @MainActor in
+            let succeeded = await appModel.saveAgentAccessMode(normalizedMode)
+            guard generation == accessSaveGeneration else { return }
+            isSavingAccessMode = false
+            appModel.chatFileAccess = ChatAccessPickerPolicy.visibleMode(
+                afterSaving: normalizedMode,
+                rollbackMode: normalizedRollback,
+                succeeded: succeeded
+            )
+        }
     }
 }
 

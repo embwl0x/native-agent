@@ -45,12 +45,30 @@ struct AttachmentChip: View {
     }
 }
 
+enum ChatEmptyStatePresentation {
+    static let suggestions = ["Plan my morning", "What's stuck?", "Run the audit"]
+}
+
+enum ChatEmptyStateSuggestionAction {
+    @MainActor
+    static func apply(
+        _ suggestion: String,
+        model: AppModel,
+        activeSessionID: String,
+        draftText: inout String,
+        draftSessionID: inout String
+    ) {
+        guard !activeSessionID.isEmpty else { return }
+        model.injectChatDraft(suggestion, sessionId: activeSessionID)
+        draftText = suggestion
+        draftSessionID = activeSessionID
+    }
+}
+
 // PATCH-2026-05-09: chat-ux-polish — Chat empty state with persona name + suggestion chips
 struct ChatEmptyState: View {
     var personaName: String
     var onSuggestion: (String) -> Void
-
-    private let suggestions = ["Plan my morning", "What's stuck?", "Run the audit"]
 
     var body: some View {
         VStack(spacing: NativeAgentSpacing.xl) {
@@ -61,7 +79,7 @@ struct ChatEmptyState: View {
             )
 
             HStack(spacing: NativeAgentSpacing.sm) {
-                ForEach(suggestions, id: \.self) { suggestion in
+                ForEach(ChatEmptyStatePresentation.suggestions, id: \.self) { suggestion in
                     Button {
                         onSuggestion(suggestion)
                     } label: {
@@ -238,32 +256,71 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
 }
 
 // PATCH-2026-05-09: nextgen-surface — Horizontal row of suggested NextGen action chips above composer
+enum NextGenActionChipsPresentation {
+    static let maxVisible = 4
+
+    static func normalizedID(_ actionID: String) -> String {
+        actionID.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func isTracked(_ actionID: String, in ids: Set<String>) -> Bool {
+        ids.contains(actionID) || ids.contains(normalizedID(actionID))
+    }
+
+    /// This is the same executor-backed filter used by the full Capabilities
+    /// surface. A chat chip is an executable promise, so catalog-only,
+    /// completed, or non-dry-run rows cannot enter this presentation.
+    static func eligibleActions(summary: NextGenSummary?) -> [NextGenAction] {
+        var seenIDs = Set<String>()
+        return (summary?.actions ?? []).filter { action in
+            let actionID = normalizedID(action.id)
+            return action.dryRunAvailable == true
+                && action.status?.lowercased() != "completed"
+                && NativeClient.isNextGenActionBacked(actionID)
+                && seenIDs.insert(actionID).inserted
+        }
+    }
+
+    static func visibleActions(summary: NextGenSummary?) -> [NextGenAction] {
+        Array(eligibleActions(summary: summary).prefix(maxVisible))
+    }
+
+    static func hasMore(summary: NextGenSummary?) -> Bool {
+        eligibleActions(summary: summary).count > maxVisible
+    }
+
+    static func canRun(
+        actionID: String,
+        runningIDs: Set<String>,
+        completedIDs: Set<String>,
+        isGlobalActionRunning: Bool
+    ) -> Bool {
+        let id = normalizedID(actionID)
+        return !id.isEmpty
+            && NativeClient.isNextGenActionBacked(id)
+            && !isGlobalActionRunning
+            && !isTracked(actionID, in: runningIDs)
+            && !isTracked(actionID, in: completedIDs)
+    }
+}
+
 struct NextGenActionChipsRow: View {
     var appModel: AppModel
+    /// Test-only injection remains behind the row's production tap gate. A
+    /// nil runner always dispatches through the real app model.
+    var actionRunner: (@MainActor (String) async -> Bool)? = nil
 
     // Per-chip running state (actionId -> true while running)
     @State private var runningIds: Set<String> = []
     // Per-chip completed state (actionId -> timestamp) for checkmark flash
     @State private var completedIds: Set<String> = []
 
-    private static let maxVisible = 4
-
-    private var eligibleActions: [NextGenAction] {
-        let all = appModel.nextGenSummary?.actions ?? []
-        return all.filter {
-            $0.dryRunAvailable == true && $0.status?.lowercased() != "completed"
-                // W6 fix-round (gpt-5.5 BLOCKING): no chips for ids with no
-                // executor — same rule the Capabilities panel now applies.
-                && NativeClient.isNextGenActionBacked($0.id)
-        }
-    }
-
     private var visibleActions: [NextGenAction] {
-        Array(eligibleActions.prefix(Self.maxVisible))
+        NextGenActionChipsPresentation.visibleActions(summary: appModel.nextGenSummary)
     }
 
     private var hasMore: Bool {
-        eligibleActions.count > Self.maxVisible
+        NextGenActionChipsPresentation.hasMore(summary: appModel.nextGenSummary)
     }
 
     var body: some View {
@@ -275,22 +332,36 @@ struct NextGenActionChipsRow: View {
                     ForEach(visible) { action in
                         NextGenChip(
                             action: action,
-                            isRunning: runningIds.contains(action.id),
-                            isCompleted: completedIds.contains(action.id)
+                            isRunning: NextGenActionChipsPresentation.isTracked(
+                                action.id, in: runningIds
+                            ),
+                            isCompleted: NextGenActionChipsPresentation.isTracked(
+                                action.id, in: completedIds
+                            ),
+                            isGlobalActionRunning: appModel.isRunningNextGenAction
                         ) {
-                            guard !runningIds.contains(action.id) else { return }
-                            runningIds.insert(action.id)
-                            Task {
-                                let succeeded = await appModel.runNextGenAction(id: action.id, dryRun: true)
-                                await MainActor.run {
-                                    runningIds.remove(action.id)
-                                    if succeeded {
-                                        completedIds.insert(action.id)
-                                        // Flash checkmark for 2s then clear.
-                                        Task {
-                                            try? await Task.sleep(for: .seconds(2))
-                                            completedIds.remove(action.id)
-                                        }
+                            guard NextGenActionChipsPresentation.canRun(
+                                actionID: action.id,
+                                runningIDs: runningIds,
+                                completedIDs: completedIds,
+                                isGlobalActionRunning: appModel.isRunningNextGenAction
+                            ) else { return }
+                            let actionID = NextGenActionChipsPresentation.normalizedID(action.id)
+                            runningIds.insert(actionID)
+                            Task { @MainActor in
+                                let succeeded: Bool
+                                if let actionRunner {
+                                    succeeded = await actionRunner(actionID)
+                                } else {
+                                    succeeded = await appModel.runNextGenAction(id: actionID, dryRun: true)
+                                }
+                                runningIds.remove(actionID)
+                                if succeeded {
+                                    completedIds.insert(actionID)
+                                    // Flash checkmark for 2s then clear.
+                                    Task {
+                                        try? await Task.sleep(for: .seconds(2))
+                                        completedIds.remove(actionID)
                                     }
                                 }
                             }
@@ -308,6 +379,7 @@ struct NextGenActionChipsRow: View {
                                 .background(.quaternary, in: Capsule())
                         }
                         .buttonStyle(.borderless)
+                        .accessibilityIdentifier("chat.nextgen-more-actions")
                         .help("View all NextGen actions in Capabilities")
                     }
                 }
@@ -321,6 +393,7 @@ struct NextGenChip: View {
     var action: NextGenAction
     var isRunning: Bool
     var isCompleted: Bool
+    var isGlobalActionRunning: Bool
     var onTap: () -> Void
 
     private var chipIcon: String {
@@ -371,7 +444,8 @@ struct NextGenChip: View {
             .shadow(color: isCompleted ? .green.opacity(0.15) : .clear, radius: 4)
         }
         .buttonStyle(.borderless)
-        .disabled(isRunning || isCompleted)
+        .disabled(isRunning || isCompleted || isGlobalActionRunning)
+        .accessibilityIdentifier("chat.nextgen-action.\(action.id)")
         .help(action.displayDetail)
         .animation(NativeAgentMotion.snappy, value: isRunning)
         .animation(NativeAgentMotion.snappy, value: isCompleted)

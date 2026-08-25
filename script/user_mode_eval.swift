@@ -12,6 +12,11 @@ struct Options {
     var artifacts: URL?
     var skipUI = false
     var strictUI = false
+    /// Narrow deterministic subprocess seam for the script's own AX gate.
+    /// It only ever forces the safe failure posture and is not part of the
+    /// user-facing evaluator contract.
+    var uiGateOnly = false
+    var forceAXUntrustedForTesting = false
 }
 
 struct Finding: Codable {
@@ -58,6 +63,24 @@ struct UIRoute {
     let steps: [UIRouteStep]
     let displayName: String
     let expectedDetailText: [String]
+    /// Unlike `expectedDetailText` (an any-of route landing cue), every entry
+    /// here must be visible. Use this for mounted setup inventories where
+    /// section chrome alone would otherwise hide a failed or empty read.
+    let requiredDetailText: [String]
+
+    init(
+        id: String,
+        steps: [UIRouteStep],
+        displayName: String,
+        expectedDetailText: [String],
+        requiredDetailText: [String] = []
+    ) {
+        self.id = id
+        self.steps = steps
+        self.displayName = displayName
+        self.expectedDetailText = expectedDetailText
+        self.requiredDetailText = requiredDetailText
+    }
 }
 
 struct UIRouteStep {
@@ -77,7 +100,7 @@ func userModeRoutes(includeNativeExperience: Bool) -> [UIRoute] {
         UIRoute(id: "activity-memory-proposals", steps: [commandStep("2", labels: ["Activity"]), axStep(["Memory Proposals"])], displayName: "Activity > Memory Proposals", expectedDetailText: ["Memory proposal", "Memory Proposals"]),
         UIRoute(id: "activity-self-improvement", steps: [commandStep("2", labels: ["Activity"]), axStep(["Self-Improvement"])], displayName: "Activity > Self-Improvement", expectedDetailText: ["Harness", "Self-Improvement"]),
         UIRoute(id: "memories", steps: [commandStep("3", labels: ["Memories", "Memory"])], displayName: "Memories", expectedDetailText: ["Memory", "last hygiene"]),
-        UIRoute(id: "workshop", steps: [commandStep("4", labels: ["Workshop"])], displayName: "Workshop", expectedDetailText: ["The Workshop", "The bench is clear"]),
+        UIRoute(id: "desk", steps: [commandStep("4", labels: ["Desk"])], displayName: "Desk", expectedDetailText: ["'s Desk", "In progress"]),
         UIRoute(id: "workshop-schedule", steps: [commandStep("4", labels: ["Workshop"]), axStep(["Schedule", "Scheduler"])], displayName: "Workshop > Schedule", expectedDetailText: ["Add Nightly Reflection", "Scheduler"]),
         UIRoute(id: "workshop-research", steps: [commandStep("4", labels: ["Workshop"]), axStep(["Research"])], displayName: "Workshop > Research", expectedDetailText: ["Research"]),
         UIRoute(id: "skills", steps: [appRouteStep("s", labels: ["Skills"])], displayName: "Skills & Tools > Skills", expectedDetailText: ["Skills & Tools", "Skills"]),
@@ -87,6 +110,10 @@ func userModeRoutes(includeNativeExperience: Bool) -> [UIRoute] {
         UIRoute(id: "personality", steps: [commandStep("5", labels: ["Personality"])], displayName: "Personality", expectedDetailText: ["Personality", "Custom mode"]),
         UIRoute(id: "connectors", steps: [appRouteStep("c", labels: ["Connectors"])], displayName: "Connectors", expectedDetailText: ["Connectors"]),
         UIRoute(id: "trust", steps: [commandStep("6", labels: ["Trust"])], displayName: "Trust", expectedDetailText: ["Trust", "Full Mac"]),
+        // Mounted on Trust > Mac Control. This is intentionally read-only:
+        // the walk proves the live inventory and must never apply a preset or
+        // trigger macOS permission prompts on the user's installed app.
+        UIRoute(id: "mac-assistant-watch-setup", steps: [commandStep("6", labels: ["Trust"])], displayName: "Trust > Assistant Watch Setup", expectedDetailText: ["Assistant Watch Setup"], requiredDetailText: ["Mac Control Bridge", "Gmail unread digest"]),
         UIRoute(id: "capabilities", steps: [appRouteStep("p", labels: ["Capabilities"])], displayName: "Capabilities", expectedDetailText: ["Capabilities", "Next-gen"]),
         UIRoute(id: "knowledge", steps: [commandStep("8", labels: ["Knowledge Graph"])], displayName: "Knowledge Graph", expectedDetailText: ["Knowledge Graph", "entities"]),
         UIRoute(id: "dreams", steps: [appRouteStep("d", labels: ["Dreams"])], displayName: "Dreams", expectedDetailText: ["Dreams", "Run Dream"]),
@@ -131,7 +158,7 @@ func userModeExpectedAdditionalRouteIDs(includeNativeExperience: Bool) -> Set<St
         "activity-approvals", "activity-inbox", "activity-memory-proposals",
         "activity-self-improvement", "workshop-schedule", "workshop-research",
         "diagnostics-status", "diagnostics-cognition", "diagnostics-inspector",
-        "telegram", "tools"
+        "mac-assistant-watch-setup", "telegram", "tools"
     ]
     if includeNativeExperience {
         routeIDs.formUnion([
@@ -195,6 +222,8 @@ func parseOptions() -> Options {
     var artifacts: URL?
     var skipUI = false
     var strictUI = false
+    var uiGateOnly = false
+    var forceAXUntrustedForTesting = false
     var args = Array(CommandLine.arguments.dropFirst())
     while !args.isEmpty {
         let arg = args.removeFirst()
@@ -209,6 +238,10 @@ func parseOptions() -> Options {
             skipUI = true
         case "--strict-ui":
             strictUI = true
+        case "--test-ui-gate-only":
+            uiGateOnly = true
+        case "--test-force-ax-untrusted":
+            forceAXUntrustedForTesting = true
         case "--help", "-h":
             print("""
             User Mode Eval
@@ -225,7 +258,8 @@ func parseOptions() -> Options {
             fatalError("unknown argument: \(arg)")
         }
     }
-    return Options(repo: repo, artifacts: artifacts, skipUI: skipUI, strictUI: strictUI)
+    return Options(repo: repo, artifacts: artifacts, skipUI: skipUI, strictUI: strictUI,
+                   uiGateOnly: uiGateOnly, forceAXUntrustedForTesting: forceAXUntrustedForTesting)
 }
 
 func isoNow() -> String {
@@ -1072,7 +1106,7 @@ func userModeRouteID(forSidebarCase name: String) -> String? {
     case "activity": "activity"
     case "memories": "memories"
     case "skills": "skills"
-    case "workshop": "workshop"
+    case "desk": "desk"
     case "personality": "personality"
     case "connectors": "connectors"
     case "trust": "trust"
@@ -1311,20 +1345,27 @@ func checkUIRuntimeIssues(
     }
 }
 
-func runUIEval(app: NSRunningApplication, dataRoot: URL, artifactDir: URL, options: Options, routes: [UIRoute], recorder: Recorder) {
+@discardableResult
+func requireUIAvailability(options: Options, accessibilityTrusted: Bool, recorder: Recorder) -> Bool {
     if options.skipUI {
         recorder.warn("ui.skipped", "UI eval skipped", "--no-ui was passed.")
-        return
+        return false
     }
-    guard AXIsProcessTrusted() else {
+    guard accessibilityTrusted else {
         let detail = "Accessibility permission is not available to this runner, so User Mode could not inventory or click the installed app."
-        if options.strictUI {
-            recorder.fail("ui.accessibility.trusted", "Accessibility permission missing", detail)
-        } else {
-            recorder.warn("ui.accessibility.trusted", "Accessibility permission missing", detail)
-        }
-        return
+        // The UI walk is a proof step, not an advisory best effort.  `--no-ui`
+        // is the one explicit opt-out; without it, an unavailable Accessibility
+        // bridge must make the command fail so a skipped 36-route walk cannot
+        // be mistaken for a successful UI gate.
+        recorder.fail("ui.accessibility.trusted", "Accessibility permission missing", detail)
+        return false
     }
+    return true
+}
+
+func runUIEval(app: NSRunningApplication, dataRoot: URL, artifactDir: URL, options: Options, routes: [UIRoute], recorder: Recorder) {
+    let accessibilityTrusted = options.forceAXUntrustedForTesting ? false : AXIsProcessTrusted()
+    guard requireUIAvailability(options: options, accessibilityTrusted: accessibilityTrusted, recorder: recorder) else { return }
     let uiEvalStartedAt = Date()
     app.activate(options: [.activateAllWindows])
     Thread.sleep(forTimeInterval: 1.0)
@@ -1357,11 +1398,12 @@ func runUIEval(app: NSRunningApplication, dataRoot: URL, artifactDir: URL, optio
     }
     let unlabeled = actionable.filter { effectiveVisibleLabel($0, in: initial).isEmpty }
     if !unlabeled.isEmpty {
-        recorder.warn(
-            "ui.action_inventory.labels",
-            "Some actionable controls have no accessible label",
-            "Found \(unlabeled.count) unlabeled actionable control(s); first paths: \(unlabeled.prefix(8).map(\.path).joined(separator: ", "))"
-        )
+        let detail = "Found \(unlabeled.count) unlabeled actionable control(s); first paths: \(unlabeled.prefix(8).map(\.path).joined(separator: ", "))"
+        if options.strictUI {
+            recorder.fail("ui.action_inventory.labels", "Some actionable controls have no accessible label", detail)
+        } else {
+            recorder.warn("ui.action_inventory.labels", "Some actionable controls have no accessible label", detail)
+        }
     } else {
         recorder.pass("ui.action_inventory.labels", "All actionable controls in the current inventory have accessible labels.")
     }
@@ -1403,6 +1445,24 @@ func runUIEval(app: NSRunningApplication, dataRoot: URL, artifactDir: URL, optio
         let snap = collectAppSnapshot(appElement: appElement)
         let path = artifactDir.appendingPathComponent("ui-inventory-\(route.id).json")
         try? writeJSON(snap, to: path)
+        let routeActionable = snap.filter {
+            isVisibleSnapshot($0)
+                && !isHiddenHarnessSnapshot($0)
+                && !isDescendantOfRole($0, role: "AXScrollBar", in: snap)
+                && !isStandardWindowChrome($0)
+                && (actionableRoles.contains($0.role) || $0.actions.contains(kAXPressAction))
+        }
+        let routeUnlabeled = routeActionable.filter { effectiveVisibleLabel($0, in: snap).isEmpty }
+        if routeUnlabeled.isEmpty {
+            recorder.pass("ui.route.\(route.id).action_labels", "All \(routeActionable.count) actionable controls on \(route.displayName) have accessible labels.")
+        } else {
+            let detail = "\(route.displayName) has \(routeUnlabeled.count) unlabeled actionable control(s): \(routeUnlabeled.prefix(8).map(\.path).joined(separator: ", "))"
+            if options.strictUI {
+                recorder.fail("ui.route.\(route.id).action_labels", "Route has unlabeled actionable controls", detail)
+            } else {
+                recorder.warn("ui.route.\(route.id).action_labels", "Route has unlabeled actionable controls", detail)
+            }
+        }
         screenshot(to: artifactDir.appendingPathComponent("route-\(route.id).png"))
         let text = allVisibleText(snap)
         let detailText = detailVisibleText(snap)
@@ -1426,6 +1486,24 @@ func runUIEval(app: NSRunningApplication, dataRoot: URL, artifactDir: URL, optio
                     "ui.route.\(route.id).expected_text",
                     "Route did not land on expected surface",
                     "\(route.displayName) detail did not contain any expected text: \(route.expectedDetailText.joined(separator: ", "))."
+                )
+            }
+        }
+        if !route.requiredDetailText.isEmpty {
+            let lowerDetail = detailText.lowercased()
+            let missing = route.requiredDetailText.filter {
+                !lowerDetail.contains($0.lowercased())
+            }
+            if missing.isEmpty {
+                recorder.pass(
+                    "ui.route.\(route.id).required_text",
+                    "\(route.displayName) rendered every required setup detail."
+                )
+            } else {
+                recorder.fail(
+                    "ui.route.\(route.id).required_text",
+                    "Route rendered incomplete setup inventory",
+                    "\(route.displayName) is missing required visible detail: \(missing.joined(separator: ", "))."
                 )
             }
         }
@@ -1512,26 +1590,33 @@ let includeNativeExperience = UserDefaults(suiteName: bundleID)?
     .bool(forKey: "nativeagent.experience.enabled") == true
 let routes = userModeRoutes(includeNativeExperience: includeNativeExperience)
 
-if !fm.fileExists(atPath: appURL.path) {
-    recorder.fail("installed_app.exists", "Installed app missing", "Expected app at \(appURL.path). Run ./script/install_app.sh first.")
+if options.uiGateOnly {
+    // Test this exact policy in a subprocess without launching an app or
+    // touching its state. The normal path below still samples AX directly.
+    let accessibilityTrusted = options.forceAXUntrustedForTesting ? false : AXIsProcessTrusted()
+    _ = requireUIAvailability(options: options, accessibilityTrusted: accessibilityTrusted, recorder: recorder)
 } else {
-    recorder.pass("installed_app.exists", "Installed app found at \(appURL.path).")
-}
+    if !fm.fileExists(atPath: appURL.path) {
+        recorder.fail("installed_app.exists", "Installed app missing", "Expected app at \(appURL.path). Run ./script/install_app.sh first.")
+    } else {
+        recorder.pass("installed_app.exists", "Installed app found at \(appURL.path).")
+    }
 
-checkRuntimeProcesses(recorder: recorder)
-checkDoctor(repo: repo, recorder: recorder)
-checkInbox(repo: repo, recorder: recorder)
-checkMemoryHygiene(repo: repo, recorder: recorder)
-checkScheduler(repo: repo, recorder: recorder)
-checkUserModeRouteCoverage(
-    repo: repo,
-    routes: routes,
-    includeNativeExperience: includeNativeExperience,
-    recorder: recorder
-)
+    checkRuntimeProcesses(recorder: recorder)
+    checkDoctor(repo: repo, recorder: recorder)
+    checkInbox(repo: repo, recorder: recorder)
+    checkMemoryHygiene(repo: repo, recorder: recorder)
+    checkScheduler(repo: repo, recorder: recorder)
+    checkUserModeRouteCoverage(
+        repo: repo,
+        routes: routes,
+        includeNativeExperience: includeNativeExperience,
+        recorder: recorder
+    )
 
-if fm.fileExists(atPath: appURL.path), let app = launchOrActivate(appURL: appURL, bundleID: bundleID, recorder: recorder) {
-    runUIEval(app: app, dataRoot: dataRoot, artifactDir: artifactDir, options: options, routes: routes, recorder: recorder)
+    if fm.fileExists(atPath: appURL.path), let app = launchOrActivate(appURL: appURL, bundleID: bundleID, recorder: recorder) {
+        runUIEval(app: app, dataRoot: dataRoot, artifactDir: artifactDir, options: options, routes: routes, recorder: recorder)
+    }
 }
 
 let failCount = recorder.findings.filter { $0.severity == "fail" }.count

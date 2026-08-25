@@ -22,9 +22,35 @@ extension AppModel {
     }
 
     /// Overload of the existing `resolveApproval(_:decision:)` for callers that
-    /// hold only the approval id (inline cards, sidebar rows).
+    /// hold only the approval id (inline cards, sidebar rows). Concurrent
+    /// callers share one task because a terminal approval may start a real
+    /// executor after its durable decision is written.
     func resolveApproval(id: String, decision: String) async throws -> ApprovalRequest {
-        try await client.resolveApproval(id: id, decision: decision)
+        let trimmedID = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedID.isEmpty else {
+            throw NSError(domain: "NativeAgentApproval", code: 400, userInfo: [
+                NSLocalizedDescriptionKey: "The approval request has no identifier."
+            ])
+        }
+        if let task = approvalResolutionTasks[trimmedID] {
+            return try await task.value
+        }
+
+        let resolverOverride = approvalResolverOverride
+        let resolverClient = client
+        let task = Task<ApprovalRequest, Error> { @MainActor in
+            if let resolverOverride {
+                return try await resolverOverride(trimmedID, decision)
+            }
+            return try await resolverClient.resolveApproval(id: trimmedID, decision: decision)
+        }
+        approvalResolutionTasks[trimmedID] = task
+        approvalResolutionInFlightIDs.insert(trimmedID)
+        defer {
+            approvalResolutionTasks.removeValue(forKey: trimmedID)
+            approvalResolutionInFlightIDs.remove(trimmedID)
+        }
+        return try await task.value
     }
 
     // MARK: Config / raw
@@ -41,7 +67,10 @@ extension AppModel {
 
     // MARK: Inbox
     func getInboxItems(unreadOnly: Bool = false) async throws -> [InboxItemRecord] {
-        try await client.getInboxItems(unreadOnly: unreadOnly)
+        if let inboxReaderOverride {
+            return try await inboxReaderOverride(unreadOnly)
+        }
+        return try await client.getInboxItems(unreadOnly: unreadOnly)
     }
 
     // MARK: Models
@@ -278,6 +307,9 @@ extension AppModel {
     }
 
     func inboxAction(_ id: String, action: String) async throws {
+        if let inboxActionOverride {
+            return try await inboxActionOverride(id, action)
+        }
         try await client.inboxAction(id, action: action)
     }
 }
